@@ -59,6 +59,10 @@ def app_harness(config_overrides: dict | None = None):
             patch("voiceink.app.FloatingWindow"),
             patch("voiceink.app.TrayIcon"),
             patch("voiceink.app.HistoryStore", create=True),
+            # App.__init__ probes the models directory on disk; without this the
+            # suite's outcome depends on whether the machine has the model
+            # downloaded (startup show_error fires on a clean checkout).
+            patch("voiceink.speech_recognizer.is_model_downloaded", return_value=True),
         ]
         started = [p.start() for p in patches]
 

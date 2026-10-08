@@ -412,6 +412,92 @@ class TestFinalResultFlow:
             h["paster"].paste_async.assert_called_once()
             assert h["paster"].paste_async.call_args[0][0] == "前十五秒松开后的尾巴"
 
+    def test_new_hold_is_refused_while_the_previous_utterance_is_still_queued(self):
+        """Repro from the evaluation: hold → release → hold again at once.
+        The queued previous utterance must not merge into the new hold."""
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            h["recognizer"].is_ready = True
+            h["recorder"].is_recording = False
+            app._is_transcribing = False
+            app._segment_queue = [np.ones(1600, dtype=np.float32)]
+
+            app._on_recording_start()
+
+            h["recorder"].start.assert_not_called()
+            h["floating"].show_recording.assert_not_called()
+            h["floating"].show_busy_transcribing.assert_called_once()
+            assert len(app._segment_queue) == 1
+
+    def test_new_hold_is_refused_while_the_previous_utterance_is_recognizing(self):
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            h["recognizer"].is_ready = True
+            app._is_transcribing = True
+
+            app._on_recording_start()
+
+            h["recorder"].start.assert_not_called()
+            h["floating"].show_busy_transcribing.assert_called_once()
+
+    def test_hold_starts_normally_when_the_pipeline_is_idle(self):
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            h["recognizer"].is_ready = True
+            app._is_transcribing = False
+            app._segment_queue = []
+
+            app._on_recording_start()
+
+            h["recorder"].start.assert_called_once()
+            h["floating"].show_recording.assert_called_once()
+            h["floating"].show_busy_transcribing.assert_not_called()
+
+    def test_esc_on_a_refused_hold_keeps_the_previous_utterance(self):
+        """hold → release → hold again (refused) → Esc: the queued previous
+        utterance must survive; Esc only cancels a hold that is recording."""
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            h["recognizer"].is_ready = True
+            h["recorder"].is_recording = False
+            queued = np.ones(1600, dtype=np.float32)
+            app._segment_queue = [queued]
+            app._live_committed = "上一句"
+            app._hold_paste_sent = False
+
+            app._on_recording_start()
+            app._on_recording_cancel()
+
+            assert app._segment_queue == [queued]
+            assert app._live_committed == "上一句"
+            assert app._hold_paste_sent is False
+            h["recorder"].cancel.assert_not_called()
+            h["floating"].show_cancelled.assert_not_called()
+
+    def test_esc_during_a_live_hold_still_cancels(self):
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            h["recorder"].is_recording = True
+            app._segment_queue = [np.ones(1600, dtype=np.float32)]
+
+            app._on_recording_cancel()
+
+            assert app._segment_queue == []
+            h["recorder"].cancel.assert_called_once()
+            h["floating"].show_cancelled.assert_called_once()
+
+    def test_release_tells_the_bar_the_key_is_up_before_stopping(self):
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            h["recorder"].is_recording = True
+            order: list[str] = []
+            h["floating"].end_capture.side_effect = lambda: order.append("end_capture")
+            h["recorder"].stop.side_effect = lambda: order.append("stop")
+
+            app._on_recording_stop()
+
+            assert order == ["end_capture", "stop"]
+
     def test_hold_waits_until_the_queued_tail_is_recognized(self):
         with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
             app = h["app"]

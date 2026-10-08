@@ -530,8 +530,11 @@ class App(QObject):
             self._show_model_not_ready()
             return
 
-        if self._is_transcribing:
-            log.warning("正在转写中，忽略新的录音请求")
+        if self._is_transcribing or self._segment_queue:
+            # A previous hold is still being recognized or waits in the queue
+            # behind an output in flight. Starting a new hold now would merge
+            # that utterance into this one, and Esc would discard it.
+            log.warning("上一轮语音尚未识别完，忽略新的录音请求")
             self._floating.show_busy_transcribing()
             return
 
@@ -557,6 +560,8 @@ class App(QObject):
         self._sound.play_stop()
         self._tray.set_recording(False)
         self._tray.set_activity_tooltip("recognizing")
+        # The key is up: the bar must stop saying 「松开结束，Esc 取消」.
+        self._floating.end_capture()
         self._recorder.stop()
 
     def _reset_recording_ui_after_abort(self):
@@ -568,6 +573,13 @@ class App(QObject):
 
     def _on_recording_cancel(self):
         if self._is_continuous_mode():
+            return
+        if not self._recorder.is_recording:
+            # This hold never started (refused while the previous utterance
+            # was still in the pipeline, or aborted early), so Esc has nothing
+            # to cancel. The utterance already in flight was not asked to go.
+            log.info("Esc：当前没有进行中的录音，忽略取消")
+            self._reset_recording_ui_after_abort()
             return
         self._hold_paste_sent = True
         self._hold_duration_ms = 0

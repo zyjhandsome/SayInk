@@ -23,8 +23,10 @@ _ASR_TAG_PATTERNS = (
     re.compile(r"</\s*asr_text\b[^>]*>", re.IGNORECASE),
     re.compile(r"<\s*/\s*asr_text\b[^>]*>", re.IGNORECASE),
 )
-# FireRedASR2 / sherpa meta tokens in tokens.txt: <sil>, <zh>, <en>, dialect tags, …
-_ASR_META_TOKEN_PATTERN = re.compile(r"<\s*/?\s*[^>]+>")
+# FireRedASR2 / sherpa meta tokens in tokens.txt: <sil>, <zh>, <en>, <|zh|>,
+# dialect tags, … A token is one identifier-like word between the brackets.
+# Anything with spaces or CJK inside is speech ("如果 a<b 并且 c>d") and stays.
+_ASR_META_TOKEN_PATTERN = re.compile(r"<\s*/?\s*\|?[A-Za-z_][A-Za-z0-9_\-]*\|?\s*/?\s*>")
 # Some decoded silence markers lose their angle brackets ("/sil", "/sil>").
 # ASCII word/path boundaries keep /silver, /sil.txt and URLs intact; Chinese
 # speech can follow the marker directly without a space.

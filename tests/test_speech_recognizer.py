@@ -118,6 +118,29 @@ class TestNormalizeAsrOutput:
         assert "<" not in result
         assert result == "你好hello"
 
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("<|zh|>你好<|en|>hello", "你好hello"),
+            ("< sil >你好</ sil>", "你好"),
+            ("<zh-CN>你好<en_US>hello", "你好hello"),
+        ],
+    )
+    def test_removes_meta_tokens_with_pipes_spaces_and_dialect_codes(self, text, expected):
+        assert normalize_asr_output(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "如果 a<b 并且 c>d 就成立",
+            "x < 3 和 y > 5",
+            "数组 <长度> 是十",
+            "他说 <我 不同意> 这句话",
+        ],
+    )
+    def test_keeps_comparisons_and_spoken_angle_brackets(self, text):
+        assert normalize_asr_output(text) == text
+
     def test_keeps_colloquial_repeats_and_fillers(self):
         spoken = "说前面啊往前挪啊。往前挪啊。没问题没问题。嗯。嗯。嗯。嗯。嗯。"
         assert normalize_asr_output(spoken) == spoken

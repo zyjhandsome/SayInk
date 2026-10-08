@@ -225,6 +225,48 @@ def test_hold_bar_stays_put_until_the_key_is_released(win):
     assert win._dot._timer.isActive()
 
 
+def test_hold_bar_switches_to_recognizing_once_the_key_is_released(win):
+    """After release the bar must stop saying 「录音中 / 松开结束」 even though
+    the capture gate is still up until the result arrives."""
+    from voiceink.ui.design_tokens import STATE_RECOGNIZE, STATE_RECORD
+
+    win.show_recording()
+    win.end_capture()
+    assert win._status_label.text() == "正在识别"
+    assert "松开结束" not in win._text_label.text()
+    assert STATE_RECOGNIZE.lower() in win._status_label.styleSheet().lower()
+    assert not win._dot._timer.isActive()
+    assert not win._waveform.isVisible()
+
+    # Late state pushes from the pipeline keep the released look.
+    win.show_recognizing()
+    assert win._status_label.text() == "正在识别"
+    win.show_polishing()
+    assert win._status_label.text() == "润色中"
+    assert STATE_RECORD.lower() not in win._status_label.styleSheet().lower()
+
+
+def test_end_capture_keeps_the_live_transcript_tail(win):
+    win.show_recording()
+    win.show_live_transcript("开头" + "啊" * 80 + "这句还在")
+    win.end_capture()
+    assert "这句还在" in win._text_label.text()
+    assert win._status_label.text() == "正在识别"
+
+
+def test_end_capture_is_a_noop_outside_a_hold(win):
+    win.show_listening()
+    win.end_capture()
+    assert "正在听" in win._status_label.text()
+    assert win._capture_released is False
+
+    win.show_recording()
+    win.end_capture()
+    win.show_recording()
+    assert win._capture_released is False
+    assert "松开结束" in win._text_label.text()
+
+
 def test_hold_recording_shows_live_transcript(win):
     win.show_recording()
     win.show_live_transcript("开头" + "啊" * 80 + "这句还在")

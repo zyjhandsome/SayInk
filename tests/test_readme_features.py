@@ -111,10 +111,22 @@ class TestReadmeHoldHotkeyFlow:
 
     def test_esc_cancels_recording(self):
         with app_harness({"audio.trigger_mode": "hotkey"}) as h:
+            h["recorder"].is_recording = True
             h["app"]._on_recording_cancel()
 
             h["recorder"].cancel.assert_called_once()
             h["floating"].show_cancelled.assert_called_once()
+            h["floating"].dismiss_if_idle.assert_called()
+
+    def test_esc_without_a_live_recording_cancels_nothing(self):
+        """README: 录音中 Esc 取消。A hold that never started (refused while
+        the previous utterance was still recognizing) leaves nothing to cancel."""
+        with app_harness({"audio.trigger_mode": "hotkey"}) as h:
+            h["recorder"].is_recording = False
+            h["app"]._on_recording_cancel()
+
+            h["recorder"].cancel.assert_not_called()
+            h["floating"].show_cancelled.assert_not_called()
             h["floating"].dismiss_if_idle.assert_called()
 
     def test_recording_too_short_shows_friendly_error(self):

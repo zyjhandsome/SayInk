@@ -11,31 +11,20 @@ from PyQt6.QtWidgets import (
 )
 
 from voiceink.ui import design_tokens as tok
+# Only theme-independent layout tokens may be bound at import time. Colors
+# change with the light/dark axis, so they are always read live as ``tok.X``;
+# a widget built after a theme switch would otherwise inherit stale colors.
 from voiceink.ui.design_tokens import (
-    ACCENT,
-    ACCENT_FOCUS,
-    ACCENT_SOFT,
-    BORDER,
-    CONTROL_BORDER,
-    DIVIDER_SOFT,
     FONT_DISPLAY,
-    HAIRLINE,
-    NAV_SELECTED_BG,
     NAV_SELECTED_BAR_PX,
     PAGE_MARGIN_H,
     PAGE_MARGIN_V,
     RADIUS_MD,
     RADIUS_SM,
-    ROW_HOVER,
     SPACE_LG,
     SPACE_MD,
     SPACE_SM,
     SPACE_XS,
-    SURFACE,
-    SURFACE_PEARL,
-    TEXT,
-    TEXT_DIM,
-    TEXT_SEC,
 )
 
 # ── Style fragments (rebuilt from active token axis via reload_styles) ──
@@ -259,7 +248,7 @@ class PageHero(QWidget):
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
         self._inline_status.setStyleSheet(
-            f"color: {TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 400;"
+            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 400;"
             f" background: transparent;"
         )
         # Reserve status width so 已关闭 ↔ 已开启 · … does not shove the title.
@@ -364,7 +353,7 @@ def polish_preview_content() -> QWidget:
     head = QLabel("效果示例（非实时结果）")
     head.setProperty("viRole", "polishPreviewHeading")
     head.setStyleSheet(
-        f"color: {TEXT}; font-size: {tok.TYPE_TITLE}px; font-weight: 700; background: transparent;"
+        f"color: {tok.TEXT}; font-size: {tok.TYPE_TITLE}px; font-weight: 700; background: transparent;"
     )
     lay.addWidget(head)
 
@@ -376,7 +365,7 @@ def polish_preview_content() -> QWidget:
         tag = QLabel(label)
         tag.setProperty("viRole", "polishPreviewLabel")
         tag.setStyleSheet(
-            f"color: {TEXT_DIM}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 700;"
+            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 700;"
             f" background: transparent;"
         )
         row_lay.addWidget(tag, 0, Qt.AlignmentFlag.AlignTop)
@@ -384,7 +373,7 @@ def polish_preview_content() -> QWidget:
         txt.setProperty("viRole", "polishPreviewText")
         txt.setWordWrap(True)
         txt.setStyleSheet(
-            f"color: {TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; line-height: 1.5;"
+            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; line-height: 1.5;"
             f" background: transparent;"
         )
         row_lay.addWidget(txt, 1)
@@ -469,7 +458,7 @@ def group_divider() -> QWidget:
     line = QFrame()
     line.setObjectName("settingsGroupDividerLine")
     line.setFixedHeight(1)
-    line.setStyleSheet(f"background: {DIVIDER_SOFT};")
+    line.setStyleSheet(f"background: {tok.DIVIDER_SOFT};")
     lay.addWidget(line)
     return wrap
 
@@ -636,7 +625,7 @@ def settings_section(
         hdr = QLabel(title)
         hdr.setObjectName("settingsGroupTitle")
         hdr.setStyleSheet(
-            f"color: {TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700;"
+            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700;"
             f" padding: 2px 2px 2px 2px; background: transparent;"
             f" letter-spacing: 0;"
         )
@@ -765,7 +754,7 @@ def option_row(title: str, subtitle: str = "") -> QWidget:
     t = QLabel(title)
     t.setProperty("viRole", "rowTitle")
     t.setStyleSheet(
-        f"color: {TEXT}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 400; background: transparent;"
+        f"color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 400; background: transparent;"
     )
     lay.addWidget(t)
     if subtitle:
@@ -773,7 +762,7 @@ def option_row(title: str, subtitle: str = "") -> QWidget:
         s.setProperty("viRole", "rowSubtitle")
         s.setWordWrap(True)
         s.setStyleSheet(
-            f"color: {TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
+            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
             f" background: transparent;"
         )
         lay.addWidget(s)
@@ -807,7 +796,7 @@ def stacked_field_row(label: str, widget: QWidget, hint: str = "") -> QWidget:
     lbl = QLabel(label)
     lbl.setProperty("viRole", "fieldLabel")
     lbl.setStyleSheet(
-        f"color: {TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 400; background: transparent;"
+        f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 400; background: transparent;"
     )
     lbl.setBuddy(widget)
     outer.addWidget(lbl)
@@ -818,7 +807,7 @@ def stacked_field_row(label: str, widget: QWidget, hint: str = "") -> QWidget:
         h.setProperty("viRole", "hint")
         h.setWordWrap(True)
         h.setStyleSheet(
-            f"color: {TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4; background: transparent;"
+            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4; background: transparent;"
         )
         outer.addWidget(h)
     return row
@@ -845,7 +834,7 @@ def kv_row(key: str, value: str, *, mono: bool = False) -> QWidget:
     k = QLabel(key)
     k.setProperty("viRole", "kvKey")
     k.setStyleSheet(
-        f"color: {TEXT}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 700; min-width: 80px;"
+        f"color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 700; min-width: 80px;"
     )
     k.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
     v = QLabel(value)
@@ -855,10 +844,10 @@ def kv_row(key: str, value: str, *, mono: bool = False) -> QWidget:
     v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
     if mono:
         v.setStyleSheet(
-            f"color: {TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; font-family: {FONT_MONO};"
+            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; font-family: {FONT_MONO};"
         )
     else:
-        v.setStyleSheet(f"color: {TEXT_DIM}; font-size: {tok.TYPE_BODY_SM}px;")
+        v.setStyleSheet(f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_BODY_SM}px;")
     lay.addWidget(k)
     lay.addWidget(v, 1)
     return row
@@ -1366,7 +1355,7 @@ class _PlayCircle(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         d = min(self.width(), self.height())
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(TEXT_SEC))
+        p.setBrush(QColor(tok.TEXT_SEC))
         p.drawEllipse(0, 0, d, d)
         tri = QPolygonF([
             QPointF(d * 0.38, d * 0.28),
@@ -1382,7 +1371,7 @@ class _WaveformBadge(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        c = QColor(TEXT_DIM)
+        c = QColor(tok.TEXT_DIM)
         c.setAlpha(120)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(c)
@@ -1423,7 +1412,7 @@ class WideTestButton(QWidget):
 
         self._label = QLabel(text)
         self._label.setStyleSheet(
-            f"color: {TEXT}; font-size: {tok.TYPE_BODY}px; font-weight: 400; background: transparent;"
+            f"color: {tok.TEXT}; font-size: {tok.TYPE_BODY}px; font-weight: 400; background: transparent;"
         )
         lay.addWidget(self._label, 1, Qt.AlignmentFlag.AlignVCenter)
 
@@ -1435,18 +1424,18 @@ class WideTestButton(QWidget):
         if self._enabled:
             self.setStyleSheet(f"""
                 WideTestButton {{
-                    background: {SURFACE};
+                    background: {tok.SURFACE};
                     border: none;
                     border-radius: {RADIUS_MD}px;
                 }}
                 WideTestButton:hover {{
-                    background: {SURFACE_PEARL};
+                    background: {tok.SURFACE_PEARL};
                 }}
             """)
         else:
             self.setStyleSheet(f"""
                 WideTestButton {{
-                    background: {SURFACE};
+                    background: {tok.SURFACE};
                     border: none;
                     border-radius: {RADIUS_MD}px;
                     opacity: 0.55;
@@ -1505,7 +1494,7 @@ def collapsible_toggle_btn(text: str) -> QPushButton:
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
     btn.setStyleSheet(f"""
         QPushButton {{
-            color: {TEXT_SEC};
+            color: {tok.TEXT_SEC};
             background: transparent;
             border: none;
             font-size: {tok.TYPE_BODY_SM}px;
@@ -1514,7 +1503,7 @@ def collapsible_toggle_btn(text: str) -> QPushButton:
             padding: 6px 4px;
         }}
         QPushButton:hover {{
-            color: {TEXT};
+            color: {tok.TEXT};
         }}
     """)
 

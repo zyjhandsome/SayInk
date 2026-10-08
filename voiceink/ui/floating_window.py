@@ -5,11 +5,6 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFontMetrics, QPainter, QColor, QFont, QCursor
 import math
 from voiceink.ui import design_tokens as tok
-
-from voiceink.ui.design_tokens import (
-    FLOAT_TEXT,
-    STATE_RECORD,
-)
 from voiceink.ui.island_chrome import (
     island_window_flags,
     position_listen_bar,
@@ -32,9 +27,11 @@ def _ui_font(family, pixels, weight=QFont.Weight.Normal):
 class _DotIndicator(QWidget):
     """Listening ring that pulses while a session is active."""
 
-    def __init__(self, color: str = STATE_RECORD, parent=None):
+    def __init__(self, color: str = "", parent=None):
         super().__init__(parent)
-        self._color = QColor(color)
+        # Resolve at construction time so the live theme axis wins over the
+        # value that happened to be active when this module was imported.
+        self._color = QColor(color or tok.STATE_RECORD)
         self._pulse = 0.0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -94,7 +91,7 @@ class WaveformWidget(QWidget):
         self._volume = 0.0
         self._bar_heights = [0.0] * self.NUM_BARS
         self._phase = 0.0
-        self._accent = QColor(FLOAT_TEXT)
+        self._accent = QColor(tok.FLOAT_TEXT)
         self._visible_bars = self.NUM_BARS
         self.setFixedHeight(18)
         self.setFixedWidth(72)
@@ -167,9 +164,11 @@ class FloatingWindow(QWidget):
         super().__init__(parent)
         self._listening_active = False
         self._capture_active = False
+        # Set by end_capture() once the hold key is up; cleared by show_recording().
+        self._capture_released = False
         self._model_loading_active = False
         self._live_text = ""
-        self._current_accent = FLOAT_TEXT
+        self._current_accent = tok.FLOAT_TEXT
         self._mode = "compact"
         self._setup_window()
         self._setup_ui()
@@ -375,7 +374,8 @@ class FloatingWindow(QWidget):
         self._set_mode("excerpt")
 
     def _hold_capture(self) -> bool:
-        return self._capture_active and not self._listening_active
+        """True while the hold key is still down (bar must stay put)."""
+        return self._capture_active and not self._listening_active and not self._capture_released
 
     def _show_capture_transcript(self, text: str) -> None:
         """Update hold-to-talk words without resizing, recoloring, or restarting."""
@@ -416,6 +416,7 @@ class FloatingWindow(QWidget):
         self._model_loading_active = False
         self._listening_active = True
         self._capture_active = False
+        self._capture_released = False
         label = "正在听" if self._live_text else "正在听 · 停顿后出字"
         self._set_state(label, "STATE_LISTEN", pulse=False)
         self.unsetCursor()
@@ -467,10 +468,31 @@ class FloatingWindow(QWidget):
         self._waveform.hide()
         self._present()
 
+    def end_capture(self) -> None:
+        """Hold key released: drop the 「松开结束」 hint and show recognition.
+
+        The words recognized so far stay on the bar; ``show_recognizing`` /
+        ``show_polishing`` may now update the title (they stay silent while the
+        key is held so the bar does not flicker).
+        """
+        if not self._capture_active or self._listening_active or self._capture_released:
+            return
+        self._capture_released = True
+        self._set_state("正在识别", "STATE_RECOGNIZE", pulse=False)
+        self._waveform.stop()
+        self._waveform.hide()
+        if self._live_text:
+            self._apply_excerpt(self._live_text, keep_tail=True)
+        else:
+            self._apply_excerpt("松开了，正在识别…")
+        self._hide_timer.stop()
+        self._present()
+
     def show_recording(self):
         continuing = self._hold_capture() and self._status_label.text() == "录音中" and self.isVisible()
         self._listening_active = False
         self._capture_active = True
+        self._capture_released = False
         if self._live_text:
             self._show_capture_transcript(self._live_text)
             return
@@ -487,6 +509,7 @@ class FloatingWindow(QWidget):
         self._model_loading_active = False
         self._listening_active = False
         self._capture_active = False
+        self._capture_released = False
         self._set_mode("compact")
         self.unsetCursor()
         self._waveform.stop()
@@ -512,7 +535,7 @@ class FloatingWindow(QWidget):
             self._waveform.start()
             if self._capture_active and not self._listening_active:
                 self._set_state(
-                    "录音中 · 识别中",
+                    "正在识别" if self._capture_released else "录音中 · 识别中",
                     "STATE_RECOGNIZE",
                     pulse=False,
                 )
@@ -536,8 +559,13 @@ class FloatingWindow(QWidget):
         if not keep_line:
             self._restore_compact_height()
         if self._listening_active or (self._capture_active and self._live_text):
-            label = "正在听 · 润色中" if self._listening_active else "录音中 · 润色中"
-            self._set_state(label, "STATE_LISTEN", pulse=False)
+            if self._listening_active:
+                label, color = "正在听 · 润色中", "STATE_LISTEN"
+            elif self._capture_released:
+                label, color = "润色中", "STATE_POLISH"
+            else:
+                label, color = "录音中 · 润色中", "STATE_LISTEN"
+            self._set_state(label, color, pulse=False)
             self._waveform.set_compact(bool(self._live_text))
             self._waveform.show()
             self._waveform.start()
@@ -624,6 +652,7 @@ class FloatingWindow(QWidget):
 
     def show_cancelled(self):
         self._capture_active = False
+        self._capture_released = False
         self._live_text = ""
         self._restore_compact_height()
         self._waveform.stop()

@@ -381,7 +381,8 @@ class AudioRecorder(QObject):
             return
         vol = rms_volume(block)
         self.volume_changed.emit(vol)
-        if vol >= self._segmenter.speech_threshold:
+        gate = getattr(self._segmenter, "effective_threshold", self._segmenter.speech_threshold)
+        if vol >= gate:
             self._last_speech_at = time.monotonic()
         segment = self._feed_segmenter(block)
         if segment is not None and segment.size > 0:

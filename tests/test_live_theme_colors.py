@@ -30,3 +30,26 @@ def test_empty_state_restyles_when_theme_changes():
     sheet = label.styleSheet()
     assert "#9CA3AF" in sheet
     assert "#667085" not in sheet
+
+
+def test_widgets_built_after_a_theme_switch_use_the_live_palette():
+    """Colors bound at import time (``from design_tokens import TEXT``) go
+    stale after ``activate()``; builders must read ``tok.X`` live."""
+    from PyQt6.QtWidgets import QLabel
+
+    from voiceink.ui.floating_window import _DotIndicator
+    from voiceink.ui.settings_components import option_row
+
+    activate("dark")
+    dark_row = option_row("标题", "副标题")
+    title = dark_row.findChildren(QLabel)[0]
+    assert "#F9FAFB" in title.styleSheet()
+    assert "#111827" not in title.styleSheet()
+    assert _DotIndicator()._color.name().upper() == "#F87171"
+
+    activate("light")
+    light_row = option_row("标题", "副标题")
+    title = light_row.findChildren(QLabel)[0]
+    assert "#111827" in title.styleSheet()
+    assert "#F9FAFB" not in title.styleSheet()
+    assert _DotIndicator()._color.name().upper() == "#DC2626"
