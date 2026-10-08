@@ -374,6 +374,8 @@ class HistoryWindow(QWidget):
 
     ROW_HEIGHT = 58
     GROUP_HEADER_HEIGHT = 30
+    # Treat a scrollbar this close to the end as "watching the latest turn".
+    _DETAIL_TAIL_SLACK = 24
 
     def __init__(self, store, parent=None):
         super().__init__(parent)
@@ -386,6 +388,12 @@ class HistoryWindow(QWidget):
         self._has_more = False
         self._view_polished = True
         self._transient_active = False
+        self._detail_session_id: str | None = None
+        self._detail_follow_tail = True
+        self._detail_pending_anchor: int | None = None
+        self._detail_scroll_lock = False
+        self._detail_scroll_settle = False
+        self._detail_scroll_gen = 0
         self._setup_window()
         self._setup_ui()
         self.refresh()
@@ -832,6 +840,12 @@ class HistoryWindow(QWidget):
         self._details.setAccessibleName("会话转写全文")
         self._details.setPlaceholderText("选择一条转写查看分段内容")
         self._details.document().setDocumentMargin(0)
+        detail_bar = self._details.verticalScrollBar()
+        detail_bar.rangeChanged.connect(self._on_detail_scrollbar_range_changed)
+        detail_bar.valueChanged.connect(self._on_detail_scrollbar_value_changed)
+        self._detail_scroll_timer = QTimer(self)
+        self._detail_scroll_timer.setSingleShot(True)
+        self._detail_scroll_timer.timeout.connect(self._on_detail_scroll_timeout)
         right_lay.addWidget(self._details, 1)
         self._history_preferences_btn = QPushButton("设置历史记录")
         self._history_preferences_btn.clicked.connect(self.history_preferences_requested.emit)
@@ -918,49 +932,56 @@ class HistoryWindow(QWidget):
         selected = self._selected_session_ids()
         pending = {s.session_id for s in self._pending_delete}
         sessions = [s for s in sessions if s.session_id not in pending]
-        self._session_list.clear()
-        self._history_preferences_btn.setVisible(
-            not sessions and not self._search_query and not self._history_enabled
-        )
-        self._more_btn.setVisible(self._has_more and not self._search_query)
-        self._sessions_by_id = {s.session_id: s for s in sessions}
-        last_day = None
-        for session in sessions:
-            day = _day_label(session.created_at)
-            if day != last_day:
-                self._add_group_header(day, first=last_day is None)
-                last_day = day
-            item = QListWidgetItem(self._session_item_text(session))
-            item.setData(Qt.ItemDataRole.UserRole, session.session_id)
-            item.setToolTip(
-                f"来源：{_source_chip_text(session.source)} · "
-                f"应用：{session.target_app or '未知应用'} · {session.segment_count} 段"
+        # Rebuilding the list clears the selection first. That signal would
+        # treat the open session as closed and snap the detail back to the top
+        # on the next paint. Restore selection, then refresh the detail once.
+        self._session_list.blockSignals(True)
+        try:
+            self._session_list.clear()
+            self._history_preferences_btn.setVisible(
+                not sessions and not self._search_query and not self._history_enabled
             )
-            item.setForeground(Qt.GlobalColor.transparent)
-            item.setSizeHint(QSize(0, self.ROW_HEIGHT))
-            self._session_list.addItem(item)
-            self._session_list.setItemWidget(item, self._build_stream_row(session))
-        items = self.session_items()
-        if items:
-            retained = [it for it in items if it.data(Qt.ItemDataRole.UserRole) in selected]
-            if retained:
-                for it in retained:
-                    it.setSelected(True)
+            self._more_btn.setVisible(self._has_more and not self._search_query)
+            self._sessions_by_id = {s.session_id: s for s in sessions}
+            last_day = None
+            for session in sessions:
+                day = _day_label(session.created_at)
+                if day != last_day:
+                    self._add_group_header(day, first=last_day is None)
+                    last_day = day
+                item = QListWidgetItem(self._session_item_text(session))
+                item.setData(Qt.ItemDataRole.UserRole, session.session_id)
+                item.setToolTip(
+                    f"来源：{_source_chip_text(session.source)} · "
+                    f"应用：{session.target_app or '未知应用'} · {session.segment_count} 段"
+                )
+                item.setForeground(Qt.GlobalColor.transparent)
+                item.setSizeHint(QSize(0, self.ROW_HEIGHT))
+                self._session_list.addItem(item)
+                self._session_list.setItemWidget(item, self._build_stream_row(session))
+            items = self.session_items()
+            if items:
+                retained = [it for it in items if it.data(Qt.ItemDataRole.UserRole) in selected]
+                if retained:
+                    for it in retained:
+                        it.setSelected(True)
+                else:
+                    self._session_list.setCurrentItem(items[0])
             else:
-                self._session_list.setCurrentItem(items[0])
-        else:
-            self._set_detail_chips([])
-            self._view_bar.hide()
-            if self._search_query:
-                empty = "没有匹配的转写。试试更短的关键词，或清除搜索。"
-            elif not self._history_enabled:
-                empty = "历史记录未开启。\n可在通用设置中开启，之后的转写文本会保存在本机。"
-            else:
-                empty = "还没有会话。完成一次转写后会出现在这里。"
-            title = "没有搜索结果" if self._search_query else (
-                "历史记录未开启" if not self._history_enabled else "还没有会话")
-            self._detail_title.setText(title)
-            self._details.setPlainText(empty)
+                self._set_detail_chips([])
+                self._view_bar.hide()
+                if self._search_query:
+                    empty = "没有匹配的转写。试试更短的关键词，或清除搜索。"
+                elif not self._history_enabled:
+                    empty = "历史记录未开启。\n可在通用设置中开启，之后的转写文本会保存在本机。"
+                else:
+                    empty = "还没有会话。完成一次转写后会出现在这里。"
+                title = "没有搜索结果" if self._search_query else (
+                    "历史记录未开启" if not self._history_enabled else "还没有会话")
+                self._detail_title.setText(title)
+                self._set_detail_document(plain=empty)
+        finally:
+            self._session_list.blockSignals(False)
         count = len(sessions)
         summary = f"{count} 场匹配" if self._search_query else f"{count} 场最近会话"
         if count > 1:
@@ -1097,7 +1118,96 @@ class HistoryWindow(QWidget):
         has_polished = _session_has_polished(segments)
         self._view_bar.setVisible(has_polished)
         show_polished = self._view_polished if has_polished else False
-        self._details.setHtml(self._render_segments_html(segments, show_polished))
+        self._set_detail_document(
+            html=self._render_segments_html(segments, show_polished),
+            session_id=session_id,
+        )
+
+    def _set_detail_document(
+        self,
+        *,
+        html: str | None = None,
+        plain: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        """Replace the detail document and keep the latest turn in view.
+
+        Segments render oldest-first, so the newest turn sits at the bottom.
+        ``setHtml`` resets the scrollbar to the top; during a multi-turn
+        session that refresh happens on every committed segment. Stay at the
+        bottom while the reader is following the latest turn. If they have
+        scrolled up into earlier turns, keep that offset across the refresh.
+        """
+        bar = self._details.verticalScrollBar()
+        if session_id is not None:
+            same = session_id == self._detail_session_id
+            if same and not self._detail_follow_tail:
+                self._detail_pending_anchor = bar.value()
+            else:
+                self._detail_follow_tail = True
+                self._detail_pending_anchor = None
+            self._detail_session_id = session_id
+        else:
+            self._detail_session_id = None
+            self._detail_follow_tail = False
+            self._detail_pending_anchor = None
+        self._detail_scroll_lock = True
+        self._detail_scroll_settle = True
+        self._detail_scroll_gen += 1
+        try:
+            if html is not None:
+                self._details.setHtml(html)
+            else:
+                self._details.setPlainText(plain or "")
+        finally:
+            self._detail_scroll_lock = False
+        # setHtml moves the caret to the start on a later event-loop turn,
+        # which would undo a synchronous scroll. Re-apply after that reset.
+        self._detail_scroll_timer.start(0)
+        self._apply_detail_scroll()
+
+    def _on_detail_scroll_timeout(self) -> None:
+        self._finish_detail_scroll(self._detail_scroll_gen)
+
+    def _finish_detail_scroll(self, generation: int) -> None:
+        if generation != self._detail_scroll_gen:
+            return
+        self._apply_detail_scroll()
+        if generation == self._detail_scroll_gen:
+            self._detail_scroll_settle = False
+
+    def _apply_detail_scroll(self) -> None:
+        bar = self._details.verticalScrollBar()
+        if self._detail_follow_tail:
+            target = bar.maximum()
+        elif self._detail_pending_anchor is not None:
+            target = min(self._detail_pending_anchor, bar.maximum())
+        else:
+            return
+        if bar.value() == target:
+            return
+        self._detail_scroll_lock = True
+        bar.setValue(target)
+        self._detail_scroll_lock = False
+
+    def _on_detail_scrollbar_range_changed(self, _minimum: int, _maximum: int) -> None:
+        if self._detail_scroll_lock:
+            return
+        # Layout after setHtml grows the range on a later pass. Re-apply once
+        # the document height is known, including the first time the page is shown.
+        self._apply_detail_scroll()
+
+    def _on_detail_scrollbar_value_changed(self, value: int) -> None:
+        if self._detail_scroll_lock or self._detail_scroll_settle:
+            return
+        bar = self._details.verticalScrollBar()
+        maximum = bar.maximum()
+        # setHtml briefly collapses the range to 0 before layout. That is not
+        # the reader moving; leave the follow/anchor decision alone.
+        if maximum <= 0:
+            return
+        self._detail_pending_anchor = None
+        self._detail_follow_tail = value >= maximum - self._DETAIL_TAIL_SLACK
 
     def _render_segments_html(self, segments: list[SegmentRecord], show_polished: bool) -> str:
         from voiceink.ui import design_tokens as tok
@@ -1166,13 +1276,13 @@ class HistoryWindow(QWidget):
             self._detail_stats.clear()
             self._view_bar.hide()
             self._detail_title.setText(f"已选 {count} 项")
-            self._details.setHtml(self._render_multi_selection_html(self._selected_sessions()))
+            self._set_detail_document(html=self._render_multi_selection_html(self._selected_sessions()))
         elif self.session_count():
             self._set_detail_chips([])
             self._detail_stats.clear()
             self._view_bar.hide()
             self._detail_title.setText("会话详情")
-            self._details.setPlainText("选择一条转写查看分段内容")
+            self._set_detail_document(plain="选择一条转写查看分段内容")
         else:
             self._detail_stats.clear()
 

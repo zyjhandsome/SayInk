@@ -122,6 +122,93 @@ def test_expand_session_renders_effective_segments(qapp):
     assert "polished first" not in detail
 
 
+def _long_turn(seq: int, text: str) -> SegmentRecord:
+    return SegmentRecord(
+        "long",
+        seq,
+        1_700_000_500_000 + seq * 1000,
+        text,
+        "",
+        "mic",
+        800,
+        "Cursor.exe",
+        "continuous",
+        "funasr-nano",
+    )
+
+
+def _settle_detail(qapp, window: HistoryWindow) -> None:
+    window.resize(980, 640)
+    window.show()
+    for _ in range(6):
+        qapp.processEvents()
+
+
+def test_detail_follows_latest_turn_and_keeps_place_when_scrolled_up(qapp):
+    paragraph = "这一轮转写内容比较长，用来把详情撑出滚动条。" * 4
+    segments = [_long_turn(seq, f"{seq} {paragraph}") for seq in range(12)]
+    store = FakeHistoryStore()
+    store.sessions.insert(
+        0,
+        SessionSummary(
+            session_id="long",
+            created_at=1_700_000_500_000,
+            segment_count=len(segments),
+            source="mic",
+            target_app="Cursor.exe",
+            preview=paragraph,
+        ),
+    )
+    store.segments["long"] = segments
+    window = HistoryWindow(store)
+    try:
+        _settle_detail(qapp, window)
+        bar = window._details.verticalScrollBar()
+        assert bar.maximum() > 0
+        assert bar.value() == bar.maximum()
+        assert window._detail_follow_tail
+        assert "11 " in window._details.toPlainText()
+
+        bar.setValue(0)
+        qapp.processEvents()
+        assert not window._detail_follow_tail
+
+        segments.append(_long_turn(12, "最新一轮在最下方"))
+        store.sessions[0] = SessionSummary(
+            session_id="long",
+            created_at=1_700_000_500_000,
+            segment_count=len(segments),
+            source="mic",
+            target_app="Cursor.exe",
+            preview=paragraph,
+        )
+        window.refresh()
+        _settle_detail(qapp, window)
+        assert "最新一轮在最下方" in window._details.toPlainText()
+        assert bar.value() <= window._DETAIL_TAIL_SLACK
+        assert bar.value() < bar.maximum()
+
+        bar.setValue(bar.maximum())
+        qapp.processEvents()
+        assert window._detail_follow_tail
+        segments.append(_long_turn(13, "再来一轮仍然贴底"))
+        store.sessions[0] = SessionSummary(
+            session_id="long",
+            created_at=1_700_000_500_000,
+            segment_count=len(segments),
+            source="mic",
+            target_app="Cursor.exe",
+            preview=paragraph,
+        )
+        window.refresh()
+        _settle_detail(qapp, window)
+        assert "再来一轮仍然贴底" in window._details.toPlainText()
+        assert bar.maximum() > 0
+        assert bar.value() == bar.maximum()
+    finally:
+        window.close()
+
+
 def test_legacy_file_import_history_labels_are_preserved(qapp):
     """Withdrawn file-transcription capability still shows legacy history metadata."""
     store = FakeHistoryStore()

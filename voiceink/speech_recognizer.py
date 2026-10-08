@@ -26,10 +26,11 @@ _ASR_TAG_PATTERNS = (
 # FireRedASR2 / sherpa meta tokens in tokens.txt: <sil>, <zh>, <en>, dialect tags, …
 _ASR_META_TOKEN_PATTERN = re.compile(r"<\s*/?\s*[^>]+>")
 _SENTENCE_PATTERN = re.compile(r"[^。！？!?]+[。！？!?]?")
-# A 2–8 character unit repeated this many times is a decoder loop, not speech.
+# A short token or clause repeated this many times is a decoder loop, not speech.
+# The upper bound covers a clause like "然后你这个月又有点长了，" (12 chars).
 _LOOP_MIN_REPEATS = 8
 _LOOP_MIN_UNIT = 2
-_LOOP_MAX_UNIT = 8
+_LOOP_MAX_UNIT = 24
 
 
 def _script_counts(text: str) -> tuple[int, int, int]:

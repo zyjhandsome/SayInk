@@ -94,6 +94,20 @@ class TestNormalizeAsrOutput:
         text = "我们出发吧" + "神の" * 20
         assert normalize_asr_output(text) == "我们出发吧"
 
+    def test_drops_repeated_clause_longer_than_a_token(self):
+        clause = "然后你这个月又有点长了，"
+        text = (
+            "就是你这个月没有完成那个100多的这个任务，"
+            "然后你这个月的这个任务有点长了，"
+            "然后你这个月又迟了，"
+            + clause * 12
+        )
+        assert normalize_asr_output(text) == (
+            "就是你这个月没有完成那个100多的这个任务，"
+            "然后你这个月的这个任务有点长了，"
+            "然后你这个月又迟了，"
+        )
+
     def test_drops_unrelated_japanese_sentence_and_keeps_chinese(self):
         text = (
             "我觉得你有点矛盾。"
