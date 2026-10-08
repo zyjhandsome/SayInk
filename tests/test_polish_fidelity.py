@@ -20,10 +20,15 @@ MEANING_CHANGED = [
     ("会议定在3点半", "会议定在4点半。", "数字被改动"),
     ("版本号是2.0.8", "版本号是2.0.9。", "数字被改动"),
     ("预算大概1,200块", "预算大概12000块。", "数字被改动"),
+    ("金额是100元。", "金额已经确认。", "数字被改动"),
+    ("预算100元，备用金200元。", "预算100元。", "数字被改动"),
+    ("今天新增0个错误。", "今天新增100个错误。", "数字被改动"),
+    ("今天新增0个错误。", "今天新增错误。", "数字被改动"),
+    ("预算100元。", "预算100元，备用金200元。", "数字被改动"),
     # proper nouns replaced or translated away
     ("把代码推到GitHub上", "把代码推到代码仓库上。", "英文专名丢失"),
     ("这个API返回了错误", "这个接口返回了错误。", "英文专名丢失"),
-    ("用iPhone15录的音", "用苹果手机录的音。", "英文专名丢失"),
+    ("用iPhone15录的音", "用苹果手机录的音。", "数字被改动"),
     # answering instead of editing
     ("今天开会", "好的！以下是关于开会的建议：" + "内容" * 60, "长度异常"),
 ]
@@ -37,6 +42,8 @@ LIGHT_EDITS = [
     ("明天三点开会", "明天3点开会。"),
     ("一共是1000元", "一共是1,000元。"),
     ("3点到5点开会", "3:00到5:00开会。"),
+    ("新增0个错误", "新增0个错误。"),
+    ("价格是100.00元", "价格是100元。"),
     ("１００个用户", "100个用户。"),
     ("我用python写了个脚本", "我用 Python 写了个脚本。"),
     ("把代码推到github上", "把代码推到 GitHub 上。"),
@@ -59,7 +66,11 @@ def test_light_edits_keep_polished_text(raw, polished):
     assert polish_looks_plausible(raw, polished) is True
 
 
-def test_app_outputs_raw_when_polish_flips_negation():
+@pytest.mark.parametrize("raw, polished", [
+    ("请不要删除文件", "请删除文件。"),
+    ("预算100元，备用金200元", "预算100元。"),
+])
+def test_app_outputs_raw_when_polish_changes_meaning(raw, polished):
     from tests.helpers.app_harness import app_harness
 
     overrides = {
@@ -70,6 +81,6 @@ def test_app_outputs_raw_when_polish_flips_negation():
     }
     with app_harness(overrides) as h:
         app = h["app"]
-        app._deliver_recognized_text("请不要删除文件")
-        app._on_polish_complete("请删除文件。")
-        assert h["paster"].paste_async.call_args[0][0] == "请不要删除文件"
+        app._deliver_recognized_text(raw)
+        app._on_polish_complete(polished)
+        assert h["paster"].paste_async.call_args[0][0] == raw

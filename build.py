@@ -110,6 +110,10 @@ def _prepare_dist_output_dir() -> tuple[Path, str]:
 
 def build():
     """Package VoiceInk with PyInstaller."""
+    from voiceink_build.dependency_check import require_release_dependencies
+
+    # Validate before killing a running app or clearing its previous build.
+    require_release_dependencies()
     print("=" * 55)
     print("  VoiceInk Build Script")
     print("=" * 55)

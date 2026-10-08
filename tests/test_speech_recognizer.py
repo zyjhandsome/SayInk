@@ -72,6 +72,46 @@ class TestNormalizeAsrOutput:
         assert "<sil>" not in result
         assert result == "给他购买还出现了个什么标识呢个没有点伟大"
 
+    @pytest.mark.parametrize("marker", ["/sil", "/SIL", "/sil>", "/sil >"])
+    def test_removes_sil_fragment_from_screenshot(self, marker):
+        spoken = "时间很紧。这次的效果会不会好一点？"
+        assert normalize_asr_output(marker + spoken) == spoken
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("/sil 你好 /sil", "你好"),
+            ("你好/sil，世界/sil", "你好，世界"),
+            ("<zh>/sil你好</sil>/sil>", "你好"),
+            ("/sil /SIL> <sil>", ""),
+        ],
+    )
+    def test_removes_sil_fragments_with_other_meta_tokens(self, text, expected):
+        assert normalize_asr_output(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "使用 /silver 命令",
+            "/silicon 是一个单词",
+            "/sil2 和 /sil_name",
+            "/sil.txt",
+            "/sil-backup",
+            "/sil/recording.wav",
+            "C:/sil",
+            r"C:\sil",
+            "https://example.com/sil",
+            "https://sil.example.com",
+            "https://sil",
+            "目录 ./sil",
+            "路径 foo/sil",
+            "and/or 和 1/2",
+            "sil 是 silence 的缩写",
+        ],
+    )
+    def test_keeps_words_paths_and_urls_with_sil(self, text):
+        assert normalize_asr_output(text) == text
+
     def test_removes_fireredasr_lang_tags(self):
         text = "<zh>你好<en>hello"
         result = normalize_asr_output(text)
@@ -454,6 +494,28 @@ class TestTranscribeWorkerRun:
         worker = TranscribeWorker(rec, np.ones(16000, dtype=np.float32))
         results, errors = self._run(worker)
         assert results == ["你好"]
+        assert errors == []
+
+    @pytest.mark.parametrize(
+        ("raw_text", "expected"),
+        [
+            ("/sil时间很紧。这次的效果会不会好一点？", "时间很紧。这次的效果会不会好一点？"),
+            ("/sil <sil> /SIL>", ""),
+        ],
+    )
+    def test_run_cleans_sil_fragments_before_partial_and_final_signals(
+        self, raw_text, expected
+    ):
+        from voiceink.speech_recognizer import TranscribeWorker
+
+        worker = TranscribeWorker(
+            _FakeRecognizer(raw_text), np.ones(16000, dtype=np.float32)
+        )
+        partials = []
+        worker.partial_ready.connect(partials.append)
+        results, errors = self._run(worker)
+        assert partials == ([expected] if expected else [])
+        assert results == [expected]
         assert errors == []
 
     def test_run_empty_audio_emits_error(self):

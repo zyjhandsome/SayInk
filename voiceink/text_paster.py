@@ -211,10 +211,10 @@ def _paste_shortcut():
                 'tell application "System Events" to keystroke "v" using command down',
             ],
             timeout=2,
-            check=False,
+            check=True,
         )
     else:
-        subprocess.run(["xdotool", "key", "ctrl+v"], timeout=2, check=False)
+        subprocess.run(["xdotool", "key", "ctrl+v"], timeout=2, check=True)
 
 
 def _paste_shortcut_win32():

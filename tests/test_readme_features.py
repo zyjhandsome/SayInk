@@ -21,6 +21,41 @@ from voiceink.app import App, MIN_AUDIO_SAMPLES
 from voiceink.hotkey_manager import HotKeyManager
 
 
+class TestReadmeExitProtection:
+    """Returning from exit allows the current session to finish normally."""
+
+    def test_return_then_stop_and_finish_before_exit(self):
+        with app_harness({"audio.trigger_mode": "continuous", "llm.enabled": False}) as h:
+            app = h["app"]
+            app._current_session_id = "exit-session"
+            h["recorder"].is_recording = True
+            h["recorder"].is_continuous = True
+            audio = np.ones(MIN_AUDIO_SAMPLES * 2, dtype=np.float32)
+            app._on_segment_ready(audio)
+            app._on_segment_ready(audio)
+            with patch("voiceink.app.QMessageBox") as boxes, patch("voiceink.app.QApplication.quit") as quit_app:
+                dialog = boxes.return_value
+                dialog.addButton.side_effect = ["return", "discard"]
+                dialog.clickedButton.return_value = "return"
+                app._quit()
+                quit_app.assert_not_called()
+
+            app._stop_continuous_user_session()
+            h["recorder"].is_continuous = False
+            h["recorder"].is_recording = False
+            for text in ("第一句", "第二句"):
+                app._on_final_result(text)
+                h["paster"].paste_async.call_args.args[1]("sent")
+                app._pump_segment_queue()
+            records = [call.args[0] for call in h["history"].enqueue.call_args_list]
+            assert [record.raw_text for record in records] == ["第一句", "第二句"]
+            assert {record.session_id for record in records} == {"exit-session"}
+            with patch("voiceink.app.QMessageBox") as boxes, patch("voiceink.app.QApplication.quit") as quit_app:
+                app._quit()
+                boxes.assert_not_called()
+                quit_app.assert_called_once()
+
+
 class TestReadmeHoldHotkeyFlow:
     """README: 按住 Ctrl+Space 开始录音，松开停止。"""
 

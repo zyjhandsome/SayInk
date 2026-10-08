@@ -25,6 +25,13 @@ _ASR_TAG_PATTERNS = (
 )
 # FireRedASR2 / sherpa meta tokens in tokens.txt: <sil>, <zh>, <en>, dialect tags, …
 _ASR_META_TOKEN_PATTERN = re.compile(r"<\s*/?\s*[^>]+>")
+# Some decoded silence markers lose their angle brackets ("/sil", "/sil>").
+# ASCII word/path boundaries keep /silver, /sil.txt and URLs intact; Chinese
+# speech can follow the marker directly without a space.
+_ASR_SIL_FRAGMENT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_./\\:-])/sil(?![A-Za-z0-9_./\\:-])(?:[ \t]*>)?",
+    re.IGNORECASE,
+)
 _SENTENCE_PATTERN = re.compile(r"[^。！？!?]+[。！？!?]?")
 # A short token or clause repeated this many times is a decoder loop, not speech.
 # The upper bound covers a clause like "然后你这个月又有点长了，" (12 chars).
@@ -118,9 +125,10 @@ def normalize_asr_output(text: str) -> str:
         if pattern.search(cleaned):
             stripped_tags = True
         cleaned = pattern.sub("", cleaned)
-    if _ASR_META_TOKEN_PATTERN.search(cleaned):
-        stripped_tags = True
-        cleaned = _ASR_META_TOKEN_PATTERN.sub("", cleaned)
+    for pattern in (_ASR_META_TOKEN_PATTERN, _ASR_SIL_FRAGMENT_PATTERN):
+        if pattern.search(cleaned):
+            stripped_tags = True
+            cleaned = pattern.sub("", cleaned)
     cleaned = _drop_unrelated_foreign_sentences(_excise_repetition_loops(cleaned))
     cleaned = cleaned.strip()
     if stripped_tags:

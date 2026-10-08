@@ -116,6 +116,51 @@ _URL = "https://github.com/zyjhandsome/VoiceInk/releases/download/v2.0.9/VoiceIn
 
 
 class TestInstallerVerification:
+    def test_verified_existing_installer_is_reused_without_network(self, tmp_path):
+        import hashlib
+        from unittest.mock import Mock
+
+        body = b"verified installer"
+        dest = tmp_path / "VoiceInk-Setup-2.0.9.exe"
+        dest.write_bytes(body)
+        opened = Mock(side_effect=AssertionError("must reuse the verified file"))
+        progress = []
+        download_installer(
+            _URL, dest, opened, expected_size=len(body),
+            sha256=hashlib.sha256(body).hexdigest(), reuse_existing=True,
+            on_progress=lambda got, total: progress.append((got, total)),
+        )
+        opened.assert_not_called()
+        assert dest.read_bytes() == body
+        assert progress == [(len(body), len(body))]
+
+    def test_modified_existing_installer_is_rechecked_and_replaced(self, tmp_path):
+        import hashlib
+        from unittest.mock import Mock
+
+        body = b"verified installer"
+        dest = tmp_path / "VoiceInk-Setup-2.0.9.exe"
+        dest.write_bytes(b"x" * len(body))
+        opened = Mock(side_effect=_response(body))
+        download_installer(
+            _URL, dest, opened, expected_size=len(body),
+            sha256=hashlib.sha256(body).hexdigest(), reuse_existing=True,
+        )
+        opened.assert_called_once()
+        assert dest.read_bytes() == body
+
+    def test_existing_installer_never_bypasses_required_digest(self, tmp_path):
+        import pytest
+        from unittest.mock import Mock
+        from voiceink.updater import MissingDigestError
+
+        dest = tmp_path / "VoiceInk-Setup-2.0.9.exe"
+        dest.write_bytes(b"unverified installer")
+        opened = Mock()
+        with pytest.raises(MissingDigestError):
+            download_installer(_URL, dest, opened, reuse_existing=True)
+        opened.assert_not_called()
+
     def test_release_carries_size_and_sha256_digest(self):
         payload = _payload("2.0.9", "VoiceInk-Setup-2.0.9.exe", _URL)
         payload["assets"][0]["size"] = 1234

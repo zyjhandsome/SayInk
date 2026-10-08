@@ -57,8 +57,9 @@
 
 - **自动粘贴**到光标处；无法确认成功时降级为「已复制到剪贴板」（不误报「已输入」）。目标窗口以管理员权限运行时（系统会拦截模拟按键），直接提示「已复制」，不发送粘贴键
 - 发送粘贴键前会再次确认前台仍是开始输出时的窗口；等待期间切到了别的窗口，就不发送粘贴键，只把文字留在剪贴板供手动粘贴，避免误输入到新窗口
+- 「已发送」表示已发送粘贴快捷键，无法证明目标控件已插入文字；请核对目标应用。macOS / Linux 的粘贴命令返回失败时会降级为「已复制」
 - 「粘贴后恢复剪贴板」在粘贴约 0.5 秒后才恢复，且只恢复文本；原剪贴板是图片等非文本内容时保留转写文字，不会清空
-- 可选 **OpenAI 兼容 API** 润色（DeepSeek、通义、Ollama 等）；失败，或返回内容明显比原话长很多（像在回答而不是润色）、改动了原话里的阿拉伯数字、去掉了全部否定词（不 / 没 / 别 / not 等）、丢掉了英文专名（如 GitHub、API）时，**输出 ASR 原文**。这是保守的规则检查，拦不住所有改义（例如中文人名被改写），重要内容请核对
+- 可选 **OpenAI 兼容 API** 润色（DeepSeek、通义、Ollama 等）；失败，或返回内容明显比原话长很多（像在回答而不是润色）、删改了原话里的阿拉伯数字（含零）、去掉了全部否定词（不 / 没 / 别 / not 等）、丢掉了英文专名（如 GitHub、API）时，**输出 ASR 原文**。数字检查允许时间补 `:00`、千位分隔符和小数末尾零等格式变化。这是保守的规则检查，拦不住所有改义（例如中文人名被改写），重要内容请核对
 - 按住说话模式下，上一句还在润色时可以开始录下一句；上一句润色失败时仍回退它自己的原文，不会被下一句影响
 - Windows 上 API Key 保存在**系统凭据管理器**（「VoiceInk/llm.api_key」），不写入 `config.json`；旧版本配置里的 Key 会在启动时自动迁移。凭据管理器写入失败时，Key 只在本次运行中有效、同样不写入 `config.json`，润色页会提示重启后需重新填写
 - **主窗口**（侧栏：历史 / 通用 / 引擎 / 润色 / 关于）收纳设置与历史；听写只留一条薄 **听写条**。托盘与听写条共用 模型载入中 / 正在听 / 正在识别 / 润色中 / 已复制。托盘 → **打开 VoiceInk**（单击或双击托盘图标均可打开主窗口）；配置保存在 `~/.voiceink/config.json`
@@ -78,6 +79,7 @@
 ### 工作台操作
 
 - 主窗口侧栏显示当前运行状态、音源与触发方式；设置页提供即时保存提示。
+- 从托盘退出或安装更新时，若仍在录音、识别、润色或有片段排队，会先询问。默认「返回继续处理」，Esc / 关闭确认框也会返回；可结束监听并等剩余内容处理完成后再退出。「放弃并退出」会丢弃尚未完成的内容。空闲退出不弹确认。取消更新安装后，已下载的包会保留，再次安装会重新校验 SHA-256，校验通过即可复用。
 - **Ctrl+1…5** 切换五个页面，**Ctrl+F** 搜索历史，**Ctrl+W** 收到托盘；录制新快捷键时暂停这些导航快捷键。
 - 双击标题栏最大化 / 还原，拖动任意窗口边缘或右下角调整窗口；历史页中间分隔条可调整阅读宽度。
 - 历史按天分组，支持 **Ctrl / Shift 多选**、**Delete** 删除、**Ctrl+C** 复制；删除后 8 秒内可在底部提示条撤销，无需二次确认。有润色结果的会话可在「润色 / 原文」间切换查看，**Ctrl+C 复制当前正在看的版本**（按钮提示里带「Ctrl+C」的那个）；超过 50 场可继续加载更早会话。搜索与选中会话在刷新后保留。多选后「复制」和 Ctrl+C 会按时间把各场的最终文本（有润色用润色版）拼成一份。「清空全部历史」是左侧摘要行上的文字按钮，确认框使用应用内样式。
@@ -194,6 +196,7 @@ py -3.10 run.py
 ```bash
 pip install -r requirements.txt
 python voiceink_build/download_bundle_model_for_build.py   # 首次：下载模型到 ./models/
+python -m voiceink_build.dependency_check                 # 打包前检查依赖版本
 python build_release.py    # → dist/VoiceInk-Setup-<版本>.exe
 # 或仅便携版：
 python build.py            # → dist/VoiceInk/VoiceInk.exe（须整目录分发）
@@ -213,13 +216,17 @@ python build.py            # → dist/VoiceInk/VoiceInk.exe（须整目录分发
 py -3.10 -m pytest tests/test_readme_features.py tests/test_theme_resolve.py tests/test_ui_styles.py -q
 ```
 
-**全量测试与验证环境：** `pip install -r requirements-dev.txt` 后，设置 `QT_QPA_PLATFORM=offscreen` 运行 `py -3.10 -m pytest -q`。记录结论时写明 Python、PyQt6、sherpa-onnx 版本：sherpa-onnx 低于 `requirements.txt` 下限（1.13.8）的环境只能证明测试里的应用逻辑，不能代表发布依赖。仓库目前没有依赖锁文件和 CI，发版前应在干净虚拟环境中按 `requirements.txt` 安装、跑全量测试，并冒烟安装包。
+**全量测试与验证环境：** Windows x64 / Python 3.10 使用已验证的固定依赖约束：`python -m pip install -r requirements-dev.txt -c constraints-windows-py310.txt`。其他平台使用 `requirements-dev.txt`。设置 `QT_QPA_PLATFORM=offscreen`，运行 `python -m pytest -p no:cacheprovider tests -q`。
+
+GitHub Actions 的 `.github/workflows/tests.yml` 会在 push / PR 时执行 Windows 回归、`pip check` 与发布依赖检查。`python -m voiceink_build.dependency_check` 核对当前环境与 `requirements.txt`；`build.py` 也会先检查依赖，再清理旧构建目录，低于要求的引擎不能继续打包。固定约束覆盖 Python 包版本，不包含模型权重、Windows 系统组件或安装包签名。
+
+记录结论时写明 Python、PyQt6、sherpa-onnx 版本：sherpa-onnx 低于下限（1.13.8）的环境只能证明测试里的应用逻辑，不能代表发布依赖。发版前仍应在干净环境中跑全量测试，并冒烟安装包。当前可靠性优化与验证记录见 [`docs/reliability-first-pass.md`](docs/reliability-first-pass.md)。
 
 **必守行为（摘要）：**
 
 | 级别 | 要点 |
 |------|------|
-| **P0** | 粘贴不假成功（含管理员窗口）；等待期间焦点切走不发送粘贴键；持续模式收尾句不丢；开启润色时持续模式逐段输出、不丢段不串段，排队片段不串场；润色失败回退本句原文；API Key 任何情况下不以明文写入 `config.json`；自动更新必须有 SHA-256；加载中不被其它错误盖住；发行版日志写入 `~/.voiceink/logs` |
+| **P0** | 粘贴不假成功（含管理员窗口）；等待期间焦点切走不发送粘贴键；持续模式收尾句不丢；开启润色时持续模式逐段输出、不丢段不串段，排队片段不串场；润色失败或数字被删改时回退本句原文；未完成转写退出须明确确认放弃，安装更新不能先启动安装包再确认；API Key 任何情况下不以明文写入 `config.json`；自动更新必须有 SHA-256；加载中不被其它错误盖住；发行版日志写入 `~/.voiceink/logs` |
 | **P1** | 默认 Alt+Z；下载≠载入有反馈；润色失败降级原文；加载失败听写条变红 |
 | **P2** | Esc 结束持续监听；30s 无语音提示；混合采集系统声失败有警告；保存设置时队列确认 |
 | **UI** | 默认 `appearance.theme_mode=dark`；切换浅/暗/系统后主窗口、听写条、托盘一致换肤且无需重启；设置控件对齐在 light/dark 下仍成立 |

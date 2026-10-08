@@ -82,8 +82,7 @@ def _numbers(text: str) -> set[str]:
     for match in _NUMBER_RE.findall(_THOUSANDS_SEP_RE.sub("", text)):
         whole, _, frac = match.partition(".")
         value = (whole.lstrip("0") or "0") + (f".{frac.rstrip('0')}" if frac.rstrip("0") else "")
-        if value != "0":
-            values.add(value)
+        values.add(value)
     return values
 
 
@@ -118,7 +117,13 @@ def polish_rejection_reason(raw: str, polished: str) -> str:
     if len(polished) > len(raw) * 2 + 40:
         return "长度异常"
     raw_numbers = _numbers(raw)
-    if raw_numbers and _numbers(polished) - raw_numbers:
+    polished_numbers = _numbers(polished)
+    # Keep every original number, including zero. An added zero can be
+    # formatting (3点 → 3:00); other introduced numbers change the content.
+    if raw_numbers and (
+        raw_numbers - polished_numbers
+        or (polished_numbers - raw_numbers) - {"0"}
+    ):
         return "数字被改动"
     if _has_negation(raw) and not _has_negation(polished):
         return "否定词丢失"
@@ -217,6 +222,8 @@ class App(QObject):
         self._loading_model_id = ""
         self._short_tap_tray_last_at = 0.0
         self._hotkey_conflict_warned = False
+        self._exit_dialog_open = False
+        self._exit_started = False
 
         log.info("正在初始化各模块...")
         set_models_dir(self._config.models_dir)
@@ -1553,6 +1560,46 @@ class App(QObject):
     # ── Lifecycle ─────────────────────────────────────
 
     def _quit(self):
+        if self._exit_started or not self._confirm_exit():
+            return
+        self._finish_quit()
+
+    def _confirm_exit(self, *, install_update: bool = False) -> bool:
+        """Never silently discard captured or in-flight speech on exit."""
+        if self._exit_dialog_open:
+            return False
+        pending = (
+            self._recorder.is_recording
+            or self._recorder.is_continuous
+            or self._pipeline_busy()
+            or self._segment_queue
+        )
+        if not pending:
+            return True
+        self._exit_dialog_open = True
+        try:
+            box = QMessageBox(self._main)
+            box.setWindowTitle("安装更新" if install_update else "退出 VoiceInk")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText("仍在录音或有转写尚未完成")
+            box.setInformativeText(
+                "立即退出会丢弃尚未识别、润色或输出的内容。\n"
+                "可以返回应用，结束监听并等待处理完成后再退出。"
+            )
+            back = box.addButton("返回继续处理", QMessageBox.ButtonRole.RejectRole)
+            discard = box.addButton("放弃并退出", QMessageBox.ButtonRole.DestructiveRole)
+            box.setDefaultButton(back)
+            box.setEscapeButton(back)
+            box.exec()
+            return box.clickedButton() == discard
+        finally:
+            self._exit_dialog_open = False
+
+    def _finish_quit(self):
+        """Release resources after the user has accepted any pending loss."""
+        if self._exit_started:
+            return
+        self._exit_started = True
         log.info("VoiceInk 正在退出...")
         self._stop_continuous_listening()
         self._hotkey_mgr.stop()
@@ -1728,6 +1775,16 @@ class App(QObject):
     def _on_update_downloaded(self, path: str) -> None:
         from voiceink.updater import launch_installer
 
+        if self._exit_started:
+            return
+        if not self._confirm_exit(install_update=True):
+            self._update_check_state = "available"
+            settings = self._settings_widget()
+            if settings is not None:
+                settings.set_update_status(
+                    "下载完成。请结束监听并等待处理完成，再安装更新。", action="install"
+                )
+            return
         try:
             launch_installer(path)
         except Exception as exc:
@@ -1737,7 +1794,7 @@ class App(QObject):
             if settings is not None:
                 settings.set_update_status("下载完成，但无法启动安装包", action="install")
             return
-        self._quit()
+        self._finish_quit()
 
     def _show_first_run_welcome_once(self):
         # Both model-ready and the 15 s fallback land here; the seen flag is

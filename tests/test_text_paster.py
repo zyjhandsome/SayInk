@@ -5,6 +5,8 @@ import pytest
 import voiceink.text_paster as tp
 from voiceink.text_paster import TextPaster, get_foreground_window_info
 
+_REAL_PASTE_SHORTCUT = tp._paste_shortcut
+
 
 class TestTextPasterInit:
     def test_init(self):
@@ -63,10 +65,12 @@ class TestTextPasterPaste:
         result = paster.paste("")
         assert result.startswith("error:")
 
-    def test_paste_returns_status(self):
+    def test_paste_returns_status(self, paste_env):
+        paste_env["set_foreground"]([(1234, "Editor", 4242)])
         paster = TextPaster()
         result = paster.paste("测试文本")
-        assert result in ["pasted", "clipboard", "error:"]
+        assert result == "pasted"
+        assert paste_env["clipboard"] == "测试文本"
 
     def test_paste_async_empty_text(self):
         paster = TextPaster()
@@ -86,6 +90,25 @@ class TestPasteShortcut:
         assert hasattr(text_paster, "get_foreground_window_info")
         assert hasattr(text_paster, "_paste_shortcut")
         assert not hasattr(text_paster, "pyautogui")
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    def test_failed_system_command_falls_back_to_clipboard(self, platform, paste_env, monkeypatch):
+        import subprocess
+        from unittest.mock import Mock
+
+        def run(command, **kwargs):
+            if kwargs.get("check"):
+                raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 1)
+
+        monkeypatch.setattr(tp.sys, "platform", platform)
+        monkeypatch.setattr(tp.subprocess, "run", Mock(side_effect=run))
+        monkeypatch.setattr(tp, "_paste_shortcut", _REAL_PASTE_SHORTCUT)
+        paste_env["set_foreground"]([(1234, "Editor", 4242)])
+        results = []
+        TextPaster().paste_async("keep this text", results.append)
+        assert [result.status for result in results] == ["clipboard"]
+        assert paste_env["clipboard"] == "keep this text"
 
 
 class TestCrossPlatformSupport:

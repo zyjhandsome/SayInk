@@ -168,10 +168,12 @@ def download_installer(
     *,
     expected_size: int = 0,
     sha256: str = "",
+    reuse_existing: bool = False,
 ) -> None:
     """Download to ``<dest>.part`` and only rename after size/hash checks pass.
 
     A published SHA-256 is mandatory: without it nothing is downloaded.
+    Reusing an installer always rechecks its complete contents first.
     """
     import hashlib
     import os
@@ -180,6 +182,20 @@ def download_installer(
         raise ValueError("安装包地址不受信任")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256 or ""):
         raise MissingDigestError("发布未提供有效的 SHA-256 校验值")
+    if reuse_existing and dest.is_file():
+        try:
+            size = dest.stat().st_size
+            if not expected_size or size == expected_size:
+                cached_hash = hashlib.sha256()
+                with dest.open("rb") as cached:
+                    for chunk in iter(lambda: cached.read(256 * 1024), b""):
+                        cached_hash.update(chunk)
+                if cached_hash.hexdigest() == sha256.lower():
+                    if on_progress is not None:
+                        on_progress(size, size)
+                    return
+        except OSError:
+            log.info("已下载的安装包无法读取，重新下载")
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
     hasher = hashlib.sha256()
@@ -260,6 +276,7 @@ class UpdateDownloadWorker(QThread):
                 on_progress=lambda got, total: self.progress.emit(got, total),
                 expected_size=self._expected_size,
                 sha256=self._sha256,
+                reuse_existing=True,
             )
             self.finished_path.emit(str(self._dest))
         except MissingDigestError as exc:
