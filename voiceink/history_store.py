@@ -111,30 +111,57 @@ def _rows_to_summaries(rows: list[tuple]) -> list[SessionSummary]:
     ]
 
 
+DISABLED_NOTICE = "历史记录数据库无法打开，本次运行不会保存转写历史。"
+RECOVERED_NOTICE = "历史记录数据库已损坏，原文件已备份为 {name}，已重新建库（之前的记录不会显示）。"
+WRITE_FAILED_NOTICE = "历史记录保存失败，最近的转写可能未写入本机历史。"
+DELETE_FAILED_NOTICE = "历史记录删除或清理失败，相关记录可能仍保留在本机。"
+
+
+def _is_corruption_error(exc: BaseException) -> bool:
+    """SQLITE_CORRUPT / SQLITE_NOTADB surface as a bare ``sqlite3.DatabaseError``.
+
+    Locked, read-only or unopenable files raise ``OperationalError`` instead and
+    must not be quarantined: the file itself is fine.
+    """
+    if type(exc) is sqlite3.DatabaseError:
+        return True
+    msg = str(exc).lower()
+    return "not a database" in msg or "malformed" in msg
+
+
 class HistoryStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.disabled = False
+        # Non-empty when init hit a problem the user should hear about once.
+        self.startup_notice = ""
         self._queue: queue.Queue[Any] = queue.Queue()
         self._stop = object()
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._init_error: BaseException | None = None
         self._committed_callbacks: list[Callable[[], None]] = []
+        self._failed_callbacks: list[Callable[[str], None]] = []
 
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            # Bootstrap schema on a short-lived connection, then hand exclusive
-            # write ownership to the daemon writer thread.
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("PRAGMA journal_mode=WAL;")
-                conn.executescript(_DDL)
-                _ensure_speaker_columns(conn)
-                conn.execute("PRAGMA user_version=1;")
-                conn.commit()
+            try:
+                self._bootstrap_schema()
+            except sqlite3.DatabaseError as exc:
+                if not (_is_corruption_error(exc) and self.db_path.is_file()):
+                    raise
+                backup = self._quarantine_corrupt_db()
+                if backup is None:
+                    raise
+                logger.warning(
+                    "HistoryStore database corrupt (%s); moved to %s and recreated",
+                    exc, backup.name,
+                )
+                self._bootstrap_schema()
+                self.startup_notice = RECOVERED_NOTICE.format(name=backup.name)
         except Exception:
             logger.exception("HistoryStore init failed; disabling history")
-            self.disabled = True
+            self._disable()
             return
 
         self._thread = threading.Thread(
@@ -143,17 +170,60 @@ class HistoryStore:
         self._thread.start()
         if not self._ready.wait(timeout=5.0):
             logger.error("HistoryStore writer thread failed to start")
-            self.disabled = True
+            self._disable()
             return
         if self._init_error is not None:
             logger.exception(
                 "HistoryStore writer connection failed; disabling history",
                 exc_info=self._init_error,
             )
-            self.disabled = True
+            self._disable()
+
+    def _bootstrap_schema(self) -> None:
+        # Bootstrap schema on a short-lived connection, then hand exclusive
+        # write ownership to the daemon writer thread. The connection must be
+        # closed explicitly (``with`` only commits) or Windows keeps the file
+        # locked and a corrupt database could not be renamed afterwards.
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.executescript(_DDL)
+            _ensure_speaker_columns(conn)
+            conn.execute("PRAGMA user_version=1;")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _quarantine_corrupt_db(self) -> Path | None:
+        """Rename ``history.db`` (plus WAL/SHM side files) like config does for
+        a corrupt ``config.json``, so the data is kept for manual recovery."""
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = self.db_path.with_name(f"{self.db_path.stem}.corrupt-{stamp}{self.db_path.suffix}")
+        try:
+            self.db_path.replace(backup)
+        except OSError:
+            logger.exception("HistoryStore could not back up corrupt database")
+            return None
+        for suffix in ("-wal", "-shm"):
+            side = self.db_path.with_name(self.db_path.name + suffix)
+            if side.exists():
+                try:
+                    side.replace(backup.with_name(backup.name + suffix))
+                except OSError:
+                    logger.warning("HistoryStore could not move %s", side.name)
+        return backup
+
+    def _disable(self) -> None:
+        self.disabled = True
+        self.startup_notice = DISABLED_NOTICE
 
     def add_committed_callback(self, callback: Callable[[], None]) -> None:
         self._committed_callbacks.append(callback)
+
+    def add_failed_callback(self, callback: Callable[[str], None]) -> None:
+        """Called from the writer thread with a user-facing message when a
+        queued write could not be committed."""
+        self._failed_callbacks.append(callback)
 
     def _notify_committed(self) -> None:
         for callback in list(self._committed_callbacks):
@@ -161,6 +231,13 @@ class HistoryStore:
                 callback()
             except Exception:
                 logger.exception("HistoryStore committed callback failed")
+
+    def _notify_failed(self, message: str) -> None:
+        for callback in list(self._failed_callbacks):
+            try:
+                callback(message)
+            except Exception:
+                logger.exception("HistoryStore failed callback failed")
 
     def enqueue(self, record: SegmentRecord) -> None:
         if self.disabled:
@@ -324,6 +401,7 @@ class HistoryStore:
                 logger.exception("HistoryStore writer connection close failed")
 
     def _dispatch(self, conn: sqlite3.Connection, item: Any) -> None:
+        op = ""
         try:
             op, payload = item
             if op == "insert":
@@ -344,6 +422,9 @@ class HistoryStore:
                 conn.rollback()
             except Exception:
                 logger.exception("HistoryStore rollback after writer failure failed")
+            self._notify_failed(
+                WRITE_FAILED_NOTICE if op == "insert" else DELETE_FAILED_NOTICE
+            )
 
     def _do_insert(self, conn: sqlite3.Connection, record: SegmentRecord) -> None:
         conn.execute(

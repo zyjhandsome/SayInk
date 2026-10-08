@@ -970,14 +970,17 @@ class HistoryWindow(QWidget):
             else:
                 self._set_detail_chips([])
                 self._view_bar.hide()
+                store_disabled = getattr(self._store, "disabled", False) is True
                 if self._search_query:
-                    empty = "没有匹配的转写。试试更短的关键词，或清除搜索。"
+                    title, empty = "没有搜索结果", "没有匹配的转写。试试更短的关键词，或清除搜索。"
+                elif store_disabled:
+                    title = "历史记录不可用"
+                    empty = "历史记录数据库无法打开，本次运行不会保存转写历史。\n请查看日志，或删除配置目录下的 history.db 后重启。"
                 elif not self._history_enabled:
+                    title = "历史记录未开启"
                     empty = "历史记录未开启。\n可在通用设置中开启，之后的转写文本会保存在本机。"
                 else:
-                    empty = "还没有会话。完成一次转写后会出现在这里。"
-                title = "没有搜索结果" if self._search_query else (
-                    "历史记录未开启" if not self._history_enabled else "还没有会话")
+                    title, empty = "还没有会话", "还没有会话。完成一次转写后会出现在这里。"
                 self._detail_title.setText(title)
                 self._set_detail_document(plain=empty)
         finally:

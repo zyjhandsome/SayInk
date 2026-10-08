@@ -1,5 +1,6 @@
 import ipaddress
 import logging
+import time
 from urllib.parse import urlparse
 
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
@@ -95,6 +96,12 @@ class PolishWorker(QThread):
     result_ready = pyqtSignal(str)
     error = pyqtSignal(str)
 
+    # One extra attempt for connection-level failures and gateway errors.
+    # Timeouts are deliberately not retried: the 15 s budget is already long for
+    # live dictation, and the caller falls back to the raw text anyway.
+    _RETRY_STATUS = frozenset({502, 503, 504})
+    _RETRY_DELAY_SEC = 0.5
+
     def __init__(
         self,
         api_url: str,
@@ -118,6 +125,39 @@ class PolishWorker(QThread):
     def cancel(self):
         """Set cancellation flag to stop the worker."""
         self._cancelled = True
+
+    def _post_with_retry(self, client, httpx, url: str, headers: dict, payload: dict):
+        """POST once; on a transient network/gateway failure wait briefly and POST again.
+
+        Returns ``None`` when the worker was cancelled in between.
+        """
+        transient = (httpx.NetworkError, httpx.RemoteProtocolError)
+        response = None
+        for attempt in (1, 2):
+            try:
+                response = client.post(url, headers=headers, json=payload)
+            except transient as exc:
+                if self._cancelled:
+                    return None
+                if attempt == 2:
+                    raise
+                log.warning(
+                    "LLM %s 连接异常，%.1f 秒后重试一次: %s",
+                    self._action_label, self._RETRY_DELAY_SEC, exc,
+                )
+            else:
+                if self._cancelled:
+                    return None
+                if attempt == 2 or response.status_code not in self._RETRY_STATUS:
+                    return response
+                log.warning(
+                    "LLM %s 返回 HTTP %s，%.1f 秒后重试一次",
+                    self._action_label, response.status_code, self._RETRY_DELAY_SEC,
+                )
+            time.sleep(self._RETRY_DELAY_SEC)
+            if self._cancelled:
+                return None
+        return response
 
     def run(self):
         if self._cancelled:
@@ -152,8 +192,8 @@ class PolishWorker(QThread):
             }
 
             with httpx.Client(timeout=15.0) as client:
-                response = client.post(url, headers=headers, json=payload)
-                if self._cancelled:
+                response = self._post_with_retry(client, httpx, url, headers, payload)
+                if response is None or self._cancelled:
                     return
                 response.raise_for_status()
                 data = response.json()

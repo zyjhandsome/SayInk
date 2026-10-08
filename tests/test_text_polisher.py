@@ -63,8 +63,20 @@ def _fake_httpx_module(response=None, raise_exc=None):
         def __init__(self, resp):
             self.response = resp
 
+    class _NetworkError(Exception):
+        pass
+
+    class _ConnectError(_NetworkError):
+        pass
+
+    class _RemoteProtocolError(Exception):
+        pass
+
     fake.TimeoutException = _Timeout
     fake.HTTPStatusError = _HTTPStatusError
+    fake.NetworkError = _NetworkError
+    fake.ConnectError = _ConnectError
+    fake.RemoteProtocolError = _RemoteProtocolError
 
     client = MagicMock()
     ctx = MagicMock()
@@ -364,6 +376,81 @@ class TestPolishWorkerRun:
         results, errors = self._run_worker(worker, fake)
         assert results == []
         assert errors and "润色失败" in errors[0]
+
+
+class TestPolishWorkerRetry:
+    """F-22: one retry for transient connection/gateway failures, none for timeouts."""
+
+    def _worker(self):
+        worker = PolishWorker("https://api.example.com/v1", "k", "m", "文本")
+        worker._RETRY_DELAY_SEC = 0
+        return worker
+
+    def _run_worker(self, worker, fake_httpx):
+        results, errors = [], []
+        worker.result_ready.connect(results.append)
+        worker.error.connect(errors.append)
+        with patch.dict(sys.modules, {"httpx": fake_httpx}):
+            worker.run()
+        return results, errors
+
+    def test_connect_error_is_retried_once_then_succeeds(self):
+        ok = _make_response({"choices": [{"message": {"content": "润色"}}]})
+        ok.status_code = 200
+        fake, client = _fake_httpx_module()
+        client.post.side_effect = [fake.ConnectError("reset"), ok]
+        results, errors = self._run_worker(self._worker(), fake)
+        assert results == ["润色"] and errors == []
+        assert client.post.call_count == 2
+
+    def test_connect_error_twice_gives_up(self):
+        fake, client = _fake_httpx_module()
+        client.post.side_effect = [fake.ConnectError("reset"), fake.ConnectError("reset")]
+        results, errors = self._run_worker(self._worker(), fake)
+        assert results == []
+        assert errors and "润色失败" in errors[0]
+        assert client.post.call_count == 2
+
+    def test_gateway_error_is_retried_once(self):
+        bad = _make_response({}, status_ok=False)
+        bad.status_code = 503
+        ok = _make_response({"choices": [{"message": {"content": "润色"}}]})
+        ok.status_code = 200
+        fake, client = _fake_httpx_module()
+        client.post.side_effect = [bad, ok]
+        results, errors = self._run_worker(self._worker(), fake)
+        assert results == ["润色"] and errors == []
+        assert client.post.call_count == 2
+
+    def test_timeout_is_not_retried(self):
+        fake, client = _fake_httpx_module()
+        client.post.side_effect = fake.TimeoutException()
+        results, errors = self._run_worker(self._worker(), fake)
+        assert results == []
+        assert errors and "超时" in errors[0]
+        assert client.post.call_count == 1
+
+    def test_rate_limit_is_not_retried(self):
+        bad = _make_response({}, status_ok=False)
+        bad.status_code = 429
+        fake, client = _fake_httpx_module()
+        client.post.side_effect = [bad]
+        results, errors = self._run_worker(self._worker(), fake)
+        assert results == [] and errors
+        assert client.post.call_count == 1
+
+    def test_cancel_between_attempts_emits_nothing(self):
+        fake, client = _fake_httpx_module()
+        worker = self._worker()
+
+        def first_fails(*_a, **_k):
+            worker.cancel()
+            raise fake.ConnectError("reset")
+
+        client.post.side_effect = first_fails
+        results, errors = self._run_worker(worker, fake)
+        assert results == [] and errors == []
+        assert client.post.call_count == 1
 
 
 class TestPolishSettingsComplete:

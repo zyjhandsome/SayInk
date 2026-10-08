@@ -52,6 +52,30 @@ class TestReleaseSelection:
         assert info is None
         assert not is_trusted_installer_url("http://github.com/a.exe")
 
+    # F-23: two-part tags and version-bound installer fallback.
+    def test_two_part_tag_is_compared_as_patch_zero(self):
+        from voiceink.updater import version_key
+
+        assert version_key("v1.2") == (1, 2, 0)
+        assert is_newer("1.2", "1.1.9")
+        assert not is_newer("v1.2", "1.2.0")
+        assert is_newer("1.2.1", "v1.2")
+
+    def test_fallback_installer_must_carry_the_release_version(self):
+        from voiceink.updater import pick_installer_asset
+
+        base = "https://github.com/zyjhandsome/VoiceInk/releases/download/v2.0.7/"
+        stale = {"name": "VoiceInk-Setup-2.0.6.exe", "browser_download_url": base + "VoiceInk-Setup-2.0.6.exe"}
+        arch = {"name": "VoiceInk-Setup-2.0.7-x64.exe", "browser_download_url": base + "VoiceInk-Setup-2.0.7-x64.exe"}
+        exact = {"name": "VoiceInk-Setup-2.0.7.exe", "browser_download_url": base + "VoiceInk-Setup-2.0.7.exe"}
+
+        assert pick_installer_asset([stale], "2.0.7") is None
+        assert pick_installer_asset([stale, arch], "2.0.7") is arch
+        assert pick_installer_asset([stale, arch, exact], "2.0.7") is exact
+        assert release_from_payload(
+            {"tag_name": "v2.0.7", "assets": [stale]}, current="2.0.5"
+        ) is None
+
 
 class TestAutoCheckGate:
     def test_disabled_switch_never_checks(self):

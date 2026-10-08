@@ -24,7 +24,8 @@ GITHUB_REPO = "zyjhandsome/VoiceInk"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 USER_AGENT = "VoiceInk"
 CHECK_INTERVAL_SEC = 24 * 60 * 60
-_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+# Accept "x.y.z" and "x.y" (a two-part tag counts as patch 0).
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
 _TRUSTED_HOSTS = frozenset(
     {
         "github.com",
@@ -58,7 +59,7 @@ def version_key(text: str) -> tuple[int, int, int]:
     match = _VERSION_RE.search((text or "").strip())
     if not match:
         return (0, 0, 0)
-    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+    return int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
 
 
 def is_newer(remote: str, current: str) -> bool:
@@ -86,6 +87,12 @@ def should_auto_check(
 
 
 def pick_installer_asset(assets: list[dict], version: str) -> dict | None:
+    """Prefer ``VoiceInk-Setup-<version>.exe``; otherwise a setup whose name
+    still carries ``<version>`` (e.g. ``VoiceInk-Setup-2.1.0-x64.exe``).
+
+    A setup for a different version is never offered, so a stray old installer
+    attached to a new release cannot be installed and re-prompted forever.
+    """
     wanted = f"VoiceInk-Setup-{version}.exe"
     exact = None
     fallback = None
@@ -96,7 +103,12 @@ def pick_installer_asset(assets: list[dict], version: str) -> dict | None:
             continue
         if name == wanted:
             exact = asset
-        elif name.startswith("VoiceInk-Setup-") and fallback is None:
+        elif (
+            fallback is None
+            and name.startswith("VoiceInk-Setup-")
+            and version
+            and version in name
+        ):
             fallback = asset
     return exact or fallback
 

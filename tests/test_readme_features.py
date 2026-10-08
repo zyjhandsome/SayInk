@@ -352,7 +352,7 @@ class TestReadmeReliabilityPromises:
         text = self._readme()
         assert "就不发送粘贴键" in text
         assert "回退它自己的原文" in text
-        assert "改动了原话里的阿拉伯数字" in text
+        assert "删改了原话里的阿拉伯数字" in text
         assert "Key 可留空" in text
 
     def test_storage_and_update_guarantees_are_documented(self):

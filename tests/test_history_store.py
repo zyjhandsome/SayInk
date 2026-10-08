@@ -223,6 +223,58 @@ class TestFailureIsolation:
         store.enqueue(_record("s", 0, raw_text="x", created_at=1))
         store.close(timeout=2.0)  # must not raise
 
+    def test_writer_failure_notifies_failed_callback(self, store, monkeypatch):
+        """F-21: a failed write is reported (once per failure) instead of only logged."""
+        from voiceink.history_store import WRITE_FAILED_NOTICE
+
+        def boom(_conn, _record):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(store, "_do_insert", boom)
+        seen = []
+        store.add_failed_callback(seen.append)
+        store.enqueue(_record("s", 0, raw_text="x", created_at=1))
+        store.close(timeout=2.0)
+        assert seen == [WRITE_FAILED_NOTICE]
+
+    def test_corrupt_db_is_quarantined_and_recreated(self, tmp_path):
+        """F-21: a non-SQLite history.db is renamed like config.corrupt-*, then rebuilt."""
+        db = tmp_path / "history.db"
+        db.write_bytes(b"this is not a sqlite database, just junk bytes" * 40)
+        (tmp_path / "history.db-wal").write_bytes(b"wal")
+
+        s = HistoryStore(db_path=db)
+        try:
+            assert s.disabled is False
+            assert "已损坏" in s.startup_notice and "history.corrupt-" in s.startup_notice
+            backups = list(tmp_path.glob("history.corrupt-*.db"))
+            assert len(backups) == 1
+            assert backups[0].read_bytes().startswith(b"this is not a sqlite database")
+            s.enqueue(_record("s1", 0, raw_text="写入新库", created_at=1))
+        finally:
+            s.close(timeout=2.0)
+        assert [x.session_id for x in s.list_sessions(10, 0)] == ["s1"]
+
+    def test_healthy_db_has_no_startup_notice(self, store):
+        assert store.disabled is False
+        assert store.startup_notice == ""
+
+    def test_locked_or_unopenable_db_is_not_quarantined(self, tmp_path, monkeypatch):
+        """OperationalError means the file is fine (locked / permissions); keep it."""
+        db = tmp_path / "history.db"
+        db.write_bytes(b"keep me")
+
+        def fail_connect(*_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(sqlite3, "connect", fail_connect)
+        s = HistoryStore(db_path=db)
+        assert s.disabled is True
+        assert s.startup_notice
+        assert db.read_bytes() == b"keep me"
+        assert not list(tmp_path.glob("history.corrupt-*"))
+        s.close(timeout=1.0)
+
     def test_init_failure_disables_all_apis(self, tmp_path, monkeypatch):
         def fail_connect(*_args, **_kwargs):
             raise sqlite3.OperationalError("cannot open")
@@ -230,6 +282,7 @@ class TestFailureIsolation:
         monkeypatch.setattr(sqlite3, "connect", fail_connect)
         s = HistoryStore(db_path=tmp_path / "nope.db")
         assert s.disabled is True
+        assert s.startup_notice
         s.enqueue(_record("s", 0, raw_text="x", created_at=1))
         s.enqueue_delete_sessions(["s"])
         s.enqueue_delete_all()

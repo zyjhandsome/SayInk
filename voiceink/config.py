@@ -245,12 +245,22 @@ class Config:
         except Exception as e:
             log.warning("读取注册表开机自启状态失败: %s", e)
 
-    def _merge_defaults(self, defaults: dict, current: dict) -> dict:
+    def _merge_defaults(self, defaults: dict, current: dict, _path: str = "") -> dict:
         result = {}
         for key, default_value in defaults.items():
+            dotted = f"{_path}.{key}" if _path else key
             if key in current:
-                if isinstance(default_value, dict) and isinstance(current[key], dict):
-                    result[key] = self._merge_defaults(default_value, current[key])
+                if isinstance(default_value, dict):
+                    if isinstance(current[key], dict):
+                        result[key] = self._merge_defaults(default_value, current[key], dotted)
+                    else:
+                        # A section written as a scalar (e.g. "history": "on") would
+                        # crash later code that calls .get() on it; fall back to defaults.
+                        log.warning(
+                            "配置节 %s 应为对象，实际为 %s，已恢复为默认值",
+                            dotted, type(current[key]).__name__,
+                        )
+                        result[key] = copy.deepcopy(default_value)
                 else:
                     result[key] = current[key]
             else:

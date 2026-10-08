@@ -218,6 +218,25 @@ def test_non_object_config_is_treated_as_unreadable(config_home):
     assert list(config_home.glob("config.corrupt-*.json"))
 
 
+def test_scalar_in_place_of_section_falls_back_to_section_defaults(config_home):
+    """F-24: ``"stt": "abc"`` used to survive the merge and crash ``_migrate_stt_model``."""
+    import json
+
+    from voiceink.config import DEFAULT_CONFIG, Config
+
+    (config_home / "config.json").write_text(
+        json.dumps({"stt": "abc", "history": "on", "hotkey": "alt+space"}),
+        encoding="utf-8",
+    )
+    cfg = Config(config_dir=config_home)  # must not raise
+    assert cfg.get("hotkey") == "alt+space"
+    assert cfg.get("stt.model_id") == DEFAULT_CONFIG["stt"]["model_id"]
+    assert cfg.get("history.enabled") == DEFAULT_CONFIG["history"]["enabled"]
+    assert isinstance(cfg.get_all()["history"], dict)
+    # Valid sections and scalars are untouched; the bad file is not quarantined.
+    assert not list(config_home.glob("config.corrupt-*.json"))
+
+
 def test_save_survives_mkstemp_failure(config, monkeypatch):
     import tempfile
 

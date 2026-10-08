@@ -165,6 +165,7 @@ class App(QObject):
     """Central orchestrator that connects all modules."""
 
     _history_committed = pyqtSignal()
+    _history_failed = pyqtSignal(str)
 
     # 友好化错误信息映射
     ERROR_HINTS = {
@@ -305,6 +306,10 @@ class App(QObject):
         self._hotkey_mgr.esc_pressed.connect(self._on_esc_pressed)
         self._history.add_committed_callback(self._history_committed.emit)
         self._history_committed.connect(self._refresh_open_history_ui)
+        # Writer-thread failures hop to the GUI thread through the signal.
+        self._history.add_failed_callback(self._history_failed.emit)
+        self._history_failed.connect(self._on_history_write_failed)
+        self._history_failure_notified = False
         self._hotkey_mgr.listener_status.connect(self._on_hotkey_listener_status)
 
         self._recorder.volume_changed.connect(self._floating.update_volume)
@@ -1293,6 +1298,25 @@ class App(QObject):
             return
         self._main._history.refresh()
 
+    def _show_history_startup_notice(self) -> None:
+        """Tell the user once if history.db was rebuilt or could not be opened."""
+        notice = getattr(self._history, "startup_notice", "")
+        if not isinstance(notice, str) or not notice:
+            return
+        log.warning("历史记录状态: %s", notice)
+        self._tray.showMessage(
+            "VoiceInk", notice, QSystemTrayIcon.MessageIcon.Warning, 10000
+        )
+
+    def _on_history_write_failed(self, message: str) -> None:
+        """One tray warning per run; the log keeps every failure."""
+        if self._history_failure_notified:
+            return
+        self._history_failure_notified = True
+        self._tray.showMessage(
+            "VoiceInk", message, QSystemTrayIcon.MessageIcon.Warning, 8000
+        )
+
     def _enqueue_history_record(
         self,
         record: SegmentRecord | None,
@@ -1623,6 +1647,7 @@ class App(QObject):
 
     def start(self):
         self._hotkey_mgr.start()
+        self._show_history_startup_notice()
         self._enqueue_history_cleanup()
         QTimer.singleShot(5000, self._maybe_auto_check_for_update)
         if not self._config.get("first_run_welcome_seen", True):

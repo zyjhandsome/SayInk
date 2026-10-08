@@ -52,6 +52,37 @@ def test_start_enqueues_history_cleanup_once_with_active_session() -> None:
         )
 
 
+def test_start_shows_history_startup_notice_in_tray() -> None:
+    """F-21: a rebuilt or unopenable history.db is announced once at startup."""
+    with app_harness() as h:
+        h["history"].startup_notice = "历史记录数据库已损坏，原文件已备份为 history.corrupt-x.db"
+        h["app"].start()
+        assert h["tray"].showMessage.called
+        assert "已损坏" in h["tray"].showMessage.call_args[0][1]
+
+
+def test_start_stays_quiet_when_history_is_healthy() -> None:
+    with app_harness() as h:
+        h["history"].startup_notice = ""
+        h["app"].start()
+        h["tray"].showMessage.assert_not_called()
+
+
+def test_history_write_failure_warns_once_per_run() -> None:
+    """F-21: the writer-thread failure callback reaches the tray exactly once."""
+    with app_harness() as h:
+        app = h["app"]
+        callback = h["history"].add_failed_callback.call_args[0][0]
+        callback("历史记录保存失败")
+        callback("历史记录保存失败")
+        from PyQt6.QtWidgets import QApplication
+
+        QApplication.processEvents()
+        assert h["tray"].showMessage.call_count == 1
+        assert "保存失败" in h["tray"].showMessage.call_args[0][1]
+        assert app._history_failure_notified is True
+
+
 def test_quit_closes_history_before_saving_config() -> None:
     with app_harness() as h:
         events: list[str] = []
