@@ -488,11 +488,13 @@ class SettingsWindow(QWidget):
         from sayink.speech_recognizer import get_model_info
         info = get_model_info(model_id)
         name = info["name"] if info else model_id
-        QMessageBox.information(
-            self,
-            "完成",
-            f"{name} 已下载，正在载入内存（约需数十秒）。载入完成前请勿开始录音。",
-        )
+        if self._config.get("stt.model_id", "") == model_id:
+            text = f"{name} 已下载，正在载入内存（约需数十秒）。载入完成前请勿开始录音。"
+        else:
+            # Only the active model is loaded; a second download just sits
+            # on disk until the user enables it, so do not claim otherwise.
+            text = f"{name} 已下载。当前仍使用原来的模型；点击该模型卡片上的「使用此模型」即可切换。"
+        QMessageBox.information(self, "完成", text)
 
     def _on_dl_error(self, msg: str, card):
         if card:

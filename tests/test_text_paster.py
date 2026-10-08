@@ -297,3 +297,60 @@ class TestIntegrityCheck:
 class TestVerifyPasteTarget:
     def test_hwnd_zero_is_not_verified(self):
         assert tp._verify_paste_target(0) is False
+
+
+class _FakeUser32:
+    """Records keybd_event calls; ``down`` lists the VKs GetAsyncKeyState reports held."""
+
+    def __init__(self, down=()):
+        self.down = set(down)
+        self.events: list[tuple[int, int]] = []
+
+    def GetAsyncKeyState(self, vk):
+        return 0x8000 if vk in self.down else 0
+
+    def MapVirtualKeyW(self, vk, _kind):
+        return vk
+
+    def keybd_event(self, vk, _scan, flags, _extra):
+        self.events.append((vk, flags))
+
+
+@pytest.fixture
+def fake_user32(monkeypatch):
+    import ctypes
+    from types import SimpleNamespace
+
+    fake = _FakeUser32()
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(user32=fake), raising=False)
+    return fake
+
+
+class TestWin32PasteShortcut:
+    """The hotkey modifier is often still down when the paste fires. Ctrl+Shift+V
+    / Ctrl+Alt+V mean something else in many apps, so lift it for the shortcut."""
+
+    CTRL, V, SHIFT, ALT, UP = 0x11, 0x56, 0x10, 0x12, 0x0002
+
+    def test_plain_ctrl_v_when_nothing_else_is_held(self, fake_user32):
+        tp._paste_shortcut_win32()
+        assert fake_user32.events == [
+            (self.CTRL, 0), (self.V, 0), (self.V, self.UP), (self.CTRL, self.UP),
+        ]
+
+    def test_held_shift_is_lifted_around_ctrl_v_and_pressed_again(self, fake_user32):
+        fake_user32.down = {self.SHIFT}
+        tp._paste_shortcut_win32()
+        assert fake_user32.events == [
+            (self.SHIFT, self.UP),
+            (self.CTRL, 0), (self.V, 0), (self.V, self.UP), (self.CTRL, self.UP),
+            (self.SHIFT, 0),
+        ]
+
+    def test_held_alt_gets_the_menu_mask_so_release_does_not_open_a_menu(self, fake_user32):
+        fake_user32.down = {self.ALT}
+        tp._paste_shortcut_win32()
+        assert fake_user32.events[0] == (self.ALT, self.UP)
+        assert fake_user32.events[-3:] == [
+            (self.ALT, 0), (tp._VK_MENU_MASK, 0), (tp._VK_MENU_MASK, self.UP),
+        ]

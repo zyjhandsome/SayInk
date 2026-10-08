@@ -137,6 +137,23 @@ def polish_looks_plausible(raw: str, polished: str) -> bool:
     """Reject replies that answer or change the text instead of lightly editing it."""
     return not polish_rejection_reason(raw, polished)
 
+
+def auto_start_command() -> str:
+    """Command line for the Run registry key.
+
+    A frozen build is its own executable; ``sys.executable`` is absolute there
+    (``sys.argv[0]`` may be relative to wherever the shortcut started us). From
+    a source checkout the interpreter alone would just open Python, so pass
+    ``run.py`` as well.
+    """
+    import os
+
+    exe = os.path.abspath(sys.executable)
+    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
+        return f'"{exe}"'
+    run_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "run.py")
+    return f'"{exe}" "{run_py}"'
+
 @dataclass
 class _PendingHistoryRecord:
     session_id: str
@@ -1581,10 +1598,9 @@ class App(QObject):
 
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
                 if enabled:
-                    exe_path = sys.executable
-                    if hasattr(sys, '_MEIPASS'):
-                        exe_path = sys.argv[0]
-                    winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, f'"{exe_path}"')
+                    winreg.SetValueEx(
+                        key, app_name, 0, winreg.REG_SZ, auto_start_command()
+                    )
                 else:
                     try:
                         winreg.DeleteValue(key, app_name)

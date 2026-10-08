@@ -1247,7 +1247,7 @@ class TriggerModePicker(QWidget):
 
         specs = [
             (continuous_radio, "持续转写", "按住启动 · Esc 或「结束」停止"),
-            (hotkey_radio, "按住说话", "按住录音 · 约 15 秒出字，松开结束"),
+            (hotkey_radio, "按住说话", "按住录音 · 松开后识别并输入"),
         ]
         for rb, title, sub in specs:
             lay.addWidget(CompactPickCard(title, sub, rb), 1)

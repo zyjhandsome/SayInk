@@ -61,6 +61,13 @@ class TestParseHotkey:
         assert keyboard.Key.ctrl_l in result
         assert len(result) == 1
 
+    @pytest.mark.parametrize("name", [f"f{n}" for n in range(1, 13)])
+    def test_parse_function_keys_offered_by_the_capture_box(self, name):
+        """Regression: Ctrl+F1 parsed to {ctrl} alone, so holding Ctrl by
+        itself started a recording."""
+        result = parse_hotkey(f"ctrl+{name}")
+        assert result == {keyboard.Key.ctrl_l, getattr(keyboard.Key, name)}
+
 
 class TestHotKeyManagerInit:
     def test_default_hotkey(self):
@@ -359,6 +366,43 @@ class TestShiftLetterTapTypesTheLetter:
         monkeypatch.setattr(mgr, "_async_key_down", lambda _vk: False)
         mgr._replay_swallowed_tap(self.VK_X)
         assert sent == [(0x10, 0), (self.VK_X, 0), (self.VK_X, 0x0002), (0x10, 0x0002)]
+
+    def test_shift_released_before_the_letter_still_types_it(self, monkeypatch):
+        """Fast typists often let go of Shift first. That release used to end
+        the hold with a 「录音过短」 hint, and the swallowed X never came back."""
+        mgr, replayed, short = self._manager(monkeypatch)
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0100, _Event(self.VK_X))
+        mgr._hold_started_at -= 0.1
+        mgr._on_release(keyboard.Key.shift_l)  # pynput's own path for Shift
+        assert mgr._hold_pending is False
+        assert short == []
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0101, _Event(self.VK_X))
+        assert replayed == [self.VK_X]
+
+    def test_letter_auto_repeat_after_shift_is_up_does_not_rearm(self, monkeypatch):
+        mgr, _replayed, _short = self._manager(monkeypatch)
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0100, _Event(self.VK_X))
+        mgr._on_release(keyboard.Key.shift_l)
+        monkeypatch.setattr(mgr, "_modifiers_held", lambda _mods: False)
+        for _ in range(5):
+            with pytest.raises(_Suppressed):
+                mgr._win32_event_filter(0x0100, _Event(self.VK_X))
+        assert mgr._hold_pending is False
+        assert keyboard.Key.shift_l not in mgr._pressed_keys
+
+    def test_alt_hotkey_still_hints_when_alt_is_released_first(self, monkeypatch):
+        mgr, replayed, short = self._manager(monkeypatch, hotkey="alt+z")
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0104, _Event(0x5A))
+        mgr._hold_started_at -= 0.1
+        mgr._on_release(keyboard.Key.alt_l)
+        assert short == [1]
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0105, _Event(0x5A))
+        assert replayed == []
 
     def test_right_shift_satisfies_a_generic_shift_hotkey(self):
         mgr = HotKeyManager("shift+x")

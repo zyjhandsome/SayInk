@@ -436,6 +436,36 @@ class TestHotkeyBinding:
         assert config.get("hotkey") == "ctrl+shift+a"
         assert emitted == ["ctrl+shift+a"]
 
+    def test_escape_cancels_capture_instead_of_binding_esc(self, settings_window, config):
+        """Esc already cancels recording / ends listening in HotKeyManager, so a
+        hotkey containing Esc could never fire. The capture box used to bind it."""
+        from PyQt6.QtTest import QTest
+
+        edit = settings_window._hotkey_edit
+        before = config.get("hotkey")
+        ended = []
+        edit.capture_ended.connect(lambda: ended.append(1))
+        edit._begin_capture()
+        assert edit._capturing is True
+        QTest.keyClick(edit, Qt.Key.Key_Escape, Qt.KeyboardModifier.ShiftModifier)
+        assert edit._capturing is False
+        assert ended == [1]
+        assert config.get("hotkey") == before
+        assert edit.text() == settings_window._hotkey_edit.text()
+        assert "Esc" not in edit.text()
+
+    def test_function_key_capture_round_trips_through_the_parser(self, settings_window, config):
+        from PyQt6.QtTest import QTest
+        from pynput import keyboard
+
+        from sayink.hotkey_manager import parse_hotkey
+
+        edit = settings_window._hotkey_edit
+        edit._begin_capture()
+        QTest.keyClick(edit, Qt.Key.Key_F3, Qt.KeyboardModifier.ControlModifier)
+        assert config.get("hotkey") == "ctrl+f3"
+        assert parse_hotkey(config.get("hotkey")) == {keyboard.Key.ctrl_l, keyboard.Key.f3}
+
 
 class TestAdvancedDevices:
     def test_first_device_index_zero_is_kept(self, settings_window, config):
@@ -559,3 +589,39 @@ class TestConfigReload:
         assert win._src_mixed_rb.isChecked()
         assert win._trigger_hotkey_rb.isChecked()
         win.close()
+
+
+class TestModelDownloadDone:
+    """Only the active model is loaded into memory after a download; the
+    completion dialog must not promise that for a second, inactive model."""
+
+    @pytest.fixture
+    def done_env(self, settings_window, config, monkeypatch):
+        shown = []
+        monkeypatch.setattr(
+            QMessageBox, "information", lambda *args, **kwargs: shown.append(args[2])
+        )
+        monkeypatch.setattr(
+            "sayink.speech_recognizer.get_model_info",
+            lambda model_id: {"name": f"模型 {model_id}"},
+        )
+        return shown
+
+    def test_second_model_download_says_it_is_not_in_use(self, settings_window, config, done_env, monkeypatch):
+        monkeypatch.setattr(
+            "sayink.speech_recognizer.get_downloaded_models", lambda: ["active", "other"]
+        )
+        config.set("stt.model_id", "active")
+        settings_window._on_dl_done("other")
+        assert config.get("stt.model_id") == "active"
+        assert len(done_env) == 1
+        assert "载入内存" not in done_env[0]
+        assert "使用此模型" in done_env[0]
+
+    def test_only_model_download_becomes_active_and_loads(self, settings_window, config, done_env, monkeypatch):
+        monkeypatch.setattr(
+            "sayink.speech_recognizer.get_downloaded_models", lambda: ["first"]
+        )
+        settings_window._on_dl_done("first")
+        assert config.get("stt.model_id") == "first"
+        assert "载入内存" in done_env[0]

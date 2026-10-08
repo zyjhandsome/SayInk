@@ -217,8 +217,28 @@ def _paste_shortcut():
         subprocess.run(["xdotool", "key", "ctrl+v"], timeout=2, check=True)
 
 
+_VK_SHIFT = 0x10
+_VK_MENU = 0x12  # Alt
+_VK_LWIN, _VK_RWIN = 0x5B, 0x5C
+# Unassigned VK AutoHotkey uses as a "menu mask": pressed between an Alt/Win
+# down and up it keeps Windows from opening the menu bar / Start on release.
+_VK_MENU_MASK = 0xE8
+_STRAY_MODIFIER_VKS = (_VK_SHIFT, _VK_MENU, _VK_LWIN, _VK_RWIN)
+
+
+def _held_stray_modifiers(user32) -> list[int]:
+    return [vk for vk in _STRAY_MODIFIER_VKS if user32.GetAsyncKeyState(vk) & 0x8000]
+
+
 def _paste_shortcut_win32():
-    """Send Ctrl+V with the Win32 keyboard API."""
+    """Send Ctrl+V with the Win32 keyboard API.
+
+    The hotkey's modifier (Shift in the default Shift+X) is often still
+    physically down when the first result arrives, and Ctrl+Shift+V or
+    Ctrl+Alt+V mean something else in many apps (paste format only, paste
+    special, ...). Lift any stray modifier for the shortcut, then press it
+    again so its physical release stays consistent.
+    """
     import ctypes
 
     user32 = ctypes.windll.user32
@@ -230,10 +250,18 @@ def _paste_shortcut_win32():
         scan = user32.MapVirtualKeyW(vk, 0)
         user32.keybd_event(vk, scan, flags, 0)
 
+    held = _held_stray_modifiers(user32)
+    for vk in held:
+        _tap(vk, key_up)
     _tap(vk_control, 0)
     _tap(vk_v, 0)
     _tap(vk_v, key_up)
     _tap(vk_control, key_up)
+    for vk in held:
+        _tap(vk, 0)
+    if any(vk != _VK_SHIFT for vk in held):
+        _tap(_VK_MENU_MASK, 0)
+        _tap(_VK_MENU_MASK, key_up)
 
 
 def _verify_paste_target(hwnd_before: int) -> bool:

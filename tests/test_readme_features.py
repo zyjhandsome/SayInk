@@ -190,6 +190,50 @@ class TestReadmeHotkeyManagerToApp:
             h["hotkey"].recording_start.connect.assert_called()
 
 
+class TestReadmeHotkeyBindingRules:
+    """README: 录制支持 F1–F12；Esc 不能作为录音键；短按先松 Shift 也输入 X。"""
+
+    def test_function_keys_parse_with_a_modifier(self):
+        from sayink.hotkey_manager import parse_hotkey
+
+        for n in (1, 5, 12):
+            assert parse_hotkey(f"ctrl+f{n}") == {keyboard.Key.ctrl_l, getattr(keyboard.Key, f"f{n}")}
+
+    def test_capture_box_never_produces_an_esc_binding(self):
+        from sayink.ui.hotkey_edit import _qt_key_to_name
+        from PyQt6.QtCore import Qt
+
+        assert _qt_key_to_name(Qt.Key.Key_Escape) == ""
+
+    def test_shift_first_short_tap_does_not_hint_too_short(self, monkeypatch):
+        app = QApplication.instance() or QApplication(sys.argv)
+        mgr = HotKeyManager("shift+x", parent=app)
+        hints = []
+        mgr.hotkey_tap_too_short.connect(lambda: hints.append(True))
+        mgr._on_press(keyboard.Key.shift_l)
+        mgr._on_press(keyboard.KeyCode.from_char("x"))
+        assert mgr._hold_pending
+        mgr._hold_started_at -= 0.1
+        mgr._on_release(keyboard.Key.shift_l)
+        assert not mgr._hold_pending
+        assert hints == []
+
+
+class TestReadmeAutoStart:
+    """README: 开机自启命令须能从任意目录启动，源码运行时经由解释器执行 run.py。"""
+
+    def test_registry_command_is_absolute_and_quoted(self, monkeypatch):
+        import os
+        from sayink.app import auto_start_command
+
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+        command = auto_start_command()
+        parts = [p for p in command.split('"') if p.strip()]
+        assert all(os.path.isabs(p) for p in parts)
+        assert parts[-1].endswith("run.py")
+
+
 class TestReadmeContinuousMode:
     """README FAQ: 自动持续转写 — 按住快捷键开始，Esc 或听写条「结束」结束。"""
 

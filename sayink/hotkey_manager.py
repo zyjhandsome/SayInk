@@ -31,6 +31,9 @@ KEY_MAP = {
     "win": keyboard.Key.cmd,
     "cmd": keyboard.Key.cmd,
 }
+# The settings capture box offers F1–F12; a name parse_hotkey does not know
+# would silently drop the main key and leave a modifier-only hotkey behind.
+KEY_MAP.update({f"f{n}": getattr(keyboard.Key, f"f{n}") for n in range(1, 13)})
 
 
 _WM_KEYDOWN = 0x0100
@@ -176,6 +179,14 @@ class HotKeyManager(QObject):
         """
         return bool(modifiers) and all(mod == keyboard.Key.shift_l for mod in modifiers)
 
+    def _taps_type_text(self) -> bool:
+        """True when the Win32 filter replays short taps of this hotkey as typing.
+
+        Then no part of the combo should raise the 「录音过短」 hint, whichever
+        key the user lets go of first.
+        """
+        return bool(self._main_keys_by_vk) and self._tap_is_typing(self._hotkey_modifiers)
+
     def _replay_swallowed_tap(self, vk: int) -> None:
         """Type the key a too-short tap swallowed.
 
@@ -225,12 +236,17 @@ class HotKeyManager(QObject):
             if main_key is None:
                 return True
             if msg in (_WM_KEYDOWN, _WM_SYSKEYDOWN):
-                if not already and not self._modifiers_held(modifiers):
+                held = self._modifiers_held(modifiers)
+                if not already and not held:
                     return True
                 with self._lock:
                     self._suppressed_vks.add(vk)
-                for mod in modifiers:
-                    self._on_press(mod)
+                # Auto-repeat of the main key keeps arriving after the user
+                # let go of the modifier; feeding the modifier then would
+                # re-arm a hold the user is not making.
+                if held:
+                    for mod in modifiers:
+                        self._on_press(mod)
                 self._on_press(main_key)
                 if not already and any(m in _MASKED_MODIFIERS for m in modifiers):
                     self._send_menu_mask()
@@ -242,7 +258,10 @@ class HotKeyManager(QObject):
                 # A tap that gets typed into the app is plain typing, not a
                 # failed hold: no 「录音过短」 hint for it.
                 replayable = self._tap_is_typing(modifiers)
-                if self._on_release(main_key, quiet=replayable) and replayable:
+                self._on_release(main_key, quiet=replayable)
+                # The hold may already have been cut short by letting go of
+                # Shift first; the swallowed letter still has to be typed.
+                if replayable and not self._hold_activated:
                     self._replay_swallowed_tap(vk)
             else:
                 return True
@@ -454,6 +473,7 @@ class HotKeyManager(QObject):
                 if not self._hold_activated:
                     tapped = True
                     held_ms = (time.monotonic() - self._hold_started_at) * 1000
+                    quiet = quiet or self._taps_type_text()
                     if held_ms >= MIN_SHORT_TAP_MS and not quiet:
                         emit_short_tap = True
                     else:

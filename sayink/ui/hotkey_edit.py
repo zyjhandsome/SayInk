@@ -22,7 +22,6 @@ def _qt_key_to_name(key: int) -> str:
     mapping = {
         Qt.Key.Key_Space: "space", Qt.Key.Key_Tab: "tab",
         Qt.Key.Key_Return: "enter", Qt.Key.Key_Enter: "enter",
-        Qt.Key.Key_Escape: "esc",
     }
     if key in mapping:
         return mapping[key]
@@ -89,6 +88,13 @@ class HotkeyEdit(QLineEdit):
 
         key = event.key()
         modifiers = event.modifiers()
+
+        # Esc cancels recording and continuous listening, so it can never be
+        # (part of) the hotkey; here it backs out of the capture instead.
+        if key == Qt.Key.Key_Escape:
+            self.cancel_capture_if_active()
+            event.accept()
+            return
 
         mod_parts = []
         if modifiers & Qt.KeyboardModifier.ControlModifier:
