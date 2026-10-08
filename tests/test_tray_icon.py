@@ -8,7 +8,7 @@ import pytest
 from PyQt6.QtCore import QPoint, QRect, QSize
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 
-from voiceink.ui.tray_icon import TrayIcon, tray_menu_top_left
+from sayink.ui.tray_icon import TrayIcon, tray_menu_top_left
 
 
 @pytest.fixture(scope="module")
@@ -46,7 +46,7 @@ class TestTrayMenuOpensAboveTheIcon:
         assert pos.y() + menu.height() <= available.top() + available.height()
 
     def test_context_menu_uses_the_upward_popup(self, tray):
-        from voiceink.ui.tray_icon import _UpwardContextMenu
+        from sayink.ui.tray_icon import _UpwardContextMenu
 
         assert isinstance(tray.contextMenu(), _UpwardContextMenu)
 
@@ -118,18 +118,18 @@ class TestTrayActivation:
     def test_activity_tooltip_uses_capsule_words(self, tray):
         tray.set_status_summary("就绪")
         tray.set_activity_tooltip("listening")
-        assert tray.toolTip() == "VoiceInk - 正在听"
+        assert tray.toolTip() == "SayInk - 正在听"
         tray.set_activity_tooltip("recognizing")
-        assert tray.toolTip() == "VoiceInk - 正在识别"
+        assert tray.toolTip() == "SayInk - 正在识别"
         tray.set_activity_tooltip("loading")
-        assert tray.toolTip() == "VoiceInk - 模型载入中"
+        assert tray.toolTip() == "SayInk - 模型载入中"
         tray.set_activity_tooltip(None)
-        assert tray.toolTip() == "VoiceInk - 就绪"
+        assert tray.toolTip() == "SayInk - 就绪"
 
 
 class TestTrayMenuStyleAndGrouping:
     def test_menu_stylesheet_uses_reference_style_tokens(self, tray):
-        from voiceink.ui import design_tokens as t
+        from sayink.ui import design_tokens as t
 
         css = tray.contextMenu().styleSheet()
         assert t.TRAY_MENU_RADIUS == 8
@@ -165,7 +165,7 @@ class TestTrayMenuStyleAndGrouping:
         assert labels[0]  # status (dynamic)
         assert not actions[0].isEnabled()
         assert labels[1] == "---"
-        assert labels[2] == "打开 VoiceInk"
+        assert labels[2] == "打开 SayInk"
         assert labels[3] == "检查更新"
         assert labels[4] == "历史"
         assert labels[5] == "切换模型"
@@ -207,7 +207,7 @@ def test_ready_status_republishes_a_small_tray_glyph(tray, qapp):
         tray.set_status_summary("就绪 · Fun-ASR-Nano")
         icon = tray.icon()
         widths = {size.width() for size in icon.availableSizes()}
-        assert tray.toolTip() == "VoiceInk - 就绪 · Fun-ASR-Nano"
+        assert tray.toolTip() == "SayInk - 就绪 · Fun-ASR-Nano"
         assert not icon.isNull()
         assert icon.cacheKey() != before
         assert {16, 32}.issubset(widths)
@@ -225,8 +225,8 @@ def test_ready_status_republishes_a_small_tray_glyph(tray, qapp):
 def test_tray_glyph_matches_shell_size_and_keeps_mic_contrast(tray):
     from PyQt6.QtCore import QSize
 
-    from voiceink.ui import design_tokens as tok
-    from voiceink.ui.tray_icon import _windows_small_icon_px
+    from sayink.ui import design_tokens as tok
+    from sayink.ui.tray_icon import _windows_small_icon_px
 
     tok.activate("dark")
     try:
@@ -247,7 +247,7 @@ def test_tray_glyph_matches_shell_size_and_keeps_mic_contrast(tray):
 
 
 def test_microphone_icon_includes_windows_small_sizes():
-    from voiceink.ui.tray_icon import create_microphone_icon
+    from sayink.ui.tray_icon import create_microphone_icon
 
     icon = create_microphone_icon()
     widths = {size.width() for size in icon.availableSizes()}
@@ -257,8 +257,8 @@ def test_microphone_icon_includes_windows_small_sizes():
 def test_idle_mic_uses_text_token():
     import inspect
 
-    from voiceink.ui import design_tokens as tok
-    from voiceink.ui.tray_icon import _microphone_pixmap
+    from sayink.ui import design_tokens as tok
+    from sayink.ui.tray_icon import _microphone_pixmap
 
     source = inspect.getsource(_microphone_pixmap)
     assert "TEXT" in source

@@ -1,4 +1,4 @@
-"""VoiceInk launcher — run from the project root directory."""
+"""SayInk launcher — run from the project root directory."""
 import sys
 from pathlib import Path
 
@@ -9,7 +9,7 @@ if str(_ROOT) not in sys.path:
 
 # Windows: AppUserModelID must be set before Qt creates any window.
 if sys.platform == "win32":
-    from voiceink.platform.windows_identity import set_windows_app_user_model_id
+    from sayink.platform.windows_identity import set_windows_app_user_model_id
 
     set_windows_app_user_model_id()
 
@@ -23,7 +23,7 @@ def _check_runtime() -> None:
         sys.exit(1)
 
 
-from voiceink.main import main
+from sayink.main import main
 
 if __name__ == "__main__":
     _check_runtime()

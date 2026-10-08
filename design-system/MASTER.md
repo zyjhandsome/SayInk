@@ -2,7 +2,7 @@
 
 > **2026-09-21 desktop redesign:** Current UX decisions and audit are in
 > [`../docs/ux-redesign.md`](../docs/ux-redesign.md). This revision supersedes older
-> prototype and island layouts. Runtime tokens remain in `voiceink/ui/design_tokens.py`.
+> prototype and island layouts. Runtime tokens remain in `sayink/ui/design_tokens.py`.
 
 > **LOGIC:** When building a specific page, first check `design-system/pages/[page-name].md`.
 > If that file exists, its rules **override** this Master file.
@@ -10,7 +10,7 @@
 
 ---
 
-**Project:** VoiceInk  
+**Project:** SayInk  
 **Generated:** 2026-07-18 via ui-ux-pro-max (`--design-system --persist`)  
 **Adapted for:** PyQt6 Windows desktop tray utility (light + dark)  
 **Style seed:** AI-Native UI / high-end utility (voice transcription)  
@@ -224,5 +224,5 @@ shadow tokens to `design_tokens.py` unless a surface actually paints one.
 | Source | Detail |
 |--------|--------|
 | ui-ux-pro-max query | `desktop utility voice transcription productivity dark mode windows tray` |
-| Persist output | `design-system/voiceink/MASTER.md` (raw skill output) |
+| Persist output | `design-system/sayink/MASTER.md` (raw skill output) |
 | This file | Canonical app MASTER with light/dark + desktop adaptations |

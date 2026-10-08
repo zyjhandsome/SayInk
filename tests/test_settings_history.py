@@ -8,9 +8,9 @@ import pytest
 from PyQt6.QtWidgets import QApplication
 
 from tests.helpers.app_harness import app_harness
-import voiceink.app as app_module
-from voiceink.app import App
-from voiceink.ui.settings_window import SettingsWindow
+import sayink.app as app_module
+from sayink.app import App
+from sayink.ui.settings_window import SettingsWindow
 
 
 @pytest.fixture(scope="module")
@@ -166,7 +166,7 @@ def test_first_run_welcome_is_scheduled_once_even_if_ready_and_fallback_both_fir
 
     with app_harness(config_overrides={"first_run_welcome_seen": False}) as h:
         app = h["app"]
-        with patch("voiceink.app.QTimer.singleShot") as single_shot:
+        with patch("sayink.app.QTimer.singleShot") as single_shot:
             app._show_first_run_welcome_once()
             app._show_first_run_welcome_once()
         scheduled = [c for c in single_shot.call_args_list if c.args[1] == app._show_first_run_welcome]

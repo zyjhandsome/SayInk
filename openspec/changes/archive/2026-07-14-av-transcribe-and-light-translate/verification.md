@@ -13,7 +13,7 @@
 
 ## 手册项（发布前）
 
-- [ ] 将 `ffmpeg.exe` 放入 `third_party/ffmpeg/` 后执行 `python build.py`，确认 `dist/VoiceInk/_internal/ffmpeg/` 存在
+- [ ] 将 `ffmpeg.exe` 放入 `third_party/ffmpeg/` 后执行 `python build.py`，确认 `dist/SayInk/_internal/ffmpeg/` 存在
 - [ ] 托盘「导入文件转写…」导入短 mp3/mp4，历史出现 `来源：文件转写`
 - [ ] 设置后处理模式=翻译，文件任务出译文；热键听写不翻译
 - [ ] Esc 可取消进行中的文件转写；文件任务期间热键听写被拒绝并提示

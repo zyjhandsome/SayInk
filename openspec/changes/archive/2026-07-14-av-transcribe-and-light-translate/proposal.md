@@ -2,7 +2,7 @@
 
 ## Why
 
-用户需要把本地音/视频转成文字，并在转写后得到目标语言译文；当前 VoiceInk 只支持麦克风/系统声实时听写与同语言润色，缺少文件入口与翻译能力。先做「文件转写 + 事后轻翻译」组合 MVP，明确不做真·流式同声传译。
+用户需要把本地音/视频转成文字，并在转写后得到目标语言译文；当前 SayInk 只支持麦克风/系统声实时听写与同语言润色，缺少文件入口与翻译能力。先做「文件转写 + 事后轻翻译」组合 MVP，明确不做真·流式同声传译。
 
 ## What Changes
 
@@ -85,11 +85,11 @@
 
 | 优先级 | 路径/符号 | 理由 |
 |---|---|---|
-| 必选 | `voiceink/speech_recognizer.py` → `SpeechRecognizer.transcribe_final` | 文件 PCM 进入现有 ASR 的唯一稳定入口 |
-| 必选 | `voiceink/app.py` → `_begin_transcription` / `_on_final_result` / `_output_text` | 编排、润色/翻译分支、历史冻结 |
-| 必选 | `voiceink/text_polisher.py` → `TextPolisher` / `POLISH_PROMPT` | 轻翻译挂载点；需与润色语义分离 |
-| 备选 | `voiceink/history_store.py` → `SegmentRecord` / DDL | 仅当译文不能复用 `polished_text` |
-| 备选 | `voiceink/ui/history_window.py` / tray / settings | 文件入口与结果面 |
+| 必选 | `sayink/speech_recognizer.py` → `SpeechRecognizer.transcribe_final` | 文件 PCM 进入现有 ASR 的唯一稳定入口 |
+| 必选 | `sayink/app.py` → `_begin_transcription` / `_on_final_result` / `_output_text` | 编排、润色/翻译分支、历史冻结 |
+| 必选 | `sayink/text_polisher.py` → `TextPolisher` / `POLISH_PROMPT` | 轻翻译挂载点；需与润色语义分离 |
+| 备选 | `sayink/history_store.py` → `SegmentRecord` / DDL | 仅当译文不能复用 `polished_text` |
+| 备选 | `sayink/ui/history_window.py` / tray / settings | 文件入口与结果面 |
 
 ### 波及线索
 
@@ -103,10 +103,10 @@
 
 | 类型 | 结论 | 证据 |
 |---|---|---|
-| 事实 | ASR 为离线整段 `transcribe_final(full_audio)` | `voiceink/speech_recognizer.py` `SpeechRecognizer.transcribe_final` |
+| 事实 | ASR 为离线整段 `transcribe_final(full_audio)` | `sayink/speech_recognizer.py` `SpeechRecognizer.transcribe_final` |
 | 事实 | 最终结果可触发润色再输出 | `App._on_final_result` → `TextPolisher.polish`（Memory `trace_path` outbound） |
-| 事实 | 润色 prompt 禁止改语言 | `voiceink/text_polisher.py` `POLISH_PROMPT` 规则 4 |
-| 事实 | 历史仅有 `raw_text`/`polished_text`，无译文列 | `voiceink/history_store.py` `_DDL` / `SegmentRecord` |
+| 事实 | 润色 prompt 禁止改语言 | `sayink/text_polisher.py` `POLISH_PROMPT` 规则 4 |
+| 事实 | 历史仅有 `raw_text`/`polished_text`，无译文列 | `sayink/history_store.py` `_DDL` / `SegmentRecord` |
 | 事实 | 无媒体文件解码管线 | Memory `search_code`（ffmpeg/mp3/mp4 等）无产品路径；`requirements.txt` 无 ffmpeg 绑定 |
 | 事实 | 系统声/混合采集已存在（实时路径） | `audio_devices.build_recording_plan` / `pawp_capture` |
 | 推断 | 文件转写可旁路 `AudioRecorder`，直接喂 PCM 给 recognizer | 基于 `transcribe_final` 签名；待设计确认分段策略 |

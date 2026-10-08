@@ -3,7 +3,7 @@
 ## 执行规则
 - 权威状态源：`openspec/changes/ui-settings-themeaware-split/`
 - 风险/闸门：Standard / medium；勾选属 Execute
-- 禁止范围：`voiceink/speech_recognizer.py`、`voiceink/audio_recorder.py`、热键核心、token/字体重做、IA 重排、像素截图基建
+- 禁止范围：`sayink/speech_recognizer.py`、`sayink/audio_recorder.py`、热键核心、token/字体重做、IA 重排、像素截图基建
 - 必须执行的最终验证：
   `py -3.10 -m pytest tests/test_theme_resolve.py tests/test_ui_styles.py tests/test_ui_font.py tests/test_settings_general.py tests/test_floating_window.py tests/test_history_window.py tests/test_tray_icon.py -q`
 
@@ -12,7 +12,7 @@
 - [x] 任务 1：设置换肤改为 ThemeAware 广播
   - 对应需求/场景：设置窗换肤为 ThemeAware 广播；切到暗色后设置四页无残留浅色；设置换肤不再角色巡检
   - 前置依赖：无
-  - 目标文件/符号：`voiceink/ui/settings_window.py` `SettingsWindow.reapply_theme`；`voiceink/ui/settings_components.py` `reapply_subtree` / 各 `reapply_styles` / `paint_*`；`tests/test_theme_resolve.py`；`tests/test_ui_styles.py`；`tests/test_ui_font.py`
+  - 目标文件/符号：`sayink/ui/settings_window.py` `SettingsWindow.reapply_theme`；`sayink/ui/settings_components.py` `reapply_subtree` / 各 `reapply_styles` / `paint_*`；`tests/test_theme_resolve.py`；`tests/test_ui_styles.py`；`tests/test_ui_font.py`
   - 允许修改：上述文件及为断言新增的测试辅助
   - 禁止修改：ASR/录音/热键；`design_tokens` 色轴与 `TYPE_*` 数值
   - 实施步骤：
@@ -30,7 +30,7 @@
 - [x] 任务 2：按页拆出设置页面模块
   - 对应需求/场景：设置分页模块化且 IA 不变；分页入口保持四个
   - 前置依赖：任务 1
-  - 目标文件/符号：`voiceink/ui/settings_pages/general.py` `build_general_page`；`model.py` `build_model_page`；`polish.py` `build_polish_page`；`about.py` `build_about_page`；`voiceink/ui/settings_window.py` `_setup_ui`
+  - 目标文件/符号：`sayink/ui/settings_pages/general.py` `build_general_page`；`model.py` `build_model_page`；`polish.py` `build_polish_page`；`about.py` `build_about_page`；`sayink/ui/settings_window.py` `_setup_ui`
   - 允许修改：新建 `settings_pages/`；`settings_window.py` 改为调用 builder；`tests/test_settings_general.py` 仅在夹具 import 路径必须时改
   - 禁止修改：侧栏页名、用户可见文案、分页数量
   - 实施步骤：
@@ -48,7 +48,7 @@
 - [x] 任务 3：四表面 ThemeAware 协议对齐
   - 对应需求/场景：四表面同一 ThemeAware 协议；四表面同时跟随暗色；冷启动有效主题一致；单表面失败不中断
   - 前置依赖：任务 1
-  - 目标文件/符号：`voiceink/ui/theme.py` `apply_theme`；`history_window.py` `HistoryWindow.reapply_theme`；`floating_window.py` `FloatingWindow.reapply_theme`；`tray_icon.py` `TrayIcon.reapply_theme`；`tests/test_floating_window.py`；`tests/test_history_window.py`；`tests/test_tray_icon.py`；`tests/test_theme_resolve.py`
+  - 目标文件/符号：`sayink/ui/theme.py` `apply_theme`；`history_window.py` `HistoryWindow.reapply_theme`；`floating_window.py` `FloatingWindow.reapply_theme`；`tray_icon.py` `TrayIcon.reapply_theme`；`tests/test_floating_window.py`；`tests/test_history_window.py`；`tests/test_tray_icon.py`；`tests/test_theme_resolve.py`
   - 允许修改：上述表面换肤与对应测试
   - 禁止修改：听写状态机、托盘业务菜单项语义
   - 实施步骤：

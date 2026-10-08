@@ -8,7 +8,7 @@
 | producer | delivery-execute-verify |
 | state_owner | openspec_change |
 | implementation_authority | delivery |
-| change_dir | D:\Hzhao\AI_Test\VoiceInk-20260918\VoiceInk\openspec\changes\ui-settings-themeaware-split |
+| change_dir | D:\Hzhao\AI_Test\SayInk-20260918\SayInk\openspec\changes\ui-settings-themeaware-split |
 | source_artifact_revision | 6f1a7e5c624f9d7aa1387c0020b5904a4f83e9ef55ffb5dcc5688febe67aa203 |
 | analysis_status | complete |
 | remediation_status | done |

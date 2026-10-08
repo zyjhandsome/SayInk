@@ -21,7 +21,7 @@
 
 ## Impact
 
-- 代码：`voiceink/ui/design_tokens.py`、`app_styles.py`、`theme.py`、`settings_styles.py`、`settings_components.py`、`settings_window.py`、`history_window.py`、`floating_window.py`、`tray_icon.py`、`model_card.py`；`design-system/MASTER.md`；相关 `tests/test_ui_styles.py` / `test_theme_resolve.py` 等
+- 代码：`sayink/ui/design_tokens.py`、`app_styles.py`、`theme.py`、`settings_styles.py`、`settings_components.py`、`settings_window.py`、`history_window.py`、`floating_window.py`、`tray_icon.py`、`model_card.py`；`design-system/MASTER.md`；相关 `tests/test_ui_styles.py` / `test_theme_resolve.py` 等
 - 配置/API：无持久化键变更（除非实现选用显式字体偏好——默认不新增）
 - 依赖：无新第三方依赖
 
@@ -41,7 +41,7 @@
 ### 边界与非目标
 - 本次范围：排版 token、字体解析、四表面样式挂载、工厂控件 reapply、chip/callout/MASTER 对齐。
 - 非目标：替换 PyQt6；设置分页 IA 重组；ASR/录音/热键业务；系统主题热监听增强（沿用既有 best-effort）；从零重做双主题。
-- 禁止修改路径：`voiceink/speech_recognizer.py`、`voiceink/audio_recorder.py`、热键核心逻辑。
+- 禁止修改路径：`sayink/speech_recognizer.py`、`sayink/audio_recorder.py`、热键核心逻辑。
 
 ## 代码事实
 
@@ -63,11 +63,11 @@
 ### 挂载点候选
 | 优先级 | 路径/符号 | 理由 |
 |---|---|---|
-| 必选 | `voiceink/ui/design_tokens.py` | 字体/字号/色 token 权威 |
-| 必选 | `voiceink/ui/app_styles.py` / `theme.apply_theme` | 全局字体基线 |
-| 必选 | `voiceink/ui/floating_window.py` | 硬编码 `QFont` 主冲突点 |
-| 必选 | `voiceink/ui/settings_window.py` `reapply_theme` + `settings_components` 工厂函数 | 换肤残留 |
-| 备选 | `voiceink/ui/history_window.py` / `tray_icon.py` / `model_card.py` | 字号魔法数收敛 |
+| 必选 | `sayink/ui/design_tokens.py` | 字体/字号/色 token 权威 |
+| 必选 | `sayink/ui/app_styles.py` / `theme.apply_theme` | 全局字体基线 |
+| 必选 | `sayink/ui/floating_window.py` | 硬编码 `QFont` 主冲突点 |
+| 必选 | `sayink/ui/settings_window.py` `reapply_theme` + `settings_components` 工厂函数 | 换肤残留 |
+| 备选 | `sayink/ui/history_window.py` / `tray_icon.py` / `model_card.py` | 字号魔法数收敛 |
 | 备选 | `design-system/MASTER.md` | 文档同轴 |
 
 ### 波及线索
@@ -143,7 +143,7 @@
 - 结论：**就绪（条件：用户接受 G8 路径重叠警告）** / 风险 medium
 - 阻塞项：无（G8 重叠按协议默认阻塞，但旧 change 已 Complete/verified 且无未完成任务 → 降记为**警告项**，须闸门显式接受）
 - 警告项：
-  - `W-g8-overlap-ui-theme`：active change `ui-theme-design-system`（Complete）与本变更共享 `voiceink/ui/*`、`design-system/MASTER.md`；接受「旧变更已收工、本变更为续作 polish、不并行改同一文件」序列风险
+  - `W-g8-overlap-ui-theme`：active change `ui-theme-design-system`（Complete）与本变更共享 `sayink/ui/*`、`design-system/MASTER.md`；接受「旧变更已收工、本变更为续作 polish、不并行改同一文件」序列风险
 - 建议项：实现后可 archive `ui-theme-design-system`
 - G1：唯一状态源本 change — pass
 - G2：任务含真实路径/符号 — pass

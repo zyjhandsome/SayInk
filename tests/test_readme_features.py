@@ -17,8 +17,8 @@ from pynput import keyboard
 from unittest.mock import patch
 
 from tests.helpers.app_harness import app_harness
-from voiceink.app import App, MIN_AUDIO_SAMPLES
-from voiceink.hotkey_manager import HotKeyManager
+from sayink.app import App, MIN_AUDIO_SAMPLES
+from sayink.hotkey_manager import HotKeyManager
 
 
 class TestReadmeExitProtection:
@@ -33,7 +33,7 @@ class TestReadmeExitProtection:
             audio = np.ones(MIN_AUDIO_SAMPLES * 2, dtype=np.float32)
             app._on_segment_ready(audio)
             app._on_segment_ready(audio)
-            with patch("voiceink.app.QMessageBox") as boxes, patch("voiceink.app.QApplication.quit") as quit_app:
+            with patch("sayink.app.QMessageBox") as boxes, patch("sayink.app.QApplication.quit") as quit_app:
                 dialog = boxes.return_value
                 dialog.addButton.side_effect = ["return", "discard"]
                 dialog.clickedButton.return_value = "return"
@@ -50,7 +50,7 @@ class TestReadmeExitProtection:
             records = [call.args[0] for call in h["history"].enqueue.call_args_list]
             assert [record.raw_text for record in records] == ["第一句", "第二句"]
             assert {record.session_id for record in records} == {"exit-session"}
-            with patch("voiceink.app.QMessageBox") as boxes, patch("voiceink.app.QApplication.quit") as quit_app:
+            with patch("sayink.app.QMessageBox") as boxes, patch("sayink.app.QApplication.quit") as quit_app:
                 app._quit()
                 boxes.assert_not_called()
                 quit_app.assert_called_once()
@@ -347,7 +347,7 @@ class TestReadmeIslandCopy:
         from pathlib import Path
 
         text = Path("README.md").read_text(encoding="utf-8")
-        assert "打开 VoiceInk" in text
+        assert "打开 SayInk" in text
         assert "听写条" in text or "薄" in text
         assert "双击托盘会唤醒空间岛" not in text
 
@@ -370,7 +370,7 @@ class TestReadmeReliabilityPromises:
     def test_storage_and_update_guarantees_are_documented(self):
         text = self._readme()
         assert "只在本次运行中有效、同样不写入 `config.json`" in text
-        assert "没有公布该安装包 SHA-256 时，VoiceInk 不会下载或自动安装" in text
+        assert "没有公布该安装包 SHA-256 时，SayInk 不会下载或自动安装" in text
         assert "长时间监听只在内存中保留当前这句话" not in text
         assert "自动暂停监听" in text
 

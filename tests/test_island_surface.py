@@ -8,8 +8,8 @@ import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
-from voiceink.ui.floating_window import COMPACT_HEIGHT, FloatingWindow
-from voiceink.ui.island_chrome import ISLAND_SHEET_WIDTH, position_island
+from sayink.ui.floating_window import COMPACT_HEIGHT, FloatingWindow
+from sayink.ui.island_chrome import ISLAND_SHEET_WIDTH, position_island
 
 
 @pytest.fixture(scope="module")
@@ -31,7 +31,7 @@ class TestIslandMorph:
         assert "正在听" in win._status_label.text()
 
     def test_partial_text_stays_listen_bar(self, win):
-        from voiceink.ui.floating_window import BAR_EXCERPT_HEIGHT
+        from sayink.ui.floating_window import BAR_EXCERPT_HEIGHT
 
         win.show_listening()
         win.update_partial_text("下一步把这份纪要贴到会议群里。")
@@ -51,7 +51,7 @@ class TestIslandMorph:
         assert stops == [True]
 
     def test_success_keeps_live_transcript_while_listening(self, win):
-        from voiceink.ui.floating_window import BAR_EXCERPT_HEIGHT
+        from sayink.ui.floating_window import BAR_EXCERPT_HEIGHT
 
         win.show_listening()
         win.update_partial_text("done")
@@ -64,7 +64,7 @@ class TestIslandMorph:
         assert win._container.objectName() == "islandContainer"
 
     def test_end_is_ink_primary(self, win):
-        from voiceink.ui import design_tokens as tok
+        from sayink.ui import design_tokens as tok
 
         win.show_listening()
         css = win._end_btn.styleSheet().lower()
@@ -96,7 +96,7 @@ class TestIslandChrome:
 
 class TestHistoryTimeStream:
     def test_history_uses_single_column_stream(self, qapp):
-        from voiceink.ui.history_window import HistoryWindow
+        from sayink.ui.history_window import HistoryWindow
         from tests.test_history_window import FakeHistoryStore
 
         window = HistoryWindow(FakeHistoryStore())
@@ -115,7 +115,7 @@ class TestHistoryTimeStream:
 
 class TestIslandSheetConstants:
     def test_sheet_width_constant(self):
-        from voiceink.ui.island_chrome import ISLAND_SETTINGS_WIDTH
+        from sayink.ui.island_chrome import ISLAND_SETTINGS_WIDTH
 
         assert ISLAND_SHEET_WIDTH >= 440
         assert ISLAND_SHEET_WIDTH <= 560
@@ -135,9 +135,9 @@ class TestIslandSheetGlass:
     def test_settings_dialog_root_is_transparent(self, qapp, tmp_path, monkeypatch):
         from PyQt6.QtWidgets import QWidget
 
-        from voiceink.config import Config
-        from voiceink.ui import design_tokens as tok
-        from voiceink.ui.settings_window import SettingsWindow
+        from sayink.config import Config
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.settings_window import SettingsWindow
 
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
         monkeypatch.setattr(SettingsWindow, "_refresh_about_info", lambda self: None)
@@ -155,8 +155,8 @@ class TestIslandSheetGlass:
     def test_history_dialog_and_right_pane_are_transparent(self, qapp):
         from PyQt6.QtWidgets import QWidget
 
-        from voiceink.ui import design_tokens as tok
-        from voiceink.ui.history_window import HistoryWindow
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.history_window import HistoryWindow
         from tests.test_history_window import FakeHistoryStore
 
         win = HistoryWindow(FakeHistoryStore())

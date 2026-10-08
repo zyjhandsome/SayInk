@@ -22,10 +22,10 @@
 
 ## Impact
 
-- 代码：`voiceink/ui/settings_window.py`、`settings_components.py`、`theme.py`、`settings_styles.py`、`model_card.py`；相关 `tests/test_settings_general.py`、`test_ui_styles.py`、`test_theme_resolve.py`、`test_ui_font.py`
+- 代码：`sayink/ui/settings_window.py`、`settings_components.py`、`theme.py`、`settings_styles.py`、`model_card.py`；相关 `tests/test_settings_general.py`、`test_ui_styles.py`、`test_theme_resolve.py`、`test_ui_font.py`
 - 配置/API：无持久化键变更（默认）
 - 依赖：无新第三方依赖
-- 并行 change：`ui-theme-design-system`、`ui-typography-theme-polish` 已 Complete/verified 未归档，共享 `voiceink/ui/*`（G8 警告，非阻塞）
+- 并行 change：`ui-theme-design-system`、`ui-typography-theme-polish` 已 Complete/verified 未归档，共享 `sayink/ui/*`（G8 警告，非阻塞）
 
 ---
 
@@ -50,7 +50,7 @@
   - 替换 PyQt6；重排设置分页信息架构
   - 持续听写中间结果、系统主题热更新、API Key 钥匙串、`App` 会话状态抽出
   - 像素级截图回归基建；顺手改用户可察视觉残留
-- 禁止修改路径：`voiceink/speech_recognizer.py`、`voiceink/audio_recorder.py`、热键核心逻辑
+- 禁止修改路径：`sayink/speech_recognizer.py`、`sayink/audio_recorder.py`、热键核心逻辑
 
 ## 代码事实
 
@@ -75,17 +75,17 @@
 
 #### 需求与现状冲突
 - 目标「不再角色枚举」与当前 225 行 `viRole` 链冲突，必须删除该链而不是再加角色
-- 与未归档 Complete change 共享 `voiceink/ui/*`（序列风险，G8 警告）
+- 与未归档 Complete change 共享 `sayink/ui/*`（序列风险，G8 警告）
 
 ### 挂载点候选
 | 优先级 | 路径/符号 | 理由 |
 |---|---|---|
-| 必选 | `voiceink/ui/settings_window.py` `SettingsWindow.reapply_theme` | 要删除的角色枚举 |
-| 必选 | `voiceink/ui/settings_components.py` 工厂函数与已有 `reapply_styles` | 换肤责任下沉处 |
-| 必选 | `voiceink/ui/theme.py` `ThemeAware` / `apply_theme` | 既有广播协议 |
+| 必选 | `sayink/ui/settings_window.py` `SettingsWindow.reapply_theme` | 要删除的角色枚举 |
+| 必选 | `sayink/ui/settings_components.py` 工厂函数与已有 `reapply_styles` | 换肤责任下沉处 |
+| 必选 | `sayink/ui/theme.py` `ThemeAware` / `apply_theme` | 既有广播协议 |
 | 必选 | `SettingsWindow._create_general_page` 等四页建造方法 | 拆页挂载 |
 | 必选 | `history_window.py` / `floating_window.py` / `tray_icon.py` 的 `reapply_theme` | Q1=C：四表面同一协议 |
-| 备选 | `voiceink/ui/model_card.py` `ModelCard.reapply_styles` | 已自刷，保持协议一致 |
+| 备选 | `sayink/ui/model_card.py` `ModelCard.reapply_styles` | 已自刷，保持协议一致 |
 | 备选 | `tests/test_settings_general.py` / `test_theme_resolve.py` / `test_ui_styles.py` / `test_floating_window.py` / `test_history_window.py` / `test_tray_icon.py` | 回归 |
 
 ### 波及线索
@@ -110,7 +110,7 @@
 |---|---|---|
 | 事实 | Settings `reapply_theme` 225 行 / cyclo 55 | Memory `get_code_snippet` `SettingsWindow.reapply_theme` |
 | 事实 | History `reapply_theme` 仅 5 行委托绘制 | `HistoryWindow.reapply_theme` |
-| 事实 | `ThemeAware` 已是 Protocol | `voiceink/ui/theme.py` L25–26 |
+| 事实 | `ThemeAware` 已是 Protocol | `sayink/ui/theme.py` L25–26 |
 | 事实 | 部分控件已有 `reapply_styles` | `PageHero` / `ToggleOptionRow` / `ModelCard` 等 |
 | 事实 | 设置双文件各约 1600 行 | 工作区行数：1621 / 1625 |
 | 事实 | 用户选定探索推荐方向 | 会话回复「推荐方向」 |
@@ -125,7 +125,7 @@
 |---|---|---|---|---|---|---|
 | 必选 | Q1 拆分深度？ | 双文件各 ~1600 行；换肤债在 Settings；其它表面已短 | A 只收口 reapply / B 按页拆 + ThemeAware / C B + 四表面 | B | decided | **C**（2026-09-18 用户点选）— 设置按页拆 + 四表面同一 ThemeAware 协议 |
 | 必选 | Q2 视觉验收口径？ | 无像素回归基建 | A 观感一致 / B 像素级 / C 顺手改残留 | A | decided | **A**（2026-09-18 用户点选）— 观感一致，允许非用户可察的 QSS 重组 |
-| 可选 | Q3 未归档 Complete change 是否本变更前 archive？ | 两份 UI change Complete，G8 共享 `voiceink/ui/*` | A 先 archive / B 本变更后另开 / C 用户自行 | B | deferred | 非阻塞；实施期不并行改旧 change |
+| 可选 | Q3 未归档 Complete change 是否本变更前 archive？ | 两份 UI change Complete，G8 共享 `sayink/ui/*` | A 先 archive / B 本变更后另开 / C 用户自行 | B | deferred | 非阻塞；实施期不并行改旧 change |
 
 ### 澄清完整性扫描
 - 已检查的适用维度：使用者（设置窗）；切主题正常态；构造后再切主题的残留；对齐/兼容；验证面；非目标边界

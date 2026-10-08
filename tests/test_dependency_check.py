@@ -3,7 +3,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from voiceink_build.dependency_check import dependency_issues
+from sayink_build.dependency_check import dependency_issues
 
 
 def test_release_engine_below_minimum_is_rejected(tmp_path):
@@ -52,7 +52,7 @@ def test_invalid_build_environment_never_clears_existing_output(monkeypatch):
     prepare = Mock()
     monkeypatch.setattr(build, "_prepare_dist_output_dir", prepare)
     monkeypatch.setattr(
-        "voiceink_build.dependency_check.require_release_dependencies",
+        "sayink_build.dependency_check.require_release_dependencies",
         Mock(side_effect=RuntimeError("invalid dependencies")),
     )
     with pytest.raises(RuntimeError, match="invalid dependencies"):

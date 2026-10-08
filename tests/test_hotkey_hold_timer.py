@@ -5,7 +5,7 @@ from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 from pynput import keyboard
 
-from voiceink.hotkey_manager import (
+from sayink.hotkey_manager import (
     HotKeyManager,
     MIN_HOLD_MS,
     MIN_HOLD_CONTINUOUS_MS,
@@ -95,7 +95,7 @@ def test_short_tap_does_not_start():
     mgr.hotkey_tap_too_short.connect(lambda: short_taps.append(True))
 
     t0 = 1000.0
-    with patch("voiceink.hotkey_manager.time.monotonic", side_effect=[t0, t0 + 0.08, t0 + 0.08]):
+    with patch("sayink.hotkey_manager.time.monotonic", side_effect=[t0, t0 + 0.08, t0 + 0.08]):
         mgr._on_press(keyboard.Key.ctrl_l)
         mgr._on_press(keyboard.Key.space)
         mgr._on_release(keyboard.Key.space)
@@ -115,7 +115,7 @@ def test_ime_flicker_does_not_emit_short_tap():
     mgr.hotkey_tap_too_short.connect(lambda: short_taps.append(True))
 
     t0 = 1000.0
-    with patch("voiceink.hotkey_manager.time.monotonic", side_effect=[t0, t0 + 0.02, t0 + 0.02]):
+    with patch("sayink.hotkey_manager.time.monotonic", side_effect=[t0, t0 + 0.02, t0 + 0.02]):
         mgr._on_press(keyboard.Key.ctrl_l)
         mgr._on_press(keyboard.Key.space)
         mgr._on_release(keyboard.Key.space)

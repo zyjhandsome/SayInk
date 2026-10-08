@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Reconstruct VoiceInk's four UI surfaces into one Spatial Island system while keeping brand tokens, IA page order, and the transcription pipeline unchanged.
+**Goal:** Reconstruct SayInk's four UI surfaces into one Spatial Island system while keeping brand tokens, IA page order, and the transcription pipeline unchanged.
 
 **Architecture:** Shared chrome lives in `island_chrome.py` and `design_tokens.py`. `FloatingWindow` is the capsule/expanded HUD. `SettingsWindow` and `HistoryWindow` are top-center sheets. `TrayIcon` speaks the same status words. `app.py` orchestration stays; only tooltip string maps and UI wiring change.
 
@@ -26,15 +26,15 @@
 
 | File | Role after this plan |
 |------|----------------------|
-| `voiceink/ui/design_tokens.py` | `TRAY_MENU_RADIUS = 8`; float tokens remain the only color axis |
+| `sayink/ui/design_tokens.py` | `TRAY_MENU_RADIUS = 8`; float tokens remain the only color axis |
 | `design-system/MASTER.md` | Float table matches `tokens_for()` |
-| `voiceink/ui/island_chrome.py` | Placement, flags, sheet/capsule QSS, shared close-button QSS |
-| `voiceink/ui/floating_window.py` | Capsule vs expanded hierarchy |
-| `voiceink/ui/settings_window.py` | Pill nav only; about disclosure; inline LLM test; history-limit visibility |
-| `voiceink/ui/settings_pages/*.py` | No `PageHero`; 通用 pill; shorter hints |
-| `voiceink/ui/settings_components.py` | Remove unused `SettingsSidebar` after window stops using it |
-| `voiceink/ui/history_window.py` | Title 历史; chips; secondary export |
-| `voiceink/ui/tray_icon.py` | Capsule-word activity map; radius follows token |
+| `sayink/ui/island_chrome.py` | Placement, flags, sheet/capsule QSS, shared close-button QSS |
+| `sayink/ui/floating_window.py` | Capsule vs expanded hierarchy |
+| `sayink/ui/settings_window.py` | Pill nav only; about disclosure; inline LLM test; history-limit visibility |
+| `sayink/ui/settings_pages/*.py` | No `PageHero`; 通用 pill; shorter hints |
+| `sayink/ui/settings_components.py` | Remove unused `SettingsSidebar` after window stops using it |
+| `sayink/ui/history_window.py` | Title 历史; chips; secondary export |
+| `sayink/ui/tray_icon.py` | Capsule-word activity map; radius follows token |
 | `README.md` | Island status words; 设置 → 通用; 历史 window name |
 | `tests/test_*.py` | Assertions updated with the visual change |
 
@@ -43,7 +43,7 @@
 ### Task 1: Token contract (tray radius + MASTER float)
 
 **Files:**
-- Modify: `voiceink/ui/design_tokens.py` (`TRAY_MENU_RADIUS`)
+- Modify: `sayink/ui/design_tokens.py` (`TRAY_MENU_RADIUS`)
 - Modify: `design-system/MASTER.md` (floating overlay table)
 - Modify: `tests/test_tray_icon.py` (`TRAY_MENU_RADIUS` assertion)
 - Test: `tests/test_theme_resolve.py` (existing float-token test)
@@ -73,7 +73,7 @@ Expected: FAIL on `TRAY_MENU_RADIUS == 8` (still 4).
 
 - [ ] **Step 3: Implement token + MASTER**
 
-In `voiceink/ui/design_tokens.py`:
+In `sayink/ui/design_tokens.py`:
 
 ```python
 TRAY_MENU_RADIUS = 8
@@ -90,7 +90,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add voiceink/ui/design_tokens.py design-system/MASTER.md tests/test_tray_icon.py
+git add sayink/ui/design_tokens.py design-system/MASTER.md tests/test_tray_icon.py
 git commit -m "fix(ui): align island tokens and tray menu radius"
 ```
 
@@ -99,8 +99,8 @@ git commit -m "fix(ui): align island tokens and tray menu radius"
 ### Task 2: Capsule and expanded island hierarchy
 
 **Files:**
-- Modify: `voiceink/ui/floating_window.py`
-- Modify: `voiceink/ui/island_chrome.py` (optional `island_close_css()`)
+- Modify: `sayink/ui/floating_window.py`
+- Modify: `sayink/ui/island_chrome.py` (optional `island_close_css()`)
 - Modify: `tests/test_island_surface.py`
 - Modify: `tests/test_floating_window.py` (`test_error_message_can_expand_window_height`)
 
@@ -114,7 +114,7 @@ Add to `tests/test_island_surface.py` in `TestIslandMorph`:
 
 ```python
     def test_expanded_end_is_only_primary(self, win):
-        from voiceink.ui import design_tokens as tok
+        from sayink.ui import design_tokens as tok
 
         win.show_listening()
         win.expand_live("hello")
@@ -147,7 +147,7 @@ In `tests/test_floating_window.py`, replace `test_error_message_can_expand_windo
     def test_error_stays_capsule_height(self, win):
         win.show_error("识别失败：" + "请检查网络或模型配置。" * 12)
 
-        from voiceink.ui.floating_window import COMPACT_HEIGHT
+        from sayink.ui.floating_window import COMPACT_HEIGHT
 
         assert win.height() <= COMPACT_HEIGHT + 40
         assert win.toolTip()
@@ -193,7 +193,7 @@ Expected: PASS. Existing emit tests for 结束/历史/设置 still pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add voiceink/ui/floating_window.py voiceink/ui/island_chrome.py tests/test_island_surface.py tests/test_floating_window.py
+git add sayink/ui/floating_window.py sayink/ui/island_chrome.py tests/test_island_surface.py tests/test_floating_window.py
 git commit -m "feat(ui): give the expanded island a single primary action"
 ```
 
@@ -202,11 +202,11 @@ git commit -m "feat(ui): give the expanded island a single primary action"
 ### Task 3: Settings chrome (pills, no sidebar, no page heroes)
 
 **Files:**
-- Modify: `voiceink/ui/settings_window.py`
-- Modify: `voiceink/ui/settings_pages/general.py`
-- Modify: `voiceink/ui/settings_pages/model.py`
-- Modify: `voiceink/ui/settings_pages/polish.py`
-- Modify: `voiceink/ui/settings_pages/about.py`
+- Modify: `sayink/ui/settings_window.py`
+- Modify: `sayink/ui/settings_pages/general.py`
+- Modify: `sayink/ui/settings_pages/model.py`
+- Modify: `sayink/ui/settings_pages/polish.py`
+- Modify: `sayink/ui/settings_pages/about.py`
 - Modify: `tests/test_settings_general.py`
 - Modify: `tests/test_ui_styles.py` (`test_sidebar_brand_and_nav_metrics`)
 
@@ -233,8 +233,8 @@ In `tests/test_ui_styles.py` class `TestSidebarVisualContracts`, replace `test_s
     def test_settings_island_nav_has_no_sidebar(self, tmp_path, monkeypatch):
         import sys
         from PyQt6.QtWidgets import QApplication
-        from voiceink.config import Config
-        from voiceink.ui.settings_window import SettingsWindow
+        from sayink.config import Config
+        from sayink.ui.settings_window import SettingsWindow
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -259,7 +259,7 @@ Expected: FAIL (`_island_nav[0]` is still `录音`, `_sidebar` still exists).
 - [ ] **Step 3: Implement chrome**
 
 1. In `settings_window.py` `_setup_ui`, change the pill tuple to `("通用", "引擎", "润色", "关于")`.
-2. Delete `self._sidebar = SettingsSidebar(...)` and `self._sidebar.hide()`. Delete `from voiceink.ui.settings_components import SettingsSidebar` if unused.
+2. Delete `self._sidebar = SettingsSidebar(...)` and `self._sidebar.hide()`. Delete `from sayink.ui.settings_components import SettingsSidebar` if unused.
 3. `_on_island_nav` only calls `_on_nav_changed(row)`.
 4. `_open_about_from_general`: `self._on_island_nav(3)` only.
 5. Remove the `for hero_name in (...)` reapply loop if heroes are gone.
@@ -276,7 +276,7 @@ Expected: PASS. `test_general_stacks_three_sections_top_to_bottom` still finds �
 - [ ] **Step 5: Commit**
 
 ```bash
-git add voiceink/ui/settings_window.py voiceink/ui/settings_pages voiceink/ui/settings_components.py tests/test_settings_general.py tests/test_ui_styles.py
+git add sayink/ui/settings_window.py sayink/ui/settings_pages sayink/ui/settings_components.py tests/test_settings_general.py tests/test_ui_styles.py
 git commit -m "feat(ui): use island pills for settings and drop the sidebar"
 ```
 
@@ -285,9 +285,9 @@ git commit -m "feat(ui): use island pills for settings and drop the sidebar"
 ### Task 4: Settings content (hints, history limits, about, polish test)
 
 **Files:**
-- Modify: `voiceink/ui/settings_pages/general.py`
-- Modify: `voiceink/ui/settings_pages/about.py`
-- Modify: `voiceink/ui/settings_window.py` (`_refresh_about_info`, `_on_history_enabled_toggled`, `_sync_source_device_widgets`, `_test_llm`, `_on_test_done`)
+- Modify: `sayink/ui/settings_pages/general.py`
+- Modify: `sayink/ui/settings_pages/about.py`
+- Modify: `sayink/ui/settings_window.py` (`_refresh_about_info`, `_on_history_enabled_toggled`, `_sync_source_device_widgets`, `_test_llm`, `_on_test_done`)
 - Test: `tests/test_settings_general.py` (extend)
 
 **Interfaces:**
@@ -343,7 +343,7 @@ Expected: FAIL (`_set_history_limit_rows_visible` missing and/or callout always 
 
 3. Add `_set_history_limit_rows_visible(self, visible: bool)` that sets both spin rows visible. Call it from `_load_settings` and `_on_history_enabled_toggled`.
 
-4. About: keep VoiceInk + version. In `_refresh_about_info`, append only 当前模型 / 快捷键 / 润色. Put 已下载 / 模型目录 / 配置文件 inside a `QWidget` `#aboutPaths` under a checkable `QPushButton`「文件位置」(objectName `aboutPathsToggle`), default unchecked/hidden.
+4. About: keep SayInk + version. In `_refresh_about_info`, append only 当前模型 / 快捷键 / 润色. Put 已下载 / 模型目录 / 配置文件 inside a `QWidget` `#aboutPaths` under a checkable `QPushButton`「文件位置」(objectName `aboutPathsToggle`), default unchecked/hidden.
 
 5. Polish: add `win._llm_test_status = QLabel("")` under the model row. `_test_llm` incomplete fields → set that label to「请填写完整的接口信息。」and return (no `QMessageBox`). `_on_test_done`: success「连接正常，可以使用。」; failure `w.msg`. Keep `QMessageBox` only if some other caller still needs it; this path must be inline.
 
@@ -356,7 +356,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add voiceink/ui/settings_pages/general.py voiceink/ui/settings_pages/about.py voiceink/ui/settings_window.py tests/test_settings_general.py
+git add sayink/ui/settings_pages/general.py sayink/ui/settings_pages/about.py sayink/ui/settings_window.py tests/test_settings_general.py
 git commit -m "feat(ui): tighten settings hierarchy and inline polish test"
 ```
 
@@ -365,7 +365,7 @@ git commit -m "feat(ui): tighten settings hierarchy and inline polish test"
 ### Task 5: History island
 
 **Files:**
-- Modify: `voiceink/ui/history_window.py`
+- Modify: `sayink/ui/history_window.py`
 - Modify: `tests/test_history_window.py`
 - Modify: `tests/test_island_surface.py` (`TestHistoryTimeStream`)
 - Modify: `tests/test_theme_resolve.py` (title still exists; do not require 22px)
@@ -384,8 +384,8 @@ def test_history_chrome_copy(qapp):
     try:
         assert window._title_label.text() == "历史"
         assert window._search_edit.placeholderText() == "搜索转写内容"
-        from voiceink.ui import settings_styles as ss
-        from voiceink.ui import design_tokens as tok
+        from sayink.ui import settings_styles as ss
+        from sayink.ui import design_tokens as tok
         assert tok.ACCENT.lower() not in window._export_btn.styleSheet().lower() or (
             ss.BTN_PRIMARY not in (window._export_btn.styleSheet(),)
         )
@@ -435,7 +435,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add voiceink/ui/history_window.py tests/test_history_window.py tests/test_island_surface.py tests/test_theme_resolve.py
+git add sayink/ui/history_window.py tests/test_history_window.py tests/test_island_surface.py tests/test_theme_resolve.py
 git commit -m "feat(ui): rebuild history as a readable island sheet"
 ```
 
@@ -444,14 +444,14 @@ git commit -m "feat(ui): rebuild history as a readable island sheet"
 ### Task 6: Tray words, README, regression
 
 **Files:**
-- Modify: `voiceink/ui/tray_icon.py` (`set_activity_tooltip` map only)
+- Modify: `sayink/ui/tray_icon.py` (`set_activity_tooltip` map only)
 - Modify: `README.md` (status words + 历史窗名)
 - Modify: `tests/test_readme_features.py` only if it snapshots the changed sentences
 - Test: `tests/test_tray_icon.py`
 
 **Interfaces:**
 - Consumes: `TrayIcon.set_activity_tooltip(self, state: str | None) -> None` keys: `recording`, `recognizing`, `polishing`, `listening`, `loading`
-- Produces: tooltip strings `VoiceInk - 录音中` / `VoiceInk - 正在识别` / `VoiceInk - 润色中` / `VoiceInk - 正在听` / `VoiceInk - 模型载入中`. Idle tooltip unchanged (`VoiceInk - {status_summary}`). Do not change `app.py` call sites.
+- Produces: tooltip strings `SayInk - 录音中` / `SayInk - 正在识别` / `SayInk - 润色中` / `SayInk - 正在听` / `SayInk - 模型载入中`. Idle tooltip unchanged (`SayInk - {status_summary}`). Do not change `app.py` call sites.
 
 - [ ] **Step 1: Write failing test**
 
@@ -461,13 +461,13 @@ Add to `tests/test_tray_icon.py`:
     def test_activity_tooltip_uses_capsule_words(self, tray):
         tray.set_status_summary("就绪")
         tray.set_activity_tooltip("listening")
-        assert tray.toolTip() == "VoiceInk - 正在听"
+        assert tray.toolTip() == "SayInk - 正在听"
         tray.set_activity_tooltip("recognizing")
-        assert tray.toolTip() == "VoiceInk - 正在识别"
+        assert tray.toolTip() == "SayInk - 正在识别"
         tray.set_activity_tooltip("loading")
-        assert tray.toolTip() == "VoiceInk - 模型载入中"
+        assert tray.toolTip() == "SayInk - 模型载入中"
         tray.set_activity_tooltip(None)
-        assert tray.toolTip() == "VoiceInk - 就绪"
+        assert tray.toolTip() == "SayInk - 就绪"
 ```
 
 - [ ] **Step 2: Run to verify fail**
@@ -513,7 +513,7 @@ Manual smoke (do not skip when executing): start app → wait 模型载入中 �
 - [ ] **Step 5: Commit**
 
 ```bash
-git add voiceink/ui/tray_icon.py README.md tests/test_tray_icon.py tests/test_readme_features.py
+git add sayink/ui/tray_icon.py README.md tests/test_tray_icon.py tests/test_readme_features.py
 git commit -m "fix(ui): use capsule status words in the tray and README"
 ```
 

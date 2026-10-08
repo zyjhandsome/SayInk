@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from voiceink.vad_segmenter import SpeechSegmenter, SPEECH_RMS_THRESHOLD
+from sayink.vad_segmenter import SpeechSegmenter, SPEECH_RMS_THRESHOLD
 
 
 def _tone(duration_sec: float, amplitude: float = 0.5, rate: int = 16000) -> np.ndarray:
@@ -114,7 +114,7 @@ class TestAdaptiveNoiseFloor:
         assert seg.effective_threshold == pytest.approx(0.0075, rel=0.1)
 
     def test_gate_never_lifts_past_the_cap(self):
-        from voiceink.vad_segmenter import ADAPTIVE_THRESHOLD_CAP
+        from sayink.vad_segmenter import ADAPTIVE_THRESHOLD_CAP
 
         seg = SpeechSegmenter(speech_threshold=0.002)
         seg.feed(_tone(1.0, 0.05))

@@ -2,8 +2,8 @@ import json
 
 import pytest
 
-from voiceink.config import Config, format_hotkey, DEFAULT_CONFIG
-from voiceink.speech_recognizer import DEFAULT_MODEL_ID
+from sayink.config import Config, format_hotkey, DEFAULT_CONFIG
+from sayink.speech_recognizer import DEFAULT_MODEL_ID
 
 
 class TestFormatHotkey:
@@ -181,7 +181,7 @@ class TestConfigRegistrySync:
 
 
 def test_reserved_hotkeys_are_detected_regardless_of_order():
-    from voiceink.config import is_reserved_hotkey
+    from sayink.config import is_reserved_hotkey
 
     assert is_reserved_hotkey("ctrl+c")
     assert is_reserved_hotkey("C+Ctrl")
@@ -195,7 +195,7 @@ def test_esc_stops_continuous_defaults_on(config):
 
 
 def test_unreadable_config_is_backed_up_before_defaults_are_saved(config_home):
-    from voiceink.config import Config
+    from sayink.config import Config
 
     broken = '{"llm": {"api_key": "sk-keep-me"'
     (config_home / "config.json").write_text(broken, encoding="utf-8")
@@ -210,7 +210,7 @@ def test_unreadable_config_is_backed_up_before_defaults_are_saved(config_home):
 
 
 def test_non_object_config_is_treated_as_unreadable(config_home):
-    from voiceink.config import Config
+    from sayink.config import Config
 
     (config_home / "config.json").write_text("[1, 2]", encoding="utf-8")
     cfg = Config(config_dir=config_home)
@@ -222,7 +222,7 @@ def test_scalar_in_place_of_section_falls_back_to_section_defaults(config_home):
     """F-24: ``"stt": "abc"`` used to survive the merge and crash ``_migrate_stt_model``."""
     import json
 
-    from voiceink.config import DEFAULT_CONFIG, Config
+    from sayink.config import DEFAULT_CONFIG, Config
 
     (config_home / "config.json").write_text(
         json.dumps({"stt": "abc", "history": "on", "hotkey": "alt+space"}),
@@ -273,7 +273,7 @@ def _write_config(config_home, data):
 
 def test_api_key_in_file_is_migrated_to_credential_store(config_home):
     import json
-    from voiceink.config import Config
+    from sayink.config import Config
 
     _write_config(config_home, {"llm": {"api_key": "sk-old"}})
     secrets = _FakeSecrets()
@@ -287,7 +287,7 @@ def test_api_key_in_file_is_migrated_to_credential_store(config_home):
 
 def test_setting_api_key_writes_store_not_file(config_home):
     import json
-    from voiceink.config import Config
+    from sayink.config import Config
 
     secrets = _FakeSecrets()
     cfg = Config(config_dir=config_home, secret_store=secrets)
@@ -306,7 +306,7 @@ def _key_on_disk(config_home) -> str:
 
 
 def test_store_write_failure_keeps_key_in_memory_only(config_home):
-    from voiceink.config import Config
+    from sayink.config import Config
 
     secrets = _FakeSecrets(fail_write=True)
     cfg = Config(config_dir=config_home, secret_store=secrets)
@@ -320,7 +320,7 @@ def test_store_write_failure_keeps_key_in_memory_only(config_home):
 
 
 def test_store_write_retried_after_failure_clears_warning(config_home):
-    from voiceink.config import Config
+    from sayink.config import Config
 
     secrets = _FakeSecrets(fail_write=True)
     cfg = Config(config_dir=config_home, secret_store=secrets)
@@ -333,7 +333,7 @@ def test_store_write_retried_after_failure_clears_warning(config_home):
 
 
 def test_unreadable_store_keeps_file_key(config_home):
-    from voiceink.config import Config
+    from sayink.config import Config
 
     _write_config(config_home, {"llm": {"api_key": "sk-file"}})
     cfg = Config(config_dir=config_home, secret_store=_FakeSecrets(unreadable=True))
@@ -341,7 +341,7 @@ def test_unreadable_store_keeps_file_key(config_home):
 
 
 def test_unreadable_store_never_writes_new_key_to_file(config_home):
-    from voiceink.config import Config
+    from sayink.config import Config
 
     secrets = _FakeSecrets(unreadable=True, fail_write=True)
     cfg = Config(config_dir=config_home, secret_store=secrets)
@@ -353,7 +353,7 @@ def test_unreadable_store_never_writes_new_key_to_file(config_home):
 
 
 def test_replacing_legacy_file_key_removes_plaintext_even_if_store_fails(config_home):
-    from voiceink.config import Config
+    from sayink.config import Config
 
     _write_config(config_home, {"llm": {"api_key": "sk-legacy"}})
     cfg = Config(config_dir=config_home, secret_store=_FakeSecrets(fail_write=True))
@@ -367,8 +367,8 @@ def test_replacing_legacy_file_key_removes_plaintext_even_if_store_fails(config_
 
 
 def test_isolated_config_dir_does_not_use_credential_store(config_home, monkeypatch):
-    from voiceink.config import Config
+    from sayink.config import Config
 
-    monkeypatch.setattr("voiceink.config.default_secret_store", lambda: _FakeSecrets("sk-real"))
+    monkeypatch.setattr("sayink.config.default_secret_store", lambda: _FakeSecrets("sk-real"))
     cfg = Config(config_dir=config_home)
     assert cfg.get("llm.api_key") == ""

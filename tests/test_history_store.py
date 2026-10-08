@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from voiceink.history_store import HistoryStore, SegmentRecord
+from sayink.history_store import HistoryStore, SegmentRecord
 
 
 def _record(
@@ -100,7 +100,7 @@ class TestCleanup:
     def test_cleanup_by_age_uses_session_min_created_at(self, store, monkeypatch):
         now_ms = 1_000_000_000_000
         monkeypatch.setattr(
-            "voiceink.history_store.time.time",
+            "sayink.history_store.time.time",
             lambda: now_ms / 1000.0,
         )
         # Session age = MIN(created_at); keep whole session or delete whole.
@@ -225,7 +225,7 @@ class TestFailureIsolation:
 
     def test_writer_failure_notifies_failed_callback(self, store, monkeypatch):
         """F-21: a failed write is reported (once per failure) instead of only logged."""
-        from voiceink.history_store import WRITE_FAILED_NOTICE
+        from sayink.history_store import WRITE_FAILED_NOTICE
 
         def boom(_conn, _record):
             raise sqlite3.OperationalError("disk I/O error")

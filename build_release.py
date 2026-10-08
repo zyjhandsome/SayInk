@@ -2,14 +2,14 @@
 One-shot Windows release build: PyInstaller → Inno Setup → remove staging.
 
 Final artifact (for distribution):
-  dist/VoiceInk-Setup-<version>.exe  (version in voiceink/version.py)
+  dist/SayInk-Setup-<version>.exe  (version in sayink/version.py)
 
-The unpacked folder dist/VoiceInk/ is only an intermediate step and is
+The unpacked folder dist/SayInk/ is only an intermediate step and is
 removed after the installer is built (unless --keep-staging).
 
 Usage:
   python build_release.py
-  python build_release.py --keep-staging    # keep dist/VoiceInk for debugging
+  python build_release.py --keep-staging    # keep dist/SayInk for debugging
 """
 
 import argparse
@@ -21,21 +21,21 @@ ROOT = Path(__file__).parent.resolve()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build VoiceInk Windows installer (single EXE output).")
+    parser = argparse.ArgumentParser(description="Build SayInk Windows installer (single EXE output).")
     parser.add_argument(
         "--keep-staging",
         action="store_true",
-        help="Do not delete dist/VoiceInk after the installer succeeds.",
+        help="Do not delete dist/SayInk after the installer succeeds.",
     )
     args = parser.parse_args()
 
-    print("Step 1/2: PyInstaller (dist/VoiceInk/) …")
+    print("Step 1/2: PyInstaller (dist/SayInk/) …")
     r = subprocess.run([sys.executable, str(ROOT / "build.py")], cwd=ROOT)
     if r.returncode != 0:
         sys.exit(r.returncode)
 
     print()
-    print("Step 2/2: Inno Setup (dist/VoiceInk-Setup-<version>.exe) …")
+    print("Step 2/2: Inno Setup (dist/SayInk-Setup-<version>.exe) …")
     inst_cmd = [sys.executable, str(ROOT / "installer" / "build_installer.py")]
     if args.keep_staging:
         inst_cmd.append("--keep-staging")

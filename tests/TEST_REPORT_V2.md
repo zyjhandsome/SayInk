@@ -1,4 +1,4 @@
-# VoiceInk 语音转文字软件 - 完整测试验证报告
+# SayInk 语音转文字软件 - 完整测试验证报告
 
 > 历史报告：以下结论针对 1.3.0，不能作为当前版本的验收依据。当前可靠性优化和验证记录见 [2026-10-08 记录](../docs/reliability-first-pass.md)。
 
@@ -12,7 +12,7 @@
 ## 一、项目概述
 
 ### 1.1 项目简介
-VoiceInk 是一款基于本地离线 ASR 模型（sherpa-onnx）的语音转文字桌面工具，支持按住快捷键说话、松开后自动将语音转为文字并粘贴到光标位置。
+SayInk 是一款基于本地离线 ASR 模型（sherpa-onnx）的语音转文字桌面工具，支持按住快捷键说话、松开后自动将语音转为文字并粘贴到光标位置。
 
 ### 1.2 技术栈
 | 组件 | 技术 | 用途 |
@@ -490,7 +490,7 @@ pytest tests/test_config.py -v
 pytest tests/test_speech_recognizer.py -v
 
 # 生成覆盖率报告
-pytest tests/ --cov=voiceink --cov-report=html
+pytest tests/ --cov=sayink --cov-report=html
 ```
 
 ---
@@ -533,7 +533,7 @@ pytest tests/ --cov=voiceink --cov-report=html
 ```
 ╔══════════════════════════════════════════════════════════╗
 ║                                                          ║
-║   VoiceInk 代码质量评级: 优秀 (A)                        ║
+║   SayInk 代码质量评级: 优秀 (A)                        ║
 ║                                                          ║
 ║   综合评分: 4.89/5                                        ║
 ║                                                          ║

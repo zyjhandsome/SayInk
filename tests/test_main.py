@@ -1,4 +1,4 @@
-"""Tests for single-instance locking and crash hooks (voiceink/main.py)."""
+"""Tests for single-instance locking and crash hooks (sayink/main.py)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import types
 
 import pytest
 
-import voiceink.main as main
+import sayink.main as main
 
 
 @pytest.fixture
@@ -24,7 +24,7 @@ class TestFileLockFallback:
     def test_first_instance_acquires_lock(self, monkeypatch, temp_lock):
         monkeypatch.setattr(main.sys, "platform", "linux")
         assert main.check_single_instance() is True
-        assert (temp_lock / "voiceink.lock").exists()
+        assert (temp_lock / "sayink.lock").exists()
 
     def test_second_instance_blocked_when_pid_alive(self, monkeypatch, temp_lock):
         monkeypatch.setattr(main.sys, "platform", "linux")
@@ -34,7 +34,7 @@ class TestFileLockFallback:
         monkeypatch.setattr(main.os, "kill", lambda _pid, _sig: None)
         assert main.check_single_instance() is True
         # A living PID (our own) in the lock → second check refuses to start.
-        (temp_lock / "voiceink.lock").write_text(str(__import__("os").getpid()))
+        (temp_lock / "sayink.lock").write_text(str(__import__("os").getpid()))
         assert main.check_single_instance() is False
 
     def test_stale_pid_allows_start(self, monkeypatch, temp_lock):
@@ -44,15 +44,15 @@ class TestFileLockFallback:
             raise OSError("no such process")
 
         monkeypatch.setattr(main.os, "kill", _dead_pid)
-        (temp_lock / "voiceink.lock").write_text("999999")
+        (temp_lock / "sayink.lock").write_text("999999")
         assert main.check_single_instance() is True
 
     def test_cleanup_removes_lock_file(self, monkeypatch, temp_lock):
         monkeypatch.setattr(main.sys, "platform", "linux")
         main.check_single_instance()
-        assert (temp_lock / "voiceink.lock").exists()
+        assert (temp_lock / "sayink.lock").exists()
         main.cleanup_lock()
-        assert not (temp_lock / "voiceink.lock").exists()
+        assert not (temp_lock / "sayink.lock").exists()
 
 
 class TestWindowsMutex:
@@ -95,11 +95,11 @@ class TestLogging:
         saved = root.handlers[:]
         try:
             path = main.setup_logging(str(tmp_path))
-            logging.getLogger("VoiceInk").info("落盘测试")
+            logging.getLogger("SayInk").info("落盘测试")
             for handler in root.handlers:
                 handler.flush()
             assert path is not None
-            assert "落盘测试" in (tmp_path / "voiceink.log").read_text(encoding="utf-8")
+            assert "落盘测试" in (tmp_path / "sayink.log").read_text(encoding="utf-8")
             assert (tmp_path / "crash.log").exists()
         finally:
             import faulthandler
@@ -138,7 +138,7 @@ class TestLogging:
 
 class TestActivation:
     def test_second_instance_reaches_running_server(self, _qapp_session, monkeypatch):
-        monkeypatch.setattr(main, "activation_server_name", lambda: "VoiceInk-activate-test")
+        monkeypatch.setattr(main, "activation_server_name", lambda: "SayInk-activate-test")
         calls = []
         server = main.start_activation_server(lambda: calls.append("show"))
         assert server is not None
@@ -164,13 +164,13 @@ class TestActivation:
             server.close()
 
     def test_no_running_server_returns_false(self, _qapp_session, monkeypatch):
-        monkeypatch.setattr(main, "activation_server_name", lambda: "VoiceInk-activate-none")
+        monkeypatch.setattr(main, "activation_server_name", lambda: "SayInk-activate-none")
         assert main._activate_running_instance() is False
 
 
 class TestExceptionHooks:
     def test_hooks_installed(self):
-        log = logging.getLogger("VoiceInk-test-hooks")
+        log = logging.getLogger("SayInk-test-hooks")
         main._install_exception_hooks(log)
         import sys as _sys
         import threading as _threading
@@ -179,7 +179,7 @@ class TestExceptionHooks:
         assert _threading.excepthook is not None
 
     def test_excepthook_logs_non_keyboard_interrupt(self, caplog):
-        log = logging.getLogger("VoiceInk-test-hooks2")
+        log = logging.getLogger("SayInk-test-hooks2")
         main._install_exception_hooks(log)
         import sys as _sys
 
@@ -191,7 +191,7 @@ class TestExceptionHooks:
         assert any("未捕获异常" in r.message for r in caplog.records)
 
     def test_threading_hook_ignores_system_exit(self):
-        log = logging.getLogger("VoiceInk-test-hooks3")
+        log = logging.getLogger("SayInk-test-hooks3")
         main._install_exception_hooks(log)
         import threading as _threading
 

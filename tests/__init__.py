@@ -1,1 +1,1 @@
-# VoiceInk Test Suite
+# SayInk Test Suite

@@ -3,7 +3,7 @@
 ## 范围与状态
 - 状态源：`openspec/changes/ui-typography-theme-polish/`
 - 风险/闸门：Standard / medium；规格闸门与实现闸门均已用户放行（含 `W-g8-overlap-ui-theme`）
-- 提交/差异：工作区未提交；涉及 `voiceink/ui/*`、`design-system/MASTER.md`、`tests/test_ui_font.py`
+- 提交/差异：工作区未提交；涉及 `sayink/ui/*`、`design-system/MASTER.md`、`tests/test_ui_font.py`
 
 ## 运行与静态证据
 | 时间 | 命令/动作 | 退出码/结果 | 失败数 | 覆盖范围 |

@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from voiceink.sound_manager import SoundManager
+from sayink.sound_manager import SoundManager
 
 
 class TestSoundManagerConstants:

@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from voiceink.text_polisher import (
+from sayink.text_polisher import (
     INSECURE_URL_ERROR,
     POLISH_PROMPT,
     PolishWorker,
@@ -110,13 +110,13 @@ class TestPolishPrompt:
 
 class TestPolishPromptOnly:
     def test_build_polish_uses_default_prompt(self):
-        from voiceink.text_polisher import LLM_MODE_POLISH, build_system_prompt
+        from sayink.text_polisher import LLM_MODE_POLISH, build_system_prompt
 
         prompt = build_system_prompt(LLM_MODE_POLISH, custom_prompt="")
         assert prompt == POLISH_PROMPT
 
     def test_translate_mode_constant_removed(self):
-        import voiceink.text_polisher as tp
+        import sayink.text_polisher as tp
 
         assert not hasattr(tp, "LLM_MODE_TRANSLATE")
         assert not hasattr(tp, "TRANSLATE_PROMPT_TEMPLATE")
@@ -464,18 +464,18 @@ class TestPolishSettingsComplete:
         ],
     )
     def test_local_endpoints_work_without_key(self, url):
-        from voiceink.text_polisher import polish_settings_complete
+        from sayink.text_polisher import polish_settings_complete
 
         assert polish_settings_complete(url, "", "local-model") is True
 
     def test_remote_endpoint_still_requires_key(self):
-        from voiceink.text_polisher import polish_settings_complete
+        from sayink.text_polisher import polish_settings_complete
 
         assert polish_settings_complete("https://api.deepseek.com/v1", "", "deepseek-chat") is False
         assert polish_settings_complete("https://api.deepseek.com/v1", "sk", "deepseek-chat") is True
 
     def test_url_and_model_always_required(self):
-        from voiceink.text_polisher import polish_settings_complete
+        from sayink.text_polisher import polish_settings_complete
 
         assert polish_settings_complete("", "sk", "m") is False
         assert polish_settings_complete("http://localhost:11434/v1", "", "") is False

@@ -2,7 +2,7 @@
 
 from io import BytesIO
 
-from voiceink.updater import (
+from sayink.updater import (
     ReleaseInfo,
     download_installer,
     is_newer,
@@ -24,29 +24,29 @@ class TestReleaseSelection:
         info = release_from_payload(
             _payload(
                 "2.0.6",
-                "VoiceInk-Setup-2.0.6.exe",
-                "https://github.com/zyjhandsome/VoiceInk/releases/download/v2.0.6/VoiceInk-Setup-2.0.6.exe",
+                "SayInk-Setup-2.0.6.exe",
+                "https://github.com/zyjhandsome/SayInk/releases/download/v2.0.6/SayInk-Setup-2.0.6.exe",
             ),
             current="2.0.5",
         )
         assert info == ReleaseInfo(
             version="2.0.6",
-            asset_name="VoiceInk-Setup-2.0.6.exe",
-            asset_url="https://github.com/zyjhandsome/VoiceInk/releases/download/v2.0.6/VoiceInk-Setup-2.0.6.exe",
+            asset_name="SayInk-Setup-2.0.6.exe",
+            asset_url="https://github.com/zyjhandsome/SayInk/releases/download/v2.0.6/SayInk-Setup-2.0.6.exe",
         )
 
     def test_same_or_older_release_is_not_an_update(self):
         payload = _payload(
             "2.0.5",
-            "VoiceInk-Setup-2.0.5.exe",
-            "https://github.com/zyjhandsome/VoiceInk/releases/download/v2.0.5/VoiceInk-Setup-2.0.5.exe",
+            "SayInk-Setup-2.0.5.exe",
+            "https://github.com/zyjhandsome/SayInk/releases/download/v2.0.5/SayInk-Setup-2.0.5.exe",
         )
         assert release_from_payload(payload, current="2.0.5") is None
         assert not is_newer("2.0.4", "2.0.5")
 
     def test_untrusted_asset_url_is_ignored(self):
         info = release_from_payload(
-            _payload("9.0.0", "VoiceInk-Setup-9.0.0.exe", "http://example.com/setup.exe"),
+            _payload("9.0.0", "SayInk-Setup-9.0.0.exe", "http://example.com/setup.exe"),
             current="2.0.5",
         )
         assert info is None
@@ -54,7 +54,7 @@ class TestReleaseSelection:
 
     # F-23: two-part tags and version-bound installer fallback.
     def test_two_part_tag_is_compared_as_patch_zero(self):
-        from voiceink.updater import version_key
+        from sayink.updater import version_key
 
         assert version_key("v1.2") == (1, 2, 0)
         assert is_newer("1.2", "1.1.9")
@@ -62,12 +62,12 @@ class TestReleaseSelection:
         assert is_newer("1.2.1", "v1.2")
 
     def test_fallback_installer_must_carry_the_release_version(self):
-        from voiceink.updater import pick_installer_asset
+        from sayink.updater import pick_installer_asset
 
-        base = "https://github.com/zyjhandsome/VoiceInk/releases/download/v2.0.7/"
-        stale = {"name": "VoiceInk-Setup-2.0.6.exe", "browser_download_url": base + "VoiceInk-Setup-2.0.6.exe"}
-        arch = {"name": "VoiceInk-Setup-2.0.7-x64.exe", "browser_download_url": base + "VoiceInk-Setup-2.0.7-x64.exe"}
-        exact = {"name": "VoiceInk-Setup-2.0.7.exe", "browser_download_url": base + "VoiceInk-Setup-2.0.7.exe"}
+        base = "https://github.com/zyjhandsome/SayInk/releases/download/v2.0.7/"
+        stale = {"name": "SayInk-Setup-2.0.6.exe", "browser_download_url": base + "SayInk-Setup-2.0.6.exe"}
+        arch = {"name": "SayInk-Setup-2.0.7-x64.exe", "browser_download_url": base + "SayInk-Setup-2.0.7-x64.exe"}
+        exact = {"name": "SayInk-Setup-2.0.7.exe", "browser_download_url": base + "SayInk-Setup-2.0.7.exe"}
 
         assert pick_installer_asset([stale], "2.0.7") is None
         assert pick_installer_asset([stale, arch], "2.0.7") is arch
@@ -107,9 +107,9 @@ class TestDownload:
         import hashlib
 
         seen = []
-        dest = tmp_path / "VoiceInk-Setup-2.0.6.exe"
+        dest = tmp_path / "SayInk-Setup-2.0.6.exe"
         download_installer(
-            "https://github.com/zyjhandsome/VoiceInk/releases/download/v2.0.6/VoiceInk-Setup-2.0.6.exe",
+            "https://github.com/zyjhandsome/SayInk/releases/download/v2.0.6/SayInk-Setup-2.0.6.exe",
             dest,
             lambda *_args, **_kwargs: _Response(),
             on_progress=lambda got, total: seen.append((got, total)),
@@ -136,7 +136,7 @@ def _response(body: bytes, length: int | None = None):
     return lambda *_a, **_k: _Response()
 
 
-_URL = "https://github.com/zyjhandsome/VoiceInk/releases/download/v2.0.9/VoiceInk-Setup-2.0.9.exe"
+_URL = "https://github.com/zyjhandsome/SayInk/releases/download/v2.0.9/SayInk-Setup-2.0.9.exe"
 
 
 class TestInstallerVerification:
@@ -145,7 +145,7 @@ class TestInstallerVerification:
         from unittest.mock import Mock
 
         body = b"verified installer"
-        dest = tmp_path / "VoiceInk-Setup-2.0.9.exe"
+        dest = tmp_path / "SayInk-Setup-2.0.9.exe"
         dest.write_bytes(body)
         opened = Mock(side_effect=AssertionError("must reuse the verified file"))
         progress = []
@@ -163,7 +163,7 @@ class TestInstallerVerification:
         from unittest.mock import Mock
 
         body = b"verified installer"
-        dest = tmp_path / "VoiceInk-Setup-2.0.9.exe"
+        dest = tmp_path / "SayInk-Setup-2.0.9.exe"
         dest.write_bytes(b"x" * len(body))
         opened = Mock(side_effect=_response(body))
         download_installer(
@@ -176,9 +176,9 @@ class TestInstallerVerification:
     def test_existing_installer_never_bypasses_required_digest(self, tmp_path):
         import pytest
         from unittest.mock import Mock
-        from voiceink.updater import MissingDigestError
+        from sayink.updater import MissingDigestError
 
-        dest = tmp_path / "VoiceInk-Setup-2.0.9.exe"
+        dest = tmp_path / "SayInk-Setup-2.0.9.exe"
         dest.write_bytes(b"unverified installer")
         opened = Mock()
         with pytest.raises(MissingDigestError):
@@ -186,7 +186,7 @@ class TestInstallerVerification:
         opened.assert_not_called()
 
     def test_release_carries_size_and_sha256_digest(self):
-        payload = _payload("2.0.9", "VoiceInk-Setup-2.0.9.exe", _URL)
+        payload = _payload("2.0.9", "SayInk-Setup-2.0.9.exe", _URL)
         payload["assets"][0]["size"] = 1234
         payload["assets"][0]["digest"] = "sha256:" + "ab" * 32
         info = release_from_payload(payload, current="2.0.8")
@@ -194,33 +194,33 @@ class TestInstallerVerification:
         assert info.sha256 == "ab" * 32
 
     def test_malformed_digest_is_ignored(self):
-        payload = _payload("2.0.9", "VoiceInk-Setup-2.0.9.exe", _URL)
+        payload = _payload("2.0.9", "SayInk-Setup-2.0.9.exe", _URL)
         payload["assets"][0]["digest"] = "md5:xyz"
         assert release_from_payload(payload, current="2.0.8").sha256 == ""
 
     def test_truncated_download_is_rejected_and_leaves_no_file(self, tmp_path):
         import pytest
-        from voiceink.updater import InstallerVerificationError
+        from sayink.updater import InstallerVerificationError
 
-        dest = tmp_path / "VoiceInk-Setup-2.0.9.exe"
+        dest = tmp_path / "SayInk-Setup-2.0.9.exe"
         with pytest.raises(InstallerVerificationError, match="不完整"):
             download_installer(_URL, dest, _response(b"half", length=100), sha256="00" * 32)
         assert not dest.exists()
-        assert not (tmp_path / "VoiceInk-Setup-2.0.9.exe.part").exists()
+        assert not (tmp_path / "SayInk-Setup-2.0.9.exe.part").exists()
 
     def test_missing_digest_is_rejected_before_downloading(self, tmp_path):
         import pytest
-        from voiceink.updater import MissingDigestError
+        from sayink.updater import MissingDigestError
 
         opened = []
-        dest = tmp_path / "VoiceInk-Setup-2.0.9.exe"
+        dest = tmp_path / "SayInk-Setup-2.0.9.exe"
         with pytest.raises(MissingDigestError):
             download_installer(_URL, dest, lambda *a, **k: opened.append(a), sha256="")
         assert opened == []
         assert not dest.exists()
 
     def test_worker_reports_missing_digest_distinctly(self, tmp_path):
-        from voiceink.updater import MISSING_DIGEST_MESSAGE, UpdateDownloadWorker
+        from sayink.updater import MISSING_DIGEST_MESSAGE, UpdateDownloadWorker
 
         worker = UpdateDownloadWorker(_URL, tmp_path / "x.exe", sha256="")
         failures = []
@@ -230,24 +230,24 @@ class TestInstallerVerification:
 
     def test_app_does_not_start_download_without_digest(self):
         from tests.helpers.app_harness import app_harness
-        from voiceink.updater import MISSING_DIGEST_MESSAGE, ReleaseInfo
+        from sayink.updater import MISSING_DIGEST_MESSAGE, ReleaseInfo
         from unittest.mock import MagicMock, patch
 
         with app_harness() as h:
             app = h["app"]
             settings = MagicMock()
             app._settings_widget = lambda: settings
-            app._pending_release = ReleaseInfo("2.0.9", "VoiceInk-Setup-2.0.9.exe", _URL)
-            with patch("voiceink.updater.UpdateDownloadWorker") as worker_cls:
+            app._pending_release = ReleaseInfo("2.0.9", "SayInk-Setup-2.0.9.exe", _URL)
+            with patch("sayink.updater.UpdateDownloadWorker") as worker_cls:
                 app._on_update_install_requested()
             worker_cls.assert_not_called()
             settings.set_update_status.assert_called_with(MISSING_DIGEST_MESSAGE, action="check")
 
     def test_hash_mismatch_is_rejected(self, tmp_path):
         import pytest
-        from voiceink.updater import InstallerVerificationError
+        from sayink.updater import InstallerVerificationError
 
-        dest = tmp_path / "VoiceInk-Setup-2.0.9.exe"
+        dest = tmp_path / "SayInk-Setup-2.0.9.exe"
         with pytest.raises(InstallerVerificationError):
             download_installer(_URL, dest, _response(b"body"), sha256="00" * 32)
         assert not dest.exists()
@@ -256,7 +256,7 @@ class TestInstallerVerification:
         import hashlib
 
         body = b"real-installer"
-        dest = tmp_path / "VoiceInk-Setup-2.0.9.exe"
+        dest = tmp_path / "SayInk-Setup-2.0.9.exe"
         download_installer(
             _URL,
             dest,

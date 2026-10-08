@@ -4,7 +4,7 @@
 
 - 权威状态源：`openspec/changes/ui-theme-design-system/`
 - 风险/闸门：High；须实现闸门放行后方可改业务代码
-- 禁止范围：`voiceink/speech_recognizer.py`、`voiceink/audio_recorder.py`、热键核心逻辑、设置分页 IA 重组、替换 PyQt6
+- 禁止范围：`sayink/speech_recognizer.py`、`sayink/audio_recorder.py`、热键核心逻辑、设置分页 IA 重组、替换 PyQt6
 - 必须执行的最终验证：见文末「最终验证」表；全部通过才可声称 verified
 
 ## 任务
@@ -12,7 +12,7 @@
 - [x] T0：生成并入库设计系统 MASTER
   - 对应需求/场景：设计系统 MASTER 权威文档 / MASTER 存在于版本库；Token 与 MASTER 同轴
   - 前置依赖：无
-  - 目标文件/符号：`design-system/MASTER.md`；ui-ux-pro-max `scripts/search.py --design-system --persist -p VoiceInk`
+  - 目标文件/符号：`design-system/MASTER.md`；ui-ux-pro-max `scripts/search.py --design-system --persist -p SayInk`
   - 允许修改：`design-system/**`
   - 禁止修改：业务 Python（本任务仅文档）
   - 实施步骤：
@@ -29,8 +29,8 @@
 - [x] T1：双主题 token + 主题解析与配置持久化
   - 对应需求/场景：主题模式与有效主题解析；主题偏好持久化；非法值回落；Token 与 MASTER 同轴
   - 前置依赖：T0
-  - 目标文件/符号：`voiceink/ui/design_tokens.py`；`voiceink/ui/theme.py`（新建：`resolve_effective_theme`/`apply_theme` 骨架）；`voiceink/config.py`（`DEFAULT_CONFIG["appearance"]`）；`tests/test_theme_resolve.py`（新建）
-  - 允许修改：上述路径；必要时 `voiceink/ui/app_styles.py` 改为可按主题重建
+  - 目标文件/符号：`sayink/ui/design_tokens.py`；`sayink/ui/theme.py`（新建：`resolve_effective_theme`/`apply_theme` 骨架）；`sayink/config.py`（`DEFAULT_CONFIG["appearance"]`）；`tests/test_theme_resolve.py`（新建）
+  - 允许修改：上述路径；必要时 `sayink/ui/app_styles.py` 改为可按主题重建
   - 禁止修改：各 Window 大改版（留 T2–T5）；ASR/录音
   - 实施步骤：
     1. 按 MASTER 映射 light/dark token 表与 `tokens_for(effective)`
@@ -49,7 +49,7 @@
   - 对应需求/场景：设置页外观入口；从设置切换到暗色；外观组可见
   - 前置依赖：T1
   - 目标文件/符号：`SettingsWindow._create_general_page`；外观控件；`_persist`/轻量主题变更路径；`App` 中主题应用调用（避免经完整 `_on_settings_changed` 重配 STT）；`tests/test_ui_styles.py` 或新建设置外观相关断言
-  - 允许修改：`voiceink/ui/settings_window.py`、`settings_components.py`（若需）、`settings_styles.py`、`voiceink/app.py`（仅主题接线）、相关测试
+  - 允许修改：`sayink/ui/settings_window.py`、`settings_components.py`（若需）、`settings_styles.py`、`sayink/app.py`（仅主题接线）、相关测试
   - 禁止修改：录音/STT 配置逻辑行为
   - 实施步骤：
     1. 通用页新增「外观」组（light/dark/system）
@@ -65,7 +65,7 @@
 - [x] T3：历史窗口随有效主题
   - 对应需求/场景：四表面随有效主题呈现（历史）
   - 前置依赖：T1；建议 T2 完成后以复用 apply 管道
-  - 目标文件/符号：`voiceink/ui/history_window.py`（`HistoryWindow.reapply_theme` 或等价）
+  - 目标文件/符号：`sayink/ui/history_window.py`（`HistoryWindow.reapply_theme` 或等价）
   - 允许修改：`history_window.py`；共享 styles/tokens；相关测试
   - 禁止修改：历史导出业务语义
   - 实施步骤：将硬编码色/QSS 改为当前 tokens；实现 reapply；接入 `apply_theme` 表面列表
@@ -79,7 +79,7 @@
 - [x] T4：浮窗随有效主题（废除唯常暗轴）
   - 对应需求/场景：四表面…浮窗；浅色下浮窗不再锁死常暗
   - 前置依赖：T1
-  - 目标文件/符号：`voiceink/ui/floating_window.py`；`FLOAT_*` 主题化映射
+  - 目标文件/符号：`sayink/ui/floating_window.py`；`FLOAT_*` 主题化映射
   - 允许修改：`floating_window.py`、`design_tokens.py`（float 轴）、相关测试
   - 禁止修改：录音状态机业务语义（仅视觉）
   - 实施步骤：为 light/dark 定义 float 表面 token；`reapply_theme`；接入 apply 管道
@@ -93,7 +93,7 @@
 - [x] T5：托盘菜单随有效主题
   - 对应需求/场景：四表面…托盘上下文菜单
   - 前置依赖：T1
-  - 目标文件/符号：`voiceink/ui/tray_icon.py`（`_menu_stylesheet` / 重建菜单样式）
+  - 目标文件/符号：`sayink/ui/tray_icon.py`（`_menu_stylesheet` / 重建菜单样式）
   - 允许修改：`tray_icon.py`、tokens、相关测试
   - 禁止修改：托盘菜单业务动作语义
   - 实施步骤：stylesheet 按有效主题生成；主题变更时刷新菜单 CSS

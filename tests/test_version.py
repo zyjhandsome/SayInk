@@ -1,6 +1,6 @@
 import pytest
-from voiceink import version
-from voiceink.version import __version__, file_version_quad, file_version_tuple
+from sayink import version
+from sayink.version import __version__, file_version_quad, file_version_tuple
 
 
 class TestVersion:

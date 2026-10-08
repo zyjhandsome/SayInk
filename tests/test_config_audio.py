@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from voiceink.config import (
+from sayink.config import (
     DEFAULT_CONFIG,
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_HOTKEY,
@@ -36,7 +36,7 @@ class TestAudioConfigDefaults:
 class TestAudioConfigPersistence:
     def test_save_and_load_system_source_hotkey_mode(self, tmp_path, monkeypatch):
         monkeypatch.setattr(Config, "_ensure_dirs", lambda self: None)
-        cfg_dir = tmp_path / ".voiceink"
+        cfg_dir = tmp_path / ".sayink"
         cfg_dir.mkdir()
         cfg_file = cfg_dir / "config.json"
         cfg_file.write_text(
@@ -64,7 +64,7 @@ class TestAudioConfigPersistence:
 
     def test_set_mixed_source_persists(self, tmp_path, monkeypatch):
         monkeypatch.setattr(Config, "_ensure_dirs", lambda self: None)
-        cfg_dir = tmp_path / ".voiceink"
+        cfg_dir = tmp_path / ".sayink"
         cfg_dir.mkdir()
         config = Config()
         config._config_dir = cfg_dir
@@ -85,7 +85,7 @@ class TestAudioConfigPersistence:
         assert reloaded["audio"]["trigger_mode"] == TRIGGER_MODE_HOTKEY
 
     def test_merge_fills_missing_audio_keys(self):
-        from voiceink.config import Config
+        from sayink.config import Config
 
         cfg = Config.__new__(Config)
         fresh_defaults = {

@@ -1,5 +1,5 @@
 import pytest
-from voiceink.audio_devices import (
+from sayink.audio_devices import (
     INPUT_SOURCE_MICROPHONE,
     INPUT_SOURCE_MIXED,
     INPUT_SOURCE_SYSTEM,
@@ -22,7 +22,7 @@ class TestSystemNameHints:
 
 class TestBuildRecordingPlan:
     def test_microphone_plan(self, monkeypatch):
-        from voiceink import audio_devices as ad
+        from sayink import audio_devices as ad
 
         fake_mic = ad.AudioDeviceInfo(0, "Mic", "WASAPI", 16000, 1, False, False)
 
@@ -37,7 +37,7 @@ class TestBuildRecordingPlan:
         assert plan.endpoints[0].role == "microphone"
 
     def test_mixed_requires_both(self, monkeypatch):
-        from voiceink import audio_devices as ad
+        from sayink import audio_devices as ad
 
         fake_mic = ad.AudioDeviceInfo(0, "Mic", "WASAPI", 16000, 1, False, False)
         fake_sys = ad.AudioDeviceInfo(1, "Speakers", "WASAPI", 48000, 2, True, True)
@@ -54,7 +54,7 @@ class TestBuildRecordingPlan:
         assert roles == {"microphone", "system"}
 
     def test_mixed_without_system_device_mic_only(self, monkeypatch):
-        from voiceink import audio_devices as ad
+        from sayink import audio_devices as ad
 
         fake_mic = ad.AudioDeviceInfo(0, "Mic", "WASAPI", 16000, 1, False, False)
         bad_sys = ad.AudioDeviceInfo(13, "Speakers (Audio Device)", "WASAPI", 48000, 2, True, True)
@@ -69,7 +69,7 @@ class TestBuildRecordingPlan:
         assert plan.endpoints[0].role == "microphone"
 
     def test_mixed_includes_default_system_even_if_unreliable(self, monkeypatch):
-        from voiceink import audio_devices as ad
+        from sayink import audio_devices as ad
 
         fake_mic = ad.AudioDeviceInfo(0, "Mic", "WASAPI", 16000, 1, False, False)
         bad_sys = ad.AudioDeviceInfo(13, "Speakers (Audio Device)", "WASAPI", 48000, 2, True, True)
@@ -85,7 +85,7 @@ class TestBuildRecordingPlan:
         assert {e.role for e in plan.endpoints} == {"microphone", "system"}
 
     def test_system_missing_raises(self, monkeypatch):
-        from voiceink import audio_devices as ad
+        from sayink import audio_devices as ad
 
         monkeypatch.setattr(ad, "list_microphone_devices", lambda: [])
         monkeypatch.setattr(ad, "list_system_capture_devices", lambda: [])
@@ -97,7 +97,7 @@ class TestBuildRecordingPlan:
 
     def test_system_only_plan(self, monkeypatch):
         """README: 仅电脑播放 — 单路系统环回。"""
-        from voiceink import audio_devices as ad
+        from sayink import audio_devices as ad
 
         fake_sys = ad.AudioDeviceInfo(17, "Speakers [Loopback]", "WASAPI", 48000, 4, True, True)
         monkeypatch.setattr(ad, "list_microphone_devices", lambda: [])
@@ -112,7 +112,7 @@ class TestBuildRecordingPlan:
         assert plan.endpoints[0].device.index == 17
 
     def test_invalid_source_defaults_to_microphone(self, monkeypatch):
-        from voiceink import audio_devices as ad
+        from sayink import audio_devices as ad
 
         fake_mic = ad.AudioDeviceInfo(0, "Mic", "WASAPI", 16000, 1, False, False)
         monkeypatch.setattr(ad, "list_microphone_devices", lambda: [fake_mic])
@@ -129,12 +129,12 @@ class TestSystemDeviceRanking:
         return AudioDeviceInfo(index, name, "Windows WASAPI", 48000, 2, True, is_output)
 
     def test_unreliable_default_still_picked_when_no_alternative(self, monkeypatch):
-        from voiceink import audio_devices as ad
+        from sayink import audio_devices as ad
 
         netease = self._dev(12, "扬声器 (网易虚拟音频设备)")
         generic = self._dev(13, "扬声器 (Audio Device)")
         monkeypatch.setattr(
-            "voiceink.pawp_capture.pick_default_pawp_loopback", lambda: None
+            "sayink.pawp_capture.pick_default_pawp_loopback", lambda: None
         )
         monkeypatch.setattr(ad, "list_system_capture_devices", lambda: [netease, generic])
         monkeypatch.setattr(ad, "_default_output_device_index", lambda: 13)
@@ -144,14 +144,14 @@ class TestSystemDeviceRanking:
         assert picked.index == 13
 
     def test_netease_deprioritized_over_realtek(self, monkeypatch):
-        from voiceink import audio_devices as ad
+        from sayink import audio_devices as ad
 
         netease = self._dev(1, "扬声器 (网易虚拟音频设备)")
         realtek = self._dev(2, "扬声器 (Realtek(R) Audio)")
         monkeypatch.setattr(ad, "list_system_capture_devices", lambda: [netease, realtek])
         monkeypatch.setattr(ad, "_default_output_device_index", lambda: 2)
         monkeypatch.setattr(
-            "voiceink.pawp_capture.pick_default_pawp_loopback", lambda: None
+            "sayink.pawp_capture.pick_default_pawp_loopback", lambda: None
         )
         monkeypatch.setattr(ad, "_supports_wasapi_loopback_flag", lambda: True)
 

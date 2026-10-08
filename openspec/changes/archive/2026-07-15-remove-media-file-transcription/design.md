@@ -30,9 +30,9 @@
 
 | 结论 | 证据 | 新鲜度 |
 |---|---|---|
-| 托盘有 `import_file_requested` 与「导入文件转写…」 | `voiceink/ui/tray_icon.py` | 2026-07-15 定点读 |
+| 托盘有 `import_file_requested` 与「导入文件转写…」 | `sayink/ui/tray_icon.py` | 2026-07-15 定点读 |
 | App 文件任务完整存在 | `start_file_transcription` / `_FileDecodeWorker` / `_file_job_*` | Memory + 源码 |
-| 解码模块独立 | `voiceink/media_decoder.py` | 磁盘存在 |
+| 解码模块独立 | `sayink/media_decoder.py` | 磁盘存在 |
 | 打包拷贝 ffmpeg | `build.py` `_copy_ffmpeg_into_dist`；`tests/test_build_ffmpeg.py` | 定点读 |
 | 翻译模式在 polisher/设置/App 后处理分支 | `LLM_MODE_TRANSLATE`；`settings_window` 模式 combo；`app.py` ~L698+ | 定点读 |
 | 历史展示 `file` / `file_import` | `history_window.py` L392–405 | 定点读；**须保留** |
@@ -91,7 +91,7 @@
 
 ## 接口与状态模型
 
-- **删除**：`App.start_file_transcription` / `cancel_file_transcription` / `_FileDecodeWorker` / `_file_job_*` / `HISTORY_SOURCE_FILE` 写入路径；托盘 `import_file_requested`；整个 `voiceink.media_decoder`；`LLM_MODE_TRANSLATE` 与翻译 prompt；设置页翻译 combo/目标语言行；`build._copy_ffmpeg_into_dist` 等
+- **删除**：`App.start_file_transcription` / `cancel_file_transcription` / `_FileDecodeWorker` / `_file_job_*` / `HISTORY_SOURCE_FILE` 写入路径；托盘 `import_file_requested`；整个 `sayink.media_decoder`；`LLM_MODE_TRANSLATE` 与翻译 prompt；设置页翻译 combo/目标语言行；`build._copy_ffmpeg_into_dist` 等
 - **保留**：`history_window` 对 `file` / `file_import` 的展示映射；润色 `LLM_MODE_POLISH`；实时听写互斥逻辑中仅去掉文件任务相关分支
 - **配置键**：可保留 `llm.target_language` 键于文件中但不暴露 UI、不参与运行时；或读时忽略。`llm.mode` 非法/`translate` → `polish`
 

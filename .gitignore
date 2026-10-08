@@ -1,11 +1,11 @@
 # PyInstaller
 build/
 *.spec
-# PyInstaller staging for Inno; release artifact is dist/VoiceInk-Setup-<version>.exe
-dist/VoiceInk/
+# PyInstaller staging for Inno; release artifact is dist/SayInk-Setup-<version>.exe
+dist/SayInk/
 
 # Installers / binaries (build locally or attach to GitHub Releases)
-dist/VoiceInk-Setup-*.exe
+dist/SayInk-Setup-*.exe
 dist/*.exe
 
 # Models (large files, download separately)

@@ -8,7 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
-from voiceink.config import DEFAULT_CONFIG
+from sayink.config import DEFAULT_CONFIG
 
 
 def _config_get(store: dict, key: str, default=None):
@@ -49,24 +49,24 @@ def app_harness(config_overrides: dict | None = None):
         config_mock.config_dir = Path(temp_dir)
 
         patches = [
-            patch("voiceink.app.Config", return_value=config_mock),
-            patch("voiceink.app.HotKeyManager"),
-            patch("voiceink.app.AudioRecorder"),
-            patch("voiceink.app.SpeechRecognizer"),
-            patch("voiceink.app.TextPolisher"),
-            patch("voiceink.app.TextPaster"),
-            patch("voiceink.app.SoundManager"),
-            patch("voiceink.app.FloatingWindow"),
-            patch("voiceink.app.TrayIcon"),
-            patch("voiceink.app.HistoryStore", create=True),
+            patch("sayink.app.Config", return_value=config_mock),
+            patch("sayink.app.HotKeyManager"),
+            patch("sayink.app.AudioRecorder"),
+            patch("sayink.app.SpeechRecognizer"),
+            patch("sayink.app.TextPolisher"),
+            patch("sayink.app.TextPaster"),
+            patch("sayink.app.SoundManager"),
+            patch("sayink.app.FloatingWindow"),
+            patch("sayink.app.TrayIcon"),
+            patch("sayink.app.HistoryStore", create=True),
             # App.__init__ probes the models directory on disk; without this the
             # suite's outcome depends on whether the machine has the model
             # downloaded (startup show_error fires on a clean checkout).
-            patch("voiceink.speech_recognizer.is_model_downloaded", return_value=True),
+            patch("sayink.speech_recognizer.is_model_downloaded", return_value=True),
         ]
         started = [p.start() for p in patches]
 
-        from voiceink.app import App
+        from sayink.app import App
 
         app = App()
         # start() schedules these with QTimer; if they fired during a later

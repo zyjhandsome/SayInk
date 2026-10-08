@@ -1,6 +1,6 @@
 ## Why
 
-VoiceInk 四表面（设置 / 历史 / 浮窗 / 托盘）仍以单轴浅色 tokens 与大量静态 QSS 拼装为主，缺少可切换主题与统一设计系统权威源。用户已选定用 ui-ux-pro-max 重定 MASTER、替换现有 tokens，并引入暗色与系统跟随，使全应用视觉一致、可主题化。
+SayInk 四表面（设置 / 历史 / 浮窗 / 托盘）仍以单轴浅色 tokens 与大量静态 QSS 拼装为主，缺少可切换主题与统一设计系统权威源。用户已选定用 ui-ux-pro-max 重定 MASTER、替换现有 tokens，并引入暗色与系统跟随，使全应用视觉一致、可主题化。
 
 ## What Changes
 
@@ -22,7 +22,7 @@ VoiceInk 四表面（设置 / 历史 / 浮窗 / 托盘）仍以单轴浅色 toke
 
 ## Impact
 
-- 代码：`voiceink/ui/design_tokens.py`、`app_styles.py`、`settings_styles.py`、`settings_window.py`、`settings_components.py`、`history_window.py`、`floating_window.py`、`tray_icon.py`、`model_card.py`、`nav_icons.py`、`hotkey_edit.py`；入口 `voiceink/main.py`（`GLOBAL_APP_STYLESHEET`）；可能 `voiceink/config.py` / `voiceink/app.py`（主题偏好与应用）
+- 代码：`sayink/ui/design_tokens.py`、`app_styles.py`、`settings_styles.py`、`settings_window.py`、`settings_components.py`、`history_window.py`、`floating_window.py`、`tray_icon.py`、`model_card.py`、`nav_icons.py`、`hotkey_edit.py`；入口 `sayink/main.py`（`GLOBAL_APP_STYLESHEET`）；可能 `sayink/config.py` / `sayink/app.py`（主题偏好与应用）
 - 配置：`DEFAULT_CONFIG` 今日无 theme 键（事实）；将新增主题偏好键（形态待产品决定）
 - 测试：`tests/test_ui_styles.py` 含硬编码 `#2563EB` 等色值断言，需随新 tokens/主题更新
 - 文档工件：ui-ux-pro-max MASTER 落盘路径待产品决定
@@ -36,7 +36,7 @@ VoiceInk 四表面（设置 / 历史 / 浮窗 / 托盘）仍以单轴浅色 toke
 
 ### 目标与成功标准
 
-- 目标：用 ui-ux-pro-max 生成并落地新设计系统 MASTER，替换现有 design tokens；为 VoiceInk 提供浅色/暗色/跟随系统主题，并一次应用到设置、历史、浮窗、托盘四表面，使视觉与主题行为一致。
+- 目标：用 ui-ux-pro-max 生成并落地新设计系统 MASTER，替换现有 design tokens；为 SayInk 提供浅色/暗色/跟随系统主题，并一次应用到设置、历史、浮窗、托盘四表面，使视觉与主题行为一致。
 - 可观察的成功结果：
   - 默认主题模式为 `system`；用户可在设置→通用→「外观」选择 `light` / `dark` / `system`
   - 主题偏好写入 `config.json`，重启后仍生效；非法值回落 `system`
@@ -53,13 +53,13 @@ VoiceInk 四表面（设置 / 历史 / 浮窗 / 托盘）仍以单轴浅色 toke
   - 不引入 Web/移动壳，不替换 PyQt6
   - 不做设置分页/导航信息架构大翻
   - 不在定框阶段写实现代码
-- 禁止修改路径（预置）：`voiceink/speech_recognizer.py`、`voiceink/audio_recorder.py`、热键核心逻辑（除非证据证明主题应用必须触碰——默认禁止）
+- 禁止修改路径（预置）：`sayink/speech_recognizer.py`、`sayink/audio_recorder.py`、热键核心逻辑（除非证据证明主题应用必须触碰——默认禁止）
 
 ## 代码事实
 
 ### 现状摘要
 
-- UI 集中在 `voiceink/ui/`（12 个文件节点）；主表面为 `SettingsWindow`、`HistoryWindow`、`FloatingWindow`、`TrayIcon`。
+- UI 集中在 `sayink/ui/`（12 个文件节点）；主表面为 `SettingsWindow`、`HistoryWindow`、`FloatingWindow`、`TrayIcon`。
 - `design_tokens.py` 声明「classic desktop utility」单轴浅色 tokens；另有独立 `FLOAT_*` 暗色叠层常量（浮窗专用）。
 - `app_styles.GLOBAL_APP_STYLESHEET` 在模块 import 时用浅色 token 拼成静态字符串；`main.py` 在 `app.setStyle("Fusion")` 后 `app.setStyleSheet(GLOBAL_APP_STYLESHEET)`。
 - 各表面大量 `setStyleSheet(...)` / 组件级常量（`settings_styles.py`、`settings_components.py` 等），今日无 theme 解析层。
@@ -92,14 +92,14 @@ VoiceInk 四表面（设置 / 历史 / 浮窗 / 托盘）仍以单轴浅色 toke
 
 | 优先级 | 路径/符号 | 理由 |
 |---|---|---|
-| 必选 | `voiceink/ui/design_tokens.py` | token 权威源替换 |
-| 必选 | `voiceink/ui/app_styles.py` / `voiceink/main.py`（`GLOBAL_APP_STYLESHEET`） | 全局换肤入口 |
-| 必选 | `voiceink/ui/settings_window.py` + `settings_styles.py` + `settings_components.py` | 设置表面 + 既有对齐验收 |
-| 必选 | `voiceink/ui/history_window.py` | 历史表面 |
-| 必选 | `voiceink/ui/floating_window.py` | 浮窗表面；FACE 与 FLOAT_* |
-| 必选 | `voiceink/ui/tray_icon.py`（`_menu_stylesheet`） | 托盘菜单 |
-| 必选 | `voiceink/config.py`（`DEFAULT_CONFIG` / `Config.get|set`） | 主题偏好持久化 |
-| 备选 | `voiceink/app.py` | 设置变更广播 / 生命周期 |
+| 必选 | `sayink/ui/design_tokens.py` | token 权威源替换 |
+| 必选 | `sayink/ui/app_styles.py` / `sayink/main.py`（`GLOBAL_APP_STYLESHEET`） | 全局换肤入口 |
+| 必选 | `sayink/ui/settings_window.py` + `settings_styles.py` + `settings_components.py` | 设置表面 + 既有对齐验收 |
+| 必选 | `sayink/ui/history_window.py` | 历史表面 |
+| 必选 | `sayink/ui/floating_window.py` | 浮窗表面；FACE 与 FLOAT_* |
+| 必选 | `sayink/ui/tray_icon.py`（`_menu_stylesheet`） | 托盘菜单 |
+| 必选 | `sayink/config.py`（`DEFAULT_CONFIG` / `Config.get|set`） | 主题偏好持久化 |
+| 备选 | `sayink/app.py` | 设置变更广播 / 生命周期 |
 | 备选 | `tests/test_ui_styles.py` | 样式/主题回归 |
 
 ### 波及线索
@@ -114,10 +114,10 @@ VoiceInk 四表面（设置 / 历史 / 浮窗 / 托盘）仍以单轴浅色 toke
 
 | 类型 | 结论 | 证据 |
 |---|---|---|
-| 事实 | UI 四表面文件存在 | Memory `voiceink/ui` file_tree；路径如上 |
-| 事实 | tokens 为单轴浅色 + 独立 FLOAT_* | `voiceink/ui/design_tokens.py` |
-| 事实 | 全局 QSS 在 main 一次性 setStyleSheet | `voiceink/main.py` L148–151；`app_styles.py` |
-| 事实 | DEFAULT_CONFIG 无 theme 键 | `voiceink/config.py` `DEFAULT_CONFIG` |
+| 事实 | UI 四表面文件存在 | Memory `sayink/ui` file_tree；路径如上 |
+| 事实 | tokens 为单轴浅色 + 独立 FLOAT_* | `sayink/ui/design_tokens.py` |
+| 事实 | 全局 QSS 在 main 一次性 setStyleSheet | `sayink/main.py` L148–151；`app_styles.py` |
+| 事实 | DEFAULT_CONFIG 无 theme 键 | `sayink/config.py` `DEFAULT_CONFIG` |
 | 事实 | 设置对齐规格已存在 | `openspec/specs/settings-control-alignment/spec.md` |
 | 事实 | 样式测试绑定旧品牌色 | `tests/test_ui_styles.py`（`#2563EB` 等） |
 | 决策 | 四表面 + 主题 + 新 MASTER 替换 tokens | Explore 用户答 1A 2C 3A → 见「开放问题清单」种子决策 |

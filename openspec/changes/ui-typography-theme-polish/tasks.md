@@ -3,7 +3,7 @@
 ## 执行规则
 - 权威状态源：`openspec/changes/ui-typography-theme-polish/`
 - 风险/闸门：Standard / medium；须实现闸门放行后方可改业务代码
-- 禁止范围：`voiceink/speech_recognizer.py`、`voiceink/audio_recorder.py`、热键核心逻辑、设置分页 IA 重组、替换 PyQt6
+- 禁止范围：`sayink/speech_recognizer.py`、`sayink/audio_recorder.py`、热键核心逻辑、设置分页 IA 重组、替换 PyQt6
 - 必须执行的最终验证：见文末「最终验证」表；全部通过才可声称 verified
 
 ## 任务
@@ -11,7 +11,7 @@
 - [x] T1：字体解析 API + 全局/浮窗统一 family
   - 对应需求/场景：ui-typography / Unified UI font family resolution（float match + fallback）
   - 前置依赖：无
-  - 目标文件/符号：`voiceink/ui/design_tokens.py`（`resolve_ui_font_family` 或并列助手）、`voiceink/ui/theme.py`（`apply_theme` 刷新 `FONT`/`FONT_DISPLAY`）、`voiceink/ui/app_styles.py`、`voiceink/ui/floating_window.py`（移除硬编码 `"Segoe UI Variable"`）、`tests/test_theme_resolve.py` 或新建 `tests/test_ui_font.py`
+  - 目标文件/符号：`sayink/ui/design_tokens.py`（`resolve_ui_font_family` 或并列助手）、`sayink/ui/theme.py`（`apply_theme` 刷新 `FONT`/`FONT_DISPLAY`）、`sayink/ui/app_styles.py`、`sayink/ui/floating_window.py`（移除硬编码 `"Segoe UI Variable"`）、`tests/test_theme_resolve.py` 或新建 `tests/test_ui_font.py`
   - 允许修改：上述路径；必要时 `settings_styles.py` 仅改 `font-family: {t.FONT}` 消费已刷新值
   - 禁止修改：ASR/录音/热键；无关窗口业务逻辑
   - 实施步骤：

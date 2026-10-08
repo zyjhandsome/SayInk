@@ -1,4 +1,4 @@
-"""Tests for the floating status HUD (voiceink/ui/floating_window.py)."""
+"""Tests for the floating status HUD (sayink/ui/floating_window.py)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import sys
 import pytest
 from PyQt6.QtWidgets import QApplication
 
-from voiceink.ui.floating_window import (
+from sayink.ui.floating_window import (
     FloatingWindow,
     WaveformWidget,
     _DotIndicator,
@@ -146,7 +146,7 @@ class TestModelLoadingGuard:
     def test_error_stays_capsule_height(self, win):
         win.show_error("识别失败：" + "请检查网络或模型配置。" * 12)
 
-        from voiceink.ui.floating_window import COMPACT_HEIGHT
+        from sayink.ui.floating_window import COMPACT_HEIGHT
 
         assert win.height() <= COMPACT_HEIGHT + 40
         assert win.toolTip()
@@ -155,7 +155,7 @@ class TestModelLoadingGuard:
         msg = "录音过短\n请按住快捷键说话，时长至少 0.1 秒"
         win.show_error(msg)
 
-        from voiceink.ui.floating_window import COMPACT_HEIGHT
+        from sayink.ui.floating_window import COMPACT_HEIGHT
 
         assert win._status_label.text() == "录音过短"
         assert win._text_label.text()
@@ -170,7 +170,7 @@ class TestModelLoadingGuard:
 
 class TestFloatingWindowClassicColors:
     def test_recording_uses_record_accent_others_neutral(self, win):
-        from voiceink.ui.design_tokens import STATE_LISTEN, STATE_RECORD
+        from sayink.ui.design_tokens import STATE_LISTEN, STATE_RECORD
 
         win.show_listening()
         listen_ss = win._status_label.styleSheet().lower()
@@ -187,7 +187,7 @@ class TestFloatingWindowClassicColors:
 
 
 def test_listen_bar_is_thin_without_extra_actions(win):
-    from voiceink.ui.floating_window import BAR_HEIGHT, BAR_WIDTH
+    from sayink.ui.floating_window import BAR_HEIGHT, BAR_WIDTH
     win.show_listening()
     assert win.height() <= BAR_HEIGHT + 8
     assert win.width() <= BAR_WIDTH + 16
@@ -197,7 +197,7 @@ def test_listen_bar_is_thin_without_extra_actions(win):
 
 
 def test_hold_bar_stays_put_until_the_key_is_released(win):
-    from voiceink.ui.design_tokens import STATE_RECORD
+    from sayink.ui.design_tokens import STATE_RECORD
 
     win.show_recording()
     held_height = win.height()
@@ -228,7 +228,7 @@ def test_hold_bar_stays_put_until_the_key_is_released(win):
 def test_hold_bar_switches_to_recognizing_once_the_key_is_released(win):
     """After release the bar must stop saying 「录音中 / 松开结束」 even though
     the capture gate is still up until the result arrives."""
-    from voiceink.ui.design_tokens import STATE_RECOGNIZE, STATE_RECORD
+    from sayink.ui.design_tokens import STATE_RECOGNIZE, STATE_RECORD
 
     win.show_recording()
     win.end_capture()
@@ -295,7 +295,7 @@ def test_live_transcript_keeps_the_tail_while_listening(win):
 
 
 def test_partial_text_grows_excerpt_only(win):
-    from voiceink.ui.floating_window import BAR_EXCERPT_HEIGHT
+    from sayink.ui.floating_window import BAR_EXCERPT_HEIGHT
     win.show_listening()
     win.update_partial_text("下一步把这份纪要贴到会议群里。")
     assert win.height() <= BAR_EXCERPT_HEIGHT + 8
@@ -307,7 +307,7 @@ def test_update_partial_text_recenters_on_excerpt_resize(win, qapp):
     from PyQt6.QtGui import QCursor
     from PyQt6.QtWidgets import QApplication
 
-    from voiceink.ui.floating_window import BAR_WIDTH
+    from sayink.ui.floating_window import BAR_WIDTH
 
     screen = QApplication.screenAt(QCursor.pos()) or qapp.primaryScreen()
     assert screen is not None

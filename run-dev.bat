@@ -1,9 +1,9 @@
 @echo off
 cd /d "%~dp0"
 
-REM Prefer packaged exe (taskbar shows "VoiceInk"). Dev mode via pythonw still may show "Python".
-if exist "dist\VoiceInk\VoiceInk.exe" (
-    start "" "dist\VoiceInk\VoiceInk.exe"
+REM Prefer packaged exe (taskbar shows "SayInk"). Dev mode via pythonw still may show "Python".
+if exist "dist\SayInk\SayInk.exe" (
+    start "" "dist\SayInk\SayInk.exe"
     exit /b 0
 )
 

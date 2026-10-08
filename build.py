@@ -1,17 +1,17 @@
 """
-Build script for packaging VoiceInk as a standalone Windows application.
+Build script for packaging SayInk as a standalone Windows application.
 
-Output: dist/VoiceInk/ — VoiceInk.exe, _internal/, and optional models/.
+Output: dist/SayInk/ — SayInk.exe, _internal/, and optional models/.
 
-Models are copied next to the exe (not inside it) from ~/.voiceink/models/
+Models are copied next to the exe (not inside it) from ~/.sayink/models/
 or ./models/ when present. **Fun-ASR-Nano must exist locally** or the build exits with an error.
-Fetch it with: `python voiceink_build/download_bundle_model_for_build.py` (writes to `./models/`).
+Fetch it with: `python sayink_build/download_bundle_model_for_build.py` (writes to `./models/`).
 
 Distribution:
 - **Installer (recommended):** run `python build_release.py` — produces
-  `dist/VoiceInk-Setup-<version>.exe` (version from `voiceink/version.py`;
+  `dist/SayInk-Setup-<version>.exe` (version from `sayink/version.py`;
   staging folder removed after Inno Setup).
-- **Portable folder:** run this script only, then zip `dist/VoiceInk/` for
+- **Portable folder:** run this script only, then zip `dist/SayInk/` for
   users who should not run an installer.
 """
 
@@ -31,8 +31,8 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-# Always bundle this model in dist/VoiceInk/models/ for released EXE/installer.
-from voiceink.speech_recognizer import DEFAULT_MODEL_ID
+# Always bundle this model in dist/SayInk/models/ for released EXE/installer.
+from sayink.speech_recognizer import DEFAULT_MODEL_ID
 
 BUNDLE_REQUIRE_MODEL_ID = DEFAULT_MODEL_ID
 
@@ -40,7 +40,7 @@ BUNDLE_REQUIRE_MODEL_ID = DEFAULT_MODEL_ID
 def _find_model_sources() -> list[tuple[str, Path]]:
     """Return the default release model if present under project or user models dir."""
     try:
-        from voiceink.speech_recognizer import get_model_info
+        from sayink.speech_recognizer import get_model_info
     except ImportError:
         return []
 
@@ -49,9 +49,10 @@ def _find_model_sources() -> list[tuple[str, Path]]:
         return []
 
     project_models = SCRIPT_DIR / "models"
-    user_models = Path.home() / ".voiceink" / "models"
+    user_models = Path.home() / ".sayink" / "models"
+    legacy_user_models = Path.home() / ".voiceink" / "models"
 
-    for src_dir in [project_models, user_models]:
+    for src_dir in [project_models, user_models, legacy_user_models]:
         d = src_dir / info["dir_name"]
         if d.exists() and all((d / f).exists() for f in info["files"]):
             return [(info["dir_name"], d)]
@@ -59,7 +60,7 @@ def _find_model_sources() -> list[tuple[str, Path]]:
 
 
 def _require_bundle_model(downloaded: list[tuple[str, Path]]) -> None:
-    from voiceink.speech_recognizer import get_model_info
+    from sayink.speech_recognizer import get_model_info
 
     info = get_model_info(BUNDLE_REQUIRE_MODEL_ID)
     if not info:
@@ -71,69 +72,69 @@ def _require_bundle_model(downloaded: list[tuple[str, Path]]) -> None:
     print("\n[ERROR] 打包 EXE 需要已在本地就绪的 Fun-ASR-Nano 模型。")
     print("  请先在应用「设置 → 引擎」中下载该模型，或将完整目录放到:")
     print(f"    {SCRIPT_DIR / 'models' / dirname}")
-    print(f"    或 {Path.home() / '.voiceink' / 'models' / dirname}")
+    print(f"    或 {Path.home() / '.sayink' / 'models' / dirname}")
     sys.exit(1)
 
 
-def _kill_running_voiceink():
+def _kill_running_sayink():
     if sys.platform != "win32":
         return
     subprocess.run(
-        ["taskkill", "/IM", "VoiceInk.exe", "/F"],
+        ["taskkill", "/IM", "SayInk.exe", "/F"],
         capture_output=True,
         text=True,
     )
 
 
 def _prepare_dist_output_dir() -> tuple[Path, str]:
-    """Return (dist_parent, pyinstaller --name) after trying to clear dist/VoiceInk."""
+    """Return (dist_parent, pyinstaller --name) after trying to clear dist/SayInk."""
     dist_parent = SCRIPT_DIR / "dist"
     dist_parent.mkdir(parents=True, exist_ok=True)
-    target = dist_parent / "VoiceInk"
+    target = dist_parent / "SayInk"
     if not target.exists():
-        return dist_parent, "VoiceInk"
+        return dist_parent, "SayInk"
 
-    _kill_running_voiceink()
+    _kill_running_sayink()
     for attempt in range(4):
         try:
             shutil.rmtree(target)
-            return dist_parent, "VoiceInk"
+            return dist_parent, "SayInk"
         except OSError as exc:
             print(f"[WARN] 无法删除 {target} (尝试 {attempt + 1}/4): {exc}")
             time.sleep(2)
-            _kill_running_voiceink()
+            _kill_running_sayink()
 
-    alt_name = f"VoiceInk_{int(time.time())}"
-    print(f"[WARN] 将输出到备用目录 dist/{alt_name}/（请关闭占用 dist/VoiceInk 的程序后改回标准路径）")
+    alt_name = f"SayInk_{int(time.time())}"
+    print(f"[WARN] 将输出到备用目录 dist/{alt_name}/（请关闭占用 dist/SayInk 的程序后改回标准路径）")
     return dist_parent, alt_name
 
 
 def build():
-    """Package VoiceInk with PyInstaller."""
-    from voiceink_build.dependency_check import require_release_dependencies
+    """Package SayInk with PyInstaller."""
+    from sayink_build.dependency_check import require_release_dependencies
 
     # Validate before killing a running app or clearing its previous build.
     require_release_dependencies()
     print("=" * 55)
-    print("  VoiceInk Build Script")
+    print("  SayInk Build Script")
     print("=" * 55)
     print()
 
-    print("[1/3] Building VoiceInk with PyInstaller...")
+    print("[1/3] Building SayInk with PyInstaller...")
 
     import PyInstaller.__main__
 
     dist_parent, app_name = _prepare_dist_output_dir()
 
-    main_script = str(SCRIPT_DIR / "voiceink" / "main.py")
-    win_dll_rthook = SCRIPT_DIR / "voiceink_build" / "pyi_rth_voiceink_win_dll.py"
+    main_script = str(SCRIPT_DIR / "sayink" / "main.py")
+    win_dll_rthook = SCRIPT_DIR / "sayink_build" / "pyi_rth_sayink_win_dll.py"
     if not win_dll_rthook.is_file():
         print(f"\n[ERROR] Missing runtime hook: {win_dll_rthook}")
         sys.exit(1)
 
     import os
 
-    spin_icons = SCRIPT_DIR / "voiceink" / "ui" / "icons"
+    spin_icons = SCRIPT_DIR / "sayink" / "ui" / "icons"
     args = [
         main_script,
         f"--name={app_name}",
@@ -144,13 +145,13 @@ def build():
         "--clean",
         "--noupx",
         f"--runtime-hook={win_dll_rthook}",
-        f"--icon={SCRIPT_DIR / 'voiceink' / 'icon.ico'}",
+        f"--icon={SCRIPT_DIR / 'sayink' / 'icon.ico'}",
         # Non-imported PNG steppers used by settings QSS (Path(__file__).parent/icons).
-        f"--add-data={spin_icons}{os.pathsep}voiceink/ui/icons",
+        f"--add-data={spin_icons}{os.pathsep}sayink/ui/icons",
     ]
 
     if sys.platform == "win32":
-        from voiceink_build.pyinstaller_version_info import write_version_file
+        from sayink_build.pyinstaller_version_info import write_version_file
 
         vf = SCRIPT_DIR / "build" / "file_version_info.txt"
         write_version_file(vf)
@@ -182,19 +183,19 @@ def build():
     PyInstaller.__main__.run(args)
 
     dist_dir = dist_parent / app_name
-    exe_path = dist_dir / "VoiceInk.exe"
-    if app_name != "VoiceInk":
-        marker = dist_parent / "VOICEINK_STAGING_DIR.txt"
+    exe_path = dist_dir / "SayInk.exe"
+    if app_name != "SayInk":
+        marker = dist_parent / "SAYINK_STAGING_DIR.txt"
         marker.write_text(app_name, encoding="utf-8")
-    elif (dist_parent / "VOICEINK_STAGING_DIR.txt").exists():
-        (dist_parent / "VOICEINK_STAGING_DIR.txt").unlink(missing_ok=True)
+    elif (dist_parent / "SAYINK_STAGING_DIR.txt").exists():
+        (dist_parent / "SAYINK_STAGING_DIR.txt").unlink(missing_ok=True)
 
     if not exe_path.exists():
-        print("\n[ERROR] Build failed — VoiceInk.exe not found.")
+        print("\n[ERROR] Build failed — SayInk.exe not found.")
         sys.exit(1)
 
     print()
-    print("[2/3] Copying models to dist/VoiceInk/models/ ...")
+    print("[2/3] Copying models to dist/SayInk/models/ ...")
 
     models_dst = dist_dir / "models"
     downloaded = _find_model_sources()

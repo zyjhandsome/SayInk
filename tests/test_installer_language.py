@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-_ISS = Path(__file__).resolve().parents[1] / "installer" / "VoiceInk-Setup.iss"
+_ISS = Path(__file__).resolve().parents[1] / "installer" / "SayInk-Setup.iss"
 
 
 def test_setup_wizard_uses_simplified_chinese_only():
@@ -11,4 +11,4 @@ def test_setup_wizard_uses_simplified_chinese_only():
     assert ( _ISS.parent / "ChineseSimplified.isl" ).is_file()
     assert "Default.isl" not in text
     assert "ShowLanguageDialog=no" in text
-    assert "VoiceInk Setup" not in text
+    assert "SayInk Setup" not in text

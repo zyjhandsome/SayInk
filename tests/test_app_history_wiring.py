@@ -5,7 +5,7 @@ from unittest.mock import patch
 import numpy as np
 
 from tests.helpers.app_harness import app_harness
-from voiceink.audio_utils import TARGET_SAMPLE_RATE
+from sayink.audio_utils import TARGET_SAMPLE_RATE
 
 
 def _audio(seconds: float = 0.2) -> np.ndarray:
@@ -189,7 +189,7 @@ def test_created_at_is_segment_finalization_time_not_begin() -> None:
     with app_harness() as h:
         app = h["app"]
         app._begin_transcription(_audio())
-        with patch("voiceink.app.time.time", return_value=1_005.5):
+        with patch("sayink.app.time.time", return_value=1_005.5):
             app._on_final_result("finalized later")
             h["paster"].paste_async.call_args[0][1]("pasted")
 
@@ -275,7 +275,7 @@ def _backlog_session(h):
 
 
 def test_backlog_at_limit_keeps_listening() -> None:
-    from voiceink.app import MAX_BACKLOG_AUDIO_SECONDS
+    from sayink.app import MAX_BACKLOG_AUDIO_SECONDS
 
     with app_harness({"audio.trigger_mode": "continuous"}) as h:
         app = _backlog_session(h)
@@ -287,7 +287,7 @@ def test_backlog_at_limit_keeps_listening() -> None:
 
 
 def test_backlog_over_limit_pauses_listening_without_dropping_audio() -> None:
-    from voiceink.app import MAX_BACKLOG_AUDIO_SECONDS
+    from sayink.app import MAX_BACKLOG_AUDIO_SECONDS
 
     with app_harness({"audio.trigger_mode": "continuous"}) as h:
         app = _backlog_session(h)

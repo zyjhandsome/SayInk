@@ -2,7 +2,7 @@
 
 ## Why
 
-delivery 族需在 VoiceInk 上跑通一次 **Quick → execute → verification.md**，并验证 **Explore 交接消费（C5）** 勾选块落在 `proposal.md`。选一处已入图、边界清晰、无红线的锚点：`voiceink/media_decoder.py` 公开 API 可被测试导入。
+delivery 族需在 SayInk 上跑通一次 **Quick → execute → verification.md**，并验证 **Explore 交接消费（C5）** 勾选块落在 `proposal.md`。选一处已入图、边界清晰、无红线的锚点：`sayink/media_decoder.py` 公开 API 可被测试导入。
 
 ## What Changes
 
@@ -17,13 +17,13 @@ delivery 族需在 VoiceInk 上跑通一次 **Quick → execute → verification
 
 影响文件/符号：
 - 新建 `tests/test_media_decoder_import_smoke.py`
-- 只读引用：`voiceink.media_decoder`（`resolve_ffmpeg_executable`、`decode_media_to_pcm`、`MissingFFmpegError`、`DecodeError`、`NoAudioError`、`CancelledError`）
+- 只读引用：`sayink.media_decoder`（`resolve_ffmpeg_executable`、`decode_media_to_pcm`、`MissingFFmpegError`、`DecodeError`、`NoAudioError`、`CancelledError`）
 
 可观察行为：`pytest tests/test_media_decoder_import_smoke.py -q` 全绿；导入失败则红。
 
 最小验证：`python -m pytest tests/test_media_decoder_import_smoke.py -q`
 
-禁止范围：`voiceink/app.py`、`voiceink/media_decoder.py` 行为修改；`speech_recognizer.py`；历史 DDL；打包脚本。
+禁止范围：`sayink/app.py`、`sayink/media_decoder.py` 行为修改；`speech_recognizer.py`；历史 DDL；打包脚本。
 
 风险/未知项：Low / Quick；无红线；工作区已有未提交媒体转写改动，本变更仅新增测试文件，避免碰撞。
 
@@ -35,7 +35,7 @@ delivery 族需在 VoiceInk 上跑通一次 **Quick → execute → verification
 - [x] `risk_signal` → 仅线索；风险已按代码事实重算
 - [x] `unknowns` → 已写入开放问题或非阻塞丢弃
 
-落点摘要：意图=media_decoder 导入烟雾；挂载=`voiceink/media_decoder.py`；Risk=Quick/low（hit 无红线）；开放问题=无阻塞。
+落点摘要：意图=media_decoder 导入烟雾；挂载=`sayink/media_decoder.py`；Risk=Quick/low（hit 无红线）；开放问题=无阻塞。
 
 实施批准：已批准（批准人=用户「完整的跑一次测试验证」/ 2026-07-15）
 

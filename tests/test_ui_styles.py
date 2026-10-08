@@ -38,7 +38,7 @@ def _blend(foreground: str, background: str, alpha: float) -> str:
 
 class TestAppStyles:
     def test_global_stylesheet_is_nonempty_string(self):
-        from voiceink.ui.app_styles import GLOBAL_APP_STYLESHEET
+        from sayink.ui.app_styles import GLOBAL_APP_STYLESHEET
 
         assert isinstance(GLOBAL_APP_STYLESHEET, str)
         assert len(GLOBAL_APP_STYLESHEET.strip()) > 0
@@ -46,7 +46,7 @@ class TestAppStyles:
 
 class TestColorContrastContracts:
     def test_small_text_and_semantic_text_meet_aa_on_light_surfaces(self):
-        from voiceink.ui.design_tokens import tokens_for
+        from sayink.ui.design_tokens import tokens_for
 
         light = tokens_for("light")
         for foreground, background in (
@@ -59,7 +59,7 @@ class TestColorContrastContracts:
             assert _contrast(foreground, background) >= 4.5
 
     def test_dark_selected_text_and_primary_buttons_meet_aa(self):
-        from voiceink.ui.design_tokens import tokens_for
+        from sayink.ui.design_tokens import tokens_for
 
         dark = tokens_for("dark")
         selected_background = _blend(
@@ -76,14 +76,14 @@ class TestColorContrastContracts:
 
 class TestSettingsStyles:
     def test_window_css_available(self):
-        import voiceink.ui.settings_styles as st
+        import sayink.ui.settings_styles as st
 
         assert hasattr(st, "WINDOW_CSS")
         assert isinstance(st.WINDOW_CSS, str)
 
     def test_interactive_styles_provide_visible_focus_rings(self):
-        import voiceink.ui.settings_styles as st
-        from voiceink.ui.settings_components import NAV_BTN_STYLE, ROW_RADIO_STYLE
+        import sayink.ui.settings_styles as st
+        from sayink.ui.settings_components import NAV_BTN_STYLE, ROW_RADIO_STYLE
 
         for style in (
             st.BTN_PRIMARY,
@@ -96,7 +96,7 @@ class TestSettingsStyles:
             assert "2px solid" in style
 
     def test_model_rating_labels_and_download_use_brand_accent(self):
-        from voiceink.ui.model_card import ModelCard, format_model_ratings
+        from sayink.ui.model_card import ModelCard, format_model_ratings
 
         card = ModelCard(
             {
@@ -117,8 +117,8 @@ class TestSettingsStyles:
         assert "#2563EB" in card._action_btn.styleSheet()
 
     def test_active_model_card_uses_subtle_current_state(self):
-        from voiceink.ui.design_tokens import ACCENT, ACCENT_SOFT, SURFACE_PEARL, TEXT_SEC
-        from voiceink.ui.model_card import ModelCard
+        from sayink.ui.design_tokens import ACCENT, ACCENT_SOFT, SURFACE_PEARL, TEXT_SEC
+        from sayink.ui.model_card import ModelCard
 
         card = ModelCard(
             {
@@ -144,7 +144,7 @@ class TestSettingsStyles:
             assert f"color: {TEXT_SEC}" in badge_sheet
             assert ACCENT_SOFT not in badge_sheet
 
-            import voiceink.ui.settings_styles as st
+            import sayink.ui.settings_styles as st
 
             assert card._delete_btn is not None
             assert card._delete_btn.styleSheet() == st.BTN_DANGER_SM
@@ -156,15 +156,15 @@ class TestSidebarVisualContracts:
     """Sidebar spacing / type / surface polish (Stitch alignment follow-up)."""
 
     def test_nav_bg_matches_cool_app_background(self):
-        from voiceink.ui import design_tokens as t
+        from sayink.ui import design_tokens as t
 
         t.activate("light")
         assert t.NAV_BG.upper() == "#F6F7F8"
         assert t.BG.upper() == "#FFFFFF"
 
     def test_nav_btn_style_uses_single_left_bar_and_soft_wash(self):
-        from voiceink.ui.design_tokens import ACCENT, NAV_SELECTED_BG
-        from voiceink.ui.settings_components import NAV_BTN_STYLE
+        from sayink.ui.design_tokens import ACCENT, NAV_SELECTED_BG
+        from sayink.ui.settings_components import NAV_BTN_STYLE
 
         assert "font-size: 14px" in NAV_BTN_STYLE
         # Prototype v3: left bar + soft wash + accent label.
@@ -176,8 +176,8 @@ class TestSidebarVisualContracts:
         assert "border: 2px solid" not in checked_block
 
     def test_page_title_avoids_negative_tracking(self):
-        from voiceink.ui.design_tokens import TEXT_SEC
-        from voiceink.ui.settings_components import PAGE_TITLE, SECTION_LABEL
+        from sayink.ui.design_tokens import TEXT_SEC
+        from sayink.ui.settings_components import PAGE_TITLE, SECTION_LABEL
 
         assert "font-size: 20px" in PAGE_TITLE
         assert "font-weight: 700" in PAGE_TITLE
@@ -187,8 +187,8 @@ class TestSidebarVisualContracts:
         assert "font-size: 14px" in SECTION_LABEL
 
     def test_group_and_hero_surfaces_are_bordered_cards(self):
-        from voiceink.ui.design_tokens import BORDER, RADIUS_LG, SURFACE
-        from voiceink.ui.settings_components import GROUP_STYLE, HERO_CARD_STYLE
+        from sayink.ui.design_tokens import BORDER, RADIUS_LG, SURFACE
+        from sayink.ui.settings_components import GROUP_STYLE, HERO_CARD_STYLE
 
         for style in (GROUP_STYLE, HERO_CARD_STYLE):
             assert f"background: {SURFACE}" in style
@@ -197,8 +197,8 @@ class TestSidebarVisualContracts:
         assert HERO_CARD_STYLE == GROUP_STYLE.replace("settingsGroup", "settingsHeroCard")
 
     def test_usage_tip_bar_is_neutral(self):
-        from voiceink.ui.design_tokens import HAIRLINE, SURFACE_PEARL, TEXT_SEC
-        from voiceink.ui.settings_components import usage_tip_bar
+        from sayink.ui.design_tokens import HAIRLINE, SURFACE_PEARL, TEXT_SEC
+        from sayink.ui.settings_components import usage_tip_bar
 
         tip = usage_tip_bar("提示")
         try:
@@ -212,8 +212,8 @@ class TestSidebarVisualContracts:
     def test_vertical_choice_selected_uses_single_emphasis(self):
         from PyQt6.QtWidgets import QRadioButton
 
-        from voiceink.ui import design_tokens as tok
-        from voiceink.ui.settings_components import ChoiceCard, VerticalChoiceCard
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.settings_components import ChoiceCard, VerticalChoiceCard
 
         tok.activate("light")
         radio = QRadioButton()
@@ -249,15 +249,15 @@ class TestSidebarVisualContracts:
             radio2.close()
 
     def test_general_page_header_class_removed(self):
-        import voiceink.ui.settings_components as components
+        import sayink.ui.settings_components as components
 
         assert not hasattr(components, "GeneralPageHeader")
 
     def test_settings_island_nav_has_no_sidebar(self, tmp_path, monkeypatch):
         import sys
         from PyQt6.QtWidgets import QApplication
-        from voiceink.config import Config
-        from voiceink.ui.settings_window import SettingsWindow
+        from sayink.config import Config
+        from sayink.ui.settings_window import SettingsWindow
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -274,7 +274,7 @@ class TestSidebarVisualContracts:
 
 class TestClassicDesktopTokens:
     def test_accent_and_surfaces(self):
-        from voiceink.ui import design_tokens as t
+        from sayink.ui import design_tokens as t
 
         t.activate("light")
         light = t.tokens_for("light")
@@ -288,8 +288,8 @@ class TestClassicDesktopTokens:
         assert "#" not in t.NAV_SELECTED_BG.lower() or t.NAV_SELECTED_BG.startswith("rgba")
 
     def test_ink_surfaces_and_primary(self):
-        from voiceink.ui import design_tokens as t
-        from voiceink.ui.design_tokens import tokens_for
+        from sayink.ui import design_tokens as t
+        from sayink.ui.design_tokens import tokens_for
 
         light = tokens_for("light")
         dark = tokens_for("dark")
@@ -308,8 +308,8 @@ class TestClassicDesktopTokens:
         assert t.STATE_LISTEN == t.GREEN
 
     def test_primary_buttons_use_primary_on(self):
-        import voiceink.ui.settings_styles as st
-        from voiceink.ui import design_tokens as t
+        import sayink.ui.settings_styles as st
+        from sayink.ui import design_tokens as t
 
         t.activate("light")
         st.reload_styles()
@@ -321,13 +321,13 @@ class TestClassicDesktopTokens:
         assert "color: white" not in accent_sm
 
     def test_dark_tokens_differ_from_light(self):
-        from voiceink.ui.design_tokens import tokens_for
+        from sayink.ui.design_tokens import tokens_for
 
         assert tokens_for("light")["BG"] != tokens_for("dark")["BG"]
         assert tokens_for("dark")["TEXT"].upper() == "#F9FAFB"
 
     def test_toggle_on_uses_semantic_green(self):
-        from voiceink.ui import design_tokens as t
+        from sayink.ui import design_tokens as t
 
         assert t.TOGGLE_ON.upper() == t.GREEN.upper()
         assert t.TOGGLE_ON_HOVER.upper() != t.TOGGLE_ON.upper()
@@ -340,8 +340,8 @@ class TestCursorInspiredSettingsPolish:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.ui.design_tokens import TOGGLE_ON, TOGGLE_ON_HOVER
-        from voiceink.ui.settings_components import SwitchControl
+        from sayink.ui.design_tokens import TOGGLE_ON, TOGGLE_ON_HOVER
+        from sayink.ui.settings_components import SwitchControl
 
         QApplication.instance() or QApplication(sys.argv)
         sw = SwitchControl()
@@ -356,14 +356,14 @@ class TestCursorInspiredSettingsPolish:
             sw.close()
 
     def test_switch_track_is_compact(self):
-        from voiceink.ui.settings_components import SwitchControl
+        from sayink.ui.settings_components import SwitchControl
 
         assert SwitchControl._TRACK_W == 36
         assert SwitchControl._TRACK_H == 20
 
     def test_ghost_sm_button_reserves_cjk_label_space(self):
-        import voiceink.ui.settings_styles as st
-        from voiceink.ui.design_tokens import (
+        import sayink.ui.settings_styles as st
+        from sayink.ui.design_tokens import (
             CONTROL_BTN_SM_FONT_PX,
             CONTROL_BTN_SM_HEIGHT,
         )
@@ -374,8 +374,8 @@ class TestCursorInspiredSettingsPolish:
         assert "QPushButton:checked" in st.BTN_GHOST_SM
 
     def test_accent_and_ghost_sm_share_size_box(self):
-        import voiceink.ui.settings_styles as st
-        from voiceink.ui.design_tokens import (
+        import sayink.ui.settings_styles as st
+        from sayink.ui.design_tokens import (
             CONTROL_BTN_SM_FONT_PX,
             CONTROL_BTN_SM_HEIGHT,
             CONTROL_BTN_SM_PAD_H,
@@ -389,8 +389,8 @@ class TestCursorInspiredSettingsPolish:
             assert "border: 1px solid" in sheet
 
     def test_model_card_select_and_delete_match_height(self):
-        from voiceink.ui.design_tokens import CONTROL_BTN_SM_HEIGHT
-        from voiceink.ui.model_card import ModelCard
+        from sayink.ui.design_tokens import CONTROL_BTN_SM_HEIGHT
+        from sayink.ui.model_card import ModelCard
 
         card = ModelCard(
             {
@@ -419,7 +419,7 @@ class TestCursorInspiredSettingsPolish:
 
         from PyQt6.QtWidgets import QApplication, QComboBox, QLabel
 
-        from voiceink.ui.settings_components import labeled_row
+        from sayink.ui.settings_components import labeled_row
 
         QApplication.instance() or QApplication(sys.argv)
         combo = QComboBox()
@@ -438,8 +438,8 @@ class TestCursorInspiredSettingsPolish:
     def test_nav_icon_active_stays_neutral_not_accent(self):
         from pathlib import Path
 
-        from voiceink.ui import nav_icons as mod
-        from voiceink.ui.nav_icons import nav_icon
+        from sayink.ui import nav_icons as mod
+        from sayink.ui.nav_icons import nav_icon
 
         idle = nav_icon("general", active=False)
         active = nav_icon("general", active=True)
@@ -454,8 +454,8 @@ class TestSettingsControlAlignment:
     """History numeric spins + scrollbar policy (settings-control-alignment)."""
 
     def test_window_css_styles_spinbox_like_inputs(self):
-        import voiceink.ui.settings_styles as st
-        from voiceink.ui.design_tokens import ACCENT_FOCUS, CONTROL_BORDER, RADIUS_MD, SURFACE
+        import sayink.ui.settings_styles as st
+        from sayink.ui.design_tokens import ACCENT_FOCUS, CONTROL_BORDER, RADIUS_MD, SURFACE
 
         assert "QSpinBox {" in st.WINDOW_CSS or "QSpinBox {{" in st.WINDOW_CSS
         assert f"border: 1px solid {CONTROL_BORDER}" in st.WINDOW_CSS
@@ -480,12 +480,12 @@ class TestSettingsControlAlignment:
         assert f"border: 1px solid {CONTROL_BORDER}" in st.WINDOW_CSS
 
     def test_numeric_control_width_token(self):
-        from voiceink.ui.design_tokens import CONTROL_NUMERIC_WIDTH
+        from sayink.ui.design_tokens import CONTROL_NUMERIC_WIDTH
 
         assert CONTROL_NUMERIC_WIDTH == 120
 
     def test_device_combo_width_token(self):
-        from voiceink.ui.design_tokens import CONTROL_DEVICE_COMBO_WIDTH
+        from sayink.ui.design_tokens import CONTROL_DEVICE_COMBO_WIDTH
 
         assert CONTROL_DEVICE_COMBO_WIDTH == 320
 
@@ -494,8 +494,8 @@ class TestSettingsControlAlignment:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.ui.design_tokens import CONTROL_NUMERIC_WIDTH
-        from voiceink.ui.settings_window import SettingsWindow
+        from sayink.ui.design_tokens import CONTROL_NUMERIC_WIDTH
+        from sayink.ui.settings_window import SettingsWindow
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -516,8 +516,8 @@ class TestSettingsControlAlignment:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.ui.design_tokens import CONTROL_DEVICE_COMBO_WIDTH
-        from voiceink.ui.settings_window import SettingsWindow
+        from sayink.ui.design_tokens import CONTROL_DEVICE_COMBO_WIDTH
+        from sayink.ui.settings_window import SettingsWindow
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -540,8 +540,8 @@ class TestSettingsControlAlignment:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.ui.settings_window import SettingsWindow
-        from voiceink.ui.theme import apply_theme
+        from sayink.ui.settings_window import SettingsWindow
+        from sayink.ui.theme import apply_theme
 
         qapp = QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -570,7 +570,7 @@ class TestSettingsControlAlignment:
         from PyQt6.QtCore import Qt
         from PyQt6.QtWidgets import QApplication, QSizePolicy
 
-        from voiceink.ui.settings_components import SettingsPage, footnote
+        from sayink.ui.settings_components import SettingsPage, footnote
 
         QApplication.instance() or QApplication(sys.argv)
         page = SettingsPage()

@@ -1,5 +1,5 @@
 import numpy as np
-from voiceink.audio_utils import mix_to_mono, resample_mono, rms_volume, to_mono
+from sayink.audio_utils import mix_to_mono, resample_mono, rms_volume, to_mono
 
 
 class TestToMono:

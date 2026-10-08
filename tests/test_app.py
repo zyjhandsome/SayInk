@@ -5,9 +5,9 @@ import numpy as np
 from PyQt6.QtWidgets import QApplication
 from unittest.mock import MagicMock
 
-from voiceink.app import App, MIN_AUDIO_SAMPLES
-from voiceink.runtime_status import RuntimeState
-from voiceink.text_paster import PasteResult
+from sayink.app import App, MIN_AUDIO_SAMPLES
+from sayink.runtime_status import RuntimeState
+from sayink.text_paster import PasteResult
 from tests.helpers.app_harness import app_harness
 
 
@@ -41,7 +41,7 @@ class TestIslandUserCopy:
         for hint in App.ERROR_HINTS.values():
             assert "设置 → 模型" not in hint
         for key in ("模型未就绪", "模型未下载"):
-            assert "打开 VoiceInk" in App.ERROR_HINTS[key]
+            assert "打开 SayInk" in App.ERROR_HINTS[key]
             assert "→ 引擎" in App.ERROR_HINTS[key]
             assert "右键托盘图标 → 设置" not in App.ERROR_HINTS[key]
 
@@ -71,7 +71,7 @@ class TestIslandUserCopy:
             h["recognizer"].is_loading = False
             h["app"]._show_model_not_ready()
             msg = h["tray"].showMessage.call_args[0][1]
-            assert "打开 VoiceInk" in msg and "→ 引擎" in msg
+            assert "打开 SayInk" in msg and "→ 引擎" in msg
             assert "右键托盘图标 → 设置" not in msg
             assert "设置 → 模型" not in msg
 
@@ -155,7 +155,7 @@ class TestTrayMenuDoesNotLeaveMainWindowStuck:
         app._restore_main_after_menu = False
         monkeypatch.setattr(QApplication, "activeWindow", staticmethod(lambda: main))
         monkeypatch.setattr(
-            "voiceink.app.QTimer.singleShot",
+            "sayink.app.QTimer.singleShot",
             lambda _delay, callback: callback(),
         )
 

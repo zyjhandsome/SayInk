@@ -7,9 +7,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from voiceink.audio_devices import AudioDeviceInfo, RecordingPlan, StreamEndpoint
-from voiceink.audio_recorder import AudioRecorder
-from voiceink.config import Config
+from sayink.audio_devices import AudioDeviceInfo, RecordingPlan, StreamEndpoint
+from sayink.audio_recorder import AudioRecorder
+from sayink.config import Config
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -31,8 +31,8 @@ def _restore_light_design_tokens():
     """Keep design-token module aliases on the light axis between tests."""
     yield
     try:
-        from voiceink.ui import design_tokens as dt
-        from voiceink.ui import settings_styles as ss
+        from sayink.ui import design_tokens as dt
+        from sayink.ui import settings_styles as ss
 
         dt.activate("light")
         ss.reload_styles()
@@ -44,7 +44,7 @@ def _restore_light_design_tokens():
 def _isolate_registry_auto_start(monkeypatch):
     """Stop tests from reading the real machine's Windows ``Run`` key.
 
-    Without this, a developer machine that has VoiceInk registered for
+    Without this, a developer machine that has SayInk registered for
     auto-start would leak ``auto_start=True`` into every isolated Config,
     making toggle/signal assertions non-deterministic. We simulate an empty
     ``Run`` key so the real sync code path still runs (and stays covered).
@@ -61,13 +61,13 @@ def _isolate_registry_auto_start(monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_real_credential_manager(monkeypatch):
     """Never read or write the developer's real Windows credentials."""
-    monkeypatch.setattr("voiceink.config.default_secret_store", lambda: None)
+    monkeypatch.setattr("sayink.config.default_secret_store", lambda: None)
 
 
 @pytest.fixture
 def config_home(tmp_path):
-    """Isolated ~/.voiceink directory for config tests."""
-    home = tmp_path / ".voiceink"
+    """Isolated ~/.sayink directory for config tests."""
+    home = tmp_path / ".sayink"
     home.mkdir(parents=True)
     return home
 
@@ -94,7 +94,7 @@ def mock_recording_hardware(monkeypatch):
         lane.sample_rate = 16000
 
     monkeypatch.setattr(
-        "voiceink.audio_recorder.build_recording_plan",
+        "sayink.audio_recorder.build_recording_plan",
         fake_build_recording_plan,
     )
     monkeypatch.setattr(AudioRecorder, "_open_lane_stream", fake_open_lane_stream)

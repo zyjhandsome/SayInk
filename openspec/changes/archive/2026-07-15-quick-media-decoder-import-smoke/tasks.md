@@ -10,7 +10,7 @@
 ## 任务
 
 - [x] 1.1 新增导入烟雾单测
-  - 目标文件/符号：`tests/test_media_decoder_import_smoke.py`；`voiceink.media_decoder.resolve_ffmpeg_executable` / `decode_media_to_pcm` / 错误类型
-  - 禁止修改：`voiceink/media_decoder.py`、`voiceink/app.py`、其它产品模块
+  - 目标文件/符号：`tests/test_media_decoder_import_smoke.py`；`sayink.media_decoder.resolve_ffmpeg_executable` / `decode_media_to_pcm` / 错误类型
+  - 禁止修改：`sayink/media_decoder.py`、`sayink/app.py`、其它产品模块
   - 验证命令/动作：`python -m pytest tests/test_media_decoder_import_smoke.py -q`
   - 预期结果：至少 1 条用例通过；退出码 0

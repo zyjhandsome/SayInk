@@ -10,20 +10,20 @@ import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton, QWidget
 
-from voiceink.audio_devices import (
+from sayink.audio_devices import (
     INPUT_SOURCE_MICROPHONE,
     INPUT_SOURCE_MIXED,
     INPUT_SOURCE_SYSTEM,
 )
-from voiceink.config import TRIGGER_MODE_CONTINUOUS, TRIGGER_MODE_HOTKEY, Config
-from voiceink.ui.design_tokens import (
+from sayink.config import TRIGGER_MODE_CONTINUOUS, TRIGGER_MODE_HOTKEY, Config
+from sayink.ui.design_tokens import (
     ACCENT,
     AMBER_TEXT,
     SURFACE_PEARL,
     TEXT_DIM,
     TEXT_SEC,
 )
-from voiceink.ui.settings_window import SettingsWindow
+from sayink.ui.settings_window import SettingsWindow
 
 
 @pytest.fixture(scope="module")
@@ -116,7 +116,7 @@ class TestGeneralPageLayout:
         assert all(f"color: {AMBER_TEXT}" not in label.styleSheet() for label in labels)
 
     def test_settings_stack_contains_only_native_pages(self, settings_window):
-        from voiceink.ui.settings_components import SettingsPage
+        from sayink.ui.settings_components import SettingsPage
 
         pages = settings_window._pages
         assert pages.count() == 4
@@ -131,7 +131,7 @@ class TestGeneralPageLayout:
 
     def test_general_stacks_three_sections_top_to_bottom(self, settings_window, qapp):
         """Prototype v3: 录音 → 音频 → 偏好 all visible in one scroll page."""
-        from voiceink.ui.settings_components import (
+        from sayink.ui.settings_components import (
             AudioSourcePicker,
             CompactPickCard,
             ThemeModeSegment,
@@ -168,7 +168,7 @@ class TestGeneralPageLayout:
     def test_general_section_groups_use_bordered_cards(self, settings_window):
         from PyQt6.QtWidgets import QFrame
 
-        from voiceink.ui.design_tokens import BORDER, RADIUS_LG, SURFACE
+        from sayink.ui.design_tokens import BORDER, RADIUS_LG, SURFACE
 
         groups = [
             frame for frame in settings_window.findChildren(QFrame)
@@ -182,7 +182,7 @@ class TestGeneralPageLayout:
             assert f"border-radius: {RADIUS_LG}px" in sheet
 
     def test_settings_content_column_is_transparent_on_sheet(self, settings_window):
-        from voiceink.ui import design_tokens as tok
+        from sayink.ui import design_tokens as tok
 
         for widget in (
             settings_window._content_wrap,
@@ -265,7 +265,7 @@ class TestGeneralPageLayout:
 
     def test_audio_source_cards_are_horizontal(self, settings_window):
         from PyQt6.QtWidgets import QHBoxLayout
-        from voiceink.ui.settings_components import AudioSourcePicker, CompactPickCard
+        from sayink.ui.settings_components import AudioSourcePicker, CompactPickCard
 
         ap = settings_window.findChild(AudioSourcePicker)
         assert ap is not None
@@ -276,7 +276,7 @@ class TestGeneralPageLayout:
 
     def test_trigger_mode_uses_compact_picks(self, settings_window):
         from PyQt6.QtWidgets import QHBoxLayout
-        from voiceink.ui.settings_components import CompactPickCard, TriggerModePicker
+        from sayink.ui.settings_components import CompactPickCard, TriggerModePicker
 
         picker = settings_window.findChild(TriggerModePicker)
         assert picker is not None

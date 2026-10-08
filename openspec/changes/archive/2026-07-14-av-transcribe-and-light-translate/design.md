@@ -2,7 +2,7 @@
 
 ## Context
 
-VoiceInk 已具备实时听写（麦克风/系统声）→ 离线 ASR（`SpeechRecognizer.transcribe_final`）→ 可选润色（`TextPolisher`）→ 粘贴/历史。规格已批准：捆绑 ffmpeg 的音/视频文件转写 + **仅文件任务**的事后轻翻译（与润色互斥），非同声传译。用户选定实现方案 **A**：旁路文件任务 + 整段转写 + Polisher 翻译模式。
+SayInk 已具备实时听写（麦克风/系统声）→ 离线 ASR（`SpeechRecognizer.transcribe_final`）→ 可选润色（`TextPolisher`）→ 粘贴/历史。规格已批准：捆绑 ffmpeg 的音/视频文件转写 + **仅文件任务**的事后轻翻译（与润色互斥），非同声传译。用户选定实现方案 **A**：旁路文件任务 + 整段转写 + Polisher 翻译模式。
 
 ## Goals / Non-Goals
 
@@ -28,11 +28,11 @@ VoiceInk 已具备实时听写（麦克风/系统声）→ 离线 ASR（`SpeechR
 
 | 结论 | 证据 | 新鲜度 |
 |---|---|---|
-| ASR 入口 `transcribe_final(np.ndarray)` | `voiceink/speech_recognizer.py` | HEAD `bb8db26` |
+| ASR 入口 `transcribe_final(np.ndarray)` | `sayink/speech_recognizer.py` | HEAD `bb8db26` |
 | 历史 `source` 现为 mic/system/mixed | `App._build_pending_history_record` | 同上 |
 | 润色 `llm.*` + `POLISH_PROMPT` 禁改语言 | `config.DEFAULT_CONFIG` / `text_polisher.py` | 同上 |
 | 托盘已有设置/历史入口 | `tray_icon._setup_menu` | 同上 |
-| PyInstaller 在 `build.py` 组装 args；Inno 拷贝 `dist/VoiceInk/_internal` | `build.py` / `installer/VoiceInk-Setup.iss` | 同上 |
+| PyInstaller 在 `build.py` 组装 args；Inno 拷贝 `dist/SayInk/_internal` | `build.py` / `installer/SayInk-Setup.iss` | 同上 |
 | 无并行活跃 change 冲突 | `openspec/changes` 仅本 change | 同上 |
 
 ## 方案比较
@@ -51,13 +51,13 @@ VoiceInk 已具备实时听写（麦克风/系统声）→ 离线 ASR（`SpeechR
 
 ## Decisions
 
-1. **解码**：新增 `voiceink/media_decoder.py`，通过 subprocess 调用捆绑 `ffmpeg`，输出 mono float32 16 kHz PCM（`numpy` 数组）。解析可执行路径：开发态可用环境变量/`third_party/ffmpeg`；冻结态优先 `_MEIPASS` / 安装目录旁 `ffmpeg`（与 models 布局同类）。
+1. **解码**：新增 `sayink/media_decoder.py`，通过 subprocess 调用捆绑 `ffmpeg`，输出 mono float32 16 kHz PCM（`numpy` 数组）。解析可执行路径：开发态可用环境变量/`third_party/ffmpeg`；冻结态优先 `_MEIPASS` / 安装目录旁 `ffmpeg`（与 models 布局同类）。
 2. **文件任务状态**：在 `App` 增加 `_file_job_*` 状态（idle/decoding/transcribing/postprocess/cancelling）。进行中拒绝热键开始录音，并提示；实时录音/转写中拒绝新文件任务。
 3. **历史元数据**：`source="file"`；`trigger_mode="file_import"`（或等价常量）；不改 DDL。
 4. **后处理配置**：扩展 `llm`（或并列 `postprocess`）为模式 `polish` | `translate`（互斥）；翻译目标语言配置键；仅当 `_file_job_active` 且 mode=translate 时走翻译 prompt。实时路径仅在 mode=polish 且 enabled 时润色（保持现状）。
 5. **翻译实现**：`TextPolisher` 增加 `TRANSLATE_PROMPT` 模板（注入目标语言）或 `polish(..., mode=...)`；复用 `PolishWorker` HTTP 骨架；失败仍走现有 `_on_polish_error` 降级语义（文件任务文案区分「翻译未成功」）。
 6. **UI**：托盘菜单「导入文件」信号；历史窗同入口可选。`QFileDialog` 过滤常见音视频。浮窗复用 recognizing/polishing 状态，必要时增加「文件转写中/可取消」。
-7. **打包**：`build.py` 在构建后（或 `--add-binary`）将平台 ffmpeg 打入 `dist/VoiceInk/`（如 `_internal/ffmpeg/` 或根目录）；文档注明二进制来源与许可证；开发者需提供/下载 ffmpeg 构建输入（任务内脚本或 README 步骤）。Inno 随 `_internal` 递归已覆盖则无需改 iss；若放在 app 根需补 `[Files]`。
+7. **打包**：`build.py` 在构建后（或 `--add-binary`）将平台 ffmpeg 打入 `dist/SayInk/`（如 `_internal/ffmpeg/` 或根目录）；文档注明二进制来源与许可证；开发者需提供/下载 ffmpeg 构建输入（任务内脚本或 README 步骤）。Inno 随 `_internal` 递归已覆盖则无需改 iss；若放在 app 根需补 `[Files]`。
 8. **并发取消**：取消文件任务时 `cancel` 解码子进程 + `SpeechRecognizer` 现有 supersede/cancel + polisher.cancel；不 `QThread.terminate` ASR（遵守现有 SD-05 约束）。
 
 ## 最终决策
@@ -97,7 +97,7 @@ VoiceInk 已具备实时听写（麦克风/系统声）→ 离线 ASR（`SpeechR
 ## 失败处理与可观测性
 
 - 缺失 ffmpeg / 解码失败 / 无音轨 / ASR 空结果 / 翻译失败：浮窗或对话框短文案 + log
-- 日志：`VoiceInk` logger，含 job id、文件 basename、阶段耗时
+- 日志：`SayInk` logger，含 job id、文件 basename、阶段耗时
 - 进度：至少阶段文案（解码中/识别中/翻译中）；精确百分比可选（非阻塞）
 
 ## 兼容、迁移与回滚

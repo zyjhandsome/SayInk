@@ -22,8 +22,8 @@
 
 ## Impact
 
-- `voiceink/ui/settings_window.py` — 历史 spin 固定宽度
-- `voiceink/ui/settings_styles.py` — `QSpinBox` QSS
-- `voiceink/ui/settings_components.py` — `labeled_row` / 滚动条策略（若需）
-- `voiceink/ui/design_tokens.py` — 可选：控件槽宽度 token
+- `sayink/ui/settings_window.py` — 历史 spin 固定宽度
+- `sayink/ui/settings_styles.py` — `QSpinBox` QSS
+- `sayink/ui/settings_components.py` — `labeled_row` / 滚动条策略（若需）
+- `sayink/ui/design_tokens.py` — 可选：控件槽宽度 token
 - `tests/test_ui_styles.py` — 样式/对齐相关断言（若已有覆盖点）

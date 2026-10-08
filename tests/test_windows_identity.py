@@ -1,4 +1,4 @@
-"""Tests for Windows shell identity helpers (voiceink/platform/windows_identity.py)."""
+"""Tests for Windows shell identity helpers (sayink/platform/windows_identity.py)."""
 
 from __future__ import annotations
 
@@ -7,13 +7,13 @@ from pathlib import Path
 
 import pytest
 
-import voiceink.platform.windows_identity as wi
+import sayink.platform.windows_identity as wi
 
 
 class TestAppUserModelId:
     def test_constants(self):
-        assert wi.APP_USER_MODEL_ID == "VoiceInk.VoiceInkApp"
-        assert wi.APP_DISPLAY_NAME == "VoiceInk"
+        assert wi.APP_USER_MODEL_ID == "SayInk.SayInkApp"
+        assert wi.APP_DISPLAY_NAME == "SayInk"
 
     def test_set_id_noop_on_non_win32(self, monkeypatch):
         monkeypatch.setattr(wi.sys, "platform", "linux")
@@ -81,9 +81,9 @@ class TestLauncherTarget:
 
     def test_frozen_uses_executable(self, monkeypatch):
         monkeypatch.setattr(wi.sys, "frozen", True, raising=False)
-        monkeypatch.setattr(wi.sys, "executable", r"C:\app\VoiceInk.exe")
+        monkeypatch.setattr(wi.sys, "executable", r"C:\app\SayInk.exe")
         target, args, workdir = wi._launcher_target()
-        assert target.endswith("VoiceInk.exe")
+        assert target.endswith("SayInk.exe")
         assert args == ""
 
     def test_dev_uses_run_py(self, monkeypatch):

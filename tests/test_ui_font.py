@@ -8,7 +8,7 @@ from pathlib import Path
 
 class TestResolveUiFontFamily:
     def test_prefers_cjk_family_when_latin_variable_also_present(self):
-        from voiceink.ui.design_tokens import resolve_ui_font_family
+        from sayink.ui.design_tokens import resolve_ui_font_family
 
         family = resolve_ui_font_family(
             available_families=("Segoe UI", "Segoe UI Variable", "Microsoft YaHei UI")
@@ -16,7 +16,7 @@ class TestResolveUiFontFamily:
         assert family == "Microsoft YaHei UI"
 
     def test_skips_family_that_cannot_cover_cjk(self):
-        from voiceink.ui.design_tokens import resolve_ui_font_family
+        from sayink.ui.design_tokens import resolve_ui_font_family
 
         family = resolve_ui_font_family(
             available_families=("Segoe UI Variable", "Microsoft YaHei UI"),
@@ -26,7 +26,7 @@ class TestResolveUiFontFamily:
         assert family == "Microsoft YaHei UI"
 
     def test_falls_back_to_yahei_when_segoe_variable_missing(self):
-        from voiceink.ui.design_tokens import resolve_ui_font_family
+        from sayink.ui.design_tokens import resolve_ui_font_family
 
         family = resolve_ui_font_family(
             available_families=("Consolas", "Microsoft YaHei UI", "Arial")
@@ -34,7 +34,7 @@ class TestResolveUiFontFamily:
         assert family == "Microsoft YaHei UI"
 
     def test_falls_back_to_segoe_ui_then_yahei_literal(self):
-        from voiceink.ui.design_tokens import resolve_ui_font_family
+        from sayink.ui.design_tokens import resolve_ui_font_family
 
         family = resolve_ui_font_family(available_families=("Segoe UI",))
         assert family == "Segoe UI"
@@ -48,8 +48,8 @@ class TestResolveUiFontFamily:
 
         from PyQt6.QtGui import QFont, QFontDatabase, QFontMetrics
 
-        from voiceink.ui.design_tokens import refresh_ui_font
-        from voiceink.ui.theme import apply_theme
+        from sayink.ui.design_tokens import refresh_ui_font
+        from sayink.ui.theme import apply_theme
 
         windir = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
         yahei = windir / "msyh.ttc"
@@ -64,7 +64,7 @@ class TestResolveUiFontFamily:
 
 class TestResolveMonoFontFamily:
     def test_prefers_cascadia_mono(self):
-        from voiceink.ui.design_tokens import resolve_mono_font_family
+        from sayink.ui.design_tokens import resolve_mono_font_family
 
         family = resolve_mono_font_family(
             available_families=("Consolas", "Cascadia Mono", "Segoe UI")
@@ -72,7 +72,7 @@ class TestResolveMonoFontFamily:
         assert family == "Cascadia Mono"
 
     def test_falls_back_to_consolas_then_jetbrains(self):
-        from voiceink.ui.design_tokens import resolve_mono_font_family
+        from sayink.ui.design_tokens import resolve_mono_font_family
 
         assert resolve_mono_font_family(
             available_families=("Arial", "Consolas")
@@ -82,12 +82,12 @@ class TestResolveMonoFontFamily:
         ) == "JetBrains Mono"
 
     def test_default_literal_when_none_installed(self):
-        from voiceink.ui.design_tokens import resolve_mono_font_family
+        from sayink.ui.design_tokens import resolve_mono_font_family
 
         assert resolve_mono_font_family(available_families=()) == "Cascadia Mono"
 
     def test_refresh_publishes_one_quoted_family(self, monkeypatch):
-        from voiceink.ui import design_tokens as dt
+        from sayink.ui import design_tokens as dt
 
         monkeypatch.setattr(dt, "resolve_ui_font_family", lambda **kwargs: "Mock UI Font")
         monkeypatch.setattr(dt, "resolve_mono_font_family", lambda **kwargs: "Mock Mono")
@@ -101,7 +101,7 @@ class TestYaHeiWeightAndTracking:
         banned_weight = re.compile(r"font-weight:\s*(500|550|600)\b")
         banned_tracking = re.compile(r"letter-spacing:\s*(-|0\.\d)")
         offenders: list[str] = []
-        for path in Path("voiceink/ui").rglob("*.py"):
+        for path in Path("sayink/ui").rglob("*.py"):
             for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
                 if (
                     banned_weight.search(line)
@@ -119,8 +119,8 @@ class TestYaHeiWeightAndTracking:
 
 class TestApplyThemeRefreshesFont:
     def test_apply_theme_sets_module_font_from_resolver(self, monkeypatch):
-        from voiceink.ui import design_tokens as dt
-        from voiceink.ui.theme import apply_theme
+        from sayink.ui import design_tokens as dt
+        from sayink.ui.theme import apply_theme
 
         monkeypatch.setattr(
             dt,
@@ -131,7 +131,7 @@ class TestApplyThemeRefreshesFont:
         assert dt.FONT == '"Mock UI Font"'
         assert dt.FONT_DISPLAY == '"Mock UI Font"'
 
-        from voiceink.ui.app_styles import build_global_stylesheet
+        from sayink.ui.app_styles import build_global_stylesheet
 
         css = build_global_stylesheet("light")
         assert "Mock UI Font" in css
@@ -139,13 +139,13 @@ class TestApplyThemeRefreshesFont:
 
 class TestFloatingWindowUsesResolvedFont:
     def test_setup_ui_does_not_hardcode_segoe_variable_literal(self):
-        source = Path("voiceink/ui/floating_window.py").read_text(encoding="utf-8")
+        source = Path("sayink/ui/floating_window.py").read_text(encoding="utf-8")
         assert 'QFont("Segoe UI Variable"' not in source
 
 
 class TestTypographyScaleTokens:
     def test_type_tokens_match_design_ladder(self):
-        from voiceink.ui import design_tokens as dt
+        from sayink.ui import design_tokens as dt
 
         assert dt.TYPE_CAPTION == 12
         assert dt.TYPE_FOOTNOTE == 13
@@ -159,8 +159,8 @@ class TestTypographyScaleTokens:
         assert dt.TYPE_ICON_LG == 17
 
     def test_settings_reload_styles_uses_type_tokens(self):
-        from voiceink.ui import design_tokens as dt
-        from voiceink.ui import settings_components as sc
+        from sayink.ui import design_tokens as dt
+        from sayink.ui import settings_components as sc
 
         sc.reload_styles()
         assert f"font-size: {dt.TYPE_TITLE_LG}px" in sc.PAGE_TITLE
@@ -168,15 +168,15 @@ class TestTypographyScaleTokens:
         assert f"font-size: {dt.TYPE_BODY_SM}px" in sc.PAGE_SUBTITLE
 
     def test_global_stylesheet_uses_type_body(self):
-        from voiceink.ui import design_tokens as dt
-        from voiceink.ui.app_styles import build_global_stylesheet
+        from sayink.ui import design_tokens as dt
+        from sayink.ui.app_styles import build_global_stylesheet
 
         assert f"font-size: {dt.TYPE_BODY}px" in build_global_stylesheet("light")
 
 
 class TestThemeSurfacePolish:
     def test_chip_hover_press_tokens_exist(self):
-        from voiceink.ui.design_tokens import tokens_for
+        from sayink.ui.design_tokens import tokens_for
 
         for axis in ("light", "dark"):
             t = tokens_for(axis)
@@ -186,7 +186,7 @@ class TestThemeSurfacePolish:
             assert t["CHIP_BG_PRESS"] != t["CHIP_BG"]
 
     def test_float_reapply_uses_primary_tokens_not_string_replace(self):
-        source = Path("voiceink/ui/floating_window.py").read_text(encoding="utf-8")
+        source = Path("sayink/ui/floating_window.py").read_text(encoding="utf-8")
         assert "CHIP_BG.replace" not in source
         assert "PRIMARY_CONTAINER_HOVER" in source
 
@@ -195,9 +195,9 @@ class TestThemeSurfacePolish:
 
         from PyQt6.QtWidgets import QApplication, QLabel
 
-        from voiceink.ui import design_tokens as dt
-        from voiceink.ui.settings_components import paint_usage_tip_bar, usage_tip_bar
-        from voiceink.ui.theme import apply_theme
+        from sayink.ui import design_tokens as dt
+        from sayink.ui.settings_components import paint_usage_tip_bar, usage_tip_bar
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         tip = usage_tip_bar("提示")
@@ -215,9 +215,9 @@ class TestCalloutThemeReapply:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.ui import design_tokens as dt
-        from voiceink.ui.settings_components import info_callout, paint_info_callout
-        from voiceink.ui.theme import apply_theme
+        from sayink.ui import design_tokens as dt
+        from sayink.ui.settings_components import info_callout, paint_info_callout
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         frame = info_callout("混合采集提示")
@@ -233,7 +233,7 @@ class TestCalloutThemeReapply:
 
 class TestMasterTypographyAlignment:
     def test_master_documents_font_strategy_and_type_ladder(self):
-        from voiceink.ui import design_tokens as dt
+        from sayink.ui import design_tokens as dt
 
         master = Path("design-system/MASTER.md").read_text(encoding="utf-8")
         assert "Segoe UI Variable" in master

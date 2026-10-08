@@ -1,4 +1,4 @@
-# VoiceInk 空间岛 UI 重构
+# SayInk 空间岛 UI 重构
 
 Date: 2026-09-19  
 Status: superseded by 2026-09-21-codex-main-window-design.md  
@@ -6,7 +6,7 @@ Approach: A, 空间岛系统重构（保留品牌）
 
 ## Problem
 
-VoiceInk 的四条 UI 表面（胶囊浮窗、设置、历史、托盘）已半迁移到顶部空间岛，但还不是同一套产品语言。设置仍藏着侧栏、展开岛三个等权按钮、历史文案和元数据挤成一团、token 与 MASTER 有漂移。用户要的是专业级全界面重构，不是换品牌色。
+SayInk 的四条 UI 表面（胶囊浮窗、设置、历史、托盘）已半迁移到顶部空间岛，但还不是同一套产品语言。设置仍藏着侧栏、展开岛三个等权按钮、历史文案和元数据挤成一团、token 与 MASTER 有漂移。用户要的是专业级全界面重构，不是换品牌色。
 
 ## Goal
 
@@ -76,7 +76,7 @@ Listening: dot pulse + waveform. Capsule to sheet: transform/opacity ~200ms. Hon
 
 ## Capsule and expanded island
 
-File: `voiceink/ui/floating_window.py` + `island_chrome.py`.
+File: `sayink/ui/floating_window.py` + `island_chrome.py`.
 
 ### Capsule (default)
 
@@ -116,7 +116,7 @@ Keep: no idle「待开始」capsule after continuous-mode ready; short-press hot
 
 ## Settings island
 
-File: `voiceink/ui/settings_window.py` + `settings_pages/` + `settings_components.py`.
+File: `sayink/ui/settings_window.py` + `settings_pages/` + `settings_components.py`.
 
 ### Chrome
 
@@ -146,13 +146,13 @@ Toggle first. Off: only the toggle and「直接输出原文」. On: preview, API
 
 ### 关于
 
-Not a spec sheet. Row 1: VoiceInk + version chip. Three status rows: current model, hotkey, polish on/off. Model dir and config path live in a collapsed「文件位置」disclosure. Bottom amber tip follows the active trigger mode.
+Not a spec sheet. Row 1: SayInk + version chip. Three status rows: current model, hotkey, polish on/off. Model dir and config path live in a collapsed「文件位置」disclosure. Bottom amber tip follows the active trigger mode.
 
 Config keys and auto-save behavior do not change.
 
 ## History island
 
-File: `voiceink/ui/history_window.py`.
+File: `sayink/ui/history_window.py`.
 
 520×640 single column (no left/right split). Title **历史** (not 过去的话). Title type is 16px semibold, not 22px display.
 
@@ -172,7 +172,7 @@ SQLite schema, retention policy, and export fields do not change.
 
 ## Tray
 
-File: `voiceink/ui/tray_icon.py`.
+File: `sayink/ui/tray_icon.py`.
 
 Three icon kinds only:
 
@@ -186,7 +186,7 @@ Tray capture-red while the capsule listen-dot is green is intentional: the tray 
 
 Menu radius 8. Structure unchanged: disabled status line; 打开设置; 历史; 切换模型 (empty: 暂无已下载模型); 开机自启; 退出.
 
-Windows double-click wakes the island, does not open settings. Tooltip and the disabled status line use the **capsule words**, not a second vocabulary: 就绪 / 正在听 / 正在识别 / 润色中 / 模型载入中. Format: `VoiceInk - {状态}`. Never pair 加载中 with 模型载入中, or 监听中 with 正在听.
+Windows double-click wakes the island, does not open settings. Tooltip and the disabled status line use the **capsule words**, not a second vocabulary: 就绪 / 正在听 / 正在识别 / 润色中 / 模型载入中. Format: `SayInk - {状态}`. Never pair 加载中 with 模型载入中, or 监听中 with 正在听.
 
 ## Cross-cutting empty / error / busy
 

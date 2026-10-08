@@ -7,11 +7,11 @@
 
 | 问题 | 原因与证据 | 本轮修改 |
 | --- | --- | --- |
-| 未完成转写可能在退出时被静默丢弃 | `voiceink/app.py` 的退出流程直接停止录音、关闭识别、取消润色；原先没有检查录音、排队、识别或输出状态 | 有未完成内容时先确认；默认返回，Esc / 关闭也返回；明确选择放弃才执行清理。返回后仍可结束监听、完成剩余片段，再正常退出 |
+| 未完成转写可能在退出时被静默丢弃 | `sayink/app.py` 的退出流程直接停止录音、关闭识别、取消润色；原先没有检查录音、排队、识别或输出状态 | 有未完成内容时先确认；默认返回，Esc / 关闭也返回；明确选择放弃才执行清理。返回后仍可结束监听、完成剩余片段，再正常退出 |
 | 更新可能先启动安装程序，再丢弃待处理内容 | `_on_update_downloaded` 原先先调用安装程序，然后调用退出 | 先完成退出确认，再启动安装程序；拒绝退出或启动安装失败时保留应用。再次安装可复用缓存，但必须在后台重新核对整文件 SHA-256 与已知大小 |
 | 润色漏检数字被删除 | `polish_rejection_reason` 原先只检查结果中新出现的数值；`_numbers` 丢弃零 | 检查原文数值是否丢失，保留零；继续允许时间补 `:00`、千位分隔符和小数末尾零等格式变化。不把这套规则当作完整语义校验 |
 | macOS / Linux 粘贴命令失败仍可能显示已发送 | `text_paster._paste_shortcut` 原先忽略外部命令的非零退出码 | 失败抛出到已有降级路径，保留文字并报告已复制；Windows 仍用原有输入路径 |
-| 低于发布下限的依赖环境可以继续构建 | 原本本机 sherpa-onnx 为 1.13.2，而 `requirements.txt` 要求 ≥1.13.8 | 新增 `voiceink_build/dependency_check.py`，构建在清理旧产物或停止已有程序前检查依赖；独立命令也可提前检查 |
+| 低于发布下限的依赖环境可以继续构建 | 原本本机 sherpa-onnx 为 1.13.2，而 `requirements.txt` 要求 ≥1.13.8 | 新增 `sayink_build/dependency_check.py`，构建在清理旧产物或停止已有程序前检查依赖；独立命令也可提前检查 |
 | 测试与安装环境难以复现 | 依赖仅有下限，缺少 CI | 记录 Windows x64 / Python 3.10 的直接和传递依赖约束，增加 Windows Actions 工作流：安装固定版本 → pip check → 发布依赖检查 → 全量 pytest |
 
 回归用例在修改前复现了 15 个失败；修复后的定向验证覆盖退出取消/放弃、更新启动顺序、数字删改、粘贴命令失败和构建检查顺序。
@@ -24,7 +24,7 @@
 ```powershell
 python -m pip install -r requirements-dev.txt -c constraints-windows-py310.txt
 python -m pip check
-python -m voiceink_build.dependency_check
+python -m sayink_build.dependency_check
 $env:QT_QPA_PLATFORM = 'offscreen'
 python -m pytest -p no:cacheprovider tests -q
 ```

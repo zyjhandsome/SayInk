@@ -52,7 +52,7 @@
 ### 阻塞项
 - 无
 ### 警告项
-- `W-g8-overlap-ui-theme`：未归档 UI change 仍共享 `voiceink/ui/*`（闸门已接受）
+- `W-g8-overlap-ui-theme`：未归档 UI change 仍共享 `sayink/ui/*`（闸门已接受）
 - `W-reapply-subtree-role-map`：**已接受**。`reapply_subtree` 仍对带 `viRole`/`objectName`/`viBtn` 的工厂控件做映射刷新（`stylesheet_for_role`），不是纯钩子发现。规格禁止的是窗级 `SettingsWindow.reapply_theme` 枚举链（已删除）。后续新复合控件应实现 `reapply_styles`。
 ### 建议项
 - 本变更 archive 后归档两份旧 UI change

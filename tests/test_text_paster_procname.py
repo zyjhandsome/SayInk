@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import voiceink.text_paster as tp
+import sayink.text_paster as tp
 
 
 class TestGetForegroundProcessName:

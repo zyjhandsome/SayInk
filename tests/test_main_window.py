@@ -10,10 +10,10 @@ def qapp():
 
 
 def _make_main_window(tmp_path, monkeypatch):
-    from voiceink.config import Config
-    from voiceink.history_store import HistoryStore
-    from voiceink.ui.main_window import MainWindow
-    from voiceink.ui.settings_window import SettingsWindow
+    from sayink.config import Config
+    from sayink.history_store import HistoryStore
+    from sayink.ui.main_window import MainWindow
+    from sayink.ui.settings_window import SettingsWindow
     monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
     monkeypatch.setattr(SettingsWindow, "_refresh_about_info", lambda self: None)
     monkeypatch.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)
@@ -23,7 +23,7 @@ def _make_main_window(tmp_path, monkeypatch):
 
 def _use_screen(monkeypatch, width, height):
     from PyQt6.QtCore import QRect
-    from voiceink.ui.main_window import MainWindow
+    from sayink.ui.main_window import MainWindow
 
     class _Screen:
         def availableGeometry(self):
@@ -71,8 +71,8 @@ def test_large_screen_keeps_preferred_minimum(qapp, tmp_path, monkeypatch):
 
 
 def test_chrome_size_and_nav(qapp, tmp_path, monkeypatch):
-    from voiceink.ui.main_window import NAV_LABELS
-    from voiceink.ui import design_tokens as tok
+    from sayink.ui.main_window import NAV_LABELS
+    from sayink.ui import design_tokens as tok
     _use_screen(monkeypatch, 1920, 1040)
     win, store = _make_main_window(tmp_path, monkeypatch)
     try:
@@ -90,7 +90,7 @@ def test_chrome_size_and_nav(qapp, tmp_path, monkeypatch):
 
 
 def test_outer_border_uses_explicit_window_frame(qapp, tmp_path, monkeypatch):
-    from voiceink.ui import design_tokens as tok
+    from sayink.ui import design_tokens as tok
 
     win, store = _make_main_window(tmp_path, monkeypatch)
     try:
@@ -162,7 +162,7 @@ def test_maximized_caption_uses_stacked_restore_glyph(qapp, tmp_path, monkeypatc
 
 
 def test_caption_chrome_is_distinct_from_content(qapp, tmp_path, monkeypatch):
-    from voiceink.ui import design_tokens as tok
+    from sayink.ui import design_tokens as tok
 
     win, store = _make_main_window(tmp_path, monkeypatch)
     try:
@@ -228,10 +228,10 @@ def test_close_hides_does_not_quit(qapp, tmp_path, monkeypatch):
 
 
 def test_show_page_embeds_hosts(qapp, tmp_path, monkeypatch):
-    from voiceink.config import Config
-    from voiceink.history_store import HistoryStore
-    from voiceink.ui.main_window import MainWindow
-    from voiceink.ui.settings_window import SettingsWindow
+    from sayink.config import Config
+    from sayink.history_store import HistoryStore
+    from sayink.ui.main_window import MainWindow
+    from sayink.ui.settings_window import SettingsWindow
     monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
     monkeypatch.setattr(SettingsWindow, "_refresh_about_info", lambda self: None)
     monkeypatch.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)

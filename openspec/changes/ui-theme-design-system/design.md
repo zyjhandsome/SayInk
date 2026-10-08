@@ -1,6 +1,6 @@
 ## Context
 
-VoiceInk 为 PyQt6 托盘应用：全局 `GLOBAL_APP_STYLESHEET` 在 `main.py` 一次性注入；各表面大量在构造期 `setStyleSheet`；`design_tokens.py` 为单轴浅色 + 独立 `FLOAT_*` 常暗常量；`Config.DEFAULT_CONFIG` 无主题键。规格已批准引入 ui-ux-pro-max `design-system/MASTER.md`、替换 tokens，并支持 `light`/`dark`/`system` 覆盖四表面。
+SayInk 为 PyQt6 托盘应用：全局 `GLOBAL_APP_STYLESHEET` 在 `main.py` 一次性注入；各表面大量在构造期 `setStyleSheet`；`design_tokens.py` 为单轴浅色 + 独立 `FLOAT_*` 常暗常量；`Config.DEFAULT_CONFIG` 无主题键。规格已批准引入 ui-ux-pro-max `design-system/MASTER.md`、替换 tokens，并支持 `light`/`dark`/`system` 覆盖四表面。
 
 ## Goals / Non-Goals
 
@@ -48,11 +48,11 @@ VoiceInk 为 PyQt6 托盘应用：全局 `GLOBAL_APP_STYLESHEET` 在 `main.py` �
 |---|---|---|---|---|---|---|
 | D1 | 配置键名与取值 | Agent | 持久化形态 | `appearance.theme_mode` ∈ {light,dark,system} | decided | 采用嵌套键，缺省 `system`；未知值运行时回落 `system` |
 | D2 | Token 结构 | Agent | 全 UI | A 双表 LIGHT/DARK + 解析函数 / B 运行时对象 | decided | A：`design_tokens` 提供 `tokens_for(effective)`；模块级兼容别名指向当前有效主题（由 apply 刷新） |
-| D3 | 主题应用中枢 | Agent | 刷新面 | 新建 `voiceink/ui/theme.py`：`resolve_effective_theme` / `apply_theme(app, windows...)` | decided | 单一入口，避免各表面各自读配置 |
+| D3 | 主题应用中枢 | Agent | 刷新面 | 新建 `sayink/ui/theme.py`：`resolve_effective_theme` / `apply_theme(app, windows...)` | decided | 单一入口，避免各表面各自读配置 |
 | D4 | Windows 系统外观探测 | Agent | system 模式 | `QSettings` 读 `AppsUseLightTheme`（或等价） | decided | 失败时回落 `light` 并打日志 |
 | D5 | 系统外观热更新 | Agent | 体验 | 尽力：监听/定时轻量轮询；非阻塞 | decided | 启动+手动切换必达；热更新 best-effort，失败不挡验收 |
 | D6 | 浮窗换肤策略 | Agent（产品已决随主题） | 浮窗视觉 | 有效主题 light/dark 各一套 float 表面 token，写入 MASTER | decided | 废弃「仅常暗唯一轴」；保留适度对比度 |
-| D7 | MASTER 生成方式 | Agent | 文档 | 实施时运行 ui-ux-pro-max `--design-system --persist -p VoiceInk`，再人工对齐桌面工具约束写入仓库 | decided | 查询关键词：desktop utility voice transcription productivity dark mode |
+| D7 | MASTER 生成方式 | Agent | 文档 | 实施时运行 ui-ux-pro-max `--design-system --persist -p SayInk`，再人工对齐桌面工具约束写入仓库 | decided | 查询关键词：desktop utility voice transcription productivity dark mode |
 
 无用户必决技术题（成本/不可逆部署无实质分叉）；无回 Frame 项。
 

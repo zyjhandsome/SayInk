@@ -9,16 +9,16 @@ import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 
-from voiceink.history_store import SegmentRecord, SessionSummary
-from voiceink.app import App
-from voiceink.ui.history_window import (
+from sayink.history_store import SegmentRecord, SessionSummary
+from sayink.app import App
+from sayink.ui.history_window import (
     HistoryWindow,
     build_batch_export_markdown,
     build_single_session_markdown,
     suggest_batch_export_filename,
     suggest_single_export_filename,
 )
-from voiceink.ui.tray_icon import TrayIcon
+from sayink.ui.tray_icon import TrayIcon
 
 
 @pytest.fixture
@@ -252,8 +252,8 @@ def test_history_chrome_copy(qapp):
     try:
         assert window._title_label.text() == "历史"
         assert window._search_edit.placeholderText() == "搜索转写内容"
-        from voiceink.ui import settings_styles as ss
-        from voiceink.ui import design_tokens as tok
+        from sayink.ui import settings_styles as ss
+        from sayink.ui import design_tokens as tok
         assert tok.ACCENT.lower() not in window._export_btn.styleSheet().lower() or (
             ss.BTN_PRIMARY not in (window._export_btn.styleSheet(),)
         )
@@ -364,7 +364,7 @@ def test_undo_pending_delete_restores_sessions_without_store_delete(qapp):
 
 
 def test_export_is_ghost_and_copy_primary_follows_polish(qapp):
-    from voiceink.ui import settings_styles as ss
+    from sayink.ui import settings_styles as ss
 
     window = HistoryWindow(FakeHistoryStore())
     try:
@@ -534,7 +534,7 @@ def test_selected_session_row_is_not_an_accent_capsule(qapp):
 
 
 def test_session_list_shows_keyboard_focus_ring(qapp):
-    from voiceink.ui import design_tokens as tok
+    from sayink.ui import design_tokens as tok
 
     window = HistoryWindow(FakeHistoryStore())
     try:
@@ -546,7 +546,7 @@ def test_session_list_shows_keyboard_focus_ring(qapp):
 
 
 def test_selected_rows_keep_an_accent_bar_when_multi_selected(qapp):
-    from voiceink.ui import design_tokens as tok
+    from sayink.ui import design_tokens as tok
 
     window = HistoryWindow(FakeHistoryStore())
     try:
@@ -633,7 +633,7 @@ def test_clear_all_history_uses_store_enqueue_after_confirmation(qapp, monkeypat
         seen.append([button.text() for button in dialog.findChildren(type(window._clear_all_btn))])
         return QDialog.DialogCode.Accepted
 
-    monkeypatch.setattr("voiceink.ui.history_window._ClearHistoryDialog.exec", _accept)
+    monkeypatch.setattr("sayink.ui.history_window._ClearHistoryDialog.exec", _accept)
 
     window._clear_all_history()
 
@@ -645,7 +645,7 @@ def test_clear_all_history_cancel_keeps_sessions(qapp, monkeypatch):
     store = FakeHistoryStore()
     window = HistoryWindow(store)
     monkeypatch.setattr(
-        "voiceink.ui.history_window._ClearHistoryDialog.exec",
+        "sayink.ui.history_window._ClearHistoryDialog.exec",
         lambda _dialog: QDialog.DialogCode.Rejected,
     )
 
@@ -694,9 +694,9 @@ def test_batch_export_markdown_uses_one_section_per_session():
 def test_export_filenames_follow_adr_patterns():
     session = SessionSummary("newer", 1_700_000_300_000, 2, "mixed", "Code.exe", "preview")
 
-    assert suggest_single_export_filename(session).startswith("voiceink-")
+    assert suggest_single_export_filename(session).startswith("sayink-")
     assert suggest_single_export_filename(session).endswith(".md")
-    assert suggest_batch_export_filename(now_ms=1_700_000_300_000).startswith("voiceink-export-")
+    assert suggest_batch_export_filename(now_ms=1_700_000_300_000).startswith("sayink-export-")
     assert suggest_batch_export_filename(now_ms=1_700_000_300_000).endswith(".md")
 
 
@@ -756,7 +756,7 @@ def test_app_show_history_window_reuses_single_window(qapp, monkeypatch):
         def installEventFilter(self, obj):
             pass
 
-    monkeypatch.setattr("voiceink.app.MainWindow", FakeMainWindow)
+    monkeypatch.setattr("sayink.app.MainWindow", FakeMainWindow)
     app = App.__new__(App)
     app._config = object()
     app._history = object()

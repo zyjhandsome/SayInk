@@ -7,8 +7,8 @@ from PyQt6.QtTest import QTest
 
 from tests.test_history_window import FakeHistoryStore
 from tests.test_main_window import _make_main_window
-from voiceink.ui.history_window import HistoryWindow
-from voiceink.ui.settings_components import CompactPickCard
+from sayink.ui.history_window import HistoryWindow
+from sayink.ui.settings_components import CompactPickCard
 
 
 @pytest.fixture
@@ -131,7 +131,7 @@ def test_polish_disabled_removes_configuration_but_keeps_example(main_window):
 
 def test_audio_error_remains_inline_with_recovery(main_window, monkeypatch):
     win = main_window._settings
-    monkeypatch.setattr("voiceink.ui.settings_window.QMessageBox.warning",
+    monkeypatch.setattr("sayink.ui.settings_window.QMessageBox.warning",
                         lambda *args: pytest.fail("Audio feedback should remain in context"))
     win._mic_probe_active = True
     win._on_mic_probe_error("设备不可用")
@@ -142,14 +142,14 @@ def test_audio_error_remains_inline_with_recovery(main_window, monkeypatch):
 
 def test_download_is_disabled_immediately_and_error_can_retry(main_window, monkeypatch):
     from unittest.mock import MagicMock
-    from voiceink.ui.model_card import ModelCard
+    from sayink.ui.model_card import ModelCard
     win = main_window._settings
     info = {"id": "preview", "name": "示例", "size_mb": 10, "description": "示例",
             "languages": "中文", "accuracy": 3, "speed": 3}
     card = ModelCard(info, False, False)
     worker = MagicMock()
-    monkeypatch.setattr("voiceink.speech_recognizer.ModelDownloadWorker", lambda _mid, **_kw: worker)
-    monkeypatch.setattr("voiceink.ui.settings_window.QMessageBox.warning",
+    monkeypatch.setattr("sayink.speech_recognizer.ModelDownloadWorker", lambda _mid, **_kw: worker)
+    monkeypatch.setattr("sayink.ui.settings_window.QMessageBox.warning",
                         lambda *args: pytest.fail("Download error should stay on the card"))
     win._model_cards["preview"] = card
     try:
@@ -282,7 +282,7 @@ def test_day_group_headers_split_sessions_by_day(_qapp_session):
 
 
 def test_listen_bar_stop_action_matches_session_state(_qapp_session):
-    from voiceink.ui.floating_window import FloatingWindow
+    from sayink.ui.floating_window import FloatingWindow
     bar = FloatingWindow()
     try:
         bar.show_model_loading()
@@ -290,8 +290,8 @@ def test_listen_bar_stop_action_matches_session_state(_qapp_session):
         bar.show_listening()
         assert not bar._end_btn.isHidden()
         assert "停顿" in bar._status_label.text()
-        from voiceink.ui.theme import apply_theme
-        from voiceink.ui import design_tokens as tok
+        from sayink.ui.theme import apply_theme
+        from sayink.ui import design_tokens as tok
         apply_theme(mode="dark", surfaces=[bar])
         assert tok.STATE_LISTEN in bar._status_label.styleSheet()
         assert bar._dot._color.name().lower() == tok.STATE_LISTEN.lower()
@@ -309,7 +309,7 @@ def test_clear_all_cancels_pending_undo(_qapp_session, monkeypatch):
     win = HistoryWindow(store)
     # Clearing everything is irreversible, so it keeps a confirmation.
     monkeypatch.setattr(
-        "voiceink.ui.history_window._ClearHistoryDialog.exec",
+        "sayink.ui.history_window._ClearHistoryDialog.exec",
         lambda _dialog: QDialog.DialogCode.Accepted,
     )
     try:

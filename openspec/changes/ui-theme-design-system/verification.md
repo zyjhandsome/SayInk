@@ -4,7 +4,7 @@
 
 - 状态源：`openspec/changes/ui-theme-design-system/`
 - 风险/闸门：High；规格闸门与实现闸门均已用户放行
-- 提交/差异：工作区未提交；涉及 `design-system/`、`voiceink/ui/*`、`config`/`main`/`app`、测试
+- 提交/差异：工作区未提交；涉及 `design-system/`、`sayink/ui/*`、`config`/`main`/`app`、测试
 
 ## 运行与静态证据
 
@@ -77,5 +77,5 @@
 
 ## 资产回写
 
-- 已更新：`design-system/MASTER.md`（及 skill 原始输出 `design-system/voiceink/`）
+- 已更新：`design-system/MASTER.md`（及 skill 原始输出 `design-system/sayink/`）
 - 无需回写 README：原因 = 设置内可发现的外观能力，非对外 API

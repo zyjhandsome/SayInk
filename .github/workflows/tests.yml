@@ -34,6 +34,6 @@ jobs:
       - name: Check package dependency consistency
         run: python -m pip check
       - name: Check release dependencies
-        run: python -m voiceink_build.dependency_check
+        run: python -m sayink_build.dependency_check
       - name: Run regression tests
         run: python -m pytest -p no:cacheprovider tests -q

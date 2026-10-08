@@ -3,7 +3,7 @@
 ## 范围与状态
 - 状态源：openspec/changes/ui-main-window-outer-border
 - 风险/闸门：Quick / low；实施批准已记录；独立审查 pass（无 CRITICAL）
-- 提交/差异：仅 `voiceink/ui/main_window.py` 与 `tests/test_main_window.py`；未改禁止范围文件
+- 提交/差异：仅 `sayink/ui/main_window.py` 与 `tests/test_main_window.py`；未改禁止范围文件
 
 ## 运行与静态证据
 | 时间 | 命令/动作 | 退出码/结果 | 失败数 | 覆盖范围 |

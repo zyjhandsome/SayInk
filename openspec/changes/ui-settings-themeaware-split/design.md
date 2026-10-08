@@ -1,6 +1,6 @@
 # ui-settings-themeaware-split：技术实施计划
 
-深度：Standard/medium 紧凑计划（决策记录 + 挂载点 + 验证矩阵）。理由：无红线、无 schema、无新依赖；文件集限定在 `voiceink/ui/*` 与既有 UI 测试。
+深度：Standard/medium 紧凑计划（决策记录 + 挂载点 + 验证矩阵）。理由：无红线、无 schema、无新依赖；文件集限定在 `sayink/ui/*` 与既有 UI 测试。
 
 ## 已批准目标与约束
 - 目标：四表面 ThemeAware 广播；设置按页拆分；删除 Settings 窗级 `viRole` 巡检链。
@@ -21,7 +21,7 @@
 | ID | 待决事项 | 决策归属 | 实质影响 | 选项与建议 | 状态 | 最终结论与记录 |
 |---|---|---|---|---|---|---|
 | D1 | ThemeAware 形态 | Agent | 无用户可察差异 | Protocol 保持 vs 改 ABC | decided | 保持 Protocol；duck-type |
-| D2 | 拆页落点 | Agent | 仅内部模块 | `settings_pages/` 包 vs mixin | decided | `voiceink/ui/settings_pages/{general,model,polish,about}.py`，`build_*_page(win)` 仍把控件挂到 `win`，避免测试大改 |
+| D2 | 拆页落点 | Agent | 仅内部模块 | `settings_pages/` 包 vs mixin | decided | `sayink/ui/settings_pages/{general,model,polish,about}.py`，`build_*_page(win)` 仍把控件挂到 `win`，避免测试大改 |
 | D3 | 角色样式迁出位置 | Agent | 满足「窗级不再枚举」 | 控件自刷 vs 组件树 helper | decided | 工厂/角色控件实现 `reapply_styles`；`settings_components.reapply_subtree(root)` 仅作发现已实现钩子的子树广播，不含 viRole 长链 |
 | D4 | 其它三表面改动量 | Agent | Q1=C 协议对齐 | 重写 vs 对齐接口 | decided | History/Tray/Float 已有 `reapply_theme`；补测试与构造期残留，不重写短实现 |
 | D5 | 视觉证据 | Agent（Q2=A） | 无像素基建 | 截图 G9 vs 样式断言+手工 | decided | substitute：pytest 样式/主题断言 + 手工四表面清单写入 verification.md |
@@ -63,7 +63,7 @@
 ## 兼容、迁移与回滚
 - 兼容：`settings-control-alignment` 不削弱。
 - 迁移：无。
-- 回滚：还原 `voiceink/ui/settings*.py` 与测试；无用户数据。
+- 回滚：还原 `sayink/ui/settings*.py` 与测试；无用户数据。
 
 ## 安全与性能
 - 安全：不适用（不碰密钥/网络）。
@@ -117,7 +117,7 @@
 - 无
 
 ### 警告项
-- `W-g8-overlap-ui-theme`：active Complete change `ui-theme-design-system`、`ui-typography-theme-polish` 与本变更共享 `voiceink/ui/*`。规格闸门已接受；实现闸门须再次可见。
+- `W-g8-overlap-ui-theme`：active Complete change `ui-theme-design-system`、`ui-typography-theme-polish` 与本变更共享 `sayink/ui/*`。规格闸门已接受；实现闸门须再次可见。
 
 ### 建议项
 - 本变更后 archive 两份旧 UI change。

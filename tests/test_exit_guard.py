@@ -23,7 +23,7 @@ def test_return_from_exit_preserves_pending_work(pending):
         else:
             app._segment_queue.append(np.ones(1600, dtype=np.float32))
         before = list(app._segment_queue)
-        with patch("voiceink.app.QMessageBox") as boxes, patch("voiceink.app.QApplication.quit") as quit_app:
+        with patch("sayink.app.QMessageBox") as boxes, patch("sayink.app.QApplication.quit") as quit_app:
             dialog = boxes.return_value
             dialog.addButton.side_effect = ["return", "discard"]
             dialog.clickedButton.return_value = "return"
@@ -43,7 +43,7 @@ def test_return_from_exit_preserves_pending_work(pending):
 def test_explicit_discard_exits_once():
     with app_harness() as h:
         h["app"]._is_transcribing = True
-        with patch("voiceink.app.QMessageBox") as boxes, patch("voiceink.app.QApplication.quit") as quit_app:
+        with patch("sayink.app.QMessageBox") as boxes, patch("sayink.app.QApplication.quit") as quit_app:
             dialog = boxes.return_value
             dialog.addButton.side_effect = ["return", "discard"]
             dialog.clickedButton.return_value = "discard"
@@ -56,7 +56,7 @@ def test_explicit_discard_exits_once():
 
 def test_idle_exit_needs_no_confirmation():
     with app_harness() as h:
-        with patch("voiceink.app.QMessageBox") as boxes, patch("voiceink.app.QApplication.quit") as quit_app:
+        with patch("sayink.app.QMessageBox") as boxes, patch("sayink.app.QApplication.quit") as quit_app:
             h["app"]._quit()
             boxes.assert_not_called()
             quit_app.assert_called_once()
@@ -65,7 +65,7 @@ def test_idle_exit_needs_no_confirmation():
 def test_closing_confirmation_preserves_pending_work():
     with app_harness() as h:
         h["app"]._is_transcribing = True
-        with patch("voiceink.app.QMessageBox") as boxes, patch("voiceink.app.QApplication.quit") as quit_app:
+        with patch("sayink.app.QMessageBox") as boxes, patch("sayink.app.QApplication.quit") as quit_app:
             dialog = boxes.return_value
             dialog.addButton.side_effect = ["return", "discard"]
             dialog.clickedButton.return_value = None
@@ -79,7 +79,7 @@ def test_reentrant_exit_does_not_open_another_confirmation():
     with app_harness() as h:
         app = h["app"]
         app._is_transcribing = True
-        with patch("voiceink.app.QMessageBox") as boxes, patch("voiceink.app.QApplication.quit") as quit_app:
+        with patch("sayink.app.QMessageBox") as boxes, patch("sayink.app.QApplication.quit") as quit_app:
             dialog = boxes.return_value
             dialog.addButton.side_effect = ["return", "discard"]
             dialog.clickedButton.return_value = "return"
@@ -112,7 +112,7 @@ def test_native_confirmation_defaults_to_return():
 def test_update_does_not_launch_installer_when_exit_is_cancelled():
     with app_harness() as h:
         h["app"]._output_busy = True
-        with patch("voiceink.app.QMessageBox") as boxes, patch("voiceink.updater.launch_installer") as launch:
+        with patch("sayink.app.QMessageBox") as boxes, patch("sayink.updater.launch_installer") as launch:
             dialog = boxes.return_value
             dialog.addButton.side_effect = ["return", "discard"]
             dialog.clickedButton.return_value = "return"
@@ -126,7 +126,7 @@ def test_update_confirms_discard_before_launch_and_does_not_confirm_twice():
     events = []
     with app_harness() as h:
         h["app"]._is_transcribing = True
-        with patch("voiceink.app.QMessageBox") as boxes, patch("voiceink.updater.launch_installer") as launch, patch("voiceink.app.QApplication.quit") as quit_app:
+        with patch("sayink.app.QMessageBox") as boxes, patch("sayink.updater.launch_installer") as launch, patch("sayink.app.QApplication.quit") as quit_app:
             dialog = boxes.return_value
             dialog.addButton.side_effect = ["return", "discard"]
             dialog.clickedButton.return_value = "discard"
@@ -140,7 +140,7 @@ def test_update_confirms_discard_before_launch_and_does_not_confirm_twice():
 
 def test_installer_launch_failure_keeps_app_running():
     with app_harness() as h:
-        with patch("voiceink.updater.launch_installer", side_effect=OSError("cannot launch")), patch("voiceink.app.QApplication.quit") as quit_app:
+        with patch("sayink.updater.launch_installer", side_effect=OSError("cannot launch")), patch("sayink.app.QApplication.quit") as quit_app:
             h["app"]._on_update_downloaded("downloaded.exe")
             quit_app.assert_not_called()
         h["recognizer"].shutdown.assert_not_called()

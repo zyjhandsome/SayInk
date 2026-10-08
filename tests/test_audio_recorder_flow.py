@@ -9,8 +9,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from voiceink.audio_devices import AudioDeviceInfo, StreamEndpoint
-from voiceink.audio_recorder import AudioRecorder, _CaptureLane
+from sayink.audio_devices import AudioDeviceInfo, StreamEndpoint
+from sayink.audio_recorder import AudioRecorder, _CaptureLane
 
 
 def _make_lane(role="microphone", chunks=None, sample_rate=16000):
@@ -270,7 +270,7 @@ class TestStartErrors:
         def _boom(*a, **k):
             raise RuntimeError("无计划可用")
 
-        monkeypatch.setattr("voiceink.audio_recorder.build_recording_plan", _boom)
+        monkeypatch.setattr("sayink.audio_recorder.build_recording_plan", _boom)
         errors = []
         rec.error.connect(errors.append)
         rec.start()

@@ -19,12 +19,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QFontDatabase
 from PyQt6.QtCore import QCoreApplication, QEvent
-from voiceink.config import Config
-from voiceink.history_store import SegmentRecord, SessionSummary
-from voiceink.ui.main_window import MainWindow, PAGE_KEYS
-from voiceink.ui.floating_window import FloatingWindow
-from voiceink.ui.theme import apply_theme
-from voiceink.speech_recognizer import DEFAULT_MODEL_ID
+from sayink.config import Config
+from sayink.history_store import SegmentRecord, SessionSummary
+from sayink.ui.main_window import MainWindow, PAGE_KEYS
+from sayink.ui.floating_window import FloatingWindow
+from sayink.ui.theme import apply_theme
+from sayink.speech_recognizer import DEFAULT_MODEL_ID
 
 
 class PreviewStore:
@@ -71,17 +71,17 @@ def main():
         path = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / font
         if path.exists():
             QFontDatabase.addApplicationFont(str(path))
-    with tempfile.TemporaryDirectory(prefix="voiceink-ui-") as temp, \
-         patch("voiceink.ui.settings_window.list_microphone_devices", return_value=[]), \
-         patch("voiceink.ui.settings_window.list_system_capture_devices_for_settings", return_value=[]), \
-         patch("voiceink.speech_recognizer.is_model_downloaded", side_effect=lambda mid: mid == DEFAULT_MODEL_ID):
+    with tempfile.TemporaryDirectory(prefix="sayink-ui-") as temp, \
+         patch("sayink.ui.settings_window.list_microphone_devices", return_value=[]), \
+         patch("sayink.ui.settings_window.list_system_capture_devices_for_settings", return_value=[]), \
+         patch("sayink.speech_recognizer.is_model_downloaded", side_effect=lambda mid: mid == DEFAULT_MODEL_ID):
         config = Config(config_dir=Path(temp))
         config.set("stt.models_dir", str(Path(temp) / "models"))
         config.set("history.enabled", True)
         config.set("auto_start", False)
         store = PreviewStore()
         win = MainWindow(config, store)
-        from voiceink.runtime_status import RuntimeState
+        from sayink.runtime_status import RuntimeState
         win._settings.set_runtime_status(RuntimeState.READY, "就绪（示例）")
         bar = FloatingWindow()
         for mode in ("light", "dark"):

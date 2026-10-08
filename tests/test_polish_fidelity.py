@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from voiceink.app import polish_looks_plausible, polish_rejection_reason
+from sayink.app import polish_looks_plausible, polish_rejection_reason
 
 MEANING_CHANGED = [
     # negation dropped or flipped

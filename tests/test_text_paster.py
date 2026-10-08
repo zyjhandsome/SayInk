@@ -2,8 +2,8 @@ import sys
 
 import pytest
 
-import voiceink.text_paster as tp
-from voiceink.text_paster import TextPaster, get_foreground_window_info
+import sayink.text_paster as tp
+from sayink.text_paster import TextPaster, get_foreground_window_info
 
 _REAL_PASTE_SHORTCUT = tp._paste_shortcut
 
@@ -17,8 +17,8 @@ class TestTextPasterInit:
         paster = TextPaster()
         assert hasattr(paster, "OWN_TITLES")
         assert isinstance(paster.OWN_TITLES, set)
-        assert "VoiceInk 设置" in paster.OWN_TITLES
-        assert "VoiceInk" in paster.OWN_TITLES
+        assert "SayInk 设置" in paster.OWN_TITLES
+        assert "SayInk" in paster.OWN_TITLES
 
 
 class TestGetForegroundWindowInfo:
@@ -45,12 +45,12 @@ class TestTextPasterIsOwnWindow:
 
     def test_own_title(self):
         paster = TextPaster()
-        info = (123, "VoiceInk", 9999)
+        info = (123, "SayInk", 9999)
         assert paster._is_own_window(info) is True
 
     def test_own_settings_title(self):
         paster = TextPaster()
-        info = (123, "VoiceInk 设置", 9999)
+        info = (123, "SayInk 设置", 9999)
         assert paster._is_own_window(info) is True
 
     def test_other_title(self):
@@ -86,7 +86,7 @@ class TestTextPasterPaste:
 
 class TestPasteShortcut:
     def test_module_imports(self):
-        from voiceink import text_paster
+        from sayink import text_paster
         assert hasattr(text_paster, "get_foreground_window_info")
         assert hasattr(text_paster, "_paste_shortcut")
         assert not hasattr(text_paster, "pyautogui")
@@ -203,7 +203,7 @@ class TestPasteAsyncFlow:
         assert paste_env["clipboard"] == "文本"
 
     def test_own_window_skips_paste(self, paste_env):
-        paste_env["set_foreground"]([(1, "VoiceInk", 1)])
+        paste_env["set_foreground"]([(1, "SayInk", 1)])
         paster = TextPaster()
         results = []
         paster.paste_async("文本", results.append)

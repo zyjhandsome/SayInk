@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from voiceink.config import Config, DEFAULT_CONFIG
+from sayink.config import Config, DEFAULT_CONFIG
 
 
 class TestHistoryDefaults:

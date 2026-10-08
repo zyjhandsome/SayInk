@@ -7,23 +7,23 @@ from pathlib import Path
 
 class TestResolveEffectiveTheme:
     def test_explicit_light(self):
-        from voiceink.ui.theme import resolve_effective_theme
+        from sayink.ui.theme import resolve_effective_theme
 
         assert resolve_effective_theme("light") == "light"
 
     def test_explicit_dark(self):
-        from voiceink.ui.theme import resolve_effective_theme
+        from sayink.ui.theme import resolve_effective_theme
 
         assert resolve_effective_theme("dark") == "dark"
 
     def test_system_follows_probe(self):
-        from voiceink.ui.theme import resolve_effective_theme
+        from sayink.ui.theme import resolve_effective_theme
 
         assert resolve_effective_theme("system", system_is_light=True) == "light"
         assert resolve_effective_theme("system", system_is_light=False) == "dark"
 
     def test_unknown_mode_falls_back_to_system(self):
-        from voiceink.ui.theme import resolve_effective_theme
+        from sayink.ui.theme import resolve_effective_theme
 
         assert resolve_effective_theme("neon", system_is_light=False) == "dark"
         assert resolve_effective_theme("", system_is_light=True) == "light"
@@ -31,13 +31,13 @@ class TestResolveEffectiveTheme:
 
 class TestThemeConfigDefault:
     def test_default_theme_mode_is_dark(self, tmp_path: Path):
-        from voiceink.config import Config
+        from sayink.config import Config
 
         cfg = Config(config_dir=tmp_path)
         assert cfg.get("appearance.theme_mode") == "dark"
 
     def test_theme_mode_persists_across_reload(self, tmp_path: Path):
-        from voiceink.config import Config
+        from sayink.config import Config
 
         cfg = Config(config_dir=tmp_path)
         cfg.set("appearance.theme_mode", "dark")
@@ -49,7 +49,7 @@ class TestThemeConfigDefault:
 
 class TestTokensFor:
     def test_light_and_dark_differ_on_background(self):
-        from voiceink.ui.design_tokens import tokens_for
+        from sayink.ui.design_tokens import tokens_for
 
         light = tokens_for("light")
         dark = tokens_for("dark")
@@ -58,7 +58,7 @@ class TestTokensFor:
         assert dark["BG"].startswith("#") or dark["BG"].startswith("rgb")
 
     def test_activate_updates_module_level_bg(self):
-        from voiceink.ui import design_tokens as dt
+        from sayink.ui import design_tokens as dt
 
         dt.activate("dark")
         assert dt.BG == dt.tokens_for("dark")["BG"]
@@ -72,9 +72,9 @@ class TestSettingsAppearanceEntry:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.config import Config
-        from voiceink.ui.settings_window import SettingsWindow
-        from voiceink.ui.theme import apply_theme
+        from sayink.config import Config
+        from sayink.ui.settings_window import SettingsWindow
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -93,7 +93,7 @@ class TestSettingsAppearanceEntry:
         assert cfg.get("appearance.theme_mode") == "dark"
 
         apply_theme(mode="dark", surfaces=(win,))
-        from voiceink.ui import design_tokens as tok
+        from sayink.ui import design_tokens as tok
 
         css = win.styleSheet()
         assert tok.tokens_for("dark")["TEXT"] in css
@@ -110,10 +110,10 @@ class TestSettingsAppearanceEntry:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.config import Config
-        from voiceink.ui import design_tokens as tok
-        from voiceink.ui.settings_window import SettingsWindow
-        from voiceink.ui.theme import apply_theme
+        from sayink.config import Config
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.settings_window import SettingsWindow
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -138,11 +138,11 @@ class TestSettingsAppearanceEntry:
 
         from PyQt6.QtWidgets import QApplication, QLabel
 
-        from voiceink.config import Config
-        from voiceink.ui import design_tokens as tok
-        from voiceink.ui.settings_components import CompactPickCard, ToggleOptionRow
-        from voiceink.ui.settings_window import SettingsWindow
-        from voiceink.ui.theme import apply_theme
+        from sayink.config import Config
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.settings_components import CompactPickCard, ToggleOptionRow
+        from sayink.ui.settings_window import SettingsWindow
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -184,11 +184,11 @@ class TestSettingsAppearanceEntry:
 
         from PyQt6.QtWidgets import QApplication, QLabel
 
-        from voiceink.config import Config
-        from voiceink.ui import design_tokens as tok
-        from voiceink.ui.model_card import ModelCard
-        from voiceink.ui.settings_window import SettingsWindow
-        from voiceink.ui.theme import apply_theme
+        from sayink.config import Config
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.model_card import ModelCard
+        from sayink.ui.settings_window import SettingsWindow
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -236,14 +236,14 @@ class TestSettingsAppearanceEntry:
             # Current-engine hero must repaint with light TEXT (not pale-on-white).
             win._rebuild_model_cards = lambda: None  # type: ignore[method-assign]
             # Force hero rebuild under light tokens with a stubbed active model.
-            from voiceink.speech_recognizer import DEFAULT_MODEL_ID, MODEL_REGISTRY
+            from sayink.speech_recognizer import DEFAULT_MODEL_ID, MODEL_REGISTRY
 
             info = next(m for m in MODEL_REGISTRY if m["id"] == DEFAULT_MODEL_ID)
             monkeypatch.setattr(
-                "voiceink.speech_recognizer.get_model_info", lambda _id: info
+                "sayink.speech_recognizer.get_model_info", lambda _id: info
             )
             monkeypatch.setattr(
-                "voiceink.speech_recognizer.is_model_downloaded", lambda _id: True
+                "sayink.speech_recognizer.is_model_downloaded", lambda _id: True
             )
             win._config.set("stt.model_id", DEFAULT_MODEL_ID)
             win._refresh_active_model_hero()
@@ -278,8 +278,8 @@ class TestSurfaceThemeReapply:
         from PyQt6.QtGui import QColor, QPalette
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.ui import design_tokens as tok
-        from voiceink.ui.theme import apply_theme
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.theme import apply_theme
 
         app = QApplication.instance() or QApplication(sys.argv)
         try:
@@ -302,8 +302,8 @@ class TestSurfaceThemeReapply:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.ui.floating_window import FloatingWindow
-        from voiceink.ui.theme import apply_theme
+        from sayink.ui.floating_window import FloatingWindow
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         win = FloatingWindow()
@@ -319,8 +319,8 @@ class TestSurfaceThemeReapply:
         assert "islandContainer" in sheet
 
     def test_tray_menu_stylesheet_follows_dark(self):
-        from voiceink.ui.theme import apply_theme
-        from voiceink.ui.tray_icon import _menu_stylesheet
+        from sayink.ui.theme import apply_theme
+        from sayink.ui.tray_icon import _menu_stylesheet
 
         apply_theme(mode="dark")
         css = _menu_stylesheet()
@@ -332,9 +332,9 @@ class TestSurfaceThemeReapply:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.config import Config
-        from voiceink.ui.settings_window import SettingsWindow
-        from voiceink.ui.theme import apply_theme
+        from sayink.config import Config
+        from sayink.ui.settings_window import SettingsWindow
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -354,9 +354,9 @@ class TestSurfaceThemeReapply:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.history_store import HistoryStore
-        from voiceink.ui.history_window import HistoryWindow
-        from voiceink.ui.theme import apply_theme
+        from sayink.history_store import HistoryStore
+        from sayink.ui.history_window import HistoryWindow
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         store = HistoryStore(tmp_path / "history.db")
@@ -395,9 +395,9 @@ class TestSurfaceThemeReapply:
         from PyQt6.QtWidgets import QApplication, QLabel
 
         from tests.test_history_window import FakeHistoryStore
-        from voiceink.ui import design_tokens as tok
-        from voiceink.ui.history_window import HistoryWindow
-        from voiceink.ui.theme import apply_theme
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.history_window import HistoryWindow
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         apply_theme(mode="light")
@@ -426,8 +426,8 @@ class TestSurfaceThemeReapply:
 
         from PyQt6.QtWidgets import QApplication, QLabel
 
-        from voiceink.ui.settings_components import info_callout
-        from voiceink.ui.theme import apply_theme
+        from sayink.ui.settings_components import info_callout
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         apply_theme(mode="light")
@@ -447,9 +447,9 @@ class TestSurfaceThemeReapply:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.ui.theme import apply_theme
-        from voiceink.ui import tray_icon as tray_mod
-        from voiceink.ui.tray_icon import TrayIcon
+        from sayink.ui.theme import apply_theme
+        from sayink.ui import tray_icon as tray_mod
+        from sayink.ui.tray_icon import TrayIcon
 
         src = inspect.getsource(tray_mod._microphone_pixmap)
         assert "#FF6961" not in src
@@ -469,9 +469,9 @@ class TestSurfaceThemeReapply:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.ui import design_tokens as tok
-        from voiceink.ui.floating_window import FloatingWindow
-        from voiceink.ui.theme import apply_theme
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.floating_window import FloatingWindow
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         win = FloatingWindow()
@@ -492,7 +492,7 @@ class TestSettingsThemeAwareBroadcast:
     def test_settings_reapply_theme_has_no_virole_walk(self):
         import inspect
 
-        from voiceink.ui.settings_window import SettingsWindow
+        from sayink.ui.settings_window import SettingsWindow
 
         src = inspect.getsource(SettingsWindow.reapply_theme)
         assert "viRole" not in src
@@ -503,10 +503,10 @@ class TestSettingsThemeAwareBroadcast:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.config import Config
-        from voiceink.ui import design_tokens as tok
-        from voiceink.ui.settings_window import SettingsWindow
-        from voiceink.ui.theme import apply_theme
+        from sayink.config import Config
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.settings_window import SettingsWindow
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -530,10 +530,10 @@ class TestSettingsThemeAwareBroadcast:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.config import Config
-        from voiceink.ui import design_tokens as tok
-        from voiceink.ui.settings_window import SettingsWindow
-        from voiceink.ui.theme import apply_theme
+        from sayink.config import Config
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.settings_window import SettingsWindow
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -563,13 +563,13 @@ class TestFourSurfaceThemeAwareProtocol:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.config import Config
-        from voiceink.history_store import HistoryStore
-        from voiceink.ui.floating_window import FloatingWindow
-        from voiceink.ui.history_window import HistoryWindow
-        from voiceink.ui.settings_window import SettingsWindow
-        from voiceink.ui.theme import ThemeAware
-        from voiceink.ui.tray_icon import TrayIcon
+        from sayink.config import Config
+        from sayink.history_store import HistoryStore
+        from sayink.ui.floating_window import FloatingWindow
+        from sayink.ui.history_window import HistoryWindow
+        from sayink.ui.settings_window import SettingsWindow
+        from sayink.ui.theme import ThemeAware
+        from sayink.ui.tray_icon import TrayIcon
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -597,14 +597,14 @@ class TestFourSurfaceThemeAwareProtocol:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.config import Config
-        from voiceink.history_store import HistoryStore
-        from voiceink.ui import design_tokens as tok
-        from voiceink.ui.floating_window import FloatingWindow
-        from voiceink.ui.history_window import HistoryWindow
-        from voiceink.ui.settings_window import SettingsWindow
-        from voiceink.ui.theme import apply_theme
-        from voiceink.ui.tray_icon import TrayIcon
+        from sayink.config import Config
+        from sayink.history_store import HistoryStore
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.floating_window import FloatingWindow
+        from sayink.ui.history_window import HistoryWindow
+        from sayink.ui.settings_window import SettingsWindow
+        from sayink.ui.theme import apply_theme
+        from sayink.ui.tray_icon import TrayIcon
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -652,12 +652,12 @@ class TestFourSurfaceThemeAwareProtocol:
 
         from PyQt6.QtWidgets import QApplication
 
-        from voiceink.config import Config
-        from voiceink.history_store import HistoryStore
-        from voiceink.ui import design_tokens as tok
-        from voiceink.ui.history_window import HistoryWindow
-        from voiceink.ui.settings_window import SettingsWindow
-        from voiceink.ui.theme import apply_theme
+        from sayink.config import Config
+        from sayink.history_store import HistoryStore
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.history_window import HistoryWindow
+        from sayink.ui.settings_window import SettingsWindow
+        from sayink.ui.theme import apply_theme
 
         QApplication.instance() or QApplication(sys.argv)
         monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
@@ -689,7 +689,7 @@ class TestFourSurfaceThemeAwareProtocol:
             history._store.close()
 
     def test_apply_theme_continues_after_one_surface_fails(self, caplog):
-        from voiceink.ui.theme import apply_theme
+        from sayink.ui.theme import apply_theme
 
         class Boom:
             def reapply_theme(self) -> None:
@@ -711,7 +711,7 @@ class TestFourSurfaceThemeAwareProtocol:
 
 def test_watch_system_color_scheme_connects_to_style_hints():
     from PyQt6.QtGui import QGuiApplication
-    from voiceink.ui.theme import watch_system_color_scheme
+    from sayink.ui.theme import watch_system_color_scheme
 
     assert hasattr(QGuiApplication.styleHints(), "colorSchemeChanged")
     calls = []

@@ -2,8 +2,8 @@
 
 import pytest
 
-from voiceink.audio_recorder import AudioRecorder
-from voiceink.vad_segmenter import SPEECH_RMS_THRESHOLD
+from sayink.audio_recorder import AudioRecorder
+from sayink.vad_segmenter import SPEECH_RMS_THRESHOLD
 
 
 class TestAudioRecorderConfigure:

@@ -25,7 +25,7 @@
 
 ## Impact
 
-- 代码：`voiceink/app.py` 文件任务编排；`voiceink/media_decoder.py`；`voiceink/ui/tray_icon.py` 导入菜单；`voiceink/ui/history_window.py`「导入文件」元数据展示；`voiceink/ui/settings_window.py` / `voiceink/text_polisher.py` 翻译模式（条件）；`build.py` + `third_party/ffmpeg/`
+- 代码：`sayink/app.py` 文件任务编排；`sayink/media_decoder.py`；`sayink/ui/tray_icon.py` 导入菜单；`sayink/ui/history_window.py`「导入文件」元数据展示；`sayink/ui/settings_window.py` / `sayink/text_polisher.py` 翻译模式（条件）；`build.py` + `third_party/ffmpeg/`
 - 配置：`llm.mode` / `llm.target_language`（条件）
 - 规格：`openspec/specs/media-file-transcription/`；条件 `openspec/specs/light-translation/`
 - 测试：`tests/test_media_decoder*.py`、`tests/test_app_file_transcription.py`、相关 polisher/settings 断言
@@ -63,7 +63,7 @@
 - 运行时：托盘 `import_file_requested` → `App._on_import_file_requested` → `start_file_transcription` → `_FileDecodeWorker` / `decode_media_to_pcm` → `_begin_transcription`；`HISTORY_SOURCE_FILE="file"`、`TRIGGER_MODE_FILE_IMPORT`；结果可跳过粘贴写入历史。
 - 互斥：文件任务进行中会阻断实时录音入口并提示；退出时可 `cancel_file_transcription`。
 - 翻译：`llm.mode=translate` + `TextPolisher` `LLM_MODE_TRANSLATE`；设置页文案标明「仅文件转写」；测试断言实时听写忽略 translate。
-- 打包：`build.py` 将 `third_party/ffmpeg` 拷入 dist；`media_decoder.resolve_ffmpeg_executable` 解析捆绑/PATH/`VOICEINK_FFMPEG`。
+- 打包：`build.py` 将 `third_party/ffmpeg` 拷入 dist；`media_decoder.resolve_ffmpeg_executable` 解析捆绑/PATH/`SAYINK_FFMPEG`。
 
 ### 可复用 / 需扩展 / 冲突
 
@@ -87,12 +87,12 @@
 
 | 优先级 | 路径/符号 | 理由 |
 |---|---|---|
-| 必选 | `voiceink/app.py`：`start_file_transcription` / `_FileDecodeWorker` / `HISTORY_SOURCE_FILE` | 文件任务编排中枢 |
-| 必选 | `voiceink/ui/tray_icon.py`：`import_file_requested` / 「导入文件转写…」 | 用户可见入口 |
+| 必选 | `sayink/app.py`：`start_file_transcription` / `_FileDecodeWorker` / `HISTORY_SOURCE_FILE` | 文件任务编排中枢 |
+| 必选 | `sayink/ui/tray_icon.py`：`import_file_requested` / 「导入文件转写…」 | 用户可见入口 |
 | 必选 | `openspec/specs/media-file-transcription/spec.md` | 主规格必须撤回 |
-| 备选 | `voiceink/media_decoder.py`；`build.py` `_copy_ffmpeg_into_dist` | 解码与打包 |
-| 备选 | `voiceink/ui/settings_window.py` 润色/翻译；`voiceink/text_polisher.py` `LLM_MODE_TRANSLATE` | 轻翻译绑定文件任务 |
-| 备选 | `voiceink/ui/history_window.py`「触发：导入文件」 | 历史元数据展示 |
+| 备选 | `sayink/media_decoder.py`；`build.py` `_copy_ffmpeg_into_dist` | 解码与打包 |
+| 备选 | `sayink/ui/settings_window.py` 润色/翻译；`sayink/text_polisher.py` `LLM_MODE_TRANSLATE` | 轻翻译绑定文件任务 |
+| 备选 | `sayink/ui/history_window.py`「触发：导入文件」 | 历史元数据展示 |
 
 ### 波及线索
 
@@ -108,7 +108,7 @@
 |---|---|---|
 | 事实 | 文件导入入口在托盘 | `tray_icon.py` `import_file_requested`；菜单「导入文件转写…」 |
 | 事实 | App 有完整文件任务 API | Memory `search_graph`：`App.start_file_transcription`（约 L866+）、`cancel_file_transcription`；`_on_import_file_requested` |
-| 事实 | 解码经 `media_decoder.decode_media_to_pcm` | `voiceink/media_decoder.py`；`tests/test_media_decoder.py` |
+| 事实 | 解码经 `media_decoder.decode_media_to_pcm` | `sayink/media_decoder.py`；`tests/test_media_decoder.py` |
 | 事实 | 打包复制 ffmpeg | `build.py` `_copy_ffmpeg_into_dist` / 步骤 `[3/4] Copying bundled ffmpeg` |
 | 事实 | 轻翻译规格仅绑定文件任务 | `openspec/specs/light-translation/spec.md` Purpose + Requirement |
 | 事实 | 历史可标「导入文件」 | `history_window.py` meta「触发：导入文件」 |

@@ -1,5 +1,5 @@
 import pytest
-from voiceink.hotkey_manager import parse_hotkey, HotKeyManager, KEY_MAP
+from sayink.hotkey_manager import parse_hotkey, HotKeyManager, KEY_MAP
 from pynput import keyboard
 import threading
 
@@ -323,7 +323,7 @@ class TestHoldSurvivesUnrelatedKeys:
         assert arms == [True]
 
     def test_releasing_hotkey_key_still_reports_short_tap(self, monkeypatch):
-        import voiceink.hotkey_manager as hm
+        import sayink.hotkey_manager as hm
 
         mgr, _arms, short = self._armed()
         mgr._hold_started_at -= 1.0

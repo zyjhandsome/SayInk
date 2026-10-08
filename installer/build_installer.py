@@ -1,14 +1,14 @@
 """
-Build script for creating VoiceInk Windows installer using Inno Setup.
+Build script for creating SayInk Windows installer using Inno Setup.
 
 Prerequisites:
 - Inno Setup 6 must be installed (https://jrsoftware.org/isdl.php)
-- VoiceInk must already be built with PyInstaller (run build.py first), or use
+- SayInk must already be built with PyInstaller (run build.py first), or use
   ../build_release.py for a one-shot build.
 
-Output: dist/VoiceInk-Setup-<version>.exe (version from voiceink/version.py)
+Output: dist/SayInk-Setup-<version>.exe (version from sayink/version.py)
 
-By default, the intermediate folder dist/VoiceInk/ is deleted after a
+By default, the intermediate folder dist/SayInk/ is deleted after a
 successful compile so dist/ only contains the setup EXE. Pass --keep-staging
 to preserve it for debugging.
 """
@@ -25,17 +25,17 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from voiceink.version import __version__, file_version_quad
+from sayink.version import __version__, file_version_quad
 
 
 def resolve_staging_dir() -> Path:
-    """PyInstaller output folder (dist/VoiceInk or alternate from VOICEINK_STAGING_DIR.txt)."""
-    marker = PROJECT_ROOT / "dist" / "VOICEINK_STAGING_DIR.txt"
+    """PyInstaller output folder (dist/SayInk or alternate from SAYINK_STAGING_DIR.txt)."""
+    marker = PROJECT_ROOT / "dist" / "SAYINK_STAGING_DIR.txt"
     if marker.is_file():
         name = marker.read_text(encoding="utf-8").strip()
         if name:
             return PROJECT_ROOT / "dist" / name
-    return PROJECT_ROOT / "dist" / "VoiceInk"
+    return PROJECT_ROOT / "dist" / "SayInk"
 
 
 # Inno Setup compiler path (common installation locations)
@@ -69,17 +69,17 @@ def check_prerequisites():
 
     print(f"[OK] Inno Setup found: {inno_path}")
 
-    # Check VoiceInk build exists
-    voiceink_exe = resolve_staging_dir() / "VoiceInk.exe"
-    if not voiceink_exe.exists():
-        print("\n[ERROR] VoiceInk.exe not found!")
+    # Check SayInk build exists
+    sayink_exe = resolve_staging_dir() / "SayInk.exe"
+    if not sayink_exe.exists():
+        print("\n[ERROR] SayInk.exe not found!")
         print("\nPlease run build.py first to create the executable.")
         return False
 
-    print(f"[OK] VoiceInk.exe found: {voiceink_exe}")
+    print(f"[OK] SayInk.exe found: {sayink_exe}")
 
     # Check installer script
-    installer_script = SCRIPT_DIR / "VoiceInk-Setup.iss"
+    installer_script = SCRIPT_DIR / "SayInk-Setup.iss"
     if not installer_script.exists():
         print("\n[ERROR] Installer script not found!")
         print(f"  Expected: {installer_script}")
@@ -88,7 +88,7 @@ def check_prerequisites():
     print(f"[OK] Installer script found: {installer_script}")
 
     # Check icon file
-    icon_file = PROJECT_ROOT / "voiceink" / "icon.ico"
+    icon_file = PROJECT_ROOT / "sayink" / "icon.ico"
     if not icon_file.exists():
         print("\n[ERROR] Icon file not found!")
         print(f"  Expected: {icon_file}")
@@ -110,7 +110,7 @@ def check_prerequisites():
 def build_installer(*, keep_staging: bool = False):
     """Build the Windows installer using Inno Setup."""
     print("=" * 60)
-    print("  VoiceInk Installer Build Script")
+    print("  SayInk Installer Build Script")
     print(f"  Version {__version__}  (Inno / Win file quad {file_version_quad()})")
     print("=" * 60)
     print()
@@ -124,7 +124,7 @@ def build_installer(*, keep_staging: bool = False):
     print()
 
     inno_path = find_inno_setup()
-    installer_script = SCRIPT_DIR / "VoiceInk-Setup.iss"
+    installer_script = SCRIPT_DIR / "SayInk-Setup.iss"
 
     # Stream ISCC output (do not capture) so long compress steps do not look hung.
     try:
@@ -150,8 +150,8 @@ def build_installer(*, keep_staging: bool = False):
         print(f"\n[ERROR] Failed to run Inno Setup: {e}")
         sys.exit(1)
 
-    # Check output (filename includes version; see VoiceInk-Setup.iss OutputBaseFilename)
-    output_file = PROJECT_ROOT / "dist" / f"VoiceInk-Setup-{__version__}.exe"
+    # Check output (filename includes version; see SayInk-Setup.iss OutputBaseFilename)
+    output_file = PROJECT_ROOT / "dist" / f"SayInk-Setup-{__version__}.exe"
     if not output_file.exists():
         print("\n[ERROR] Installer not created!")
         sys.exit(1)
@@ -168,13 +168,13 @@ def build_installer(*, keep_staging: bool = False):
     print()
     print("  Distribution:")
     print(f"    Share {output_file.name} with users.")
-    print("    Users run the installer to install VoiceInk.")
+    print("    Users run the installer to install SayInk.")
     print("=" * 60)
 
     staging_dir = resolve_staging_dir()
     if not keep_staging and staging_dir.exists():
         shutil.rmtree(staging_dir, ignore_errors=True)
-        marker = PROJECT_ROOT / "dist" / "VOICEINK_STAGING_DIR.txt"
+        marker = PROJECT_ROOT / "dist" / "SAYINK_STAGING_DIR.txt"
         if marker.is_file():
             marker.unlink(missing_ok=True)
         print()
@@ -185,11 +185,11 @@ def build_installer(*, keep_staging: bool = False):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Build VoiceInk-Setup.exe (Inno Setup).")
+    ap = argparse.ArgumentParser(description="Build SayInk-Setup.exe (Inno Setup).")
     ap.add_argument(
         "--keep-staging",
         action="store_true",
-        help="Keep dist/VoiceInk after success (default: delete to leave only the installer).",
+        help="Keep dist/SayInk after success (default: delete to leave only the installer).",
     )
     ns = ap.parse_args()
     build_installer(keep_staging=ns.keep_staging)

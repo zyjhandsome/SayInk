@@ -1,7 +1,7 @@
 """Regression checks for removed file-transcription entry points."""
 
-from voiceink.app import App
-from voiceink.ui.tray_icon import TrayIcon
+from sayink.app import App
+from sayink.ui.tray_icon import TrayIcon
 
 
 def test_file_transcription_entry_points_are_absent():

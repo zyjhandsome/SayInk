@@ -9,11 +9,11 @@ from tests.test_app_history_wiring import (
     _enqueued_records,
     _start_continuous_user_session,
 )
-from voiceink.audio_utils import TARGET_SAMPLE_RATE
-from voiceink.history_store import HistoryStore, SegmentRecord
-from voiceink.speaker_session import MAX_SPEAKERS, SpeakerSession, dominant_route, voice_embedding
-from voiceink.ui.history_window import HistoryWindow, _session_body
-from voiceink.vad_segmenter import SpeechSegmenter
+from sayink.audio_utils import TARGET_SAMPLE_RATE
+from sayink.history_store import HistoryStore, SegmentRecord
+from sayink.speaker_session import MAX_SPEAKERS, SpeakerSession, dominant_route, voice_embedding
+from sayink.ui.history_window import HistoryWindow, _session_body
+from sayink.vad_segmenter import SpeechSegmenter
 
 
 def _tone(freq: float, seconds: float = 0.55) -> np.ndarray:

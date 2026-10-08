@@ -2,9 +2,9 @@
 
 from PyQt6.QtWidgets import QWidget
 
-from voiceink.ui.design_tokens import activate
-from voiceink.ui.hotkey_edit import HotkeyEdit
-from voiceink.ui.settings_components import empty_state, reapply_subtree
+from sayink.ui.design_tokens import activate
+from sayink.ui.hotkey_edit import HotkeyEdit
+from sayink.ui.settings_components import empty_state, reapply_subtree
 
 
 def test_hotkey_capture_uses_active_dark_colors():
@@ -37,8 +37,8 @@ def test_widgets_built_after_a_theme_switch_use_the_live_palette():
     stale after ``activate()``; builders must read ``tok.X`` live."""
     from PyQt6.QtWidgets import QLabel
 
-    from voiceink.ui.floating_window import _DotIndicator
-    from voiceink.ui.settings_components import option_row
+    from sayink.ui.floating_window import _DotIndicator
+    from sayink.ui.settings_components import option_row
 
     activate("dark")
     dark_row = option_row("标题", "副标题")

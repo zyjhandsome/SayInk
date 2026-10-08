@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from voiceink.audio_recorder import AudioRecorder
+from sayink.audio_recorder import AudioRecorder
 
 
 class TestAudioRecorderConstants:
@@ -120,7 +120,7 @@ class TestAudioRecorderCancel:
 
 class TestAudioRecorderAudioCallback:
     def _lane_with_callback(self, recorder):
-        from voiceink.audio_devices import AudioDeviceInfo
+        from sayink.audio_devices import AudioDeviceInfo
 
         ep = type(
             "E",

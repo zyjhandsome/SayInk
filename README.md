@@ -1,8 +1,10 @@
-# VoiceInk — 语音转文字桌面工具
+# SayInk — 语音转文字桌面工具
 
 本地离线语音转文字：采集**麦克风** / **电脑播放声** / **混合** → 本地 ASR 识别 →（可选）大模型润色 → 自动粘贴到光标位置。默认 **自动持续转写**（按住快捷键开始整场监听，停顿后自动出字）；也可切换为 **按住说话、松开识别**。
 
-版本号以 **`voiceink/version.py`** 中的 `__version__` 为准（当前 **2.1.0**）；安装包文件名、Inno 元数据与 Windows 下 `VoiceInk.exe` 属性均与之同步。
+版本号以 **`sayink/version.py`** 中的 `__version__` 为准（当前 **2.1.0**）；安装包文件名、Inno 元数据与 Windows 下 `SayInk.exe` 属性均与之同步。
+
+> **原名 VoiceInk。** 从 VoiceInk 升级：安装 SayInk 会先卸载旧版 VoiceInk，并把 `~/.voiceink`（设置、历史、已下载模型）整体改名为 `~/.sayink`，凭据管理器里的 API Key 也会自动迁移；无需重新配置或重新下载模型。
 
 **文档导航**
 
@@ -61,8 +63,8 @@
 - 「粘贴后恢复剪贴板」在粘贴约 0.5 秒后才恢复，且只恢复文本；原剪贴板是图片等非文本内容时保留转写文字，不会清空
 - 可选 **OpenAI 兼容 API** 润色（DeepSeek、通义、Ollama 等）；失败，或返回内容明显比原话长很多（像在回答而不是润色）、删改了原话里的阿拉伯数字（含零）、去掉了全部否定词（不 / 没 / 别 / not 等）、丢掉了英文专名（如 GitHub、API）时，**输出 ASR 原文**。数字检查允许时间补 `:00`、千位分隔符和小数末尾零等格式变化。这是保守的规则检查，拦不住所有改义（例如中文人名被改写），重要内容请核对
 - 按住说话模式下，上一句还在润色时可以开始录下一句；上一句润色失败时仍回退它自己的原文，不会被下一句影响
-- Windows 上 API Key 保存在**系统凭据管理器**（「VoiceInk/llm.api_key」），不写入 `config.json`；旧版本配置里的 Key 会在启动时自动迁移。凭据管理器写入失败时，Key 只在本次运行中有效、同样不写入 `config.json`，润色页会提示重启后需重新填写
-- **主窗口**（侧栏：历史 / 通用 / 引擎 / 润色 / 关于）收纳设置与历史；听写只留一条薄 **听写条**。托盘与听写条共用 模型载入中 / 正在听 / 正在识别 / 润色中 / 已复制。托盘 → **打开 VoiceInk**（单击或双击托盘图标均可打开主窗口）；配置保存在 `~/.voiceink/config.json`
+- Windows 上 API Key 保存在**系统凭据管理器**（「SayInk/llm.api_key」），不写入 `config.json`；旧版本配置里的 Key 会在启动时自动迁移。凭据管理器写入失败时，Key 只在本次运行中有效、同样不写入 `config.json`，润色页会提示重启后需重新填写
+- **主窗口**（侧栏：历史 / 通用 / 引擎 / 润色 / 关于）收纳设置与历史；听写只留一条薄 **听写条**。托盘与听写条共用 模型载入中 / 正在听 / 正在识别 / 润色中 / 已复制。托盘 → **打开 SayInk**（单击或双击托盘图标均可打开主窗口）；配置保存在 `~/.sayink/config.json`
 
 ### 外观主题
 
@@ -74,7 +76,7 @@
 
 - 入口：**设置 → 通用 → 外观 → 主题**；偏好键 `appearance.theme_mode`（`system` / `light` / `dark`）
 - 一次作用于主窗口、听写条、托盘菜单（含全局控件样式）
-- 设计令牌权威源见 [`design-system/MASTER.md`](design-system/MASTER.md)；实现位于 `voiceink/ui/design_tokens.py`、`theme.py`
+- 设计令牌权威源见 [`design-system/MASTER.md`](design-system/MASTER.md)；实现位于 `sayink/ui/design_tokens.py`、`theme.py`
 
 ### 工作台操作
 
@@ -89,7 +91,7 @@
 - 可选在本机保存转写历史；首次使用会询问是否开启，默认配置项为 `history.enabled`
 - 历史写入发生在文本输出流程之后；保存 ASR 原文、润色后文本（如有）、音频来源、触发模式、模型、时长与目标应用**进程名**。持续转写的多人场次另存本场说话人编号（最多 8 人），不写入粘贴文本，也不跨场保留声纹
 - 托盘 → **历史** 打开主窗口并切到历史，可搜索、查看、复制原文 / 润色结果、删除会话，并导出 Markdown
-- 历史保存在 `~/.voiceink/history.db`（SQLite）；按「整场会话」管理，默认保留 **90 天**、最多 **5000 场**
+- 历史保存在 `~/.sayink/history.db`（SQLite）；按「整场会话」管理，默认保留 **90 天**、最多 **5000 场**
 
 ### 平台
 
@@ -115,7 +117,7 @@ macOS / Linux 只提供源码运行方式，没有安装包，也没有在真机
 | 依赖 | 说明 |
 |------|------|
 | Python **3.10+** | 从源码运行 / 打包时需要 |
-| `VoiceInk-Setup-*.exe` | 安装后**无需** Python |
+| `SayInk-Setup-*.exe` | 安装后**无需** Python |
 
 ```bash
 pip install -r requirements.txt   # PyQt6、sherpa-onnx、sounddevice、pynput 等
@@ -127,7 +129,7 @@ pip install -r requirements.txt   # PyQt6、sherpa-onnx、sounddevice、pynput �
 
 ### 安装（Windows，推荐）
 
-安装 **[Releases](https://github.com/zyjhandsome/VoiceInk/releases)** 中的 **`VoiceInk-Setup-2.1.0.exe`**（约 709 MB）。无安装包见 [从源码打包](#从源码打包)。
+安装 **[Releases](https://github.com/zyjhandsome/SayInk/releases)** 中的 **`SayInk-Setup-2.1.0.exe`**（约 709 MB）。无安装包见 [从源码打包](#从源码打包)。
 
 ### 从源码运行
 
@@ -143,12 +145,12 @@ py -3.10 -m pip install -r requirements.txt
 py -3.10 run.py
 ```
 
-模型：**设置 → 引擎** 下载，或放到 `models/`、`~/.voiceink/models/`。
+模型：**设置 → 引擎** 下载，或放到 `models/`、`~/.sayink/models/`。
 
 ### 首次使用
 
 1. 等托盘 **「模型载入中」** 消失；持续模式就绪后**不会**再弹闲置「待开始」，请看托盘提示
-2. 托盘 → **打开 VoiceInk**（Windows **双击**托盘打开主窗口；冷启动第一次落在「通用」）→ **测试声音**；确认触发方式
+2. 托盘 → **打开 SayInk**（Windows **双击**托盘打开主窗口；冷启动第一次落在「通用」）→ **测试声音**；确认触发方式
 3. **持续转写**：按住 **Alt+Z** 约 **0.30 秒** → 说话停顿约 **1 秒**后自动出字（不用点结束）→ **Esc** / 听写条 **结束**整场
 4. **按住说话**：按住约 **0.18 秒** 说话 → **松开** 识别
 
@@ -167,23 +169,23 @@ py -3.10 run.py
 **历史（可选）：** 设置 → 通用 → 历史，可开关「保存语音历史」，并调整「保留天数」与「最大会话数」。关闭开关只停止未来写入，不会删除已有历史。  
 **外观：** 设置 → 通用 → 外观，可选跟随系统 / 浅色 / 暗色；切换后立即作用于主窗口、听写条与托盘。
 
-**模型目录：** 设置 → 引擎 → 存储位置 **更改**（默认 `~/.voiceink/models/`；安装版的安装目录普通用户不可写时，新下载的模型一律放到这里，安装包自带的模型仍可直接使用）。  
+**模型目录：** 设置 → 引擎 → 存储位置 **更改**（默认 `~/.sayink/models/`；安装版的安装目录普通用户不可写时，新下载的模型一律放到这里，安装包自带的模型仍可直接使用）。  
 **下载源：** 设置 → 引擎 → 下载 → 下载源。默认「自动」先连 Hugging Face 官方，连不上时改用 hf-mirror 国内镜像；也可固定其中一个。下载的文件会核对大小，不完整的不会保留。
 
 ---
 
 ## 源码结构
 
-入口：`run.py` → `voiceink/main.py`（应用 Fusion 样式并 `apply_theme`）→ `voiceink/app.py`（编排热键、录音、识别、粘贴与 UI 表面）。
+入口：`run.py` → `sayink/main.py`（应用 Fusion 样式并 `apply_theme`）→ `sayink/app.py`（编排热键、录音、识别、粘贴与 UI 表面）。
 
 | 区域 | 主要模块 | 职责 |
 |------|----------|------|
-| 编排 | `app.py`、`config.py`、`secret_store.py`、`hotkey_manager.py` | 生命周期、配置（`~/.voiceink/config.json`，API Key 存 Windows 凭据管理器）、快捷键（Windows 上拦截快捷键主键） |
+| 编排 | `app.py`、`config.py`、`secret_store.py`、`hotkey_manager.py` | 生命周期、配置（`~/.sayink/config.json`，API Key 存 Windows 凭据管理器）、快捷键（Windows 上拦截快捷键主键） |
 | 音频 / ASR | `audio_recorder.py`、`audio_devices.py`、`vad_segmenter.py`、`speech_recognizer.py` | 采集、VAD 切分、sherpa-onnx 本地识别 |
 | 输出 | `text_paster.py`、`text_polisher.py`、`history_store.py` | 粘贴、可选 LLM 润色、SQLite 历史 |
 | UI | `ui/main_window.py`、`floating_window.py`、`tray_icon.py` | 主窗口（侧栏五栏）、听写条、托盘 |
 | 主题 | `ui/theme.py`、`ui/design_tokens.py`、`ui/app_styles.py`、`ui/settings_styles.py` | 有效主题解析、token、全局/设置 QSS |
-| 构建 | `build.py`、`build_release.py`、`voiceink_build/` | 便携版与 Inno 安装包 |
+| 构建 | `build.py`、`build_release.py`、`sayink_build/` | 便携版与 Inno 安装包 |
 
 自动化测试在 `tests/`（含 `test_readme_features.py`、`test_theme_resolve.py`、`test_ui_styles.py`）。产品变更走 OpenSpec（`openspec/changes/`）。
 
@@ -195,14 +197,14 @@ py -3.10 run.py
 
 ```bash
 pip install -r requirements.txt
-python voiceink_build/download_bundle_model_for_build.py   # 首次：下载模型到 ./models/
-python -m voiceink_build.dependency_check                 # 打包前检查依赖版本
-python build_release.py    # → dist/VoiceInk-Setup-<版本>.exe
+python sayink_build/download_bundle_model_for_build.py   # 首次：下载模型到 ./models/
+python -m sayink_build.dependency_check                 # 打包前检查依赖版本
+python build_release.py    # → dist/SayInk-Setup-<版本>.exe
 # 或仅便携版：
-python build.py            # → dist/VoiceInk/VoiceInk.exe（须整目录分发）
+python build.py            # → dist/SayInk/SayInk.exe（须整目录分发）
 ```
 
-安装包产物：`dist/VoiceInk-Setup-<版本>.exe`；便携版须整目录分发 `dist/VoiceInk/`。
+安装包产物：`dist/SayInk-Setup-<版本>.exe`；便携版须整目录分发 `dist/SayInk/`。
 
 ---
 
@@ -218,7 +220,7 @@ py -3.10 -m pytest tests/test_readme_features.py tests/test_theme_resolve.py tes
 
 **全量测试与验证环境：** Windows x64 / Python 3.10 使用已验证的固定依赖约束：`python -m pip install -r requirements-dev.txt -c constraints-windows-py310.txt`。其他平台使用 `requirements-dev.txt`。设置 `QT_QPA_PLATFORM=offscreen`，运行 `python -m pytest -p no:cacheprovider tests -q`。
 
-GitHub Actions 的 `.github/workflows/tests.yml` 会在 push / PR 时执行 Windows 回归、`pip check` 与发布依赖检查。`python -m voiceink_build.dependency_check` 核对当前环境与 `requirements.txt`；`build.py` 也会先检查依赖，再清理旧构建目录，低于要求的引擎不能继续打包。固定约束覆盖 Python 包版本，不包含模型权重、Windows 系统组件或安装包签名。
+GitHub Actions 的 `.github/workflows/tests.yml` 会在 push / PR 时执行 Windows 回归、`pip check` 与发布依赖检查。`python -m sayink_build.dependency_check` 核对当前环境与 `requirements.txt`；`build.py` 也会先检查依赖，再清理旧构建目录，低于要求的引擎不能继续打包。固定约束覆盖 Python 包版本，不包含模型权重、Windows 系统组件或安装包签名。
 
 记录结论时写明 Python、PyQt6、sherpa-onnx 版本：sherpa-onnx 低于下限（1.13.8）的环境只能证明测试里的应用逻辑，不能代表发布依赖。发版前仍应在干净环境中跑全量测试，并冒烟安装包。当前可靠性优化与验证记录见 [`docs/reliability-first-pass.md`](docs/reliability-first-pass.md)。
 
@@ -226,12 +228,12 @@ GitHub Actions 的 `.github/workflows/tests.yml` 会在 push / PR 时执行 Wind
 
 | 级别 | 要点 |
 |------|------|
-| **P0** | 粘贴不假成功（含管理员窗口）；等待期间焦点切走不发送粘贴键；持续模式收尾句不丢；开启润色时持续模式逐段输出、不丢段不串段，排队片段不串场；润色失败或数字被删改时回退本句原文；未完成转写退出须明确确认放弃，安装更新不能先启动安装包再确认；API Key 任何情况下不以明文写入 `config.json`；自动更新必须有 SHA-256；加载中不被其它错误盖住；发行版日志写入 `~/.voiceink/logs` |
+| **P0** | 粘贴不假成功（含管理员窗口）；等待期间焦点切走不发送粘贴键；持续模式收尾句不丢；开启润色时持续模式逐段输出、不丢段不串段，排队片段不串场；润色失败或数字被删改时回退本句原文；未完成转写退出须明确确认放弃，安装更新不能先启动安装包再确认；API Key 任何情况下不以明文写入 `config.json`；自动更新必须有 SHA-256；加载中不被其它错误盖住；发行版日志写入 `~/.sayink/logs` |
 | **P1** | 默认 Alt+Z；下载≠载入有反馈；润色失败降级原文；加载失败听写条变红 |
 | **P2** | Esc 结束持续监听；30s 无语音提示；混合采集系统声失败有警告；保存设置时队列确认 |
 | **UI** | 默认 `appearance.theme_mode=dark`；切换浅/暗/系统后主窗口、听写条、托盘一致换肤且无需重启；设置控件对齐在 light/dark 下仍成立 |
 
-变更 `app.py`、触发模式、持续模式或模型就绪流程时，**必须**更新本 README 相关段落并扩展 `tests/test_readme_features.py`。变更主题 / tokens / 四表面样式时，同步 [`design-system/voiceink/MASTER.md`](design-system/voiceink/MASTER.md) 与 `tests/test_theme_resolve.py` / `tests/test_ui_styles.py`。
+变更 `app.py`、触发模式、持续模式或模型就绪流程时，**必须**更新本 README 相关段落并扩展 `tests/test_readme_features.py`。变更主题 / tokens / 四表面样式时，同步 [`design-system/sayink/MASTER.md`](design-system/sayink/MASTER.md) 与 `tests/test_theme_resolve.py` / `tests/test_ui_styles.py`。
 
 ---
 
@@ -262,7 +264,7 @@ A: 分段门限会跟着最近约 8 秒里最安静的时刻自动抬高（最�
 A: 应自动清洗；若仍出现请升级至最新版。
 
 **Q: 打包提示缺少 Fun-ASR-Nano？**  
-A: 运行 `python voiceink_build/download_bundle_model_for_build.py`。
+A: 运行 `python sayink_build/download_bundle_model_for_build.py`。
 
 **Q: 识别不准？**  
 A: 可试 FireRedASR2、Qwen3-ASR、FireRedASR2 AED；要快可换 SenseVoice。
@@ -270,21 +272,24 @@ A: 可试 FireRedASR2、Qwen3-ASR、FireRedASR2 AED；要快可换 SenseVoice。
 **Q: 无法自动粘贴？**  
 A: 管理员终端、密码框等会拦截；会提示「已复制」，请手动 Ctrl+V。
 
+**Q: 以前装的是 VoiceInk，升级到 SayInk 会丢设置和历史吗？**  
+A: 不会。SayInk 首次启动（或安装程序）会把 `~/.voiceink` 整体改名为 `~/.sayink`，设置、历史、日志和已下载模型原样保留；凭据管理器里的 API Key 在第一次读取时迁到新条目。若 `~/.sayink` 已存在则不会覆盖，旧目录保持不动。
+
 **Q: 历史会保存什么？如何关闭或清空？**  
-A: 仅在本机 `~/.voiceink/history.db` 保存文本历史与少量元数据（例如音频来源、模型、目标应用进程名，以及持续转写本场的说话人编号）；不保存音频，也不保存声纹。可在设置 → 通用 → 历史关闭未来写入；已有记录需在托盘 → 历史 中删除会话，或通过左侧摘要行的「清空全部历史」一次清除。清理策略按保留天数和最大会话数删除旧会话。
+A: 仅在本机 `~/.sayink/history.db` 保存文本历史与少量元数据（例如音频来源、模型、目标应用进程名，以及持续转写本场的说话人编号）；不保存音频，也不保存声纹。可在设置 → 通用 → 历史关闭未来写入；已有记录需在托盘 → 历史 中删除会话，或通过左侧摘要行的「清空全部历史」一次清除。清理策略按保留天数和最大会话数删除旧会话。
 
 **Q: 如何切换浅色 / 暗色？**
 
-A: 设置 → 通用 → 外观 → 主题。默认「暗色」；也可固定「浅色」或「跟随系统」。偏好写入 `~/.voiceink/config.json` 的 `appearance.theme_mode`，重启后仍生效。
+A: 设置 → 通用 → 外观 → 主题。默认「暗色」；也可固定「浅色」或「跟随系统」。偏好写入 `~/.sayink/config.json` 的 `appearance.theme_mode`，重启后仍生效。
 
 **Q: Linux / macOS 权限？**  
-A: Linux 装 `xdotool`；macOS 在辅助功能中授权 VoiceInk。
+A: Linux 装 `xdotool`；macOS 在辅助功能中授权 SayInk。
 
 **Q: 出问题了，日志在哪里？**  
-A: `~/.voiceink/logs/voiceink.log`（自动轮转，最多约 4 MB）；程序异常崩溃的底层信息在同目录 `crash.log`。设置 → 关于 → 文件位置 可看到完整路径。
+A: `~/.sayink/logs/sayink.log`（自动轮转，最多约 4 MB）；程序异常崩溃的底层信息在同目录 `crash.log`。设置 → 关于 → 文件位置 可看到完整路径。
 
-**Q: 再次双击 VoiceInk 图标没反应？**  
-A: VoiceInk 同时只运行一个；再次启动会直接打开已在运行的主窗口。
+**Q: 再次双击 SayInk 图标没反应？**  
+A: SayInk 同时只运行一个；再次启动会直接打开已在运行的主窗口。
 
 **Q: 配置文件损坏了会怎样？**  
 A: 启动时读不了 `config.json`，会先把它改名为 `config.corrupt-<时间>.json` 保留，再用默认设置启动，原来的设置不会被覆盖掉。某一节写错了类型（比如把 `"history"` 写成字符串）时，只有这一节回到默认值，其余设置照常生效。
@@ -293,6 +298,6 @@ A: 启动时读不了 `config.json`，会先把它改名为 `config.corrupt-<时
 A: 同样处理：`history.db` 改名为 `history.corrupt-<时间>.db` 保留，重新建一个空库，并在托盘提示一次。之前的记录不会显示，但文件还在，可以手动恢复。数据库完全打不开（被占用、没有权限）时不会动原文件，本次运行只是不保存历史，托盘和历史窗口都会说明原因。单条记录写入失败也会在托盘提示一次，细节在日志里。
 
 **Q: 自动更新下载的安装包安全吗？**  
-A: 只从 GitHub Releases 下载，先存为 `.part`，核对大小与 GitHub 公布的 SHA-256 后才会运行；不完整或校验不符的安装包会被删除并提示重试。GitHub 没有公布该安装包 SHA-256 时，VoiceInk 不会下载或自动安装，会提示到发布页手动下载。安装包目前没有代码签名，Windows 可能提示「未知发布者」。
+A: 只从 GitHub Releases 下载，先存为 `.part`，核对大小与 GitHub 公布的 SHA-256 后才会运行；不完整或校验不符的安装包会被删除并提示重试。GitHub 没有公布该安装包 SHA-256 时，SayInk 不会下载或自动安装，会提示到发布页手动下载。安装包目前没有代码签名，Windows 可能提示「未知发布者」。
 
 ---

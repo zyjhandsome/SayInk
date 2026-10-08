@@ -12,7 +12,7 @@
 - [x] 1.1 实现捆绑 ffmpeg 路径解析与媒体→PCM 解码
   - 对应需求/场景：捆绑媒体解码能力；解码失败可见；空音频失败
   - 前置依赖：无
-  - 目标文件/符号：新建 `voiceink/media_decoder.py`（`resolve_ffmpeg_executable`、`decode_media_to_pcm`）；新建 `tests/test_media_decoder.py`
+  - 目标文件/符号：新建 `sayink/media_decoder.py`（`resolve_ffmpeg_executable`、`decode_media_to_pcm`）；新建 `tests/test_media_decoder.py`
   - 允许修改：上述新文件；必要时极小工具函数
   - 禁止修改：`speech_recognizer.py` ASR 内核；听写热键逻辑
   - 实施步骤：列表 argv 调用 ffmpeg；输出 mono float32 16 kHz；分类错误；支持取消（杀子进程）；禁止 `shell=True`
@@ -26,10 +26,10 @@
 - [x] 1.2 将 ffmpeg 纳入 PyInstaller/发布产物
   - 对应需求/场景：无系统 ffmpeg 仍可解码
   - 前置依赖：1.1
-  - 目标文件/符号：`build.py`；必要时 `installer/VoiceInk-Setup.iss`；构建说明中的 ffmpeg 获取步骤；约定放置目录（如 `third_party/ffmpeg/`）
+  - 目标文件/符号：`build.py`；必要时 `installer/SayInk-Setup.iss`；构建说明中的 ffmpeg 获取步骤；约定放置目录（如 `third_party/ffmpeg/`）
   - 允许修改：构建脚本与安装拷贝规则、简短构建文档
   - 禁止修改：运行时听写逻辑
-  - 实施步骤：构建时把 ffmpeg 拷入 `dist/VoiceInk/`（或 `--add-binary`）；确保冻结态能解析；文档写清来源/许可
+  - 实施步骤：构建时把 ffmpeg 拷入 `dist/SayInk/`（或 `--add-binary`）；确保冻结态能解析；文档写清来源/许可
   - 失败测试或已批准替代验证：脚本/断言检查产物路径存在（无输入时跳过并明确提示）
   - 验证命令/动作：有 ffmpeg 输入时跑构建或最小产物检查
   - 预期结果：冻结路径解析指向捆绑二进制
@@ -42,7 +42,7 @@
 - [x] 2.1 App 文件任务：解码→ASR→历史（含互斥）
   - 对应需求/场景：导入并转写；历史写入与来源可区分；互斥策略；文件失败行为
   - 前置依赖：1.1
-  - 目标文件/符号：`voiceink/app.py`（`start_file_transcription` / `cancel_file_transcription` / file job 状态）；必要时历史 pending 文件变体；`tests/test_app_file_transcription.py`（新）或扩展 `tests/test_app.py`
+  - 目标文件/符号：`sayink/app.py`（`start_file_transcription` / `cancel_file_transcription` / file job 状态）；必要时历史 pending 文件变体；`tests/test_app_file_transcription.py`（新）或扩展 `tests/test_app.py`
   - 允许修改：`app.py` 及相关测试；常量 `source=file`、`trigger_mode=file_import`
   - 禁止修改：翻译模式；DDL；无关设置页大改
   - 实施步骤：硬互斥实时录音/转写；复用 `transcribe_final`；成功写历史；默认不自动粘贴；取消协作式停止
@@ -56,7 +56,7 @@
 - [x] 2.2 托盘/历史「导入文件」UI与进行中取消
   - 对应需求/场景：用户可导入；取消文件转写；进行中状态
   - 前置依赖：2.1
-  - 目标文件/符号：`voiceink/ui/tray_icon.py`；`voiceink/ui/history_window.py`（可选同入口）；`voiceink/ui/floating_window.py`；`app.py` 接线；相关 UI 测试
+  - 目标文件/符号：`sayink/ui/tray_icon.py`；`sayink/ui/history_window.py`（可选同入口）；`sayink/ui/floating_window.py`；`app.py` 接线；相关 UI 测试
   - 允许修改：上述 UI + app 接线
   - 禁止修改：解码实现细节；翻译设置
   - 实施步骤：菜单项 + `QFileDialog`；连接启动；展示阶段状态；提供取消
@@ -72,7 +72,7 @@
 - [x] 3.1 TextPolisher 翻译模式与配置键
   - 对应需求/场景：润色\|翻译互斥；翻译失败回退（单元层）
   - 前置依赖：无（可与 2.x 并行，合并前需 2.1）
-  - 目标文件/符号：`voiceink/text_polisher.py`；`voiceink/config.py`（`llm.mode`、`llm.target_language` 默认）；`tests/test_text_polisher.py`
+  - 目标文件/符号：`sayink/text_polisher.py`；`sayink/config.py`（`llm.mode`、`llm.target_language` 默认）；`tests/test_text_polisher.py`
   - 允许修改：上述文件
   - 禁止修改：`app.py` 文件任务接线（留给 3.2）；DDL
   - 实施步骤：`TRANSLATE_PROMPT`；`mode` 参数；缺省 `polish`；保持 URL 安全策略
@@ -86,7 +86,7 @@
 - [x] 3.2 仅文件任务启用翻译 + 设置文案（非同传）
   - 对应需求/场景：文件可翻译；实时不翻译；失败回退；非同声传译边界
   - 前置依赖：2.1、3.1
-  - 目标文件/符号：`app.py`（file job 后处理分支）；`voiceink/ui/settings_window.py` / `settings_components.py`；测试
+  - 目标文件/符号：`app.py`（file job 后处理分支）；`sayink/ui/settings_window.py` / `settings_components.py`；测试
   - 允许修改：上述
   - 禁止修改：实时路径自动翻译；schema
   - 实施步骤：仅文件任务 + mode=translate + enabled 时翻译；实时仍只润色；降级提示；设置文案为转写后翻译
@@ -102,7 +102,7 @@
 - [x] 4.1 历史来源展示与原文/译文查看
   - 对应需求/场景：历史来源可区分；翻译结果进入历史
   - 前置依赖：2.1、3.2
-  - 目标文件/符号：`voiceink/ui/history_window.py`；必要时测试
+  - 目标文件/符号：`sayink/ui/history_window.py`；必要时测试
   - 允许修改：历史 UI 展示逻辑
   - 禁止修改：DDL
   - 实施步骤：`source=file` 显示为文件转写；保留 raw/polished（译文）查看

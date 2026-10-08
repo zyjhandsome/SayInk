@@ -19,7 +19,7 @@ def test_runtime_has_no_webengine_dependency_or_bridge_modules():
         "about_settings_web.py",
         "history_web.py",
     )
-    ui_dir = ROOT / "voiceink" / "ui"
+    ui_dir = ROOT / "sayink" / "ui"
     assert all(not (ui_dir / name).exists() for name in removed_modules)
     assert not (ui_dir / "web").exists()
 
