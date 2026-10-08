@@ -65,7 +65,7 @@ class TestParseHotkey:
 class TestHotKeyManagerInit:
     def test_default_hotkey(self):
         mgr = HotKeyManager()
-        assert mgr._hotkey_str == "alt+z"
+        assert mgr._hotkey_str == "shift+x"
         assert mgr._hotkey_keys is not None
 
     def test_custom_hotkey(self):
@@ -285,6 +285,94 @@ class TestWin32HotkeySuppression:
         with pytest.raises(_Suppressed):
             mgr._win32_event_filter(0x0100, _Event(0x20))
         assert mgr._masks == []
+
+
+class TestShiftLetterTapTypesTheLetter:
+    """README: default Shift+X — a short tap still types a capital X, with
+    no 「录音过短」 hint; only a hold records."""
+
+    VK_X = 0x58
+
+    def _manager(self, monkeypatch, hotkey="shift+x", shift_down=True):
+        from unittest.mock import MagicMock
+
+        mgr = HotKeyManager(hotkey)
+        mgr._listener = MagicMock()
+        mgr._listener.suppress_event.side_effect = _Suppressed
+        monkeypatch.setattr(mgr, "_modifiers_held", lambda _mods: True)
+        monkeypatch.setattr(mgr, "_async_key_down", lambda _vk: shift_down)
+        monkeypatch.setattr(mgr, "_send_menu_mask", lambda: None)
+        replayed = []
+        monkeypatch.setattr(mgr, "_replay_swallowed_tap", lambda vk: replayed.append(vk))
+        short = []
+        mgr.hotkey_tap_too_short.connect(lambda: short.append(1))
+        return mgr, replayed, short
+
+    def _tap(self, mgr, vk):
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0100, _Event(vk))
+        mgr._hold_started_at -= 0.1  # 100 ms: a keystroke, not a hold
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0101, _Event(vk))
+
+    def test_short_tap_is_replayed_and_stays_quiet(self, monkeypatch):
+        mgr, replayed, short = self._manager(monkeypatch)
+        self._tap(mgr, self.VK_X)
+        assert replayed == [self.VK_X]
+        assert short == []
+        assert mgr._hold_pending is False
+
+    def test_hold_that_activated_is_not_replayed(self, monkeypatch):
+        mgr, replayed, _short = self._manager(monkeypatch)
+        started = []
+        mgr.recording_start.connect(lambda: started.append(1))
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0100, _Event(self.VK_X))
+        mgr._on_hold_timeout()
+        assert started == [1]
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0101, _Event(self.VK_X))
+        assert replayed == []
+
+    def test_alt_hotkey_tap_keeps_the_hint_and_is_not_replayed(self, monkeypatch):
+        mgr, replayed, short = self._manager(monkeypatch, hotkey="alt+z")
+        self._tap(mgr, 0x5A)
+        assert replayed == []
+        assert short == [1]
+
+    def test_ctrl_shift_combo_is_a_command_not_typing(self, monkeypatch):
+        mgr, replayed, short = self._manager(monkeypatch, hotkey="ctrl+shift+x")
+        self._tap(mgr, self.VK_X)
+        assert replayed == []
+        assert short == [1]
+
+    def test_replay_presses_shift_only_when_the_user_let_go(self, monkeypatch):
+        sent: list[tuple[int, int]] = []
+        mgr = HotKeyManager("shift+x")
+        monkeypatch.setattr(mgr, "_keybd_event", lambda vk, flags: sent.append((vk, flags)))
+
+        monkeypatch.setattr(mgr, "_async_key_down", lambda _vk: True)
+        mgr._replay_swallowed_tap(self.VK_X)
+        assert sent == [(self.VK_X, 0), (self.VK_X, 0x0002)]
+
+        sent.clear()
+        monkeypatch.setattr(mgr, "_async_key_down", lambda _vk: False)
+        mgr._replay_swallowed_tap(self.VK_X)
+        assert sent == [(0x10, 0), (self.VK_X, 0), (self.VK_X, 0x0002), (0x10, 0x0002)]
+
+    def test_right_shift_satisfies_a_generic_shift_hotkey(self):
+        mgr = HotKeyManager("shift+x")
+        mgr._on_press(keyboard.Key.shift_r)
+        mgr._on_press(keyboard.KeyCode.from_char("x"))
+        assert mgr._hold_pending is True
+
+    def test_explicit_right_shift_hotkey_ignores_left_shift(self):
+        mgr = HotKeyManager("shift_r+x")
+        mgr._on_press(keyboard.Key.shift_l)
+        mgr._on_press(keyboard.KeyCode.from_char("x"))
+        assert mgr._hold_pending is False
+        mgr._on_press(keyboard.Key.shift_r)
+        assert mgr._hold_pending is True
 
 
 class TestHoldSurvivesUnrelatedKeys:

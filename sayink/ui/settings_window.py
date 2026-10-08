@@ -1154,7 +1154,7 @@ class SettingsWindow(QWidget):
         elif is_reserved_hotkey(hotkey):
             problem = (
                 f"{format_hotkey(hotkey)} 是系统或常用软件的快捷键，"
-                "占用后它在其他软件里会失效。请换一个组合，例如 Alt + Z。"
+                "占用后它在其他软件里会失效。请换一个组合，例如 Shift + X。"
             )
         if problem:
             QMessageBox.warning(self, "提示", problem)

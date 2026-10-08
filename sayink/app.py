@@ -1864,7 +1864,7 @@ class App(QObject):
             "· 混合：开会时远端 + 自己都要\n\n"
             "请先在设置 → 引擎 中下载至少一个语音模型"
             "（若安装包已附带模型，启动后会自动载入）。\n\n"
-            "默认快捷键为 Alt+Z；可在设置 → 通用 中更改。\n"
+            "默认快捷键为 Shift+X；可在设置 → 通用 中更改。\n"
             "Windows：双击托盘图标可打开主窗口。"
         )
         QMessageBox.information(None, "欢迎使用 SayInk", text)

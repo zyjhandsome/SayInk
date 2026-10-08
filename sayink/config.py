@@ -60,7 +60,7 @@ def is_reserved_hotkey(hotkey: str) -> bool:
 TRIGGER_MODE_HOTKEY = "hotkey"
 TRIGGER_MODE_CONTINUOUS = "continuous"
 
-DEFAULT_HOTKEY = "alt+z"
+DEFAULT_HOTKEY = "shift+x"
 
 DEFAULT_CONFIG = {
     "hotkey": DEFAULT_HOTKEY,

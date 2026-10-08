@@ -38,6 +38,7 @@ _WM_KEYUP = 0x0101
 _WM_SYSKEYDOWN = 0x0104
 _WM_SYSKEYUP = 0x0105
 _LLKHF_INJECTED = 0x10
+_KEYEVENTF_KEYUP = 0x0002
 # Unassigned VK used by AutoHotkey as a "menu mask": an event between Alt/Win
 # down and up stops Windows from opening the menu bar / Start on release.
 _VK_MENU_MASK = 0xE8
@@ -108,7 +109,7 @@ class HotKeyManager(QObject):
     # 从 pynput 线程投递到 Qt 主线程，再启动 QTimer
     _arm_hold_on_main = pyqtSignal()
 
-    def __init__(self, hotkey_str: str = "alt+z", parent=None):
+    def __init__(self, hotkey_str: str = "shift+x", parent=None):
         super().__init__(parent)
         self._hotkey_keys = parse_hotkey(hotkey_str)
         self._hotkey_str = hotkey_str
@@ -165,6 +166,46 @@ class HotKeyManager(QObject):
         user32.keybd_event(_VK_MENU_MASK, 0, 0, 0)
         user32.keybd_event(_VK_MENU_MASK, 0, 0x0002, 0)
 
+    @staticmethod
+    def _tap_is_typing(modifiers: tuple) -> bool:
+        """Shift+letter tapped briefly is the user typing a capital letter.
+
+        Alt / Win / Ctrl combos are commands, not text: a bare Alt+Z tap types
+        nothing (and replaying Alt would pop the menu bar), so those keep the
+        「按住时间过短」 hint instead.
+        """
+        return bool(modifiers) and all(mod == keyboard.Key.shift_l for mod in modifiers)
+
+    def _replay_swallowed_tap(self, vk: int) -> None:
+        """Type the key a too-short tap swallowed.
+
+        The default hotkey is Shift+X: the filter has to eat X while Shift is
+        held or a recording would type XXXX into the focused app, but then a
+        normal capital X typed by the user would vanish too. When the hold
+        never reached the threshold, re-send the keystroke as an injected
+        event (which the filter lets through).
+        """
+        try:
+            # Shift normally is still physically down when the letter goes up;
+            # if the user already let go, hold it for the replay so the case
+            # matches what they typed.
+            shift_vk = _MODIFIER_VKS[keyboard.Key.shift_l][0]
+            press_shift = not self._async_key_down(shift_vk)
+            if press_shift:
+                self._keybd_event(shift_vk, 0)
+            self._keybd_event(vk, 0)
+            self._keybd_event(vk, _KEYEVENTF_KEYUP)
+            if press_shift:
+                self._keybd_event(shift_vk, _KEYEVENTF_KEYUP)
+        except Exception:
+            log.exception("补发被吞掉的按键失败")
+
+    @staticmethod
+    def _keybd_event(vk: int, flags: int) -> None:
+        import ctypes
+
+        ctypes.windll.user32.keybd_event(vk, 0, flags, 0)
+
     def _win32_event_filter(self, msg, data):
         """Keep the hotkey's main key (and its auto-repeat) out of the focused app.
 
@@ -198,7 +239,11 @@ class HotKeyManager(QObject):
                     return True
                 with self._lock:
                     self._suppressed_vks.discard(vk)
-                self._on_release(main_key)
+                # A tap that gets typed into the app is plain typing, not a
+                # failed hold: no 「录音过短」 hint for it.
+                replayable = self._tap_is_typing(modifiers)
+                if self._on_release(main_key, quiet=replayable) and replayable:
+                    self._replay_swallowed_tap(vk)
             else:
                 return True
         except Exception:
@@ -329,16 +374,19 @@ class HotKeyManager(QObject):
         self.recording_start.emit()
 
     def _normalize_key(self, key):
+        # A hotkey written with the generic modifier ("shift+x") accepts either
+        # physical key; only an explicit right variant ("shift_r+x") keeps the
+        # left and right keys apart.
         if key in (keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr):
-            if keyboard.Key.alt_l in self._hotkey_keys or keyboard.Key.alt_r in self._hotkey_keys:
+            if keyboard.Key.alt_r in self._hotkey_keys:
                 return key
             return keyboard.Key.alt_l
         if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
-            if keyboard.Key.ctrl_l in self._hotkey_keys or keyboard.Key.ctrl_r in self._hotkey_keys:
-                return keyboard.Key.ctrl_l
+            if keyboard.Key.ctrl_r in self._hotkey_keys:
+                return key
             return keyboard.Key.ctrl_l
         if key in (keyboard.Key.shift_l, keyboard.Key.shift_r):
-            if keyboard.Key.shift_l in self._hotkey_keys or keyboard.Key.shift_r in self._hotkey_keys:
+            if keyboard.Key.shift_r in self._hotkey_keys:
                 return key
             return keyboard.Key.shift_l
         return key
@@ -380,17 +428,21 @@ class HotKeyManager(QObject):
         if newly_armed:
             self._arm_hold_on_main.emit()
 
-    def _on_release(self, key):
+    def _on_release(self, key, *, quiet: bool = False) -> bool:
+        """Returns True when this release ended a hold before it activated,
+        i.e. the combo was tapped rather than held. ``quiet`` skips the
+        ``hotkey_tap_too_short`` hint for such a tap."""
         if self._is_menu_mask(key):
-            return
+            return False
         normalized = self._normalize_key(key)
         emit_stop = False
         sync_hold_timer = False
         emit_short_tap = False
+        tapped = False
 
         with self._lock:
             if self._paused:
-                return
+                return False
             self._pressed_keys.discard(normalized)
             self._pressed_keys.discard(key)
             # Only letting go of part of the hotkey ends a pending hold.
@@ -400,8 +452,9 @@ class HotKeyManager(QObject):
                 self._hold_pending = False
                 sync_hold_timer = True
                 if not self._hold_activated:
+                    tapped = True
                     held_ms = (time.monotonic() - self._hold_started_at) * 1000
-                    if held_ms >= MIN_SHORT_TAP_MS:
+                    if held_ms >= MIN_SHORT_TAP_MS and not quiet:
                         emit_short_tap = True
                     else:
                         log.debug(
@@ -420,6 +473,7 @@ class HotKeyManager(QObject):
         if emit_stop:
             log.debug("快捷键松开，停止录音")
             self.recording_stop.emit()
+        return tapped
 
     def _start_hold_timer_on_main_thread(self):
         """QTimer 只能在 Qt 主线程 start/stop。"""

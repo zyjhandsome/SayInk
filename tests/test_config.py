@@ -38,7 +38,7 @@ class TestFormatHotkey:
 
 class TestConfigDefaults:
     def test_default_hotkey(self):
-        assert DEFAULT_CONFIG["hotkey"] == "alt+z"
+        assert DEFAULT_CONFIG["hotkey"] == "shift+x"
 
     def test_default_sound_enabled(self):
         assert DEFAULT_CONFIG["sound_enabled"] is True
@@ -87,7 +87,7 @@ class TestConfigInit:
         with open(config_home / "config.json", "w", encoding="utf-8") as f:
             json.dump({}, f)
         config = Config(config_dir=config_home)
-        assert config.get("hotkey") == "alt+z"
+        assert config.get("hotkey") == "shift+x"
         assert config.get("sound_enabled") is True
 
     def test_config_loads_existing(self, config_home):
@@ -187,6 +187,7 @@ def test_reserved_hotkeys_are_detected_regardless_of_order():
     assert is_reserved_hotkey("C+Ctrl")
     assert is_reserved_hotkey("cmd+l")
     assert not is_reserved_hotkey("alt+z")
+    assert not is_reserved_hotkey("shift+x")
     assert not is_reserved_hotkey("alt+space")
 
 
@@ -214,7 +215,7 @@ def test_non_object_config_is_treated_as_unreadable(config_home):
 
     (config_home / "config.json").write_text("[1, 2]", encoding="utf-8")
     cfg = Config(config_dir=config_home)
-    assert cfg.get("hotkey") == "alt+z"
+    assert cfg.get("hotkey") == "shift+x"
     assert list(config_home.glob("config.corrupt-*.json"))
 
 
