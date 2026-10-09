@@ -403,6 +403,20 @@ def _select_polished_session(window):
     window._on_selection_changed()
 
 
+def _clipboard_text() -> str:
+    """Read the clipboard after letting clipboard managers finish their read.
+
+    Qt hands the data to Windows as an OLE object served by *our* event loop;
+    Ditto/Listary/clipboard history fetch it cross-process right after the
+    write. Without pumping events that fetch blocks (holding the clipboard
+    open ~30 s) and the next test's write fails silently.
+    """
+    from PyQt6.QtTest import QTest
+
+    QTest.qWait(50)
+    return QApplication.clipboard().text()
+
+
 def test_ctrl_c_in_raw_view_copies_raw_text(qapp):
     from PyQt6.QtTest import QTest
 
@@ -418,7 +432,7 @@ def test_ctrl_c_in_raw_view_copies_raw_text(qapp):
 
         QTest.keyClick(window._session_list, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
 
-        assert QApplication.clipboard().text() == "raw first\n\nraw second"
+        assert _clipboard_text() == "raw first\n\nraw second"
         assert "原文" in window._feedback_label.text()
     finally:
         window.close()
@@ -430,7 +444,7 @@ def test_ctrl_c_in_polished_view_copies_polished_text(qapp):
         _select_polished_session(window)
         window._view_polished_btn.setChecked(True)
         window._copy_selected_effective()
-        assert QApplication.clipboard().text() == "polished first\n\nraw second"
+        assert _clipboard_text() == "polished first\n\nraw second"
     finally:
         window.close()
 
@@ -473,7 +487,7 @@ def test_multi_select_copy_joins_effective_text(qapp):
     assert window._delete_btn.isEnabled()
 
     window._copy_selected_effective()
-    copied = QApplication.clipboard().text()
+    copied = _clipboard_text()
     assert copied == "older raw\n\npolished first\n\nraw second"
     assert "已复制 2 项" in window._feedback_label.text()
     # Action bar is fixed: buttons disable rather than disappear.

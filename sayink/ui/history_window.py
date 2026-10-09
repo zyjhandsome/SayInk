@@ -12,7 +12,6 @@ from PyQt6.QtCore import QEvent, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFontMetrics, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QButtonGroup,
     QDialog,
     QFileDialog,
@@ -33,6 +32,9 @@ from PyQt6.QtWidgets import (
 
 from sayink.history_store import SegmentRecord, SessionSummary
 from sayink.ui import settings_styles as _settings_styles
+from sayink.ui.clipboard import copy_text
+
+COPY_FAILED_TEXT = "复制失败，请再试一次"
 
 
 class _ElidedLabel(QLabel):
@@ -1323,8 +1325,10 @@ class HistoryWindow(QWidget):
         text = self._joined_effective_text(sessions)
         if not text:
             return
-        QApplication.clipboard().setText(text)
-        self._show_feedback(f"已复制 {len(sessions)} 项")
+        self._copy_with_feedback(text, f"已复制 {len(sessions)} 项")
+
+    def _copy_with_feedback(self, text: str, done_text: str) -> None:
+        self._show_feedback(done_text if copy_text(text) else COPY_FAILED_TEXT)
 
     def _copy_selected_raw(self) -> None:
         sessions = self._selected_sessions()
@@ -1342,16 +1346,14 @@ class HistoryWindow(QWidget):
             for segment in ordered
             if segment.raw_text.strip()
         )
-        QApplication.clipboard().setText(text)
-        self._show_feedback("已复制原文" if _session_has_polished(segments) else "已复制")
+        self._copy_with_feedback(text, "已复制原文" if _session_has_polished(segments) else "已复制")
 
     def _copy_selected_polished(self) -> None:
         session_id = self._active_session_id()
         if not session_id:
             return
         segments = self._store.get_session_segments(session_id)
-        QApplication.clipboard().setText(_session_body(segments))
-        self._show_feedback("已复制润色文本")
+        self._copy_with_feedback(_session_body(segments), "已复制润色文本")
 
     def _copy_selected_effective(self) -> None:
         sessions = self._selected_sessions()
