@@ -17,8 +17,9 @@ class TestAudioConfigDefaults:
     def test_default_input_source_is_microphone(self):
         assert DEFAULT_CONFIG["audio"]["input_source"] == "microphone"
 
-    def test_default_trigger_mode_is_continuous(self):
-        assert DEFAULT_CONFIG["audio"]["trigger_mode"] == TRIGGER_MODE_CONTINUOUS
+    def test_default_trigger_mode_is_hold_to_talk(self):
+        # P-01: dictation first; continuous transcription is the opt-in mode.
+        assert DEFAULT_CONFIG["audio"]["trigger_mode"] == TRIGGER_MODE_HOTKEY
 
     def test_default_device_indices_auto(self):
         assert DEFAULT_CONFIG["audio"]["mic_device_index"] == -1
