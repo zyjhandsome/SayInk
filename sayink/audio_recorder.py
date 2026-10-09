@@ -129,7 +129,7 @@ class AudioRecorder(QObject):
             try:
                 self._pawp.terminate()
             except Exception:
-                pass
+                log.debug("释放 PyAudioWPatch 失败", exc_info=True)
             self._pawp = None
 
     def _pawp_read_loop(self, lane: _CaptureLane, stream, channels: int, rate: int):
@@ -238,6 +238,7 @@ class AudioRecorder(QObject):
                 try:
                     extra = sd.WasapiSettings(loopback=True)
                 except TypeError:
+                    log.debug("此 sounddevice 不支持 WASAPI loopback 参数，改用普通输入流")
                     continue
             for rate in sample_rates:
                 try:
@@ -275,7 +276,7 @@ class AudioRecorder(QObject):
                         try:
                             lane.stream.close()
                         except Exception:
-                            pass
+                            log.debug("关闭半开的音频流失败", exc_info=True)
                         lane.stream = None
 
         raise RuntimeError(f"无法打开音频设备：{ep.device.name}") from last_err
@@ -607,14 +608,14 @@ class AudioRecorder(QObject):
                 lane.pawp_stream.stop_stream()
                 lane.pawp_stream.close()
             except Exception:
-                pass
+                log.debug("关闭 PyAudioWPatch 流 [%s] 失败", lane.endpoint.role, exc_info=True)
             lane.pawp_stream = None
         if lane.stream is not None:
             try:
                 lane.stream.stop()
                 lane.stream.close()
             except Exception:
-                pass
+                log.debug("关闭音频流 [%s] 失败", lane.endpoint.role, exc_info=True)
             lane.stream = None
 
     def stop(self):

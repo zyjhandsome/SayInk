@@ -36,6 +36,7 @@ def _get_foreground_window_win32():
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         return hwnd, title, pid
     except Exception:
+        log.debug("读取前台窗口失败", exc_info=True)
         return 0, "", 0
 
 
@@ -49,6 +50,7 @@ def _get_foreground_window_macos():
         ).strip()
         return 1, out
     except Exception:
+        log.debug("osascript 读取前台应用失败", exc_info=True)
         return 0, ""
 
 
@@ -63,6 +65,7 @@ def _get_foreground_window_linux():
         ).strip()
         return int(wid), title
     except Exception:
+        log.debug("xdotool 读取活动窗口失败", exc_info=True)
         return 0, ""
 
 
@@ -102,9 +105,10 @@ def _process_name_from_window_info(info: tuple) -> str:
             try:
                 win32api.CloseHandle(handle)
             except Exception:
-                pass
+                log.debug("关闭进程句柄失败", exc_info=True)
         return os.path.basename(path) if path else ""
     except Exception:
+        log.debug("完整进程查询失败，改用受限查询", exc_info=True)
         return _process_name_limited(info)
 
 
@@ -134,6 +138,7 @@ def _process_name_limited(info: tuple) -> str:
         finally:
             kernel32.CloseHandle(handle)
     except Exception:
+        log.debug("受限进程名查询失败", exc_info=True)
         return ""
 
 
@@ -184,6 +189,7 @@ def target_rejects_synthetic_input(info: tuple) -> bool:
         own = _integrity_rid(os.getpid())
         target = _integrity_rid(int(info[2]))
     except Exception:
+        log.debug("读取完整性级别失败，按可粘贴处理", exc_info=True)
         return False
     if own is None or own < 0 or target is None:
         return False
@@ -343,7 +349,7 @@ class TextPaster:
                 try:
                     old_clipboard = pyperclip.paste()
                 except Exception:
-                    pass
+                    log.debug("读取原剪贴板失败，粘贴后不恢复", exc_info=True)
                 self._saved_clipboard = old_clipboard
             self._restore_pending = True
 
@@ -379,13 +385,13 @@ class TextPaster:
                 if pyperclip.paste() == text:
                     pyperclip.copy(old_clipboard)
             except Exception:
-                pass
+                log.debug("恢复原剪贴板失败", exc_info=True)
 
         def _keep_for_manual_paste(detail: str = ""):
             try:
                 pyperclip.copy(text)
             except Exception:
-                pass
+                log.debug("重新写入剪贴板失败", exc_info=True)
             callback(PasteResult("clipboard", target_app=target_app, detail=detail))
 
         def _do_paste():
@@ -418,7 +424,7 @@ class TextPaster:
                 try:
                     pyperclip.copy(text)
                 except Exception:
-                    pass
+                    log.debug("重新写入剪贴板失败", exc_info=True)
                 callback(PasteResult("unverified", target_app=target_app, detail="focus_changed_after_send"))
 
         QTimer.singleShot(PASTE_DELAY_MS, _do_paste)

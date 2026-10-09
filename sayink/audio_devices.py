@@ -80,6 +80,7 @@ def _hostapi_name(hostapi_index: int) -> str:
         apis = sd.query_hostapis()
         return apis[hostapi_index]["name"]
     except Exception:
+        log.debug("查询 hostapi %s 失败", hostapi_index, exc_info=True)
         return ""
 
 
@@ -95,6 +96,8 @@ def _supports_wasapi_loopback_flag() -> bool:
         sd.WasapiSettings(loopback=True)
         return True
     except TypeError:
+        # Feature probe called from several places; the recorder logs once
+        # when it actually falls back.
         return False
 
 
@@ -192,7 +195,7 @@ def pick_default_microphone() -> Optional[AudioDeviceInfo]:
                 if d.index == int(default_in):
                     return d
     except Exception:
-        pass
+        log.debug("读取默认输入设备失败，改用第一个麦克风", exc_info=True)
     return mics[0]
 
 
@@ -202,7 +205,7 @@ def _default_output_device_index() -> Optional[int]:
         if idx is not None and int(idx) >= 0:
             return int(idx)
     except Exception:
-        pass
+        log.debug("读取默认输出设备失败", exc_info=True)
     return None
 
 
@@ -212,6 +215,7 @@ def _same_playback_device_name(index_a: int, index_b: int) -> bool:
         name_b = str(sd.query_devices(int(index_b)).get("name", ""))
         return bool(name_a) and name_a == name_b
     except Exception:
+        log.debug("比较播放设备 %s/%s 名称失败", index_a, index_b, exc_info=True)
         return False
 
 
@@ -220,6 +224,7 @@ def _wasapi_output_twin_for_default(default_out: int) -> Optional[AudioDeviceInf
     try:
         default_name = str(sd.query_devices(int(default_out)).get("name", ""))
     except Exception:
+        log.debug("查询默认输出设备 %s 失败", default_out, exc_info=True)
         return None
     if not default_name:
         return None
