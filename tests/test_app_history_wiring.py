@@ -6,6 +6,7 @@ import numpy as np
 
 from tests.helpers.app_harness import app_harness
 from sayink.audio_utils import TARGET_SAMPLE_RATE
+from sayink.runtime_status import ModelLoadPhase
 
 
 def _audio(seconds: float = 0.2) -> np.ndarray:
@@ -673,11 +674,11 @@ def test_model_load_hint_uses_last_measured_duration() -> None:
         h["recognizer"].current_model_id = "sensevoice"
         h["recorder"].is_continuous = False
 
-        app._on_model_load_progress("正在加载 SenseVoice…")
+        app._on_model_load_progress(ModelLoadPhase.LOADING, "正在加载 SenseVoice…")
         assert "约 10–40 秒" in h["floating"].show_model_loading.call_args[0][0]
         app._load_started_at -= 12.0
-        app._on_model_load_progress("模型已就绪")
+        app._on_model_load_progress(ModelLoadPhase.READY, "模型已就绪")
         assert round(h["store"]["stt_load_seconds"]["sensevoice"]) == 12
 
-        app._on_model_load_progress("正在加载 SenseVoice…")
+        app._on_model_load_progress(ModelLoadPhase.LOADING, "正在加载 SenseVoice…")
         assert "上次用时约 12 秒" in h["floating"].show_model_loading.call_args[0][0]

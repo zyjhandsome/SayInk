@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
+from sayink.runtime_status import ModelLoadPhase
+
 log = logging.getLogger("SayInk")
 
 SAMPLE_RATE = 16000
@@ -957,7 +959,8 @@ class SpeechRecognizer(QObject):
     partial_result = pyqtSignal(str)
     error = pyqtSignal(str)
     ready = pyqtSignal()
-    model_load_progress = pyqtSignal(str)
+    # (ModelLoadPhase, human-readable message)
+    model_load_progress = pyqtSignal(object, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1015,7 +1018,7 @@ class SpeechRecognizer(QObject):
         name = info["name"] if info else self._model_id
         self._is_ready = False
         self._reload_after_current = False
-        self.model_load_progress.emit(f"正在加载 {name}…")
+        self.model_load_progress.emit(ModelLoadPhase.LOADING, f"正在加载 {name}…")
         worker = ModelLoadWorker(self._model_id, self._num_threads)
         target = (self._model_id, self._num_threads)
         worker.loaded.connect(lambda rec, t=target: self._on_model_loaded(rec, t))
@@ -1034,7 +1037,7 @@ class SpeechRecognizer(QObject):
         self._recognizer = recognizer
         self._loaded_target = (self._model_id, self._num_threads)
         self._is_ready = True
-        self.model_load_progress.emit("模型已就绪")
+        self.model_load_progress.emit(ModelLoadPhase.READY, "模型已就绪")
         self.ready.emit()
 
     def _on_model_load_error(self, msg: str, target: tuple[str, int] | None = None):
@@ -1042,8 +1045,8 @@ class SpeechRecognizer(QObject):
             log.info("忽略已过时的模型加载错误: %s", msg)
             return
         self._is_ready = False
-        self.model_load_progress.emit(msg)
-        self.error.emit(msg)
+        # The App handles a failed load from this one signal; no separate error.
+        self.model_load_progress.emit(ModelLoadPhase.FAILED, msg)
 
     def _on_load_worker_finished(self) -> None:
         worker = self._load_worker

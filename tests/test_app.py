@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import QApplication
 from unittest.mock import MagicMock
 
 from sayink.app import App, MIN_AUDIO_SAMPLES, _QueuedSegment
-from sayink.runtime_status import RuntimeState
+from sayink.runtime_status import ModelLoadPhase, RuntimeState
 from sayink.text_paster import PasteResult
 from tests.helpers.app_harness import app_harness
 
@@ -52,7 +52,7 @@ class TestIslandUserCopy:
     def test_model_load_progress_copy_is_single_line(self):
         with app_harness() as h:
             h["recorder"].is_continuous = False
-            h["app"]._on_model_load_progress("正在加载 Fun-ASR-Nano…")
+            h["app"]._on_model_load_progress(ModelLoadPhase.LOADING, "正在加载 Fun-ASR-Nano…")
             detail = h["floating"].show_model_loading.call_args[0][0]
             assert "\n" not in detail
             assert "正在加载 Fun-ASR-Nano…" in detail
@@ -87,7 +87,7 @@ class TestIslandUserCopy:
                 {"set_runtime_status": lambda self, state, label: setattr(self, "value", (state, label))},
             )()
             h["app"]._main = type("MainSpy", (), {"settings_panel": settings})()
-            h["app"]._on_model_load_progress("模型加载失败: boom")
+            h["app"]._on_model_load_progress(ModelLoadPhase.FAILED, "模型加载失败: boom")
             assert settings.value == (RuntimeState.UNAVAILABLE, "模型载入失败")
             h["tray"].set_status_summary.assert_any_call("模型载入失败")
 
@@ -407,17 +407,19 @@ class TestSegmentReadyQueueing:
             h["floating"].clear_model_loading_lock.assert_not_called()
             h["floating"].show_error.assert_not_called()
 
-    def test_load_failure_error_does_not_drop_queue(self):
+    def test_load_failure_does_not_drop_queue_and_reports_once(self):
         with app_harness() as h:
             app = h["app"]
             h["recognizer"].is_ready = False
             h["recognizer"].is_loading = False
             audio = np.ones(1600, dtype=np.float32)
             app._segment_queue = _queued(audio)
-            app._on_recognizer_error("模型加载失败: boom")
+            app._is_transcribing = True
+            app._on_model_load_progress(ModelLoadPhase.FAILED, "模型加载失败: boom")
+            assert app._is_transcribing is False
             assert app._queued_audio() == [audio]
             h["recognizer"].transcribe_final.assert_not_called()
-            h["floating"].show_error.assert_not_called()
+            h["floating"].show_error.assert_called_once()
 
 
 class TestFinalResultFlow:

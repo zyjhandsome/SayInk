@@ -50,7 +50,13 @@ from sayink.sound_manager import SoundManager
 from sayink.ui.floating_window import FloatingWindow
 from sayink.ui.tray_icon import TrayIcon
 from sayink.ui.main_window import MainWindow
-from sayink.runtime_status import RuntimeStatus, RuntimeState, runtime_status_from_flags
+from sayink.runtime_status import (
+    ModelLoadPhase,
+    OutputStage,
+    RuntimeStatus,
+    RuntimeState,
+    runtime_status_from_flags,
+)
 from sayink.update_controller import UpdateController
 from sayink.onboarding import OnboardingController
 
@@ -305,7 +311,7 @@ class App(QObject):
         self._output_raw_text = ""
         # "polish" while the polisher owns the sentence, "paste" once it was
         # handed to the paster; the watchdog decides from this what to salvage.
-        self._output_stage = ""
+        self._output_stage = OutputStage.IDLE
         self._output_stage_text = ""
         self._segment_queue: list[_QueuedSegment] = []
         self._speakers = SpeakerSession()
@@ -595,19 +601,23 @@ class App(QObject):
         durations[model_id] = round(time.monotonic() - started, 1)
         self._config.set(LOAD_SECONDS_KEY, durations)
 
-    def _on_model_load_progress(self, msg: str):
-        if "就绪" in msg:
+    def _on_model_load_progress(self, phase: ModelLoadPhase, msg: str):
+        if phase is ModelLoadPhase.READY:
             self._remember_load_duration()
             self._floating.clear_model_loading_lock()
             self._sync_settings_runtime_status()
             return
-        if "失败" in msg:
+        if phase is ModelLoadPhase.FAILED:
+            self._is_transcribing = False
             self._floating.clear_model_loading_lock()
             self._tray.set_activity_tooltip(None)
             self._floating.show_error(self._friendly_error(msg))
             self._sync_settings_runtime_status(
                 RuntimeStatus(RuntimeState.UNAVAILABLE, "模型载入失败")
             )
+            # Queued audio stays queued; it is picked up once a model loads.
+            if not self._recognizer.is_loading:
+                self._pump_segment_queue()
             return
         if self._recorder.is_continuous:
             log.info("模型重新加载，暂停持续监听")
@@ -1156,17 +1166,17 @@ class App(QObject):
         if not self._output_busy or token != self._output_token:
             return
         raw = self._output_raw_text
-        if self._output_stage == "polish" and raw.strip():
+        if self._output_stage is OutputStage.POLISH and raw.strip():
             # The polisher never answered. Its result would have been this
             # sentence anyway, so output the raw words instead of losing them.
             log.error("润色超时未回调，改为输出原文")
             self._polisher.cancel()
-            self._output_stage = "paste"
+            self._output_stage = OutputStage.PASTE
             self._output_text(raw, degraded_from_polish=True)
             return
         log.error("输出流程超时未回调，释放队列以免后续语音卡住")
         self._output_busy = False
-        self._output_stage = ""
+        self._output_stage = OutputStage.IDLE
         if self._output_stage_text.strip():
             # Ctrl+V may or may not have gone out; leave the words on the
             # clipboard rather than risk pasting them twice.
@@ -1181,7 +1191,7 @@ class App(QObject):
     def _deliver_recognized_text(self, text: str) -> None:
         self._mark_output_busy()
         self._output_raw_text = text
-        self._output_stage = "polish"
+        self._output_stage = OutputStage.POLISH
         self._output_stage_text = ""
         llm_enabled = self._config.get("llm.enabled", False)
         api_url = self._config.get("llm.api_url", "")
@@ -1217,10 +1227,6 @@ class App(QObject):
     def _on_recognizer_error(self, error_msg: str):
         self._is_transcribing = False
         if self._recognizer.is_loading:
-            return
-        if "加载失败" in error_msg:
-            # Load progress already showed this failure. Pump must not drop audio.
-            self._pump_segment_queue()
             return
         if not self._is_continuous_mode():
             if self._emit_hold_output_if_ready():
@@ -1282,7 +1288,7 @@ class App(QObject):
     # ── Polishing ─────────────────────────────────────
 
     def _on_polish_complete(self, polished_text: str):
-        if self._output_stage != "polish":
+        if self._output_stage is not OutputStage.POLISH:
             log.warning("润色结果晚于超时到达，已输出原文，忽略")
             return
         raw = self._output_raw_text
@@ -1297,7 +1303,7 @@ class App(QObject):
         self._output_text(polished_text)
 
     def _on_polish_error(self, error_msg: str):
-        if self._output_stage != "polish":
+        if self._output_stage is not OutputStage.POLISH:
             return
         log.warning("后处理失败，降级输出原文: %s", error_msg)
         self._output_text(
@@ -1338,7 +1344,7 @@ class App(QObject):
                 record=record,
             )
             return
-        self._output_stage = "paste"
+        self._output_stage = OutputStage.PASTE
         self._output_stage_text = text
         self._paster.paste_async(text, lambda result, record=record: self._handle_paste_result(
             result,
@@ -1399,7 +1405,7 @@ class App(QObject):
         record: SegmentRecord | None = None,
     ):
         self._output_busy = False
-        self._output_stage = ""
+        self._output_stage = OutputStage.IDLE
         self._output_stage_text = ""
         if isinstance(result, PasteResult):
             status = result.status

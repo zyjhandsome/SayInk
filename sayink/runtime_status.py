@@ -12,6 +12,22 @@ class RuntimeState(str, Enum):
     UNAVAILABLE = "unavailable"
 
 
+class ModelLoadPhase(str, Enum):
+    """What SpeechRecognizer.model_load_progress is reporting."""
+
+    LOADING = "loading"
+    READY = "ready"
+    FAILED = "failed"
+
+
+class OutputStage(str, Enum):
+    """Who currently owns the sentence being output (App watchdog bookkeeping)."""
+
+    IDLE = "idle"
+    POLISH = "polish"
+    PASTE = "paste"
+
+
 @dataclass(frozen=True)
 class RuntimeStatus:
     state: RuntimeState
