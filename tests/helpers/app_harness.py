@@ -82,8 +82,8 @@ def app_harness(config_overrides: dict | None = None):
         # start() schedules these with QTimer; if they fired during a later
         # test's processEvents, a modal dialog or a real network check would
         # block the suite.
-        app._show_first_run_welcome = lambda: None
-        app._ask_history_onboarding_enabled = lambda: False
+        app._onboarding.show_welcome = lambda: None
+        app._onboarding.ask_history_enabled = lambda: False
         app._updates.maybe_auto_check = lambda: None
         harness = {
             "app": app,

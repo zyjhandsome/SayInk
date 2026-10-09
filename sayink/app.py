@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import numpy as np
 import pyperclip
-from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMessageBox
 
 from sayink.config import (
@@ -52,6 +52,7 @@ from sayink.ui.tray_icon import TrayIcon
 from sayink.ui.main_window import MainWindow
 from sayink.runtime_status import RuntimeStatus, RuntimeState, runtime_status_from_flags
 from sayink.update_controller import UpdateController
+from sayink.onboarding import OnboardingController
 
 log = logging.getLogger("SayInk")
 
@@ -312,7 +313,6 @@ class App(QObject):
         self._current_session_id: str | None = None
         self._current_seq = 0
         self._pending_record: _PendingHistoryRecord | None = None
-        self._welcome_scheduled = False
         self._load_started_at: float | None = None
         self._loading_model_id = ""
         self._short_tap_tray_last_at = 0.0
@@ -334,6 +334,13 @@ class App(QObject):
             confirm_exit=lambda: self._confirm_exit(install_update=True),
             finish_quit=self._finish_quit,
             exit_started=lambda: self._exit_started,
+        )
+        self._onboarding = OnboardingController(
+            self._config,
+            parent=self,
+            dialog_parent=lambda: self._main,
+            is_continuous_mode=self._is_continuous_mode,
+            show_main_window=self._show_main_window,
         )
         self._connect_signals()
         self._sync_hotkey_trigger_mode()
@@ -1857,122 +1864,9 @@ class App(QObject):
         self._show_history_startup_notice()
         self._enqueue_history_cleanup()
         QTimer.singleShot(5000, self._updates.maybe_auto_check)
-        if not self._config.get("first_run_welcome_seen", True):
-            # 等模型加载完成后再弹欢迎框，避免挡住「模型加载中」状态
-            self._recognizer.ready.connect(self._show_first_run_welcome_once)
-            QTimer.singleShot(15000, self._show_first_run_welcome_once)
-        elif not self._config.get("history.onboarded", False):
-            # 无欢迎框时，历史询问仍等模型就绪后再弹。
-            self._recognizer.ready.connect(self._show_history_onboarding_once)
+        self._onboarding.schedule(self._recognizer.ready)
 
     def _settings_widget(self):
         if self._main is not None:
             return getattr(self._main, "_settings", None)
         return None
-
-    def _show_first_run_welcome_once(self):
-        # Both model-ready and the 15 s fallback land here; the seen flag is
-        # only written after the modal closes, so guard the scheduling itself.
-        if self._config.get("first_run_welcome_seen", True) or self._welcome_scheduled:
-            return
-        self._welcome_scheduled = True
-        try:
-            self._recognizer.ready.disconnect(self._show_first_run_welcome_once)
-        except TypeError:
-            pass
-        QTimer.singleShot(400, self._show_first_run_welcome)
-
-    def _has_any_downloaded_model(self) -> bool:
-        from sayink.speech_recognizer import get_downloaded_models
-
-        try:
-            return bool(get_downloaded_models())
-        except Exception:
-            log.debug("无法枚举已下载模型", exc_info=True)
-            return False
-
-    def _show_first_run_welcome(self):
-        model_missing = not self._has_any_downloaded_model()
-        if self._is_continuous_mode():
-            hotkey = self._continuous_hotkey_label()
-            mode_tip = (
-                f"当前为「自动持续转写」：按住 {hotkey} 开始监听，"
-                "按 Esc 或听写条「结束」停止。"
-            )
-        else:
-            hk = format_hotkey(self._config.get("hotkey", DEFAULT_HOTKEY))
-            mode_tip = (
-                f"当前为「按住说话」（默认）：按住 {hk} 说话，松开后识别并粘贴。"
-                "开会、长口述可在设置 → 通用 中切换到「持续转写」。"
-            )
-        text = (
-            "SayInk 在本地完成语音识别（可选通过网络调用大模型润色）。\n\n"
-            f"{mode_tip}\n\n"
-            "SayInk 主要用来口述输入：识别结果直接粘贴到光标处。\n"
-            "音频来源在设置 → 通用 中选择：\n"
-            "· 仅麦克风：你的说话（默认）\n"
-            "· 仅电脑播放 / 混合：听会议或视频里的声音；选这两项后结果只记录到历史、"
-            "不粘贴到当前窗口，可在「偏好」里改回\n\n"
-            + (
-                "本机还没有语音模型：请先在设置 → 引擎 中下载 Fun-ASR-Nano（约 600 MB，仅需一次），"
-                "下载前无法听写。\n\n"
-                if model_missing
-                else "语音模型已就绪，启动后会自动载入。\n\n"
-            )
-            + "默认快捷键为 Alt+X；可在设置 → 通用 中更改。\n"
-            "Windows：双击托盘图标可打开主窗口。"
-        )
-        box = self._dialog("欢迎使用 SayInk", text, QMessageBox.Icon.Information)
-        download_btn = None
-        if model_missing:
-            download_btn = box.addButton("去下载模型", QMessageBox.ButtonRole.ActionRole)
-        box.addButton("知道了", QMessageBox.ButtonRole.AcceptRole)
-        box.exec()
-        self._config.set("first_run_welcome_seen", True)
-        if download_btn is not None and box.clickedButton() is download_btn:
-            self._show_main_window("engine")
-        # Sequence: history onboarding only after welcome is dismissed.
-        if not self._config.get("history.onboarded", False):
-            QTimer.singleShot(200, self._show_history_onboarding)
-
-    def _dialog(self, title: str, text: str, icon) -> QMessageBox:
-        """Message box owned by the main window; a tray-only app has no other
-        anchor, so without one the box stays on top instead of opening behind
-        whatever the user is working in."""
-        parent = getattr(self, "_main", None)
-        box = QMessageBox(parent)
-        box.setWindowTitle(title)
-        box.setText(text)
-        box.setIcon(icon)
-        if parent is None:
-            box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        return box
-
-    def _show_history_onboarding_once(self):
-        if self._config.get("history.onboarded", False):
-            return
-        try:
-            self._recognizer.ready.disconnect(self._show_history_onboarding_once)
-        except TypeError:
-            pass
-        QTimer.singleShot(500, self._show_history_onboarding)
-
-    def _show_history_onboarding(self):
-        if self._config.get("history.onboarded", False):
-            return
-        enabled = self._ask_history_onboarding_enabled()
-        self._config.set("history.enabled", enabled)
-        self._config.set("history.onboarded", True)
-
-    def _ask_history_onboarding_enabled(self) -> bool:
-        text = (
-            "SayInk 可以在本机保存语音转写历史，方便稍后搜索、复制或导出。\n\n"
-            "历史只保存在本地；关闭后只会停止未来写入，不会删除已有数据。\n"
-            "随时可以在设置关闭或调整保留策略。"
-        )
-        box = self._dialog("开启语音历史？", text, QMessageBox.Icon.Question)
-        enable_btn = box.addButton("开启", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("暂不开启", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(enable_btn)
-        box.exec()
-        return box.clickedButton() == enable_btn
