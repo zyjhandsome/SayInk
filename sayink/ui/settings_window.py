@@ -507,12 +507,12 @@ class SettingsWindow(QWidget):
         from sayink.speech_recognizer import get_model_info, delete_model
         info = get_model_info(model_id)
         name = info["name"] if info else model_id
-        reply = QMessageBox.question(
-            self, "删除模型",
-            f'确定删除 "{name}" 吗？删除后需重新下载。',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        if not self._confirm(
+            "删除模型",
+            f"确定删除「{name}」吗？删除后需重新下载。",
+            accept="删除",
+            destructive=True,
+        ):
             return
         active_id = self._config.get("stt.model_id", "")
         if not delete_model(model_id):
@@ -1040,14 +1040,28 @@ class SettingsWindow(QWidget):
         pending = int(self._pending_segment_count())
         if pending <= 0:
             return True
-        reply = QMessageBox.question(
-            self,
+        return self._confirm(
             "待识别语音",
             f"仍有 {pending} 段语音等待识别，应用此更改将丢弃这些片段。\n是否继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+            accept="丢弃并应用",
+            destructive=True,
         )
-        return reply == QMessageBox.StandardButton.Yes
+
+    def _confirm(self, title: str, text: str, *, accept: str, cancel: str = "取消",
+                 destructive: bool = False) -> bool:
+        """Yes/No question with Chinese buttons (Qt's standard buttons stay
+        English because the app ships no QTranslator). Cancel is the default."""
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setIcon(QMessageBox.Icon.Question)
+        role = QMessageBox.ButtonRole.DestructiveRole if destructive else QMessageBox.ButtonRole.AcceptRole
+        accept_btn = box.addButton(accept, role)
+        cancel_btn = box.addButton(cancel, QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec()
+        return box.clickedButton() is accept_btn
 
     def _revert_input_source_radios(self):
         self._loading = True

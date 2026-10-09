@@ -327,7 +327,9 @@ def activate(effective: str) -> None:
     g["STATE_RECOGNIZE"] = vals["FLOAT_TEXT"]
     g["STATE_POLISH"] = vals["FLOAT_TEXT"]
     g["STATE_SUCCESS"] = vals["FLOAT_TEXT"]
-    g["STATE_WARN"] = vals["FLOAT_TEXT_SEC"]
+    # Warnings get the semantic amber so they read as warnings; stopped /
+    # cancelled stay quiet grey on purpose.
+    g["STATE_WARN"] = vals["AMBER"]
     g["STATE_MUTED"] = vals["FLOAT_TEXT_SEC"]
     g["STATE_ERROR"] = vals["STATE_RECORD"]
 

@@ -15,12 +15,9 @@ from sayink.ui import design_tokens as tok
 # change with the light/dark axis, so they are always read live as ``tok.X``;
 # a widget built after a theme switch would otherwise inherit stale colors.
 from sayink.ui.design_tokens import (
-    FONT_DISPLAY,
-    NAV_SELECTED_BAR_PX,
     PAGE_MARGIN_H,
     PAGE_MARGIN_V,
     RADIUS_MD,
-    RADIUS_SM,
     SPACE_LG,
     SPACE_MD,
     SPACE_SM,
@@ -352,9 +349,9 @@ def polish_preview_content() -> QWidget:
 
     head = QLabel("效果示例（非实时结果）")
     head.setProperty("viRole", "polishPreviewHeading")
-    head.setStyleSheet(
-        f"color: {tok.TEXT}; font-size: {tok.TYPE_TITLE}px; font-weight: 700; background: transparent;"
-    )
+    # Same rank as the other section labels on the page; it used to be set
+    # at TYPE_TITLE and outranked the headings above it.
+    head.setStyleSheet(SECTION_LABEL)
     lay.addWidget(head)
 
     def _sample(label: str, body: str) -> None:

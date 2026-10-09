@@ -15,6 +15,7 @@ BAR_EXCERPT_HEIGHT = 68
 BAR_WIDTH = 360
 BAR_EXCERPT_WIDTH = 420
 COMPACT_HEIGHT = BAR_HEIGHT
+MODEL_LOADING_TITLE = "模型载入中 · 请勿录音"
 
 
 def _ui_font(family, pixels, weight=QFont.Weight.Normal):
@@ -437,9 +438,11 @@ class FloatingWindow(QWidget):
         self._live_text = cleaned
         if self._listening_active:
             self._set_state("正在听", "STATE_LISTEN", pulse=False)
-        elif self._capture_active:
+        elif self._capture_active and not self._capture_released:
             self._set_state("录音中", "STATE_RECORD", pulse=False)
         else:
+            # Key already up (or no capture at all): the result arriving must
+            # not flip the bar back to a red 「录音中」 before paste finishes.
             self._set_state("正在识别", "STATE_RECOGNIZE", pulse=False)
         self._restore_live_line()
         self._present()
@@ -721,7 +724,9 @@ class FloatingWindow(QWidget):
         self._listening_active = False
         self._restore_compact_height()
         self._model_loading_active = True
-        self._set_state("模型载入中", "STATE_RECOGNIZE", pulse=False)
+        # The one thing the user must know lives in the title, where nothing
+        # elides it; the detail line only carries progress / ETA.
+        self._set_state(MODEL_LOADING_TITLE, "STATE_RECOGNIZE", pulse=False)
         self._waveform.hide()
         self._apply_excerpt(
             detail or "模型文件已下载，正在载入内存，请稍候…"

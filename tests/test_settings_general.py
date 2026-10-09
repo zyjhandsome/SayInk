@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import json
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton, QWidget
+from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox, QWidget
 
 from sayink.audio_devices import (
     INPUT_SOURCE_MICROPHONE,
-    INPUT_SOURCE_MIXED,
     INPUT_SOURCE_SYSTEM,
 )
 from sayink.config import TRIGGER_MODE_CONTINUOUS, TRIGGER_MODE_HOTKEY, Config
@@ -415,6 +414,71 @@ class TestToggles:
         settings_window._restore_clipboard_row.setChecked(True)
         assert config.get("output.restore_clipboard") is True
         assert signals == [True]
+
+
+class TestConfirmDialogs:
+    """U-02: confirmations show Chinese buttons, not Qt's English Yes/No."""
+
+    def _fake_box(self, monkeypatch, events, *, click: str):
+        from sayink.ui import settings_window as module
+
+        class FakeBox:
+            def __init__(self, parent=None):
+                events["parent"] = parent
+                self._buttons: list[tuple[str, object]] = []
+
+            def setWindowTitle(self, title):
+                events["title"] = title
+
+            def setText(self, text):
+                events["text"] = text
+
+            def setIcon(self, icon):
+                pass
+
+            def addButton(self, text, role):
+                button = object()
+                self._buttons.append((text, button))
+                events.setdefault("buttons", []).append((text, role))
+                return button
+
+            def setDefaultButton(self, button):
+                events["default"] = [t for t, b in self._buttons if b is button][0]
+
+            def setEscapeButton(self, button):
+                events["escape"] = [t for t, b in self._buttons if b is button][0]
+
+            def exec(self):
+                return 0
+
+            def clickedButton(self):
+                return [b for t, b in self._buttons if t == click][0]
+
+        FakeBox.Icon = QMessageBox.Icon
+        FakeBox.ButtonRole = QMessageBox.ButtonRole
+        monkeypatch.setattr(module, "QMessageBox", FakeBox)
+
+    def test_delete_model_asks_in_chinese_and_defaults_to_cancel(self, settings_window, monkeypatch):
+        events: dict = {}
+        self._fake_box(monkeypatch, events, click="取消")
+        deleted = []
+        monkeypatch.setattr("sayink.speech_recognizer.delete_model", lambda mid: deleted.append(mid) or True)
+        settings_window._delete_model("sense-voice-small")
+
+        assert [t for t, _r in events["buttons"]] == ["删除", "取消"]
+        assert events["buttons"][0][1] == QMessageBox.ButtonRole.DestructiveRole
+        assert events["default"] == events["escape"] == "取消"
+        assert events["parent"] is settings_window
+        assert deleted == []
+
+    def test_discard_pending_confirms_only_on_accept(self, settings_window, monkeypatch):
+        settings_window._pending_segment_count = lambda: 2
+        events: dict = {}
+        self._fake_box(monkeypatch, events, click="丢弃并应用")
+        assert settings_window._confirm_discard_pending() is True
+        assert "2 段语音" in events["text"]
+        self._fake_box(monkeypatch, events, click="取消")
+        assert settings_window._confirm_discard_pending() is False
 
 
 class TestHotkeyBinding:

@@ -8,6 +8,7 @@ import pytest
 from PyQt6.QtWidgets import QApplication
 
 from sayink.ui.floating_window import (
+    MODEL_LOADING_TITLE,
     FloatingWindow,
     WaveformWidget,
     _DotIndicator,
@@ -120,12 +121,18 @@ class TestModelLoadingGuard:
         assert win._model_loading_active is True
         win.show_error("识别失败")
         # Still showing model-loading state, error was ignored.
-        assert win._status_label.text() == "模型载入中"
+        assert win._status_label.text() == MODEL_LOADING_TITLE
 
     def test_warning_suppressed_during_model_loading(self, win):
         win.show_model_loading()
         win.show_warning("音频受限")
-        assert win._status_label.text() == "模型载入中"
+        assert win._status_label.text() == MODEL_LOADING_TITLE
+
+    def test_do_not_record_hint_is_in_the_title_not_the_elided_detail(self, win):
+        """U-04: a long ETA detail used to push “请勿录音” off the end of the bar."""
+        win.show_model_loading("正在加载 Fun-ASR-Nano（首次载入约 10–40 秒，上次用时约 12 秒）…")
+        assert "请勿录音" in win._status_label.text()
+        assert "…" in win._text_label.text() or "Fun-ASR-Nano" in win._text_label.text()
 
     def test_clear_lock_allows_errors_again(self, win):
         win.show_model_loading()
@@ -243,6 +250,10 @@ def test_hold_bar_switches_to_recognizing_once_the_key_is_released(win):
     assert win._status_label.text() == "正在识别"
     win.show_polishing()
     assert win._status_label.text() == "润色中"
+    assert STATE_RECORD.lower() not in win._status_label.styleSheet().lower()
+    # The final transcript landing after release must not paint 「录音中」 again.
+    win.show_live_transcript("今天下午三点开会")
+    assert win._status_label.text() == "正在识别"
     assert STATE_RECORD.lower() not in win._status_label.styleSheet().lower()
 
 

@@ -223,7 +223,7 @@ class TestSidebarVisualContracts:
             sheet = card.styleSheet()
             assert tok.NAV_SELECTED_BG in sheet
             assert f"border: 1px solid {tok.HAIRLINE}" in sheet
-            assert f"border: 2px solid" not in sheet
+            assert "border: 2px solid" not in sheet
             assert "border-left:" not in sheet or "border-left: 0" in sheet
             title = next(label for label in card.findChildren(QLabel) if label.text() == "仅麦克风")
             assert f"color: {tok.TEXT}" in title.styleSheet()
@@ -239,7 +239,7 @@ class TestSidebarVisualContracts:
             sheet = grid.styleSheet()
             assert tok.NAV_SELECTED_BG in sheet
             assert f"border: 1px solid {tok.HAIRLINE}" in sheet
-            assert f"border: 2px solid" not in sheet
+            assert "border: 2px solid" not in sheet
             assert "border-left:" not in sheet or "border-left: 0" in sheet
             title = next(label for label in grid.findChildren(QLabel) if label.text() == "仅麦克风")
             assert f"color: {tok.TEXT}" in title.styleSheet()
@@ -304,8 +304,12 @@ class TestClassicDesktopTokens:
         assert t.SIDEBAR_WIDTH == 184
         t.activate("dark")
         assert t.STATE_LISTEN == t.GREEN
+        assert t.STATE_WARN == t.AMBER
+        assert t.STATE_MUTED == t.FLOAT_TEXT_SEC
         t.activate("light")
         assert t.STATE_LISTEN == t.GREEN
+        # U-05: warnings are amber, not the same grey as stopped/cancelled.
+        assert t.STATE_WARN == t.AMBER != t.STATE_MUTED
 
     def test_primary_buttons_use_primary_on(self):
         import sayink.ui.settings_styles as st
