@@ -1,4 +1,9 @@
-"""General settings page: 录音 → 音频 → 偏好."""
+"""General settings page: 录音 → 音频 → 偏好.
+
+Each section has its own builder; ``build_general_page`` only stacks them and
+fixes the keyboard order. The builders attach the controls to ``win`` because
+SettingsWindow reads/writes them when settings load or change.
+"""
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -46,25 +51,37 @@ SYSTEM_AUDIO_NOTE = (
 )
 
 
-def build_general_page(win) -> QWidget:
-    """Prototype v3 layout: stacked 录音 → 音频 → 偏好 cards (top to bottom)."""
-    page = SettingsPage()
-    page.add(page_header("通用", "按你的习惯设置听写。更改会自动保存。"))
+def _card() -> tuple[QWidget, QVBoxLayout]:
+    card = settings_group()
+    lay = QVBoxLayout(card)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+    return card, lay
 
-    # ── 录音 ──
-    record_card = settings_group()
-    record_lay = QVBoxLayout(record_card)
-    record_lay.setContentsMargins(0, 0, 0, 0)
-    record_lay.setSpacing(0)
+
+def _ghost_button(text: str, slot, *, height: int = 32, tooltip: str = "") -> QPushButton:
+    btn = QPushButton(text)
+    btn.setProperty("viBtn", "ghostSm")
+    btn.setMinimumHeight(height)
+    btn.setStyleSheet(settings_styles.BTN_GHOST_SM)
+    if tooltip:
+        btn.setToolTip(tooltip)
+    btn.clicked.connect(slot)
+    return btn
+
+
+# ── 录音 ───────────────────────────────────────────────
+
+def build_recording_section(win) -> QWidget:
+    card, lay = _card()
     win._trigger_group = QButtonGroup(win)
     win._trigger_continuous_rb = QRadioButton()
     win._trigger_hotkey_rb = QRadioButton()
     for rb in (win._trigger_continuous_rb, win._trigger_hotkey_rb):
         win._trigger_group.addButton(rb)
-    record_lay.addWidget(TriggerModePicker(
-        win._trigger_continuous_rb,
-        win._trigger_hotkey_rb,
-    ))
+        rb.toggled.connect(win._on_trigger_mode_radio_toggled)
+    lay.addWidget(TriggerModePicker(win._trigger_continuous_rb, win._trigger_hotkey_rb))
+
     win._hotkey_edit = HotkeyEdit()
     win._hotkey_edit.setObjectName("HotkeyEdit")
     win._hotkey_edit.setMinimumHeight(40)
@@ -73,146 +90,143 @@ def build_general_page(win) -> QWidget:
     win._hotkey_edit.hotkey_changed.connect(win._apply_hotkey_setting)
     win._hotkey_hint = QLabel()
     win._hotkey_hint.setWordWrap(True)
-    win._hotkey_hint.setSizePolicy(
-        QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
-    )
+    win._hotkey_hint.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
     win._hotkey_hint.setStyleSheet(
         f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
         f" background: transparent; padding: 0 16px 12px 16px;"
     )
-    record_lay.addWidget(stacked_field_row("录音快捷键", win._hotkey_edit))
-    record_lay.addWidget(win._hotkey_hint)
-    record_lay.addWidget(group_divider())
+    lay.addWidget(stacked_field_row("录音快捷键", win._hotkey_edit))
+    lay.addWidget(win._hotkey_hint)
+    lay.addWidget(group_divider())
+
     win._esc_stop_row = ToggleOptionRow(
         "Esc 结束持续转写",
         "关闭后，在其他软件里按 Esc 不会中断监听；用听写条「结束」停止",
     )
     win._esc_stop_row.toggled.connect(win._on_esc_stop_toggled)
-    record_lay.addWidget(win._esc_stop_row)
-    page.add(settings_section("录音", record_card))
+    lay.addWidget(win._esc_stop_row)
+    return settings_section("录音", card)
 
-    # ── 音频 ──
-    audio_card = settings_group()
-    audio_lay = QVBoxLayout(audio_card)
-    audio_lay.setContentsMargins(0, 0, 0, 0)
-    audio_lay.setSpacing(0)
+
+# ── 音频 ───────────────────────────────────────────────
+
+def _build_source_picker(win, lay: QVBoxLayout) -> None:
     win._source_group = QButtonGroup(win)
     win._src_mic_rb = QRadioButton()
     win._src_sys_rb = QRadioButton()
     win._src_mixed_rb = QRadioButton()
     for rb in (win._src_mic_rb, win._src_sys_rb, win._src_mixed_rb):
         win._source_group.addButton(rb)
-    audio_lay.addWidget(AudioSourcePicker(
-        win._src_mic_rb, win._src_sys_rb, win._src_mixed_rb,
-    ))
+        rb.toggled.connect(win._sync_source_device_widgets)
+        rb.toggled.connect(win._on_input_source_radio_toggled)
+    lay.addWidget(AudioSourcePicker(win._src_mic_rb, win._src_sys_rb, win._src_mixed_rb))
+
     win._mixed_audio_callout = info_callout(MIXED_AUDIO_NOTE)
     win._mixed_audio_callout_wrap = QWidget()
     callout_lay = QHBoxLayout(win._mixed_audio_callout_wrap)
     callout_lay.setContentsMargins(12, 0, 12, 12)
     callout_lay.addWidget(win._mixed_audio_callout)
-    audio_lay.addWidget(win._mixed_audio_callout_wrap)
-    win._src_mic_rb.toggled.connect(win._sync_source_device_widgets)
-    win._src_sys_rb.toggled.connect(win._sync_source_device_widgets)
-    win._src_mixed_rb.toggled.connect(win._sync_source_device_widgets)
+    lay.addWidget(win._mixed_audio_callout_wrap)
 
-    audio_lay.addWidget(group_divider())
-    test_row = QWidget()
-    test_row.setMinimumHeight(52)
-    test_row_lay = QVBoxLayout(test_row)
-    test_row_lay.setContentsMargins(16, 12, 16, 12)
-    test_row_lay.setSpacing(6)
+
+def _build_mic_test_row(win) -> QWidget:
+    row = QWidget()
+    row.setMinimumHeight(52)
+    row_lay = QVBoxLayout(row)
+    row_lay.setContentsMargins(16, 12, 16, 12)
+    row_lay.setSpacing(6)
     win._mic_test_btn = QPushButton("测试声音（约 2 秒）")
     win._mic_test_btn.setProperty("viBtn", "primary")
     win._mic_test_btn.setStyleSheet(settings_styles.BTN_PRIMARY)
     win._mic_test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     win._mic_test_btn.setFixedHeight(36)
     win._mic_test_btn.clicked.connect(win._run_mic_probe)
-    test_actions = QHBoxLayout()
-    test_actions.setContentsMargins(0, 0, 0, 0)
-    test_actions.setSpacing(8)
-    test_actions.addWidget(win._mic_test_btn)
-    win._mic_reset_btn = QPushButton("恢复自动选择")
-    win._mic_reset_btn.setProperty("viBtn", "ghostSm")
-    win._mic_reset_btn.setStyleSheet(settings_styles.BTN_GHOST_SM)
-    win._mic_reset_btn.setMinimumHeight(36)
-    win._mic_reset_btn.clicked.connect(win._reset_audio_devices_to_auto)
-    test_actions.addWidget(win._mic_reset_btn)
-    test_actions.addStretch(1)
-    test_row_lay.addLayout(test_actions)
+    win._mic_reset_btn = _ghost_button("恢复自动选择", win._reset_audio_devices_to_auto, height=36)
+    actions = QHBoxLayout()
+    actions.setContentsMargins(0, 0, 0, 0)
+    actions.setSpacing(8)
+    actions.addWidget(win._mic_test_btn)
+    actions.addWidget(win._mic_reset_btn)
+    actions.addStretch(1)
+    row_lay.addLayout(actions)
     win._mic_test_status = QLabel("")
     win._mic_test_status.setProperty("viRole", "hint")
     win._mic_test_status.setStyleSheet(
         f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
     )
     win._mic_test_status.setWordWrap(True)
-    test_row_lay.addWidget(win._mic_test_status)
-    audio_lay.addWidget(test_row)
+    row_lay.addWidget(win._mic_test_status)
+    return row
 
-    audio_lay.addWidget(group_divider())
+
+def _build_advanced_audio(win, lay: QVBoxLayout) -> tuple[QPushButton, QPushButton]:
+    """Collapsible device pickers; returns the two buttons for the Tab chain."""
     link_row = QWidget()
     link_row.setMinimumHeight(52)
-    link_row_lay = QHBoxLayout(link_row)
-    link_row_lay.setContentsMargins(16, 12, 16, 12)
-    link_row_lay.setSpacing(0)
+    link_lay = QHBoxLayout(link_row)
+    link_lay.setContentsMargins(16, 12, 16, 12)
+    link_lay.setSpacing(0)
     win._advanced_audio_btn = device_selection_link("手动选择音频设备")
     win._advanced_audio_btn.toggled.connect(win._toggle_advanced_audio)
-    link_row_lay.addWidget(win._advanced_audio_btn, 0, Qt.AlignmentFlag.AlignVCenter)
-    link_row_lay.addStretch(1)
-    audio_lay.addWidget(link_row)
+    link_lay.addWidget(win._advanced_audio_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+    link_lay.addStretch(1)
+    lay.addWidget(link_row)
 
     win._advanced_audio_panel = QWidget()
     win._advanced_audio_panel.setVisible(False)
-    win._advanced_audio_panel.setSizePolicy(
-        QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
-    )
+    win._advanced_audio_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
     adv_lay = QVBoxLayout(win._advanced_audio_panel)
     adv_lay.setContentsMargins(0, 0, 0, 0)
     adv_lay.setSpacing(0)
     win._mic_device_combo = QComboBox()
     win._system_device_combo = QComboBox()
-    win._mic_device_combo.setFixedWidth(tok.CONTROL_DEVICE_COMBO_WIDTH)
-    win._system_device_combo.setFixedWidth(tok.CONTROL_DEVICE_COMBO_WIDTH)
+    for combo in (win._mic_device_combo, win._system_device_combo):
+        combo.setFixedWidth(tok.CONTROL_DEVICE_COMBO_WIDTH)
+        combo.currentIndexChanged.connect(win._on_audio_device_changed)
     adv_lay.addWidget(labeled_row("麦克风", win._mic_device_combo))
     adv_lay.addWidget(group_divider())
     adv_lay.addWidget(labeled_row("电脑播放", win._system_device_combo))
 
-    dev_btn_row = QHBoxLayout()
-    dev_btn_row.setContentsMargins(16, 8, 16, 12)
-    dev_btn_row.setSpacing(8)
-    refresh_btn = QPushButton("刷新列表")
-    refresh_btn.setProperty("viBtn", "ghostSm")
-    refresh_btn.setMinimumHeight(32)
-    refresh_btn.setStyleSheet(settings_styles.BTN_GHOST_SM)
-    refresh_btn.clicked.connect(win._refresh_audio_device_lists)
-    reset_btn = QPushButton("恢复自动选择")
-    reset_btn.setProperty("viBtn", "ghostSm")
-    reset_btn.setMinimumHeight(32)
-    reset_btn.setStyleSheet(settings_styles.BTN_GHOST_SM)
-    reset_btn.setToolTip("让程序自动挑选设备，避免选到打不开的声卡")
-    reset_btn.clicked.connect(win._reset_audio_devices_to_auto)
-    dev_btn_row.addWidget(refresh_btn)
-    dev_btn_row.addWidget(reset_btn)
-    dev_btn_row.addStretch()
-    adv_lay.addLayout(dev_btn_row)
-    audio_lay.addWidget(win._advanced_audio_panel)
-    page.add(settings_section("音频", audio_card))
+    btn_row = QHBoxLayout()
+    btn_row.setContentsMargins(16, 8, 16, 12)
+    btn_row.setSpacing(8)
+    refresh_btn = _ghost_button("刷新列表", win._refresh_audio_device_lists)
+    reset_btn = _ghost_button(
+        "恢复自动选择",
+        win._reset_audio_devices_to_auto,
+        tooltip="让程序自动挑选设备，避免选到打不开的声卡",
+    )
+    btn_row.addWidget(refresh_btn)
+    btn_row.addWidget(reset_btn)
+    btn_row.addStretch()
+    adv_lay.addLayout(btn_row)
+    lay.addWidget(win._advanced_audio_panel)
+    return refresh_btn, reset_btn
 
-    # ── 偏好 ──
-    prefs_card = settings_group()
-    prefs_lay = QVBoxLayout(prefs_card)
-    prefs_lay.setContentsMargins(0, 0, 0, 0)
-    prefs_lay.setSpacing(0)
 
+def build_audio_section(win) -> tuple[QWidget, tuple[QPushButton, QPushButton]]:
+    card, lay = _card()
+    _build_source_picker(win, lay)
+    lay.addWidget(group_divider())
+    lay.addWidget(_build_mic_test_row(win))
+    lay.addWidget(group_divider())
+    device_buttons = _build_advanced_audio(win, lay)
+    return settings_section("音频", card), device_buttons
+
+
+# ── 偏好 ───────────────────────────────────────────────
+
+def _build_theme_row(win) -> QWidget:
     win._theme_combo = ThemeModeSegment()
     win._theme_combo.currentIndexChanged.connect(win._on_theme_mode_changed)
-    theme_row = QWidget()
-    theme_row_lay = QHBoxLayout(theme_row)
-    theme_row_lay.setContentsMargins(16, 10, 16, 10)
-    theme_row_lay.setSpacing(12)
-    theme_text = QWidget()
-    theme_text_lay = QVBoxLayout(theme_text)
-    theme_text_lay.setContentsMargins(0, 0, 0, 0)
-    theme_text_lay.setSpacing(2)
+    row = QWidget()
+    row_lay = QHBoxLayout(row)
+    row_lay.setContentsMargins(16, 10, 16, 10)
+    row_lay.setSpacing(12)
+    text = QWidget()
+    text_lay = QVBoxLayout(text)
+    text_lay.setContentsMargins(0, 0, 0, 0)
+    text_lay.setSpacing(2)
     win._theme_title_label = QLabel("主题")
     win._theme_title_label.setProperty("viRole", "rowTitle")
     win._theme_title_label.setStyleSheet(
@@ -224,13 +238,14 @@ def build_general_page(win) -> QWidget:
         f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
         f" background: transparent;"
     )
-    theme_text_lay.addWidget(win._theme_title_label)
-    theme_text_lay.addWidget(win._theme_desc_label)
-    theme_row_lay.addWidget(theme_text, 1)
-    theme_row_lay.addWidget(win._theme_combo, 0, Qt.AlignmentFlag.AlignVCenter)
-    prefs_lay.addWidget(theme_row)
-    prefs_lay.addWidget(group_divider())
+    text_lay.addWidget(win._theme_title_label)
+    text_lay.addWidget(win._theme_desc_label)
+    row_lay.addWidget(text, 1)
+    row_lay.addWidget(win._theme_combo, 0, Qt.AlignmentFlag.AlignVCenter)
+    return row
 
+
+def _build_toggle_rows(win, lay: QVBoxLayout) -> None:
     win._auto_start_row = ToggleOptionRow("开机时自动启动")
     win._sound_row = ToggleOptionRow("录音提示音")
     win._restore_clipboard_row = ToggleOptionRow("粘贴后恢复剪贴板")
@@ -242,16 +257,20 @@ def build_general_page(win) -> QWidget:
     win._sound_row.toggled.connect(win._on_sound_toggled)
     win._restore_clipboard_row.toggled.connect(win._on_restore_clipboard_toggled)
     win._history_only_output_row.toggled.connect(win._on_history_only_output_toggled)
-    prefs_lay.addWidget(win._auto_start_row)
-    prefs_lay.addWidget(group_divider())
-    prefs_lay.addWidget(win._sound_row)
-    prefs_lay.addWidget(group_divider())
-    prefs_lay.addWidget(win._history_only_output_row)
-    prefs_lay.addWidget(group_divider())
-    prefs_lay.addWidget(win._restore_clipboard_row)
-    prefs_lay.addWidget(group_divider())
+    for row in (
+        win._auto_start_row,
+        win._sound_row,
+        win._history_only_output_row,
+        win._restore_clipboard_row,
+    ):
+        lay.addWidget(row)
+        lay.addWidget(group_divider())
 
-    win._history_enabled_row = ToggleOptionRow("保存语音历史", "在本机保存转写文本，便于搜索和复制；不保存音频")
+
+def _build_history_rows(win, lay: QVBoxLayout) -> None:
+    win._history_enabled_row = ToggleOptionRow(
+        "保存语音历史", "在本机保存转写文本，便于搜索和复制；不保存音频"
+    )
     win._history_retention_days_spin = QSpinBox()
     win._history_retention_days_spin.setRange(1, 3650)
     win._history_retention_days_spin.setSuffix(" 天")
@@ -266,28 +285,37 @@ def build_general_page(win) -> QWidget:
     win._history_enabled_row.toggled.connect(win._on_history_enabled_toggled)
     win._history_retention_days_spin.valueChanged.connect(win._on_history_limits_changed)
     win._history_max_entries_spin.valueChanged.connect(win._on_history_limits_changed)
-    prefs_lay.addWidget(win._history_enabled_row)
-    prefs_lay.addWidget(group_divider())
-    win._history_retention_row = labeled_row(
-        "保留天数", win._history_retention_days_spin
-    )
-    win._history_max_entries_row = labeled_row(
-        "最大会话数", win._history_max_entries_spin
-    )
-    prefs_lay.addWidget(win._history_retention_row)
-    prefs_lay.addWidget(group_divider())
-    prefs_lay.addWidget(win._history_max_entries_row)
-    prefs_bottom = QWidget()
-    prefs_bottom.setFixedHeight(4)
-    prefs_lay.addWidget(prefs_bottom)
-    page.add(settings_section("偏好", prefs_card))
+    lay.addWidget(win._history_enabled_row)
+    lay.addWidget(group_divider())
+    win._history_retention_row = labeled_row("保留天数", win._history_retention_days_spin)
+    win._history_max_entries_row = labeled_row("最大会话数", win._history_max_entries_spin)
+    lay.addWidget(win._history_retention_row)
+    lay.addWidget(group_divider())
+    lay.addWidget(win._history_max_entries_row)
 
-    for rb in (win._src_mic_rb, win._src_sys_rb, win._src_mixed_rb):
-        rb.toggled.connect(win._on_input_source_radio_toggled)
-    win._trigger_continuous_rb.toggled.connect(win._on_trigger_mode_radio_toggled)
-    win._trigger_hotkey_rb.toggled.connect(win._on_trigger_mode_radio_toggled)
-    win._mic_device_combo.currentIndexChanged.connect(win._on_audio_device_changed)
-    win._system_device_combo.currentIndexChanged.connect(win._on_audio_device_changed)
+
+def build_preferences_section(win) -> QWidget:
+    card, lay = _card()
+    lay.addWidget(_build_theme_row(win))
+    lay.addWidget(group_divider())
+    _build_toggle_rows(win, lay)
+    _build_history_rows(win, lay)
+    bottom = QWidget()
+    bottom.setFixedHeight(4)
+    lay.addWidget(bottom)
+    return settings_section("偏好", card)
+
+
+# ── Page ───────────────────────────────────────────────
+
+def build_general_page(win) -> QWidget:
+    """Prototype v3 layout: stacked 录音 → 音频 → 偏好 cards (top to bottom)."""
+    page = SettingsPage()
+    page.add(page_header("通用", "按你的习惯设置听写。更改会自动保存。"))
+    page.add(build_recording_section(win))
+    audio_section, (refresh_btn, reset_btn) = build_audio_section(win)
+    page.add(audio_section)
+    page.add(build_preferences_section(win))
 
     win._general_footer_note = footnote(
         "更改将自动保存并立即生效；若录音快捷键与输入法冲突，"
