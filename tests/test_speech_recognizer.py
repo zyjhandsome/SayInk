@@ -141,9 +141,44 @@ class TestNormalizeAsrOutput:
     def test_keeps_comparisons_and_spoken_angle_brackets(self, text):
         assert normalize_asr_output(text) == text
 
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "请把 <div> 标签改成 <span>",
+            "用 <b> 加粗，<br> 换行",
+            "泛型写成 List<T>",
+        ],
+    )
+    def test_keeps_spoken_html_and_generic_tags(self, text):
+        """README: only known ASR markers and language codes are stripped."""
+        assert normalize_asr_output(text) == text
+
     def test_keeps_colloquial_repeats_and_fillers(self):
         spoken = "说前面啊往前挪啊。往前挪啊。没问题没问题。嗯。嗯。嗯。嗯。嗯。"
         assert normalize_asr_output(spoken) == spoken
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("哈" * 16, "哈哈哈"),
+            ("对" * 16 + "，就是这样。", "对对对，就是这样。"),
+            ("太好笑了" + "哈" * 20 + "真的", "太好笑了哈哈哈真的"),
+        ],
+    )
+    def test_long_single_character_runs_are_shortened_not_deleted(self, text, expected):
+        assert normalize_asr_output(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "こんにちは、今日はいい天気ですね。",
+            "明日の会議は三時からです。",
+            "안녕하세요 만나서 반갑습니다.",
+        ],
+    )
+    def test_keeps_an_utterance_spoken_entirely_in_japanese_or_korean(self, text):
+        """README lists 中/英/日: a Japanese sentence on its own is speech, not drift."""
+        assert normalize_asr_output(text) == text
 
     def test_keeps_chinese_english_mix(self):
         text = "这个 API 怎么调用"
@@ -275,6 +310,40 @@ class TestIsModelDownloaded:
     def test_valid_model_check(self):
         result = is_model_downloaded("sensevoice")
         assert isinstance(result, bool)
+
+    def _model_dir(self, tmp_path, monkeypatch):
+        import sayink.speech_recognizer as sr
+
+        info = sr.get_model_info("sensevoice")
+        model_dir = tmp_path / info["dir_name"]
+        model_dir.mkdir()
+        monkeypatch.setattr(sr, "_get_models_dir", lambda: tmp_path)
+        monkeypatch.setattr(sr, "_get_portable_model_dir", lambda _mid: None)
+        return model_dir, info["files"]
+
+    def test_real_files_count_as_downloaded(self, tmp_path, monkeypatch):
+        model_dir, files = self._model_dir(tmp_path, monkeypatch)
+        for name in files:
+            (model_dir / name).write_bytes(b"\x00" * 4096)
+        assert is_model_downloaded("sensevoice") is True
+
+    def test_git_lfs_pointer_files_do_not_count_as_downloaded(self, tmp_path, monkeypatch):
+        """README: a checkout without `git lfs pull` is not a downloaded model."""
+        model_dir, files = self._model_dir(tmp_path, monkeypatch)
+        pointer = (
+            b"version https://git-lfs.github.com/spec/v1\n"
+            b"oid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+            b"size 950000000\n"
+        )
+        for name in files:
+            (model_dir / name).write_bytes(pointer)
+        assert is_model_downloaded("sensevoice") is False
+
+    def test_empty_files_do_not_count_as_downloaded(self, tmp_path, monkeypatch):
+        model_dir, files = self._model_dir(tmp_path, monkeypatch)
+        for name in files:
+            (model_dir / name).write_bytes(b"")
+        assert is_model_downloaded("sensevoice") is False
 
 
 class TestGetModelsDir:
@@ -502,7 +571,6 @@ class _FakeRecognizer:
 
 class TestTranscribeWorkerRun:
     def _run(self, worker):
-        from unittest.mock import MagicMock
 
         results, errors = [], []
         worker.result_ready.connect(results.append)
@@ -626,6 +694,34 @@ class TestLongUtteranceSlicing:
 
         assert merge_slice_texts(["今天天气不错", "气不错我们出发"]) == "今天天气不错我们出发"
         assert merge_slice_texts(["你好", "世界"]) == "你好世界"
+
+    def test_merge_tolerates_a_misheard_character_in_the_overlap(self):
+        """README: the join between two slices must not repeat or garble words."""
+        from sayink.speech_recognizer import merge_slice_texts
+
+        assert merge_slice_texts(["我们大约有两百个", "大约有两白个自动化用例"]) == "我们大约有两百个自动化用例"
+        # Short overlaps still have to match exactly.
+        assert merge_slice_texts(["你好啊", "你坏啊今天"]) == "你好啊你坏啊今天"
+        assert merge_slice_texts(["前十五秒", "后十五秒"]) == "前十五秒后十五秒"
+
+    def test_slice_boundaries_land_on_the_quietest_frame(self):
+        from sayink.speech_recognizer import SAMPLE_RATE, plan_audio_slices
+
+        audio = np.full(int(40 * SAMPLE_RATE), 0.5, dtype=np.float32)
+        # A breath at 13.0–13.1 s and another at 26.5–26.6 s.
+        for at in (13.0, 26.5):
+            lo = int(at * SAMPLE_RATE)
+            audio[lo:lo + int(0.1 * SAMPLE_RATE)] = 0.01
+        slices = plan_audio_slices(audio, SAMPLE_RATE, slice_sec=15.0, overlap_sec=0.4)
+        ends = []
+        start = 0
+        for piece in slices:
+            ends.append(start + piece.size)
+            start = start + piece.size - int(0.4 * SAMPLE_RATE)
+        assert ends[0] == int(13.1 * SAMPLE_RATE)
+        assert ends[1] == int(26.6 * SAMPLE_RATE)
+        assert ends[-1] == audio.size
+        assert all(s.size <= int(15 * SAMPLE_RATE) for s in slices)
 
     def test_context_limited_models_use_slice_window(self):
         from sayink.speech_recognizer import slice_window_for_loader

@@ -24,6 +24,13 @@ ADAPTIVE_THRESHOLD_CAP = 0.01
 # A transient (key click, cough) is loud for one block only; speech keeps the
 # gate open for at least this long before a segment is worth transcribing.
 MIN_LOUD_SEC = 0.2
+# When an utterance runs into MAX_SPEECH_SEC the cut lands on the quietest
+# block inside this window before the limit (a breath or syllable gap) rather
+# than exactly at the limit, so words are not sliced in half.
+CUT_SEARCH_SEC = 3.0
+# The quietest block only counts as a gap when its RMS is below this fraction
+# of the window's median; otherwise the cut stays at the limit.
+QUIET_CUT_RATIO = 0.6
 
 
 class SpeechSegmenter:
@@ -47,6 +54,7 @@ class SpeechSegmenter:
         self._max_samples = int(sample_rate * max_speech_sec)
         self._adaptive = adaptive
         self._min_loud_samples = int(sample_rate * min(min_loud_sec, min_speech_sec))
+        self._cut_search_samples = int(sample_rate * min(CUT_SEARCH_SEC, max_speech_sec / 2))
         self._floor_window_samples = int(sample_rate * NOISE_FLOOR_WINDOW_SEC)
         self._floor_blocks: list[tuple[int, float]] = []
         self._floor_total = 0
@@ -77,7 +85,8 @@ class SpeechSegmenter:
         # The noise-floor window deliberately survives reset(): it describes
         # the room, not the utterance.
         self._buffer: list[np.ndarray] = []
-        self._energy: list[tuple[int, float, float]] = []
+        # (sample count, mic energy, system energy, block RMS) per buffered block.
+        self._energy: list[tuple[int, float, float, float]] = []
         self._total_samples = 0
         self._loud_samples = 0
         self._silence_run = 0
@@ -106,22 +115,45 @@ class SpeechSegmenter:
         if loud:
             self._in_speech = True
             self._silence_run = 0
-            self._remember_block(block, mic_energy, system_energy)
+            self._remember_block(block, mic_energy, system_energy, float(rms))
             self._loud_samples += int(block.size)
             if self._total_samples >= self._max_samples:
-                return self._take_segment(limit=self._max_samples)
+                return self._take_segment(limit=self._quiet_cut_point())
             return None
 
         if not self._in_speech:
             return None
 
-        self._remember_block(block, mic_energy, system_energy)
+        self._remember_block(block, mic_energy, system_energy, float(rms))
         self._silence_run += block.size
         if self._total_samples >= self._max_samples:
-            return self._take_segment(limit=self._max_samples)
+            return self._take_segment(limit=self._quiet_cut_point())
         if self._silence_run >= self._silence_hold_samples:
             return self._take_segment()
         return None
+
+    def _quiet_cut_point(self) -> int:
+        """Sample offset to cut a too-long utterance: the end of the quietest
+        block within CUT_SEARCH_SEC before the limit, else the limit itself."""
+        limit = self._max_samples
+        window_start = limit - self._cut_search_samples
+        candidates: list[tuple[int, float]] = []
+        end = 0
+        for count, _mic, _system, rms in self._energy:
+            end += count
+            if end > limit:
+                break
+            if end >= window_start:
+                candidates.append((end, rms))
+        if not candidates:
+            return limit
+        best_end, best_rms = min(candidates, key=lambda c: c[1])
+        typical = float(np.median([rms for _end, rms in candidates]))
+        # A "breath" must be clearly quieter than the rest of the window;
+        # on a flat signal every block ties and the limit itself is the cut.
+        if best_rms > typical * QUIET_CUT_RATIO or best_end < self._min_samples:
+            return limit
+        return best_end
 
     def _too_short(self) -> bool:
         return self._total_samples < self._min_samples or self._loud_samples < self._min_loud_samples
@@ -140,22 +172,26 @@ class SpeechSegmenter:
         self._last_route = dominant_route(mic, system)
         return out
 
-    def _remember_block(self, block: np.ndarray, mic_energy: float, system_energy: float) -> None:
+    def _remember_block(
+        self, block: np.ndarray, mic_energy: float, system_energy: float, rms: float = 0.0
+    ) -> None:
         self._buffer.append(block)
-        self._energy.append((int(block.size), float(mic_energy), float(system_energy)))
+        self._energy.append((int(block.size), float(mic_energy), float(system_energy), float(rms)))
         self._total_samples += int(block.size)
 
-    def _split_energy(self, sample_count: int) -> tuple[float, float, list[tuple[int, float, float]]]:
+    def _split_energy(
+        self, sample_count: int
+    ) -> tuple[float, float, list[tuple[int, float, float, float]]]:
         mic = 0.0
         system = 0.0
         remaining = int(sample_count)
-        tail: list[tuple[int, float, float]] = []
-        for count, mic_part, system_part in self._energy:
+        tail: list[tuple[int, float, float, float]] = []
+        for count, mic_part, system_part, rms in self._energy:
             count = int(count)
             if count <= 0:
                 continue
             if remaining <= 0:
-                tail.append((count, mic_part, system_part))
+                tail.append((count, mic_part, system_part, rms))
                 continue
             if count <= remaining:
                 mic += mic_part
@@ -165,7 +201,12 @@ class SpeechSegmenter:
             fraction = remaining / count
             mic += mic_part * fraction
             system += system_part * fraction
-            tail.append((count - remaining, mic_part * (1.0 - fraction), system_part * (1.0 - fraction)))
+            tail.append((
+                count - remaining,
+                mic_part * (1.0 - fraction),
+                system_part * (1.0 - fraction),
+                rms,
+            ))
             remaining = 0
         return mic, system, tail
 

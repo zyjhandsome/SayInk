@@ -24,9 +24,48 @@ _ASR_TAG_PATTERNS = (
     re.compile(r"<\s*/\s*asr_text\b[^>]*>", re.IGNORECASE),
 )
 # FireRedASR2 / sherpa meta tokens in tokens.txt: <sil>, <zh>, <en>, <|zh|>,
-# dialect tags, … A token is one identifier-like word between the brackets.
-# Anything with spaces or CJK inside is speech ("如果 a<b 并且 c>d") and stays.
-_ASR_META_TOKEN_PATTERN = re.compile(r"<\s*/?\s*\|?[A-Za-z_][A-Za-z0-9_\-]*\|?\s*/?\s*>")
+# <zh-CN>, … Only known marker words and language / locale codes are removed;
+# a spoken HTML tag ("请把 <div> 改成 <span>") or comparison ("a<b 并且 c>d")
+# is speech and stays.
+_ASR_META_TOKEN_PATTERN = re.compile(r"<\s*/?\s*(\|?)([A-Za-z_][A-Za-z0-9_\-]*)\|?\s*/?\s*>")
+_ASR_MARKER_WORDS = frozenset({
+    "sil", "unk", "blank", "pad", "eos", "sos", "bos", "s", "nospeech", "speech",
+    "noise", "music", "laughter", "event", "asr_text", "withitn", "woitn",
+})
+_ASR_LANG_CODES = frozenset({
+    "zh", "en", "ja", "ko", "yue", "de", "fr", "es", "it", "pt", "ru", "ar", "hi",
+    "th", "vi", "id", "ms", "tr", "nl", "pl", "sv", "uk", "cs", "ro", "hu", "el",
+    "he", "fa", "ur", "bn", "ta", "te", "kn", "ml", "tl", "sw", "cmn", "wuu",
+    "nan", "hak", "jpn", "kor", "eng", "zho", "chi",
+})
+_ASR_LANG_TAG_RE = re.compile(r"^[a-z]{2,3}(?:[-_][A-Za-z]{2,4})?$")
+
+
+def _is_asr_meta_token(match: re.Match) -> bool:
+    piped, word = match.group(1), match.group(2)
+    if piped:
+        # <|zh|>, <|HAPPY|>, <|withitn|>: SenseVoice / sherpa always pipe-wrap.
+        return True
+    lowered = word.lower()
+    if lowered in _ASR_MARKER_WORDS:
+        return True
+    if "-" in word or "_" in word:
+        base = re.split(r"[-_]", word)[0].lower()
+        return base in _ASR_LANG_CODES and bool(_ASR_LANG_TAG_RE.match(word))
+    return lowered in _ASR_LANG_CODES
+
+
+def _strip_meta_tokens(text: str) -> tuple[str, bool]:
+    stripped = False
+
+    def _replace(match: re.Match) -> str:
+        nonlocal stripped
+        if _is_asr_meta_token(match):
+            stripped = True
+            return ""
+        return match.group(0)
+
+    return _ASR_META_TOKEN_PATTERN.sub(_replace, text), stripped
 # Some decoded silence markers lose their angle brackets ("/sil", "/sil>").
 # ASCII word/path boundaries keep /silver, /sil.txt and URLs intact; Chinese
 # speech can follow the marker directly without a space.
@@ -40,6 +79,8 @@ _SENTENCE_PATTERN = re.compile(r"[^。！？!?]+[。！？!?]?")
 _LOOP_MIN_REPEATS = 8
 _LOOP_MIN_UNIT = 2
 _LOOP_MAX_UNIT = 24
+# How many characters survive when a loop is one character repeated (哈 × 16).
+_SINGLE_CHAR_RUN_KEEP = 3
 
 
 def _script_counts(text: str) -> tuple[int, int, int]:
@@ -91,6 +132,10 @@ def _excise_repetition_loops(text: str) -> str:
                 cursor += unit_len
             if repeats >= _LOOP_MIN_REPEATS:
                 cut_at = cursor
+                if len(set(unit)) == 1:
+                    # 哈哈哈…… / 对对对…… is laughter or emphasis, not a decoder
+                    # loop; keep a natural-sounding run instead of deleting it.
+                    kept.append(unit[0] * _SINGLE_CHAR_RUN_KEEP)
                 break
         if cut_at is None:
             kept.append(text[index])
@@ -108,12 +153,14 @@ def _is_unrelated_foreign_sentence(sentence: str) -> bool:
     return kana >= 3 and kana > cjk
 
 
-def _drop_unrelated_foreign_sentences(text: str) -> str:
-    kept = [
-        sentence
-        for sentence in _SENTENCE_PATTERN.findall(text)
-        if sentence.strip() and not _is_unrelated_foreign_sentence(sentence)
-    ]
+def _drop_unrelated_foreign_sentences(text: str, *, decoder_glitch: bool = False) -> str:
+    sentences = [s for s in _SENTENCE_PATTERN.findall(text) if s.strip()]
+    kept = [s for s in sentences if not _is_unrelated_foreign_sentence(s)]
+    if len(kept) == len(sentences):
+        return text
+    if not decoder_glitch and not any(_script_counts(s)[2] for s in kept):
+        # Nothing Chinese to drift away from: the user spoke Japanese / Korean.
+        return text
     return "".join(kept)
 
 
@@ -127,11 +174,17 @@ def normalize_asr_output(text: str) -> str:
         if pattern.search(cleaned):
             stripped_tags = True
         cleaned = pattern.sub("", cleaned)
-    for pattern in (_ASR_META_TOKEN_PATTERN, _ASR_SIL_FRAGMENT_PATTERN):
-        if pattern.search(cleaned):
-            stripped_tags = True
-            cleaned = pattern.sub("", cleaned)
-    cleaned = _drop_unrelated_foreign_sentences(_excise_repetition_loops(cleaned))
+    cleaned, stripped_meta = _strip_meta_tokens(cleaned)
+    stripped_tags = stripped_tags or stripped_meta
+    if _ASR_SIL_FRAGMENT_PATTERN.search(cleaned):
+        stripped_tags = True
+        cleaned = _ASR_SIL_FRAGMENT_PATTERN.sub("", cleaned)
+    deloop = _excise_repetition_loops(cleaned)
+    # A decoder loop means the model derailed, so stray Japanese / Korean
+    # around it is noise. Otherwise only drop a foreign sentence when the
+    # utterance is otherwise Chinese (language drift), never a whole Japanese
+    # utterance: Fun-ASR-Nano is a 中/英/日 model.
+    cleaned = _drop_unrelated_foreign_sentences(deloop, decoder_glitch=deloop != cleaned)
     cleaned = cleaned.strip()
     if stripped_tags:
         log.debug("已剥离 ASR 标签，清洗后长度: %d", len(cleaned))
@@ -141,8 +194,9 @@ def normalize_asr_output(text: str) -> str:
 
 
 # Fun-ASR-Nano and Qwen3-ASR keep only the start of an utterance once audio
-# exceeds the exported KV window (about 20s). Slice earlier so a continuous
-# utterance up to the 90s segment cap is still fully transcribed.
+# exceeds the exported KV window (about 20s). Continuous mode already slices
+# at MAX_SPEECH_SEC (15 s) in vad_segmenter; this covers hold-to-talk, where
+# a single held utterance has no upper bound.
 CONTEXT_LIMITED_LOADERS = frozenset({"funasr_nano", "qwen3_asr"})
 CONTEXT_SLICE_SEC = 15.0
 CONTEXT_SLICE_OVERLAP_SEC = 0.4
@@ -155,13 +209,44 @@ def slice_window_for_loader(loader: str) -> tuple[float, float] | None:
     return None
 
 
+# A slice boundary moves back to the quietest 100 ms frame inside this window
+# (a breath or syllable gap) instead of landing mid-word at exactly slice_sec.
+SLICE_CUT_SEARCH_SEC = 3.0
+SLICE_CUT_FRAME_SEC = 0.1
+
+
+def _quiet_boundary(audio: np.ndarray, end: int, sample_rate: int) -> int:
+    frame = max(1, int(sample_rate * SLICE_CUT_FRAME_SEC))
+    search = int(sample_rate * SLICE_CUT_SEARCH_SEC)
+    start = max(0, end - search)
+    if end - start < frame * 2:
+        return end
+    best_end = end
+    best_rms: float | None = None
+    frame_end = start + frame
+    while frame_end <= end:
+        piece = audio[frame_end - frame:frame_end]
+        rms = float(np.sqrt(np.mean(np.square(piece)))) if piece.size else 0.0
+        if best_rms is None or rms <= best_rms:
+            best_rms = rms
+            best_end = frame_end
+        frame_end += frame
+    return best_end
+
+
 def plan_audio_slices(
     audio: np.ndarray,
     sample_rate: int,
     slice_sec: float,
     overlap_sec: float,
+    *,
+    cut_at_quiet: bool = True,
 ) -> list[np.ndarray]:
-    """Split audio into slices no longer than slice_sec, overlapping slightly."""
+    """Split audio into slices no longer than slice_sec, overlapping slightly.
+
+    With ``cut_at_quiet`` each boundary is pulled back to the quietest frame of
+    the last SLICE_CUT_SEARCH_SEC so the joins fall between words.
+    """
     audio = np.asarray(audio, dtype=np.float32).reshape(-1)
     if audio.size == 0:
         return []
@@ -177,6 +262,10 @@ def plan_audio_slices(
     total = audio.size
     while start < total:
         end = min(total, start + slice_len)
+        if cut_at_quiet and end < total:
+            quiet = _quiet_boundary(audio, end, sample_rate)
+            if quiet - start > overlap:
+                end = quiet
         slices.append(audio[start:end])
         if end >= total:
             break
@@ -185,6 +274,9 @@ def plan_audio_slices(
             next_start = end
         start = next_start
     return slices
+
+
+FUZZY_OVERLAP_MIN_CHARS = 6
 
 
 def merge_slice_texts(parts: list[str], max_overlap_chars: int = 12) -> str:
@@ -200,7 +292,16 @@ def merge_slice_texts(parts: list[str], max_overlap_chars: int = 12) -> str:
         limit = min(len(merged), len(piece), max_overlap_chars)
         cut = 0
         for size in range(limit, 0, -1):
-            if merged.endswith(piece[:size]):
+            head = piece[:size]
+            tail = merged[-size:]
+            if head == tail:
+                cut = size
+                break
+            # The overlap is decoded twice and the two passes rarely agree
+            # letter for letter (两百个 / 两白个). Tolerate one mismatch per
+            # five characters, but only for overlaps long enough that two
+            # genuinely different phrases (前十五秒 / 后十五秒) cannot collide.
+            if size >= FUZZY_OVERLAP_MIN_CHARS and sum(a != b for a, b in zip(head, tail)) <= size // 5:
                 cut = size
                 break
         merged += piece[cut:]
@@ -454,6 +555,33 @@ def get_model_dir(model_id: str) -> Path:
     return _get_models_dir() / info["dir_name"]
 
 
+_LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/"
+_LFS_POINTER_MAX_BYTES = 1024
+
+
+def _is_usable_model_file(path: Path) -> bool:
+    """A real weight / token file, not a git-lfs pointer or an empty stub.
+
+    A checkout without ``git lfs pull`` leaves ~130-byte pointer files where
+    the models should be; treating those as 「已下载」 made CI pass on nothing.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size == 0:
+        return False
+    if size <= _LFS_POINTER_MAX_BYTES:
+        try:
+            with path.open("rb") as handle:
+                head = handle.read(len(_LFS_POINTER_PREFIX))
+        except OSError:
+            return False
+        if head == _LFS_POINTER_PREFIX:
+            return False
+    return True
+
+
 def is_model_downloaded(model_id: str) -> bool:
     if _get_portable_model_dir(model_id):
         return True
@@ -461,7 +589,7 @@ def is_model_downloaded(model_id: str) -> bool:
     if not info:
         return False
     d = _get_models_dir() / info["dir_name"]
-    return all((d / f).exists() for f in info["files"])
+    return all(_is_usable_model_file(d / f) for f in info["files"])
 
 
 def get_downloaded_models() -> list[str]:

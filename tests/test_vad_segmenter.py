@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from sayink.vad_segmenter import SpeechSegmenter, SPEECH_RMS_THRESHOLD
+from sayink.vad_segmenter import SpeechSegmenter
 
 
 def _tone(duration_sec: float, amplitude: float = 0.5, rate: int = 16000) -> np.ndarray:
@@ -45,6 +45,31 @@ class TestSpeechSegmenterBasics:
         out = seg.feed(_tone(16))
         assert out is not None
         assert out.size <= int(16000 * 15) + 100
+
+    def test_long_utterance_is_cut_at_the_quietest_recent_block(self):
+        """README: the 15 s slice ends in a breath, not in the middle of a word."""
+        seg = SpeechSegmenter(speech_threshold=0.002, min_speech_sec=0.1)
+        block = int(16000 * 0.1)
+        emitted = []
+        for i in range(0, 160):  # 16 s in 0.1 s blocks
+            amp = 0.01 if i == 130 else 0.5  # a breath at 13.0–13.1 s, still above the gate
+            out = seg.feed(np.full(block, amp, dtype=np.float32))
+            if out is not None:
+                emitted.append(out)
+        assert len(emitted) == 1
+        assert emitted[0].size == 131 * block
+        # The remainder carries on as the next utterance.
+        tail = seg.flush()
+        assert tail is not None
+        assert tail.size == (160 - 131) * block
+
+    def test_flat_long_utterance_still_cuts_at_the_limit(self):
+        seg = SpeechSegmenter(speech_threshold=0.002, min_speech_sec=0.1)
+        block = int(16000 * 0.1)
+        emitted = [seg.feed(np.full(block, 0.5, dtype=np.float32)) for _ in range(160)]
+        emitted = [e for e in emitted if e is not None]
+        assert len(emitted) == 1
+        assert emitted[0].size == int(16000 * 15)
 
     def test_max_length_forces_cut(self):
         seg = SpeechSegmenter(
