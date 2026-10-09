@@ -32,26 +32,60 @@ def qapp():
     yield app
 
 
-@pytest.fixture
-def settings_window(config, qapp, monkeypatch):
-    monkeypatch.setattr(
-        SettingsWindow,
-        "_rebuild_model_cards",
-        lambda self: None,
-    )
-    monkeypatch.setattr(
-        SettingsWindow,
-        "_refresh_about_info",
-        lambda self: None,
-    )
-    monkeypatch.setattr(
-        SettingsWindow,
-        "_refresh_audio_device_lists",
-        lambda self: None,
-    )
-    win = SettingsWindow(config)
-    yield win
+_INERT_WINDOW_METHODS = ("_rebuild_model_cards", "_refresh_about_info", "_refresh_audio_device_lists")
+
+
+@pytest.fixture(scope="module")
+def _shared_settings(qapp, tmp_path_factory):
+    """One SettingsWindow for the whole module (Q-18: building it costs 2–4 s
+    per test). Tests get it through ``settings_window`` / ``config`` below,
+    which reset the config to defaults and reload the form before each test."""
+    # Patches only wrap construction; tests that build their own window with
+    # the real methods (e.g. the About paths) must not see them.
+    with pytest.MonkeyPatch.context() as mp:
+        for name in _INERT_WINDOW_METHODS:
+            mp.setattr(SettingsWindow, name, lambda self: None)
+        if sys.platform == "win32":
+            import winreg
+
+            def _no_entry(*_args, **_kwargs):
+                raise FileNotFoundError
+
+            mp.setattr(winreg, "QueryValueEx", _no_entry)
+        home = tmp_path_factory.mktemp("settings_general") / ".sayink"
+        home.mkdir(parents=True)
+        cfg = Config(config_dir=home)
+        win = SettingsWindow(cfg)
+    yield win, cfg
     win.close()
+
+
+def _reset_config(cfg: Config) -> None:
+    """Back to a fresh-install Config: no file on disk, defaults in memory."""
+    cfg._save_timer.stop()
+    cfg._config_file.unlink(missing_ok=True)
+    cfg._secret_value = None
+    cfg._secret_persist_failed = False
+    cfg._secret_read_failed = False
+    cfg._load()
+
+
+@pytest.fixture
+def config(_shared_settings):
+    _win, cfg = _shared_settings
+    _reset_config(cfg)
+    return cfg
+
+
+@pytest.fixture
+def settings_window(_shared_settings, config, monkeypatch):
+    win, _cfg = _shared_settings
+    for name in _INERT_WINDOW_METHODS:
+        monkeypatch.setattr(SettingsWindow, name, lambda self: None)
+    win.hide()
+    win._loading = False
+    win.reload_settings()
+    yield win
 
 
 class TestGeneralPageLayout:
@@ -313,7 +347,15 @@ class TestGeneralPageLayout:
         settings_window._sync_source_device_widgets()
         assert settings_window._mixed_audio_callout.isVisible()
 
-    def test_hotkey_hint_is_one_sentence(self, settings_window):
+    def test_hotkey_hint_is_one_sentence(self, settings_window, config):
+        # Default (hold-to-talk) hint right after load, not the continuous one.
+        text = settings_window._hotkey_hint.text()
+        assert "0.18" in text and "0.30" not in text
+        assert text.count("。") <= 2
+        assert "浮窗" not in text
+
+        config.set("audio.trigger_mode", TRIGGER_MODE_CONTINUOUS)
+        settings_window.reload_settings()
         text = settings_window._hotkey_hint.text()
         assert "0.30" in text
         assert text.count("。") <= 2

@@ -833,7 +833,6 @@ class SettingsWindow(QWidget):
             self._download_source_combo,
             self._config.get("stt.download_source", "auto"),
         )
-        self._refresh_hotkey_hint()
         self._history_enabled_row.setChecked(self._config.get("history.enabled", True))
         if hasattr(self, "_about_auto_update_row"):
             self._about_auto_update_row.setChecked(
@@ -863,6 +862,9 @@ class SettingsWindow(QWidget):
         self._apply_trigger_mode_radios(
             self._config.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY)
         )
+        # After the radios: the hint describes the loaded mode, not whichever
+        # radio happened to be checked before.
+        self._refresh_hotkey_hint()
 
         self._refresh_audio_device_lists()
         mic_ok = self._set_combo_by_data(
