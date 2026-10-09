@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox, QWidget
 
 from sayink.audio_devices import (
     INPUT_SOURCE_MICROPHONE,
+    INPUT_SOURCE_MIXED,
     INPUT_SOURCE_SYSTEM,
 )
 from sayink.config import TRIGGER_MODE_CONTINUOUS, TRIGGER_MODE_HOTKEY, Config
@@ -320,12 +321,13 @@ class TestGeneralPageLayout:
 
 
 class TestTriggerMode:
-    def test_default_continuous_mode(self, settings_window):
-        assert settings_window._trigger_continuous_rb.isChecked()
-        assert not settings_window._trigger_hotkey_rb.isChecked()
-        assert settings_window._selected_trigger_mode() == TRIGGER_MODE_CONTINUOUS
+    def test_default_is_hold_to_talk(self, settings_window):
+        """P-01: dictation is the product; hold-to-talk is the default."""
+        assert settings_window._trigger_hotkey_rb.isChecked()
+        assert not settings_window._trigger_continuous_rb.isChecked()
+        assert settings_window._selected_trigger_mode() == TRIGGER_MODE_HOTKEY
 
-    def test_hotkey_mode_mutually_exclusive(self, settings_window, monkeypatch):
+    def test_continuous_mode_mutually_exclusive(self, settings_window, monkeypatch):
         persisted = []
         monkeypatch.setattr(
             settings_window,
@@ -337,10 +339,47 @@ class TestTriggerMode:
             "_persist_runtime_settings",
             lambda: persisted.append(settings_window._selected_trigger_mode()),
         )
-        settings_window._trigger_hotkey_rb.setChecked(True)
-        assert settings_window._trigger_hotkey_rb.isChecked()
-        assert not settings_window._trigger_continuous_rb.isChecked()
-        assert persisted == [TRIGGER_MODE_HOTKEY]
+        settings_window._trigger_continuous_rb.setChecked(True)
+        assert settings_window._trigger_continuous_rb.isChecked()
+        assert not settings_window._trigger_hotkey_rb.isChecked()
+        assert persisted == [TRIGGER_MODE_CONTINUOUS]
+
+
+class TestOutputMode:
+    """P-01: meeting capture goes to history, not into the front window."""
+
+    def test_default_pastes(self, settings_window, config):
+        assert config.history_only_output() is False
+        assert not settings_window._history_only_output_row.isChecked()
+
+    def test_system_or_mixed_source_switches_to_history_only(self, settings_window, config, monkeypatch):
+        monkeypatch.setattr(settings_window, "_confirm_discard_pending", lambda: True)
+        settings_window._src_sys_rb.setChecked(True)
+        assert config.history_only_output() is True
+        assert settings_window._history_only_output_row.isChecked()
+        assert not settings_window._mixed_audio_callout.isHidden()
+
+    def test_back_to_microphone_restores_paste_only_if_app_chose_it(self, settings_window, config, monkeypatch):
+        monkeypatch.setattr(settings_window, "_confirm_discard_pending", lambda: True)
+        settings_window._src_mixed_rb.setChecked(True)
+        assert config.history_only_output() is True
+        settings_window._src_mic_rb.setChecked(True)
+        assert config.history_only_output() is False
+        assert not settings_window._history_only_output_row.isChecked()
+
+        # The user turns history-only on by hand: the source no longer touches it.
+        settings_window._history_only_output_row.setChecked(True)
+        assert config.get("output.mode_auto") is False
+        settings_window._src_mixed_rb.setChecked(True)
+        settings_window._src_mic_rb.setChecked(True)
+        assert config.history_only_output() is True
+
+    def test_user_can_switch_back_to_paste_while_on_mixed(self, settings_window, config, monkeypatch):
+        monkeypatch.setattr(settings_window, "_confirm_discard_pending", lambda: True)
+        settings_window._src_mixed_rb.setChecked(True)
+        settings_window._history_only_output_row.setChecked(False)
+        assert config.history_only_output() is False
+        assert config.get("audio.input_source") == INPUT_SOURCE_MIXED
 
 
 class TestInputSource:

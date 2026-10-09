@@ -62,6 +62,16 @@ TRIGGER_MODE_CONTINUOUS = "continuous"
 
 DEFAULT_HOTKEY = "alt+x"
 
+# Where a recognized sentence goes: pasted at the cursor (dictation, the
+# product's main job) or written to history only (listening to a meeting
+# through 「仅电脑播放 / 混合」, where pasting into whatever window is in
+# front would be an accident).
+OUTPUT_MODE_PASTE = "paste"
+OUTPUT_MODE_HISTORY = "history"
+OUTPUT_MODES = (OUTPUT_MODE_PASTE, OUTPUT_MODE_HISTORY)
+# Input sources for which the app switches to history-only output by itself.
+HISTORY_ONLY_INPUT_SOURCES = frozenset({"system", "mixed"})
+
 DEFAULT_CONFIG = {
     "hotkey": DEFAULT_HOTKEY,
     "first_run_welcome_seen": True,
@@ -69,10 +79,14 @@ DEFAULT_CONFIG = {
     "sound_enabled": True,
     "output": {
         "restore_clipboard": False,
+        "mode": OUTPUT_MODE_PASTE,
+        # True while the mode was picked by the app (input source changed),
+        # so returning to the microphone can undo it; a manual choice sticks.
+        "mode_auto": False,
     },
     "audio": {
         "input_source": "microphone",
-        "trigger_mode": "continuous",
+        "trigger_mode": TRIGGER_MODE_HOTKEY,
         "mic_device_index": -1,
         "system_device_index": -1,
         "esc_stops_continuous": True,
@@ -419,6 +433,43 @@ class Config:
 
     def get_all(self) -> dict:
         return self._config.copy()
+
+    # ── Output mode ───────────────────────────────────
+
+    def output_mode(self) -> str:
+        mode = self.get("output.mode", OUTPUT_MODE_PASTE)
+        return mode if mode in OUTPUT_MODES else OUTPUT_MODE_PASTE
+
+    def history_only_output(self) -> bool:
+        return self.output_mode() == OUTPUT_MODE_HISTORY
+
+    def set_output_mode(self, mode: str, *, auto: bool = False) -> None:
+        """Pick where results go. ``auto`` marks a choice made by the app."""
+        if mode not in OUTPUT_MODES:
+            mode = OUTPUT_MODE_PASTE
+        self.set("output.mode", mode)
+        self.set("output.mode_auto", bool(auto))
+
+    def follow_input_source_for_output(self, source: str) -> str | None:
+        """Keep output mode in step with the audio source.
+
+        Picking 「仅电脑播放」 or 「混合」 switches to history-only output so a
+        meeting is not typed into the front window; going back to the
+        microphone undoes that, but only when the app made the choice. A
+        history-only mode the user set by hand is left alone, and the user can
+        flip the switch back at any time. Returns the new mode if changed.
+        """
+        current = self.output_mode()
+        auto = bool(self.get("output.mode_auto", False))
+        if source in HISTORY_ONLY_INPUT_SOURCES:
+            if current == OUTPUT_MODE_PASTE:
+                self.set_output_mode(OUTPUT_MODE_HISTORY, auto=True)
+                return OUTPUT_MODE_HISTORY
+            return None
+        if current == OUTPUT_MODE_HISTORY and auto:
+            self.set_output_mode(OUTPUT_MODE_PASTE, auto=False)
+            return OUTPUT_MODE_PASTE
+        return None
 
     @property
     def models_dir(self) -> Path:

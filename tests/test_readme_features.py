@@ -483,6 +483,20 @@ class TestReadmeReliabilityPromises:
 
         return (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
 
+    def test_positioning_and_output_mode_are_documented(self):
+        """P-01: dictation first; meeting capture never types into the front window."""
+        from sayink.config import DEFAULT_CONFIG, TRIGGER_MODE_HOTKEY, OUTPUT_MODE_PASTE
+
+        text = self._readme()
+        assert DEFAULT_CONFIG["audio"]["trigger_mode"] == TRIGGER_MODE_HOTKEY
+        assert DEFAULT_CONFIG["output"]["mode"] == OUTPUT_MODE_PASTE
+        assert "**按住说话**（默认）" in text
+        assert "持续转写（默认）" not in text
+        assert "只记录到历史，不粘贴" in text
+        assert "改回「仅麦克风」会自动恢复粘贴" in text
+        assert "手动改过的选择不会再被来源切换覆盖" in text
+        assert "未保存 · 历史已关闭" in text
+
     def test_output_and_polish_guarantees_are_documented(self):
         text = self._readme()
         assert "就不发送粘贴键" in text

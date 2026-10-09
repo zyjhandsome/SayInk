@@ -35,6 +35,16 @@ from sayink.ui.settings_components import (
 )
 
 
+MIXED_AUDIO_NOTE = (
+    "混合模式可能混入背景音导致识别杂乱。日常口述建议「仅麦克风」。"
+    "选「仅电脑播放」或「混合」后，结果会自动改为只记录到历史、不粘贴；可在下方「偏好」里改回。"
+)
+SYSTEM_AUDIO_NOTE = (
+    "正在听电脑播放的声音：结果会自动改为只记录到历史、不粘贴，"
+    "不会输入到当前窗口；可在下方「偏好」里改回。"
+)
+
+
 def build_general_page(win) -> QWidget:
     """Prototype v3 layout: stacked 录音 → 音频 → 偏好 cards (top to bottom)."""
     page = SettingsPage()
@@ -94,9 +104,7 @@ def build_general_page(win) -> QWidget:
     audio_lay.addWidget(AudioSourcePicker(
         win._src_mic_rb, win._src_sys_rb, win._src_mixed_rb,
     ))
-    win._mixed_audio_callout = info_callout(
-        "混合模式可能混入背景音导致识别杂乱。日常口述建议「仅麦克风」。"
-    )
+    win._mixed_audio_callout = info_callout(MIXED_AUDIO_NOTE)
     win._mixed_audio_callout_wrap = QWidget()
     callout_lay = QHBoxLayout(win._mixed_audio_callout_wrap)
     callout_lay.setContentsMargins(12, 0, 12, 12)
@@ -225,12 +233,19 @@ def build_general_page(win) -> QWidget:
     win._auto_start_row = ToggleOptionRow("开机时自动启动")
     win._sound_row = ToggleOptionRow("录音提示音")
     win._restore_clipboard_row = ToggleOptionRow("粘贴后恢复剪贴板")
+    win._history_only_output_row = ToggleOptionRow(
+        "只记录到历史，不粘贴",
+        "开会或听电脑播放声时用：识别结果只写入历史，不会输入到当前窗口",
+    )
     win._auto_start_row.toggled.connect(win._on_auto_start_toggled)
     win._sound_row.toggled.connect(win._on_sound_toggled)
     win._restore_clipboard_row.toggled.connect(win._on_restore_clipboard_toggled)
+    win._history_only_output_row.toggled.connect(win._on_history_only_output_toggled)
     prefs_lay.addWidget(win._auto_start_row)
     prefs_lay.addWidget(group_divider())
     prefs_lay.addWidget(win._sound_row)
+    prefs_lay.addWidget(group_divider())
+    prefs_lay.addWidget(win._history_only_output_row)
     prefs_lay.addWidget(group_divider())
     prefs_lay.addWidget(win._restore_clipboard_row)
     prefs_lay.addWidget(group_divider())

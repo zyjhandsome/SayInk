@@ -604,12 +604,51 @@ def test_remote_polish_service_without_key_outputs_raw_text() -> None:
 
 
 def test_clipboard_and_error_paste_results_enqueue_history() -> None:
-    with app_harness() as h:
+    with app_harness({"audio.trigger_mode": "continuous"}) as h:
         _drive_segment(h["app"], h["paster"], "copied text", result="clipboard")
         _drive_segment(h["app"], h["paster"], "failed text", result="error:target locked")
 
         records = _enqueued_records(h["history"])
         assert [record.raw_text for record in records] == ["copied text", "failed text"]
+
+
+def test_history_only_output_records_without_pasting() -> None:
+    """P-01: with 「只记录到历史」 a meeting is never typed into the front window."""
+    with app_harness({"audio.trigger_mode": "continuous", "output.mode": "history"}) as h:
+        app = h["app"]
+        _start_continuous_user_session(app)
+        h["recorder"].is_continuous = True
+
+        app._begin_transcription(_audio())
+        app._on_final_result("远端在说话")
+
+        h["paster"].paste_async.assert_not_called()
+        records = _enqueued_records(h["history"])
+        assert [r.raw_text for r in records] == ["远端在说话"]
+        assert records[0].target_app == ""
+        assert h["floating"].show_success.call_args[0][0] == "已记录"
+        assert app._output_busy is False
+
+
+def test_history_only_output_warns_when_history_is_disabled() -> None:
+    with app_harness({"audio.trigger_mode": "hotkey", "output.mode": "history", "history.enabled": False}) as h:
+        app = h["app"]
+        app._begin_transcription(_audio())
+        app._on_final_result("没人保存我")
+
+        h["paster"].paste_async.assert_not_called()
+        h["history"].enqueue.assert_not_called()
+        title, hint = h["floating"].show_info.call_args[0][:2]
+        assert "历史已关闭" in title
+        assert "改回粘贴" in hint
+
+
+def test_default_output_mode_still_pastes() -> None:
+    with app_harness({"audio.trigger_mode": "hotkey"}) as h:
+        app = h["app"]
+        app._begin_transcription(_audio())
+        app._on_final_result("口述一句")
+        h["paster"].paste_async.assert_called_once()
 
 
 def test_esc_does_not_end_continuous_session_when_disabled() -> None:

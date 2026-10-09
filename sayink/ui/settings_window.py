@@ -20,6 +20,8 @@ from sayink.config import (
     DEFAULT_HOTKEY,
     format_hotkey,
     is_reserved_hotkey,
+    OUTPUT_MODE_HISTORY,
+    OUTPUT_MODE_PASTE,
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_HOTKEY,
 )
@@ -50,6 +52,7 @@ from sayink.ui.settings_pages import (
     build_polish_page,
 )
 from sayink.ui.settings_pages.about import paint_about_update_row
+from sayink.ui.settings_pages.general import MIXED_AUDIO_NOTE, SYSTEM_AUDIO_NOTE
 from sayink.ui.model_card import ModelCard, RATING_TOOLTIP, format_model_ratings
 from sayink.ui import design_tokens as _tok
 from sayink.ui import settings_styles as _settings_styles
@@ -740,7 +743,7 @@ class SettingsWindow(QWidget):
         }.get(src, "仅麦克风")
 
     def _config_trigger_label(self, mode: str | None = None) -> str:
-        m = mode or self._config.get("audio.trigger_mode", TRIGGER_MODE_CONTINUOUS)
+        m = mode or self._config.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY)
         return "持续转写" if m == TRIGGER_MODE_CONTINUOUS else "按住录音"
 
     def _refresh_about_hero_status(self) -> None:
@@ -788,9 +791,12 @@ class SettingsWindow(QWidget):
         self._mic_device_combo.setEnabled(mic_on)
         self._system_device_combo.setEnabled(sys_on)
         mixed = self._src_mixed_rb.isChecked()
-        self._mixed_audio_callout.setVisible(mixed)
+        show_note = mixed or src == INPUT_SOURCE_SYSTEM
+        for lbl in self._mixed_audio_callout.findChildren(QLabel):
+            lbl.setText(MIXED_AUDIO_NOTE if mixed else SYSTEM_AUDIO_NOTE)
+        self._mixed_audio_callout.setVisible(show_note)
         if hasattr(self, "_mixed_audio_callout_wrap"):
-            self._mixed_audio_callout_wrap.setVisible(mixed)
+            self._mixed_audio_callout_wrap.setVisible(show_note)
 
     def _set_history_limit_rows_visible(self, visible: bool) -> None:
         self._history_retention_row.setVisible(visible)
@@ -819,6 +825,7 @@ class SettingsWindow(QWidget):
         self._restore_clipboard_row.setChecked(
             self._config.get("output.restore_clipboard", False)
         )
+        self._history_only_output_row.setChecked(self._config.history_only_output())
         self._esc_stop_row.setChecked(
             bool(self._config.get("audio.esc_stops_continuous", True))
         )
@@ -854,7 +861,7 @@ class SettingsWindow(QWidget):
             self._config.get("audio.input_source", INPUT_SOURCE_MICROPHONE)
         )
         self._apply_trigger_mode_radios(
-            self._config.get("audio.trigger_mode", TRIGGER_MODE_CONTINUOUS)
+            self._config.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY)
         )
 
         self._refresh_audio_device_lists()
@@ -1079,12 +1086,15 @@ class SettingsWindow(QWidget):
     def _revert_trigger_mode_radios(self):
         self._loading = True
         self._apply_trigger_mode_radios(
-            self._config.get("audio.trigger_mode", TRIGGER_MODE_CONTINUOUS)
+            self._config.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY)
         )
         self._loading = False
 
     def _persist_runtime_settings(self):
-        self._config.set("audio.input_source", self._selected_input_source())
+        source = self._selected_input_source()
+        if source != self._config.get("audio.input_source", INPUT_SOURCE_MICROPHONE):
+            self._sync_output_mode_with_source(source)
+        self._config.set("audio.input_source", source)
         self._config.set("audio.trigger_mode", self._selected_trigger_mode())
         self._config.set(
             "audio.mic_device_index",
@@ -1150,6 +1160,23 @@ class SettingsWindow(QWidget):
             return
         self._config.set("output.restore_clipboard", checked)
         self.restore_clipboard_changed.emit(checked)
+
+    def _on_history_only_output_toggled(self, checked: bool):
+        if self._loading:
+            return
+        # A hand-made choice is never undone by a later input-source change.
+        self._config.set_output_mode(
+            OUTPUT_MODE_HISTORY if checked else OUTPUT_MODE_PASTE, auto=False
+        )
+        self._config.save_immediate()
+
+    def _sync_output_mode_with_source(self, source: str) -> None:
+        changed = self._config.follow_input_source_for_output(source)
+        if changed is None:
+            return
+        self._loading = True
+        self._history_only_output_row.setChecked(changed == OUTPUT_MODE_HISTORY)
+        self._loading = False
 
     def _on_history_enabled_toggled(self, checked: bool):
         self._set_history_limit_rows_visible(checked)

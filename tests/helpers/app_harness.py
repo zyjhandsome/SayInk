@@ -8,7 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
-from sayink.config import DEFAULT_CONFIG
+from sayink.config import DEFAULT_CONFIG, Config
 
 
 def _config_get(store: dict, key: str, default=None):
@@ -45,6 +45,16 @@ def app_harness(config_overrides: dict | None = None):
     config_mock.set.side_effect = lambda key, value: _config_set(store, key, value)
     config_mock.get_all.return_value = store
     config_mock.models_dir = store.get("stt", {}).get("models_dir") or None
+    # Output-mode helpers are real logic on Config; run them against the
+    # store so tests see the same rules as the app.
+    config_mock.output_mode.side_effect = lambda: Config.output_mode(config_mock)
+    config_mock.history_only_output.side_effect = lambda: Config.history_only_output(config_mock)
+    config_mock.set_output_mode.side_effect = (
+        lambda mode, auto=False: Config.set_output_mode(config_mock, mode, auto=auto)
+    )
+    config_mock.follow_input_source_for_output.side_effect = (
+        lambda source: Config.follow_input_source_for_output(config_mock, source)
+    )
     with TemporaryDirectory() as temp_dir:
         config_mock.config_dir = Path(temp_dir)
 

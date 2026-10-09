@@ -374,7 +374,7 @@ class App(QObject):
             self.apply_appearance_theme()
 
     def _is_continuous_mode(self) -> bool:
-        return self._config.get("audio.trigger_mode", TRIGGER_MODE_CONTINUOUS) == TRIGGER_MODE_CONTINUOUS
+        return self._config.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY) == TRIGGER_MODE_CONTINUOUS
 
     def _continuous_session_active(self) -> bool:
         """True while continuous listen session is running (hotkey started, not yet stopped)."""
@@ -1314,6 +1314,17 @@ class App(QObject):
             return
 
         record = self._freeze_pending_history_record(text, degraded_from_polish)
+        if self._config.history_only_output():
+            # Meeting / playback capture: the words go to history, never to
+            # whatever window happens to be in front.
+            saved = bool(self._config.get("history.enabled", True))
+            log.info("只记录不粘贴：%d 字%s", len(text), "" if saved else "（历史已关闭，未保存）")
+            self._handle_paste_result(
+                PasteResult("recorded", detail="" if saved else "history_disabled"),
+                degraded_from_polish=degraded_from_polish,
+                record=record,
+            )
+            return
         self._output_stage = "paste"
         self._output_stage_text = text
         self._paster.paste_async(text, lambda result, record=record: self._handle_paste_result(
@@ -1413,6 +1424,28 @@ class App(QObject):
                     self._floating.show_info(success_msg, target_hint)
                 else:
                     self._floating.show_success(success_msg, target_hint)
+        elif status == "recorded":
+            saved = error_detail != "history_disabled"
+            title = ("已记录" if saved else "未保存 · 历史已关闭") + ("（原文）" if degraded_from_polish else "")
+            hint = "" if saved else "当前为「只记录到历史」，但历史已关闭；请在设置中打开历史或改回粘贴"
+            self._tray.set_activity_tooltip(
+                "listening" if self._continuous_session_active() else None
+            )
+            if self._continuous_session_active():
+                if saved and not degraded_from_polish:
+                    self._floating.show_success(title, hint)
+                else:
+                    self._floating.show_info(title, hint)
+                QTimer.singleShot(1700, self._refresh_continuous_ui_after_output)
+            elif self._continuous_user_stopped:
+                self._floating.show_continuous_stopped(f"剩余内容：{title}")
+                QTimer.singleShot(2200, self._refresh_continuous_ui_after_output)
+            elif self._recorder.is_recording:
+                self._floating.show_recording()
+            elif saved and not degraded_from_polish:
+                self._floating.show_success(title, hint)
+            else:
+                self._floating.show_info(title, hint)
         elif status == "unverified":
             # Ctrl+V already went out, then the foreground changed. Saying
             # 「已复制」 here invites a second manual paste of the same words.
@@ -2008,14 +2041,18 @@ class App(QObject):
             )
         else:
             hk = format_hotkey(self._config.get("hotkey", DEFAULT_HOTKEY))
-            mode_tip = f"当前为「按住快捷键」：按住 {hk} 说话，松开后识别并粘贴。"
+            mode_tip = (
+                f"当前为「按住说话」（默认）：按住 {hk} 说话，松开后识别并粘贴。"
+                "开会、长口述可在设置 → 通用 中切换到「持续转写」。"
+            )
         text = (
             "SayInk 在本地完成语音识别（可选通过网络调用大模型润色）。\n\n"
             f"{mode_tip}\n\n"
-            "请在设置 → 通用 中选择音频来源：\n"
-            "· 仅麦克风：你的说话\n"
-            "· 仅电脑播放：视频/会议远端声音\n"
-            "· 混合：开会时远端 + 自己都要\n\n"
+            "SayInk 主要用来口述输入：识别结果直接粘贴到光标处。\n"
+            "音频来源在设置 → 通用 中选择：\n"
+            "· 仅麦克风：你的说话（默认）\n"
+            "· 仅电脑播放 / 混合：听会议或视频里的声音；选这两项后结果只记录到历史、"
+            "不粘贴到当前窗口，可在「偏好」里改回\n\n"
             "请先在设置 → 引擎 中下载至少一个语音模型"
             "（若安装包已附带模型，启动后会自动载入）。\n\n"
             "默认快捷键为 Alt+X；可在设置 → 通用 中更改。\n"
