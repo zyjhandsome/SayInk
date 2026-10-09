@@ -276,6 +276,23 @@ class TestPasteAsyncFlow:
         pending[0]()
         assert paste_env["clipboard"] == "用户刚复制的"
 
+    def test_back_to_back_pastes_restore_the_users_clipboard(self, paste_env, monkeypatch):
+        """Regression: the second segment started before the first restore ran,
+        saved the first transcript as 「原剪贴板」 and put it back at the end."""
+        paste_env["set_foreground"]([(1234, "Editor", 1)])
+        pending = []
+        monkeypatch.setattr(
+            tp.QTimer,
+            "singleShot",
+            lambda ms, fn: pending.append(fn) if ms == tp.RESTORE_CLIPBOARD_DELAY_MS else fn(),
+        )
+        paster = TextPaster(restore_clipboard=True)
+        paster.paste_async("第一句", lambda _r: None)
+        paster.paste_async("第二句", lambda _r: None)
+        for restore in pending:
+            restore()
+        assert paste_env["clipboard"] == "OLD"
+
 
 class TestIntegrityCheck:
     def test_own_process_is_not_rejected(self):
@@ -333,7 +350,7 @@ class TestWin32PasteShortcut:
     """The hotkey modifier is often still down when the paste fires. Ctrl+Shift+V
     / Ctrl+Alt+V mean something else in many apps, so lift it for the shortcut."""
 
-    CTRL, V, SHIFT, ALT, UP = 0x11, 0x56, 0x10, 0x12, 0x0002
+    CTRL, V, SHIFT, ALT, RALT, UP, EXT = 0x11, 0x56, 0xA0, 0xA4, 0xA5, 0x0002, 0x0001
 
     def test_plain_ctrl_v_when_nothing_else_is_held(self, fake_user32):
         tp._paste_shortcut_win32()
@@ -357,3 +374,12 @@ class TestWin32PasteShortcut:
         assert fake_user32.events[-3:] == [
             (self.ALT, 0), (tp._VK_MENU_MASK, 0), (tp._VK_MENU_MASK, self.UP),
         ]
+
+    def test_held_right_alt_is_pressed_again_as_right_alt(self, fake_user32):
+        """Re-pressing the generic VK_MENU lands on the left Alt; the user then
+        lets go of the right one and the left Alt stays stuck down."""
+        fake_user32.down = {self.RALT}
+        tp._paste_shortcut_win32()
+        assert fake_user32.events[0] == (self.RALT, self.UP | self.EXT)
+        assert (self.RALT, self.EXT) in fake_user32.events
+        assert all(vk != self.ALT for vk, _ in fake_user32.events)

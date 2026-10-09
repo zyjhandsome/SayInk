@@ -2,12 +2,12 @@
 ; Creates a professional Windows installer with custom installation path
 ;
 ; Version constants are normally passed by build_installer.py:
-;   ISCC /DAppVersionStr=2.2.1 /DAppVersionQuad=2.2.1.0 SayInk-Setup.iss
+;   ISCC /DAppVersionStr=2.2.2 /DAppVersionQuad=2.2.2.0 SayInk-Setup.iss
 #ifndef AppVersionStr
-#define AppVersionStr "2.2.1"
+#define AppVersionStr "2.2.2"
 #endif
 #ifndef AppVersionQuad
-#define AppVersionQuad "2.2.1.0"
+#define AppVersionQuad "2.2.2.0"
 #endif
 
 [Setup]
@@ -54,6 +54,10 @@ Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "autostart"; Description: "开机自动启动"; GroupDescription: "启动选项"; Flags: unchecked
 
+[InstallDelete]
+; Libraries dropped by a newer build must not linger next to the new ones.
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
 ; Paths match build.py PyInstaller output: dist\SayInk\
 Source: "..\dist\SayInk\SayInk.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -68,8 +72,8 @@ Name: "{group}\卸载 SayInk"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\SayInk"; Filename: "{app}\SayInk.exe"; Tasks: desktopicon
 
 [Registry]
-; Auto-start on Windows boot (optional)
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "SayInk"; ValueData: """{app}\SayInk.exe"""; Tasks: autostart; Flags: uninsdeletevalue
+; The autostart task is written in [Code] for the signed-in user: HKCU here
+; would be the hive of whichever admin approved the UAC prompt.
 ; App paths for Windows to find the executable
 Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\SayInk.exe"; ValueType: string; ValueName: ""; ValueData: "{app}\SayInk.exe"; Flags: uninsdeletekey
 
@@ -85,23 +89,38 @@ Type: filesandordirs; Name: "{app}"
 [Code]
 const
   LegacyUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\VoiceInk_is1';
+  RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+
+// Setup runs elevated, possibly as another account (a standard user typing an
+// admin password). Per-user data, the Run key and Start Menu entries belong
+// to the user who started Setup, so those commands run as that user and let
+// %USERPROFILE% / %APPDATA% / HKCU resolve to their profile.
+function RunAsUser(const Filename, Params: string): Integer;
+var
+  ResultCode: Integer;
+begin
+  if ExecAsOriginalUser(Filename, Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Result := ResultCode
+  else
+    Result := -1;
+end;
 
 // VoiceInk ≤ 2.1.0 kept its data in ~\.voiceink. Rename it before the old
 // uninstaller runs so its「是否删除用户配置」prompt never sees the folder;
-// the app performs the same move on first start for portable copies.
+// if a file is locked the app retries the move on its next start.
 procedure MigrateLegacyDataDir();
-var
-  OldDir, NewDir: string;
 begin
-  OldDir := ExpandConstant('{%USERPROFILE}\.voiceink');
-  NewDir := ExpandConstant('{%USERPROFILE}\.sayink');
-  if DirExists(OldDir) and (not DirExists(NewDir)) then
-  begin
-    if RenameFile(OldDir, NewDir) then
-      Log('Moved ' + OldDir + ' to ' + NewDir)
-    else
-      Log('Could not move ' + OldDir + '; the app will retry on first start');
-  end;
+  RunAsUser(ExpandConstant('{cmd}'),
+    '/c if exist "%USERPROFILE%\.voiceink\" if not exist "%USERPROFILE%\.sayink" ' +
+    'move "%USERPROFILE%\.voiceink" "%USERPROFILE%\.sayink"');
+end;
+
+// Unknown (the check could not run) counts as present: skipping the old
+// uninstaller is harmless, running it next to the data is not.
+function UserHasLegacyDataDir(): Boolean;
+begin
+  Result := RunAsUser(ExpandConstant('{cmd}'),
+    '/c if exist "%USERPROFILE%\.voiceink\" (exit 1) else (exit 0)') <> 0;
 end;
 
 // Remove a VoiceInk install (same program, old name) so both do not sit in
@@ -117,9 +136,56 @@ begin
   UninstallString := RemoveQuotes(UninstallString);
   if not FileExists(UninstallString) then
     Exit;
+  // Its uninstaller asks with a plain MsgBox (not suppressible) whether to
+  // delete ~\.voiceink; never let it run while the data still lives there.
+  if UserHasLegacyDataDir() then
+  begin
+    Log('Legacy data folder still present; skipping the VoiceInk uninstaller');
+    Exit;
+  end;
   Log('Removing legacy VoiceInk via ' + UninstallString);
-  Exec('taskkill', '/F /IM VoiceInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
-  Exec(UninstallString, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+  if Exec(UninstallString, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode)
+    and (ErrorCode = 0) then
+    // The old app made this per-user shortcut itself; its uninstaller does
+    // not know about it and it now points at a deleted EXE.
+    RunAsUser(ExpandConstant('{cmd}'),
+      '/c del /q "%APPDATA%\Microsoft\Windows\Start Menu\Programs\VoiceInk.lnk"');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if (CurStep = ssPostInstall) and WizardIsTaskSelected('autostart') then
+    RunAsUser(ExpandConstant('{sys}\reg.exe'),
+      'add "HKCU\' + RunKey + '" /v SayInk /t REG_SZ /d "\"' +
+      ExpandConstant('{app}') + '\SayInk.exe\"" /f');
+end;
+
+// The app writes its own Run value (settings → 开机自启) and a Start Menu
+// shortcut (taskbar name/icon) for each user who starts it; Setup never
+// recorded either. Clean them for every signed-in user, but only a Run value
+// that launches this install, so a source checkout's entry survives.
+procedure RemovePerUserLeftovers();
+var
+  Users: TArrayOfString;
+  I: Integer;
+  AppExe, Value, Programs: string;
+begin
+  AppExe := Lowercase(ExpandConstant('{app}\SayInk.exe'));
+  if not RegGetSubkeyNames(HKU, '', Users) then
+    Exit;
+  for I := 0 to GetArrayLength(Users) - 1 do
+  begin
+    if RegQueryStringValue(HKU, Users[I] + '\' + RunKey, 'SayInk', Value)
+      and (Pos(AppExe, Lowercase(Value)) > 0) then
+    begin
+      RegDeleteValue(HKU, Users[I] + '\' + RunKey, 'SayInk');
+      Log('Removed Run\SayInk for ' + Users[I]);
+    end;
+    if RegQueryStringValue(HKU,
+      Users[I] + '\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders',
+      'Programs', Programs) then
+      DeleteFile(AddBackslash(Programs) + 'SayInk.lnk');
+  end;
 end;
 
 function InitializeSetup(): Boolean;
@@ -128,6 +194,9 @@ var
 begin
   // Kill any running SayInk process before installing
   Exec('taskkill', '/F /IM SayInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+  // A running VoiceInk holds files in ~\.voiceink open and the rename fails.
+  Exec('taskkill', '/F /IM VoiceInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+  Sleep(1000);
   MigrateLegacyDataDir();
   UninstallLegacyVoiceInk();
   Result := True;
@@ -139,6 +208,7 @@ var
 begin
   if CurUninstallStep = usUninstall then
   begin
+    RemovePerUserLeftovers();
     // Ask user if they want to delete user data
     SayInkDataDir := ExpandConstant('{%USERPROFILE}\.sayink');
     if DirExists(SayInkDataDir) then

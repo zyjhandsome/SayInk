@@ -37,7 +37,7 @@ class TestFormatHotkey:
 
 class TestConfigDefaults:
     def test_default_hotkey(self):
-        assert DEFAULT_CONFIG["hotkey"] == "shift+x"
+        assert DEFAULT_CONFIG["hotkey"] == "alt+x"
 
     def test_default_sound_enabled(self):
         assert DEFAULT_CONFIG["sound_enabled"] is True
@@ -86,7 +86,7 @@ class TestConfigInit:
         with open(config_home / "config.json", "w", encoding="utf-8") as f:
             json.dump({}, f)
         config = Config(config_dir=config_home)
-        assert config.get("hotkey") == "shift+x"
+        assert config.get("hotkey") == "alt+x"
         assert config.get("sound_enabled") is True
 
     def test_config_loads_existing(self, config_home):
@@ -101,6 +101,14 @@ class TestConfigInit:
         assert config.get("hotkey") == "alt+space"
         assert config.get("sound_enabled") is False
         assert config.get("stt.model_id") == "sensevoice"
+
+    def test_model_chosen_after_migration_survives_restart(self, config_home):
+        """Regression: migration_version was dropped on load, so the one-time
+        migration reran every start and reset Qwen3 / FireRed to Fun-ASR-Nano."""
+        config = Config(config_dir=config_home)
+        config.set("stt.model_id", "qwen3-asr-0.6b")
+        config.save_immediate()
+        assert Config(config_dir=config_home).get("stt.model_id") == "qwen3-asr-0.6b"
 
 
 class TestConfigGetSet:
@@ -187,6 +195,7 @@ def test_reserved_hotkeys_are_detected_regardless_of_order():
     assert is_reserved_hotkey("cmd+l")
     assert not is_reserved_hotkey("alt+z")
     assert not is_reserved_hotkey("shift+x")
+    assert not is_reserved_hotkey("alt+x")
     assert not is_reserved_hotkey("alt+space")
 
 
@@ -214,7 +223,7 @@ def test_non_object_config_is_treated_as_unreadable(config_home):
 
     (config_home / "config.json").write_text("[1, 2]", encoding="utf-8")
     cfg = Config(config_dir=config_home)
-    assert cfg.get("hotkey") == "shift+x"
+    assert cfg.get("hotkey") == "alt+x"
     assert list(config_home.glob("config.corrupt-*.json"))
 
 
@@ -345,7 +354,10 @@ def test_unreadable_store_scrubs_plaintext_key_from_file(config_home):
     from sayink.config import Config
 
     _write_config(config_home, {"llm": {"api_key": "sk-file"}})
-    cfg = Config(config_dir=config_home, secret_store=_FakeSecrets(unreadable=True))
+    cfg = Config(
+        config_dir=config_home,
+        secret_store=_FakeSecrets(unreadable=True, fail_write=True),
+    )
 
     assert cfg.get("llm.api_key") == "sk-file"
     assert cfg.secret_persist_failed is True
@@ -353,6 +365,20 @@ def test_unreadable_store_scrubs_plaintext_key_from_file(config_home):
     cfg.set("sound_enabled", False)
     cfg.save_immediate()
     assert "sk-file" not in (config_home / "config.json").read_text(encoding="utf-8")
+
+
+def test_unreadable_but_writable_store_still_takes_the_file_key(config_home):
+    """Reading can fail where writing works; the key must not be lost then."""
+    from sayink.config import Config
+
+    _write_config(config_home, {"llm": {"api_key": "sk-file"}})
+    secrets = _FakeSecrets(unreadable=True)
+    cfg = Config(config_dir=config_home, secret_store=secrets)
+
+    assert secrets.writes == ["sk-file"]
+    assert cfg.get("llm.api_key") == "sk-file"
+    assert cfg.secret_persist_failed is False
+    assert _key_on_disk(config_home) == ""
 
 
 def test_failed_migration_scrubs_plaintext_key_from_file(config_home):

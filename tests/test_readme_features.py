@@ -106,7 +106,41 @@ class TestReadmeHoldHotkeyFlow:
             h["app"]._on_recording_stop()
 
             h["recorder"].stop.assert_not_called()
-            h["floating"].dismiss_if_idle.assert_called_once()
+            h["tray"].set_recording.assert_called_with(False)
+            h["tray"].set_activity_tooltip.assert_called_with(None)
+
+    def test_release_of_refused_hold_keeps_the_reason_on_screen(self):
+        """README P0: 加载中不被其它错误盖住. Letting go of a hold refused
+        while the model loads (or the previous utterance is still being
+        recognized) used to hide the bar and drop the loading lock."""
+        with app_harness({"audio.trigger_mode": "hotkey"}) as h:
+            h["recorder"].is_recording = False
+            h["recognizer"].is_loading = True
+            h["floating"].reset_mock()
+            h["tray"].reset_mock()
+            h["app"]._on_recording_stop()
+            h["floating"].dismiss_if_idle.assert_not_called()
+            h["tray"].set_activity_tooltip.assert_not_called()
+
+            h["recognizer"].is_loading = False
+            h["app"]._is_transcribing = True
+            h["app"]._on_recording_stop()
+            h["floating"].dismiss_if_idle.assert_not_called()
+            h["tray"].set_activity_tooltip.assert_not_called()
+
+    def test_esc_during_hold_cancels_once_and_keeps_cancelled_visible(self):
+        with app_harness({"audio.trigger_mode": "hotkey"}) as h:
+            app = h["app"]
+            h["recorder"].is_recording = True
+            h["recorder"].cancel.side_effect = lambda: setattr(h["recorder"], "is_recording", False)
+            h["floating"].reset_mock()
+            # The hotkey manager emits both signals for one Esc press.
+            app._on_esc_pressed()
+            app._on_recording_cancel()
+
+            h["recorder"].cancel.assert_called_once()
+            h["floating"].show_cancelled.assert_called_once()
+            assert h["floating"].mock_calls[-1][0] == "show_cancelled"
 
     def test_esc_cancels_recording(self):
         with app_harness({"audio.trigger_mode": "hotkey"}) as h:
@@ -122,11 +156,12 @@ class TestReadmeHoldHotkeyFlow:
         the previous utterance was still recognizing) leaves nothing to cancel."""
         with app_harness({"audio.trigger_mode": "hotkey"}) as h:
             h["recorder"].is_recording = False
+            h["floating"].reset_mock()
             h["app"]._on_recording_cancel()
 
             h["recorder"].cancel.assert_not_called()
             h["floating"].show_cancelled.assert_not_called()
-            h["floating"].dismiss_if_idle.assert_called()
+            h["floating"].dismiss_if_idle.assert_not_called()
 
     def test_recording_too_short_shows_friendly_error(self):
         with app_harness({"audio.trigger_mode": "hotkey"}) as h:
@@ -257,6 +292,19 @@ class TestReadmeContinuousMode:
             h["app"]._on_hotkey_tap_too_short()
             h["floating"].show_continuous_idle.assert_not_called()
             h["tray"].showMessage.assert_called()
+
+    def test_recognition_error_after_session_ended_does_not_reopen_the_mic(self):
+        """Settings save / model reload / device loss end the session; a late
+        recognition error must not start listening again on its own."""
+        with app_harness({"audio.trigger_mode": "continuous"}) as h:
+            h["recorder"].is_continuous = False
+            h["app"]._continuous_user_stopped = False
+            with patch("sayink.app.QTimer.singleShot") as later:
+                h["app"]._on_recognizer_error("识别失败")
+            assert not any(
+                c.args[1] == h["app"]._start_continuous_listening
+                for c in later.call_args_list
+            )
 
     def test_close_button_stops_continuous_session(self):
         with app_harness({"audio.trigger_mode": "continuous"}) as h:

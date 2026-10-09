@@ -704,6 +704,16 @@ class TestLongUtteranceSlicing:
         assert merge_slice_texts(["你好啊", "你坏啊今天"]) == "你好啊你坏啊今天"
         assert merge_slice_texts(["前十五秒", "后十五秒"]) == "前十五秒后十五秒"
 
+    def test_separate_utterances_keep_repeated_words_and_spaces(self):
+        """Regression: hold-to-talk segments went through the overlap merger,
+        which deleted 「谢谢」 from 「谢谢」+「谢谢大家」 and glued English words."""
+        from sayink.speech_recognizer import join_segment_texts
+
+        assert join_segment_texts(["谢谢", "谢谢大家"]) == "谢谢谢谢大家"
+        assert join_segment_texts(["我说好", "好的没问题"]) == "我说好好的没问题"
+        assert join_segment_texts(["hello world", "how are you"]) == "hello world how are you"
+        assert join_segment_texts(["用 Python", "写脚本", "", "OK"]) == "用 Python写脚本OK"
+
     def test_slice_boundaries_land_on_the_quietest_frame(self):
         from sayink.speech_recognizer import SAMPLE_RATE, plan_audio_slices
 

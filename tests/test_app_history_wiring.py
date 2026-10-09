@@ -519,6 +519,20 @@ def test_stuck_polish_falls_back_to_raw_text() -> None:
         assert [(r.raw_text, r.polished_text) for r in records] == [("AAA", "AAA")]
 
 
+def test_polish_answering_after_the_timeout_is_not_pasted_again() -> None:
+    with app_harness(_POLISH_ON) as h:
+        app, paster = h["app"], h["paster"]
+        app._begin_transcription(_audio())
+        app._on_final_result("AAA")
+        app._release_stuck_output(app._output_token)
+        assert h["polisher"].cancel.called
+        paster.paste_async.call_args[0][1]("pasted")
+
+        app._on_polish_complete("AAA。")
+        app._on_polish_error("超时")
+        assert paster.paste_async.call_count == 1
+
+
 def test_stuck_paste_releases_queue_and_keeps_words_on_clipboard() -> None:
     with app_harness(_POLISH_ON) as h, patch("sayink.app.pyperclip.copy") as copy:
         app, paster = h["app"], h["paster"]

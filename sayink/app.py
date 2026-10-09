@@ -37,7 +37,7 @@ from sayink.speech_recognizer import (
     set_models_dir,
     normalize_asr_output,
     get_model_info,
-    merge_slice_texts,
+    join_segment_texts,
 )
 from sayink.history_store import HistoryStore, SegmentRecord
 from sayink.text_polisher import (
@@ -152,15 +152,21 @@ def _has_negation(text: str) -> bool:
 
 
 def _proper_nouns(text: str) -> set[str]:
-    """Latin names worth keeping verbatim: GitHub, iPhone, API, GPT4."""
+    """Latin names worth keeping verbatim: GitHub, iPhone, API, AI, Python,
+    GPT4. All-lowercase words are left out so dropped English filler is not
+    mistaken for a lost name."""
     names = set()
     for token in _LATIN_TOKEN_RE.findall(text):
-        camel = any(c.isupper() for c in token[1:]) and any(c.islower() for c in token)
-        acronym = len(token) >= 3 and token.isupper()
-        alnum = any(c.isdigit() for c in token)
-        if camel or acronym or alnum:
+        if len(token) >= 2 and any(c.isupper() or c.isdigit() for c in token):
             names.add(token.casefold())
     return names
+
+
+def _keeps_name(name: str, folded: str) -> bool:
+    # Whole word only: API inside "rapid" is not the name. Spacing may change
+    # either way (iPhone15 → iPhone 15), so try the text with and without it.
+    pattern = re.compile(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])")
+    return any(pattern.search(t) for t in (folded, re.sub(r"\s+", "", folded)))
 
 
 def polish_rejection_reason(raw: str, polished: str) -> str:
@@ -187,8 +193,8 @@ def polish_rejection_reason(raw: str, polished: str) -> str:
     # Count, not presence: 我不同意，也没准备好 → 我不同意，也准备好了 drops one.
     if _negation_count(polished) < _negation_count(raw):
         return "否定词丢失"
-    folded = re.sub(r"\s+", "", polished.casefold())
-    if any(name not in folded for name in _proper_nouns(raw)):
+    folded = polished.casefold()
+    if any(not _keeps_name(name, folded) for name in _proper_nouns(raw)):
         return "英文专名丢失"
     return ""
 
@@ -278,10 +284,10 @@ class App(QObject):
                 return hint
         return original_msg
 
-    def __init__(self):
+    def __init__(self, config: Config | None = None):
         super().__init__()
 
-        self._config = Config()
+        self._config = config if config is not None else Config()
         self._current_transcription = ""
         self._live_committed = ""
         self._live_inflight = ""
@@ -545,9 +551,9 @@ class App(QObject):
         if self._continuous_session_active():
             if self._config.get("audio.esc_stops_continuous", True):
                 self._stop_continuous_user_session()
-            return
-        if self._recorder.is_recording and not self._is_continuous_mode():
-            self._on_recording_cancel()
+        # Hold-to-talk: the hotkey manager sends recording_cancel itself; a
+        # second cancel from here would find the recorder stopped and hide
+        # 「已取消」 at once.
 
     def _on_hotkey_listener_status(self, ok: bool, message: str):
         if ok:
@@ -645,7 +651,7 @@ class App(QObject):
         if self._is_continuous_mode():
             return
         if not self._recorder.is_recording:
-            self._reset_recording_ui_after_abort()
+            self._release_unstarted_hold()
             return
 
         log.info("停止录音，开始识别...")
@@ -663,6 +669,14 @@ class App(QObject):
         if not self._is_continuous_mode():
             self._floating.dismiss_if_idle()
 
+    def _release_unstarted_hold(self) -> None:
+        """The key went up on a hold the app refused or failed to start. The
+        bar is showing why (模型载入中 / 请稍候 / an error) and dismisses that
+        itself; the tray keeps describing work still in flight."""
+        self._tray.set_recording(False)
+        if not (self._pipeline_busy() or self._recognizer.is_loading):
+            self._tray.set_activity_tooltip(None)
+
     def _on_recording_cancel(self):
         if self._is_continuous_mode():
             return
@@ -671,7 +685,7 @@ class App(QObject):
             # was still in the pipeline, or aborted early), so Esc has nothing
             # to cancel. The utterance already in flight was not asked to go.
             log.info("Esc：当前没有进行中的录音，忽略取消")
-            self._reset_recording_ui_after_abort()
+            self._release_unstarted_hold()
             return
         self._hold_paste_sent = True
         self._hold_duration_ms = 0
@@ -757,7 +771,8 @@ class App(QObject):
         detail = f"正在处理剩余内容（{pending} 段）" if pending else ""
         self._floating.show_continuous_stopped(detail)
         if not pending:
-            QTimer.singleShot(1200, self._floating.dismiss_if_idle)
+            # Re-checks state: a session restarted within the delay keeps its bar.
+            QTimer.singleShot(1200, self._refresh_continuous_ui_after_output)
 
     def _on_recorder_error(self, error_msg: str):
         if self._recorder.is_continuous:
@@ -919,11 +934,18 @@ class App(QObject):
         if not self._recognizer.is_ready:
             self._hold_audio_until_ready(audio, route, front=False, context=context)
             return
-        if self._pipeline_busy():
+        if self._pipeline_busy() or self._segment_queue:
             self._enqueue_audio(audio, route, context=context)
             log.debug("转写排队，队列长度 %d", len(self._segment_queue))
+            self._schedule_queue_pump()
             return
         self._begin_transcription(audio, route=route, context=context)
+
+    def _schedule_queue_pump(self) -> None:
+        # Older segments may be waiting out the post-paste pause; joining the
+        # queue instead of starting right away keeps them in spoken order.
+        if not self._pipeline_busy():
+            QTimer.singleShot(300, self._pump_segment_queue)
 
     # ── Recognition ───────────────────────────────────
 
@@ -940,8 +962,9 @@ class App(QObject):
             self._reset_recording_ui_after_abort()
             self._floating.show_error(self._friendly_error("录音过短"))
             return
-        if self._pipeline_busy():
+        if self._pipeline_busy() or self._segment_queue:
             self._enqueue_audio(full_audio)
+            self._schedule_queue_pump()
             return
         self._begin_transcription(full_audio)
 
@@ -1007,7 +1030,7 @@ class App(QObject):
 
     def _show_live_transcript(self) -> None:
         parts = [self._live_committed, self._live_inflight]
-        text = merge_slice_texts([part for part in parts if part])
+        text = join_segment_texts(parts)
         if text:
             self._floating.show_live_transcript(text)
 
@@ -1023,7 +1046,7 @@ class App(QObject):
         if not piece:
             return
         if self._live_committed:
-            self._live_committed = merge_slice_texts([self._live_committed, piece])
+            self._live_committed = join_segment_texts([self._live_committed, piece])
         else:
             self._live_committed = piece
         self._live_inflight = ""
@@ -1124,6 +1147,7 @@ class App(QObject):
             # The polisher never answered. Its result would have been this
             # sentence anyway, so output the raw words instead of losing them.
             log.error("润色超时未回调，改为输出原文")
+            self._polisher.cancel()
             self._output_stage = "paste"
             self._output_text(raw, degraded_from_polish=True)
             return
@@ -1199,8 +1223,6 @@ class App(QObject):
         self._sound.play_error()
         self._floating.show_error(self._friendly_error(error_msg))
         self._pump_segment_queue()
-        if self._is_continuous_mode() and not self._recorder.is_continuous and not self._continuous_user_stopped:
-            QTimer.singleShot(1500, self._start_continuous_listening)
 
     def _pump_segment_queue(self):
         if self._pipeline_busy() or not self._segment_queue:
@@ -1247,6 +1269,9 @@ class App(QObject):
     # ── Polishing ─────────────────────────────────────
 
     def _on_polish_complete(self, polished_text: str):
+        if self._output_stage != "polish":
+            log.warning("润色结果晚于超时到达，已输出原文，忽略")
+            return
         raw = self._output_raw_text
         reason = polish_rejection_reason(raw, polished_text) if raw else ""
         if reason:
@@ -1259,6 +1284,8 @@ class App(QObject):
         self._output_text(polished_text)
 
     def _on_polish_error(self, error_msg: str):
+        if self._output_stage != "polish":
+            return
         log.warning("后处理失败，降级输出原文: %s", error_msg)
         self._output_text(
             self._output_raw_text,
@@ -1646,6 +1673,11 @@ class App(QObject):
         apply_theme(QApplication.instance(), mode=theme_mode, surfaces=surfaces)
 
     def _on_settings_changed(self):
+        # Drop only what the confirmation counted; the sentence cut off by
+        # stopping below is still the user's speech and gets transcribed.
+        if self._segment_queue:
+            log.warning("设置已保存，丢弃 %d 段待识别语音", len(self._segment_queue))
+        self._clear_queued_audio()
         was_continuous = self._recorder.is_continuous
         if was_continuous:
             self._stop_continuous_listening()
@@ -1657,9 +1689,6 @@ class App(QObject):
         set_models_dir(self._config.models_dir)
         self._configure_stt()
         self._update_tray_models()
-        if self._pending_segment_count() > 0:
-            log.warning("设置已保存，丢弃 %d 段待识别语音", self._pending_segment_count())
-        self._clear_queued_audio()
         self._paster.restore_clipboard = self._config.get(
             "output.restore_clipboard", False
         )
@@ -1989,7 +2018,7 @@ class App(QObject):
             "· 混合：开会时远端 + 自己都要\n\n"
             "请先在设置 → 引擎 中下载至少一个语音模型"
             "（若安装包已附带模型，启动后会自动载入）。\n\n"
-            "默认快捷键为 Shift+X；可在设置 → 通用 中更改。\n"
+            "默认快捷键为 Alt+X；可在设置 → 通用 中更改。\n"
             "Windows：双击托盘图标可打开主窗口。"
         )
         box = self._dialog("欢迎使用 SayInk", text, QMessageBox.Icon.Information)

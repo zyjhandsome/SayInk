@@ -273,7 +273,9 @@ def main():
     apply_theme(app, mode=_boot_config.get("appearance.theme_mode", "dark"))
 
     from sayink.app import App
-    say_ink = App()
+    # Reuse it: a second Config would not see a plaintext API key the first one
+    # already moved out of config.json when Credential Manager was unreadable.
+    say_ink = App(_boot_config)
     say_ink.start()
     _activation_server = start_activation_server(say_ink.show_main_window)
 

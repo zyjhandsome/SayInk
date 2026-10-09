@@ -112,7 +112,7 @@ class HotKeyManager(QObject):
     # 从 pynput 线程投递到 Qt 主线程，再启动 QTimer
     _arm_hold_on_main = pyqtSignal()
 
-    def __init__(self, hotkey_str: str = "shift+x", parent=None):
+    def __init__(self, hotkey_str: str = "alt+x", parent=None):
         super().__init__(parent)
         self._hotkey_keys = parse_hotkey(hotkey_str)
         self._hotkey_str = hotkey_str
@@ -190,8 +190,9 @@ class HotKeyManager(QObject):
     def _replay_swallowed_tap(self, vk: int) -> None:
         """Type the key a too-short tap swallowed.
 
-        The default hotkey is Shift+X: the filter has to eat X while Shift is
-        held or a recording would type XXXX into the focused app, but then a
+        With a Shift+letter hotkey such as Shift+X the filter has to eat X
+        while Shift is held or a recording would type XXXX into the focused
+        app, but then a
         normal capital X typed by the user would vanish too. When the hold
         never reached the threshold, re-send the keystroke as an injected
         event (which the filter lets through).
@@ -279,9 +280,18 @@ class HotKeyManager(QObject):
         kwargs = {}
         if sys.platform == "win32":
             kwargs["win32_event_filter"] = self._win32_event_filter
+        # pynput 1.8 counts keyword-only parameters when deciding whether to
+        # pass ``injected``, and stops the listener when a callback returns
+        # False; ``_on_release`` has both, so pynput only sees these wrappers.
+        def on_press(key):
+            self._on_press(key)
+
+        def on_release(key):
+            self._on_release(key)
+
         self._listener = keyboard.Listener(
-            on_press=self._on_press,
-            on_release=self._on_release,
+            on_press=on_press,
+            on_release=on_release,
             **kwargs,
         )
         self._listener.daemon = True
@@ -423,6 +433,11 @@ class HotKeyManager(QObject):
         with self._lock:
             if self._paused:
                 return
+            # Auto-repeat re-sends keys that are already down; only the press
+            # that completes the combo starts a hold. Re-arming on repeats
+            # would clear ``_hold_activated`` after continuous listening began
+            # and make the release replay the swallowed key as typed text.
+            was_complete = self._hotkey_still_held_locked()
             self._pressed_keys.add(normalized)
 
             if key == keyboard.Key.esc:
@@ -433,10 +448,10 @@ class HotKeyManager(QObject):
                 return
 
             if (
-                not self._is_recording
+                not was_complete
+                and not self._is_recording
                 and not self._hold_pending
-                and self._hotkey_keys
-                and self._hotkey_keys.issubset(self._pressed_keys)
+                and self._hotkey_still_held_locked()
             ):
                 self._hold_pending = True
                 self._hold_activated = False

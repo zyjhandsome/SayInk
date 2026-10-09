@@ -17,6 +17,10 @@ log = logging.getLogger("SayInk")
 DATA_DIR_NAME = ".sayink"
 LEGACY_DATA_DIR_NAME = ".voiceink"
 
+# One answer per home for the whole process: config, logs and models must not
+# end up split across both folders if a later retry happens to succeed.
+_resolved: dict[Path, Path] = {}
+
 
 def migrate_legacy_data_dir(home: Path | None = None) -> bool:
     """Move ``~/.voiceink`` to ``~/.sayink`` once. Returns True when a move happened."""
@@ -35,7 +39,19 @@ def migrate_legacy_data_dir(home: Path | None = None) -> bool:
 
 
 def user_data_dir(home: Path | None = None) -> Path:
-    """``~/.sayink`` (after migrating a legacy ``~/.voiceink`` when present)."""
+    """``~/.sayink`` (after migrating a legacy ``~/.voiceink`` when present).
+
+    When the move fails (a file in it is locked), this run keeps using
+    ``~/.voiceink``. Creating an empty ``~/.sayink`` instead would hide the old
+    settings and history and stop every later start from retrying the move.
+    """
     home = Path(home) if home is not None else Path.home()
+    cached = _resolved.get(home)
+    if cached is not None:
+        return cached
     migrate_legacy_data_dir(home)
-    return home / DATA_DIR_NAME
+    new_dir = home / DATA_DIR_NAME
+    old_dir = home / LEGACY_DATA_DIR_NAME
+    chosen = old_dir if not new_dir.exists() and old_dir.is_dir() else new_dir
+    _resolved[home] = chosen
+    return chosen

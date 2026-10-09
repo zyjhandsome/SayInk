@@ -40,6 +40,9 @@ class WindowsCredentialStore:
         if value or value is None or not self._legacy_target:
             return value
         legacy = self._read_target(self._legacy_target)
+        if legacy is None:
+            # Unreadable is not "no key": the caller must not treat it as blank.
+            return None
         if not legacy:
             return value
         # Carry the key over so the old entry can go; keep it if the write fails.

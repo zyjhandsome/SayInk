@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 
 class TestResolveEffectiveTheme:
     def test_explicit_light(self):
@@ -707,6 +709,60 @@ class TestFourSurfaceThemeAwareProtocol:
         apply_theme(mode="light", surfaces=(boom, tracker))
         assert tracker.called
         assert any("表面换肤失败" in record.message for record in caplog.records)
+
+
+@pytest.mark.parametrize("start, target", [("dark", "light"), ("light", "dark")])
+def test_runtime_switch_leaves_no_widget_with_old_theme_colors(
+    tmp_path: Path, monkeypatch, start, target
+):
+    """Regression: the engine page's model-list headings and the About page's
+    update row were styled once at build time and kept the old theme."""
+    import re
+    import sys
+
+    from PyQt6.QtCore import QEvent
+    from PyQt6.QtWidgets import QApplication, QWidget
+
+    from sayink.config import Config
+    from sayink.history_store import HistoryStore
+    from sayink.ui import design_tokens as tok
+    from sayink.ui.floating_window import FloatingWindow
+    from sayink.ui.main_window import PAGE_KEYS, MainWindow
+    from sayink.ui.settings_window import SettingsWindow
+    from sayink.ui.theme import apply_theme
+
+    def hex_colors(theme):
+        found = set()
+        for value in tok.tokens_for(theme).values():
+            if isinstance(value, str):
+                found.update(c.lower() for c in re.findall(r"#[0-9a-fA-F]{6}\b", value))
+        return found
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    monkeypatch.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)
+    apply_theme(mode=start)
+    win = MainWindow(Config(config_dir=tmp_path), HistoryStore(tmp_path / "h.db"))
+    floating = FloatingWindow()
+    try:
+        for key in PAGE_KEYS:
+            win.show_page(key)
+        apply_theme(
+            mode=target,
+            surfaces=(win, floating, win._settings, win._history),
+        )
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+
+        stale_colors = hex_colors(start) - hex_colors(target)
+        stale = [
+            (type(w).__name__, w.objectName(), w.property("viRole"))
+            for w in [win, floating, *win.findChildren(QWidget), *floating.findChildren(QWidget)]
+            if any(c in w.styleSheet().lower() for c in stale_colors)
+        ]
+        assert stale == []
+    finally:
+        win.close()
+        floating.close()
+        apply_theme(mode="light")
 
 
 def test_watch_system_color_scheme_connects_to_style_hints():

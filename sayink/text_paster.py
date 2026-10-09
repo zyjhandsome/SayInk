@@ -217,13 +217,18 @@ def _paste_shortcut():
         subprocess.run(["xdotool", "key", "ctrl+v"], timeout=2, check=True)
 
 
-_VK_SHIFT = 0x10
-_VK_MENU = 0x12  # Alt
+# Sided VKs: re-pressing the generic VK_SHIFT / VK_MENU lands on the left key,
+# so a held right Alt would come back as a left Alt that is never released.
+_VK_LSHIFT, _VK_RSHIFT = 0xA0, 0xA1
+_VK_LMENU, _VK_RMENU = 0xA4, 0xA5  # Alt
 _VK_LWIN, _VK_RWIN = 0x5B, 0x5C
+_SHIFT_VKS = (_VK_LSHIFT, _VK_RSHIFT)
+_EXTENDED_VKS = frozenset((_VK_RMENU, _VK_LWIN, _VK_RWIN))
+_KEYEVENTF_EXTENDEDKEY = 0x0001
 # Unassigned VK AutoHotkey uses as a "menu mask": pressed between an Alt/Win
 # down and up it keeps Windows from opening the menu bar / Start on release.
 _VK_MENU_MASK = 0xE8
-_STRAY_MODIFIER_VKS = (_VK_SHIFT, _VK_MENU, _VK_LWIN, _VK_RWIN)
+_STRAY_MODIFIER_VKS = (_VK_LSHIFT, _VK_RSHIFT, _VK_LMENU, _VK_RMENU, _VK_LWIN, _VK_RWIN)
 
 
 def _held_stray_modifiers(user32) -> list[int]:
@@ -233,7 +238,7 @@ def _held_stray_modifiers(user32) -> list[int]:
 def _paste_shortcut_win32():
     """Send Ctrl+V with the Win32 keyboard API.
 
-    The hotkey's modifier (Shift in the default Shift+X) is often still
+    The hotkey's modifier (Alt in the default Alt+X) is often still
     physically down when the first result arrives, and Ctrl+Shift+V or
     Ctrl+Alt+V mean something else in many apps (paste format only, paste
     special, ...). Lift any stray modifier for the shortcut, then press it
@@ -248,6 +253,8 @@ def _paste_shortcut_win32():
 
     def _tap(vk: int, flags: int) -> None:
         scan = user32.MapVirtualKeyW(vk, 0)
+        if vk in _EXTENDED_VKS:
+            flags |= _KEYEVENTF_EXTENDEDKEY
         user32.keybd_event(vk, scan, flags, 0)
 
     held = _held_stray_modifiers(user32)
@@ -259,7 +266,7 @@ def _paste_shortcut_win32():
     _tap(vk_control, key_up)
     for vk in held:
         _tap(vk, 0)
-    if any(vk != _VK_SHIFT for vk in held):
+    if any(vk not in _SHIFT_VKS for vk in held):
         _tap(_VK_MENU_MASK, 0)
         _tap(_VK_MENU_MASK, key_up)
 
@@ -277,6 +284,11 @@ class TextPaster:
 
     def __init__(self, restore_clipboard: bool = False):
         self.restore_clipboard = restore_clipboard
+        self._paste_seq = 0
+        # The user's own clipboard while a delayed restore has not run yet;
+        # the next paste must not mistake the previous transcript for it.
+        self._saved_clipboard: str | None = None
+        self._restore_pending = False
 
     def _is_own_window(self, info: tuple) -> bool:
         """Check if the foreground window belongs to this process."""
@@ -321,12 +333,27 @@ class TextPaster:
         has_target = hwnd != 0 and not self._is_own_window(info)
         target_app = _process_name_from_window_info(info) if has_target else ""
 
+        self._paste_seq += 1
+        seq = self._paste_seq
         old_clipboard = None
         if self.restore_clipboard:
-            try:
-                old_clipboard = pyperclip.paste()
-            except Exception:
-                pass
+            if self._restore_pending:
+                old_clipboard = self._saved_clipboard
+            else:
+                try:
+                    old_clipboard = pyperclip.paste()
+                except Exception:
+                    pass
+                self._saved_clipboard = old_clipboard
+            self._restore_pending = True
+
+        report = callback
+
+        def callback(result: PasteResult) -> None:
+            restoring = result.status == "sent" and self.restore_clipboard and old_clipboard
+            if not restoring and seq == self._paste_seq:
+                self._restore_pending = False
+            report(result)
 
         try:
             pyperclip.copy(text)
@@ -345,6 +372,9 @@ class TextPaster:
             return
 
         def _restore_clipboard():
+            if seq != self._paste_seq:
+                return  # a later paste restores the same original
+            self._restore_pending = False
             try:
                 if pyperclip.paste() == text:
                     pyperclip.copy(old_clipboard)

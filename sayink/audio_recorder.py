@@ -30,6 +30,8 @@ class _CaptureLane:
     def __init__(self, endpoint: StreamEndpoint):
         self.endpoint = endpoint
         self.chunks: list[np.ndarray] = []
+        # Resampled to TARGET_SAMPLE_RATE, not yet mixed with the other lanes.
+        self.pending = np.zeros(0, dtype=np.float32)
         self.last_chunk_at = time.monotonic()
         self.sample_rate = TARGET_SAMPLE_RATE
         self.stream: Optional[sd.InputStream] = None
@@ -48,6 +50,10 @@ class AudioRecorder(QObject):
 
     NO_SPEECH_WARN_SEC = 30.0
     LANE_STALL_SEC = 3.0
+    # Mixing waits for a lane that delivered within this window; a quieter
+    # one (loopback while nothing plays) is filled with silence instead.
+    MIX_WAIT_SEC = 0.3
+    MAX_MIX_SKEW_SEC = 1.0
 
     SAMPLE_RATE = TARGET_SAMPLE_RATE
     CHANNELS = 1
@@ -159,6 +165,7 @@ class AudioRecorder(QObject):
             self.volume_changed.emit(vol)
             with self._lock:
                 lane.chunks.append(block_mono)
+                lane.last_chunk_at = time.monotonic()
 
     def _open_pawp_lane(self, lane: _CaptureLane):
         import pyaudiowpatch as pyaudio
@@ -304,28 +311,52 @@ class AudioRecorder(QObject):
     def last_start_warning(self) -> str:
         return self._last_start_warning
 
-    def _drain_mixed_mono(self) -> Optional[np.ndarray]:
-        parts: list[tuple[np.ndarray, int, str]] = []
+    def _drain_mixed_mono(self, final: bool = False) -> Optional[np.ndarray]:
+        """Mix what every lane has delivered so far. Lanes call back on their
+        own clocks, so a tick can find two blocks on one lane and none on the
+        other; only the span both have covered is mixed, the rest waits for
+        the next tick (or ``final``, which takes everything)."""
+        now = time.monotonic()
+        drained: list[tuple[_CaptureLane, Optional[np.ndarray], float]] = []
         with self._lock:
             for lane in self._lanes:
                 # Hand drained blocks to the segmenter and drop them here, so a
                 # long session holds only the current utterance in memory.
                 new = lane.chunks
                 lane.chunks = []
-                if not new:
-                    continue
-                parts.append((np.concatenate(new), lane.sample_rate, lane.endpoint.role))
-        if not parts:
+                drained.append((lane, np.concatenate(new) if new else None, lane.last_chunk_at))
+        for lane, raw, _last in drained:
+            if raw is None or raw.size == 0:
+                continue
+            track = resample_mono(raw, lane.sample_rate, TARGET_SAMPLE_RATE)
+            lane.pending = np.concatenate([lane.pending, track]) if lane.pending.size else track
+
+        longest = max((lane.pending.size for lane, _raw, _last in drained), default=0)
+        if final or len(drained) <= 1:
+            take = longest
+        else:
+            waiting = [
+                lane.pending.size
+                for lane, _raw, last in drained
+                if now - last < self.MIX_WAIT_SEC
+            ]
+            take = min(waiting) if waiting else longest
+            take = max(take, longest - int(self.MAX_MIX_SKEW_SEC * TARGET_SAMPLE_RATE))
+        if take <= 0:
             self._block_mic_energy = 0.0
             self._block_system_energy = 0.0
             return None
+
         tracks: list[np.ndarray] = []
         mic_energy = 0.0
         system_energy = 0.0
-        for raw, sample_rate, role in parts:
-            track = resample_mono(raw, sample_rate, TARGET_SAMPLE_RATE)
-            energy = float(np.dot(track, track)) if track.size else 0.0
-            if role == "system":
+        for lane, _raw, _last in drained:
+            track = lane.pending[:take]
+            lane.pending = lane.pending[take:]
+            if track.size == 0:
+                continue
+            energy = float(np.dot(track, track))
+            if lane.endpoint.role == "system":
                 system_energy += energy
             else:
                 mic_energy += energy
@@ -333,7 +364,10 @@ class AudioRecorder(QObject):
         self._block_mic_energy = mic_energy
         self._block_system_energy = system_energy
         if len(tracks) == 1:
-            return tracks[0]
+            track = tracks[0]
+            if track.size < take:
+                track = np.concatenate([track, np.zeros(take - track.size, dtype=np.float32)])
+            return track
         return mix_to_mono(tracks, TARGET_SAMPLE_RATE)
 
     def _reset_continuous_speech_watch(self) -> None:
@@ -475,7 +509,7 @@ class AudioRecorder(QObject):
     def _flush_continuous_segments(self) -> int:
         """Drain VAD buffer so trailing speech is not lost on stop."""
         emitted = 0
-        block = self._drain_mixed_mono()
+        block = self._drain_mixed_mono(final=True)
         if block is not None and block.size > 0:
             segment = self._feed_segmenter(block)
             if segment is not None and segment.size > 0:
@@ -510,16 +544,20 @@ class AudioRecorder(QObject):
         if not self._continuous_mode and not self._is_recording:
             return
         self._continuous_timer.stop()
-        self._flush_continuous_segments()
+        self._close_lanes_then_flush()
         self._continuous_mode = False
         self._is_cancelled = False
         self._is_recording = False
-        lanes = self._lanes
         self._lanes = []
-        for lane in lanes:
-            self._close_lane(lane)
         self._terminate_pawp()
         self._segmenter.reset()
+
+    def _close_lanes_then_flush(self, flush: bool = True) -> int:
+        """Stopping a stream hands over the block still in the driver; close
+        while callbacks still accept data so the last words reach the flush."""
+        for lane in self._lanes:
+            self._close_lane(lane)
+        return self._flush_continuous_segments() if flush else 0
 
     @property
     def is_continuous(self) -> bool:
@@ -590,13 +628,10 @@ class AudioRecorder(QObject):
             return
         if segment_live:
             cancelled = self._is_cancelled
+            emitted = self._close_lanes_then_flush(flush=not cancelled)
             self._is_cancelled = False
-            emitted = 0 if cancelled else self._flush_continuous_segments()
             self._is_recording = False
-            lanes = self._lanes
             self._lanes = []
-            for lane in lanes:
-                self._close_lane(lane)
             self._terminate_pawp()
             self._segmenter.reset()
             if not cancelled and emitted == 0:

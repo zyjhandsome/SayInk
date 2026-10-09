@@ -53,7 +53,11 @@ _MIN_H = 580
 
 # Win32 messages used for native edge resizing and a stable maximize rect.
 _WM_NCHITTEST = 0x0084
+_WM_NCCALCSIZE = 0x0083
 _WM_GETMINMAXINFO = 0x0024
+_WM_ENTERSIZEMOVE = 0x0231
+_WM_EXITSIZEMOVE = 0x0232
+_WVR_VALIDRECTS = 0x0400
 _MONITOR_DEFAULTTONEAREST = 2
 _HTLEFT, _HTRIGHT, _HTTOP, _HTTOPLEFT, _HTTOPRIGHT = 10, 11, 12, 13, 14
 _HTBOTTOM, _HTBOTTOMLEFT, _HTBOTTOMRIGHT = 15, 16, 17
@@ -132,6 +136,7 @@ class MainWindow(QWidget):
         self._history_store = history_store
         self._page = "general"
         self._drag_offset = None
+        self._live_resizing = False
         self._setup_window()
         self._setup_ui()
         self.reapply_theme()
@@ -465,8 +470,11 @@ class MainWindow(QWidget):
 
     def _apply_window_shape(self) -> None:
         radius = self._chrome_radius()
-        self._apply_native_round_corners(radius)
-        if radius <= 0 or self.isMaximized():
+        if radius != getattr(self, "_native_radius", None):
+            self._native_radius = radius
+            self._apply_native_round_corners(radius)
+        # Swapping the window region on every frame of a drag makes the edges jitter.
+        if radius <= 0 or self.isMaximized() or self._live_resizing:
             self._clear_round_mask()
             return
         key = (self.width(), self.height(), radius)
@@ -608,6 +616,70 @@ class MainWindow(QWidget):
             return _HTBOTTOM
         return None
 
+    def _fill_min_max_info(self, msg) -> bool:
+        """Report the minimum track size and the maximized work-area rect to Windows.
+
+        Handling WM_GETMINMAXINFO here bypasses Qt's own handler, so the minimum
+        size must be filled in too; otherwise shrinking from a top/left edge
+        moves the window first and Qt snaps it back afterwards.
+        """
+        import math
+        from ctypes import POINTER, Structure, c_long, cast
+
+        class POINT(Structure):
+            _fields_ = [("x", c_long), ("y", c_long)]
+
+        class MINMAXINFO(Structure):
+            _fields_ = [
+                ("ptReserved", POINT),
+                ("ptMaxSize", POINT),
+                ("ptMaxPosition", POINT),
+                ("ptMinTrackSize", POINT),
+                ("ptMaxTrackSize", POINT),
+            ]
+
+        info = cast(msg.lParam, POINTER(MINMAXINFO)).contents
+        ratio = self.devicePixelRatioF() or 1.0
+        minimum = self.minimumSize()
+        info.ptMinTrackSize.x = math.ceil(minimum.width() * ratio)
+        info.ptMinTrackSize.y = math.ceil(minimum.height() * ratio)
+        self._fit_maximized_to_work_area(msg)
+        return True
+
+    @staticmethod
+    def _skip_stale_client_copy(msg) -> bool:
+        """Stop Windows copying old client pixels while resizing from a top/left edge.
+
+        The frameless client area already equals the window rect, so rgrc[0] stays
+        as proposed; identical 1px source/destination rects make the copy a no-op
+        and Qt repaints the whole client area instead.
+        """
+        from ctypes import POINTER, Structure, c_long, c_void_p, cast
+
+        class RECT(Structure):
+            _fields_ = [
+                ("left", c_long),
+                ("top", c_long),
+                ("right", c_long),
+                ("bottom", c_long),
+            ]
+
+        class NCCALCSIZE_PARAMS(Structure):
+            _fields_ = [("rgrc", RECT * 3), ("lppos", c_void_p)]
+
+        params = cast(msg.lParam, POINTER(NCCALCSIZE_PARAMS)).contents
+        new, old = params.rgrc[0], params.rgrc[1]
+        if (new.right - new.left, new.bottom - new.top) == (
+            old.right - old.left, old.bottom - old.top
+        ):
+            return False
+        for index in (1, 2):
+            params.rgrc[index].left = new.left
+            params.rgrc[index].top = new.top
+            params.rgrc[index].right = new.left + 1
+            params.rgrc[index].bottom = new.top + 1
+        return True
+
     def _fit_maximized_to_work_area(self, msg) -> bool:
         """Pin the maximized frame to the monitor work area, without the frame offset."""
         from ctypes import POINTER, Structure, byref, c_long, c_ulong, cast, sizeof, windll
@@ -663,8 +735,17 @@ class MainWindow(QWidget):
 
                 msg = wintypes.MSG.from_address(int(message))
                 if msg.message == _WM_GETMINMAXINFO:
-                    if self._fit_maximized_to_work_area(msg):
+                    if self._fill_min_max_info(msg):
                         return True, 0
+                if msg.message == _WM_NCCALCSIZE and msg.wParam:
+                    if self._skip_stale_client_copy(msg):
+                        return True, _WVR_VALIDRECTS
+                if msg.message == _WM_ENTERSIZEMOVE:
+                    self._live_resizing = True
+                    self._clear_round_mask()
+                elif msg.message == _WM_EXITSIZEMOVE:
+                    self._live_resizing = False
+                    self._apply_window_shape()
                 if msg.message == _WM_NCHITTEST and self.windowHandle() is not None:
                     # QCursor.pos() is already in logical coordinates, which
                     # keeps the hit test correct on mixed-DPI monitor setups.

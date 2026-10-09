@@ -311,6 +311,24 @@ class TestSettingsChangedQueue:
             app._on_settings_changed()
             assert app._segment_queue == []
 
+    def test_sentence_cut_off_by_the_settings_change_is_kept(self):
+        """Regression: the confirmation counted the queue, then stopping the
+        session flushed one more sentence that was cleared without notice."""
+        with app_harness({"audio.trigger_mode": "continuous"}) as h:
+            app = h["app"]
+            app._is_transcribing = True
+            app._segment_queue = _queued(*[np.zeros(1600, dtype=np.float32)] * 2)
+            tail = np.ones(1600, dtype=np.float32)
+            h["recorder"].is_continuous = True
+
+            def flush_tail():
+                h["recorder"].is_continuous = False
+                app._on_segment_ready(tail)
+
+            h["recorder"].stop_continuous.side_effect = flush_tail
+            app._on_settings_changed()
+            assert [s.audio for s in app._segment_queue] == [tail]
+
     def test_pending_segment_count_counts_queue_and_active(self):
         with app_harness() as h:
             app = h["app"]
@@ -333,6 +351,20 @@ class TestSegmentReadyQueueing:
             app._is_transcribing = True
             app._on_segment_ready(np.zeros(1600, dtype=np.float32))
             assert len(app._segment_queue) == 1
+
+    def test_new_segment_waits_behind_backlog_after_paste(self):
+        """Regression: in the 300 ms pause after a paste the pipeline is idle,
+        and a fresh segment used to start before the ones already queued."""
+        with app_harness() as h:
+            app = h["app"]
+            older = np.full(1600, 0.1, dtype=np.float32)
+            newer = np.full(1600, 0.2, dtype=np.float32)
+            app._enqueue_audio(older)
+            app._on_segment_ready(newer)
+            h["recognizer"].transcribe_final.assert_not_called()
+            assert [s.audio for s in app._segment_queue] == [older, newer]
+            app._pump_segment_queue()
+            assert app._segment_queue[0].audio is newer
 
     def test_segment_queued_while_model_loading(self):
         with app_harness() as h:

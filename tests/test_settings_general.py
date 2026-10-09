@@ -110,6 +110,11 @@ class TestGeneralPageLayout:
         assert f"color: {TEXT_SEC}" in version_sheet
         assert f"color: {ACCENT}" not in version_sheet
 
+        assert (
+            settings_window._about_version_label.width()
+            == settings_window._about_update_btn.width()
+        )
+
         labels = settings_window._about_usage_tip.findChildren(QLabel)
         assert labels
         assert all(f"color: {AMBER_TEXT}" not in label.styleSheet() for label in labels)
@@ -361,6 +366,19 @@ class TestInputSource:
         settings_window._src_mixed_rb.setChecked(True)
         assert settings_window._src_mic_rb.isChecked()
         assert config.get("audio.input_source") == INPUT_SOURCE_MICROPHONE
+
+    def test_reset_to_auto_asks_before_dropping_queued_speech(
+            self, settings_window, config, monkeypatch):
+        persisted = []
+        monkeypatch.setattr(settings_window, "_persist_runtime_settings",
+                            lambda: persisted.append(True))
+        monkeypatch.setattr(settings_window, "_confirm_discard_pending", lambda: False)
+        settings_window._loading = False
+        settings_window._reset_audio_devices_to_auto()
+        assert persisted == []
+        monkeypatch.setattr(settings_window, "_confirm_discard_pending", lambda: True)
+        settings_window._reset_audio_devices_to_auto()
+        assert persisted == [True]
 
 
 class TestToggles:

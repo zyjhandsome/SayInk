@@ -60,7 +60,7 @@ def is_reserved_hotkey(hotkey: str) -> bool:
 TRIGGER_MODE_HOTKEY = "hotkey"
 TRIGGER_MODE_CONTINUOUS = "continuous"
 
-DEFAULT_HOTKEY = "shift+x"
+DEFAULT_HOTKEY = "alt+x"
 
 DEFAULT_CONFIG = {
     "hotkey": DEFAULT_HOTKEY,
@@ -82,6 +82,7 @@ DEFAULT_CONFIG = {
         "num_threads": 4,
         "models_dir": "",
         "download_source": "auto",
+        "migration_version": 0,
     },
     "llm": {
         "enabled": False,
@@ -125,6 +126,7 @@ class Config:
         self._secrets = secret_store
         self._secret_value: str | None = None
         self._secret_persist_failed = False
+        self._secret_read_failed = False
         self._config_file = self._config_dir / "config.json"
         self._models_dir = _get_default_models_dir()
         self._config: dict = {}
@@ -181,7 +183,16 @@ class Config:
             # this run, but it may not stay on disk (README P0: never written
             # in plaintext). The settings page tells the user to re-enter it.
             self._secret_value = in_file
-            if in_file:
+            self._secret_read_failed = not in_file
+            if not in_file:
+                log.warning("凭据管理器不可读，已保存的 API Key 本次无法读取")
+            elif store.write(in_file):
+                # Reading can fail where writing works (e.g. a missing helper
+                # module); then the key is safe and the plaintext copy can go.
+                self._config.setdefault("llm", {})["api_key"] = ""
+                self.save_immediate()
+                log.info("凭据管理器读取失败但写入成功，API Key 已迁移")
+            else:
                 self._scrub_plaintext_key(
                     "凭据管理器不可读，配置文件中的 API Key 已移除，仅本次运行有效"
                 )
@@ -209,6 +220,11 @@ class Config:
     def secret_persist_failed(self) -> bool:
         """True when the last API key change is held in memory only."""
         return self._secret_persist_failed
+
+    @property
+    def secret_read_failed(self) -> bool:
+        """True when a saved API key may exist but could not be read this run."""
+        return self._secret_read_failed
 
     def _backup_unreadable_config(self) -> Path | None:
         """Keep the unreadable file so the next save cannot erase API keys etc."""
@@ -261,6 +277,8 @@ class Config:
             # not remove it, so it would keep pointing at a deleted EXE (or
             # start the app twice). Carry the intent over and drop the value.
             if self._drop_legacy_auto_start_value(winreg, key_path):
+                if not registered:
+                    self._write_auto_start_value(winreg, key_path)
                 registered = True
             if registered and not self._config.get("auto_start", False):
                 self._config["auto_start"] = True
@@ -268,6 +286,16 @@ class Config:
                 log.info("同步注册表开机自启状态到配置文件")
         except Exception as e:
             log.warning("读取注册表开机自启状态失败: %s", e)
+
+    @staticmethod
+    def _write_auto_start_value(winreg, key_path: str) -> None:
+        from sayink.app import auto_start_command
+
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, "SayInk", 0, winreg.REG_SZ, auto_start_command())
+        except Exception as e:
+            log.warning("写入开机自启项失败: %s", e)
 
     @staticmethod
     def _drop_legacy_auto_start_value(winreg, key_path: str) -> bool:
@@ -365,6 +393,8 @@ class Config:
                 return
             self._secret_value = secret
             self._secret_persist_failed = not store.write(secret)
+            if secret and not self._secret_persist_failed:
+                self._secret_read_failed = False
             if self._secret_persist_failed:
                 log.warning("API Key 未能存入凭据管理器，仅在本次运行中有效，未写入配置文件")
             llm = self._config.setdefault("llm", {})

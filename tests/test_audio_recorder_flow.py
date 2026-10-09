@@ -72,6 +72,35 @@ class TestDrainMixedMono:
         out = rec._drain_mixed_mono()
         assert out is not None and out.size == 1600
 
+    def test_lanes_out_of_phase_stay_aligned_and_keep_their_length(self):
+        """Regression: one tick found two mic blocks and one loopback block;
+        padding the loopback with silence stretched 0.2 s of sound to 0.3 s
+        and pushed the next loopback block 0.1 s late."""
+        rec = AudioRecorder()
+        mic = _make_lane(role="microphone")
+        system = _make_lane(role="system")
+        rec._lanes = [mic, system]
+        a, b = np.full(1600, 0.1, np.float32), np.full(1600, 0.2, np.float32)
+        c, d = np.full(1600, 0.4, np.float32), np.full(1600, 0.8, np.float32)
+        mic.chunks, system.chunks = [a, b], [c]
+        first = rec._drain_mixed_mono()
+        system.chunks = [d]
+        second = rec._drain_mixed_mono()
+        out = np.concatenate([first, second])
+        assert out.size == 3200
+        assert np.allclose(out[:1600], (0.1 + 0.4) / 2)
+        assert np.allclose(out[1600:], (0.2 + 0.8) / 2)
+
+    def test_quiet_loopback_does_not_hold_back_the_microphone(self):
+        rec = AudioRecorder()
+        mic = _make_lane(role="microphone", chunks=[np.ones(1600, np.float32)])
+        system = _make_lane(role="system")
+        system.last_chunk_at -= AudioRecorder.MIX_WAIT_SEC + 1
+        rec._lanes = [mic, system]
+        out = rec._drain_mixed_mono()
+        assert out is not None and out.size == 1600
+        assert np.allclose(out, 1.0)
+
     def test_drain_advances_index(self):
         rec = AudioRecorder()
         lane = _make_lane(chunks=[np.ones(1600, dtype=np.float32)])
@@ -227,6 +256,31 @@ class TestHoldLiveSegments:
         assert finished == []
         assert segments and segments[0].size >= 16000
         assert rec.is_recording is False
+
+    def test_block_delivered_while_the_stream_closes_is_kept(self):
+        """Regression: the flush ran before the streams were stopped, so the
+        driver's last block arrived after recording ended and was dropped."""
+        rec = AudioRecorder()
+        rec._is_recording = True
+        rec._continuous_mode = False
+        rec._segment_live = True
+        lane = _make_lane(chunks=[])
+        callback = rec._make_callback(lane)
+
+        class _ClosingStream:
+            def stop(self):
+                callback(np.full((1600, 1), 0.5, dtype=np.float32), 1600, None, None)
+
+            def close(self):
+                pass
+
+        lane.stream = _ClosingStream()
+        rec._lanes = [lane]
+        fed = []
+        rec._segmenter = _FakeSegmenter()
+        rec._segmenter.feed = lambda block, **_kw: fed.append(block) or None
+        rec.stop()
+        assert fed and fed[0].size == 1600
 
 
 class TestStopOutput:

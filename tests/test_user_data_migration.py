@@ -41,6 +41,34 @@ class TestDataDirMigration:
         assert user_data_dir(tmp_path) == tmp_path / ".sayink"
         assert (tmp_path / ".sayink").is_dir()
 
+    def test_failed_move_keeps_using_old_dir_and_retries_next_start(self, tmp_path, monkeypatch):
+        import sayink.user_data as user_data
+
+        old = tmp_path / ".voiceink"
+        old.mkdir()
+        (old / "config.json").write_text("old", encoding="utf-8")
+
+        def locked(*_a):
+            raise PermissionError("history.db is in use")
+
+        monkeypatch.setattr(user_data.os, "rename", locked)
+        assert user_data_dir(tmp_path) == old
+        assert not (tmp_path / ".sayink").exists()
+
+        monkeypatch.undo()
+        user_data._resolved.clear()
+        assert user_data_dir(tmp_path) == tmp_path / ".sayink"
+        assert (tmp_path / ".sayink" / "config.json").read_text(encoding="utf-8") == "old"
+
+    def test_one_answer_per_run_even_if_a_later_move_would_succeed(self, tmp_path, monkeypatch):
+        import sayink.user_data as user_data
+
+        (tmp_path / ".voiceink").mkdir()
+        monkeypatch.setattr(user_data.os, "rename", lambda *_a: (_ for _ in ()).throw(OSError()))
+        first = user_data_dir(tmp_path)
+        monkeypatch.undo()
+        assert user_data_dir(tmp_path) == first
+
 
 class _NotFound(Exception):
     winerror = 1168  # ERROR_NOT_FOUND, as pywintypes.error exposes it
@@ -98,6 +126,35 @@ class TestCredentialMigration:
         store, fake = _store({})
         assert store.read() == ""
         assert fake.deleted == []
+
+    def test_unreadable_legacy_entry_is_not_reported_as_no_key(self):
+        store, fake = _store({LEGACY_CREDENTIAL_TARGET: "sk-old"})
+        real_read = fake.CredRead
+
+        def read(target, *rest):
+            if target == LEGACY_CREDENTIAL_TARGET:
+                raise OSError("access denied")
+            return real_read(target, *rest)
+
+        fake.CredRead = read
+        assert store.read() is None
+        assert fake.deleted == []
+
+    def test_config_flags_an_unreadable_key_until_a_new_one_is_saved(self, config_home):
+        from unittest.mock import MagicMock
+
+        from sayink.config import SECRET_KEY, Config
+
+        store = MagicMock()
+        store.read.return_value = None
+        store.write.return_value = True
+        cfg = Config(config_dir=config_home, secret_store=store)
+        assert cfg.secret_read_failed is True
+        assert cfg.get(SECRET_KEY) == ""
+        store.write.assert_not_called()
+
+        cfg.set(SECRET_KEY, "sk-new")
+        assert cfg.secret_read_failed is False
 
     def test_write_uses_the_new_target(self):
         store, fake = _store({})

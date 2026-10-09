@@ -144,6 +144,46 @@ def test_maximized_chrome_drops_the_round_mask(qapp, tmp_path, monkeypatch):
         store.close()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 sizing message")
+def test_min_max_info_reports_minimum_track_size(qapp, tmp_path, monkeypatch):
+    import ctypes
+    from ctypes import wintypes
+
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        monkeypatch.setattr(win, "devicePixelRatioF", lambda: 1.5)
+        info = (ctypes.c_long * 10)()
+        msg = wintypes.MSG()
+        msg.hWnd = int(win.winId())
+        msg.lParam = ctypes.addressof(info)
+        assert win._fill_min_max_info(msg)
+        assert (info[6], info[7]) == (
+            -(-win.minimumWidth() * 3 // 2),
+            -(-win.minimumHeight() * 3 // 2),
+        )
+    finally:
+        win.close()
+        store.close()
+
+
+def test_live_resize_keeps_the_round_mask_off(qapp, tmp_path, monkeypatch):
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        win.show()
+        QApplication.processEvents()
+        assert not win.mask().isEmpty()
+        win._live_resizing = True
+        win.resize(win.width() + 20, win.height() + 20)
+        QApplication.processEvents()
+        assert win.mask().isEmpty()
+        win._live_resizing = False
+        win._apply_window_shape()
+        assert not win.mask().isEmpty()
+    finally:
+        win.close()
+        store.close()
+
+
 def test_maximized_caption_uses_stacked_restore_glyph(qapp, tmp_path, monkeypatch):
     win, store = _make_main_window(tmp_path, monkeypatch)
     try:

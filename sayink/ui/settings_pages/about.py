@@ -16,6 +16,40 @@ from sayink.ui.settings_components import (
 )
 
 
+def paint_about_update_row(win) -> None:
+    win._about_update_status.setStyleSheet(
+        f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; background: transparent;"
+    )
+    win._about_update_btn.setStyleSheet(
+        f"QPushButton#aboutUpdateButton {{"
+        f" color: {tok.TEXT}; background: {tok.SURFACE_PEARL};"
+        f" border: 1px solid {tok.HAIRLINE}; border-radius: {tok.RADIUS_PILL}px;"
+        f" font-size: {tok.TYPE_CAPTION}px; font-weight: 700; padding: 6px 12px;"
+        f"}}"
+        f"QPushButton#aboutUpdateButton:hover {{ background: {tok.CHIP_BG_HOVER}; }}"
+        f"QPushButton#aboutUpdateButton:disabled {{ color: {tok.TEXT_DIM}; }}"
+    )
+    sync_about_pill_widths(win)
+
+
+_UPDATE_BUTTON_TEXTS = ("检查更新", "下载并安装")
+
+
+def sync_about_pill_widths(win) -> None:
+    label = getattr(win, "_about_version_label", None)
+    btn = getattr(win, "_about_update_btn", None)
+    if label is None or btn is None:
+        return
+    label.ensurePolished()
+    btn.ensurePolished()
+    btn_text_w = max(btn.fontMetrics().horizontalAdvance(t) for t in _UPDATE_BUTTON_TEXTS)
+    label_text_w = label.fontMetrics().horizontalAdvance(label.text())
+    # Stylesheet horizontal padding (12px button / 10px label) plus 1px borders.
+    width = max(btn_text_w + 26, label_text_w + 22) + 8
+    label.setFixedWidth(width)
+    btn.setFixedWidth(width)
+
+
 def build_about_page(win) -> QWidget:
     page = SettingsPage()
     page.add(page_header("关于", "SayInk · 让语音成为文字"))
@@ -37,6 +71,7 @@ def build_about_page(win) -> QWidget:
     brand_lay.addWidget(brand_name)
     brand_lay.addStretch(1)
     win._about_version_label = QLabel(f"版本 {VERSION}")
+    win._about_version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
     win._about_version_label.setStyleSheet(
         f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_CAPTION}px; font-weight: 700;"
         f" background: {tok.SURFACE_PEARL}; border: 1px solid {tok.HAIRLINE};"
@@ -53,22 +88,11 @@ def build_about_page(win) -> QWidget:
     win._about_update_status = QLabel("点击检查是否有新版本")
     win._about_update_status.setObjectName("aboutUpdateStatus")
     win._about_update_status.setWordWrap(True)
-    win._about_update_status.setStyleSheet(
-        f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; background: transparent;"
-    )
     update_lay.addWidget(win._about_update_status, 1)
     win._about_update_btn = QPushButton("检查更新")
     win._about_update_btn.setObjectName("aboutUpdateButton")
     win._about_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    win._about_update_btn.setStyleSheet(
-        f"QPushButton#aboutUpdateButton {{"
-        f" color: {tok.TEXT}; background: {tok.SURFACE_PEARL};"
-        f" border: 1px solid {tok.HAIRLINE}; border-radius: {tok.RADIUS_PILL}px;"
-        f" font-size: {tok.TYPE_CAPTION}px; font-weight: 700; padding: 6px 12px;"
-        f"}}"
-        f"QPushButton#aboutUpdateButton:hover {{ background: {tok.CHIP_BG_HOVER}; }}"
-        f"QPushButton#aboutUpdateButton:disabled {{ color: {tok.TEXT_DIM}; }}"
-    )
+    paint_about_update_row(win)
     win._about_update_btn.clicked.connect(win._on_about_update_button)
     update_lay.addWidget(win._about_update_btn, 0, Qt.AlignmentFlag.AlignVCenter)
     win._about_info_lay.addWidget(update_row)

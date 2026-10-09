@@ -40,6 +40,7 @@ from sayink.ui.settings_components import (
     group_divider,
     kv_row,
     kv_row_elided,
+    section_header,
     settings_group,
 )
 from sayink.ui.settings_pages import (
@@ -48,6 +49,7 @@ from sayink.ui.settings_pages import (
     build_model_page,
     build_polish_page,
 )
+from sayink.ui.settings_pages.about import paint_about_update_row
 from sayink.ui.model_card import ModelCard, RATING_TOOLTIP, format_model_ratings
 from sayink.ui import design_tokens as _tok
 from sayink.ui import settings_styles as _settings_styles
@@ -143,6 +145,8 @@ class SettingsWindow(QWidget):
                 f" background: {tok.SURFACE_PEARL}; border: 1px solid {tok.HAIRLINE};"
                 f" border-radius: {tok.RADIUS_PILL}px; padding: 3px 10px;"
             )
+        if hasattr(self, "_about_update_btn"):
+            paint_about_update_row(self)
         if hasattr(self, "_llm_test_status"):
             self._llm_test_status.setStyleSheet(
                 f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px;"
@@ -409,13 +413,7 @@ class SettingsWindow(QWidget):
             section_lay.setSpacing(10)
 
             if title:
-                hdr = QLabel(title)
-                hdr.setStyleSheet(
-                    f"color: {_tok.TEXT_SEC}; font-size: {_tok.TYPE_FOOTNOTE}px; font-weight: 700;"
-                    f" padding: 0 4px; background: transparent;"
-                    f" letter-spacing: 0;"
-                )
-                section_lay.addWidget(hdr)
+                section_lay.addWidget(section_header(title))
 
             if not models:
                 msg = "暂无其他已下载模型" if downloaded else "所有模型均已下载"
@@ -587,6 +585,12 @@ class SettingsWindow(QWidget):
             self._llm_test_status.setText(
                 "API 密钥未能存入 Windows 凭据管理器，仅本次运行有效，"
                 "也没有写入配置文件；重启后需重新填写。"
+            )
+            return
+        if getattr(self._config, "secret_read_failed", False) is True:
+            self._llm_test_status.setText(
+                "无法从 Windows 凭据管理器读取已保存的 API 密钥，这里暂时显示为空；"
+                "重启后仍为空请重新填写。"
             )
             return
         if not self._llm_enable_row.isChecked():
@@ -889,6 +893,8 @@ class SettingsWindow(QWidget):
         return False
 
     def _reset_audio_devices_to_auto(self):
+        if not self._loading and not self._confirm_discard_pending():
+            return
         was_loading = self._loading
         self._loading = True
         self._set_combo_by_data(self._mic_device_combo, -1)
@@ -1170,7 +1176,7 @@ class SettingsWindow(QWidget):
         elif is_reserved_hotkey(hotkey):
             problem = (
                 f"{format_hotkey(hotkey)} 是系统或常用软件的快捷键，"
-                "占用后它在其他软件里会失效。请换一个组合，例如 Shift + X。"
+                "占用后它在其他软件里会失效。请换一个组合，例如 Alt + X。"
             )
         if problem:
             QMessageBox.warning(self, "提示", problem)

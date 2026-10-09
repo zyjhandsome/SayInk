@@ -1,4 +1,5 @@
 import pytest
+from sayink.config import DEFAULT_HOTKEY
 from sayink.hotkey_manager import parse_hotkey, HotKeyManager, KEY_MAP
 from pynput import keyboard
 import threading
@@ -72,7 +73,7 @@ class TestParseHotkey:
 class TestHotKeyManagerInit:
     def test_default_hotkey(self):
         mgr = HotKeyManager()
-        assert mgr._hotkey_str == "shift+x"
+        assert mgr._hotkey_str == "alt+x"
         assert mgr._hotkey_keys is not None
 
     def test_custom_hotkey(self):
@@ -286,6 +287,17 @@ class TestWin32HotkeySuppression:
         assert mgr._win32_event_filter(0x0104, _Event(self.VK_Z, flags=0x10)) is True
         assert mgr._win32_event_filter(0x0104, _Event(0x41)) is True
 
+    def test_default_alt_x_swallows_x_and_masks_the_menu(self, monkeypatch):
+        mgr = self._manager(monkeypatch)
+        mgr.update_hotkey(DEFAULT_HOTKEY)
+        vk_x = 0x58
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0104, _Event(vk_x))
+        assert mgr._hold_pending is True
+        assert mgr._masks == [1]
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0105, _Event(vk_x))
+
     def test_ctrl_hotkey_does_not_send_menu_mask(self, monkeypatch):
         mgr = self._manager(monkeypatch)
         mgr.update_hotkey("ctrl+space")
@@ -295,7 +307,7 @@ class TestWin32HotkeySuppression:
 
 
 class TestShiftLetterTapTypesTheLetter:
-    """README: default Shift+X — a short tap still types a capital X, with
+    """README: with Shift+X bound, a short tap still types a capital X, with
     no 「录音过短」 hint; only a hold records."""
 
     VK_X = 0x58
@@ -340,6 +352,26 @@ class TestShiftLetterTapTypesTheLetter:
         with pytest.raises(_Suppressed):
             mgr._win32_event_filter(0x0101, _Event(self.VK_X))
         assert replayed == []
+
+    def test_continuous_hold_with_auto_repeat_does_not_type_the_letter(self, monkeypatch):
+        """Regression: auto-repeat after continuous listening started re-armed
+        the hold, so letting go typed an extra capital X into the app."""
+        mgr, replayed, short = self._manager(monkeypatch)
+        mgr.set_continuous_trigger_mode(True)
+        started = []
+        mgr.continuous_listen_start.connect(lambda: started.append(1))
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0100, _Event(self.VK_X))
+        mgr._on_hold_timeout()
+        for _ in range(3):
+            with pytest.raises(_Suppressed):
+                mgr._win32_event_filter(0x0100, _Event(self.VK_X))
+        assert mgr._hold_pending is False
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0101, _Event(self.VK_X))
+        assert started == [1]
+        assert replayed == []
+        assert short == []
 
     def test_alt_hotkey_tap_keeps_the_hint_and_is_not_replayed(self, monkeypatch):
         mgr, replayed, short = self._manager(monkeypatch, hotkey="alt+z")
@@ -417,6 +449,29 @@ class TestShiftLetterTapTypesTheLetter:
         assert mgr._hold_pending is False
         mgr._on_press(keyboard.Key.shift_r)
         assert mgr._hold_pending is True
+
+
+class TestListenerCallbackArity:
+    """Regression: pynput 1.8 counted ``_on_release``'s keyword-only ``quiet``
+    and called it as ``(key, injected)``, and its ``False`` return (not a tap)
+    is pynput's stop signal; either way the listener died on the first key
+    release and the hotkey never worked again."""
+
+    def test_real_listener_callbacks_accept_pynput_call(self, monkeypatch):
+        monkeypatch.setattr(keyboard.Listener, "start", lambda self: None)
+        monkeypatch.setattr(keyboard.Listener, "is_alive", lambda self: True)
+        mgr = HotKeyManager("shift+x")
+        mgr.start()
+        listener = mgr._listener
+        try:
+            listener.on_press(keyboard.Key.shift_l, False)
+            listener.on_press(keyboard.KeyCode.from_char("x"), False)
+            assert mgr._hold_pending is True
+            listener.on_release(keyboard.KeyCode.from_char("x"), False)
+            listener.on_release(keyboard.Key.shift_l, False)
+            assert mgr._pressed_keys == set()
+        finally:
+            mgr._listener = None
 
 
 class TestHoldSurvivesUnrelatedKeys:

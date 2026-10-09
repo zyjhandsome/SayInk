@@ -308,6 +308,20 @@ def merge_slice_texts(parts: list[str], max_overlap_chars: int = 12) -> str:
     return merged
 
 
+def join_segment_texts(parts: list[str]) -> str:
+    """Join transcripts of separate utterances (no shared audio, so nothing to
+    de-duplicate); keep a space between Latin words on either side."""
+    joined = ""
+    for part in parts:
+        piece = (part or "").strip()
+        if not piece:
+            continue
+        if joined and joined[-1].isascii() and joined[-1].isalnum() and piece[0].isascii() and piece[0].isalnum():
+            joined += " "
+        joined += piece
+    return joined
+
+
 HF_URL = "https://huggingface.co"
 HF_MIRROR_URL = "https://hf-mirror.com"
 DOWNLOAD_SOURCE_AUTO = "auto"
