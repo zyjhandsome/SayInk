@@ -310,7 +310,7 @@ def test_history_commit_refreshes_open_main_window() -> None:
         app = h["app"]
         history_ui = MagicMock()
         app._main = MagicMock()
-        app._main._history = history_ui
+        app._main.history_panel = history_ui
 
         callback = h["history"].add_committed_callback.call_args[0][0]
         callback()

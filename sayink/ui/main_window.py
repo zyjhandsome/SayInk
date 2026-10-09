@@ -488,6 +488,16 @@ class MainWindow(QWidget):
         path.addRoundedRect(QRectF(self.rect()), float(radius), float(radius))
         self.setMask(QRegion(path.toFillPolygon().toPolygon()))
 
+    @property
+    def settings_panel(self):
+        """The settings pages (通用 / 引擎 / 润色 / 关于); the App talks to it only through this."""
+        return self._settings
+
+    @property
+    def history_panel(self):
+        """The 历史 page."""
+        return self._history
+
     def show_page(self, key: str) -> None:
         if key not in PAGE_KEYS:
             return

@@ -1052,6 +1052,11 @@ class SettingsWindow(QWidget):
 
     # ── Instant apply ──────────────────────────────────
 
+    def set_pending_segment_counter(self, counter) -> None:
+        """``counter()`` returns how many captured segments are still waiting
+        for recognition; applying an engine/audio change asks before dropping them."""
+        self._pending_segment_count = counter
+
     def _confirm_discard_pending(self) -> bool:
         if self._pending_segment_count is None:
             return True

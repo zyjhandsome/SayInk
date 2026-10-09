@@ -86,7 +86,7 @@ class TestIslandUserCopy:
                 (),
                 {"set_runtime_status": lambda self, state, label: setattr(self, "value", (state, label))},
             )()
-            h["app"]._main = type("MainSpy", (), {"_settings": settings})()
+            h["app"]._main = type("MainSpy", (), {"settings_panel": settings})()
             h["app"]._on_model_load_progress("模型加载失败: boom")
             assert settings.value == (RuntimeState.UNAVAILABLE, "模型载入失败")
             h["tray"].set_status_summary.assert_any_call("模型载入失败")

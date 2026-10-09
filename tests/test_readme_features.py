@@ -567,7 +567,7 @@ class TestReadmeSettingsLifecycle:
     def test_settings_closed_resumes_hotkey_listener(self):
         with app_harness({"audio.trigger_mode": "hotkey"}) as h:
             settings = type("W", (), {"cancel_hotkey_capture": lambda self: None})()
-            h["app"]._main = type("M", (), {"_settings": settings})()
+            h["app"]._main = type("M", (), {"settings_panel": settings})()
             h["hotkey"].pause()
             h["app"]._on_settings_closed()
             h["hotkey"].resume.assert_called_once()

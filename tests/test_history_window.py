@@ -334,7 +334,7 @@ def test_quit_commits_pending_history_delete_before_closing_store() -> None:
         app = h["app"]
         events: list[str] = []
         app._main = MagicMock()
-        app._main._history.flush_pending_delete.side_effect = lambda: events.append("flush")
+        app._main.history_panel.flush_pending_delete.side_effect = lambda: events.append("flush")
         h["history"].close.side_effect = lambda **_: events.append("close")
         app._quit()
         assert events == ["flush", "close"]
@@ -730,8 +730,8 @@ def test_app_show_history_window_reuses_single_window(qapp, monkeypatch):
         def __init__(self, config, history_store):
             self.config = config
             self.store = history_store
-            self._history = FakeHistoryWidget()
-            self._settings = MagicMock()
+            self.history_panel = FakeHistoryWidget()
+            self.settings_panel = MagicMock()
             self._page = "general"
             self.shown = 0
             self.raised = 0
@@ -778,7 +778,7 @@ def test_app_show_history_window_reuses_single_window(qapp, monkeypatch):
     assert created[0].shown == 2
     assert created[0].raised == 2
     assert created[0].activated == 2
-    assert created[0]._history.refresh_calls == 2
+    assert created[0].history_panel.refresh_calls == 2
 
     app._show_main_window(None)
-    assert created[0]._history.refresh_calls == 3
+    assert created[0].history_panel.refresh_calls == 3

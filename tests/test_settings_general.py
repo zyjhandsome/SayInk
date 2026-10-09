@@ -589,7 +589,7 @@ class TestConfirmDialogs:
         assert deleted == []
 
     def test_discard_pending_confirms_only_on_accept(self, settings_window, monkeypatch):
-        settings_window._pending_segment_count = lambda: 2
+        settings_window.set_pending_segment_counter(lambda: 2)
         events: dict = {}
         self._fake_box(monkeypatch, events, click="丢弃并应用")
         assert settings_window._confirm_discard_pending() is True

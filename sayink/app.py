@@ -1505,7 +1505,7 @@ class App(QObject):
     def _refresh_open_history_ui(self) -> None:
         if self._main is None:
             return
-        self._main._history.refresh()
+        self._main.history_panel.refresh()
 
     def _show_history_startup_notice(self) -> None:
         """Tell the user once if history.db was rebuilt or could not be opened."""
@@ -1601,8 +1601,8 @@ class App(QObject):
     def _show_main_window(self, page: str | None = None):
         if self._main is None:
             self._main = MainWindow(self._config, self._history)
-            settings = self._main._settings
-            settings._pending_segment_count = self._pending_segment_count
+            settings = self._main.settings_panel
+            settings.set_pending_segment_counter(self._pending_segment_count)
             settings.hotkey_updated.connect(self._on_hotkey_updated)
             settings.settings_changed.connect(self._on_settings_changed)
             settings.auto_start_changed.connect(self._on_auto_start_toggled)
@@ -1621,9 +1621,9 @@ class App(QObject):
         if page:
             self._main.show_page(page)
         if page == "history" or (not page and self._main.current_page() == "history"):
-            self._main._history.refresh()
+            self._main.history_panel.refresh()
         self.apply_appearance_theme()
-        self._main._settings.reload_settings()
+        self._main.settings_panel.reload_settings()
         self._sync_settings_runtime_status()
         self._main.show()
         self._main.raise_()
@@ -1849,7 +1849,7 @@ class App(QObject):
             self._main.hide()
 
         if self._main is not None:
-            self._main._history.flush_pending_delete()
+            self._main.history_panel.flush_pending_delete()
         self._recognizer.shutdown()
         self._polisher.cancel()
         self._tray.hide()
@@ -1868,5 +1868,5 @@ class App(QObject):
 
     def _settings_widget(self):
         if self._main is not None:
-            return getattr(self._main, "_settings", None)
+            return self._main.settings_panel
         return None
