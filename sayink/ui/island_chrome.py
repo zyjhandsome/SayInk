@@ -44,20 +44,3 @@ def apply_island_sheet_flags(widget: QWidget) -> None:
         | Qt.WindowType.WindowStaysOnTopHint
     )
     widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-
-
-def island_container_css() -> str:
-    from sayink.ui import design_tokens as tok
-
-    return f"""
-        QWidget#islandContainer {{
-            background-color: {tok.FLOAT_BG};
-            border-radius: {tok.RADIUS_PILL}px;
-            border: 1px solid {tok.FLOAT_BORDER};
-        }}
-        QWidget#islandSheet {{
-            background-color: {tok.FLOAT_BG};
-            border-radius: 28px;
-            border: 1px solid {tok.FLOAT_BORDER};
-        }}
-    """

@@ -7,7 +7,7 @@ from PyQt6.QtGui import QColor, QKeyEvent, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel,
     QCheckBox, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
-    QStackedWidget, QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget,
 )
 
 from sayink.ui import design_tokens as tok
@@ -35,15 +35,12 @@ HERO_CARD_STYLE = ""
 ROW_RADIO_STYLE = ""
 NAV_BTN_STYLE = ""
 LINK_BTN_STYLE = ""
-SUB_TAB_BAR_STYLE = ""
-SUB_TAB_BTN_STYLE = ""
 
 
 def reload_styles() -> None:
     """Rebuild style fragments from the currently activated design tokens."""
     global SECTION_LABEL, PAGE_TITLE, PAGE_SUBTITLE, FOOTNOTE
     global GROUP_STYLE, HERO_CARD_STYLE, ROW_RADIO_STYLE, NAV_BTN_STYLE, LINK_BTN_STYLE
-    global SUB_TAB_BAR_STYLE, SUB_TAB_BTN_STYLE
     from sayink.ui import design_tokens as tok
 
     SECTION_LABEL = (
@@ -146,40 +143,6 @@ def reload_styles() -> None:
         border-bottom: 1px solid {tok.CONTROL_BORDER_HOVER};
     }}
 """
-    SUB_TAB_BAR_STYLE = f"""
-    QFrame#settingsSubTabBar {{
-        background: transparent;
-        border: none;
-        border-bottom: 1px solid {tok.BORDER};
-    }}
-"""
-    SUB_TAB_BTN_STYLE = f"""
-    QPushButton#settingsSubTabBtn {{
-        text-align: center;
-        padding: 10px 14px;
-        border: none;
-        border-bottom: 2px solid transparent;
-        border-radius: 0;
-        color: {tok.TEXT_DIM};
-        font-size: {tok.TYPE_BODY_SM}px;
-        font-weight: 400;
-        background: transparent;
-        min-width: 56px;
-    }}
-    QPushButton#settingsSubTabBtn:checked {{
-        color: {tok.ACCENT_TEXT};
-        font-weight: 700;
-        border-bottom: 2px solid {tok.ACCENT};
-        background: transparent;
-    }}
-    QPushButton#settingsSubTabBtn:hover:!checked {{
-        color: {tok.TEXT};
-    }}
-    QPushButton#settingsSubTabBtn:focus {{
-        outline: none;
-        border-bottom: 2px solid {tok.ACCENT_FOCUS};
-    }}
-"""
 
 
 reload_styles()
@@ -221,83 +184,6 @@ def elide_middle(text: str, max_len: int = 44) -> str:
     head = max_len // 2 - 2
     tail = max_len - head - 1
     return f"{text[:head]}…{text[-tail:]}"
-
-
-class PageHero(QWidget):
-    """Page title with optional inline status and subtitle."""
-
-    def __init__(self, title: str, tags: list[str] | None = None, subtitle: str = "", parent=None):
-        super().__init__(parent)
-        self._root = QVBoxLayout(self)
-        self._root.setContentsMargins(0, 0, 0, 8)
-        self._root.setSpacing(6)
-
-        top = QHBoxLayout()
-        top.setSpacing(8)
-        self._title = QLabel(title)
-        self._title.setProperty("viRole", "pageTitle")
-        self._title.setStyleSheet(PAGE_TITLE)
-        top.addWidget(self._title, 0, Qt.AlignmentFlag.AlignVCenter)
-        top.addStretch(1)
-
-        self._inline_status = QLabel("")
-        self._inline_status.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        self._inline_status.setStyleSheet(
-            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 400;"
-            f" background: transparent;"
-        )
-        # Reserve status width so 已关闭 ↔ 已开启 · … does not shove the title.
-        self._inline_status.setMinimumWidth(120)
-        self._inline_status.setSizePolicy(
-            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed
-        )
-        self._inline_status.setVisible(False)
-        top.addWidget(self._inline_status, 0, Qt.AlignmentFlag.AlignVCenter)
-        self._root.addLayout(top)
-
-        self._subtitle = QLabel(subtitle)
-        self._subtitle.setProperty("viRole", "pageSubtitle")
-        self._subtitle.setWordWrap(True)
-        self._subtitle.setStyleSheet(PAGE_SUBTITLE)
-        self._subtitle.setVisible(bool(subtitle))
-        self._root.addWidget(self._subtitle)
-
-        if tags:
-            self.set_tags(tags)
-
-        self.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
-        )
-
-    def reapply_styles(self) -> None:
-        from sayink.ui import design_tokens as tok
-
-        self._title.setStyleSheet(PAGE_TITLE)
-        self._subtitle.setStyleSheet(PAGE_SUBTITLE)
-        self._inline_status.setStyleSheet(
-            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 400;"
-            f" background: transparent;"
-        )
-
-    def set_inline_status(self, text: str) -> None:
-        cleaned = text.strip()
-        self._inline_status.setText(cleaned)
-        self._inline_status.setVisible(bool(cleaned))
-
-    def set_tags(self, tags: list[str]) -> None:
-        parts = [t.strip() for t in tags if t and t.strip()]
-        self.set_subtitle(" · ".join(parts))
-
-    def set_status(self, text: str) -> None:
-        self.set_inline_status(text)
-
-    def set_subtitle(self, text: str) -> None:
-        self._subtitle.setText(text)
-        visible = bool(text)
-        self._subtitle.setVisible(visible)
-        self._root.setContentsMargins(0, 0, 0, 6 if visible else 2)
 
 
 def hero_card() -> QFrame:
@@ -638,109 +524,6 @@ def settings_section(
             lay.addLayout(head)
     lay.addWidget(group)
     return wrap
-
-
-def settings_tab_pane(*sections: QWidget) -> QWidget:
-    """Vertical stack of settings sections for one sub-tab page."""
-    pane = QWidget()
-    pane.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-    lay = QVBoxLayout(pane)
-    lay.setContentsMargins(0, SPACE_SM, 0, 0)
-    lay.setSpacing(SPACE_LG + SPACE_XS)
-    lay.setAlignment(Qt.AlignmentFlag.AlignTop)
-    for section in sections:
-        lay.addWidget(section)
-    lay.addStretch(1)
-    return pane
-
-
-class SettingsSubTabs(QWidget):
-    """Underline sub-tabs + stacked panes for settings pages (录音 / 音频 / 偏好)."""
-
-    tab_changed = pyqtSignal(int)
-
-    def __init__(
-        self,
-        labels: list[str],
-        pages: list[QWidget],
-        parent: QWidget | None = None,
-    ):
-        super().__init__(parent)
-        if len(labels) != len(pages) or not labels:
-            raise ValueError("labels and pages must be non-empty and equal length")
-        self._labels = list(labels)
-        self._buttons: list[QPushButton] = []
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
-        bar = QFrame()
-        bar.setObjectName("settingsSubTabBar")
-        bar.setStyleSheet(SUB_TAB_BAR_STYLE)
-        bar_lay = QHBoxLayout(bar)
-        bar_lay.setContentsMargins(0, 0, 0, 0)
-        bar_lay.setSpacing(4)
-
-        for i, label in enumerate(labels):
-            btn = QPushButton(label)
-            btn.setObjectName("settingsSubTabBtn")
-            btn.setCheckable(True)
-            btn.setAutoExclusive(True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setStyleSheet(SUB_TAB_BTN_STYLE)
-            btn.setAccessibleName(f"通用子页签 {label}")
-            btn.clicked.connect(lambda _checked=False, idx=i: self.set_current_index(idx))
-            self._buttons.append(btn)
-            bar_lay.addWidget(btn, 0, Qt.AlignmentFlag.AlignLeft)
-        bar_lay.addStretch(1)
-        root.addWidget(bar)
-
-        self._stack = QStackedWidget()
-        self._stack.setObjectName("settingsSubTabStack")
-        self._stack.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
-        )
-        for page in pages:
-            self._stack.addWidget(page)
-        root.addWidget(self._stack)
-
-        self._buttons[0].setChecked(True)
-        self._stack.setCurrentIndex(0)
-        self._fit_stack_to_current()
-
-    def tab_labels(self) -> list[str]:
-        return list(self._labels)
-
-    def current_index(self) -> int:
-        return self._stack.currentIndex()
-
-    def set_current_index(self, index: int) -> None:
-        if index < 0 or index >= len(self._labels):
-            return
-        if self._stack.currentIndex() != index:
-            self._stack.setCurrentIndex(index)
-        btn = self._buttons[index]
-        if not btn.isChecked():
-            btn.setChecked(True)
-        self._fit_stack_to_current()
-        self.tab_changed.emit(index)
-
-    def _fit_stack_to_current(self) -> None:
-        """Keep stack height to the active pane so short tabs leave no empty scroll."""
-        page = self._stack.currentWidget()
-        if page is None:
-            return
-        height = max(page.sizeHint().height(), page.minimumSizeHint().height())
-        if height > 0:
-            self._stack.setFixedHeight(height)
-
-    def reapply_styles(self) -> None:
-        bar = self.findChild(QFrame, "settingsSubTabBar")
-        if bar is not None:
-            bar.setStyleSheet(SUB_TAB_BAR_STYLE)
-        for btn in self._buttons:
-            btn.setStyleSheet(SUB_TAB_BTN_STYLE)
 
 
 def option_row(title: str, subtitle: str = "") -> QWidget:
@@ -1520,41 +1303,6 @@ def _option_text_column(title: str, subtitle: str) -> QWidget:
     lay.setSpacing(0)
     lay.addWidget(option_row(title, subtitle), 1)
     return wrap
-
-
-class RadioOptionRow(QWidget):
-    """Full-width selectable row; click anywhere or press Space to select."""
-
-    def __init__(self, title: str, subtitle: str, radio_button, parent=None):
-        super().__init__(parent)
-        self._radio = radio_button
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setAccessibleName(title)
-        if subtitle:
-            self.setAccessibleDescription(subtitle)
-        radio_button.setAccessibleName(title)
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-        lay.addWidget(_option_text_column(title, subtitle), 1)
-        radio_button.setText("")
-        radio_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        lay.addWidget(radio_button)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._radio.setChecked(True)
-            self.setFocus()
-        super().mousePressEvent(event)
-
-    def keyPressEvent(self, event: QKeyEvent):
-        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self._radio.setChecked(True)
-            event.accept()
-            return
-        super().keyPressEvent(event)
 
 
 class SwitchControl(QCheckBox):

@@ -458,25 +458,3 @@ def input_source_label(source: str) -> str:
 
 def plan_includes_system_capture(plan: RecordingPlan) -> bool:
     return any(ep.role == "system" for ep in plan.endpoints)
-
-
-def platform_audio_hint() -> str:
-    if sys.platform == "win32":
-        base = (
-            "Windows：优先使用 WASAPI 回放采集；若无可用项，可在声音设置中启用「立体声混音」，"
-            "或安装 VB-Audio Virtual Cable 并在「系统声音设备」中选择。"
-        )
-        if not _supports_wasapi_loopback_flag():
-            from sayink.pawp_capture import pawp_available
-
-            if pawp_available():
-                base += " 已使用 PyAudioWPatch 采集电脑播放声（无需立体声混音）。"
-            else:
-                base += (
-                    " 当前环境无法 WASAPI 环回：请执行 pip install PyAudioWPatch，"
-                    "或启用「立体声混音」/ 虚拟声卡。"
-                )
-        return base
-    if sys.platform == "darwin":
-        return "macOS：请安装 BlackHole 等虚拟声卡，将系统输出路由到该设备后在此选择。"
-    return "Linux：请选择 PulseAudio/PipeWire 的 monitor 源（名称通常含 monitor）。"

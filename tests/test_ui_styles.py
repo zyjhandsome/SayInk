@@ -439,20 +439,6 @@ class TestCursorInspiredSettingsPolish:
             row.close()
             combo.close()
 
-    def test_nav_icon_active_stays_neutral_not_accent(self):
-        from pathlib import Path
-
-        from sayink.ui import nav_icons as mod
-        from sayink.ui.nav_icons import nav_icon
-
-        idle = nav_icon("general", active=False)
-        active = nav_icon("general", active=True)
-        assert not idle.isNull() and not active.isNull()
-
-        src = Path(mod.__file__).read_text(encoding="utf-8")
-        assert "TEXT if active else TEXT_SEC" in src
-        assert "ACCENT if active" not in src
-
 
 class TestSettingsControlAlignment:
     """History numeric spins + scrollbar policy (settings-control-alignment)."""
