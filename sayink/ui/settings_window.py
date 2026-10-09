@@ -44,6 +44,7 @@ from sayink.ui.settings_components import (
     kv_row_elided,
     section_header,
     settings_group,
+    sync_group_tab_stop,
 )
 from sayink.ui.settings_pages import (
     build_about_page,
@@ -810,12 +811,14 @@ class SettingsWindow(QWidget):
         else:
             self._src_mic_rb.setChecked(True)
         self._sync_source_device_widgets()
+        sync_group_tab_stop(self._source_group)
 
     def _apply_trigger_mode_radios(self, mode: str):
         if mode == TRIGGER_MODE_HOTKEY:
             self._trigger_hotkey_rb.setChecked(True)
         else:
             self._trigger_continuous_rb.setChecked(True)
+        sync_group_tab_stop(self._trigger_group)
 
     def _load_settings(self):
         self._loading = True

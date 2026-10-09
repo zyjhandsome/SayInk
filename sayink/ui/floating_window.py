@@ -12,8 +12,10 @@ from sayink.ui.island_chrome import (
 
 BAR_HEIGHT = 44
 BAR_EXCERPT_HEIGHT = 68
-BAR_WIDTH = 360
-BAR_EXCERPT_WIDTH = 420
+# One width for both modes: the bar used to jump 360 ↔ 420 (and re-center)
+# every time an excerpt appeared or cleared (U-12). Only the height grows.
+BAR_WIDTH = 420
+BAR_EXCERPT_WIDTH = BAR_WIDTH
 COMPACT_HEIGHT = BAR_HEIGHT
 MODEL_LOADING_TITLE = "模型载入中 · 请勿录音"
 

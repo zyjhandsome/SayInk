@@ -1593,11 +1593,60 @@ def _set_click_through(widget: QWidget) -> None:
         child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
 
+def _tab_stops(widget: QWidget) -> list[QWidget]:
+    """What to hand ``setTabOrder`` for ``widget``.
+
+    A composite with a focus proxy (CompactPickCard, ToggleOptionRow, QSpinBox)
+    is chained as itself so Qt moves it together with the child that takes
+    focus. A plain container (ThemeModeSegment) contributes its focusable
+    children in creation order. Anything else is chained as is."""
+    if widget.focusProxy() is not None or widget.focusPolicy() != Qt.FocusPolicy.NoFocus:
+        return [widget]
+    return [
+        child for child in widget.findChildren(QWidget)
+        if child.focusPolicy() != Qt.FocusPolicy.NoFocus and child.focusProxy() is None
+    ]
+
+
+def chain_tab_order(widgets: list[QWidget]) -> None:
+    """``QWidget.setTabOrder`` over consecutive pairs (U-07)."""
+    stops: list[QWidget] = []
+    for widget in widgets:
+        for stop in _tab_stops(widget):
+            if stop not in stops:
+                stops.append(stop)
+    for first, second in zip(stops, stops[1:]):
+        QWidget.setTabOrder(first, second)
+
+
+def sync_group_tab_stop(group) -> None:
+    """Make an exclusive button group a single Tab stop that lands on the
+    checked button (arrows move inside the group, as on native Windows).
+
+    Qt only drops TabFocus from the other buttons once one of them has had
+    focus; before that, Tab entered the group at the first button in order —
+    the unchecked 「持续转写」 card ahead of the checked default (U-07)."""
+    for button in group.buttons():
+        base = button.property("baseFocusPolicy")
+        if base is None:
+            base = button.focusPolicy()
+            button.setProperty("baseFocusPolicy", base)
+        if button.isChecked():
+            policy = Qt.FocusPolicy(base | Qt.FocusPolicy.TabFocus)
+        else:
+            policy = Qt.FocusPolicy(base & ~Qt.FocusPolicy.TabFocus)
+        if button.focusPolicy() != policy:
+            button.setFocusPolicy(policy)
+
+
 class SettingsPage(QScrollArea):
     """Scrollable content shell with consistent margins."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # The page itself is not a control: Tab goes straight to its content
+        # (the viewport still scrolls to whichever child receives focus).
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)

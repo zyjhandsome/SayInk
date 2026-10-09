@@ -314,11 +314,12 @@ def test_partial_text_grows_excerpt_only(win):
     assert win._end_btn.text() == "结束"
 
 
-def test_update_partial_text_recenters_on_excerpt_resize(win, qapp):
+def test_update_partial_text_keeps_width_and_center_on_excerpt(win, qapp):
+    """U-12: the excerpt line only adds height; the bar must not jump sideways."""
     from PyQt6.QtGui import QCursor
     from PyQt6.QtWidgets import QApplication
 
-    from sayink.ui.floating_window import BAR_WIDTH
+    from sayink.ui.floating_window import BAR_EXCERPT_HEIGHT, BAR_HEIGHT, BAR_WIDTH
 
     screen = QApplication.screenAt(QCursor.pos()) or qapp.primaryScreen()
     assert screen is not None
@@ -327,17 +328,15 @@ def test_update_partial_text_recenters_on_excerpt_resize(win, qapp):
     win.show_listening()
     qapp.processEvents()
     compact_x = win.x()
-    compact_w = win.width()
-    expected_compact_x = geo.x() + (geo.width() - compact_w) // 2
-    assert compact_x == expected_compact_x
+    assert win.width() == BAR_WIDTH
+    assert win.height() == BAR_HEIGHT
+    assert compact_x == geo.x() + (geo.width() - BAR_WIDTH) // 2
 
     win.update_partial_text("下一步把这份纪要贴到会议群里。")
     qapp.processEvents()
-    excerpt_w = win.width()
-    assert excerpt_w > BAR_WIDTH
-    expected_excerpt_x = geo.x() + (geo.width() - excerpt_w) // 2
-    assert win.x() == expected_excerpt_x
-    assert win.x() != compact_x
+    assert win.width() == BAR_WIDTH
+    assert win.height() == BAR_EXCERPT_HEIGHT
+    assert win.x() == compact_x
 
 
 class TestCloseButton:

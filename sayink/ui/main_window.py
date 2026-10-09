@@ -26,8 +26,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from sayink.config import DEFAULT_HOTKEY, format_hotkey
+from sayink.config import DEFAULT_HOTKEY, TRIGGER_MODE_HOTKEY, format_hotkey
 from sayink.ui import design_tokens as tok
+from sayink.ui.settings_components import sync_group_tab_stop
 
 NAV_LABELS = ("历史", "通用", "引擎", "润色", "关于")
 PAGE_KEYS = ("history", "general", "engine", "polish", "about")
@@ -362,11 +363,13 @@ class MainWindow(QWidget):
     def _refresh_usage_summary(self, *_args) -> None:
         source = {"microphone": "麦克风", "system": "电脑播放", "mixed": "混合音频"}.get(
             self._config.get("audio.input_source", "microphone"), "麦克风")
-        continuous = self._config.get("audio.trigger_mode", "continuous") == "continuous"
+        continuous = self._config.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY) == "continuous"
         self._mode_label.setText(f"{source} · {'持续转写' if continuous else '按住说话'}")
         hotkey = format_hotkey(self._config.get("hotkey", DEFAULT_HOTKEY))
+        # One clause per line: the sidebar is narrow and word wrap used to
+        # orphan 「停止」 on its own line (U-09).
         self._shortcut_label.setText(f"按住 {hotkey}\n" + (
-            "停顿出字 · Esc /「结束」停止" if continuous else "松开出字 · Esc 取消"))
+            "停顿出字\nEsc 或「结束」停止" if continuous else "松开出字\nEsc 取消"))
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -506,6 +509,8 @@ class MainWindow(QWidget):
         btn.blockSignals(True)
         btn.setChecked(True)
         btn.blockSignals(False)
+        # Tab enters the sidebar on the current page's button (U-07).
+        sync_group_tab_stop(self._nav_group)
 
     def current_page(self) -> str:
         return self._page

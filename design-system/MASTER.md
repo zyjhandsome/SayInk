@@ -182,7 +182,7 @@ shadow tokens to `design_tokens.py` unless a surface actually paints one.
 ### Floating window
 
 - Follows **effective** theme float tokens (not permanently locked to dark)
-- 360×44px at rest; 420×68px with a one-line excerpt. Radius 22px / 16px respectively.
+- 420×44px at rest; 420×68px with a one-line excerpt (width is constant so the bar never jumps sideways; only the height grows). Radius 22px / 16px respectively.
 - The 64×30px stop target appears only during a continuous session; state colors survive theme changes.
 - Native QFont sizes use pixels to match the QSS type scale under display scaling.
 

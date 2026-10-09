@@ -23,6 +23,7 @@ from sayink.ui.settings_components import (
     ThemeModeSegment,
     ToggleOptionRow,
     TriggerModePicker,
+    chain_tab_order,
     device_selection_link,
     footnote,
     group_divider,
@@ -297,4 +298,34 @@ def build_general_page(win) -> QWidget:
     page.add(win._general_footer_note)
     page._layout.setContentsMargins(2, 20, 2, 12)
     page.set_spacing(18)
+
+    # U-07: keyboard order follows the visual order top to bottom, regardless
+    # of how the widgets above were constructed. Radio groups count as one
+    # stop (only the checked one keeps TabFocus, see sync_group_tab_stop).
+    win._general_tab_chain = [
+        # The pick cards (focus proxy → their radio), not the bare radios.
+        win._trigger_continuous_rb.parentWidget(),
+        win._trigger_hotkey_rb.parentWidget(),
+        win._hotkey_edit,
+        win._esc_stop_row,
+        win._src_mic_rb.parentWidget(),
+        win._src_sys_rb.parentWidget(),
+        win._src_mixed_rb.parentWidget(),
+        win._mic_test_btn,
+        win._mic_reset_btn,
+        win._advanced_audio_btn,
+        win._mic_device_combo,
+        win._system_device_combo,
+        refresh_btn,
+        reset_btn,
+        win._theme_combo,
+        win._auto_start_row,
+        win._sound_row,
+        win._history_only_output_row,
+        win._restore_clipboard_row,
+        win._history_enabled_row,
+        win._history_retention_days_spin,
+        win._history_max_entries_spin,
+    ]
+    chain_tab_order(win._general_tab_chain)
     return page

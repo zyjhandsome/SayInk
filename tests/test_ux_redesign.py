@@ -33,6 +33,46 @@ def test_keyboard_can_reach_navigation_and_search(main_window, _qapp_session):
     assert win._history._search_edit.hasFocus()
 
 
+def _tab_stops(win, app, count):
+    names = []
+    for _ in range(count):
+        QTest.keyClick(win, Qt.Key.Key_Tab)
+        app.processEvents()
+        fw = app.focusWidget()
+        names.append(fw.accessibleName() or fw.text())
+    return names
+
+
+def test_tab_walks_the_general_page_top_to_bottom_then_back_to_the_current_nav(main_window, _qapp_session):
+    """U-07: Tab enters the sidebar on the current page, then follows the
+    visual order; each radio group is one stop that lands on the checked card."""
+    win = main_window
+    win.resize(1100, 900)
+    win.show_page("general")
+    win.setFocus()
+    _qapp_session.processEvents()
+
+    stops = _tab_stops(win, _qapp_session, 17)
+    assert stops[:5] == ["通用", "按住说话", "录音快捷键", "Esc 结束持续转写", "仅麦克风"]
+    assert "持续转写" not in stops and "仅电脑播放" not in stops
+    assert stops[5:8] == ["测试声音（约 2 秒）", "恢复自动选择", "手动选择音频设备"]
+    assert stops[9:14] == ["开机时自动启动", "录音提示音", "只记录到历史，不粘贴", "粘贴后恢复剪贴板", "保存语音历史"]
+    assert stops[14:16] == ["历史保留天数", "最多保留会话数"]
+    assert stops[16] == "通用"
+
+
+def test_tab_enters_radio_groups_on_the_checked_option(main_window, _qapp_session):
+    win = main_window
+    win._settings._trigger_continuous_rb.setChecked(True)
+    win._settings._src_mixed_rb.setChecked(True)
+    win._settings.reload_settings()
+    win.setFocus()
+    _qapp_session.processEvents()
+    stops = _tab_stops(win, _qapp_session, 5)
+    assert stops[1] == "持续转写"
+    assert stops[4] == "混合"
+
+
 def test_navigation_shortcuts_pause_during_hotkey_capture(main_window):
     win = main_window
     win._settings.hotkey_capture_started.emit()
@@ -62,7 +102,10 @@ def test_sidebar_status_is_not_a_card_and_nav_has_no_stale_focus_ring(main_windo
     win = main_window
     # No nav button is focused just by opening the window.
     assert not any(btn.hasFocus() for btn in win._nav_buttons)
-    assert all(btn.focusPolicy() == Qt.FocusPolicy.TabFocus for btn in win._nav_buttons)
+    # Clicking never focuses a nav button; Tab reaches only the current page's button.
+    assert not any(btn.focusPolicy() & Qt.FocusPolicy.ClickFocus for btn in win._nav_buttons)
+    tabbable = [btn for btn in win._nav_buttons if btn.focusPolicy() & Qt.FocusPolicy.TabFocus]
+    assert tabbable == [btn for btn in win._nav_buttons if btn.isChecked()]
     assert not hasattr(win, "_nav_heading")
     assert "border-radius: 8px" not in win._runtime_label.styleSheet()
     win._settings.set_runtime_status("模型载入中…")
@@ -95,8 +138,16 @@ def test_trigger_choice_uses_same_name_as_runtime_mode(main_window):
     cards = main_window._settings.findChildren(CompactPickCard)
     titles = [card._title_label.text() for card in cards]
     assert "持续转写" in titles
+    assert "按住说话" in titles
     assert "连续口述" not in titles
+    # P-01: hold-to-talk is the default; the sidebar names the mode like the card.
+    assert "按住说话" in main_window._mode_label.text()
+    main_window._settings._trigger_continuous_rb.setChecked(True)
     assert "持续转写" in main_window._mode_label.text()
+    # U-09: each clause on its own line so 「停止」 never wraps alone.
+    lines = main_window._shortcut_label.text().split("\n")
+    assert lines[-1] == "Esc 或「结束」停止"
+    assert all(len(line) <= 12 for line in lines)
 
 
 def test_task_choices_have_visible_native_radios(main_window):
