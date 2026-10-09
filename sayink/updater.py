@@ -22,6 +22,7 @@ log = logging.getLogger("SayInk")
 
 GITHUB_REPO = "zyjhandsome/SayInk"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+ISSUES_URL = f"https://github.com/{GITHUB_REPO}/issues/new/choose"
 USER_AGENT = "SayInk"
 CHECK_INTERVAL_SEC = 24 * 60 * 60
 # Accept "x.y.z" and "x.y" (a two-part tag counts as patch 0).

@@ -1,0 +1,36 @@
+name: 功能建议 / Feature request
+description: 想要一个新能力，或觉得某处应该换个做法
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决什么问题
+      description: 先说场景，再说你现在是怎么绕过去的
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 希望 SayInk 怎么做
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 涉及的部分
+      multiple: true
+      options:
+        - 按住说话 / 持续转写
+        - 音频来源与设备
+        - 识别模型
+        - 润色
+        - 粘贴与输出
+        - 历史
+        - 外观与设置
+        - 安装与更新
+  - type: textarea
+    id: context
+    attributes:
+      label: 补充说明
+      description: 截图、参考的其他软件、使用频率等

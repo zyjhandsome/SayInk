@@ -11,7 +11,7 @@
 | 读者 | 建议阅读 |
 |------|----------|
 | **普通用户** | [功能一览](#功能一览) → [快速上手](#快速上手) → [常见问题](#常见问题) |
-| **开发者 / 维护者 / Agent** | [源码结构](#源码结构) → [从源码打包](#从源码打包) → [变更审查清单](#变更审查清单必读) → [设计系统](design-system/MASTER.md) / [UX 重设计](docs/ux-redesign.md) / [OpenSpec](openspec/) |
+| **开发者 / 维护者 / Agent** | [源码结构](#源码结构) → [从源码打包](#从源码打包) → [变更审查清单](#变更审查清单必读) → [设计系统](design-system/MASTER.md) / [UX 重设计](docs/ux-redesign.md) / [OpenSpec 归档](openspec/changes/archive/) |
 
 ---
 
@@ -204,7 +204,9 @@ py -3.10 run.py
 | 主题 | `ui/theme.py`、`ui/design_tokens.py`、`ui/app_styles.py`、`ui/settings_styles.py` | 有效主题解析、token、全局/设置 QSS |
 | 构建 | `build.py`、`build_release.py`、`sayink_build/` | 便携版与 Inno 安装包 |
 
-自动化测试在 `tests/`（含 `test_readme_features.py`、`test_theme_resolve.py`、`test_ui_styles.py`）。产品变更走 OpenSpec（`openspec/changes/`）。
+自动化测试在 `tests/`（含 `test_readme_features.py`、`test_theme_resolve.py`、`test_ui_styles.py`）。
+
+**真相源：** 产品行为以本 README 为准，视觉 token 以 [`design-system/MASTER.md`](design-system/MASTER.md) 为准；两者与代码不一致时，先改代码或改文档，不能并存。`openspec/` 只保留已完成变更的归档（`openspec/changes/archive/`）供追溯，不再作为当前行为的依据；新的产品变更直接改 README 并补测试，不必再起 OpenSpec 变更。
 
 ---
 
@@ -308,6 +310,9 @@ A: Linux 装 `xdotool`；macOS 在辅助功能中授权 SayInk。
 
 **Q: 出问题了，日志在哪里？**  
 A: `~/.sayink/logs/sayink.log`（自动轮转，最多约 4 MB）；程序异常崩溃的底层信息在同目录 `crash.log`。设置 → 关于 → 文件位置 可看到完整路径。
+
+**Q: 怎么反馈问题或提建议？**  
+A: 设置 → 关于 → 「GitHub 反馈」会打开 [issue 页面](https://github.com/zyjhandsome/SayInk/issues/new/choose)，有问题反馈和功能建议两个模板；报问题时附上最新一份 `sayink.log` 定位最快。
 
 **Q: 再次双击 SayInk 图标没反应？**  
 A: SayInk 同时只运行一个；再次启动会直接打开已在运行的主窗口。

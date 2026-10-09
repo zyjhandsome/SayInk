@@ -1,0 +1,67 @@
+name: 问题反馈 / Bug report
+description: 听写、粘贴、模型、安装或更新出了问题
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。日志在 SayInk 主窗口 → 关于 → 文件位置 → 日志目录（默认 `%USERPROFILE%\.sayink\logs`），请把最新一份附上，能快很多。
+  - type: input
+    id: version
+    attributes:
+      label: SayInk 版本
+      description: 关于页「版本」胶囊里的数字
+      placeholder: 例如 1.4.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: 安装方式
+      options:
+        - 轻量安装包 SayInk-Setup-x.y.z.exe
+        - 完整安装包 SayInk-Setup-x.y.z-full.exe
+        - 从源码运行（run.py）
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: 系统与硬件
+      placeholder: Windows 11 23H2 · Intel Core Ultra 9 185H · 32 GB
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 当时的触发方式与音频来源
+      multiple: true
+      options:
+        - 按住说话
+        - 持续转写
+        - 仅麦克风
+        - 仅电脑播放
+        - 混合
+        - 开启了润色
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 在哪个应用里按住 Alt+X
+        2. 说了什么、说了多久
+        3. 松开后看到什么
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果与实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志片段
+      description: 直接粘贴会自动按代码块排版
+      render: text

@@ -1,10 +1,18 @@
 """About settings page."""
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QStyle, QVBoxLayout, QWidget
 
 from sayink.config import VERSION
 from sayink.ui import design_tokens as tok
+from sayink.updater import ISSUES_URL
+
+FEEDBACK_HINT = "遇到问题或有建议？到 GitHub 提 issue，附上「文件位置」里日志目录的最新日志会更快定位。"
+
+
+def open_feedback_page() -> bool:
+    return bool(QDesktopServices.openUrl(QUrl(ISSUES_URL)))
 from sayink.ui.settings_components import (
     SettingsPage,
     ToggleOptionRow,
@@ -20,16 +28,23 @@ def paint_about_update_row(win) -> None:
     win._about_update_status.setStyleSheet(
         f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; background: transparent;"
     )
-    win._about_update_btn.setStyleSheet(
-        f"QPushButton#aboutUpdateButton {{"
+    win._about_update_btn.setStyleSheet(_pill_button_css("aboutUpdateButton"))
+    feedback_btn = getattr(win, "_about_feedback_btn", None)
+    if feedback_btn is not None:
+        feedback_btn.setStyleSheet(_pill_button_css("aboutFeedbackButton"))
+    sync_about_pill_widths(win)
+
+
+def _pill_button_css(object_name: str) -> str:
+    return (
+        f"QPushButton#{object_name} {{"
         f" color: {tok.TEXT}; background: {tok.SURFACE_PEARL};"
         f" border: 1px solid {tok.HAIRLINE}; border-radius: {tok.RADIUS_PILL}px;"
         f" font-size: {tok.TYPE_CAPTION}px; font-weight: 700; padding: 6px 12px;"
         f"}}"
-        f"QPushButton#aboutUpdateButton:hover {{ background: {tok.CHIP_BG_HOVER}; }}"
-        f"QPushButton#aboutUpdateButton:disabled {{ color: {tok.TEXT_DIM}; }}"
+        f"QPushButton#{object_name}:hover {{ background: {tok.CHIP_BG_HOVER}; }}"
+        f"QPushButton#{object_name}:disabled {{ color: {tok.TEXT_DIM}; }}"
     )
-    sync_about_pill_widths(win)
 
 
 _UPDATE_BUTTON_TEXTS = ("检查更新", "下载并安装")
@@ -155,8 +170,26 @@ def build_about_page(win) -> QWidget:
     win._about_usage_tip.setObjectName("settingsGroup")
     tip_layout = QVBoxLayout(win._about_usage_tip)
     tip_layout.setContentsMargins(16, 12, 16, 12)
-    tip_layout.addWidget(footnote(""))
+    tip_layout.addWidget(footnote(""))  # filled by _refresh_about_hero_status
     page.add(win._about_usage_tip)
+
+    # Feedback entry (P-06): one sentence plus a button to the issue tracker.
+    win._about_feedback_group = settings_group()
+    win._about_feedback_group.setObjectName("settingsGroup")
+    feedback_layout = QHBoxLayout(win._about_feedback_group)
+    feedback_layout.setContentsMargins(16, 12, 16, 12)
+    feedback_layout.setSpacing(12)
+    win._about_feedback_hint = footnote(FEEDBACK_HINT)
+    feedback_layout.addWidget(win._about_feedback_hint, 1)
+    win._about_feedback_btn = QPushButton("GitHub 反馈")
+    win._about_feedback_btn.setObjectName("aboutFeedbackButton")
+    win._about_feedback_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    win._about_feedback_btn.setAccessibleName("在 GitHub 提交反馈")
+    win._about_feedback_btn.setToolTip(ISSUES_URL)
+    win._about_feedback_btn.clicked.connect(open_feedback_page)
+    feedback_layout.addWidget(win._about_feedback_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+    paint_about_update_row(win)
+    page.add(win._about_feedback_group)
     page.set_compact()
     page.set_spacing(12)
     return page

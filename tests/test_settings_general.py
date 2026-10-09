@@ -233,6 +233,24 @@ class TestGeneralPageLayout:
             assert f"background: {tok.BG}" not in sheet
         assert not hasattr(settings_window, "_sheet")
 
+    def test_about_feedback_button_opens_issue_tracker(self, settings_window, monkeypatch):
+        """P-06: the About page has a visible feedback entry that goes to GitHub issues."""
+        from sayink.ui.settings_pages import about as about_page
+        from sayink.updater import GITHUB_REPO, ISSUES_URL
+
+        opened = []
+        monkeypatch.setattr(
+            about_page.QDesktopServices, "openUrl", lambda url: opened.append(url.toString()) or True
+        )
+        btn = settings_window._about_feedback_btn
+        assert btn.text() == "GitHub 反馈"
+        assert "日志" in settings_window._about_feedback_hint.text()
+        btn.click()
+        assert opened == [ISSUES_URL]
+        assert ISSUES_URL == f"https://github.com/{GITHUB_REPO}/issues/new/choose"
+        # Same pill look as 检查更新 so the two actions read as one family.
+        assert f"background: {SURFACE_PEARL}" in btn.styleSheet()
+
     def test_about_paths_start_hidden_and_reveal_on_toggle(
         self, config, qapp, monkeypatch
     ):

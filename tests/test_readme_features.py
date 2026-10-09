@@ -507,6 +507,24 @@ class TestReadmeReliabilityPromises:
         assert f"约 **{SILENCE_HOLD_SEC:.2f} 秒**静音判定" in text
         assert "说完要等几秒才出字，正常吗" in text
 
+    def test_feedback_entry_and_truth_source_are_documented(self):
+        """P-06 / P-10: README points at the in-app feedback entry and names itself the truth source."""
+        from pathlib import Path
+
+        from sayink.updater import ISSUES_URL
+
+        text = self._readme()
+        assert "「GitHub 反馈」" in text
+        assert ISSUES_URL in text
+        assert "**真相源：**" in text
+        assert "不必再起 OpenSpec 变更" in text
+        root = Path(__file__).resolve().parents[1]
+        assert (root / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml").exists()
+        assert (root / ".github" / "ISSUE_TEMPLATE" / "feature_request.yml").exists()
+        # No live (unarchived) OpenSpec change directories remain.
+        live = [p for p in (root / "openspec" / "changes").iterdir() if p.is_dir() and p.name != "archive"]
+        assert live == []
+
     def test_output_and_polish_guarantees_are_documented(self):
         text = self._readme()
         assert "就不发送粘贴键" in text
