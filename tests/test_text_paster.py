@@ -294,6 +294,106 @@ class TestPasteAsyncFlow:
         assert paste_env["clipboard"] == "OLD"
 
 
+class TestForegroundProcessName:
+    """Q-13: the Win32 process-name path, with pywin32 / ctypes replaced by fakes.
+    Only the EXE basename may leave this module (no window title, no path)."""
+
+    @pytest.fixture
+    def win32(self, monkeypatch):
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(tp.sys, "platform", "win32")
+        closed = []
+        win32api = SimpleNamespace(
+            OpenProcess=lambda _access, _inherit, pid: f"h{pid}",
+            CloseHandle=lambda h: closed.append(h),
+        )
+        win32con = SimpleNamespace(PROCESS_QUERY_INFORMATION=0x400, PROCESS_VM_READ=0x10)
+        win32process = SimpleNamespace(
+            GetModuleFileNameEx=lambda _h, _mod: r"C:\Program Files\Editor\editor.exe",
+            GetWindowThreadProcessId=lambda _hwnd: (7, 4242),
+        )
+        win32gui = SimpleNamespace(GetForegroundWindow=lambda: 99, GetWindowText=lambda _h: "secret.txt - Editor")
+        for name, mod in (
+            ("win32api", win32api),
+            ("win32con", win32con),
+            ("win32process", win32process),
+            ("win32gui", win32gui),
+        ):
+            monkeypatch.setitem(sys.modules, name, mod)
+        return SimpleNamespace(closed=closed, api=win32api, process=win32process, gui=win32gui)
+
+    def test_foreground_window_info_carries_hwnd_title_and_pid(self, win32):
+        assert tp._get_foreground_window_win32() == (99, "secret.txt - Editor", 4242)
+        assert tp.get_foreground_window_info() == (99, "secret.txt - Editor", 4242)
+
+    def test_foreground_window_failure_yields_no_target(self, win32, monkeypatch):
+        def boom():
+            raise OSError("no desktop")
+
+        monkeypatch.setattr(win32.gui, "GetForegroundWindow", boom)
+        assert tp._get_foreground_window_win32() == (0, "", 0)
+
+    def test_process_name_is_the_exe_basename_and_the_handle_is_closed(self, win32):
+        assert tp._process_name_from_window_info((99, "secret.txt - Editor", 4242)) == "editor.exe"
+        assert win32.closed == ["h4242"]
+        assert tp.get_foreground_process_name() == "editor.exe"
+
+    def test_no_pid_or_short_info_gives_empty_name(self, win32):
+        assert tp._process_name_from_window_info((99, "x", 0)) == ""
+        assert tp._process_name_from_window_info((99, "x")) == ""
+
+    def test_elevated_target_falls_back_to_the_limited_query(self, win32, monkeypatch):
+        import ctypes
+        from types import SimpleNamespace
+
+        def denied(*_a):
+            raise PermissionError("access denied")
+
+        monkeypatch.setattr(win32.api, "OpenProcess", denied)
+
+        class _Kernel32:
+            def __init__(self):
+                self.closed = []
+
+            def OpenProcess(self, access, _inherit, pid):
+                assert access == tp._PROCESS_QUERY_LIMITED_INFORMATION
+                return 0x55 if pid == 4242 else 0
+
+            def QueryFullProcessImageNameW(self, _h, _flags, buf, _size_ref):
+                buf.value = r"C:\Windows\regedit.exe"
+                return 1
+
+            def CloseHandle(self, h):
+                self.closed.append(h)
+
+        kernel32 = _Kernel32()
+        monkeypatch.setattr(ctypes, "windll", SimpleNamespace(kernel32=kernel32), raising=False)
+
+        assert tp._process_name_from_window_info((99, "Registry Editor", 4242)) == "regedit.exe"
+        assert kernel32.closed == [0x55]
+        # Handle could not be opened at all → still no exception, just empty.
+        assert tp._process_name_limited((99, "x", 1)) == ""
+
+    def test_limited_query_failure_is_empty_not_an_exception(self, win32, monkeypatch):
+        import ctypes
+        from types import SimpleNamespace
+
+        class _Kernel32:
+            def OpenProcess(self, *_a):
+                return 0x55
+
+            def QueryFullProcessImageNameW(self, *_a):
+                return 0
+
+            def CloseHandle(self, _h):
+                pass
+
+        monkeypatch.setattr(ctypes, "windll", SimpleNamespace(kernel32=_Kernel32()), raising=False)
+        assert tp._process_name_limited((99, "x", 4242)) == ""
+        assert tp._process_name_limited((99, "x", 0)) == ""
+
+
 class TestIntegrityCheck:
     def test_own_process_is_not_rejected(self):
         import os
