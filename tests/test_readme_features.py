@@ -497,6 +497,16 @@ class TestReadmeReliabilityPromises:
         assert "手动改过的选择不会再被来源切换覆盖" in text
         assert "未保存 · 历史已关闭" in text
 
+    def test_expected_latency_is_documented_and_matches_vad_hold(self):
+        """F-19: README states measured latency; the silence figure tracks the code."""
+        from sayink.vad_segmenter import SILENCE_HOLD_SEC
+
+        text = self._readme()
+        assert "预期延迟（本机实测" in text
+        assert "实时率约 **0.5–0.8**" in text
+        assert f"约 **{SILENCE_HOLD_SEC:.2f} 秒**静音判定" in text
+        assert "说完要等几秒才出字，正常吗" in text
+
     def test_output_and_polish_guarantees_are_documented(self):
         text = self._readme()
         assert "就不发送粘贴键" in text
