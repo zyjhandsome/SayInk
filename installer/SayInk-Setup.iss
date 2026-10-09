@@ -2,16 +2,16 @@
 ; Creates a professional Windows installer with custom installation path
 ;
 ; Constants are normally passed by build_installer.py:
-;   ISCC /DAppVersionStr=2.2.3 /DAppVersionQuad=2.2.3.0 SayInk-Setup.iss
+;   ISCC /DAppVersionStr=2.2.4 /DAppVersionQuad=2.2.4.0 SayInk-Setup.iss
 ; Lite installer (default): no model inside, the app downloads Fun-ASR-Nano
 ; on first start. Full installer: /DBundleModel /DOutputSuffix=-full copies
 ; dist\SayInk\models\ and names the file SayInk-Setup-<version>-full.exe.
 ; The in-app updater only downloads the lite name (sayink/updater.py).
 #ifndef AppVersionStr
-#define AppVersionStr "2.2.3"
+#define AppVersionStr "2.2.4"
 #endif
 #ifndef AppVersionQuad
-#define AppVersionQuad "2.2.3.0"
+#define AppVersionQuad "2.2.4.0"
 #endif
 #ifndef OutputSuffix
 #define OutputSuffix ""
