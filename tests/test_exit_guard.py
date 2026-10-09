@@ -116,7 +116,7 @@ def test_update_does_not_launch_installer_when_exit_is_cancelled():
             dialog = boxes.return_value
             dialog.addButton.side_effect = ["return", "discard"]
             dialog.clickedButton.return_value = "return"
-            h["app"]._on_update_downloaded("downloaded.exe")
+            h["app"]._updates.on_downloaded("downloaded.exe")
             launch.assert_not_called()
         h["recognizer"].shutdown.assert_not_called()
         h["history"].close.assert_not_called()
@@ -133,7 +133,7 @@ def test_update_confirms_discard_before_launch_and_does_not_confirm_twice():
             dialog.exec.side_effect = lambda: events.append("confirm")
             launch.side_effect = lambda _path: events.append("launch")
             quit_app.side_effect = lambda: events.append("quit")
-            h["app"]._on_update_downloaded("downloaded.exe")
+            h["app"]._updates.on_downloaded("downloaded.exe")
             assert events == ["confirm", "launch", "quit"]
             dialog.exec.assert_called_once()
 
@@ -141,6 +141,6 @@ def test_update_confirms_discard_before_launch_and_does_not_confirm_twice():
 def test_installer_launch_failure_keeps_app_running():
     with app_harness() as h:
         with patch("sayink.updater.launch_installer", side_effect=OSError("cannot launch")), patch("sayink.app.QApplication.quit") as quit_app:
-            h["app"]._on_update_downloaded("downloaded.exe")
+            h["app"]._updates.on_downloaded("downloaded.exe")
             quit_app.assert_not_called()
         h["recognizer"].shutdown.assert_not_called()

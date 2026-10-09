@@ -84,7 +84,7 @@ def app_harness(config_overrides: dict | None = None):
         # block the suite.
         app._show_first_run_welcome = lambda: None
         app._ask_history_onboarding_enabled = lambda: False
-        app._maybe_auto_check_for_update = lambda: None
+        app._updates.maybe_auto_check = lambda: None
         harness = {
             "app": app,
             "config": config_mock,

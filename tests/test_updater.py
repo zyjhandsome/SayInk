@@ -269,10 +269,10 @@ class TestInstallerVerification:
         with app_harness() as h:
             app = h["app"]
             settings = MagicMock()
-            app._settings_widget = lambda: settings
-            app._pending_release = ReleaseInfo("2.0.9", "SayInk-Setup-2.0.9.exe", _URL)
+            app._updates.status_sink = lambda: settings
+            app._updates.pending_release = ReleaseInfo("2.0.9", "SayInk-Setup-2.0.9.exe", _URL)
             with patch("sayink.updater.UpdateDownloadWorker") as worker_cls:
-                app._on_update_install_requested()
+                app._updates.install()
             worker_cls.assert_not_called()
             settings.set_update_status.assert_called_with(MISSING_DIGEST_MESSAGE, action="check")
 
