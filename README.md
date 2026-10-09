@@ -143,7 +143,7 @@ pip install -r requirements.txt   # PyQt6、sherpa-onnx、sounddevice、pynput �
 
 | 安装包 | 大小 | 适合 |
 |--------|------|------|
-| **`SayInk-Setup-2.2.3.exe`**（轻量包，默认） | 约 100 MB | 首次安装、日常更新。不含语音模型，首次启动的欢迎框会带你到 **设置 → 引擎** 下载 Fun-ASR-Nano（约 600 MB，只需一次） |
+| **`SayInk-Setup-2.2.3.exe`**（轻量包，默认） | 约 50 MB | 首次安装、日常更新。不含语音模型，首次启动的欢迎框会带你到 **设置 → 引擎** 下载 Fun-ASR-Nano（约 600 MB，只需一次） |
 | `SayInk-Setup-2.2.3-full.exe`（完整包） | 约 700 MB | 安装后要立刻离线使用、或下载模型困难的机器：模型随安装包一起装好 |
 
 两种包装出来的程序完全相同；**应用内自动更新一律下载轻量包**。已安装的模型（无论是完整包带的 `安装目录\models`，还是自己下载到 `~/.sayink/models/` 的）在升级时都会保留，不必重新下载。无安装包见 [从源码打包](#从源码打包)。
@@ -217,7 +217,7 @@ py -3.10 run.py
 ```bash
 pip install -r requirements-build.txt -c constraints-windows-py310.txt   # 运行依赖 + PyInstaller，按已验证版本固定
 python -m sayink_build.dependency_check                 # 打包前检查依赖版本
-python build_release.py                 # → dist/SayInk-Setup-<版本>.exe（轻量包，约 100 MB）
+python build_release.py                 # → dist/SayInk-Setup-<版本>.exe（轻量包，约 50 MB）
 python sayink_build/download_bundle_model_for_build.py   # 完整包首次：下载模型到 ./models/
 python build_release.py --with-model    # → dist/SayInk-Setup-<版本>-full.exe（完整包，约 700 MB）
 # 或仅便携版：
@@ -327,6 +327,6 @@ A: 同样处理：`history.db` 改名为 `history.corrupt-<时间>.db` 保留，
 A: 只从 GitHub Releases 下载，先存为 `.part`，核对大小与 GitHub 公布的 SHA-256 后才会运行；不完整或校验不符的安装包会被删除并提示重试。GitHub 没有公布该安装包 SHA-256 时，SayInk 不会下载或自动安装，会提示到发布页手动下载。安装包目前没有代码签名，Windows 可能提示「未知发布者」。
 
 **Q: 升级会不会重新下载模型？**  
-A: 不会。自动更新只下载不含模型的轻量包（约 100 MB）；安装目录里完整包带来的 `models\` 和 `~/.sayink/models/` 里自己下载的模型都原样保留，升级后直接载入。只有卸载时选择「删除用户配置和模型数据」才会清掉。
+A: 不会。自动更新只下载不含模型的轻量包（约 50 MB）；安装目录里完整包带来的 `models\` 和 `~/.sayink/models/` 里自己下载的模型都原样保留，升级后直接载入。只有卸载时选择「删除用户配置和模型数据」才会清掉。
 
 ---
