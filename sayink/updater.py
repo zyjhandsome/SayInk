@@ -87,8 +87,11 @@ def should_auto_check(
 
 
 def pick_installer_asset(assets: list[dict], version: str) -> dict | None:
-    """Prefer ``SayInk-Setup-<version>.exe``; otherwise a setup whose name
-    still carries ``<version>`` (e.g. ``SayInk-Setup-2.2.1-x64.exe``).
+    """Prefer ``SayInk-Setup-<version>.exe`` — the lite installer without the
+    model, which an installed copy never needs again (the bundled model stays
+    in ``{app}\\models`` and downloaded ones in ``~/.sayink/models``). Otherwise
+    fall back to a setup whose name still carries ``<version>`` (e.g.
+    ``SayInk-Setup-2.2.1-x64.exe`` or the ``-full`` installer).
 
     A setup for a different version is never offered, so a stray old installer
     attached to a new release cannot be installed and re-prompted forever.

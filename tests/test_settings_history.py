@@ -184,3 +184,95 @@ def test_first_run_welcome_is_scheduled_once_even_if_ready_and_fallback_both_fir
             app._show_first_run_welcome_once()
         scheduled = [c for c in single_shot.call_args_list if c.args[1] == app._show_first_run_welcome]
         assert len(scheduled) == 1
+
+
+class _WelcomeBox:
+    """Minimal QMessageBox stand-in: records buttons, clicks the one at ``click``."""
+
+    class Icon:
+        Information = object()
+        Question = object()
+
+    class ButtonRole:
+        AcceptRole = object()
+        RejectRole = object()
+        ActionRole = object()
+
+    click: str | None = None
+    last = None
+
+    def __init__(self, parent=None):
+        self.buttons = []
+        self.text = ""
+        _WelcomeBox.last = self
+
+    def setWindowFlag(self, flag, on=True):
+        pass
+
+    def setWindowTitle(self, title):
+        pass
+
+    def setText(self, text):
+        self.text = text
+
+    def setIcon(self, icon):
+        pass
+
+    def addButton(self, text, role):
+        button = (text, role)
+        self.buttons.append(button)
+        return button
+
+    def setDefaultButton(self, button):
+        pass
+
+    def exec(self):
+        return 0
+
+    def clickedButton(self):
+        for button in self.buttons:
+            if button[0] == _WelcomeBox.click:
+                return button
+        return self.buttons[-1]
+
+
+# P-04: the lite installer ships without a model; the welcome box must lead there.
+def test_first_run_welcome_offers_model_download_when_none_is_installed(monkeypatch):
+    import sayink.app as app_module
+
+    monkeypatch.setattr(app_module, "QMessageBox", _WelcomeBox)
+    _WelcomeBox.click = "去下载模型"
+    with app_harness(config_overrides={"first_run_welcome_seen": False, "history.onboarded": True}) as h:
+        app = h["app"]
+        app._show_first_run_welcome = type(app)._show_first_run_welcome.__get__(app)
+        opened = []
+        app._show_main_window = lambda page=None: opened.append(page)
+        monkeypatch.setattr(app, "_has_any_downloaded_model", lambda: False)
+
+        app._show_first_run_welcome()
+
+        box = _WelcomeBox.last
+        assert [t for t, _ in box.buttons] == ["去下载模型", "知道了"]
+        assert "本机还没有语音模型" in box.text
+        assert opened == ["engine"]
+        assert h["config"].get("first_run_welcome_seen") is True
+
+
+def test_first_run_welcome_has_no_download_button_when_a_model_is_installed(monkeypatch):
+    import sayink.app as app_module
+
+    monkeypatch.setattr(app_module, "QMessageBox", _WelcomeBox)
+    _WelcomeBox.click = None
+    with app_harness(config_overrides={"first_run_welcome_seen": False, "history.onboarded": True}) as h:
+        app = h["app"]
+        app._show_first_run_welcome = type(app)._show_first_run_welcome.__get__(app)
+        opened = []
+        app._show_main_window = lambda page=None: opened.append(page)
+        monkeypatch.setattr(app, "_has_any_downloaded_model", lambda: True)
+
+        app._show_first_run_welcome()
+
+        box = _WelcomeBox.last
+        assert [t for t, _ in box.buttons] == ["知道了"]
+        assert "语音模型已就绪" in box.text
+        assert opened == []

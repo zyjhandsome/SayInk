@@ -1,13 +1,20 @@
 ; SayInk Installation Script for Inno Setup 6
 ; Creates a professional Windows installer with custom installation path
 ;
-; Version constants are normally passed by build_installer.py:
+; Constants are normally passed by build_installer.py:
 ;   ISCC /DAppVersionStr=2.2.2 /DAppVersionQuad=2.2.2.0 SayInk-Setup.iss
+; Lite installer (default): no model inside, the app downloads Fun-ASR-Nano
+; on first start. Full installer: /DBundleModel /DOutputSuffix=-full copies
+; dist\SayInk\models\ and names the file SayInk-Setup-<version>-full.exe.
+; The in-app updater only downloads the lite name (sayink/updater.py).
 #ifndef AppVersionStr
 #define AppVersionStr "2.2.2"
 #endif
 #ifndef AppVersionQuad
 #define AppVersionQuad "2.2.2.0"
+#endif
+#ifndef OutputSuffix
+#define OutputSuffix ""
 #endif
 
 [Setup]
@@ -24,10 +31,12 @@ DefaultDirName={commonpf}\SayInk
 DefaultGroupName=SayInk
 AllowNoIcons=yes
 OutputDir=..\dist
-OutputBaseFilename=SayInk-Setup-{#AppVersionStr}
+OutputBaseFilename=SayInk-Setup-{#AppVersionStr}{#OutputSuffix}
 SetupIconFile=..\sayink\icon.ico
 Compression=lzma2/ultra64
-SolidCompression=yes
+; 模型本身已经压缩过，整包固体压缩几乎不再变小，但双击后要先解开
+; 固体流，向导才会出现，资源管理器会一直卡住。关掉后窗口马上出来。
+SolidCompression=no
 WizardStyle=modern
 ; 只带简体中文，避免向导页中英混排，也不弹出语言选择。
 ShowLanguageDialog=no
@@ -62,8 +71,10 @@ Type: filesandordirs; Name: "{app}\_internal"
 ; Paths match build.py PyInstaller output: dist\SayInk\
 Source: "..\dist\SayInk\SayInk.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\SayInk\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Models copied by build.py when present (optional at compile time)
-Source: "..\dist\SayInk\models\*"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+#ifdef BundleModel
+; Full installer only: model copied by `build.py --with-model`.
+Source: "..\dist\SayInk\models\*"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs
+#endif
 
 [Icons]
 Name: "{group}\SayInk"; Filename: "{app}\SayInk.exe"

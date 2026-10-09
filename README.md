@@ -138,7 +138,14 @@ pip install -r requirements.txt   # PyQt6、sherpa-onnx、sounddevice、pynput �
 
 ### 安装（Windows，推荐）
 
-安装 **[Releases](https://github.com/zyjhandsome/SayInk/releases)** 中的 **`SayInk-Setup-2.2.2.exe`**（约 709 MB）。无安装包见 [从源码打包](#从源码打包)。
+[Releases](https://github.com/zyjhandsome/SayInk/releases) 提供两种安装包，选一个即可：
+
+| 安装包 | 大小 | 适合 |
+|--------|------|------|
+| **`SayInk-Setup-2.2.2.exe`**（轻量包，默认） | 约 100 MB | 首次安装、日常更新。不含语音模型，首次启动的欢迎框会带你到 **设置 → 引擎** 下载 Fun-ASR-Nano（约 600 MB，只需一次） |
+| `SayInk-Setup-2.2.2-full.exe`（完整包） | 约 700 MB | 安装后要立刻离线使用、或下载模型困难的机器：模型随安装包一起装好 |
+
+两种包装出来的程序完全相同；**应用内自动更新一律下载轻量包**。已安装的模型（无论是完整包带的 `安装目录\models`，还是自己下载到 `~/.sayink/models/` 的）在升级时都会保留，不必重新下载。无安装包见 [从源码打包](#从源码打包)。
 
 ### 从源码运行
 
@@ -202,18 +209,19 @@ py -3.10 run.py
 
 ## 从源码打包
 
-**Windows 10/11**，Python 3.10+，本地须有 **Fun-ASR-Nano** 模型。生成安装包还需 [Inno Setup 6](https://jrsoftware.org/isdl.php)。
+**Windows 10/11**，Python 3.10+。生成安装包还需 [Inno Setup 6](https://jrsoftware.org/isdl.php)。默认打出的是**轻量包**（不含模型）；加 `--with-model` 打**完整包**，此时本地须有 **Fun-ASR-Nano** 模型。
 
 ```bash
 pip install -r requirements-build.txt -c constraints-windows-py310.txt   # 运行依赖 + PyInstaller，按已验证版本固定
-python sayink_build/download_bundle_model_for_build.py   # 首次：下载模型到 ./models/
 python -m sayink_build.dependency_check                 # 打包前检查依赖版本
-python build_release.py    # → dist/SayInk-Setup-<版本>.exe
+python build_release.py                 # → dist/SayInk-Setup-<版本>.exe（轻量包，约 100 MB）
+python sayink_build/download_bundle_model_for_build.py   # 完整包首次：下载模型到 ./models/
+python build_release.py --with-model    # → dist/SayInk-Setup-<版本>-full.exe（完整包，约 700 MB）
 # 或仅便携版：
-python build.py            # → dist/SayInk/SayInk.exe（须整目录分发）
+python build.py                         # → dist/SayInk/SayInk.exe（须整目录分发；加 --with-model 带模型）
 ```
 
-安装包产物：`dist/SayInk-Setup-<版本>.exe`；便携版须整目录分发 `dist/SayInk/`。
+发布时把两个安装包都上传到同一个 Release；应用内更新器按文件名 `SayInk-Setup-<版本>.exe` 挑轻量包（`sayink/updater.py`），找不到时才退回同版本的其他安装包。便携版须整目录分发 `dist/SayInk/`。
 
 ---
 
@@ -308,5 +316,8 @@ A: 同样处理：`history.db` 改名为 `history.corrupt-<时间>.db` 保留，
 
 **Q: 自动更新下载的安装包安全吗？**  
 A: 只从 GitHub Releases 下载，先存为 `.part`，核对大小与 GitHub 公布的 SHA-256 后才会运行；不完整或校验不符的安装包会被删除并提示重试。GitHub 没有公布该安装包 SHA-256 时，SayInk 不会下载或自动安装，会提示到发布页手动下载。安装包目前没有代码签名，Windows 可能提示「未知发布者」。
+
+**Q: 升级会不会重新下载模型？**  
+A: 不会。自动更新只下载不含模型的轻量包（约 100 MB）；安装目录里完整包带来的 `models\` 和 `~/.sayink/models/` 里自己下载的模型都原样保留，升级后直接载入。只有卸载时选择「删除用户配置和模型数据」才会清掉。
 
 ---

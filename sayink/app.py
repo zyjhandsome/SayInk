@@ -2032,7 +2032,17 @@ class App(QObject):
             pass
         QTimer.singleShot(400, self._show_first_run_welcome)
 
+    def _has_any_downloaded_model(self) -> bool:
+        from sayink.speech_recognizer import get_downloaded_models
+
+        try:
+            return bool(get_downloaded_models())
+        except Exception:
+            log.debug("无法枚举已下载模型", exc_info=True)
+            return False
+
     def _show_first_run_welcome(self):
+        model_missing = not self._has_any_downloaded_model()
         if self._is_continuous_mode():
             hotkey = self._continuous_hotkey_label()
             mode_tip = (
@@ -2053,15 +2063,24 @@ class App(QObject):
             "· 仅麦克风：你的说话（默认）\n"
             "· 仅电脑播放 / 混合：听会议或视频里的声音；选这两项后结果只记录到历史、"
             "不粘贴到当前窗口，可在「偏好」里改回\n\n"
-            "请先在设置 → 引擎 中下载至少一个语音模型"
-            "（若安装包已附带模型，启动后会自动载入）。\n\n"
-            "默认快捷键为 Alt+X；可在设置 → 通用 中更改。\n"
+            + (
+                "本机还没有语音模型：请先在设置 → 引擎 中下载 Fun-ASR-Nano（约 600 MB，仅需一次），"
+                "下载前无法听写。\n\n"
+                if model_missing
+                else "语音模型已就绪，启动后会自动载入。\n\n"
+            )
+            + "默认快捷键为 Alt+X；可在设置 → 通用 中更改。\n"
             "Windows：双击托盘图标可打开主窗口。"
         )
         box = self._dialog("欢迎使用 SayInk", text, QMessageBox.Icon.Information)
+        download_btn = None
+        if model_missing:
+            download_btn = box.addButton("去下载模型", QMessageBox.ButtonRole.ActionRole)
         box.addButton("知道了", QMessageBox.ButtonRole.AcceptRole)
         box.exec()
         self._config.set("first_run_welcome_seen", True)
+        if download_btn is not None and box.clickedButton() is download_btn:
+            self._show_main_window("engine")
         # Sequence: history onboarding only after welcome is dismissed.
         if not self._config.get("history.onboarded", False):
             QTimer.singleShot(200, self._show_history_onboarding)

@@ -76,6 +76,39 @@ class TestReleaseSelection:
             {"tag_name": "v2.0.7", "assets": [stale]}, current="2.0.5"
         ) is None
 
+    # P-04: updates download the lite installer; the model already on disk is kept.
+    def test_lite_installer_is_preferred_over_the_full_one(self):
+        from sayink.updater import pick_installer_asset
+
+        base = "https://github.com/zyjhandsome/SayInk/releases/download/v2.3.0/"
+        full = {"name": "SayInk-Setup-2.3.0-full.exe", "browser_download_url": base + "SayInk-Setup-2.3.0-full.exe"}
+        lite = {"name": "SayInk-Setup-2.3.0.exe", "browser_download_url": base + "SayInk-Setup-2.3.0.exe"}
+
+        assert pick_installer_asset([full, lite], "2.3.0") is lite
+        assert pick_installer_asset([lite, full], "2.3.0") is lite
+        # A release that only ships the full installer is still an update.
+        assert pick_installer_asset([full], "2.3.0") is full
+
+    def test_installer_names_agree_between_build_and_updater(self):
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "installer"))
+        try:
+            from build_installer import installer_file_name
+        finally:
+            sys.path.pop(0)
+        from sayink.updater import pick_installer_asset
+
+        base = "https://github.com/zyjhandsome/SayInk/releases/download/v2.3.0/"
+        lite_name = installer_file_name("2.3.0", with_model=False)
+        full_name = installer_file_name("2.3.0", with_model=True)
+        assert lite_name == "SayInk-Setup-2.3.0.exe"
+        assert full_name == "SayInk-Setup-2.3.0-full.exe"
+        lite = {"name": lite_name, "browser_download_url": base + lite_name}
+        full = {"name": full_name, "browser_download_url": base + full_name}
+        assert pick_installer_asset([full, lite], "2.3.0") is lite
+
 
 class TestAutoCheckGate:
     def test_disabled_switch_never_checks(self):

@@ -517,6 +517,15 @@ class TestReadmeReliabilityPromises:
         assert "长时间监听只在内存中保留当前这句话" not in text
         assert "自动暂停监听" in text
 
+    # P-04: lite installer is the default download and the update channel.
+    def test_lite_and_full_installers_are_documented(self):
+        text = self._readme()
+        assert "轻量包，默认" in text
+        assert "-full.exe" in text
+        assert "应用内自动更新一律下载轻量包" in text
+        assert "升级会不会重新下载模型" in text
+        assert "build_release.py --with-model" in text
+
     def test_unverified_claims_are_marked(self):
         text = self._readme()
         assert "准确率最高" not in text

@@ -1,20 +1,24 @@
 """
 Build script for packaging SayInk as a standalone Windows application.
 
-Output: dist/SayInk/ — SayInk.exe, _internal/, and optional models/.
+Output: dist/SayInk/ — SayInk.exe, _internal/, and (with --with-model) models/.
 
-Models are copied next to the exe (not inside it) from ~/.sayink/models/
-or ./models/ when present. **Fun-ASR-Nano must exist locally** or the build exits with an error.
-Fetch it with: `python sayink_build/download_bundle_model_for_build.py` (writes to `./models/`).
+The default build is the **lite** package: no model inside, the app downloads
+Fun-ASR-Nano on first start (设置 → 引擎). ``--with-model`` (or
+``SAYINK_BUNDLE_MODEL=1``) copies the model next to the exe from
+~/.sayink/models/ or ./models/ and fails when it is missing; fetch it with
+`python sayink_build/download_bundle_model_for_build.py` (writes to `./models/`).
 
 Distribution:
 - **Installer (recommended):** run `python build_release.py` — produces
-  `dist/SayInk-Setup-<version>.exe` (version from `sayink/version.py`;
-  staging folder removed after Inno Setup).
+  `dist/SayInk-Setup-<version>.exe` (lite, ~100 MB); add `--with-model` for
+  `dist/SayInk-Setup-<version>-full.exe` (~700 MB). Version from
+  `sayink/version.py`; staging folder removed after Inno Setup.
 - **Portable folder:** run this script only, then zip `dist/SayInk/` for
   users who should not run an installer.
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -31,10 +35,18 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-# Always bundle this model in dist/SayInk/models/ for released EXE/installer.
+# The model copied into dist/SayInk/models/ by a --with-model build.
 from sayink.speech_recognizer import DEFAULT_MODEL_ID
 
 BUNDLE_REQUIRE_MODEL_ID = DEFAULT_MODEL_ID
+
+
+def bundle_model_requested(argv: list[str] | None = None) -> bool:
+    """``--with-model`` on the command line or SAYINK_BUNDLE_MODEL=1."""
+    argv = sys.argv[1:] if argv is None else argv
+    if "--with-model" in argv:
+        return True
+    return os.environ.get("SAYINK_BUNDLE_MODEL", "").strip().lower() in ("1", "true", "yes")
 
 
 def _find_model_sources() -> list[tuple[str, Path]]:
@@ -136,8 +148,6 @@ def build():
         print(f"\n[ERROR] Missing runtime hook: {win_dll_rthook}")
         sys.exit(1)
 
-    import os
-
     spin_icons = SCRIPT_DIR / "sayink" / "ui" / "icons"
     args = [
         main_script,
@@ -200,11 +210,17 @@ def build():
         sys.exit(1)
 
     print()
-    print("[2/3] Copying models to dist/SayInk/models/ ...")
-
+    with_model = bundle_model_requested()
     models_dst = dist_dir / "models"
-    downloaded = _find_model_sources()
-    _require_bundle_model(downloaded)
+    downloaded: list[tuple[str, Path]] = []
+    if with_model:
+        print("[2/3] Copying models to dist/SayInk/models/ ...")
+        downloaded = _find_model_sources()
+        _require_bundle_model(downloaded)
+    else:
+        print("[2/3] Lite build: no model bundled (users download Fun-ASR-Nano on first start).")
+        if models_dst.exists():
+            shutil.rmtree(models_dst)
 
     if downloaded:
         models_dst.mkdir(parents=True, exist_ok=True)
@@ -214,7 +230,7 @@ def build():
                 shutil.rmtree(dst_path)
             shutil.copytree(src_path, dst_path)
             print(f"    + {dir_name}")
-    else:
+    elif with_model:
         print("    (no models found, users will need to download in settings)")
 
     total_size = sum(

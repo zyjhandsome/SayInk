@@ -6,7 +6,9 @@ Prerequisites:
 - SayInk must already be built with PyInstaller (run build.py first), or use
   ../build_release.py for a one-shot build.
 
-Output: dist/SayInk-Setup-<version>.exe (version from sayink/version.py)
+Output: dist/SayInk-Setup-<version>.exe (lite, no model inside; version from
+sayink/version.py). With --with-model the staging folder must contain
+models/ and the output is dist/SayInk-Setup-<version>-full.exe.
 
 By default, the intermediate folder dist/SayInk/ is deleted after a
 successful compile so dist/ only contains the setup EXE. Pass --keep-staging
@@ -26,6 +28,18 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from sayink.version import __version__, file_version_quad
+
+FULL_SUFFIX = "-full"
+
+
+def installer_file_name(version: str, *, with_model: bool) -> str:
+    """``SayInk-Setup-<version>.exe`` (lite) or ``…-full.exe`` (model bundled).
+
+    Must agree with ``sayink.updater.pick_installer_asset``, which selects the
+    lite name for in-app updates.
+    """
+    suffix = FULL_SUFFIX if with_model else ""
+    return f"SayInk-Setup-{version}{suffix}.exe"
 
 
 def resolve_staging_dir() -> Path:
@@ -56,7 +70,7 @@ def find_inno_setup() -> Path | None:
     return None
 
 
-def check_prerequisites():
+def check_prerequisites(*, with_model: bool = False):
     """Check that all prerequisites are met."""
     # Check Inno Setup
     inno_path = find_inno_setup()
@@ -98,24 +112,34 @@ def check_prerequisites():
 
     # Check models
     models_dir = resolve_staging_dir() / "models"
-    if models_dir.exists():
+    has_models = models_dir.exists() and any(models_dir.iterdir())
+    if with_model and not has_models:
+        print("\n[ERROR] --with-model requested but the staging folder has no models/.")
+        print("  Run: python build.py --with-model")
+        return False
+    if has_models and not with_model:
+        print(f"\n[ERROR] Lite installer requested but {models_dir} exists.")
+        print("  Run python build.py (lite) again, or pass --with-model for the full installer.")
+        return False
+    if has_models:
         model_count = len(list(models_dir.iterdir()))
         print(f"[OK] Models found: {model_count} models in {models_dir}")
     else:
-        print("[WARN] No models found - users will need to download after installation")
+        print("[OK] Lite build: no model inside; the app downloads Fun-ASR-Nano on first start")
 
     return True
 
 
-def build_installer(*, keep_staging: bool = False):
+def build_installer(*, keep_staging: bool = False, with_model: bool = False):
     """Build the Windows installer using Inno Setup."""
     print("=" * 60)
     print("  SayInk Installer Build Script")
     print(f"  Version {__version__}  (Inno / Win file quad {file_version_quad()})")
+    print(f"  Flavor  {'full (model bundled)' if with_model else 'lite (no model)'}")
     print("=" * 60)
     print()
 
-    if not check_prerequisites():
+    if not check_prerequisites(with_model=with_model):
         sys.exit(1)
 
     print()
@@ -133,6 +157,8 @@ def build_installer(*, keep_staging: bool = False):
                 str(inno_path),
                 f"/DAppVersionStr={__version__}",
                 f"/DAppVersionQuad={file_version_quad()}",
+                f"/DOutputSuffix={FULL_SUFFIX if with_model else ''}",
+                *(["/DBundleModel"] if with_model else []),
                 str(installer_script),
             ],
             cwd=str(SCRIPT_DIR),
@@ -151,7 +177,7 @@ def build_installer(*, keep_staging: bool = False):
         sys.exit(1)
 
     # Check output (filename includes version; see SayInk-Setup.iss OutputBaseFilename)
-    output_file = PROJECT_ROOT / "dist" / f"SayInk-Setup-{__version__}.exe"
+    output_file = PROJECT_ROOT / "dist" / installer_file_name(__version__, with_model=with_model)
     if not output_file.exists():
         print("\n[ERROR] Installer not created!")
         sys.exit(1)
@@ -191,5 +217,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Keep dist/SayInk after success (default: delete to leave only the installer).",
     )
+    ap.add_argument(
+        "--with-model",
+        action="store_true",
+        help="Staging folder contains models/; output SayInk-Setup-<version>-full.exe.",
+    )
     ns = ap.parse_args()
-    build_installer(keep_staging=ns.keep_staging)
+    build_installer(keep_staging=ns.keep_staging, with_model=ns.with_model)
