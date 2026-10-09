@@ -425,6 +425,7 @@ class _FakeUser32:
     def __init__(self, down=()):
         self.down = set(down)
         self.events: list[tuple[int, int]] = []
+        self.extras: list[int] = []
 
     def GetAsyncKeyState(self, vk):
         return 0x8000 if vk in self.down else 0
@@ -432,8 +433,9 @@ class _FakeUser32:
     def MapVirtualKeyW(self, vk, _kind):
         return vk
 
-    def keybd_event(self, vk, _scan, flags, _extra):
+    def keybd_event(self, vk, _scan, flags, extra):
         self.events.append((vk, flags))
+        self.extras.append(extra)
 
 
 @pytest.fixture
@@ -466,6 +468,15 @@ class TestWin32PasteShortcut:
             (self.CTRL, 0), (self.V, 0), (self.V, self.UP), (self.CTRL, self.UP),
             (self.SHIFT, 0),
         ]
+
+    def test_every_synthetic_key_is_tagged_for_the_hotkey_listener(self, fake_user32):
+        """Untagged, the lifted Alt would cancel an Alt+X hold in progress."""
+        from sayink.platform import SYNTHETIC_KEY_TAG
+
+        fake_user32.down = {self.ALT}
+        tp._paste_shortcut_win32()
+        assert fake_user32.extras
+        assert set(fake_user32.extras) == {SYNTHETIC_KEY_TAG}
 
     def test_held_alt_gets_the_menu_mask_so_release_does_not_open_a_menu(self, fake_user32):
         fake_user32.down = {self.ALT}

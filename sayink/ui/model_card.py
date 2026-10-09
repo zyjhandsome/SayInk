@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout,
+    QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
 from sayink.ui import design_tokens as tok
@@ -41,6 +41,7 @@ class ModelCard(QFrame):
         self._action_btn = None
         self._select_btn = None
         self._delete_btn = None
+        self._cancel_btn = None
         self._badge = None
         self._setup_ui()
 
@@ -85,11 +86,18 @@ class ModelCard(QFrame):
 
         layout.addSpacing(12)
 
+        self._progress_row = QWidget()
+        progress_lay = QVBoxLayout(self._progress_row)
+        progress_lay.setContentsMargins(0, 0, 0, 12)
+        progress_lay.setSpacing(6)
         self._progress_bar = QProgressBar()
-        self._progress_bar.setFixedHeight(4)
+        self._progress_bar.setFixedHeight(6)
         self._progress_bar.setTextVisible(False)
-        self._progress_bar.setVisible(False)
-        layout.addWidget(self._progress_bar)
+        progress_lay.addWidget(self._progress_bar)
+        self._progress_lbl = QLabel()
+        progress_lay.addWidget(self._progress_lbl)
+        self._progress_row.setVisible(False)
+        layout.addWidget(self._progress_row)
 
         actions = QHBoxLayout()
         actions.setSpacing(10)
@@ -119,6 +127,13 @@ class ModelCard(QFrame):
                 lambda: self.action_clicked.emit(self._model_id, "download")
             )
             actions.addWidget(self._action_btn)
+            self._cancel_btn = QPushButton("取消")
+            self._cancel_btn.setFixedHeight(btn_h)
+            self._cancel_btn.clicked.connect(
+                lambda: self.action_clicked.emit(self._model_id, "cancel")
+            )
+            self._cancel_btn.setVisible(False)
+            actions.addWidget(self._cancel_btn)
         actions.addStretch()
         layout.addLayout(actions)
         for button in self.findChildren(QPushButton):
@@ -161,15 +176,19 @@ class ModelCard(QFrame):
         self._meta_lbl.setStyleSheet(
             f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
         )
-        if self._progress_bar is not None:
-            self._progress_bar.setStyleSheet(f"""
-                QProgressBar {{
-                    background: {tok.BAR_OFF}; border-radius: 2px; border: none;
-                }}
-                QProgressBar::chunk {{
-                    background: {tok.GREEN}; border-radius: 2px;
-                }}
-            """)
+        self._progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background: {tok.BAR_OFF}; border-radius: 3px; border: none;
+            }}
+            QProgressBar::chunk {{
+                background: {tok.GREEN}; border-radius: 3px;
+            }}
+        """)
+        self._progress_lbl.setStyleSheet(
+            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
+        )
+        if self._cancel_btn is not None:
+            self._cancel_btn.setStyleSheet(ss.BTN_GHOST_SM)
         if self._select_btn is not None:
             self._select_btn.setStyleSheet(ss.BTN_ACCENT_SM)
         if self._delete_btn is not None:
@@ -181,18 +200,34 @@ class ModelCard(QFrame):
 
     def set_download_progress(self, pct: int):
         self._error_label.hide()
-        if self._progress_bar:
-            self._progress_bar.setVisible(True)
-            self._progress_bar.setValue(pct)
+        self._progress_row.setVisible(True)
+        self._progress_bar.setValue(pct)
+        total_mb = int(self._info.get("size_mb") or 0)
+        if pct <= 0:
+            self._progress_lbl.setText("正在连接下载源…")
+        elif total_mb:
+            self._progress_lbl.setText(f"已下载约 {total_mb * pct // 100} / {total_mb} MB")
+        else:
+            self._progress_lbl.setText(f"已下载 {pct}%")
         if self._action_btn:
             self._action_btn.setEnabled(False)
-            self._action_btn.setText(f"{pct}%")
+            self._action_btn.setText(f"下载中 {pct}%")
+        if self._cancel_btn:
+            self._cancel_btn.setVisible(True)
+
+    def _end_download(self, button_text: str) -> None:
+        self._progress_row.setVisible(False)
+        if self._action_btn:
+            self._action_btn.setEnabled(True)
+            self._action_btn.setText(button_text)
+        if self._cancel_btn:
+            self._cancel_btn.setVisible(False)
+
+    def set_download_cancelled(self):
+        self._error_label.hide()
+        self._end_download("下载")
 
     def set_download_error(self, msg: str):
         self._error_label.setText(f"下载失败：{msg}")
         self._error_label.show()
-        if self._progress_bar:
-            self._progress_bar.setVisible(False)
-        if self._action_btn:
-            self._action_btn.setEnabled(True)
-            self._action_btn.setText("重试")
+        self._end_download("重试")

@@ -503,6 +503,51 @@ class TestFinalResultFlow:
             h["floating"].show_recording.assert_called_once()
             h["floating"].show_busy_transcribing.assert_not_called()
 
+    @staticmethod
+    def _defer_paint(h) -> list:
+        painted = []
+        h["floating"].call_when_painted.side_effect = painted.append
+        return painted
+
+    def test_device_opens_only_after_the_bar_painted_recording(self):
+        """Opening the device blocks ~0.5 s; before 「录音中」 is painted the bar
+        would keep showing the previous 「已发送」."""
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            painted = self._defer_paint(h)
+
+            app._on_recording_start()
+
+            h["floating"].show_recording.assert_called_once()
+            h["recorder"].start.assert_not_called()
+            painted.pop()()
+            h["recorder"].start.assert_called_once_with(continuous=False)
+
+    def test_release_before_the_device_opened_never_opens_it(self):
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            painted = self._defer_paint(h)
+            app._on_recording_start()
+
+            app._on_recording_stop()
+            painted.pop()()
+
+            h["recorder"].start.assert_not_called()
+            h["recorder"].stop.assert_not_called()
+            assert "录音过短" in h["floating"].show_error.call_args[0][0]
+
+    def test_esc_before_the_device_opened_cancels_the_hold(self):
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            painted = self._defer_paint(h)
+            app._on_recording_start()
+
+            app._on_recording_cancel()
+            painted.pop()()
+
+            h["recorder"].start.assert_not_called()
+            h["floating"].show_cancelled.assert_called_once()
+
     def test_esc_on_a_refused_hold_keeps_the_previous_utterance(self):
         """hold → release → hold again (refused) → Esc: the queued previous
         utterance must survive; Esc only cancels a hold that is recording."""

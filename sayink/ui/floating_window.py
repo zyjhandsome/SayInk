@@ -18,6 +18,9 @@ BAR_WIDTH = 420
 BAR_EXCERPT_WIDTH = BAR_WIDTH
 COMPACT_HEIGHT = BAR_HEIGHT
 MODEL_LOADING_TITLE = "模型载入中 · 请勿录音"
+# call_when_painted() gives up waiting for a paint after this long (the bar
+# may be off screen or unchanged, and then no paint arrives).
+PAINT_WAIT_MAX_MS = 100
 
 
 def _ui_font(family, pixels, weight=QFont.Weight.Normal):
@@ -178,6 +181,32 @@ class FloatingWindow(QWidget):
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self.hide)
+        self._after_paint: list = []
+        self._after_paint_timer = QTimer(self)
+        self._after_paint_timer.setSingleShot(True)
+        self._after_paint_timer.timeout.connect(self._run_after_paint)
+
+    def call_when_painted(self, fn) -> None:
+        """Run ``fn`` once the bar's current state is on screen.
+
+        A translucent window reappears with the frame it last drew (「已发送」)
+        until Qt repaints it, which needs the event loop; work that blocks the
+        UI thread (opening the audio device ≈ 0.5 s) must wait for that paint.
+        """
+        self._after_paint.append(fn)
+        self._after_paint_timer.start(PAINT_WAIT_MAX_MS)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._after_paint:
+            # The frame is flushed after paintEvent returns.
+            QTimer.singleShot(0, self._run_after_paint)
+
+    def _run_after_paint(self) -> None:
+        self._after_paint_timer.stop()
+        pending, self._after_paint = self._after_paint, []
+        for fn in pending:
+            fn()
 
     def island_mode(self) -> str:
         return self._mode

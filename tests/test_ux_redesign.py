@@ -217,6 +217,36 @@ def test_download_is_disabled_immediately_and_error_can_retry(main_window, monke
         card.close()
 
 
+def test_download_can_be_cancelled_from_card(main_window, monkeypatch):
+    from unittest.mock import MagicMock
+    from sayink.ui.model_card import ModelCard
+    win = main_window._settings
+    info = {"id": "preview", "name": "示例", "size_mb": 2400, "description": "示例",
+            "languages": "中文", "accuracy": 3, "speed": 3}
+    card = ModelCard(info, False, False)
+    worker = MagicMock()
+    worker._cancelled = False
+    worker.cancel.side_effect = lambda: setattr(worker, "_cancelled", True)
+    monkeypatch.setattr("sayink.speech_recognizer.ModelDownloadWorker", lambda _mid, **_kw: worker)
+    card.action_clicked.connect(win._on_card_action)
+    win._model_cards["preview"] = card
+    try:
+        win._start_download("preview")
+        card.set_download_progress(50)
+        assert not card._cancel_btn.isHidden()
+        assert "1200 / 2400 MB" in card._progress_lbl.text()
+        card._cancel_btn.click()
+        worker.cancel.assert_called_once()
+        win._on_dl_error("下载已取消", card)
+        assert card._action_btn.text() == "下载"
+        assert card._action_btn.isEnabled()
+        assert card._error_label.isHidden()
+        assert card._cancel_btn.isHidden()
+        assert card._progress_row.isHidden()
+    finally:
+        card.close()
+
+
 def test_history_rows_reflow_to_splitter_width(_qapp_session):
     win = HistoryWindow(FakeHistoryStore())
     try:

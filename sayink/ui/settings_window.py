@@ -459,6 +459,10 @@ class SettingsWindow(QWidget):
             self.models_changed.emit()
         elif action == "download":
             self._start_download(model_id)
+        elif action == "cancel":
+            worker = self._dl_workers.get(model_id)
+            if worker is not None:
+                worker.cancel()
         elif action == "delete":
             self._delete_model(model_id)
 
@@ -500,8 +504,11 @@ class SettingsWindow(QWidget):
 
     def _on_dl_error(self, msg: str, card):
         if card:
-            self._dl_workers.pop(card._model_id, None)
-            card.set_download_error(msg)
+            worker = self._dl_workers.pop(card._model_id, None)
+            if worker is not None and getattr(worker, "_cancelled", False) is True:
+                card.set_download_cancelled()
+            else:
+                card.set_download_error(msg)
         else:
             QMessageBox.warning(self, "下载失败", msg)
 

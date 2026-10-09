@@ -41,6 +41,21 @@ _ASR_LANG_CODES = frozenset({
     "nan", "hak", "jpn", "kor", "eng", "zho", "chi",
 })
 _ASR_LANG_TAG_RE = re.compile(r"^[a-z]{2,3}(?:[-_][A-Za-z]{2,4})?$")
+# Qwen3-ASR prefixes every decode with "language Chinese<asr_text>". Only a
+# known language name that sits right before <asr_text> or directly against
+# CJK speech is the marker; "the language English is…" stays.
+_QWEN_LANGUAGE_NAMES = (
+    "None", "Chinese", "English", "Cantonese", "Arabic", "German", "French",
+    "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
+    "Thai", "Vietnamese", "Japanese", "Turkish", "Hindi", "Malay", "Dutch",
+    "Swedish", "Danish", "Finnish", "Polish", "Czech", "Filipino", "Persian",
+    "Greek", "Romanian", "Hungarian", "Macedonian",
+)
+_QWEN_LANGUAGE_PREFIX_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])language\s*(?:" + "|".join(_QWEN_LANGUAGE_NAMES) + r")"
+    r"(?:\s*(?=<\s*asr_text)|(?=[\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af])|\s*$)",
+    re.IGNORECASE,
+)
 
 
 def _is_asr_meta_token(match: re.Match) -> bool:
@@ -172,6 +187,9 @@ def normalize_asr_output(text: str) -> str:
         return ""
     cleaned = text
     stripped_tags = False
+    if _QWEN_LANGUAGE_PREFIX_PATTERN.search(cleaned):
+        stripped_tags = True
+        cleaned = _QWEN_LANGUAGE_PREFIX_PATTERN.sub("", cleaned)
     for pattern in _ASR_TAG_PATTERNS:
         if pattern.search(cleaned):
             stripped_tags = True
@@ -679,6 +697,8 @@ class ModelDownloadWorker(QThread):
         self._endpoints = download_endpoints(source)
         self._cancelled = False
         self._last_emit_pct = -1
+        self._expected_bytes = 0
+        self._done_bytes = 0
 
     def cancel(self):
         """Set cancellation flag to stop download."""
@@ -688,6 +708,16 @@ class ModelDownloadWorker(QThread):
         if pct > self._last_emit_pct:
             self._last_emit_pct = pct
             self.progress.emit(pct)
+
+    def _emit_progress(self, index: int, total_files: int, file_fraction: float, file_bytes: int) -> None:
+        # One large decoder dominates the byte count, so equal per-file weights
+        # would stall the bar for most of the download. size_mb is approximate:
+        # cap below 100 until every file is in place.
+        if self._expected_bytes > 0:
+            pct = int((self._done_bytes + file_bytes) / self._expected_bytes * 100)
+            self._emit_pct(min(pct, 99))
+        else:
+            self._emit_pct(int((index + file_fraction) / total_files * 100))
 
     def _download_file(self, url: str, target: Path, index: int, total_files: int) -> None:
         import httpx
@@ -704,8 +734,8 @@ class ModelDownloadWorker(QThread):
                             raise _DownloadCancelled()
                         f.write(chunk)
                         downloaded += len(chunk)
-                        if total > 0:
-                            self._emit_pct(int((index + downloaded / total) / total_files * 100))
+                        fraction = downloaded / total if total > 0 else 0.0
+                        self._emit_progress(index, total_files, fraction, downloaded)
             if total > 0 and downloaded != total:
                 raise IncompleteDownloadError(
                     f"{target.name} 不完整（{downloaded} / {total} 字节）"
@@ -732,6 +762,7 @@ class ModelDownloadWorker(QThread):
 
             files = info["files"]
             total_files = len(files)
+            self._expected_bytes = int(info.get("size_mb") or 0) * 1024 * 1024
 
             for i, filename in enumerate(files):
                 if self._cancelled:
@@ -740,7 +771,8 @@ class ModelDownloadWorker(QThread):
                 target = model_dir / filename
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if target.exists():
-                    self._emit_pct(int((i + 1) / total_files * 100))
+                    self._done_bytes += target.stat().st_size
+                    self._emit_progress(i, total_files, 1.0, 0)
                     continue
 
                 last_err: Exception | None = None
@@ -749,6 +781,7 @@ class ModelDownloadWorker(QThread):
                     log.info("下载: %s", url)
                     try:
                         self._download_file(url, target, i, total_files)
+                        self._done_bytes += target.stat().st_size
                         last_err = None
                         break
                     except _DownloadCancelled:
@@ -764,6 +797,7 @@ class ModelDownloadWorker(QThread):
 
             if is_model_downloaded(self._model_id):
                 log.info("模型下载完成: %s", info["name"])
+                self._emit_pct(100)
                 self.finished_ok.emit(self._model_id)
             else:
                 self.error.emit("模型文件不完整，请重试")

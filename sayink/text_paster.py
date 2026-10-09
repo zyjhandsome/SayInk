@@ -8,6 +8,8 @@ from typing import Callable
 import pyperclip
 from PyQt6.QtCore import QTimer
 
+from sayink.platform import SYNTHETIC_KEY_TAG
+
 log = logging.getLogger("SayInk")
 
 PASTE_DELAY_MS = 150
@@ -261,7 +263,7 @@ def _paste_shortcut_win32():
         scan = user32.MapVirtualKeyW(vk, 0)
         if vk in _EXTENDED_VKS:
             flags |= _KEYEVENTF_EXTENDEDKEY
-        user32.keybd_event(vk, scan, flags, 0)
+        user32.keybd_event(vk, scan, flags, SYNTHETIC_KEY_TAG)
 
     held = _held_stray_modifiers(user32)
     for vk in held:

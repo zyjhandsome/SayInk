@@ -107,6 +107,8 @@ def app_harness(config_overrides: dict | None = None):
         harness["recorder"].is_continuous = False
         harness["recorder"].input_source = _config_get(store, "audio.input_source", "microphone")
         harness["recorder"].input_source_display = "麦克风"
+        # The real bar defers until its frame is painted; a mock never paints.
+        harness["floating"].call_when_painted.side_effect = lambda fn: fn()
 
         try:
             yield harness

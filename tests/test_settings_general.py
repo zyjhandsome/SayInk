@@ -233,8 +233,14 @@ class TestGeneralPageLayout:
             assert f"background: {tok.BG}" not in sheet
         assert not hasattr(settings_window, "_sheet")
 
+    def test_about_feedback_row_is_hidden_for_now(self, settings_window):
+        from sayink.ui.settings_pages import about as about_page
+
+        assert about_page.SHOW_FEEDBACK_ENTRY is False
+        assert settings_window._about_feedback_group.isHidden()
+
     def test_about_feedback_button_opens_issue_tracker(self, settings_window, monkeypatch):
-        """P-06: the About page has a visible feedback entry that goes to GitHub issues."""
+        """P-06: the (currently hidden) feedback entry goes to GitHub issues."""
         from sayink.ui.settings_pages import about as about_page
         from sayink.updater import GITHUB_REPO, ISSUES_URL
 

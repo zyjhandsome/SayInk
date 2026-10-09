@@ -27,6 +27,47 @@ def win(qapp):
     w.close()
 
 
+class TestCallWhenPainted:
+    """A translucent bar reappears with its last frame (「已发送」) until it
+    repaints; blocking work must wait until the new state is on screen."""
+
+    def test_runs_after_the_bar_painted_not_before(self, win, qapp):
+        import time
+
+        win.show_success("已发送")
+        for _ in range(20):
+            qapp.processEvents()
+            time.sleep(0.01)
+        win.dismiss_if_idle()
+        qapp.processEvents()
+        painted = []
+        win.paintEvent = (lambda orig: lambda ev: (painted.append(1), orig(ev)))(win.paintEvent)
+        ran = []
+
+        win.show_recording()
+        win.call_when_painted(lambda: ran.append(bool(painted)))
+        assert ran == []
+        deadline = time.monotonic() + 1.0
+        while not ran and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.005)
+        assert ran == [True]
+
+    def test_falls_back_when_no_paint_arrives(self, win, qapp):
+        import time
+
+        from sayink.ui.floating_window import PAINT_WAIT_MAX_MS
+
+        win.hide()
+        ran = []
+        win.call_when_painted(lambda: ran.append(1))
+        deadline = time.monotonic() + PAINT_WAIT_MAX_MS / 1000 + 1.0
+        while not ran and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.005)
+        assert ran == [1]
+
+
 class TestFloatingWindowStates:
     def test_initial_flags(self, win):
         assert win._listening_active is False

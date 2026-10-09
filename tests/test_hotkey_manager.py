@@ -229,9 +229,10 @@ class _Suppressed(Exception):
 
 
 class _Event:
-    def __init__(self, vk, flags=0):
+    def __init__(self, vk, flags=0, extra=None):
         self.vkCode = vk
         self.flags = flags
+        self.dwExtraInfo = extra
 
 
 class TestWin32HotkeySuppression:
@@ -286,6 +287,25 @@ class TestWin32HotkeySuppression:
         mgr = self._manager(monkeypatch)
         assert mgr._win32_event_filter(0x0104, _Event(self.VK_Z, flags=0x10)) is True
         assert mgr._win32_event_filter(0x0104, _Event(0x41)) is True
+
+    def test_own_synthetic_keys_never_reach_the_hotkey_state(self, monkeypatch):
+        """Paste lifts and re-presses the held Alt mid-hold (SYNTHETIC_KEY_TAG)."""
+        from sayink.platform import SYNTHETIC_KEY_TAG
+
+        mgr = self._manager(monkeypatch)
+        mgr.update_hotkey(DEFAULT_HOTKEY)
+        mgr.set_continuous_trigger_mode(True)
+        mgr._on_press(keyboard.Key.alt_l)
+        with pytest.raises(_Suppressed):
+            mgr._win32_event_filter(0x0104, _Event(0x58))
+        assert mgr._hold_pending is True
+        mgr._listener.suppress_event.reset_mock()
+        vk_lmenu = 0xA4
+        for msg in (0x0105, 0x0104):  # Alt up, Alt down from the paste
+            tagged = _Event(vk_lmenu, flags=0x10, extra=SYNTHETIC_KEY_TAG)
+            assert mgr._win32_event_filter(msg, tagged) is False
+        assert mgr._hold_pending is True
+        mgr._listener.suppress_event.assert_not_called()
 
     def test_default_alt_x_swallows_x_and_masks_the_menu(self, monkeypatch):
         mgr = self._manager(monkeypatch)

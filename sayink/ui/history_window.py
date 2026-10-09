@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 from sayink.history_store import SegmentRecord, SessionSummary
 from sayink.ui import settings_styles as _settings_styles
 from sayink.ui.clipboard import copy_text
+from sayink.ui.flow_layout import FlowLayout
 
 COPY_FAILED_TEXT = "复制失败，请再试一次"
 
@@ -807,12 +808,10 @@ class HistoryWindow(QWidget):
 
         self._detail_chip_bar = QWidget()
         self._detail_chip_bar.setObjectName("historyMetadata")
-        self._detail_chips = QHBoxLayout(self._detail_chip_bar)
+        self._detail_chips = FlowLayout(self._detail_chip_bar, spacing=6)
         self._detail_chips.setContentsMargins(0, 0, 0, 0)
-        self._detail_chips.setSpacing(6)
         self._detail_chip_host = self._detail_chips
         self._detail_chip_labels: list[QLabel] = []
-        self._detail_chips.addStretch()
         right_lay.addWidget(self._detail_chip_bar)
 
         self._view_bar = QWidget()
@@ -1074,12 +1073,11 @@ class HistoryWindow(QWidget):
             lab.setToolTip(text)
             lab.setObjectName("streamChip")
             lab.setStyleSheet(chip_css)
-            # Chips size to their content; they must never be squeezed into
-            # truncation by the layout.
+            # Chips size to their content and wrap to a new row when the
+            # detail pane is narrow; they are never squeezed or clipped.
             lab.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
             self._detail_chip_labels.append(lab)
             self._detail_chips.addWidget(lab)
-        self._detail_chips.addStretch()
         self._detail_chip_bar.setVisible(bool(self._detail_chip_labels))
 
     def _on_view_toggled(self, polished_checked: bool) -> None:

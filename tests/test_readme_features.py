@@ -508,13 +508,14 @@ class TestReadmeReliabilityPromises:
         assert "说完要等几秒才出字，正常吗" in text
 
     def test_feedback_entry_and_truth_source_are_documented(self):
-        """P-06 / P-10: README points at the in-app feedback entry and names itself the truth source."""
+        """P-06 / P-10: README points at the issue tracker and names itself the truth source.
+        The About page feedback row is hidden, so the README must not send users to it."""
         from pathlib import Path
 
         from sayink.updater import ISSUES_URL
 
         text = self._readme()
-        assert "「GitHub 反馈」" in text
+        assert "「GitHub 反馈」" not in text
         assert ISSUES_URL in text
         assert "**真相源：**" in text
         assert "不必再起 OpenSpec 变更" in text

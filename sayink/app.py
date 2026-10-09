@@ -301,6 +301,8 @@ class App(QObject):
         self._live_inflight = ""
         self._hold_paste_sent = False
         self._hold_duration_ms = 0
+        # A hold whose bar is up but whose audio device is not opened yet.
+        self._hold_open_pending = False
         self._is_transcribing = False
         # One segment at a time from ASR through paste: the pending history
         # record and the polisher each hold a single in-flight segment.
@@ -668,10 +670,31 @@ class App(QObject):
         self._tray.set_recording(True)
         self._tray.set_activity_tooltip("recording")
         self._floating.show_recording()
+        # Opening the device blocks the UI thread for ~0.5 s; until the bar
+        # has painted 「录音中」 it would keep showing the previous 「已发送」.
+        self._hold_open_pending = True
+        self._floating.call_when_painted(self._open_hold_recorder)
+
+    def _open_hold_recorder(self):
+        if not self._hold_open_pending:
+            return
+        self._hold_open_pending = False
         self._recorder.start(continuous=False)
+
+    def _abort_pending_hold(self) -> bool:
+        """The key went up / Esc before the device opened: nothing was recorded."""
+        if not self._hold_open_pending:
+            return False
+        self._hold_open_pending = False
+        self._reset_recording_ui_after_abort()
+        return True
 
     def _on_recording_stop(self):
         if self._is_continuous_mode():
+            return
+        if self._abort_pending_hold():
+            log.warning("录音设备尚未打开就已松开，忽略")
+            self._floating.show_error(self._friendly_error("录音过短"))
             return
         if not self._recorder.is_recording:
             self._release_unstarted_hold()
@@ -702,6 +725,9 @@ class App(QObject):
 
     def _on_recording_cancel(self):
         if self._is_continuous_mode():
+            return
+        if self._abort_pending_hold():
+            self._floating.show_cancelled()
             return
         if not self._recorder.is_recording:
             # This hold never started (refused while the previous utterance
@@ -1845,6 +1871,7 @@ class App(QObject):
         log.info("SayInk 正在退出...")
         self._stop_continuous_listening()
         self._hotkey_mgr.stop()
+        self._hold_open_pending = False
         if self._recorder.is_recording:
             self._recorder.cancel()
 

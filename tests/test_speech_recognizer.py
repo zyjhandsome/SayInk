@@ -66,6 +66,23 @@ class TestNormalizeAsrOutput:
         assert result == "嗯"
         assert "asr_text" not in result
 
+    @pytest.mark.parametrize("text, expected", [
+        ("language Chinese<asr_text>现在这个。", "现在这个。"),
+        ("现在这个。language Chinese如果大家一起讲话。", "现在这个。如果大家一起讲话。"),
+        ("现在这个。language Chinese<asr_text>如果大家一起讲话", "现在这个。如果大家一起讲话"),
+        ("language English<asr_text>hello world", "hello world"),
+        ("language None<asr_text>", ""),
+    ])
+    def test_removes_qwen3_language_prefix(self, text, expected):
+        assert normalize_asr_output(text) == expected
+
+    @pytest.mark.parametrize("text", [
+        "The language English is widely spoken",
+        "我们讨论 language Chinese learning 的方法",
+    ])
+    def test_keeps_spoken_language_phrase(self, text):
+        assert normalize_asr_output(text) == text
+
     def test_removes_fireredasr_sil_tokens(self):
         text = "给他购买还出现了个什么标识呢<sil>个没有点伟大<sil><sil><sil>"
         result = normalize_asr_output(text)
@@ -1123,6 +1140,27 @@ class TestModelDownloadSources:
         assert errors and "不完整" in errors[0]
         assert not (tmp_path / "tiny" / "a.bin").exists()
         assert not (tmp_path / "tiny" / "a.bin.tmp").exists()
+
+    def test_progress_is_weighted_by_bytes(self, monkeypatch, tmp_path):
+        import httpx
+        import sayink.speech_recognizer as sr
+
+        mb = 1024 * 1024
+        info = {"id": "tiny", "name": "Tiny", "hf_repo": "org/tiny", "dir_name": "tiny",
+                "size_mb": 4, "files": ["small.bin", "big.bin"]}
+        bodies = {"small.bin": b"s" * mb, "big.bin": b"b" * (3 * mb)}
+        monkeypatch.setattr(sr, "get_model_info", lambda _mid: info)
+        monkeypatch.setattr(sr, "_get_models_dir", lambda: tmp_path)
+        monkeypatch.setattr(sr, "is_model_downloaded", lambda _mid: True)
+        monkeypatch.setattr(
+            httpx, "stream",
+            lambda _method, url, **_kw: _FakeHttpStream(bodies[url.rsplit("/", 1)[-1]]),
+        )
+        worker = sr.ModelDownloadWorker("tiny", source="huggingface")
+        progress = []
+        worker.progress.connect(progress.append)
+        worker.run()
+        assert progress == [25, 99, 100]
 
     def test_download_endpoints_default_to_auto(self):
         from sayink.speech_recognizer import download_endpoints, HF_URL, HF_MIRROR_URL

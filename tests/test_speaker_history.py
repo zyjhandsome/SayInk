@@ -73,7 +73,9 @@ def test_dominant_route_needs_a_clear_energy_gap():
 
 
 def test_segmenter_reports_the_louder_route_for_the_emitted_segment():
-    seg = SpeechSegmenter(speech_threshold=0.002, silence_hold_sec=0.2, min_speech_sec=0.1)
+    seg = SpeechSegmenter(
+        speech_threshold=0.002, silence_hold_sec=0.2, min_speech_sec=0.1, short_speech_sec=0.0
+    )
     assert seg.feed(_tone(180, 0.3), mic_energy=12.0, system_energy=0.2) is None
     out = seg.feed(np.zeros(int(TARGET_SAMPLE_RATE * 0.25), dtype=np.float32))
     assert out is not None and out.size > 0

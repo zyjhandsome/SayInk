@@ -19,7 +19,14 @@ from sayink.audio_devices import (
     ordered_system_devices,
     should_use_wasapi_loopback,
 )
-from sayink.audio_utils import TARGET_SAMPLE_RATE, mix_to_mono, resample_mono, rms_volume, to_mono
+from sayink.audio_utils import (
+    TARGET_SAMPLE_RATE,
+    StreamResampler,
+    mix_to_mono,
+    resample_mono,
+    rms_volume,
+    to_mono,
+)
 from sayink.pawp_capture import decode_pawp_device_index, is_encoded_pawp_device_index
 from sayink.vad_segmenter import SpeechSegmenter
 
@@ -34,6 +41,7 @@ class _CaptureLane:
         self.pending = np.zeros(0, dtype=np.float32)
         self.last_chunk_at = time.monotonic()
         self.sample_rate = TARGET_SAMPLE_RATE
+        self.resampler: Optional[StreamResampler] = None
         self.stream: Optional[sd.InputStream] = None
         self.pawp_stream: object | None = None
         self.pawp_stop: threading.Event | None = None
@@ -329,7 +337,9 @@ class AudioRecorder(QObject):
         for lane, raw, _last in drained:
             if raw is None or raw.size == 0:
                 continue
-            track = resample_mono(raw, lane.sample_rate, TARGET_SAMPLE_RATE)
+            if lane.resampler is None or lane.resampler.source_rate != lane.sample_rate:
+                lane.resampler = StreamResampler(lane.sample_rate, TARGET_SAMPLE_RATE)
+            track = lane.resampler.process(raw)
             lane.pending = np.concatenate([lane.pending, track]) if lane.pending.size else track
 
         longest = max((lane.pending.size for lane, _raw, _last in drained), default=0)

@@ -8,8 +8,24 @@ from sayink.audio_utils import TARGET_SAMPLE_RATE, rms_volume
 from sayink.speaker_session import dominant_route
 
 SPEECH_RMS_THRESHOLD = 0.002
-SILENCE_HOLD_SEC = 0.85
+SILENCE_HOLD_SEC = 1.2
 MIN_SPEECH_SEC = 0.25
+# The first syllable starts below the gate (soft consonant, breath), so the
+# quiet audio just before the gate opened is kept and prepended.
+PRE_ROLL_SEC = 0.3
+# A clip with less voiced audio than this ("嗯", "一个") gives the ASR model no
+# context to pick homophones or even the language; wait longer for the talker
+# to go on so it can join the next words instead of being recognized alone.
+SHORT_SPEECH_SEC = 0.8
+SHORT_SILENCE_HOLD_SEC = 1.8
+# Silence after the last word adds nothing to recognize and invites the model
+# to hallucinate; at most this much of it stays on the segment.
+TRAILING_SILENCE_KEEP_SEC = 0.5
+# Once open, the gate closes only below this fraction of the opening level
+# (but still above the noise floor), so the soft end of a word or a quiet
+# syllable mid-sentence is not taken for a pause.
+HOLD_GATE_RATIO = 0.5
+HOLD_GATE_FLOOR_RATIO = 1.5
 # Stay inside the Fun-ASR-Nano / Qwen3-ASR context window so a long
 # monologue emits a slice while the user is still talking.
 MAX_SPEECH_SEC = 15.0
@@ -21,6 +37,13 @@ NOISE_FLOOR_RATIO = 3.0
 # Never lift the gate past this, or quiet speech (a soft talker, a far mic,
 # RMS around 0.01–0.02) would be treated as silence.
 ADAPTIVE_THRESHOLD_CAP = 0.01
+# ...except that the gate never sits below the noise itself: with a floor
+# above the cap (fan, café, music under a meeting) every block counted as
+# speech, pauses vanished, and 15 s slices cut words in half.
+NOISE_FLOOR_MIN_RATIO = 1.5
+# Only once this much audio was measured: before that the quietest block may
+# be the talker's own voice (first words right after start), not the room.
+NOISE_FLOOR_TRUST_SEC = 3.0
 # A transient (key click, cough) is loud for one block only; speech keeps the
 # gate open for at least this long before a segment is worth transcribing.
 MIN_LOUD_SEC = 0.2
@@ -46,16 +69,27 @@ class SpeechSegmenter:
         *,
         adaptive: bool = True,
         min_loud_sec: float = MIN_LOUD_SEC,
+        pre_roll_sec: float = PRE_ROLL_SEC,
+        short_speech_sec: float = SHORT_SPEECH_SEC,
+        short_silence_hold_sec: float = SHORT_SILENCE_HOLD_SEC,
+        trailing_silence_keep_sec: float = TRAILING_SILENCE_KEEP_SEC,
     ):
         self._rate = sample_rate
         self._speech_threshold = speech_threshold
         self._silence_hold_samples = int(sample_rate * silence_hold_sec)
+        self._pre_roll_samples = int(sample_rate * max(0.0, pre_roll_sec))
+        self._short_speech_samples = int(sample_rate * max(0.0, short_speech_sec))
+        self._short_hold_samples = max(
+            self._silence_hold_samples, int(sample_rate * short_silence_hold_sec)
+        )
+        self._trailing_keep_samples = int(sample_rate * max(0.0, trailing_silence_keep_sec))
         self._min_samples = int(sample_rate * min_speech_sec)
         self._max_samples = int(sample_rate * max_speech_sec)
         self._adaptive = adaptive
         self._min_loud_samples = int(sample_rate * min(min_loud_sec, min_speech_sec))
         self._cut_search_samples = int(sample_rate * min(CUT_SEARCH_SEC, max_speech_sec / 2))
         self._floor_window_samples = int(sample_rate * NOISE_FLOOR_WINDOW_SEC)
+        self._floor_trust_samples = int(sample_rate * NOISE_FLOOR_TRUST_SEC)
         self._floor_blocks: list[tuple[int, float]] = []
         self._floor_total = 0
         self.reset()
@@ -70,9 +104,23 @@ class SpeechSegmenter:
         """Gate in use right now: the base gate lifted above the recent noise floor."""
         if not self._adaptive or not self._floor_blocks:
             return self._speech_threshold
-        floor = min(rms for _count, rms in self._floor_blocks)
+        floor = self._noise_floor()
         lifted = min(floor * NOISE_FLOOR_RATIO, ADAPTIVE_THRESHOLD_CAP)
+        if self._floor_total >= self._floor_trust_samples:
+            lifted = max(lifted, floor * NOISE_FLOOR_MIN_RATIO)
         return max(self._speech_threshold, lifted)
+
+    @property
+    def hold_threshold(self) -> float:
+        """Lower gate that keeps an utterance going once it has started."""
+        opening = self.effective_threshold
+        hold = opening * HOLD_GATE_RATIO
+        if self._adaptive and self._floor_blocks:
+            hold = max(hold, self._noise_floor() * HOLD_GATE_FLOOR_RATIO)
+        return min(hold, opening)
+
+    def _noise_floor(self) -> float:
+        return min(rms for _count, rms in self._floor_blocks)
 
     def _track_noise_floor(self, block_size: int, rms: float) -> None:
         self._floor_blocks.append((block_size, rms))
@@ -92,6 +140,11 @@ class SpeechSegmenter:
         self._silence_run = 0
         self._in_speech = False
         self._last_route = ""
+        # Quiet blocks heard before the gate opened, newest last.
+        self._pre_roll: list[tuple[np.ndarray, float, float, float]] = []
+        self._pre_roll_total = 0
+        # How much of the buffer came from the pre-roll (not the utterance).
+        self._lead_samples = 0
 
     @property
     def last_route(self) -> str:
@@ -111,9 +164,12 @@ class SpeechSegmenter:
 
         rms = rms_volume(block)
         self._track_noise_floor(int(block.size), float(rms))
-        loud = rms >= self.effective_threshold
+        gate = self.hold_threshold if self._in_speech else self.effective_threshold
+        loud = rms >= gate
         if loud:
-            self._in_speech = True
+            if not self._in_speech:
+                self._in_speech = True
+                self._take_pre_roll()
             self._silence_run = 0
             self._remember_block(block, mic_energy, system_energy, float(rms))
             self._loud_samples += int(block.size)
@@ -122,15 +178,47 @@ class SpeechSegmenter:
             return None
 
         if not self._in_speech:
+            self._keep_pre_roll(block, mic_energy, system_energy, float(rms))
             return None
 
         self._remember_block(block, mic_energy, system_energy, float(rms))
         self._silence_run += block.size
         if self._total_samples >= self._max_samples:
             return self._take_segment(limit=self._quiet_cut_point())
-        if self._silence_run >= self._silence_hold_samples:
-            return self._take_segment()
+        hold = (
+            self._short_hold_samples
+            if self._loud_samples < self._short_speech_samples
+            else self._silence_hold_samples
+        )
+        if self._silence_run >= hold:
+            trim = max(0, self._silence_run - self._trailing_keep_samples)
+            return self._take_segment(limit=self._total_samples - trim, tail_is_speech=False)
         return None
+
+    def _keep_pre_roll(
+        self, block: np.ndarray, mic_energy: float, system_energy: float, rms: float
+    ) -> None:
+        if self._pre_roll_samples <= 0:
+            return
+        self._pre_roll.append((block, mic_energy, system_energy, rms))
+        self._pre_roll_total += int(block.size)
+        while self._pre_roll and self._pre_roll_total > self._pre_roll_samples:
+            oldest, mic, system, old_rms = self._pre_roll[0]
+            excess = self._pre_roll_total - self._pre_roll_samples
+            if oldest.size <= excess:
+                self._pre_roll.pop(0)
+                self._pre_roll_total -= int(oldest.size)
+                continue
+            kept = (oldest.size - excess) / oldest.size
+            self._pre_roll[0] = (oldest[excess:], mic * kept, system * kept, old_rms)
+            self._pre_roll_total -= excess
+
+    def _take_pre_roll(self) -> None:
+        for block, mic, system, rms in self._pre_roll:
+            self._remember_block(block, mic, system, rms)
+        self._lead_samples = self._pre_roll_total
+        self._pre_roll = []
+        self._pre_roll_total = 0
 
     def _quiet_cut_point(self) -> int:
         """Sample offset to cut a too-long utterance: the end of the quietest
@@ -155,18 +243,33 @@ class SpeechSegmenter:
             return limit
         return best_end
 
-    def _too_short(self) -> bool:
-        return self._total_samples < self._min_samples or self._loud_samples < self._min_loud_samples
+    def _should_drop(self) -> bool:
+        spoken = self._total_samples - self._lead_samples
+        if spoken < self._min_samples or self._loud_samples < self._min_loud_samples:
+            return True
+        return self._noise_only()
+
+    def _noise_only(self) -> bool:
+        # A segment opened by loud noise before the floor was trusted: once it
+        # is, nothing in it rises above the room, and the ASR would only
+        # hallucinate words into it.
+        if not self._adaptive or self._floor_total < self._floor_trust_samples:
+            return False
+        peak = max((rms for _count, _mic, _system, rms in self._energy), default=0.0)
+        return peak < self.effective_threshold
 
     def flush(self) -> np.ndarray | None:
         """Emit buffered speech that has not yet reached the silence threshold."""
-        if not self._in_speech or self._too_short():
+        if not self._in_speech or self._should_drop():
             self.reset()
             return None
         if not self._buffer:
             self.reset()
             return None
         out = np.concatenate(self._buffer).astype(np.float32, copy=False)
+        trim = max(0, self._silence_run - self._trailing_keep_samples)
+        if trim:
+            out = out[: out.size - trim]
         mic, system, _tail = self._split_energy(out.size)
         self.reset()
         self._last_route = dominant_route(mic, system)
@@ -210,8 +313,10 @@ class SpeechSegmenter:
             remaining = 0
         return mic, system, tail
 
-    def _take_segment(self, limit: int | None = None) -> np.ndarray | None:
-        if self._too_short():
+    def _take_segment(
+        self, limit: int | None = None, *, tail_is_speech: bool = True
+    ) -> np.ndarray | None:
+        if self._should_drop():
             self.reset()
             return None
         if not self._buffer:
@@ -223,7 +328,15 @@ class SpeechSegmenter:
         tail = audio[take:] if take < audio.size else None
         self.reset()
         self._last_route = dominant_route(mic, system)
-        if tail is not None and tail.size:
+        if tail is not None and tail.size and not tail_is_speech:
+            # Trimmed trailing silence: the next utterance's pre-roll.
+            self._keep_pre_roll(
+                tail,
+                sum(part[1] for part in tail_energy),
+                sum(part[2] for part in tail_energy),
+                rms_volume(tail),
+            )
+        elif tail is not None and tail.size:
             self._in_speech = True
             self._buffer = [tail]
             self._total_samples = int(tail.size)

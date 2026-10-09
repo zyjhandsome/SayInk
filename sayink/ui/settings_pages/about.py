@@ -9,6 +9,8 @@ from sayink.ui import design_tokens as tok
 from sayink.updater import ISSUES_URL
 
 FEEDBACK_HINT = "遇到问题或有建议？到 GitHub 提 issue，附上「文件位置」里日志目录的最新日志会更快定位。"
+# The GitHub feedback row is held back from the About page for now.
+SHOW_FEEDBACK_ENTRY = False
 
 
 def open_feedback_page() -> bool:
@@ -189,7 +191,11 @@ def build_about_page(win) -> QWidget:
     win._about_feedback_btn.clicked.connect(open_feedback_page)
     feedback_layout.addWidget(win._about_feedback_btn, 0, Qt.AlignmentFlag.AlignVCenter)
     paint_about_update_row(win)
-    page.add(win._about_feedback_group)
+    if SHOW_FEEDBACK_ENTRY:
+        page.add(win._about_feedback_group)
+    else:
+        win._about_feedback_group.setParent(page)
+        win._about_feedback_group.hide()
     page.set_compact()
     page.set_spacing(12)
     return page

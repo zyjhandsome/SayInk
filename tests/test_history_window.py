@@ -122,6 +122,23 @@ def test_expand_session_renders_effective_segments(qapp):
     assert "polished first" not in detail
 
 
+def test_detail_chips_wrap_instead_of_clipping_in_a_narrow_pane(qapp):
+    window = HistoryWindow(FakeHistoryStore())
+    window._set_detail_chips(["麦克风", "会议记录（示例）", "持续转写", "Fun-ASR-Nano"])
+    bar = window._detail_chip_bar
+    one_row = window._detail_chip_labels[0].sizeHint().height()
+    total = sum(c.sizeHint().width() + 6 for c in window._detail_chip_labels)
+    width = total // 2
+    bar.resize(width, bar.heightForWidth(width))
+    bar.layout().setGeometry(bar.rect())
+
+    assert bar.heightForWidth(width) > one_row
+    for chip in window._detail_chip_labels:
+        assert chip.geometry().right() < width
+        assert chip.width() >= chip.sizeHint().width()
+    assert bar.heightForWidth(total * 2) == one_row
+
+
 def _long_turn(seq: int, text: str) -> SegmentRecord:
     return SegmentRecord(
         "long",

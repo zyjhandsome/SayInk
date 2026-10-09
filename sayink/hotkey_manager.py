@@ -6,6 +6,8 @@ import time
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 from pynput import keyboard
 
+from sayink.platform import SYNTHETIC_KEY_TAG
+
 log = logging.getLogger("SayInk")
 
 # 短按防误触（毫秒）；计时器必须在 Qt 主线程启动，否则 Windows 上可能永不触发
@@ -166,8 +168,8 @@ class HotKeyManager(QObject):
         import ctypes
 
         user32 = ctypes.windll.user32
-        user32.keybd_event(_VK_MENU_MASK, 0, 0, 0)
-        user32.keybd_event(_VK_MENU_MASK, 0, 0x0002, 0)
+        user32.keybd_event(_VK_MENU_MASK, 0, 0, SYNTHETIC_KEY_TAG)
+        user32.keybd_event(_VK_MENU_MASK, 0, 0x0002, SYNTHETIC_KEY_TAG)
 
     @staticmethod
     def _tap_is_typing(modifiers: tuple) -> bool:
@@ -216,7 +218,7 @@ class HotKeyManager(QObject):
     def _keybd_event(vk: int, flags: int) -> None:
         import ctypes
 
-        ctypes.windll.user32.keybd_event(vk, 0, flags, 0)
+        ctypes.windll.user32.keybd_event(vk, 0, flags, SYNTHETIC_KEY_TAG)
 
     def _win32_event_filter(self, msg, data):
         """Keep the hotkey's main key (and its auto-repeat) out of the focused app.
@@ -225,6 +227,10 @@ class HotKeyManager(QObject):
         this path feeds the hotkey state machine directly.
         """
         try:
+            if data.dwExtraInfo == SYNTHETIC_KEY_TAG:
+                # Paste lifts and re-presses the held Alt; seen as the user's
+                # keys, that would cancel the hold the user is making.
+                return False
             if data.flags & _LLKHF_INJECTED:
                 return True
             vk = int(data.vkCode)
