@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 
 import pytest
-from PyQt6.QtCore import QPoint, QRect, QSize
+from PyQt6.QtCore import QRect, QSize
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 
 from sayink.ui.tray_icon import TrayIcon, tray_menu_top_left

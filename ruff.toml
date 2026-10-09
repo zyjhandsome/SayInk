@@ -1,0 +1,16 @@
+# Static gate for CI (see .github/workflows/tests.yml). Deliberately small:
+# only rules that are clean today, so the gate blocks new mistakes without a
+# suppression list. Widen the selection as the tree is cleaned up.
+target-version = "py310"
+line-length = 120
+extend-exclude = ["build", "dist", "sayink_build/*.spec", "*.spec"]
+
+[lint]
+select = [
+    "E9",   # syntax / io errors
+    "F",    # pyflakes: undefined names, unused imports and variables, f-strings
+    "W6",   # deprecated syntax
+    "B006", # mutable default argument
+    "B008", # function call in default argument
+    "PLE",  # pylint errors
+]

@@ -1,0 +1,4 @@
+# Only needed to produce the Windows installer (build.py / build_release.py).
+# Running from source or the test suite does not need PyInstaller.
+-r requirements.txt
+PyInstaller>=6.0.0

@@ -455,7 +455,6 @@ class TestHoldSurvivesUnrelatedKeys:
         assert arms == [True]
 
     def test_releasing_hotkey_key_still_reports_short_tap(self, monkeypatch):
-        import sayink.hotkey_manager as hm
 
         mgr, _arms, short = self._armed()
         mgr._hold_started_at -= 1.0

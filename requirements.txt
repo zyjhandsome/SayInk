@@ -7,5 +7,4 @@ pyperclip>=1.8.2
 pywin32>=306; sys_platform == "win32"
 numpy>=1.24.0
 sherpa-onnx>=1.13.8
-PyInstaller>=6.0.0
 packaging>=23.0

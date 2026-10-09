@@ -30,6 +30,7 @@ PyQt6_sip==13.13.0
 pytest==9.1.1
 pywin32==312
 pywin32-ctypes==0.2.3
+ruff==0.16.10
 setuptools==65.5.0
 sherpa-onnx==1.13.8
 sherpa-onnx-core==1.13.8

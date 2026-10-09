@@ -1,4 +1,3 @@
-import pytest
 import numpy as np
 from sayink.audio_recorder import AudioRecorder
 

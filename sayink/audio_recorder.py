@@ -274,7 +274,6 @@ class AudioRecorder(QObject):
         raise RuntimeError(f"无法打开音频设备：{ep.device.name}") from last_err
 
     def _system_device_candidates(self, primary: StreamEndpoint) -> list[StreamEndpoint]:
-        from sayink.pawp_capture import is_encoded_pawp_device_index
 
         ordered = ordered_system_devices(self._system_device_index)
         reliable = [d for d in ordered if not is_unreliable_loopback_output(d)]

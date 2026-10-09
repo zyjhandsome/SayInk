@@ -5,7 +5,6 @@ from __future__ import annotations
 import types
 from pathlib import Path
 
-import pytest
 
 import sayink.platform.windows_identity as wi
 

@@ -1,11 +1,7 @@
 """Tests for README「声音收录 / 触发方式」相关配置项。"""
 
 import json
-import shutil
-import tempfile
-from pathlib import Path
 
-import pytest
 
 from sayink.config import (
     DEFAULT_CONFIG,

@@ -1,4 +1,3 @@
-import pytest
 import numpy as np
 from sayink.sound_manager import SoundManager
 

@@ -1,6 +1,5 @@
 """AudioRecorder unit tests that avoid opening real hardware (README 声音收录)."""
 
-import pytest
 
 from sayink.audio_recorder import AudioRecorder
 from sayink.vad_segmenter import SPEECH_RMS_THRESHOLD

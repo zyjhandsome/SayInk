@@ -1,4 +1,3 @@
-import pytest
 from sayink import version
 from sayink.version import __version__, file_version_quad, file_version_tuple
 

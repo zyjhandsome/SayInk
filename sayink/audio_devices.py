@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import sys
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -358,7 +357,6 @@ def should_use_wasapi_loopback(dev: AudioDeviceInfo) -> bool:
 
 def pick_default_system_capture() -> Optional[AudioDeviceInfo]:
     from sayink.pawp_capture import (
-        is_encoded_pawp_device_index,
         pick_default_pawp_loopback,
     )
 

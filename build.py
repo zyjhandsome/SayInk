@@ -122,7 +122,11 @@ def build():
 
     print("[1/3] Building SayInk with PyInstaller...")
 
-    import PyInstaller.__main__
+    try:
+        import PyInstaller.__main__
+    except ImportError:
+        print("\n[ERROR] PyInstaller 未安装（它只在打包时需要）: pip install -r requirements-build.txt")
+        sys.exit(1)
 
     dist_parent, app_name = _prepare_dist_output_dir()
 
