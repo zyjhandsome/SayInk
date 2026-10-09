@@ -1,6 +1,5 @@
 import json
 
-import pytest
 
 from sayink.config import Config, format_hotkey, DEFAULT_CONFIG
 from sayink.speech_recognizer import DEFAULT_MODEL_ID
@@ -339,6 +338,32 @@ def test_unreadable_store_keeps_file_key(config_home):
     _write_config(config_home, {"llm": {"api_key": "sk-file"}})
     cfg = Config(config_dir=config_home, secret_store=_FakeSecrets(unreadable=True))
     assert cfg.get("llm.api_key") == "sk-file"
+
+
+def test_unreadable_store_scrubs_plaintext_key_from_file(config_home):
+    """README P0: the key is never left in config.json, even when migration fails."""
+    from sayink.config import Config
+
+    _write_config(config_home, {"llm": {"api_key": "sk-file"}})
+    cfg = Config(config_dir=config_home, secret_store=_FakeSecrets(unreadable=True))
+
+    assert cfg.get("llm.api_key") == "sk-file"
+    assert cfg.secret_persist_failed is True
+    assert _key_on_disk(config_home) == ""
+    cfg.set("sound_enabled", False)
+    cfg.save_immediate()
+    assert "sk-file" not in (config_home / "config.json").read_text(encoding="utf-8")
+
+
+def test_failed_migration_scrubs_plaintext_key_from_file(config_home):
+    from sayink.config import Config
+
+    _write_config(config_home, {"llm": {"api_key": "sk-legacy"}})
+    cfg = Config(config_dir=config_home, secret_store=_FakeSecrets(fail_write=True))
+
+    assert cfg.get("llm.api_key") == "sk-legacy"
+    assert cfg.secret_persist_failed is True
+    assert _key_on_disk(config_home) == ""
 
 
 def test_unreadable_store_never_writes_new_key_to_file(config_home):

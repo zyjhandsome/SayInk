@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 
 import pytest
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
 from tests.helpers.app_harness import app_harness
@@ -122,9 +123,13 @@ class TestHistoryOnboarding:
                 AcceptRole = object()
                 RejectRole = object()
 
-            def __init__(self):
+            def __init__(self, parent=None):
                 self._buttons = []
                 self._default = None
+                events["parent"] = parent
+
+            def setWindowFlag(self, flag, on=True):
+                events["flag"] = (flag, on)
 
             def setWindowTitle(self, title):
                 events["title"] = title
@@ -153,12 +158,20 @@ class TestHistoryOnboarding:
 
         monkeypatch.setattr(app_module, "QMessageBox", FakeMessageBox)
 
-        assert App._ask_history_onboarding_enabled(object()) is True
+        class Owner:
+            _main = None
+            _dialog = App._dialog
+            _ask_history_onboarding_enabled = App._ask_history_onboarding_enabled
+
+        assert Owner()._ask_history_onboarding_enabled() is True
         buttons = events["buttons"]
         assert [text for text, _role, _button in buttons] == ["开启", "暂不开启"]
         assert events["default"] is buttons[0][2]
         assert events["title"] == "开启语音历史？"
         assert "随时可以在设置关闭" in events["text"]
+        # U-03: no main window yet, so the box must not open behind other apps.
+        assert events["parent"] is None
+        assert events["flag"] == (Qt.WindowType.WindowStaysOnTopHint, True)
 
 
 def test_first_run_welcome_is_scheduled_once_even_if_ready_and_fallback_both_fire():

@@ -12,8 +12,22 @@ if _project_root not in sys.path:
 _lock_file_path: str | None = None
 _win_mutex = None
 
+MUTEX_NAME = "Local\\SayInk_Single_Instance_Mutex"
+# VoiceInk ≤ 2.1.0 (same program, old name) owns this one while it runs. A
+# SayInk started next to it would record the same hotkey twice.
+LEGACY_MUTEX_NAME = "Local\\VoiceInk_Single_Instance_Mutex"
+_SYNCHRONIZE = 0x00100000
+
 # 在 main() 配置日志前，使用临时 logger
 _log = logging.getLogger("SayInk")
+
+
+def _legacy_instance_running(kernel32) -> bool:
+    handle = kernel32.OpenMutexW(_SYNCHRONIZE, False, LEGACY_MUTEX_NAME)
+    if not handle:
+        return False
+    kernel32.CloseHandle(handle)
+    return True
 
 
 def check_single_instance() -> bool:
@@ -21,7 +35,7 @@ def check_single_instance() -> bool:
     if sys.platform == "win32":
         # 使用 ctypes 创建 Windows 互斥锁（更可靠，不需要 pywin32）
         try:
-            mutex_name = "Local\\SayInk_Single_Instance_Mutex"
+            mutex_name = MUTEX_NAME
             # CreateMutex 参数: lpMutexAttributes=NULL, bInitialOwner=False, lpName
             kernel32 = ctypes.windll.kernel32
             ERROR_ALREADY_EXISTS = 183  # Windows 错误代码
@@ -31,6 +45,12 @@ def check_single_instance() -> bool:
 
             if last_error == ERROR_ALREADY_EXISTS:
                 # 互斥锁已存在，说明已有实例运行
+                if mutex:
+                    kernel32.CloseHandle(mutex)
+                return False
+
+            if _legacy_instance_running(kernel32):
+                _log.warning("检测到旧版 VoiceInk 正在运行，SayInk 不再启动第二个实例")
                 if mutex:
                     kernel32.CloseHandle(mutex)
                 return False

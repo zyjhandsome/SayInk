@@ -193,13 +193,16 @@ class TestPasteAsyncFlow:
         assert [(r.status, r.detail) for r in results] == [("clipboard", "focus_changed")]
         assert paste_env["clipboard"] == "口述内容"
 
-    def test_focus_switch_after_send_is_reported_as_clipboard(self, paste_env):
+    def test_focus_switch_after_send_is_reported_as_unverified_not_clipboard(self, paste_env):
+        """README: Ctrl+V already went out, so the bar must not say 「已复制」
+        (a second manual paste would duplicate the words)."""
         paste_env["set_foreground"]([(1234, "Editor", 1), (1234, "Editor", 1), (9999, "Other", 2)])
         paster = TextPaster()
         results = []
         paster.paste_async("文本", results.append)
         assert paste_env["shortcut_calls"] == 1
-        assert [result.status for result in results] == ["clipboard"]
+        assert [(r.status, r.detail) for r in results] == [("unverified", "focus_changed_after_send")]
+        assert results[0].target_app == "editor.exe"
         assert paste_env["clipboard"] == "文本"
 
     def test_own_window_skips_paste(self, paste_env):

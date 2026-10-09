@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 import numpy as np
-from PyQt6.QtCore import QEvent, QObject, QTimer, pyqtSignal
+import pyperclip
+from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMessageBox
 
 from sayink.config import (
@@ -75,21 +76,79 @@ _EN_NEGATION_RE = re.compile(
     r"\b(?:not|no|never|none|cannot)\b|n't\b", re.IGNORECASE | re.ASCII
 )
 _LATIN_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+# Chinese numerals: FireRedASR2 writes 两千五百元 / 十月十五日, so the number
+# guard has to read them too. A numeral starts with a digit or 十; a lone
+# 百/千/万 is a word (千万别, 百分之) and stays text.
+_CN_DIGITS = {
+    "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+_CN_UNITS = {"十": 10, "百": 100, "千": 1000}
+_CN_BIG_UNITS = {"万": 10_000, "亿": 100_000_000}
+_CN_NUMERAL_RE = re.compile(r"[一二两三四五六七八九十][零〇一二两三四五六七八九十百千万亿]*")
+_REPEATED_NEGATION_RE = re.compile(r"([不没别未无非勿莫])\1+")
+
+
+def _cn_numeral_to_arabic(numeral: str) -> str:
+    """两千五百 → 2500; 一三八零零 → 13800; 三四 → "3 4" (an approximate range)."""
+    if all(ch in _CN_DIGITS for ch in numeral):
+        digits = [_CN_DIGITS[ch] for ch in numeral]
+        if len(digits) == 2 and 0 not in digits and abs(digits[0] - digits[1]) == 1:
+            return f"{digits[0]} {digits[1]}"
+        return "".join(str(d) for d in digits)
+    total = 0
+    section = 0
+    number = 0
+    for ch in numeral:
+        if ch in _CN_DIGITS:
+            number = _CN_DIGITS[ch]
+        elif ch in _CN_UNITS:
+            section += (number or 1) * _CN_UNITS[ch]
+            number = 0
+        else:
+            total = (total + section + number) * _CN_BIG_UNITS[ch]
+            section = 0
+            number = 0
+    if number and len(numeral) > 1:
+        # Colloquial 三万五 / 两千五: the trailing digit takes the next unit down.
+        before = numeral[-2]
+        unit = _CN_UNITS.get(before) or _CN_BIG_UNITS.get(before) or 0
+        if unit >= 100:
+            number *= unit // 10
+    return str(total + section + number)
+
+
+def _normalize_cn_numerals(text: str) -> str:
+    def _replace(match: re.Match) -> str:
+        numeral = match.group(0)
+        if numeral == "一":
+            # A lone 一 is mostly an article or idiom (一段话, 优化一下, 一起);
+            # dropping or adding it does not change the meaning.
+            return numeral
+        return f" {_cn_numeral_to_arabic(numeral)} "
+
+    return _CN_NUMERAL_RE.sub(_replace, text)
 
 
 def _numbers(text: str) -> set[str]:
     values = set()
-    for match in _NUMBER_RE.findall(_THOUSANDS_SEP_RE.sub("", text)):
+    text = _normalize_cn_numerals(_THOUSANDS_SEP_RE.sub("", text))
+    for match in _NUMBER_RE.findall(text):
         whole, _, frac = match.partition(".")
         value = (whole.lstrip("0") or "0") + (f".{frac.rstrip('0')}" if frac.rstrip("0") else "")
         values.add(value)
     return values
 
 
-def _has_negation(text: str) -> bool:
+def _negation_count(text: str) -> int:
     for word in _NON_NEGATING_WORDS:
         text = text.replace(word, "")
-    return any(ch in _NEGATION_CHARS for ch in text) or bool(_EN_NEGATION_RE.search(text))
+    text = _REPEATED_NEGATION_RE.sub(r"\1", text)
+    return sum(1 for ch in text if ch in _NEGATION_CHARS) + len(_EN_NEGATION_RE.findall(text))
+
+
+def _has_negation(text: str) -> bool:
+    return _negation_count(text) > 0
 
 
 def _proper_nouns(text: str) -> set[str]:
@@ -125,7 +184,8 @@ def polish_rejection_reason(raw: str, polished: str) -> str:
         or (polished_numbers - raw_numbers) - {"0"}
     ):
         return "数字被改动"
-    if _has_negation(raw) and not _has_negation(polished):
+    # Count, not presence: 我不同意，也没准备好 → 我不同意，也准备好了 drops one.
+    if _negation_count(polished) < _negation_count(raw):
         return "否定词丢失"
     folded = re.sub(r"\s+", "", polished.casefold())
     if any(name not in folded for name in _proper_nouns(raw)):
@@ -178,6 +238,19 @@ class _SegmentContext:
     speakers: SpeakerSession
 
 
+@dataclass
+class _QueuedSegment:
+    """One captured utterance waiting for the recognizer.
+
+    Everything that belongs to the audio travels with it, so the queue cannot
+    fall out of step with a parallel list of routes or contexts.
+    """
+
+    audio: np.ndarray
+    route: str = ""
+    context: _SegmentContext | None = None
+
+
 class App(QObject):
     """Central orchestrator that connects all modules."""
 
@@ -227,9 +300,11 @@ class App(QObject):
         # Raw text of the segment currently being output. A new hold recording
         # may start meanwhile and reset _current_transcription.
         self._output_raw_text = ""
-        self._segment_queue: list[np.ndarray] = []
-        self._segment_routes: list[str] = []
-        self._segment_contexts: list[_SegmentContext | None] = []
+        # "polish" while the polisher owns the sentence, "paste" once it was
+        # handed to the paster; the watchdog decides from this what to salvage.
+        self._output_stage = ""
+        self._output_stage_text = ""
+        self._segment_queue: list[_QueuedSegment] = []
         self._speakers = SpeakerSession()
         self._continuous_user_stopped = False
         self._current_session_id: str | None = None
@@ -523,7 +598,7 @@ class App(QObject):
             self._load_started_at = time.monotonic()
             self._loading_model_id = model_id
             msg = f"{msg}（{self._load_eta_text(model_id)}）"
-        self._floating.show_model_loading(f"{msg} · 完成前请勿录音")
+        self._floating.show_model_loading(msg)
         self._tray.set_activity_tooltip("loading")
         self._sync_settings_runtime_status()
 
@@ -600,6 +675,8 @@ class App(QObject):
             return
         self._hold_paste_sent = True
         self._hold_duration_ms = 0
+        # A hold cannot start while an earlier utterance is still queued
+        # (_on_recording_start refuses), so everything here is this hold's.
         self._clear_queued_audio()
         self._clear_live_transcript()
         self._reset_recording_ui_after_abort()
@@ -777,38 +854,26 @@ class App(QObject):
         front: bool = False,
         context: _SegmentContext | None = None,
     ) -> None:
+        segment = _QueuedSegment(audio=audio, route=route, context=context)
         if front:
-            self._segment_queue.insert(0, audio)
-            self._segment_routes.insert(0, route)
-            self._segment_contexts.insert(0, context)
+            self._segment_queue.insert(0, segment)
             return
-        self._segment_queue.append(audio)
-        self._segment_routes.append(route)
-        self._segment_contexts.append(context)
+        self._segment_queue.append(segment)
         self._pause_if_backlog_too_long()
 
     def _pop_queued_audio(self) -> tuple[np.ndarray, str, _SegmentContext | None]:
-        audio = self._segment_queue.pop(0)
-        remaining = len(self._segment_queue)
-        route = ""
-        if len(self._segment_routes) == remaining + 1:
-            route = self._segment_routes.pop(0)
-        else:
-            self._segment_routes.clear()
-        context = None
-        if len(self._segment_contexts) == remaining + 1:
-            context = self._segment_contexts.pop(0)
-        else:
-            self._segment_contexts.clear()
-        return audio, route, context
+        segment = self._segment_queue.pop(0)
+        return segment.audio, segment.route, segment.context
 
     def _clear_queued_audio(self) -> None:
         self._segment_queue.clear()
-        self._segment_routes.clear()
-        self._segment_contexts.clear()
+
+    def _queued_audio(self) -> list[np.ndarray]:
+        """Audio arrays waiting in the queue, oldest first (tests and logging)."""
+        return [segment.audio for segment in self._segment_queue]
 
     def _queued_audio_seconds(self) -> float:
-        return sum(int(audio.size) for audio in self._segment_queue) / TARGET_SAMPLE_RATE
+        return sum(int(segment.audio.size) for segment in self._segment_queue) / TARGET_SAMPLE_RATE
 
     def _pause_if_backlog_too_long(self) -> None:
         if not self._continuous_session_active():
@@ -1054,13 +1119,33 @@ class App(QObject):
     def _release_stuck_output(self, token: int) -> None:
         if not self._output_busy or token != self._output_token:
             return
+        raw = self._output_raw_text
+        if self._output_stage == "polish" and raw.strip():
+            # The polisher never answered. Its result would have been this
+            # sentence anyway, so output the raw words instead of losing them.
+            log.error("润色超时未回调，改为输出原文")
+            self._output_stage = "paste"
+            self._output_text(raw, degraded_from_polish=True)
+            return
         log.error("输出流程超时未回调，释放队列以免后续语音卡住")
         self._output_busy = False
+        self._output_stage = ""
+        if self._output_stage_text.strip():
+            # Ctrl+V may or may not have gone out; leave the words on the
+            # clipboard rather than risk pasting them twice.
+            try:
+                pyperclip.copy(self._output_stage_text)
+            except Exception as exc:
+                log.warning("复制超时句子到剪贴板失败: %s", exc)
+            else:
+                self._floating.show_info("输出超时 · 已复制", "可按 Ctrl+V 粘贴")
         self._pump_segment_queue()
 
     def _deliver_recognized_text(self, text: str) -> None:
         self._mark_output_busy()
         self._output_raw_text = text
+        self._output_stage = "polish"
+        self._output_stage_text = ""
         llm_enabled = self._config.get("llm.enabled", False)
         api_url = self._config.get("llm.api_url", "")
         api_key = self._config.get("llm.api_key", "")
@@ -1202,6 +1287,8 @@ class App(QObject):
             return
 
         record = self._freeze_pending_history_record(text, degraded_from_polish)
+        self._output_stage = "paste"
+        self._output_stage_text = text
         self._paster.paste_async(text, lambda result, record=record: self._handle_paste_result(
             result,
             degraded_from_polish=degraded_from_polish,
@@ -1261,6 +1348,8 @@ class App(QObject):
         record: SegmentRecord | None = None,
     ):
         self._output_busy = False
+        self._output_stage = ""
+        self._output_stage_text = ""
         if isinstance(result, PasteResult):
             status = result.status
             target_app = result.target_app
@@ -1297,6 +1386,24 @@ class App(QObject):
                     self._floating.show_info(success_msg, target_hint)
                 else:
                     self._floating.show_success(success_msg, target_hint)
+        elif status == "unverified":
+            # Ctrl+V already went out, then the foreground changed. Saying
+            # 「已复制」 here invites a second manual paste of the same words.
+            log.info("已发送粘贴快捷键，但焦点随后切换，无法确认是否已插入")
+            self._tray.set_activity_tooltip(
+                "listening" if self._continuous_session_active() else None
+            )
+            unverified_hint = f"焦点已切换，若 {target_app} 未出字{paste_hint}" if target_app else f"焦点已切换，若未出字{paste_hint}"
+            if self._continuous_session_active():
+                self._floating.show_info("已发送 · 未确认", unverified_hint)
+                QTimer.singleShot(2200, self._refresh_continuous_ui_after_output)
+            elif self._continuous_user_stopped:
+                self._floating.show_continuous_stopped(f"剩余内容：已发送 · 未确认 · {unverified_hint}")
+                QTimer.singleShot(2200, self._refresh_continuous_ui_after_output)
+            elif self._recorder.is_recording:
+                self._floating.show_recording()
+            else:
+                self._floating.show_info("已发送 · 未确认", unverified_hint)
         elif status == "clipboard":
             log.info("已复制到剪贴板（粘贴未确认成功）")
             self._tray.set_activity_tooltip(
@@ -1669,7 +1776,9 @@ class App(QObject):
         self._recognizer.shutdown()
         self._polisher.cancel()
         self._tray.hide()
-        self._history.close(timeout=2.0)
+        # Queued history writes finish before the process goes away; the
+        # writer is a daemon thread, so this wait is their only chance.
+        self._history.close()
         self._config.save_immediate()
         QApplication.quit()
 
@@ -1883,11 +1992,26 @@ class App(QObject):
             "默认快捷键为 Shift+X；可在设置 → 通用 中更改。\n"
             "Windows：双击托盘图标可打开主窗口。"
         )
-        QMessageBox.information(None, "欢迎使用 SayInk", text)
+        box = self._dialog("欢迎使用 SayInk", text, QMessageBox.Icon.Information)
+        box.addButton("知道了", QMessageBox.ButtonRole.AcceptRole)
+        box.exec()
         self._config.set("first_run_welcome_seen", True)
         # Sequence: history onboarding only after welcome is dismissed.
         if not self._config.get("history.onboarded", False):
             QTimer.singleShot(200, self._show_history_onboarding)
+
+    def _dialog(self, title: str, text: str, icon) -> QMessageBox:
+        """Message box owned by the main window; a tray-only app has no other
+        anchor, so without one the box stays on top instead of opening behind
+        whatever the user is working in."""
+        parent = getattr(self, "_main", None)
+        box = QMessageBox(parent)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setIcon(icon)
+        if parent is None:
+            box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        return box
 
     def _show_history_onboarding_once(self):
         if self._config.get("history.onboarded", False):
@@ -1911,10 +2035,7 @@ class App(QObject):
             "历史只保存在本地；关闭后只会停止未来写入，不会删除已有数据。\n"
             "随时可以在设置关闭或调整保留策略。"
         )
-        box = QMessageBox()
-        box.setWindowTitle("开启语音历史？")
-        box.setText(text)
-        box.setIcon(QMessageBox.Icon.Question)
+        box = self._dialog("开启语音历史？", text, QMessageBox.Icon.Question)
         enable_btn = box.addButton("开启", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("暂不开启", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(enable_btn)

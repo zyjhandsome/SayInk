@@ -103,3 +103,76 @@ class TestCredentialMigration:
         store, fake = _store({})
         assert store.write("sk-1") is True
         assert fake.entries == {CREDENTIAL_TARGET: "sk-1"}
+
+
+class _FakeRunKey:
+    """HKCU\\...\\Run as a dict; supports the winreg calls Config uses."""
+
+    def __init__(self, values: dict[str, str]):
+        self.values = dict(values)
+        self.deleted: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _fake_winreg(values: dict[str, str]):
+    import types
+
+    key = _FakeRunKey(values)
+
+    def _query(k, name):
+        if name not in key.values:
+            raise FileNotFoundError(name)
+        return key.values[name], 1
+
+    def _delete(k, name):
+        key.values.pop(name)
+        key.deleted.append(name)
+
+    mod = types.SimpleNamespace(
+        HKEY_CURRENT_USER=0,
+        KEY_READ=1,
+        KEY_SET_VALUE=2,
+        OpenKey=lambda *a, **k: key,
+        CloseKey=lambda k: None,
+        QueryValueEx=_query,
+        DeleteValue=_delete,
+    )
+    return mod, key
+
+
+class TestLegacyAutoStartValue:
+    """README: 旧版 VoiceInk 的开机自启项会被移除，由 SayInk 接管。"""
+
+    def test_legacy_run_value_is_dropped_and_intent_kept(self, config_home, monkeypatch):
+        import sys
+
+        from sayink.config import LEGACY_AUTO_START_VALUE, Config
+
+        winreg, key = _fake_winreg({LEGACY_AUTO_START_VALUE: r"C:\old\VoiceInk.exe"})
+        monkeypatch.setitem(sys.modules, "winreg", winreg)
+        monkeypatch.setattr(sys, "platform", "win32")
+
+        cfg = Config(config_dir=config_home)
+
+        assert key.deleted == [LEGACY_AUTO_START_VALUE]
+        assert LEGACY_AUTO_START_VALUE not in key.values
+        assert cfg.get("auto_start") is True
+
+    def test_without_legacy_value_nothing_changes(self, config_home, monkeypatch):
+        import sys
+
+        from sayink.config import Config
+
+        winreg, key = _fake_winreg({})
+        monkeypatch.setitem(sys.modules, "winreg", winreg)
+        monkeypatch.setattr(sys, "platform", "win32")
+
+        cfg = Config(config_dir=config_home)
+
+        assert key.deleted == []
+        assert cfg.get("auto_start") is False

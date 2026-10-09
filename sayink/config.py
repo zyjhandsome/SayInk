@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 from PyQt6.QtCore import QTimer
 
-from sayink.version import __version__ as VERSION
 from sayink.secret_store import default_secret_store
 from sayink.speech_recognizer import (
     DEFAULT_MODEL_ID,
@@ -16,6 +15,7 @@ from sayink.speech_recognizer import (
     default_models_dir,
 )
 from sayink.user_data import user_data_dir
+from sayink.version import __version__ as VERSION  # noqa: F401  (re-exported for the About page)
 
 log = logging.getLogger("SayInk")
 
@@ -108,6 +108,8 @@ DEFAULT_CONFIG = {
 
 
 SECRET_KEY = "llm.api_key"
+# Run-key value name written by VoiceInk ≤ 2.1.0; removed once on first start.
+LEGACY_AUTO_START_VALUE = "VoiceInk"
 
 
 class Config:
@@ -176,8 +178,13 @@ class Config:
         stored = store.read()
         if stored is None:
             # Credential Manager unreadable: an older plaintext key still works
-            # this run, but a newly entered key must not land in config.json.
+            # this run, but it may not stay on disk (README P0: never written
+            # in plaintext). The settings page tells the user to re-enter it.
             self._secret_value = in_file
+            if in_file:
+                self._scrub_plaintext_key(
+                    "凭据管理器不可读，配置文件中的 API Key 已移除，仅本次运行有效"
+                )
             return
         if in_file and store.write(in_file):
             log.info("已将 API Key 从配置文件迁移到 Windows 凭据管理器")
@@ -186,7 +193,17 @@ class Config:
             self.save_immediate()
         elif in_file:
             stored = in_file
+            self._scrub_plaintext_key(
+                "API Key 未能迁移到凭据管理器，已从配置文件移除，仅本次运行有效"
+            )
         self._secret_value = stored
+
+    def _scrub_plaintext_key(self, reason: str) -> None:
+        """Drop a legacy plaintext key from config.json; keep it in memory only."""
+        self._config.setdefault("llm", {})["api_key"] = ""
+        self._secret_persist_failed = True
+        self.save_immediate()
+        log.warning(reason)
 
     @property
     def secret_persist_failed(self) -> bool:
@@ -232,19 +249,42 @@ class Config:
             import winreg
             key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
+            registered = False
             try:
                 winreg.QueryValueEx(key, "SayInk")
-                # Registry entry exists - sync to config
-                if not self._config.get("auto_start", False):
-                    self._config["auto_start"] = True
-                    self.save_immediate()
-                    log.info("同步注册表开机自启状态到配置文件")
+                registered = True
             except FileNotFoundError:
                 # Registry entry doesn't exist - nothing to sync
                 pass
             winreg.CloseKey(key)
+            # VoiceInk ≤ 2.1.0 wrote its own Run value. Its uninstaller does
+            # not remove it, so it would keep pointing at a deleted EXE (or
+            # start the app twice). Carry the intent over and drop the value.
+            if self._drop_legacy_auto_start_value(winreg, key_path):
+                registered = True
+            if registered and not self._config.get("auto_start", False):
+                self._config["auto_start"] = True
+                self.save_immediate()
+                log.info("同步注册表开机自启状态到配置文件")
         except Exception as e:
             log.warning("读取注册表开机自启状态失败: %s", e)
+
+    @staticmethod
+    def _drop_legacy_auto_start_value(winreg, key_path: str) -> bool:
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE
+            ) as key:
+                try:
+                    winreg.QueryValueEx(key, LEGACY_AUTO_START_VALUE)
+                except FileNotFoundError:
+                    return False
+                winreg.DeleteValue(key, LEGACY_AUTO_START_VALUE)
+                log.info("已移除旧版 VoiceInk 的开机自启项，改由 SayInk 接管")
+                return True
+        except Exception as e:
+            log.warning("清理旧版开机自启项失败: %s", e)
+            return False
 
     def _merge_defaults(self, defaults: dict, current: dict, _path: str = "") -> dict:
         result = {}

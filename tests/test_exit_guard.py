@@ -21,7 +21,7 @@ def test_return_from_exit_preserves_pending_work(pending):
         elif pending == "polish":
             app._output_busy = True
         else:
-            app._segment_queue.append(np.ones(1600, dtype=np.float32))
+            app._enqueue_audio(np.ones(1600, dtype=np.float32))
         before = list(app._segment_queue)
         with patch("sayink.app.QMessageBox") as boxes, patch("sayink.app.QApplication.quit") as quit_app:
             dialog = boxes.return_value

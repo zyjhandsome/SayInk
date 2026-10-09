@@ -10,15 +10,14 @@ from __future__ import annotations
 import sys
 
 import numpy as np
-import pytest
-from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 from pynput import keyboard
 from unittest.mock import patch
 
 from tests.helpers.app_harness import app_harness
-from sayink.app import App, MIN_AUDIO_SAMPLES
+from sayink.app import MIN_AUDIO_SAMPLES
 from sayink.hotkey_manager import HotKeyManager
+from sayink.text_paster import PasteResult
 
 
 class TestReadmeExitProtection:
@@ -289,7 +288,7 @@ class TestReadmeContinuousMode:
             app = h["app"]
             app._is_transcribing = True
             seg = np.zeros(MIN_AUDIO_SAMPLES, dtype=np.float32)
-            app._segment_queue.append(seg)
+            app._enqueue_audio(seg)
             app._is_transcribing = False
             app._recorder.is_continuous = True
 
@@ -332,6 +331,38 @@ class TestReadmeAsrOutputAndPaste:
                 h["app"]._output_text("直接粘贴")
                 h["paster"].paste_async.assert_called_once()
                 assert h["paster"].paste_async.call_args[0][0] == "直接粘贴"
+
+    def test_user_spoken_html_tags_survive_while_asr_markers_go(self):
+        """README: 只去识别器自身的标记，口述的 <div> 保留。"""
+        from sayink.speech_recognizer import normalize_asr_output
+
+        assert normalize_asr_output("<|zh|><asr_text>写一个 <div> 标签<sil>") == "写一个 <div> 标签"
+
+    def test_whole_japanese_utterance_is_kept(self):
+        """README: 整句都是日语时原样保留。"""
+        from sayink.speech_recognizer import normalize_asr_output
+
+        text = "こんにちは、今日はいい天気ですね。"
+        assert normalize_asr_output(text) == text
+
+    def test_unverified_paste_tells_the_user_to_check(self):
+        """README: 粘贴键发出后前台变了 → 「已发送 · 未确认」。"""
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            app._output_text("你好")
+            h["paster"].paste_async.call_args[0][1](PasteResult("unverified", detail="focus_changed_after_send"))
+            title = h["floating"].show_info.call_args[0][0]
+            assert "未确认" in title
+
+    def test_long_hold_is_sliced_at_a_quiet_frame(self):
+        """README: 超过 15 秒的长句在最安静处分片。"""
+        from sayink.speech_recognizer import SAMPLE_RATE, plan_audio_slices
+
+        audio = np.full(int(20 * SAMPLE_RATE), 0.5, dtype=np.float32)
+        quiet = slice(int(13.0 * SAMPLE_RATE), int(13.1 * SAMPLE_RATE))
+        audio[quiet] = 0.01
+        first = plan_audio_slices(audio, SAMPLE_RATE, slice_sec=15.0, overlap_sec=0.4)[0]
+        assert 12.9 * SAMPLE_RATE <= first.size <= 13.2 * SAMPLE_RATE
 
 
 class TestReadmeAudioSources:
@@ -408,12 +439,18 @@ class TestReadmeReliabilityPromises:
         text = self._readme()
         assert "就不发送粘贴键" in text
         assert "回退它自己的原文" in text
-        assert "删改了原话里的阿拉伯数字" in text
+        assert "删改了原话里的数字" in text
+        assert "「三万五」等中文数字换算后比对" in text
+        assert "少了否定词" in text
+        assert "已发送 · 未确认" in text
+        assert "输出超时 · 已复制" in text
         assert "Key 可留空" in text
 
     def test_storage_and_update_guarantees_are_documented(self):
         text = self._readme()
-        assert "只在本次运行中有效、同样不写入 `config.json`" in text
+        assert "Key 只在本次运行中有效" in text
+        assert "残留的明文 Key 也会被清掉" in text
+        assert "旧版 VoiceInk 还在运行时 SayInk 不会再开一个实例" in text
         assert "没有公布该安装包 SHA-256 时，SayInk 不会下载或自动安装" in text
         assert "长时间监听只在内存中保留当前这句话" not in text
         assert "自动暂停监听" in text

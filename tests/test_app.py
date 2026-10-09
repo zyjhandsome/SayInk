@@ -5,10 +5,14 @@ import numpy as np
 from PyQt6.QtWidgets import QApplication
 from unittest.mock import MagicMock
 
-from sayink.app import App, MIN_AUDIO_SAMPLES
+from sayink.app import App, MIN_AUDIO_SAMPLES, _QueuedSegment
 from sayink.runtime_status import RuntimeState
 from sayink.text_paster import PasteResult
 from tests.helpers.app_harness import app_harness
+
+
+def _queued(*audios: np.ndarray) -> list[_QueuedSegment]:
+    return [_QueuedSegment(audio=a) for a in audios]
 
 
 class TestAppConstants:
@@ -250,6 +254,18 @@ class TestHandlePasteResult:
             args = h["floating"].show_success.call_args[0]
             assert "已复制" in args[0]
 
+    def test_unverified_send_is_not_called_copied(self):
+        """README: after Ctrl+V went out, a focus change shows 「已发送 · 未确认」."""
+        with app_harness() as h:
+            app = h["app"]
+            app._handle_paste_result(
+                PasteResult("unverified", target_app="notepad.exe", detail="focus_changed_after_send")
+            )
+            assert not h["floating"].show_success.called
+            title, hint = h["floating"].show_info.call_args[0]
+            assert title == "已发送 · 未确认"
+            assert "notepad.exe" in hint and "Ctrl+V" in hint
+
     def test_error_shows_friendly_error(self):
         with app_harness() as h:
             app = h["app"]
@@ -290,7 +306,7 @@ class TestSettingsChangedQueue:
     def test_pending_queue_cleared_on_settings_change(self):
         with app_harness() as h:
             app = h["app"]
-            app._segment_queue = [np.zeros(1600, dtype=np.float32)] * 3
+            app._segment_queue = _queued(*[np.zeros(1600, dtype=np.float32)] * 3)
             h["recorder"].is_continuous = False
             app._on_settings_changed()
             assert app._segment_queue == []
@@ -298,7 +314,7 @@ class TestSettingsChangedQueue:
     def test_pending_segment_count_counts_queue_and_active(self):
         with app_harness() as h:
             app = h["app"]
-            app._segment_queue = [np.zeros(1600, dtype=np.float32)] * 2
+            app._segment_queue = _queued(*[np.zeros(1600, dtype=np.float32)] * 2)
             app._is_transcribing = True
             assert app._pending_segment_count() == 3
 
@@ -334,7 +350,7 @@ class TestSegmentReadyQueueing:
             audio = np.ones(1600, dtype=np.float32)
             app._on_segment_ready(audio)
             assert len(app._segment_queue) == 1
-            assert app._segment_queue[0] is audio
+            assert app._segment_queue[0].audio is audio
             h["recognizer"].transcribe_final.assert_not_called()
             h["floating"].show_error.assert_called()
 
@@ -344,9 +360,9 @@ class TestSegmentReadyQueueing:
             h["recognizer"].is_ready = False
             h["recognizer"].is_loading = False
             audio = np.ones(1600, dtype=np.float32)
-            app._segment_queue = [audio]
+            app._segment_queue = _queued(audio)
             app._pump_segment_queue()
-            assert app._segment_queue == [audio]
+            assert app._queued_audio() == [audio]
             h["recognizer"].transcribe_final.assert_not_called()
 
     def test_recognizer_error_while_loading_keeps_hud_lock(self):
@@ -365,9 +381,9 @@ class TestSegmentReadyQueueing:
             h["recognizer"].is_ready = False
             h["recognizer"].is_loading = False
             audio = np.ones(1600, dtype=np.float32)
-            app._segment_queue = [audio]
+            app._segment_queue = _queued(audio)
             app._on_recognizer_error("模型加载失败: boom")
-            assert app._segment_queue == [audio]
+            assert app._queued_audio() == [audio]
             h["recognizer"].transcribe_final.assert_not_called()
             h["floating"].show_error.assert_not_called()
 
@@ -420,7 +436,7 @@ class TestFinalResultFlow:
             h["recognizer"].is_ready = True
             h["recorder"].is_recording = False
             app._is_transcribing = False
-            app._segment_queue = [np.ones(1600, dtype=np.float32)]
+            app._segment_queue = _queued(np.ones(1600, dtype=np.float32))
 
             app._on_recording_start()
 
@@ -461,14 +477,14 @@ class TestFinalResultFlow:
             h["recognizer"].is_ready = True
             h["recorder"].is_recording = False
             queued = np.ones(1600, dtype=np.float32)
-            app._segment_queue = [queued]
+            app._segment_queue = _queued(queued)
             app._live_committed = "上一句"
             app._hold_paste_sent = False
 
             app._on_recording_start()
             app._on_recording_cancel()
 
-            assert app._segment_queue == [queued]
+            assert app._queued_audio() == [queued]
             assert app._live_committed == "上一句"
             assert app._hold_paste_sent is False
             h["recorder"].cancel.assert_not_called()
@@ -478,13 +494,27 @@ class TestFinalResultFlow:
         with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
             app = h["app"]
             h["recorder"].is_recording = True
-            app._segment_queue = [np.ones(1600, dtype=np.float32)]
+            app._enqueue_audio(np.ones(1600, dtype=np.float32), "mic")
 
             app._on_recording_cancel()
 
             assert app._segment_queue == []
             h["recorder"].cancel.assert_called_once()
             h["floating"].show_cancelled.assert_called_once()
+
+    def test_queue_entries_carry_route_and_context_together(self):
+        """Q-02: one dataclass per segment, no parallel lists to keep in step."""
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            first, second = np.ones(1600, dtype=np.float32), np.zeros(1600, dtype=np.float32)
+            app._enqueue_audio(first, "mic")
+            app._enqueue_audio(second, "system", front=True)
+
+            assert [s.route for s in app._segment_queue] == ["system", "mic"]
+            audio, route, context = app._pop_queued_audio()
+            assert audio is second and route == "system" and context is None
+            assert app._queued_audio() == [first]
+            assert app._queued_audio_seconds() == pytest.approx(0.1)
 
     def test_release_tells_the_bar_the_key_is_up_before_stopping(self):
         with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
@@ -502,7 +532,7 @@ class TestFinalResultFlow:
         with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
             app = h["app"]
             h["recorder"].is_recording = False
-            app._segment_queue = [np.ones(1600, dtype=np.float32)]
+            app._segment_queue = _queued(np.ones(1600, dtype=np.float32))
             app._on_final_result("前十五秒")
             h["paster"].paste_async.assert_not_called()
             assert app._live_committed == "前十五秒"
@@ -577,6 +607,6 @@ class TestBeginTranscription:
             audio = np.ones(1600, dtype=np.float32)
             app._begin_transcription(audio)
             assert app._is_transcribing is False
-            assert app._segment_queue == [audio]
+            assert app._queued_audio() == [audio]
             h["recognizer"].transcribe_final.assert_not_called()
             h["floating"].show_error.assert_called()

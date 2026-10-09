@@ -206,13 +206,13 @@ def test_queued_segments_after_user_stop_keep_same_session() -> None:
 
         first_cb = _begin_and_finish_asr(app, h["paster"], "first")
         queued = _audio()
-        app._segment_queue.append(queued)
+        app._enqueue_audio(queued)
         session_before_stop = app._current_session_id
 
         app._stop_continuous_user_session()
         first_cb("pasted")
 
-        app._begin_transcription(app._segment_queue.pop(0))
+        app._begin_transcription(app._pop_queued_audio()[0])
         app._on_final_result("late after esc")
         h["paster"].paste_async.call_args[0][1]("pasted")
 
@@ -243,7 +243,7 @@ def test_restart_keeps_queued_old_session_audio_in_old_session() -> None:
         recorder.is_continuous = True
         app._on_segment_ready(_audio())
 
-        assert app._segment_contexts[0].speakers is old_speakers
+        assert app._segment_queue[0].context.speakers is old_speakers
         assert app._speakers is not old_speakers
 
         first_callback("pasted")
@@ -495,17 +495,45 @@ def test_continuous_segment_waits_while_previous_segment_is_polishing() -> None:
         ]
 
 
-def test_stuck_output_is_released_by_watchdog() -> None:
+def test_stuck_polish_falls_back_to_raw_text() -> None:
+    """README: a polisher that never answers must not swallow the sentence."""
     with app_harness(_POLISH_ON) as h:
-        app = h["app"]
+        app, paster = h["app"], h["paster"]
         app._begin_transcription(_audio())
         app._on_final_result("AAA")
         app._enqueue_audio(_audio())
         assert app._output_busy is True
+        assert not paster.paste_async.called
+
+        app._release_stuck_output(app._output_token)
+
+        # The raw words went to the paster as a degraded output ...
+        assert paster.paste_async.call_args[0][0] == "AAA"
+        assert app._output_busy is True
+        paster.paste_async.call_args[0][1]("pasted")
+        # ... and the queue moves on once that paste reports back.
+        assert app._output_busy is False
+        app._pump_segment_queue()
+        assert h["recognizer"].transcribe_final.call_count == 2
+        records = _enqueued_records(h["history"])
+        assert [(r.raw_text, r.polished_text) for r in records] == [("AAA", "AAA")]
+
+
+def test_stuck_paste_releases_queue_and_keeps_words_on_clipboard() -> None:
+    with app_harness(_POLISH_ON) as h, patch("sayink.app.pyperclip.copy") as copy:
+        app, paster = h["app"], h["paster"]
+        app._begin_transcription(_audio())
+        app._on_final_result("AAA")
+        app._on_polish_complete("AAA。")
+        app._enqueue_audio(_audio())
+        assert paster.paste_async.call_args[0][0] == "AAA。"
 
         app._release_stuck_output(app._output_token)
 
         assert app._output_busy is False
+        copy.assert_called_once_with("AAA。")
+        # No second paste attempt: Ctrl+V may already have landed.
+        assert paster.paste_async.call_count == 1
         assert h["recognizer"].transcribe_final.call_count == 2
 
 

@@ -117,6 +117,18 @@ WRITE_FAILED_NOTICE = "历史记录保存失败，最近的转写可能未写入
 DELETE_FAILED_NOTICE = "历史记录删除或清理失败，相关记录可能仍保留在本机。"
 
 
+# How long a reader / writer waits on a locked database before giving up.
+BUSY_TIMEOUT_MS = 5000
+# Exiting waits this long for queued history writes; the writer is a daemon
+# thread, so anything still pending after that is lost.
+CLOSE_TIMEOUT_SEC = 10.0
+
+
+def _escape_like(text: str) -> str:
+    """Make ``%`` and ``_`` literal in a LIKE pattern (searching 100% or a_b)."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _is_corruption_error(exc: BaseException) -> bool:
     """SQLITE_CORRUPT / SQLITE_NOTADB surface as a bare ``sqlite3.DatabaseError``.
 
@@ -184,8 +196,9 @@ class HistoryStore:
         # write ownership to the daemon writer thread. The connection must be
         # closed explicitly (``with`` only commits) or Windows keeps the file
         # locked and a corrupt database could not be renamed afterwards.
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_MS / 1000)
         try:
+            conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.executescript(_DDL)
             _ensure_speaker_columns(conn)
@@ -266,20 +279,21 @@ class HistoryStore:
             ("cleanup", (retention_days, max_entries, active_session_id))
         )
 
-    def close(self, timeout: float = 2.0) -> None:
+    def close(self, timeout: float = CLOSE_TIMEOUT_SEC) -> None:
         if self.disabled:
             return
         thread = self._thread
         if thread is None:
             return
         self._thread = None
+        pending = self._queue.qsize()
         self._queue.put(self._stop)
         thread.join(timeout=timeout)
         if thread.is_alive():
             logger.warning(
-                "HistoryStore writer did not finish within %.1fs; "
+                "HistoryStore writer did not finish within %.1fs (%d writes were queued); "
                 "leaving connection with writer thread",
-                timeout,
+                timeout, pending,
             )
 
     def list_sessions(self, limit: int = 50, offset: int = 0) -> list[SessionSummary]:
@@ -304,7 +318,7 @@ class HistoryStore:
     def search_sessions(self, q: str) -> list[SessionSummary]:
         if self.disabled or not q:
             return []
-        pattern = f"%{q}%"
+        pattern = f"%{_escape_like(q)}%"
         try:
             with self._readonly_conn() as conn:
                 rows = conn.execute(
@@ -312,7 +326,7 @@ class HistoryStore:
                     + """
                     WHERE h.session_id IN (
                       SELECT DISTINCT session_id FROM history
-                      WHERE raw_text LIKE ? OR polished_text LIKE ?
+                      WHERE raw_text LIKE ? ESCAPE '\\' OR polished_text LIKE ? ESCAPE '\\'
                     )
                     GROUP BY h.session_id
                     ORDER BY session_created DESC
@@ -364,7 +378,8 @@ class HistoryStore:
     def _readonly_conn(self) -> sqlite3.Connection:
         # Short-lived read-only URI connection (WAL allows concurrent readers).
         uri = self.db_path.resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000)
+        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
         conn.execute("PRAGMA query_only=ON;")
         return conn
 
@@ -372,7 +387,8 @@ class HistoryStore:
         conn: sqlite3.Connection | None = None
         try:
             # Writer thread exclusively owns this connection for its lifetime.
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000)
+            conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
             conn.execute("PRAGMA journal_mode=WAL;")
         except Exception as exc:
             self._init_error = exc

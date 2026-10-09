@@ -381,7 +381,14 @@ class TextPaster:
                     QTimer.singleShot(RESTORE_CLIPBOARD_DELAY_MS, _restore_clipboard)
                 callback(PasteResult("sent", target_app=target_app))
             else:
-                log.info("粘贴校验未通过（焦点已切换或目标不可粘贴），保留剪贴板内容")
-                _keep_for_manual_paste()
+                # The shortcut is already out; the target may well have taken
+                # it before the focus moved. Keep the words on the clipboard
+                # but do not call it 「已复制」, or the user pastes them twice.
+                log.info("粘贴键已发出，但随后焦点切换，无法确认是否已插入；保留剪贴板内容")
+                try:
+                    pyperclip.copy(text)
+                except Exception:
+                    pass
+                callback(PasteResult("unverified", target_app=target_app, detail="focus_changed_after_send"))
 
         QTimer.singleShot(PASTE_DELAY_MS, _do_paste)

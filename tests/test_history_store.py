@@ -82,6 +82,24 @@ class TestLikeSearch:
         assert [s.session_id for s in walk] == ["s1"]
         assert store.search_sessions("不存在") == []
 
+    def test_percent_and_underscore_are_literal_in_search(self, store):
+        """README: searching 100% does not match every text that starts with 100."""
+        store.enqueue(_record("pct", 0, raw_text="完成度是100%", created_at=1000))
+        store.enqueue(_record("num", 0, raw_text="预算是100元", created_at=2000))
+        store.enqueue(_record("under", 0, raw_text="变量名 a_b", created_at=3000))
+        store.enqueue(_record("plain", 0, raw_text="变量名 axb", created_at=4000))
+        store.close(timeout=2.0)
+
+        assert [s.session_id for s in store.search_sessions("100%")] == ["pct"]
+        assert [s.session_id for s in store.search_sessions("a_b")] == ["under"]
+        assert store.search_sessions("\\") == []
+
+    def test_connections_set_a_busy_timeout(self, store):
+        from sayink.history_store import BUSY_TIMEOUT_MS
+
+        with store._readonly_conn() as conn:
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == BUSY_TIMEOUT_MS
+
 
 class TestCleanup:
     def test_cleanup_by_max_sessions_deletes_oldest_whole_session(self, store):

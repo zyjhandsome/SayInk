@@ -61,6 +61,7 @@ class TestWindowsMutex:
 
         fake_kernel = types.SimpleNamespace(
             CreateMutexW=lambda a, b, name: 111,
+            OpenMutexW=lambda access, inherit, name: 0,
             GetLastError=lambda: 0,
             CloseHandle=lambda h: True,
         )
@@ -72,12 +73,39 @@ class TestWindowsMutex:
         assert main._win_mutex == 111
         main._win_mutex = None
 
+    def test_running_legacy_voiceink_blocks_sayink(self, monkeypatch):
+        """README: 旧版 VoiceInk 还在运行时，SayInk 不会再起第二个实例。"""
+        monkeypatch.setattr(main.sys, "platform", "win32")
+
+        closed = []
+        opened = []
+
+        def _open(access, inherit, name):
+            opened.append(name)
+            return 333 if name == main.LEGACY_MUTEX_NAME else 0
+
+        fake_kernel = types.SimpleNamespace(
+            CreateMutexW=lambda a, b, name: 111,
+            OpenMutexW=_open,
+            GetLastError=lambda: 0,
+            CloseHandle=lambda h: closed.append(h),
+        )
+        fake_windll = types.SimpleNamespace(kernel32=fake_kernel)
+        monkeypatch.setattr(main.ctypes, "windll", fake_windll, raising=False)
+        monkeypatch.setattr(main, "_win_mutex", None, raising=False)
+
+        assert main.check_single_instance() is False
+        assert opened == [main.LEGACY_MUTEX_NAME]
+        assert sorted(closed) == [111, 333]
+        assert main._win_mutex is None
+
     def test_mutex_already_exists_blocks(self, monkeypatch):
         monkeypatch.setattr(main.sys, "platform", "win32")
 
         closed = []
         fake_kernel = types.SimpleNamespace(
             CreateMutexW=lambda a, b, name: 222,
+            OpenMutexW=lambda access, inherit, name: 0,
             GetLastError=lambda: 183,  # ERROR_ALREADY_EXISTS
             CloseHandle=lambda h: closed.append(h),
         )
