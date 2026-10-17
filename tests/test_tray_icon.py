@@ -168,11 +168,16 @@ class TestTrayMenuStyleAndGrouping:
         assert labels[2] == "打开 SayInk"
         assert labels[3] == "检查更新"
         assert labels[4] == "历史"
-        assert labels[5] == "切换模型"
-        assert labels[6] == "开机自启"
-        assert actions[6].isCheckable()
-        assert labels[7] == "---"
-        assert labels[8] == "退出"
+        # Meeting group: start/end toggle + the 会议 page, between 历史 and 切换模型.
+        assert labels[5] == "---"
+        assert labels[6] == "开始会议"
+        assert labels[7] == "会议记录"
+        assert labels[8] == "---"
+        assert labels[9] == "切换模型"
+        assert labels[10] == "开机自启"
+        assert actions[10].isCheckable()
+        assert labels[11] == "---"
+        assert labels[12] == "退出"
 
 
 def test_model_switch_keeps_the_active_name_beside_the_label(tray):

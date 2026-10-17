@@ -77,6 +77,9 @@ class TestDrainMixedMono:
         padding the loopback with silence stretched 0.2 s of sound to 0.3 s
         and pushed the next loopback block 0.1 s late."""
         rec = AudioRecorder()
+        # Alignment is what is under test; drop the lane balancer so the
+        # plain average is predictable.
+        rec._balancer = None
         mic = _make_lane(role="microphone")
         system = _make_lane(role="system")
         rec._lanes = [mic, system]

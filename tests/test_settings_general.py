@@ -704,6 +704,40 @@ class TestPolishConfigurationStatus:
         self._fill(settings_window, "https://api.deepseek.com/v1", "", "deepseek-chat")
         assert settings_window._llm_missing_fields() == ["API 密钥"]
 
+    def test_missing_fields_reported_with_polish_off(self, settings_window):
+        settings_window._llm_enable_row.setChecked(False)
+        settings_window._llm_url_edit.clear()
+        settings_window._llm_key_edit.clear()
+        settings_window._llm_model_edit.clear()
+        settings_window._update_llm_configuration_status()
+        text = settings_window._llm_test_status.text()
+        assert "接口地址" in text and "会议纪要" in text
+
+    def test_insecure_remote_url_rejected_with_polish_off(self, settings_window, config, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warnings.append(a)))
+        settings_window._llm_enable_row.setChecked(False)
+        settings_window._llm_url_edit.setText("http://api.example.com/v1")
+        settings_window._flush_llm_fields()
+        assert warnings
+        assert config.get("llm.api_url", "") != "http://api.example.com/v1"
+
+    def test_minutes_model_test_uses_shared_endpoint(self, settings_window, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "sayink.text_polisher.TextPolisher.test_connection",
+            staticmethod(lambda u, k, m: (calls.append((u, k, m)), (True, ""))[1]),
+        )
+        settings_window._llm_url_edit.setText("https://api.deepseek.com/v1")
+        settings_window._llm_key_edit.setText("sk-x")
+        settings_window._llm_model_edit.setText("deepseek-chat")
+        settings_window._minutes_model_edit.setText("deepseek-reasoner")
+        settings_window._test_minutes_model()
+        settings_window._minutes_test_worker.wait(3000)
+        QApplication.processEvents()
+        assert calls == [("https://api.deepseek.com/v1", "sk-x", "deepseek-reasoner")]
+        assert "deepseek-reasoner" in settings_window._minutes_test_status.text()
+
     def test_unsaved_credential_is_reported(self, settings_window, config):
         config._secret_persist_failed = True
         self._fill(settings_window, "https://api.deepseek.com/v1", "sk-x", "deepseek-chat")
@@ -812,3 +846,76 @@ class TestModelDownloadDone:
         settings_window._on_dl_done("first")
         assert config.get("stt.model_id") == "first"
         assert "载入内存" in done_env[0]
+
+
+class TestMeetingSettings:
+    """通用 → 「会议与识别」 and 润色 → 「会议纪要」 round-trip through config.
+
+    Glossary / language / VAD are shared by dictation and meetings, so they
+    live under ``stt.*``; only the meeting-specific choices stay in ``meeting.*``.
+    """
+
+    def test_meeting_defaults_load(self, settings_window, config):
+        assert settings_window._meeting_source_combo.currentData() == "mixed"
+        assert settings_window._meeting_model_combo.currentData() == ""
+        assert settings_window._meeting_vad_combo.currentData() == "silero"
+        assert settings_window._meeting_language_combo.currentData() == "auto"
+        assert settings_window._meeting_start_card_row.isChecked()
+        assert settings_window._meeting_glossary_edit.toPlainText() == ""
+        assert settings_window._minutes_template_combo.currentData() == "general"
+
+    def test_meeting_choices_persist(self, settings_window, config):
+        win = settings_window
+        win._meeting_source_combo.setCurrentIndex(win._meeting_source_combo.findData("microphone"))
+        win._meeting_vad_combo.setCurrentIndex(win._meeting_vad_combo.findData("energy"))
+        win._meeting_language_combo.setCurrentIndex(win._meeting_language_combo.findData("en"))
+        win._meeting_start_card_row.setChecked(False)
+        assert config.get("meeting.input_source") == "microphone"
+        assert config.get("stt.vad") == "energy"
+        assert config.get("stt.language") == "en"
+        assert config.get("meeting.show_start_card") is False
+        assert config.get("meeting.vad") is None and config.get("meeting.language") is None
+
+    def test_recognition_changes_emit_shared_signal(self, settings_window, config):
+        win = settings_window
+        fired = []
+        win.recognition_changed.connect(lambda: fired.append(True))
+        win._meeting_vad_combo.setCurrentIndex(win._meeting_vad_combo.findData("energy"))
+        win._meeting_language_combo.setCurrentIndex(win._meeting_language_combo.findData("en"))
+        win._meeting_glossary_edit.setPlainText("SayInk")
+        win._flush_meeting_glossary()
+        assert len(fired) == 3
+        # Meeting-only choices do not force a recognizer reload.
+        win._meeting_source_combo.setCurrentIndex(win._meeting_source_combo.findData("microphone"))
+        win._flush_meeting_glossary()  # unchanged glossary → no signal
+        assert len(fired) == 3
+
+    def test_glossary_lines_become_terms_capped_and_deduped(self, settings_window, config):
+        win = settings_window
+        lines = ["SayInk", "  ", "SayInk", "FireRedASR2", "x" * 30] + [f"t{i}" for i in range(60)]
+        win._meeting_glossary_edit.setPlainText("\n".join(lines))
+        win._flush_meeting_glossary()
+        terms = [g["term"] for g in config.get("stt.glossary")]
+        assert terms[:3] == ["SayInk", "FireRedASR2", "x" * 20]
+        assert len(terms) == 50
+        win.reload_settings()
+        assert win._meeting_glossary_edit.toPlainText().splitlines()[:2] == ["SayInk", "FireRedASR2"]
+
+    def test_minutes_fields_persist(self, settings_window, config):
+        win = settings_window
+        win._minutes_model_edit.setText("  big-model ")
+        win._minutes_template_combo.setCurrentIndex(win._minutes_template_combo.findData("standup"))
+        win._minutes_language_combo.setCurrentIndex(win._minutes_language_combo.findData("zh"))
+        win._flush_minutes_fields()
+        assert config.get("meeting.model_name") == "big-model"
+        assert config.get("meeting.template_id") == "standup"
+        assert config.get("meeting.output_language") == "zh"
+
+    def test_aux_model_download_message_does_not_touch_dictation_model(self, settings_window, config, monkeypatch):
+        shown = []
+        monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: shown.append(args[2]))
+        monkeypatch.setattr("sayink.speech_recognizer.get_downloaded_models", lambda: [])
+        config.set("stt.model_id", "funasr-nano")
+        settings_window._on_dl_done("speaker-campplus")
+        assert config.get("stt.model_id") == "funasr-nano"
+        assert "下一场会议" in shown[0]

@@ -90,6 +90,8 @@ def test_chrome_size_and_nav(qapp, tmp_path, monkeypatch):
 
 
 def test_outer_border_uses_explicit_window_frame(qapp, tmp_path, monkeypatch):
+    from PyQt6.QtGui import QColor
+
     from sayink.ui import design_tokens as tok
 
     win, store = _make_main_window(tmp_path, monkeypatch)
@@ -98,8 +100,9 @@ def test_outer_border_uses_explicit_window_frame(qapp, tmp_path, monkeypatch):
         margins = win.layout().contentsMargins()
         assert win.objectName() == "mainWindow"
         assert "QWidget#mainWindow" in css
-        assert f"border: 1px solid {tok.TEXT_DIM}" in css
-        assert f"border-radius: {tok.WINDOW_RADIUS}px" in css
+        assert "border: none" in css
+        assert "border-radius" not in css
+        assert win._chrome_radius() == tok.WINDOW_RADIUS
         assert not win.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         assert f"background: {tok.BG}" in css
         assert f"background: {tok.BG}" in win._stack.styleSheet()
@@ -110,21 +113,42 @@ def test_outer_border_uses_explicit_window_frame(qapp, tmp_path, monkeypatch):
             1,
         )
         assert "border: 1px solid" not in win._sidebar.styleSheet()
+        assert len(win._frame_edges) == 4
+        color = QColor(tok.TEXT_DIM)
+        for edge in win._frame_edges:
+            assert edge.palette().color(edge.backgroundRole()) == color
+            assert edge.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        assert win._frame_edges[0].height() == 1
+        assert win._frame_edges[0].width() == win.width()
     finally:
         win.close()
         store.close()
 
 
 def test_maximize_toggle_does_not_restyle_the_whole_window(qapp, tmp_path, monkeypatch):
+    from PyQt6.QtCore import QEvent
+
     win, store = _make_main_window(tmp_path, monkeypatch)
     try:
         calls: list[str] = []
+        sheets: list[str] = []
         win.reapply_theme = lambda: calls.append("theme")
+        original = win.setStyleSheet
+
+        def tracked(sheet: str) -> None:
+            sheets.append(sheet)
+            original(sheet)
+
+        win.setStyleSheet = tracked
+        css = win.styleSheet()
         monkeypatch.setattr(win, "isMaximized", lambda: False)
         monkeypatch.setattr(win, "showMaximized", lambda: None)
         monkeypatch.setattr(win, "showNormal", lambda: None)
         win._toggle_maximized()
+        win.changeEvent(QEvent(QEvent.Type.WindowStateChange))
         assert calls == []
+        assert sheets == []
+        assert win.styleSheet() == css
     finally:
         win.close()
         store.close()
@@ -133,12 +157,20 @@ def test_maximize_toggle_does_not_restyle_the_whole_window(qapp, tmp_path, monke
 def test_maximized_chrome_drops_the_round_mask(qapp, tmp_path, monkeypatch):
     win, store = _make_main_window(tmp_path, monkeypatch)
     try:
+        css = win.styleSheet()
         monkeypatch.setattr(win, "isMaximized", lambda: True)
         win._apply_chrome_radius()
-        assert "border-radius: 0px" in win.styleSheet()
+        assert "border-radius" not in win.styleSheet()
         assert "border: none" in win.styleSheet()
+        assert win.styleSheet() == css
         assert win.layout().contentsMargins().left() == 0
         assert win.mask().isEmpty()
+        assert all(edge.geometry().isEmpty() for edge in win._frame_edges)
+        monkeypatch.setattr(win, "isMaximized", lambda: False)
+        win._sync_frame_margin()
+        win._position_frame_edges()
+        assert win.layout().contentsMargins().left() == 1
+        assert win._frame_edges[0].height() == 1
     finally:
         win.close()
         store.close()
@@ -260,6 +292,15 @@ def test_close_hides_does_not_quit(qapp, tmp_path, monkeypatch):
     win, store = _make_main_window(tmp_path, monkeypatch)
     try:
         win.show()
+        QApplication.processEvents()
+        css = win.styleSheet()
+        win._close_btn.click()
+        QApplication.processEvents()
+        assert win.isHidden()
+        assert win.styleSheet() == css
+        win.show()
+        QApplication.processEvents()
+        assert win.isVisible()
         win.close()
         assert win.isHidden()
         win.deleteLater()
@@ -307,3 +348,105 @@ def test_show_page_history_refreshes_list(qapp, tmp_path, monkeypatch):
     finally:
         win.close()
         store.close()
+
+
+def test_selected_meeting_row_is_highlighted_inside_main_window(qapp, tmp_path, monkeypatch):
+    """The page stack's background must not paint over list item widgets."""
+    from sayink.config import Config
+    from sayink.history_store import HistoryStore
+    from sayink.meeting_session import MeetingController
+    from sayink.ui.main_window import MainWindow
+    from sayink.ui.settings_window import SettingsWindow
+
+    monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
+    monkeypatch.setattr(SettingsWindow, "_refresh_about_info", lambda self: None)
+    monkeypatch.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)
+    store = HistoryStore(tmp_path / "h.db")
+    config = Config(config_dir=tmp_path)
+    ctrl = MeetingController(config, store, pending_segments=lambda: 0)
+    for title in ("周会", "评审"):
+        record = ctrl.store.create_meeting(title=title)
+        ctrl.store.end_meeting(record.id)
+    ctrl.store.flush()
+    win = MainWindow(config, store, meeting=ctrl)
+    try:
+        win.resize(1024, 680)
+        win.show()
+        win.show_page("meeting")
+        lst = win.meeting_panel._list
+        lst.setCurrentRow(1)
+        for _ in range(10):
+            qapp.processEvents()
+        def color_at(image, row):
+            rect = lst.visualItemRect(lst.item(row))
+            # grab() is in device pixels; item rects are logical.
+            dpr = image.devicePixelRatio() or 1.0
+            x = min(image.width() - 1, max(0, int((rect.right() - 4) * dpr)))
+            y = min(image.height() - 1, max(0, int(rect.center().y() * dpr)))
+            return image.pixelColor(x, y).name()
+
+        image = lst.viewport().grab().toImage()
+        for _ in range(20):
+            qapp.processEvents()
+            image = lst.viewport().grab().toImage()
+            if image.width() > 0 and color_at(image, 1) != color_at(image, 0):
+                break
+
+        assert lst.item(1).isSelected()
+        assert color_at(image, 1) != color_at(image, 0)
+    finally:
+        win.close()
+        ctrl.shutdown()
+        store.close()
+
+
+def test_history_promote_to_meeting_navigates_to_meeting_page_and_selects_it(qapp, tmp_path, monkeypatch):
+    from sayink.config import Config
+    from sayink.history_store import HistoryStore, SegmentRecord
+    from sayink.meeting_session import MeetingController
+    from sayink.ui.main_window import MainWindow
+    from sayink.ui.settings_window import SettingsWindow
+
+    monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
+    monkeypatch.setattr(SettingsWindow, "_refresh_about_info", lambda self: None)
+    monkeypatch.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)
+    store = HistoryStore(tmp_path / "h.db")
+    store.enqueue(
+        SegmentRecord(
+            session_id="dictation-1",
+            seq=0,
+            created_at=1_700_000_000_000,
+            raw_text="一段要整理成会议纪要的听写内容",
+            polished_text="",
+            source="mic",
+            duration_ms=2000,
+            target_app="Notepad.exe",
+            trigger_mode="continuous",
+            model="funasr-nano",
+        )
+    )
+    store.flush(timeout=2.0)
+    config = Config(config_dir=tmp_path)
+    ctrl = MeetingController(config, store, pending_segments=lambda: 0)
+    win = MainWindow(config, store, meeting=ctrl)
+    try:
+        win.show()
+        win.show_page("history")
+        assert win.current_page() == "history"
+        assert win.history_panel.session_count() == 1
+
+        win.history_panel._to_meeting_action.trigger()
+        qapp.processEvents()
+
+        assert win.current_page() == "meeting"
+        meeting_id = win.meeting_panel.current_meeting_id
+        assert meeting_id != ""
+        segs = ctrl.store.get_segments(meeting_id)
+        assert [s.raw_text for s in segs] == ["一段要整理成会议纪要的听写内容"]
+        # Dictation history still keeps the original session.
+        assert [s.session_id for s in store.list_sessions()] == ["dictation-1"]
+    finally:
+        win.close()
+        ctrl.shutdown()
+        store.close()
+

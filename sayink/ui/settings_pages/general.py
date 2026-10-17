@@ -306,15 +306,76 @@ def build_preferences_section(win) -> QWidget:
     return settings_section("偏好", card)
 
 
+def build_meeting_section(win) -> QWidget:
+    """「会议与识别」: meeting defaults (source, model, start card) plus the
+    recognition settings dictation shares with meetings (VAD, language,
+    glossary → ``stt.*``)."""
+    from sayink.speech_recognizer import MODEL_REGISTRY
+    from PyQt6.QtWidgets import QPlainTextEdit
+
+    card, lay = _card()
+    win._meeting_source_combo = QComboBox()
+    win._meeting_source_combo.setAccessibleName("会议音频来源")
+    for key, label in (("mixed", "混合（麦克风 + 电脑播放）"), ("microphone", "仅麦克风"), ("system", "仅电脑播放")):
+        win._meeting_source_combo.addItem(label, key)
+    win._meeting_source_combo.currentIndexChanged.connect(win._on_meeting_setting_changed)
+    lay.addWidget(labeled_row("默认音频来源", win._meeting_source_combo, "线下会议选麦克风；线上会议选混合"))
+    lay.addWidget(group_divider())
+
+    win._meeting_model_combo = QComboBox()
+    win._meeting_model_combo.setAccessibleName("会议识别模型")
+    win._meeting_model_combo.addItem("与听写相同", "")
+    for model in MODEL_REGISTRY:
+        win._meeting_model_combo.addItem(model["name"], model["id"])
+    win._meeting_model_combo.currentIndexChanged.connect(win._on_meeting_setting_changed)
+    lay.addWidget(labeled_row("会议识别模型", win._meeting_model_combo, "未下载的模型开会时会退回听写模型"))
+    lay.addWidget(group_divider())
+
+    win._meeting_vad_combo = QComboBox()
+    win._meeting_vad_combo.setAccessibleName("断句方式")
+    win._meeting_vad_combo.addItem("Silero VAD（需下载，更稳）", "silero")
+    win._meeting_vad_combo.addItem("能量断句", "energy")
+    win._meeting_vad_combo.currentIndexChanged.connect(win._on_meeting_setting_changed)
+    lay.addWidget(labeled_row("断句方式", win._meeting_vad_combo, "听写与会议共用；Silero 未下载时自动用能量断句"))
+    lay.addWidget(group_divider())
+
+    win._meeting_language_combo = QComboBox()
+    win._meeting_language_combo.setAccessibleName("识别语言")
+    for key, label in (("auto", "自动（中文优先）"), ("zh", "中文"), ("en", "English"), ("ja", "日本語")):
+        win._meeting_language_combo.addItem(label, key)
+    win._meeting_language_combo.currentIndexChanged.connect(win._on_meeting_setting_changed)
+    lay.addWidget(labeled_row("识别语言", win._meeting_language_combo, "听写与会议共用；支持的模型会按此语言识别"))
+    lay.addWidget(group_divider())
+
+    win._meeting_start_card_row = ToggleOptionRow(
+        "开始前显示会议信息卡",
+        "填写标题、参会人与议程；关闭后从托盘直接开始",
+    )
+    win._meeting_start_card_row.toggled.connect(win._on_meeting_setting_changed)
+    lay.addWidget(win._meeting_start_card_row)
+    lay.addWidget(group_divider())
+
+    win._meeting_glossary_edit = QPlainTextEdit()
+    win._meeting_glossary_edit.setAccessibleName("术语表")
+    win._meeting_glossary_edit.setPlaceholderText("每行一个术语，如：SayInk\n产品名、人名、缩写；支持热词的模型会在识别时优先采用")
+    win._meeting_glossary_edit.setFixedHeight(96)
+    win._meeting_glossary_edit.setTabChangesFocus(True)
+    win._paint_meeting_glossary_edit()
+    win._meeting_glossary_edit.textChanged.connect(win._on_meeting_glossary_changed)
+    lay.addWidget(stacked_field_row("术语表", win._meeting_glossary_edit, "听写与会议共用；最多 50 条，每条不超过 20 字"))
+    return settings_section("会议与识别", card)
+
+
 # ── Page ───────────────────────────────────────────────
 
 def build_general_page(win) -> QWidget:
-    """Prototype v3 layout: stacked 录音 → 音频 → 偏好 cards (top to bottom)."""
+    """Prototype v3 layout: stacked 录音 → 音频 → 会议 → 偏好 cards (top to bottom)."""
     page = SettingsPage()
     page.add(page_header("通用", "按你的习惯设置听写。更改会自动保存。"))
     page.add(build_recording_section(win))
     audio_section, (refresh_btn, reset_btn) = build_audio_section(win)
     page.add(audio_section)
+    page.add(build_meeting_section(win))
     page.add(build_preferences_section(win))
 
     win._general_footer_note = footnote(
@@ -346,6 +407,12 @@ def build_general_page(win) -> QWidget:
         win._system_device_combo,
         refresh_btn,
         reset_btn,
+        win._meeting_source_combo,
+        win._meeting_model_combo,
+        win._meeting_vad_combo,
+        win._meeting_language_combo,
+        win._meeting_start_card_row,
+        win._meeting_glossary_edit,
         win._theme_combo,
         win._auto_start_row,
         win._sound_row,

@@ -62,8 +62,76 @@ class TestWriteAndList:
         assert segs[0].raw_text == "今天天气很好"
         assert segs[1].raw_text == "我们去公园散步"
 
+    def test_enqueue_update_polished_preserves_raw_text(self, store):
+        store.enqueue(_record("s1", 0, raw_text="原始第一段", polished_text="", created_at=1000))
+        store.enqueue(_record("s1", 1, raw_text="原始第二段", polished_text="旧润色", created_at=2000))
+        store.enqueue(_record("s2", 0, raw_text="其他会话", polished_text="保持不变", created_at=3000))
+        store.flush(timeout=2.0)
+
+        store.enqueue_update_polished("s1", {0: "新润色第一段", 1: "新润色第二段"})
+        store.flush(timeout=2.0)
+
+        s1_segs = store.get_session_segments("s1")
+        assert [(r.seq, r.raw_text, r.polished_text) for r in s1_segs] == [
+            (0, "原始第一段", "新润色第一段"),
+            (1, "原始第二段", "新润色第二段"),
+        ]
+        s2_segs = store.get_session_segments("s2")
+        assert s2_segs[0].polished_text == "保持不变"
+
+    def test_enqueue_merge_sessions_combines_and_resequences_chronologically(self, store):
+        store.enqueue(_record("s_late", 0, raw_text="第三句", created_at=3000))
+        store.enqueue(_record("s_early", 0, raw_text="第一句", created_at=1000))
+        store.enqueue(_record("s_early", 1, raw_text="第二句", created_at=1500))
+        store.enqueue(_record("s_mid", 0, raw_text="中间句", created_at=2000))
+        store.enqueue(_record("s_other", 0, raw_text="无关句", created_at=2500))
+        store.flush(timeout=2.0)
+
+        store.enqueue_merge_sessions("s_early", ["s_late", "s_early", "s_mid"])
+        store.flush(timeout=2.0)
+
+        sessions = store.list_sessions(limit=10, offset=0)
+        assert [s.session_id for s in sessions] == ["s_other", "s_early"]
+        merged_summary = next(s for s in sessions if s.session_id == "s_early")
+        assert merged_summary.segment_count == 4
+        assert merged_summary.created_at == 1000
+
+        segs = store.get_session_segments("s_early")
+        assert [(r.seq, r.raw_text) for r in segs] == [
+            (0, "第一句"),
+            (1, "第二句"),
+            (2, "中间句"),
+            (3, "第三句"),
+        ]
+        assert store.get_session_segments("s_mid") == []
+        assert store.get_session_segments("s_late") == []
+
 
 class TestLikeSearch:
+    def test_search_preview_shows_the_matching_segment_and_version(self, store):
+        store.enqueue(_record("s1", 0, raw_text="开场白", created_at=1000))
+        store.enqueue(_record("s1", 1, raw_text="确认评审时间", polished_text="确认审核时间", created_at=2000))
+        store.enqueue(_record("s2", 0, raw_text="会议中的评审", trigger_mode="meeting", created_at=3000))
+        store.close(timeout=2.0)
+
+        raw_match = store.search_sessions("评审")
+        assert len(raw_match) == 1
+        assert raw_match[0].preview == "确认评审时间"
+        assert raw_match[0].segment_count == 2
+        assert raw_match[0].created_at == 1000
+        assert store.search_sessions("审核")[0].preview == "确认审核时间"
+        assert store.list_sessions()[0].preview == "开场白"
+
+    def test_count_includes_unloaded_sessions_and_excludes_meetings(self, store):
+        for index in range(60):
+            store.enqueue(_record(f"s{index}", 0, raw_text="听写", created_at=index + 1))
+        store.enqueue(_record("s0", 1, raw_text="第二段", created_at=1000))
+        store.enqueue(_record("meeting", 0, raw_text="会议", trigger_mode="meeting", created_at=2000))
+        store.close(timeout=2.0)
+
+        assert len(store.list_sessions()) == 50
+        assert store.count_sessions() == 60
+
     def test_chinese_substring_hits_two_char_words(self, store):
         # Unspaced Chinese sentence — LIKE must find 1–2 char substrings (ADR-0002).
         store.enqueue(

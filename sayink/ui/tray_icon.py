@@ -343,6 +343,9 @@ class TrayIcon(QSystemTrayIcon):
     model_switched = pyqtSignal(str)
     menu_about_to_show = pyqtSignal()
     menu_closed = pyqtSignal()
+    meeting_start_requested = pyqtSignal()
+    meeting_end_requested = pyqtSignal()
+    meetings_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -440,6 +443,14 @@ class TrayIcon(QSystemTrayIcon):
         history_action = menu.addAction("历史")
         history_action.triggered.connect(self.history_requested.emit)
 
+        menu.addSeparator()
+        self._meeting_toggle_action = menu.addAction("开始会议")
+        self._meeting_toggle_action.triggered.connect(self._on_meeting_toggle)
+        meetings_action = menu.addAction("会议记录")
+        meetings_action.triggered.connect(self.meetings_requested.emit)
+        self._meeting_in_progress = False
+        menu.addSeparator()
+
         self._model_menu = menu.addMenu("切换模型")
         _paint_menu(self._model_menu)
         empty = self._model_menu.addAction("加载中...")
@@ -457,6 +468,21 @@ class TrayIcon(QSystemTrayIcon):
         menu.aboutToShow.connect(self._on_menu_about_to_show)
         menu.aboutToHide.connect(self._on_menu_about_to_hide)
         self.setContextMenu(menu)
+
+    def _on_meeting_toggle(self) -> None:
+        if self._meeting_in_progress:
+            self.meeting_end_requested.emit()
+        else:
+            self.meeting_start_requested.emit()
+
+    def set_meeting_in_progress(self, active: bool) -> None:
+        """Flip the tray entry between 「开始会议」 and 「结束会议」."""
+        self._meeting_in_progress = bool(active)
+        self._meeting_toggle_action.setText("结束会议" if active else "开始会议")
+
+    @property
+    def meeting_in_progress(self) -> bool:
+        return self._meeting_in_progress
 
     def show_update_notice(self, body: str) -> None:
         """Tray balloon for a new version. Other notices clear this kind."""
@@ -625,6 +651,7 @@ class TrayIcon(QSystemTrayIcon):
             "polishing": "润色中",
             "listening": "正在听",
             "loading": "模型载入中",
+            "meeting": "会议记录中",
         }
         label = lines.get(state, "")
         if label:

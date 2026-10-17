@@ -24,8 +24,8 @@ def main_window(_qapp_session, tmp_path, monkeypatch):
 
 def test_keyboard_can_reach_navigation_and_search(main_window, _qapp_session):
     win = main_window
-    win._nav_buttons[2].setFocus()
-    QTest.keyClick(win._nav_buttons[2], Qt.Key.Key_Space)
+    win._nav_buttons[3].setFocus()
+    QTest.keyClick(win._nav_buttons[3], Qt.Key.Key_Space)
     assert win.current_page() == "engine"
     win._focus_history_search()
     _qapp_session.processEvents()
@@ -52,13 +52,16 @@ def test_tab_walks_the_general_page_top_to_bottom_then_back_to_the_current_nav(m
     win.setFocus()
     _qapp_session.processEvents()
 
-    stops = _tab_stops(win, _qapp_session, 17)
+    stops = _tab_stops(win, _qapp_session, 23)
     assert stops[:5] == ["通用", "按住说话", "录音快捷键", "Esc 结束持续转写", "仅麦克风"]
     assert "持续转写" not in stops and "仅电脑播放" not in stops
     assert stops[5:8] == ["测试声音（约 2 秒）", "恢复自动选择", "手动选择音频设备"]
-    assert stops[9:14] == ["开机时自动启动", "录音提示音", "只记录到历史，不粘贴", "粘贴后恢复剪贴板", "保存语音历史"]
-    assert stops[14:16] == ["历史保留天数", "最多保留会话数"]
-    assert stops[16] == "通用"
+    # 会议与识别 card sits between 音频 and 偏好; 断句/语言/术语表 are shared
+    # with dictation, so their names no longer say 会议.
+    assert stops[8:14] == ["会议音频来源", "会议识别模型", "断句方式", "识别语言", "开始前显示会议信息卡", "术语表"]
+    assert stops[15:20] == ["开机时自动启动", "录音提示音", "只记录到历史，不粘贴", "粘贴后恢复剪贴板", "保存语音历史"]
+    assert stops[20:22] == ["历史保留天数", "最多保留会话数"]
+    assert stops[22] == "通用"
 
 
 def test_tab_enters_radio_groups_on_the_checked_option(main_window, _qapp_session):
@@ -169,15 +172,28 @@ def test_radio_choices_support_arrow_keys(main_window, _qapp_session):
     assert settings._trigger_hotkey_rb.isChecked()
 
 
-def test_polish_disabled_removes_configuration_but_keeps_example(main_window):
+def test_polish_disabled_hides_prompt_but_keeps_connection_and_example(main_window):
     win = main_window._settings
     win._llm_enable_row.setChecked(True)
-    assert not win._llm_container.isHidden()
+    assert not win._llm_prompt_container.isHidden()
     win._llm_enable_row.setChecked(False)
-    assert win._llm_container.isHidden()
+    assert win._llm_prompt_container.isHidden()
+    # Meeting minutes use the same endpoint with polish off.
+    assert not win._llm_connection_section.isHidden()
     # The before/after example is what helps a user decide to enable it,
     # so it must be visible while the feature is still off.
     assert not win._llm_preview_card.isHidden()
+
+
+def test_meeting_configure_button_opens_ai_connection(main_window):
+    main_window.show_page("meeting")
+    settings = main_window._settings
+    settings._llm_url_edit.setText("https://api.deepseek.com/v1")
+    settings._llm_key_edit.clear()
+    main_window._open_ai_connection()
+    assert main_window.current_page() == "polish"
+    assert settings._pages.currentIndex() == 2
+    assert main_window._nav_buttons[4].isChecked()
 
 
 def test_audio_error_remains_inline_with_recovery(main_window, monkeypatch):
@@ -380,6 +396,23 @@ def test_listen_bar_stop_action_matches_session_state(_qapp_session):
         assert bar._end_btn.isHidden()
         bar.show_recording()
         assert bar._end_btn.isHidden()
+    finally:
+        bar.dismiss_if_idle()
+
+
+def test_meeting_bar_leaves_draining_state_when_meeting_ends(_qapp_session):
+    from sayink.ui.floating_window import FloatingWindow
+    bar = FloatingWindow()
+    try:
+        bar.show_meeting("00:27:37")
+        bar.show_meeting_paused("正在整理文字稿", title="会议结束中")
+        assert bar._status_label.text() == "会议结束中"
+        assert not bar._end_btn.isHidden()
+        bar.end_meeting_state()
+        assert bar._status_label.text() == "会议已结束"
+        assert "正在整理" not in bar._text_label.text()
+        assert bar._end_btn.isHidden() and bar._mark_btn.isHidden()
+        assert bar._hide_timer.isActive()
     finally:
         bar.dismiss_if_idle()
 

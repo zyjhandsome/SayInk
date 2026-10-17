@@ -21,6 +21,7 @@ from sayink.audio_devices import (
 )
 from sayink.audio_utils import (
     TARGET_SAMPLE_RATE,
+    LaneBalancer,
     StreamResampler,
     mix_to_mono,
     resample_mono,
@@ -28,7 +29,13 @@ from sayink.audio_utils import (
     to_mono,
 )
 from sayink.pawp_capture import decode_pawp_device_index, is_encoded_pawp_device_index
-from sayink.vad_segmenter import SpeechSegmenter
+from sayink.vad_segmenter import (
+    MEETING_MAX_SPEECH_SEC,
+    MEETING_SILENCE_HOLD_SEC,
+    VAD_ENERGY,
+    SpeechSegmenter,
+    make_speech_gate,
+)
 
 log = logging.getLogger("SayInk")
 
@@ -90,6 +97,15 @@ class AudioRecorder(QObject):
         self._block_mic_energy = 0.0
         self._block_system_energy = 0.0
         self._segment_route = ""
+        self._vad_kind = VAD_ENERGY
+        self._vad_model_path: str | None = None
+        self._meeting_profile = False
+        # Per-lane loudness balancing for mixed capture (every profile).
+        self._balancer: LaneBalancer | None = LaneBalancer()
+        # Wall-clock ms at which the block that opened the current utterance
+        # arrived; handed out with the segment (history.captured_at).
+        self._segment_started_at = 0
+        self._block_started_at = 0
 
     def configure(
         self,
@@ -100,8 +116,43 @@ class AudioRecorder(QObject):
         self._input_source = input_source
         self._mic_device_index = int(mic_device_index)
         self._system_device_index = int(system_device_index)
-        threshold = 0.0006 if input_source == INPUT_SOURCE_SYSTEM else 0.002
-        self._segmenter = SpeechSegmenter(speech_threshold=threshold)
+        self._rebuild_segmenter()
+
+    def set_segmenter_profile(
+        self,
+        *,
+        vad: str = VAD_ENERGY,
+        vad_model_path: str | None = None,
+        meeting: bool = False,
+    ) -> None:
+        """Pick the VAD and the pause lengths; meeting mode holds longer and
+        may use Silero (docs/meeting-notes-design.md §5.8)."""
+        self._vad_kind = vad or VAD_ENERGY
+        self._vad_model_path = str(vad_model_path) if vad_model_path else None
+        self._meeting_profile = bool(meeting)
+        # Mixed capture balances the two lanes in every profile: dictation
+        # listening to a call has the same quiet-remote-party problem.
+        self._balancer = LaneBalancer()
+        self._rebuild_segmenter()
+
+    def _rebuild_segmenter(self) -> None:
+        threshold = 0.0006 if self._input_source == INPUT_SOURCE_SYSTEM else 0.002
+        if self._meeting_profile:
+            segmenter = SpeechSegmenter(
+                speech_threshold=threshold,
+                silence_hold_sec=MEETING_SILENCE_HOLD_SEC,
+                max_speech_sec=MEETING_MAX_SPEECH_SEC,
+            )
+        else:
+            segmenter = SpeechSegmenter(speech_threshold=threshold)
+        gate = make_speech_gate(self._vad_kind, segmenter, model_path=self._vad_model_path)
+        segmenter.set_gate(gate)
+        self._segmenter = segmenter
+
+    @property
+    def vad_name(self) -> str:
+        """Which gate the segmenter is actually using (energy / silero)."""
+        return self._segmenter.gate_name
 
     @property
     def input_source(self) -> str:
@@ -359,6 +410,7 @@ class AudioRecorder(QObject):
             return None
 
         tracks: list[np.ndarray] = []
+        gains: list[float] = []
         mic_energy = 0.0
         system_energy = 0.0
         for lane, _raw, _last in drained:
@@ -372,6 +424,8 @@ class AudioRecorder(QObject):
             else:
                 mic_energy += energy
             tracks.append(track)
+            if self._balancer is not None:
+                gains.append(self._balancer.observe(lane.endpoint.role, track))
         self._block_mic_energy = mic_energy
         self._block_system_energy = system_energy
         if len(tracks) == 1:
@@ -379,6 +433,8 @@ class AudioRecorder(QObject):
             if track.size < take:
                 track = np.concatenate([track, np.zeros(take - track.size, dtype=np.float32)])
             return track
+        if self._balancer is not None and len(gains) == len(tracks):
+            return mix_to_mono(tracks, TARGET_SAMPLE_RATE, gains=gains)
         return mix_to_mono(tracks, TARGET_SAMPLE_RATE)
 
     def _reset_continuous_speech_watch(self) -> None:
@@ -530,19 +586,35 @@ class AudioRecorder(QObject):
         flushed = self._segmenter.flush()
         if flushed is not None and flushed.size > 0:
             log.debug("持续监听 flush 片段: %d 采样点", flushed.size)
+            self._block_started_at = self._segment_started_at
             self._emit_segment(flushed)
             emitted += 1
         return emitted
 
     def _feed_segmenter(self, block: np.ndarray) -> Optional[np.ndarray]:
-        return self._segmenter.feed(
+        segmenter = self._segmenter
+        was_in_speech = bool(getattr(segmenter, "in_speech", False))
+        now_ms = int(time.time() * 1000)
+        segment = segmenter.feed(
             block,
             mic_energy=self._block_mic_energy,
             system_energy=self._block_system_energy,
         )
+        in_speech = bool(getattr(segmenter, "in_speech", False))
+        if not was_in_speech and (segment is not None or in_speech):
+            # The gate opened inside this block; the utterance started about
+            # one block (plus pre-roll) before the block arrived.
+            self._segment_started_at = now_ms - int(self.CHUNK_DURATION * 1000)
+        if segment is not None:
+            self._block_started_at = self._segment_started_at
+            if in_speech:
+                # A carried tail already belongs to the next utterance.
+                self._segment_started_at = now_ms
+        return segment
 
     def _emit_segment(self, segment: np.ndarray) -> None:
         self._segment_route = self._segmenter.last_route
+        self._segment_captured_at = self._block_started_at or int(time.time() * 1000)
         self.segment_ready.emit(segment)
 
     def consume_segment_route(self) -> str:
@@ -550,6 +622,12 @@ class AudioRecorder(QObject):
         route = self._segment_route
         self._segment_route = ""
         return route
+
+    def consume_segment_captured_at(self) -> int:
+        """Wall-clock ms when the segment just emitted started (0 if unknown)."""
+        stamp = getattr(self, "_segment_captured_at", 0)
+        self._segment_captured_at = 0
+        return int(stamp or 0)
 
     def stop_continuous(self):
         if not self._continuous_mode and not self._is_recording:

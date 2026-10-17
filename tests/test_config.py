@@ -111,6 +111,53 @@ class TestConfigInit:
         assert Config(config_dir=config_home).get("stt.model_id") == "qwen3-asr-0.6b"
 
 
+class TestSharedRecognitionSettings:
+    """Glossary / language / VAD / speaker model are shared by dictation and
+    meetings, so they live under ``stt.*``; an older ``meeting.*`` layout is
+    moved there once on load."""
+
+    def test_defaults_live_under_stt(self):
+        stt = DEFAULT_CONFIG["stt"]
+        assert stt["glossary"] == []
+        assert stt["language"] == "auto"
+        assert stt["vad"] == "silero"
+        assert stt["speaker_model_enabled"] is True
+        for key in ("glossary", "language", "vad", "speaker_model_enabled"):
+            assert key not in DEFAULT_CONFIG["meeting"]
+
+    def test_legacy_meeting_keys_are_migrated_and_saved(self, config_home):
+        legacy = {
+            "meeting": {
+                "input_source": "microphone",
+                "glossary": [{"term": "SayInk"}],
+                "language": "en",
+                "vad": "energy",
+                "speaker_model_enabled": False,
+            }
+        }
+        with open(config_home / "config.json", "w", encoding="utf-8") as f:
+            json.dump(legacy, f)
+        config = Config(config_dir=config_home)
+        assert config.get("stt.glossary") == [{"term": "SayInk"}]
+        assert config.get("stt.language") == "en"
+        assert config.get("stt.vad") == "energy"
+        assert config.get("stt.speaker_model_enabled") is False
+        assert config.get("meeting.input_source") == "microphone"
+        assert config.get("meeting.glossary") is None
+        with open(config_home / "config.json", encoding="utf-8") as f:
+            on_disk = json.load(f)
+        assert on_disk["stt"]["language"] == "en"
+        assert "language" not in on_disk["meeting"]
+
+    def test_existing_stt_value_wins_over_legacy(self, config_home):
+        data = {"stt": {"language": "zh"}, "meeting": {"language": "en"}}
+        with open(config_home / "config.json", "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        config = Config(config_dir=config_home)
+        assert config.get("stt.language") == "zh"
+        assert config.get("meeting.language") is None
+
+
 class TestConfigGetSet:
     def test_get_nested_key(self, config):
         assert config.get("stt.model_id") == DEFAULT_MODEL_ID

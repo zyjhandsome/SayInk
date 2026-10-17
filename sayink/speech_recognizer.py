@@ -126,40 +126,62 @@ def _is_speech_char(ch: str) -> bool:
     )
 
 
+def _find_loop(core: str, start: int) -> tuple[int, int] | None:
+    """(unit length, repeats) of a loop beginning at core[start], if any."""
+    length = len(core)
+    for unit_len in range(1, _LOOP_MAX_UNIT + 1):
+        if start + unit_len * _LOOP_MIN_REPEATS > length:
+            return None
+        unit = core[start:start + unit_len]
+        # 100000000 / 8888 8888 are numbers, and "aaaa" is not an ASR loop.
+        if unit.isascii() and (unit_len < _LOOP_MIN_UNIT or unit.isdigit()):
+            continue
+        repeats = 1
+        cursor = start + unit_len
+        while core.startswith(unit, cursor):
+            repeats += 1
+            cursor += unit_len
+        if repeats >= _LOOP_MIN_REPEATS:
+            return unit_len, repeats
+    return None
+
+
 def _excise_repetition_loops(text: str) -> str:
-    """Drop a short token that the decoder emitted over and over."""
-    if len(text) < _LOOP_MIN_UNIT * _LOOP_MIN_REPEATS:
+    """Drop a short token or clause that the decoder emitted over and over.
+
+    Repeats are compared on speech characters only, so a loop whose last
+    copy ends in 。 instead of ， (他走了，× 7 + 他走了。) is still one loop.
+    """
+    positions = [i for i, ch in enumerate(text) if _is_speech_char(ch)]
+    if len(positions) < _LOOP_MIN_REPEATS:
         return text
-    kept: list[str] = []
-    index = 0
-    length = len(text)
-    while index < length:
-        cut_at = None
-        for unit_len in range(_LOOP_MIN_UNIT, _LOOP_MAX_UNIT + 1):
-            end = index + unit_len * _LOOP_MIN_REPEATS
-            if end > length:
-                continue
-            unit = text[index:index + unit_len]
-            if not any(_is_speech_char(ch) for ch in unit):
-                continue
-            repeats = 1
-            cursor = index + unit_len
-            while cursor + unit_len <= length and text[cursor:cursor + unit_len] == unit:
-                repeats += 1
-                cursor += unit_len
-            if repeats >= _LOOP_MIN_REPEATS:
-                cut_at = cursor
-                if len(set(unit)) == 1:
-                    # 哈哈哈…… / 对对对…… is laughter or emphasis, not a decoder
-                    # loop; keep a natural-sounding run instead of deleting it.
-                    kept.append(unit[0] * _SINGLE_CHAR_RUN_KEEP)
-                break
-        if cut_at is None:
-            kept.append(text[index])
-            index += 1
+    core = "".join(text[i] for i in positions)
+    pieces: list[str] = []
+    copied = 0
+    k = 0
+    while k < len(core):
+        found = _find_loop(core, k)
+        if found is None:
+            k += 1
+            continue
+        unit_len, repeats = found
+        unit = core[k:k + unit_len]
+        loop_end = k + unit_len * repeats
+        start = positions[k]
+        end = positions[loop_end - 1] + 1
+        pieces.append(text[copied:start])
+        if len(set(unit)) == 1:
+            # 哈哈哈…… / 对对对…… is laughter or emphasis, not a decoder
+            # loop; keep a natural-sounding run instead of deleting it.
+            pieces.append(unit[0] * _SINGLE_CHAR_RUN_KEEP)
         else:
-            index = cut_at
-    return "".join(kept)
+            next_speech = positions[loop_end] if loop_end < len(positions) else len(text)
+            while end < next_speech and not text[end].isspace():
+                end += 1
+        copied = end
+        k = loop_end
+    pieces.append(text[copied:])
+    return "".join(pieces)
 
 
 def _is_unrelated_foreign_sentence(sentence: str) -> bool:
@@ -361,6 +383,13 @@ def download_endpoints(source: str) -> tuple[str, ...]:
     return DOWNLOAD_SOURCES.get(source or DOWNLOAD_SOURCE_AUTO, DOWNLOAD_SOURCES[DOWNLOAD_SOURCE_AUTO])
 
 # ── Model Registry ────────────────────────────────────────────────
+#
+# ``supports`` lists the per-model knobs the meeting mode can use
+# (docs/meeting-notes-design.md §5.8): "hotwords" (glossary injected into the
+# decoder prompt) and "language" (lock the transcription language).
+
+SUPPORTS_HOTWORDS = "hotwords"
+SUPPORTS_LANGUAGE = "language"
 
 MODEL_REGISTRY = [
     {
@@ -375,6 +404,7 @@ MODEL_REGISTRY = [
         "hf_repo": "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
         "dir_name": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
         "files": ["model.int8.onnx", "tokens.txt"],
+        "supports": (SUPPORTS_LANGUAGE,),
     },
     {
         "id": "paraformer-zh",
@@ -460,6 +490,7 @@ MODEL_REGISTRY = [
             "tokenizer/merges.txt",
             "tokenizer/tokenizer_config.json",
         ],
+        "supports": (SUPPORTS_HOTWORDS,),
     },
     {
         "id": "qwen3-asr-1.7b",
@@ -480,6 +511,7 @@ MODEL_REGISTRY = [
             "tokenizer/merges.txt",
             "tokenizer/tokenizer_config.json",
         ],
+        "supports": (SUPPORTS_HOTWORDS,),
     },
     {
         "id": "funasr-nano",
@@ -500,6 +532,38 @@ MODEL_REGISTRY = [
             "Qwen3-0.6B/merges.txt",
             "Qwen3-0.6B/tokenizer.json",
         ],
+        "supports": (SUPPORTS_HOTWORDS, SUPPORTS_LANGUAGE),
+    },
+]
+
+# Auxiliary models used by the meeting mode (not speech recognizers; never
+# offered as the STT model). They share the download / storage machinery.
+AUX_MODEL_SPEAKER = "speaker-campplus"
+AUX_MODEL_SILERO_VAD = "silero-vad"
+AUX_MODEL_REGISTRY = [
+    {
+        "id": AUX_MODEL_SPEAKER,
+        "name": "说话人嵌入 CAM++",
+        "description": "3D-Speaker CAM++ 中英声纹模型，会议中区分说话人",
+        "languages": "中/英",
+        "size_mb": 28,
+        "loader": "speaker_embedding",
+        "hf_repo": "csukuangfj/speaker-embedding-models",
+        "dir_name": "3dspeaker-campplus-zh-en",
+        "files": ["3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"],
+        "aux": True,
+    },
+    {
+        "id": AUX_MODEL_SILERO_VAD,
+        "name": "Silero VAD",
+        "description": "神经网络语音活动检测，会议中更稳的断句",
+        "languages": "通用",
+        "size_mb": 2,
+        "loader": "silero_vad",
+        "hf_repo": "csukuangfj/vad",
+        "dir_name": "silero-vad",
+        "files": ["silero_vad.onnx"],
+        "aux": True,
     },
 ]
 
@@ -508,7 +572,79 @@ def get_model_info(model_id: str) -> dict | None:
     for m in MODEL_REGISTRY:
         if m["id"] == model_id:
             return m
+    for m in AUX_MODEL_REGISTRY:
+        if m["id"] == model_id:
+            return m
     return None
+
+
+def is_aux_model(model_id: str) -> bool:
+    info = get_model_info(model_id)
+    return bool(info and info.get("aux"))
+
+
+def model_supports(model_id: str, feature: str) -> bool:
+    info = get_model_info(model_id)
+    return bool(info and feature in info.get("supports", ()))
+
+
+# Fun-ASR-Nano takes a language *name* that is spliced into its prompt
+# (「语音转写：中文」); SenseVoice takes an ISO-ish code.
+_FUNASR_NANO_LANGUAGE_NAMES = {"zh": "中文", "en": "英文", "ja": "日文", "yue": "粤语"}
+_SENSE_VOICE_LANGUAGE_CODES = {"zh": "zh", "en": "en", "ja": "ja", "ko": "ko", "yue": "yue"}
+
+
+def language_argument(model_id: str, language: str) -> str:
+    """Translate a config language ('auto'/'zh'/'en'/…) to the loader's value;
+    empty string when the model takes none or the language is 'auto'."""
+    code = (language or "").strip().lower()
+    if code in ("", "auto"):
+        return ""
+    info = get_model_info(model_id)
+    if not info:
+        return ""
+    loader = info.get("loader", "")
+    if loader == "funasr_nano":
+        return _FUNASR_NANO_LANGUAGE_NAMES.get(code, "")
+    if loader == "sense_voice":
+        return _SENSE_VOICE_LANGUAGE_CODES.get(code, "")
+    return ""
+
+
+def effective_language(language: str) -> str:
+    """The config language with 「auto」 resolved: Chinese first, for dictation
+    and meetings alike (both must agree or a meeting start reloads the model)."""
+    code = (language or "").strip().lower()
+    return "zh" if code in ("", "auto") else code
+
+
+def recognition_params(config) -> tuple[str, str]:
+    """``(hotwords, language)`` for :meth:`SpeechRecognizer.configure` from the
+    shared ``stt.glossary`` / ``stt.language`` settings."""
+    glossary = config.get("stt.glossary", []) or []
+    return format_hotwords(glossary), effective_language(str(config.get("stt.language", "auto") or "auto"))
+
+
+MAX_HOTWORDS = 50
+MAX_HOTWORD_CHARS = 20
+
+
+def format_hotwords(glossary) -> str:
+    """Glossary entries (``{"term": ..., "variants": [...]}`` or plain strings)
+    → the comma-separated hotword string Fun-ASR-Nano / Qwen3-ASR expect.
+
+    Only the canonical term goes in: a hotword nudges the decoder towards that
+    spelling, so listing the mis-heard variants would make them likelier."""
+    seen: list[str] = []
+    for entry in glossary or ():
+        term = entry.get("term", "") if isinstance(entry, dict) else entry
+        term = str(term or "").strip().replace(",", " ").replace("，", " ")
+        if not term or len(term) > MAX_HOTWORD_CHARS or term in seen:
+            continue
+        seen.append(term)
+        if len(seen) >= MAX_HOTWORDS:
+            break
+    return ",".join(seen)
 
 
 _custom_models_dir: Path | None = None
@@ -811,12 +947,17 @@ class ModelDownloadWorker(QThread):
             self.error.emit(f"下载失败: {e}{hint}")
 
 
-def _create_recognizer(model_id: str, num_threads: int):
-    """Create a sherpa_onnx.OfflineRecognizer for the given model."""
+def _create_recognizer(model_id: str, num_threads: int, *, hotwords: str = "", language: str = ""):
+    """Create a sherpa_onnx.OfflineRecognizer for the given model.
+
+    ``hotwords`` / ``language`` are applied only to loaders that take them
+    (see ``supports`` in the registry); ``language`` is already the loader's
+    own value (see :func:`language_argument`).
+    """
     import sherpa_onnx
 
     info = get_model_info(model_id)
-    if not info:
+    if not info or info.get("aux"):
         raise ValueError(f"未知模型: {model_id}")
 
     model_dir = get_model_dir(model_id)
@@ -827,6 +968,7 @@ def _create_recognizer(model_id: str, num_threads: int):
             model=str(model_dir / "model.int8.onnx"),
             tokens=str(model_dir / "tokens.txt"),
             num_threads=num_threads,
+            language=language,
             use_itn=True,
             debug=False,
         )
@@ -866,6 +1008,7 @@ def _create_recognizer(model_id: str, num_threads: int):
             decoder=str(model_dir / "decoder.int8.onnx"),
             tokenizer=str(model_dir / "tokenizer"),
             num_threads=num_threads,
+            hotwords=hotwords,
             debug=False,
         )
     elif loader == "funasr_nano":
@@ -875,10 +1018,16 @@ def _create_recognizer(model_id: str, num_threads: int):
             embedding=str(model_dir / "embedding.int8.onnx"),
             tokenizer=str(model_dir / "Qwen3-0.6B"),
             num_threads=num_threads,
+            language=language,
+            hotwords=hotwords,
             debug=False,
         )
     else:
         raise ValueError(f"不支持的 loader: {loader}")
+
+
+# (model_id, num_threads, hotwords, language): what a loaded recognizer was built from.
+LoadTarget = tuple[str, int, str, str]
 
 
 class ModelLoadWorker(QThread):
@@ -886,17 +1035,22 @@ class ModelLoadWorker(QThread):
     loaded = pyqtSignal(object)
     error = pyqtSignal(str)
 
-    def __init__(self, model_id: str, num_threads: int = 4):
+    def __init__(self, model_id: str, num_threads: int = 4, *, hotwords: str = "", language: str = ""):
         super().__init__()
         self._model_id = model_id
         self._num_threads = num_threads
+        self._hotwords = hotwords
+        self._language = language
 
     def run(self):
         try:
             info = get_model_info(self._model_id)
             name = info["name"] if info else self._model_id
             log.info("正在加载语音识别模型 (%s)...", name)
-            recognizer = _create_recognizer(self._model_id, self._num_threads)
+            recognizer = _create_recognizer(
+                self._model_id, self._num_threads,
+                hotwords=self._hotwords, language=self._language,
+            )
             log.info("语音识别模型加载完成: %s", name)
             self.loaded.emit(recognizer)
         except Exception as e:
@@ -1002,40 +1156,51 @@ class SpeechRecognizer(QObject):
         self._current_worker = None
         self._load_worker = None
         self._reload_after_current = False
-        self._loaded_target: tuple[str, int] | None = None
+        self._loaded_target: LoadTarget | None = None
         self._is_ready = False
         self._model_id = ""
         self._num_threads = 4
+        self._hotwords = ""
+        self._language = ""
         # Monotonic request id: results from superseded/cancelled workers are
         # ignored instead of force-terminating C++/ONNX threads (see SD-05).
         self._request_seq = 0
         self._active_seq = 0
         self._workers: list[TranscribeWorker] = []
 
-    def configure(self, model_id: str, num_threads: int = 4):
+    def _target(self) -> LoadTarget:
+        return (self._model_id, self._num_threads, self._hotwords, self._language)
+
+    def configure(
+        self,
+        model_id: str,
+        num_threads: int = 4,
+        *,
+        hotwords: str = "",
+        language: str = "",
+    ):
+        """Load ``model_id``; ``hotwords`` / ``language`` are silently dropped
+        for models that do not take them (so the same call works for all)."""
         if not model_id:
             log.warning("未选择语音模型")
             return
 
-        if (
-            model_id == self._model_id
-            and num_threads == self._num_threads
-            and self._is_ready
-            and self._recognizer is not None
-        ):
+        if not model_supports(model_id, SUPPORTS_HOTWORDS):
+            hotwords = ""
+        if not model_supports(model_id, SUPPORTS_LANGUAGE):
+            language = ""
+        language = language_argument(model_id, language) if language else ""
+        wanted: LoadTarget = (model_id, num_threads, hotwords or "", language)
+
+        if wanted == self._target() and self._is_ready and self._recognizer is not None:
             log.debug("语音模型已驻留内存，跳过重复加载: %s", model_id)
             return
 
-        if (
-            model_id == self._model_id
-            and num_threads == self._num_threads
-            and self.is_loading
-        ):
+        if wanted == self._target() and self.is_loading:
             log.debug("语音模型正在加载中，跳过重复请求: %s", model_id)
             return
 
-        self._num_threads = num_threads
-        self._model_id = model_id
+        self._model_id, self._num_threads, self._hotwords, self._language = wanted
 
         if is_model_downloaded(model_id):
             self._load_model()
@@ -1053,28 +1218,31 @@ class SpeechRecognizer(QObject):
         self._is_ready = False
         self._reload_after_current = False
         self.model_load_progress.emit(ModelLoadPhase.LOADING, f"正在加载 {name}…")
-        worker = ModelLoadWorker(self._model_id, self._num_threads)
-        target = (self._model_id, self._num_threads)
+        worker = ModelLoadWorker(
+            self._model_id, self._num_threads,
+            hotwords=self._hotwords, language=self._language,
+        )
+        target = self._target()
         worker.loaded.connect(lambda rec, t=target: self._on_model_loaded(rec, t))
         worker.error.connect(lambda msg, t=target: self._on_model_load_error(msg, t))
         worker.finished.connect(self._on_load_worker_finished)
         self._load_worker = worker
         worker.start()
 
-    def _is_current_target(self, target: tuple[str, int] | None) -> bool:
-        return target is None or target == (self._model_id, self._num_threads)
+    def _is_current_target(self, target: LoadTarget | None) -> bool:
+        return target is None or target == self._target()
 
-    def _on_model_loaded(self, recognizer, target: tuple[str, int] | None = None):
+    def _on_model_loaded(self, recognizer, target: LoadTarget | None = None):
         if not self._is_current_target(target):
             log.info("丢弃已过时的模型加载结果: %s", target[0])
             return
         self._recognizer = recognizer
-        self._loaded_target = (self._model_id, self._num_threads)
+        self._loaded_target = self._target()
         self._is_ready = True
         self.model_load_progress.emit(ModelLoadPhase.READY, "模型已就绪")
         self.ready.emit()
 
-    def _on_model_load_error(self, msg: str, target: tuple[str, int] | None = None):
+    def _on_model_load_error(self, msg: str, target: LoadTarget | None = None):
         if not self._is_current_target(target):
             log.info("忽略已过时的模型加载错误: %s", msg)
             return
@@ -1090,8 +1258,7 @@ class SpeechRecognizer(QObject):
         if not self._reload_after_current:
             return
         self._reload_after_current = False
-        current = (self._model_id, self._num_threads)
-        if self._is_ready and self._loaded_target == current:
+        if self._is_ready and self._loaded_target == self._target():
             return
         if is_model_downloaded(self._model_id):
             self._load_model()
@@ -1190,3 +1357,11 @@ class SpeechRecognizer(QObject):
     @property
     def current_model_id(self) -> str:
         return self._model_id
+
+    @property
+    def current_hotwords(self) -> str:
+        return self._hotwords
+
+    @property
+    def current_language(self) -> str:
+        return self._language

@@ -165,10 +165,16 @@ class FloatingWindow(QWidget):
     continuous_stop_requested = pyqtSignal()
     settings_requested = pyqtSignal()
     history_requested = pyqtSignal()
+    # Meeting state: 「标记」 button and a click on the bar body.
+    meeting_mark_requested = pyqtSignal()
+    meeting_open_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._listening_active = False
+        self._meeting_active = False
+        self._meeting_elapsed = "00:00:00"
+        self._meeting_paused_detail = ""
         self._capture_active = False
         # Set by end_capture() once the hold key is up; cleared by show_recording().
         self._capture_released = False
@@ -243,6 +249,7 @@ class FloatingWindow(QWidget):
                 background: {tok.PRIMARY_CONTAINER_PRESSED};
             }}
         """)
+        self._mark_btn.setStyleSheet(self._end_btn.styleSheet())
         self._text_label.setFont(_ui_font(tok.UI_FONT_FAMILY, tok.TYPE_BODY_SM))
         self._text_label.setStyleSheet(
             f"color: {tok.FLOAT_TEXT}; background: transparent;"
@@ -307,6 +314,16 @@ class FloatingWindow(QWidget):
         self._end_btn.setToolTip("结束整场监听 · Esc")
         self._end_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._end_btn.clicked.connect(self._on_end_clicked)
+        self._mark_btn = QPushButton("标记")
+        self._mark_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._mark_btn.setFixedHeight(30)
+        self._mark_btn.setMinimumWidth(56)
+        self._mark_btn.setAccessibleName("标记会议时刻")
+        self._mark_btn.setToolTip("记下当前时刻，纪要会重点覆盖")
+        self._mark_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._mark_btn.clicked.connect(self.meeting_mark_requested.emit)
+        self._mark_btn.hide()
+        header_row.addWidget(self._mark_btn)
         header_row.addWidget(self._end_btn)
         container_layout.addLayout(header_row)
 
@@ -369,8 +386,71 @@ class FloatingWindow(QWidget):
     def _present(self) -> None:
         self._hide_timer.stop()
         self._end_btn.setVisible(self._listening_active)
+        self._mark_btn.setVisible(self._meeting_active)
         self._position_on_screen()
         self.show()
+
+    # ── Meeting state ─────────────────────────────────────
+
+    @property
+    def meeting_active(self) -> bool:
+        return self._meeting_active
+
+    def show_meeting(self, elapsed: str | None = None, detail: str = "") -> None:
+        """Red-dot meeting bar: 「会议中 · hh:mm:ss」 + 标记 + 结束."""
+        if elapsed is not None:
+            self._meeting_elapsed = elapsed
+        self._meeting_active = True
+        self._meeting_paused_detail = ""
+        self._model_loading_active = False
+        self._listening_active = True
+        self._capture_active = False
+        self._capture_released = False
+        self._end_btn.setAccessibleName("结束会议")
+        self._end_btn.setToolTip("结束会议并整理文字稿")
+        self._set_state(f"会议中 · {self._meeting_elapsed}", "STATE_RECORD", pulse=True)
+        self.unsetCursor()
+        self._waveform.set_compact(True)
+        self._waveform.show()
+        self._waveform.start()
+        if detail:
+            self._apply_excerpt(detail)
+        elif self._live_text:
+            self._apply_excerpt(self._live_text, keep_tail=True)
+        else:
+            self._apply_excerpt("点此打开会议页 · 停顿后出字")
+        self._present()
+
+    def update_meeting_clock(self, elapsed: str) -> None:
+        self._meeting_elapsed = elapsed
+        if not self._meeting_active:
+            return
+        current = self._status_label.text()
+        _prefix, sep, rest = current.partition(" · ")
+        # Only the clock changes; other feedback (「正在听 · 已记录」) keeps its text.
+        if current.startswith("会议中") and sep and rest.count(":") == 2 and len(rest) == 8:
+            self._status_label.setText(f"会议中 · {elapsed}")
+
+    def show_meeting_paused(self, detail: str = "", *, title: str = "会议已暂停") -> None:
+        self._meeting_active = True
+        self._listening_active = True
+        self._meeting_paused_detail = detail
+        self._set_state(title, "STATE_WARN", pulse=False)
+        self._waveform.stop()
+        self._waveform.hide()
+        self._apply_excerpt(detail or "采集已暂停，可在会议页继续或结束")
+        self._present()
+
+    def end_meeting_state(self) -> None:
+        self._meeting_active = False
+        self._meeting_paused_detail = ""
+        self._listening_active = False
+        self._capture_active = False
+        self._end_btn.setAccessibleName("结束持续转写")
+        self._end_btn.setToolTip("结束整场监听 · Esc")
+        self._mark_btn.hide()
+        self._live_text = ""
+        self.show_success("会议已结束", "可到「会议」页生成纪要")
 
     def _set_state(self, text: str, color: str, pulse: bool = False):
         self._state_token = color
@@ -445,6 +525,12 @@ class FloatingWindow(QWidget):
         self._set_mode("compact")
 
     def show_listening(self):
+        if self._meeting_active:
+            if self._meeting_paused_detail:
+                self.show_meeting_paused(self._meeting_paused_detail)
+            else:
+                self.show_meeting()
+            return
         self._model_loading_active = False
         self._listening_active = True
         self._capture_active = False
@@ -540,6 +626,10 @@ class FloatingWindow(QWidget):
         self._present()
 
     def dismiss_if_idle(self):
+        if self._meeting_active:
+            # The meeting bar stays up for the whole meeting.
+            self.show_listening()
+            return
         self._model_loading_active = False
         self._listening_active = False
         self._capture_active = False
@@ -769,3 +859,5 @@ class FloatingWindow(QWidget):
 
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
+        if self._meeting_active and event.button() == Qt.MouseButton.LeftButton:
+            self.meeting_open_requested.emit()

@@ -303,6 +303,142 @@ def test_backlog_over_limit_pauses_listening_without_dropping_audio() -> None:
         assert "暂停监听" in h["floating"].show_continuous_stopped.call_args[0][0]
 
 
+class TestDictationSharesMeetingSpeakerStack:
+    """持续转写 labels speakers with the meeting stack (embedder thresholds,
+    continuity prior) and re-clusters once the session has fully drained."""
+
+    def test_new_session_uses_embedder_thresholds_and_sticky_prior(self) -> None:
+        from sayink.speaker_embedding import STICKY_GAP_MS
+
+        with app_harness({"audio.trigger_mode": "continuous"}) as h:
+            app = h["app"]
+            embedder = app._speaker_embedder()
+            session = app._new_speaker_session()
+            assert session._threshold == embedder.threshold
+            assert session._sticky_threshold == embedder.sticky_threshold
+            assert session._sticky_gap_ms == STICKY_GAP_MS
+            assert session.history == []  # keep_history=True
+            assert app._speaker_embedder() is embedder  # cached
+
+    def test_stop_with_nothing_pending_reclusters_and_relabels_history(self) -> None:
+        from unittest.mock import MagicMock
+
+        with app_harness({"audio.trigger_mode": "continuous"}) as h:
+            app, recorder = h["app"], h["recorder"]
+            _start_continuous_user_session(app)
+            recorder.is_continuous = True
+            recorder.stop_continuous.side_effect = lambda: setattr(recorder, "is_continuous", False)
+            # An empty session has no id and nothing to renumber.
+            with patch("sayink.app.recluster") as rc:
+                app._stop_continuous_user_session()
+            rc.assert_not_called()
+
+            _start_continuous_user_session(app)
+            recorder.is_continuous = True
+            _drive_segment(app, h["paster"], "第一句")
+            session_id = app._current_session_id
+            assert session_id
+            fake = MagicMock(speaker_count=3, history=[("h", 1)])
+            app._speakers = fake
+            with patch("sayink.app.recluster", return_value={1: 1, 2: 1, 3: 2}) as rc:
+                app._stop_continuous_user_session()
+            rc.assert_called_once_with(fake.history, threshold=app._speaker_embedder().recluster_threshold)
+            h["history"].relabel_session_speakers.assert_called_once_with(session_id, {1: 1, 2: 1, 3: 2})
+            # Once per session: a second stop/drain does not renumber again.
+            with patch("sayink.app.recluster", return_value={1: 2, 2: 1, 3: 3}):
+                app._maybe_finish_dictation_speakers()
+            assert h["history"].relabel_session_speakers.call_count == 1
+
+    def test_recluster_waits_for_the_last_queued_segment(self) -> None:
+        from unittest.mock import MagicMock
+
+        with app_harness({"audio.trigger_mode": "continuous"}) as h:
+            app, recorder, paster = h["app"], h["recorder"], h["paster"]
+            recorder.consume_segment_route.return_value = ""
+            _start_continuous_user_session(app)
+            recorder.is_continuous = True
+            recorder.stop_continuous.side_effect = lambda: setattr(recorder, "is_continuous", False)
+            callback = _begin_and_finish_asr(app, paster, "第一句")
+            session_id = app._current_session_id
+            app._speakers = MagicMock(speaker_count=2, history=[])
+            with patch("sayink.app.recluster", return_value={1: 1, 2: 1}):
+                app._stop_continuous_user_session()
+                h["history"].relabel_session_speakers.assert_not_called()
+                callback("pasted")
+            h["history"].relabel_session_speakers.assert_called_once_with(session_id, {1: 1, 2: 1})
+
+    def test_single_speaker_or_identity_mapping_skips_relabel(self) -> None:
+        from unittest.mock import MagicMock
+
+        with app_harness({"audio.trigger_mode": "continuous"}) as h:
+            app, recorder = h["app"], h["recorder"]
+            _start_continuous_user_session(app)
+            recorder.is_continuous = True
+            recorder.stop_continuous.side_effect = lambda: setattr(recorder, "is_continuous", False)
+            _drive_segment(app, h["paster"], "一")
+            app._speakers = MagicMock(speaker_count=1, history=[])
+            with patch("sayink.app.recluster") as rc:
+                app._stop_continuous_user_session()
+            rc.assert_not_called()
+            h["history"].relabel_session_speakers.assert_not_called()
+
+            _start_continuous_user_session(app)
+            recorder.is_continuous = True
+            _drive_segment(app, h["paster"], "二")
+            app._speakers = MagicMock(speaker_count=2, history=[])
+            with patch("sayink.app.recluster", return_value={1: 1, 2: 2}):
+                app._stop_continuous_user_session()
+            h["history"].relabel_session_speakers.assert_not_called()
+
+
+class TestDictationSharesRecognitionSettings:
+    """stt.glossary / stt.language / stt.vad drive dictation exactly as they
+    drive meetings, so a meeting start never has to reload the model."""
+
+    def test_configure_stt_passes_shared_hotwords_and_language(self) -> None:
+        overrides = {"stt.glossary": [{"term": "SayInk"}, {"term": "张鑫"}], "stt.language": "en"}
+        with app_harness(overrides) as h:
+            app = h["app"]
+            h["recognizer"].configure.reset_mock()
+            app._configure_stt()
+            kwargs = h["recognizer"].configure.call_args.kwargs
+            assert kwargs == {"hotwords": "SayInk,张鑫", "language": "en"}
+
+    def test_dictation_segmenter_uses_silero_when_downloaded(self) -> None:
+        with app_harness({"stt.vad": "silero"}) as h:
+            app = h["app"]
+            with patch("sayink.app.aux_model_path", return_value="C:/models/silero_vad.onnx"):
+                app._apply_dictation_segmenter_profile()
+            h["recorder"].set_segmenter_profile.assert_called_with(
+                vad="silero", vad_model_path="C:/models/silero_vad.onnx", meeting=False
+            )
+
+    def test_dictation_segmenter_falls_back_to_energy_without_model(self) -> None:
+        with app_harness({"stt.vad": "silero"}) as h:
+            app = h["app"]
+            with patch("sayink.app.aux_model_path", return_value=None):
+                app._apply_dictation_segmenter_profile()
+            h["recorder"].set_segmenter_profile.assert_called_with(vad="energy", vad_model_path=None, meeting=False)
+
+        with app_harness({"stt.vad": "energy"}) as h:
+            app = h["app"]
+            with patch("sayink.app.aux_model_path") as path:
+                app._apply_dictation_segmenter_profile()
+            path.assert_not_called()
+            h["recorder"].set_segmenter_profile.assert_called_with(vad="energy", vad_model_path=None, meeting=False)
+
+    def test_recognition_settings_change_rebuilds_embedder_and_reconfigures(self) -> None:
+        with app_harness() as h:
+            app = h["app"]
+            before = app._speaker_embedder()
+            h["recognizer"].configure.reset_mock()
+            h["recorder"].set_segmenter_profile.reset_mock()
+            app._on_recognition_settings_changed()
+            h["recognizer"].configure.assert_called_once()
+            h["recorder"].set_segmenter_profile.assert_called_once()
+            assert app._speaker_embedder() is not before
+
+
 def test_history_commit_refreshes_open_main_window() -> None:
     from PyQt6.QtWidgets import QApplication
     from unittest.mock import MagicMock

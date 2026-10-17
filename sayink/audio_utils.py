@@ -107,26 +107,101 @@ def rms_volume(audio: np.ndarray) -> float:
     return float(np.sqrt(np.mean(mono ** 2)))
 
 
-def mix_to_mono(tracks: list[np.ndarray], sample_rate: int = TARGET_SAMPLE_RATE) -> np.ndarray:
-    """Resample each track to sample_rate, align length, and mix with headroom."""
+def mix_to_mono(
+    tracks: list[np.ndarray],
+    sample_rate: int = TARGET_SAMPLE_RATE,
+    *,
+    gains: list[float] | None = None,
+) -> np.ndarray:
+    """Resample each track to sample_rate, align length, and mix with headroom.
+
+    Without ``gains`` the tracks are averaged (dictation behaviour). With
+    ``gains`` (one per track, from :class:`LaneBalancer`) each track is scaled
+    and the tracks are *summed*: a lane that is quiet because nobody on it is
+    talking must not halve the lane that is, which is what averaging did to
+    mixed-capture meetings.
+    """
     if not tracks:
         return np.array([], dtype=np.float32)
-    resampled = [resample_mono(t, sample_rate, sample_rate) for t in tracks if t is not None and t.size > 0]
-    if not resampled:
+    pairs = [
+        (resample_mono(t, sample_rate, sample_rate), (gains[i] if gains and i < len(gains) else 1.0))
+        for i, t in enumerate(tracks)
+        if t is not None and t.size > 0
+    ]
+    if not pairs:
         return np.array([], dtype=np.float32)
-    max_len = max(t.shape[0] for t in resampled)
-    padded = []
-    for t in resampled:
-        if t.shape[0] < max_len:
-            pad = np.zeros(max_len - t.shape[0], dtype=np.float32)
-            padded.append(np.concatenate([t, pad]))
-        else:
-            padded.append(t[:max_len])
+    max_len = max(t.shape[0] for t, _g in pairs)
     mixed = np.zeros(max_len, dtype=np.float32)
-    scale = 1.0 / len(padded)
-    for t in padded:
-        mixed += t * scale
+    scale = 1.0 if gains else 1.0 / len(pairs)
+    for t, gain in pairs:
+        if t.shape[0] < max_len:
+            t = np.concatenate([t, np.zeros(max_len - t.shape[0], dtype=np.float32)])
+        else:
+            t = t[:max_len]
+        mixed += t * (scale * float(gain))
     peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
     if peak > 1.0:
         mixed = (mixed / peak).astype(np.float32)
     return mixed
+
+
+# Speech below this RMS is treated as "nobody talking on this lane": its
+# level is not learned, so the gain never chases room noise upward.
+BALANCE_SPEECH_RMS = 0.004
+# Lanes are pulled toward this RMS (a comfortable speech level); the gain is
+# clamped so a bad level estimate cannot blow up or mute a lane.
+BALANCE_TARGET_RMS = 0.05
+BALANCE_MAX_GAIN = 4.0
+BALANCE_MIN_GAIN = 0.25
+# How fast a lane's learned level follows new loud blocks (0..1 per block).
+BALANCE_LEVEL_ALPHA = 0.1
+
+
+class LaneBalancer:
+    """Slow per-lane loudness tracker for mixed capture (mic + loopback).
+
+    A remote caller through the speakers and the user at the mic rarely come
+    in at the same level; the quieter one got half the headroom and worse ASR.
+    Each lane's speech RMS is tracked with an exponential average over blocks
+    that actually contain speech, and the gain that would bring that level to
+    ``BALANCE_TARGET_RMS`` is applied, clamped to [1/4, 4].
+    """
+
+    def __init__(
+        self,
+        *,
+        target_rms: float = BALANCE_TARGET_RMS,
+        max_gain: float = BALANCE_MAX_GAIN,
+        min_gain: float = BALANCE_MIN_GAIN,
+        speech_rms: float = BALANCE_SPEECH_RMS,
+        alpha: float = BALANCE_LEVEL_ALPHA,
+    ):
+        self._target = float(target_rms)
+        self._max = float(max_gain)
+        self._min = float(min_gain)
+        self._speech = float(speech_rms)
+        self._alpha = float(alpha)
+        self._levels: dict[str, float] = {}
+
+    def reset(self) -> None:
+        self._levels.clear()
+
+    def level(self, lane: str) -> float:
+        return self._levels.get(lane, 0.0)
+
+    def observe(self, lane: str, block: np.ndarray) -> float:
+        """Learn from one block and return the gain to apply to it."""
+        rms = rms_volume(block)
+        if rms >= self._speech:
+            previous = self._levels.get(lane)
+            if previous is None:
+                self._levels[lane] = rms
+            else:
+                self._levels[lane] = previous + self._alpha * (rms - previous)
+        return self.gain(lane)
+
+    def gain(self, lane: str) -> float:
+        level = self._levels.get(lane, 0.0)
+        if level <= 0.0:
+            return 1.0
+        return float(min(self._max, max(self._min, self._target / level)))

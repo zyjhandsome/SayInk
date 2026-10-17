@@ -152,7 +152,7 @@ SPACE_XL = 32
 PAGE_MARGIN_H = 20
 PAGE_MARGIN_V = 16
 CONTENT_MAX_WIDTH = 900
-SIDEBAR_WIDTH = 184
+SIDEBAR_WIDTH = 168
 
 # Wide enough for values like「5500 场」plus a 22px flat stepper column.
 CONTROL_NUMERIC_WIDTH = 120
@@ -240,6 +240,10 @@ _LIGHT: dict[str, Any] = {
     "FLOAT_TEXT": "#111827",
     "FLOAT_TEXT_SEC": "#4B5563",
     "STATE_RECORD": "#DC2626",
+    # Transcript speaker names, by speaker id. Each stays >= 4.5:1 on
+    # SURFACE_PEARL and HIGHLIGHT_BG (tests/test_ui_styles.py checks).
+    "SPEAKER_COLORS": ("#2563EB", "#15803D", "#7C3AED", "#B45309", "#BE185D", "#0F766E"),
+    "HIGHLIGHT_BG": "#EFF6FF",
 }
 
 _DARK: dict[str, Any] = {
@@ -305,6 +309,8 @@ _DARK: dict[str, Any] = {
     "FLOAT_TEXT": "#FFFFFF",
     "FLOAT_TEXT_SEC": "rgba(235, 235, 245, 0.72)",
     "STATE_RECORD": "#F87171",
+    "SPEAKER_COLORS": ("#60A5FA", "#4ADE80", "#C4B5FD", "#FBBF24", "#F9A8D4", "#5EEAD4"),
+    "HIGHLIGHT_BG": "#1E3A5F",
 }
 
 _COLOR_KEYS = tuple(_LIGHT.keys())

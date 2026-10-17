@@ -43,6 +43,80 @@ class TestAppStyles:
         assert isinstance(GLOBAL_APP_STYLESHEET, str)
         assert len(GLOBAL_APP_STYLESHEET.strip()) > 0
 
+    def test_dropdown_popup_opens_below_and_fits_longest_item(self):
+        import sys
+
+        from PyQt6.QtWidgets import QApplication, QComboBox
+
+        from sayink.ui.app_styles import DropDownComboStyle
+
+        app = QApplication.instance() or QApplication(sys.argv)
+        style = DropDownComboStyle("Fusion")
+        combo = QComboBox()
+        combo.setStyle(style)
+        combo.addItems(["短", "评审 / 决策会 · 一个很长的模板名称"])
+        combo.setCurrentIndex(1)
+        combo.setFixedWidth(60)
+        combo.show()
+        app.processEvents()
+        try:
+            combo.showPopup()
+            app.processEvents()
+            view = combo.view()
+            popup = view.window()
+            assert popup.geometry().top() >= combo.mapToGlobal(combo.rect().bottomLeft()).y()
+            assert popup.width() > combo.width()
+            assert view.viewport().width() >= view.sizeHintForColumn(0)
+        finally:
+            combo.hidePopup()
+            combo.close()
+
+    def test_dropdown_popup_appears_at_final_width_when_clicked(self):
+        import sys
+
+        from PyQt6.QtCore import QEvent, QObject, Qt
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QApplication, QComboBox
+
+        from sayink.ui.app_styles import DropDownComboStyle
+
+        app = QApplication.instance() or QApplication(sys.argv)
+        style = DropDownComboStyle("Fusion")
+        combo = QComboBox()
+        combo.setStyle(style)
+        combo.setStyleSheet(
+            "QComboBox QAbstractItemView { padding: 6px; border: 1px solid #888; }"
+            "QComboBox QAbstractItemView::item { padding: 6px 10px; }"
+        )
+        combo.addItems(["通用会议", "评审 / 决策会", "周会 / 站会"])
+        combo.setFixedWidth(70)
+        combo.show()
+        app.processEvents()
+        container = combo.view().window()
+        widths_at_show = []
+
+        # Installed after the style's filter, so it runs first and sees the
+        # width Qt laid out before any post-show correction.
+        class Probe(QObject):
+            def eventFilter(self, obj, event):
+                if event.type() == QEvent.Type.Show:
+                    widths_at_show.append(container.width())
+                return False
+
+        probe = Probe()
+        combo.view().installEventFilter(probe)
+        try:
+            QTest.mousePress(combo, Qt.MouseButton.LeftButton)
+            app.processEvents()
+            view = combo.view()
+            assert widths_at_show and widths_at_show[0] == container.width()
+            used = container.width() - view.viewport().width()
+            assert view.viewport().width() >= view.sizeHintForColumn(0), used
+        finally:
+            combo.view().removeEventFilter(probe)
+            combo.hidePopup()
+            combo.close()
+
 
 class TestColorContrastContracts:
     def test_small_text_and_semantic_text_meet_aa_on_light_surfaces(self):
@@ -57,6 +131,15 @@ class TestColorContrastContracts:
             (light["PRIMARY_ON"], light["PRIMARY_CONTAINER"]),
         ):
             assert _contrast(foreground, background) >= 4.5
+
+    def test_transcript_speaker_and_time_colors_meet_aa(self):
+        from sayink.ui.design_tokens import tokens_for
+
+        for theme in ("light", "dark"):
+            t = tokens_for(theme)
+            for background in (t["SURFACE_PEARL"], t["HIGHLIGHT_BG"]):
+                for foreground in (*t["SPEAKER_COLORS"], t["TEXT_DIM"]):
+                    assert _contrast(foreground, background) >= 4.5, (theme, foreground, background)
 
     def test_dark_selected_text_and_primary_buttons_meet_aa(self):
         from sayink.ui.design_tokens import tokens_for
@@ -301,7 +384,7 @@ class TestClassicDesktopTokens:
         assert light["PRIMARY_ON"] == "#FFFFFF"
         assert dark["PRIMARY_CONTAINER"] == "#FFFFFF"
         assert dark["PRIMARY_ON"] == "#0D0D0D"
-        assert t.SIDEBAR_WIDTH == 184
+        assert t.SIDEBAR_WIDTH == 168
         t.activate("dark")
         assert t.STATE_LISTEN == t.GREEN
         assert t.STATE_WARN == t.AMBER

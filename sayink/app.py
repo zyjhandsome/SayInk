@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import numpy as np
 import pyperclip
-from PyQt6.QtCore import QEvent, QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMessageBox
 
 from sayink.config import (
@@ -17,6 +17,7 @@ from sayink.config import (
     format_hotkey,
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_HOTKEY,
+    TRIGGER_MODE_MEETING,
 )
 from sayink.hotkey_manager import (
     HotKeyManager,
@@ -30,16 +31,28 @@ from sayink.audio_devices import (
 )
 from sayink.audio_recorder import AudioRecorder
 from sayink.audio_utils import TARGET_SAMPLE_RATE
-from sayink.speaker_session import SpeakerSession, voice_embedding
+from sayink.speaker_embedding import STICKY_GAP_MS, SpeakerEmbedder, make_embedder
+from sayink.speaker_session import SpeakerSession, recluster, voice_embedding
 from sayink.speech_recognizer import (
+    AUX_MODEL_SILERO_VAD,
+    AUX_MODEL_SPEAKER,
     DEFAULT_MODEL_ID,
     SpeechRecognizer,
     set_models_dir,
     normalize_asr_output,
     get_model_info,
     join_segment_texts,
+    recognition_params,
 )
+from sayink.vad_segmenter import VAD_ENERGY, VAD_SILERO
 from sayink.history_store import HistoryStore, SegmentRecord
+from sayink.meeting_session import (
+    MeetingController,
+    MeetingOptions,
+    MeetingState,
+    aux_model_path,
+    resolve_capabilities,
+)
 from sayink.text_polisher import (
     LLM_MODE_POLISH,
     TextPolisher,
@@ -240,6 +253,7 @@ class _PendingHistoryRecord:
     model: str
     speaker_id: int = 0
     speaker_route: str = ""
+    captured_at: int = 0
 
 
 @dataclass
@@ -250,6 +264,12 @@ class _SegmentContext:
     seq: int
     source: str
     speakers: SpeakerSession
+    trigger_mode: str = TRIGGER_MODE_CONTINUOUS
+    model: str = ""
+    # Wall-clock ms when the utterance started (0 = unknown).
+    captured_at: int = 0
+    # Speaker embedding function; None = dictation's log-mel summary.
+    embed: object = None
 
 
 @dataclass
@@ -316,7 +336,13 @@ class App(QObject):
         self._output_stage = OutputStage.IDLE
         self._output_stage_text = ""
         self._segment_queue: list[_QueuedSegment] = []
-        self._speakers = SpeakerSession()
+        # Speaker numbering shares one stack with meetings: CAM++ when the aux
+        # model is downloaded (else the mel summary), continuity prior, and a
+        # re-clustering pass once a continuous session has fully drained.
+        self._embedder: SpeakerEmbedder | None = None
+        set_models_dir(self._config.models_dir)   # aux model lookup needs it
+        self._speakers = self._new_speaker_session()
+        self._reclustered_session_id: str | None = None
         self._continuous_user_stopped = False
         self._current_session_id: str | None = None
         self._current_seq = 0
@@ -329,7 +355,6 @@ class App(QObject):
         self._exit_started = False
 
         log.info("正在初始化各模块...")
-        set_models_dir(self._config.models_dir)
         self._init_modules()
         log.info("正在初始化界面...")
         self._init_ui()
@@ -370,6 +395,15 @@ class App(QObject):
             enabled=self._config.get("sound_enabled", True)
         )
         self._history = HistoryStore(db_path=self._config.config_dir / "history.db")
+        self._meeting = MeetingController(
+            self._config,
+            self._history,
+            pending_segments=self._pending_segment_count,
+            parent=self,
+        )
+        # Audio / output settings to restore once a meeting ends.
+        self._meeting_saved_output: tuple[str, bool] | None = None
+        self._meeting_capture_pending = False
 
     def _init_ui(self):
         self._floating = FloatingWindow()
@@ -394,7 +428,24 @@ class App(QObject):
             log.info("系统浅/深色外观已变化，重新换肤")
             self.apply_appearance_theme()
 
+    def _meeting_or_none(self) -> MeetingController | None:
+        # Tests build App via __new__; a missing attribute on a half-built
+        # QObject raises RuntimeError rather than AttributeError.
+        try:
+            return object.__getattribute__(self, "_meeting")
+        except (AttributeError, RuntimeError):
+            return None
+
+    def _meeting_active(self) -> bool:
+        """A meeting owns the audio pipeline (live, paused or draining)."""
+        meeting = self._meeting_or_none()
+        return meeting is not None and meeting.is_active
+
     def _is_continuous_mode(self) -> bool:
+        # A meeting is a continuous session whatever the dictation trigger
+        # mode is: segments flow through the same VAD → queue → history path.
+        if self._meeting_active():
+            return True
         return self._config.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY) == TRIGGER_MODE_CONTINUOUS
 
     def _continuous_session_active(self) -> bool:
@@ -450,10 +501,21 @@ class App(QObject):
         self._floating.continuous_stop_requested.connect(self._stop_continuous_user_session)
         self._floating.settings_requested.connect(self._show_settings)
         self._floating.history_requested.connect(self._show_history_window)
+        self._floating.meeting_mark_requested.connect(lambda: self._meeting.add_mark())
+        self._floating.meeting_open_requested.connect(self._show_meeting_window)
+
+        self._meeting.clock_tick.connect(self._floating.update_meeting_clock)
+        self._meeting.notice.connect(self._on_meeting_notice)
+        self._meeting.state_changed.connect(self._on_meeting_state_changed)
+        self._meeting.generation_finished.connect(self._on_minutes_generated)
+        self._meeting.generation_failed.connect(self._on_minutes_failed)
 
         self._tray.open_settings.connect(self._show_settings)
         self._tray.wake_island.connect(self._show_main_window)
         self._tray.history_requested.connect(self._show_history_window)
+        self._tray.meeting_start_requested.connect(self._start_meeting_from_tray)
+        self._tray.meeting_end_requested.connect(self._end_meeting)
+        self._tray.meetings_requested.connect(self._show_meeting_window)
         self._tray.quit_app.connect(self._quit)
         self._tray.auto_start_toggled.connect(self._on_auto_start_toggled)
         self._tray.model_switched.connect(self._on_tray_model_switch)
@@ -484,6 +546,7 @@ class App(QObject):
             mic_device_index=int(self._config.get("audio.mic_device_index", -1)),
             system_device_index=sys_idx,
         )
+        self._apply_dictation_segmenter_profile()
         floating = getattr(self, "_floating", None)
         if floating is not None:
             setter = getattr(floating, "set_input_source", None)
@@ -503,12 +566,24 @@ class App(QObject):
         except RuntimeError as e:
             log.warning("音频计划不可用: %s", e)
 
+    def _apply_dictation_segmenter_profile(self) -> None:
+        """Dictation keeps its short pauses but uses the same VAD choice as
+        meetings (Silero when downloaded, else energy)."""
+        vad = str(self._config.get("stt.vad", VAD_SILERO) or VAD_SILERO)
+        model_path = aux_model_path(AUX_MODEL_SILERO_VAD) if vad == VAD_SILERO else None
+        if vad == VAD_SILERO and model_path is None:
+            vad = VAD_ENERGY
+        self._recorder.set_segmenter_profile(vad=vad, vad_model_path=model_path, meeting=False)
+
     def _configure_stt(self):
         from sayink.speech_recognizer import is_model_downloaded, resolve_startup_model_id
 
         configured = self._config.get("stt.model_id", DEFAULT_MODEL_ID)
         model_id = resolve_startup_model_id(configured)
         num_threads = self._config.get("stt.num_threads", 4)
+        # Same glossary / language as a meeting, so starting one does not
+        # force a model reload.
+        hotwords, language = recognition_params(self._config)
 
         if model_id and is_model_downloaded(model_id):
             info = get_model_info(model_id)
@@ -523,7 +598,7 @@ class App(QObject):
                 )
                 self._tray.set_activity_tooltip("loading")
                 self._sync_settings_runtime_status()
-            self._recognizer.configure(model_id, num_threads)
+            self._recognizer.configure(model_id, num_threads, hotwords=hotwords, language=language)
         else:
             info = get_model_info(model_id) if model_id else None
             name = info["name"] if info else (model_id or DEFAULT_MODEL_ID)
@@ -569,6 +644,10 @@ class App(QObject):
         return self._is_transcribing or self._output_busy
 
     def _on_esc_pressed(self):
+        if self._meeting_active():
+            # Esc never ends a meeting: an hour of notes must not vanish on a
+            # stray key. The bar's end button / tray menu do that.
+            return
         if self._continuous_session_active():
             if self._config.get("audio.esc_stops_continuous", True):
                 self._stop_continuous_user_session()
@@ -622,8 +701,15 @@ class App(QObject):
                 self._pump_segment_queue()
             return
         if self._recorder.is_continuous:
-            log.info("模型重新加载，暂停持续监听")
-            self._stop_continuous_listening()
+            if self._meeting_active() and self._meeting.state is MeetingState.LIVE:
+                log.info("模型重新加载，会议采集暂停")
+                self._recorder.stop_continuous()
+                self._meeting.pause("语音模型载入中 · 载入完成后自动继续")
+                self._meeting_capture_pending = True
+                self._floating.show_meeting_paused(self._meeting.paused_detail)
+            else:
+                log.info("模型重新加载，暂停持续监听")
+                self._stop_continuous_listening()
         model_id = self._recognizer.current_model_id
         if isinstance(model_id, str) and model_id:
             self._load_started_at = time.monotonic()
@@ -646,7 +732,31 @@ class App(QObject):
             6000,
         )
 
+    def _meeting_blocks_hotkey(self) -> bool:
+        """Dictation hotkeys are parked while a meeting owns the microphone."""
+        if not self._meeting_active():
+            return False
+        self._floating.show_meeting_paused("会议记录中 · 听写快捷键已暂停")
+        QTimer.singleShot(1500, self._refresh_meeting_bar)
+        return True
+
+    def _refresh_meeting_bar(self) -> None:
+        if not self._meeting_active():
+            return
+        if self._meeting.state is MeetingState.PAUSED:
+            self._floating.show_meeting_paused(self._meeting.paused_detail)
+        elif self._meeting.state is MeetingState.DRAINING:
+            pending = self._pending_segment_count()
+            self._floating.show_meeting_paused(
+                f"正在整理文字稿（剩余 {pending} 段）" if pending else "正在整理文字稿",
+                title="会议结束中",
+            )
+        else:
+            self._floating.show_meeting(self._meeting.elapsed_text())
+
     def _on_recording_start(self):
+        if self._meeting_blocks_hotkey():
+            return
         if self._is_continuous_mode():
             return
         if not self._recognizer.is_ready:
@@ -690,7 +800,7 @@ class App(QObject):
         return True
 
     def _on_recording_stop(self):
-        if self._is_continuous_mode():
+        if self._meeting_active() or self._is_continuous_mode():
             return
         if self._abort_pending_hold():
             log.warning("录音设备尚未打开就已松开，忽略")
@@ -724,7 +834,7 @@ class App(QObject):
             self._tray.set_activity_tooltip(None)
 
     def _on_recording_cancel(self):
-        if self._is_continuous_mode():
+        if self._meeting_active() or self._is_continuous_mode():
             return
         if self._abort_pending_hold():
             self._floating.show_cancelled()
@@ -747,6 +857,8 @@ class App(QObject):
         self._floating.show_cancelled()
 
     def _on_continuous_hotkey_start(self):
+        if self._meeting_blocks_hotkey():
+            return
         if not self._is_continuous_mode():
             return
         if not self._recognizer.is_ready:
@@ -768,11 +880,13 @@ class App(QObject):
         self._current_session_id = None
         self._current_seq = 0
         # Segments still queued from the previous session keep its speaker numbering.
-        self._speakers = SpeakerSession()
+        self._speakers = self._new_speaker_session()
         self._clear_live_transcript()
         self._start_continuous_listening()
 
     def _on_hotkey_tap_too_short(self):
+        if self._meeting_active():
+            return
         if self._continuous_session_active():
             log.debug("已在持续监听中，忽略快捷键短按提示")
             return
@@ -806,7 +920,12 @@ class App(QObject):
 
     def _stop_continuous_user_session(self):
         """End the whole continuous listen session; in-flight transcription still completes."""
+        if self._meeting_active():
+            self._end_meeting()
+            return
         if not self._is_continuous_mode() or not self._recorder.is_continuous:
+            if not self._pending_segment_count():
+                self._floating.dismiss_if_idle()
             return
         self._continuous_user_stopped = True
         log.info("用户停止持续转写会话（进行中的识别会继续完成）")
@@ -820,10 +939,20 @@ class App(QObject):
         detail = f"正在处理剩余内容（{pending} 段）" if pending else ""
         self._floating.show_continuous_stopped(detail)
         if not pending:
+            self._maybe_finish_dictation_speakers()
             # Re-checks state: a session restarted within the delay keeps its bar.
             QTimer.singleShot(1200, self._refresh_continuous_ui_after_output)
 
     def _on_recorder_error(self, error_msg: str):
+        if self._meeting_active() and self._meeting.state is MeetingState.LIVE:
+            # The meeting stays open: the words so far are safe in history and
+            # the user can resume capture from the meeting page or end it.
+            if self._recorder.is_continuous or self._recorder.is_recording:
+                self._recorder.stop_continuous()
+            self._meeting.pause(f"采集中断：{self._friendly_error(error_msg)}")
+            self._sound.play_error()
+            self._floating.show_meeting_paused(self._meeting.paused_detail)
+            return
         if self._recorder.is_continuous:
             self._stop_continuous_listening()
         self._tray.set_recording(False)
@@ -948,6 +1077,20 @@ class App(QObject):
             "识别积压 %d 段（约 %.0f 秒），暂停持续监听",
             len(self._segment_queue), self._queued_audio_seconds(),
         )
+        if self._meeting_active():
+            # Capture pauses, the meeting does not end; it resumes once the
+            # backlog has drained (see _pump_segment_queue).
+            self._recorder.stop_continuous()
+            self._meeting.pause("识别跟不上，已暂停采集 · 处理完会自动继续")
+            self._meeting_capture_pending = True
+            self._floating.show_meeting_paused(self._meeting.paused_detail)
+            self._tray.showMessage(
+                "SayInk",
+                "识别跟不上说话速度，会议采集已暂停；已录下的内容会继续处理，处理完自动继续。",
+                QSystemTrayIcon.MessageIcon.Warning,
+                8000,
+            )
+            return
         self._stop_continuous_user_session()
         pending = self._pending_segment_count()
         self._floating.show_continuous_stopped(
@@ -972,14 +1115,76 @@ class App(QObject):
             source=self._history_source(),
             speakers=self._speakers,
         )
+        if self._meeting_active() and self._meeting.current_id == self._current_session_id:
+            context.trigger_mode = TRIGGER_MODE_MEETING
+            context.model = self._meeting.capabilities.model_id
+            # SpeakerEmbedder instances are callables (audio → vector).
+            context.embed = self._meeting.embedder
+        else:
+            context.embed = self._speaker_embedder()
         self._current_seq += 1
         return context
 
+    # ── Speaker numbering (shared with meetings) ──────
+
+    def _speaker_embedder(self) -> SpeakerEmbedder:
+        """CAM++ when downloaded and enabled, else the mel summary; built once
+        and dropped when the model list changes."""
+        embedder = self._embedder
+        if embedder is None:
+            enabled = bool(self._config.get("stt.speaker_model_enabled", True))
+            embedder = make_embedder(aux_model_path(AUX_MODEL_SPEAKER) if enabled else None, enabled=enabled)
+            self._embedder = embedder
+        return embedder
+
+    def _new_speaker_session(self) -> SpeakerSession:
+        embedder = self._speaker_embedder()
+        return SpeakerSession(
+            threshold=embedder.threshold,
+            keep_history=True,
+            sticky_threshold=embedder.sticky_threshold,
+            sticky_gap_ms=STICKY_GAP_MS,
+        )
+
+    def _finish_dictation_speakers(self) -> None:
+        """A continuous session has fully drained: re-cluster its speakers the
+        way a meeting does and renumber the rows already in history."""
+        session_id = self._current_session_id
+        speakers = self._speakers
+        if not session_id or speakers is None or session_id == self._reclustered_session_id:
+            return
+        if self._meeting_active() and self._meeting.current_id == session_id:
+            return
+        self._reclustered_session_id = session_id
+        if speakers.speaker_count < 2:
+            return
+        mapping = recluster(speakers.history, threshold=self._speaker_embedder().recluster_threshold)
+        if mapping and any(old != new for old, new in mapping.items()):
+            log.info("持续转写 %s 说话人重聚类: %s", session_id[:8], mapping)
+            self._history.relabel_session_speakers(session_id, mapping)
+
+    def _maybe_finish_dictation_speakers(self) -> None:
+        if not self._continuous_user_stopped or self._recorder.is_continuous:
+            return
+        if self._pending_segment_count() > 0 or self._is_transcribing:
+            return
+        self._finish_dictation_speakers()
+
+    def _segment_captured_at_from_recorder(self) -> int:
+        consume = getattr(self._recorder, "consume_segment_captured_at", None)
+        if not callable(consume):
+            return 0
+        value = consume()
+        return int(value) if isinstance(value, (int, float)) else 0
+
     def _on_segment_ready(self, audio: np.ndarray):
         route = self._segment_route_from_recorder()
+        captured_at = self._segment_captured_at_from_recorder()
         if audio.size < MIN_AUDIO_SAMPLES:
             return
         context = self._capture_segment_context()
+        if context is not None:
+            context.captured_at = captured_at
         if not self._recognizer.is_ready:
             self._hold_audio_until_ready(audio, route, front=False, context=context)
             return
@@ -1054,13 +1259,18 @@ class App(QObject):
         audio: np.ndarray,
         context: _SegmentContext | None = None,
     ) -> _PendingHistoryRecord:
+        captured_at = 0
         if context is not None:
-            trigger_mode = TRIGGER_MODE_CONTINUOUS
+            trigger_mode = context.trigger_mode or TRIGGER_MODE_CONTINUOUS
             session_id, seq, source = context.session_id, context.seq, context.source
+            captured_at = context.captured_at
         else:
             trigger_mode = TRIGGER_MODE_HOTKEY
             session_id, seq, source = uuid4().hex, 0, self._history_source()
 
+        model = (context.model if context is not None else "") or self._config.get(
+            "stt.model_id", DEFAULT_MODEL_ID
+        )
         return _PendingHistoryRecord(
             session_id=session_id,
             seq=seq,
@@ -1069,7 +1279,8 @@ class App(QObject):
             source=source,
             duration_ms=int(len(audio) / TARGET_SAMPLE_RATE * 1000),
             trigger_mode=trigger_mode,
-            model=self._config.get("stt.model_id", DEFAULT_MODEL_ID),
+            model=model,
+            captured_at=captured_at,
         )
 
     def _clear_live_transcript(self) -> None:
@@ -1220,6 +1431,11 @@ class App(QObject):
         self._output_stage = OutputStage.POLISH
         self._output_stage_text = ""
         llm_enabled = self._config.get("llm.enabled", False)
+        pending = self._pending_record
+        if pending is not None and pending.trigger_mode == TRIGGER_MODE_MEETING:
+            # Meeting rows go to the minutes model later, in one pass; a
+            # per-sentence polish would only add latency and API cost.
+            llm_enabled = bool(self._config.get("meeting.polish_segments", False)) and llm_enabled
         api_url = self._config.get("llm.api_url", "")
         api_key = self._config.get("llm.api_key", "")
         model_name = self._config.get("llm.model_name", "")
@@ -1271,6 +1487,8 @@ class App(QObject):
 
     def _pump_segment_queue(self):
         if self._pipeline_busy() or not self._segment_queue:
+            if not self._pipeline_busy():
+                self._resume_meeting_capture_if_pending()
             if self._continuous_session_active() and not self._pipeline_busy():
                 self._floating.show_listening()
             return
@@ -1286,6 +1504,10 @@ class App(QObject):
         if self._segment_queue and not self._is_transcribing:
             log.info("模型就绪，处理排队语音 %d 段", len(self._segment_queue))
             self._pump_segment_queue()
+        if self._meeting_active():
+            self._resume_meeting_capture_if_pending()
+            self._refresh_meeting_bar()
+            return
         hotkey = self._continuous_hotkey_label()
         if self._is_continuous_mode():
             # Loading HUD stays visible until replaced/dismissed; continuous mode
@@ -1359,10 +1581,11 @@ class App(QObject):
             return
 
         record = self._freeze_pending_history_record(text, degraded_from_polish)
-        if self._config.history_only_output():
+        is_meeting_row = record is not None and record.trigger_mode == TRIGGER_MODE_MEETING
+        if is_meeting_row or self._config.history_only_output():
             # Meeting / playback capture: the words go to history, never to
             # whatever window happens to be in front.
-            saved = bool(self._config.get("history.enabled", True))
+            saved = is_meeting_row or bool(self._config.get("history.enabled", True))
             log.info("只记录不粘贴：%d 字%s", len(text), "" if saved else "（历史已关闭，未保存）")
             self._handle_paste_result(
                 PasteResult("recorded", detail="" if saved else "history_disabled"),
@@ -1407,6 +1630,7 @@ class App(QObject):
             model=pending.model,
             speaker_id=int(pending.speaker_id),
             speaker_route=pending.speaker_route or "",
+            captured_at=int(pending.captured_at or 0),
         )
 
     def _label_speaker(
@@ -1421,7 +1645,17 @@ class App(QObject):
         stored_route = ""
         if context.source == "mixed" and route in ("mic", "system"):
             stored_route = route
-        return context.speakers.assign(voice_embedding(audio), stored_route), stored_route
+        embed = context.embed if callable(context.embed) else voice_embedding
+        try:
+            embedding = embed(audio)
+        except Exception as e:  # a broken speaker model must not drop the words
+            log.warning("说话人特征提取失败，退回频谱特征: %s", e)
+            embedding = voice_embedding(audio)
+        # Wall-clock bounds let the meeting session apply its continuity prior.
+        start_ms = int(context.captured_at or 0)
+        end_ms = start_ms + int(audio.size * 1000 / TARGET_SAMPLE_RATE) if start_ms else 0
+        speaker_id = context.speakers.assign(embedding, stored_route, start_ms=start_ms, end_ms=end_ms)
+        return speaker_id, stored_route
 
     def _handle_paste_result(
         self,
@@ -1532,6 +1766,8 @@ class App(QObject):
             self._floating.show_error(self._friendly_error("输出失败"))
 
         self._enqueue_history_record(record, target_app=target_app)
+        # Last words of a stopped continuous session are in: settle speakers.
+        self._maybe_finish_dictation_speakers()
         QTimer.singleShot(300, self._pump_segment_queue)
 
     def _refresh_open_history_ui(self) -> None:
@@ -1566,7 +1802,10 @@ class App(QObject):
     ) -> None:
         if record is None:
             return
-        if not self._config.get("history.enabled", True):
+        # Meeting transcripts are the meeting itself, not dictation history:
+        # they are kept even when the user has switched history off.
+        is_meeting_row = record.trigger_mode == TRIGGER_MODE_MEETING
+        if not is_meeting_row and not self._config.get("history.enabled", True):
             return
         if not (record.raw_text.strip() or record.polished_text.strip()):
             return
@@ -1584,6 +1823,7 @@ class App(QObject):
                 model=record.model,
                 speaker_id=int(record.speaker_id),
                 speaker_route=record.speaker_route or "",
+                captured_at=int(record.captured_at or 0),
             )
         )
 
@@ -1593,6 +1833,303 @@ class App(QObject):
             max_entries=int(self._config.get("history.max_entries", 5000)),
             active_session_id=self._current_session_id,
         )
+
+    # ── Meeting ───────────────────────────────────────
+
+    @property
+    def meeting(self) -> MeetingController:
+        return self._meeting
+
+    def _on_meeting_page_start(self, options: object) -> None:
+        if isinstance(options, MeetingOptions):
+            self._request_meeting_start(options)
+
+    def _start_meeting_from_tray(self) -> None:
+        if self._meeting_active():
+            self._show_meeting_window()
+            return
+        if self._config.get("meeting.show_start_card", True):
+            self._show_main_window("meeting")
+            main = self._main
+            if main is not None:
+                main.meeting_panel.show_start_card()
+            return
+        self._request_meeting_start(MeetingOptions.from_config(self._config))
+
+    # ── aux models: first-meeting prompt ──────────────────────────
+
+    def _request_meeting_start(self, options: MeetingOptions) -> None:
+        """User asked for a meeting: offer the helper models once, then start."""
+        decision = self._offer_aux_download()
+        if decision == "cancel":
+            return
+        if decision == "download":
+            self._download_aux_then_start(options)
+            return
+        self._start_meeting_or_show_browse(options)
+
+    def _start_meeting_or_show_browse(self, options: MeetingOptions) -> None:
+        if not self.start_meeting(options):
+            main = self._main
+            if main is not None:
+                main.meeting_panel.show_meeting("")
+
+    def _offer_aux_download(self) -> str:
+        """「download」/「start」/「cancel」. Asks only once per install, and only
+        while a helper model is missing (docs/meeting-notes-design.md §4.6)."""
+        from sayink.aux_models import missing_aux_models
+
+        if self._config.get("meeting.aux_prompted", False):
+            return "start"
+        missing = missing_aux_models()
+        if not missing:
+            return "start"
+        decision = self._ask_aux_download(missing)
+        if decision != "cancel":
+            self._config.set("meeting.aux_prompted", True)
+        return decision
+
+    def _ask_aux_download(self, missing: list[dict]) -> str:
+        from sayink.aux_models import describe_aux_models
+
+        box = QMessageBox(self._main)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("会议辅助模型")
+        box.setText("区分说话人和更稳的断句需要两个小模型，现在下载吗？")
+        box.setInformativeText(
+            f"{describe_aux_models(missing)}。不下载也能开会，但同一个人可能被分成多位说话人。"
+            "之后随时可在 会议 页或 引擎 页下载；此提示只出现一次。"
+        )
+        download = box.addButton("下载后开始", QMessageBox.ButtonRole.AcceptRole)
+        start = box.addButton("直接开始", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(download)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is download:
+            return "download"
+        if clicked is start:
+            return "start"
+        return "cancel"
+
+    def _download_aux_then_start(self, options: MeetingOptions) -> None:
+        from PyQt6.QtWidgets import QProgressDialog
+
+        from sayink.aux_models import AuxModelDownloads
+
+        downloads = AuxModelDownloads(str(self._config.get("stt.download_source", "auto") or "auto"), self)
+        dialog = QProgressDialog("正在下载会议辅助模型…", "取消", 0, 100, self._main)
+        dialog.setWindowTitle("会议辅助模型")
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setValue(0)
+        downloads.progress.connect(dialog.setValue)
+        dialog.canceled.connect(downloads.cancel)
+
+        def finished(ok: bool, message: str) -> None:
+            dialog.close()
+            dialog.deleteLater()
+            downloads.deleteLater()
+            if ok:
+                log.info("会议辅助模型已就绪，开始会议")
+                self._start_meeting_or_show_browse(options)
+                return
+            if message == "已取消":
+                self._tray.showMessage("SayInk", "已取消下载，会议未开始。", QSystemTrayIcon.MessageIcon.Information, 4000)
+                return
+            answer = QMessageBox.question(
+                self._main, "下载失败",
+                f"{message}\n\n仍以粗略的说话人区分开始会议吗？（可稍后在 引擎 页重试下载）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._start_meeting_or_show_browse(options)
+
+        downloads.finished.connect(finished)
+        if not downloads.start():
+            # Someone downloaded them meanwhile: nothing to wait for.
+            dialog.close()
+            dialog.deleteLater()
+            downloads.deleteLater()
+            self._start_meeting_or_show_browse(options)
+            return
+        dialog.show()
+
+    def _meeting_refusal(self) -> str:
+        """Why a meeting cannot start right now ("" when it can)."""
+        from sayink.speech_recognizer import is_model_downloaded
+
+        if self._meeting_active():
+            return "已有会议在进行中"
+        if self._recorder.is_recording and not self._recorder.is_continuous:
+            return "正在按键听写，请松开快捷键后再开始会议"
+        configured = str(self._config.get("meeting.model_id", "") or self._config.get("stt.model_id", DEFAULT_MODEL_ID))
+        if not configured or not is_model_downloaded(configured):
+            return "语音模型未下载：请在 设置 → 引擎 下载后再开始会议"
+        return ""
+
+    def start_meeting(self, options: MeetingOptions) -> bool:
+        """Switch the audio pipeline to a meeting; False when refused."""
+        refusal = self._meeting_refusal()
+        if refusal:
+            log.warning("无法开始会议：%s", refusal)
+            self._floating.show_error(refusal)
+            self._tray.showMessage("SayInk", refusal, QSystemTrayIcon.MessageIcon.Warning, 6000)
+            return False
+        if self._continuous_session_active():
+            # One microphone, one owner: the dictation session yields.
+            self._continuous_user_stopped = True
+            self._recorder.stop_continuous()
+            self._enqueue_history_cleanup()
+        dictation_model = str(self._config.get("stt.model_id", DEFAULT_MODEL_ID) or DEFAULT_MODEL_ID)
+        caps = resolve_capabilities(self._config, options, dictation_model_id=dictation_model)
+        record = self._meeting.begin(options, caps)
+        log.info(
+            "开始会议 %s（来源 %s，模型 %s，VAD %s，热词 %d 字，说话人模型 %s）",
+            record.id[:8], options.input_source, caps.model_id, caps.vad,
+            len(caps.hotwords), "是" if caps.speaker_model_available else "否",
+        )
+        # Session identity for every segment captured from here on.
+        self._current_session_id = record.id
+        self._current_seq = 0
+        self._speakers = self._meeting.speakers or SpeakerSession()
+        self._continuous_user_stopped = False
+        self._meeting_capture_pending = False
+        self._clear_live_transcript()
+
+        self._recorder.set_segmenter_profile(
+            vad=caps.vad,
+            vad_model_path=aux_model_path(AUX_MODEL_SILERO_VAD) if caps.vad != "energy" else None,
+            meeting=True,
+        )
+        self._recorder.configure(
+            input_source=options.input_source,
+            mic_device_index=int(self._config.get("audio.mic_device_index", -1)),
+            system_device_index=int(self._config.get("audio.system_device_index", -1)),
+        )
+        self._recognizer.configure(
+            caps.model_id,
+            int(self._config.get("stt.num_threads", 4)),
+            hotwords=caps.hotwords,
+            language=caps.language,
+        )
+        self._tray.set_meeting_in_progress(True)
+        self._tray.set_activity_tooltip("meeting")
+        self._sound.play_start()
+        self._floating.show_meeting(self._meeting.elapsed_text())
+        for note in caps.notes:
+            log.info("会议提示：%s", note)
+        self._start_meeting_capture()
+        return True
+
+    def _start_meeting_capture(self) -> None:
+        """Open the device; segments queue while the model is still loading."""
+        if not self._meeting_active() or self._recorder.is_continuous:
+            return
+        self._recorder.start_continuous()
+        if not self._recorder.is_continuous:
+            self._meeting.pause("音频设备打开失败 · 请检查设备后在会议页「继续采集」")
+            self._floating.show_meeting_paused(self._meeting.paused_detail)
+            self._tray.showMessage(
+                "SayInk", "会议采集无法开启，请检查音频设备设置。",
+                QSystemTrayIcon.MessageIcon.Warning, 6000,
+            )
+            return
+        self._meeting.resume()
+        self._floating.show_meeting(self._meeting.elapsed_text())
+
+    def resume_meeting_capture(self) -> None:
+        """User-driven resume after a device error / backlog pause."""
+        if not self._meeting_active() or self._meeting.state is not MeetingState.PAUSED:
+            return
+        self._meeting_capture_pending = False
+        self._start_meeting_capture()
+
+    def _resume_meeting_capture_if_pending(self) -> None:
+        if not self._meeting_capture_pending or not self._meeting_active():
+            return
+        if self._meeting.state is not MeetingState.PAUSED:
+            self._meeting_capture_pending = False
+            return
+        if not self._recognizer.is_ready or self._segment_queue:
+            return
+        self._meeting_capture_pending = False
+        log.info("积压处理完毕，会议采集继续")
+        self._start_meeting_capture()
+
+    def _end_meeting(self) -> None:
+        if not self._meeting_active():
+            return
+        if self._meeting.state is MeetingState.DRAINING:
+            return
+        log.info("结束会议，等待剩余 %d 段识别完成", self._pending_segment_count())
+        self._meeting_capture_pending = False
+        if self._recorder.is_continuous or self._recorder.is_recording:
+            self._recorder.stop_continuous()
+        if self._segment_queue and not self._recognizer.is_ready and not self._recognizer.is_loading:
+            # No model will ever come for these; do not wait on them forever.
+            log.warning("模型不可用，丢弃 %d 段未识别的会议语音", len(self._segment_queue))
+            self._clear_queued_audio()
+        self._sound.play_stop()
+        self._tray.set_activity_tooltip("recognizing" if self._pending_segment_count() else None)
+        self._refresh_meeting_bar()
+        self._meeting.request_end()
+
+    def _on_meeting_state_changed(self, state: MeetingState) -> None:
+        if state is MeetingState.DRAINING:
+            self._refresh_meeting_bar()
+        elif state is MeetingState.ENDED:
+            self._on_meeting_ended()
+
+    def _on_meeting_ended(self) -> None:
+        meeting_id = self._meeting.current_id
+        log.info("会议 %s 已结束", meeting_id[:8])
+        self._tray.set_meeting_in_progress(False)
+        self._tray.set_activity_tooltip(None)
+        self._floating.end_meeting_state()
+        # Hand the pipeline back to dictation (segmenter profile included).
+        self._apply_audio_config()
+        self._configure_stt()
+        self._current_session_id = None
+        self._current_seq = 0
+        self._speakers = self._new_speaker_session()
+        self._sync_hotkey_trigger_mode()
+        main = self._main
+        if main is not None and main.isVisible():
+            main.meeting_panel.show_meeting(meeting_id)
+        else:
+            self._tray.showMessage(
+                "SayInk", "会议已结束，可到「会议」页生成纪要。",
+                QSystemTrayIcon.MessageIcon.Information, 5000,
+            )
+
+    def _on_meeting_notice(self, title: str, detail: str) -> None:
+        if not self._meeting_active():
+            return
+        self._floating.show_info(title, detail)
+        QTimer.singleShot(1200, self._refresh_meeting_bar)
+
+    def _on_minutes_generated(self, meeting_id: str) -> None:
+        main = self._main
+        if main is None or not main.isVisible():
+            from sayink.minutes_prompts import get_template
+
+            notes = self._meeting.store.get_notes(meeting_id)
+            message = "原文已精整，可在会议页查看。" if notes is not None and get_template(notes.template_id).is_refinement else "会议纪要已生成。"
+            self._tray.showMessage(
+                "SayInk", message, QSystemTrayIcon.MessageIcon.Information, 5000
+            )
+
+    def _on_minutes_failed(self, meeting_id: str, message: str) -> None:
+        log.warning("纪要生成失败: %s", message)
+        main = self._main
+        if main is None or not main.isVisible():
+            self._tray.showMessage(
+                "SayInk", f"会议内容处理失败：{message}", QSystemTrayIcon.MessageIcon.Warning, 8000
+            )
 
     # ── Settings ──────────────────────────────────────
 
@@ -1632,7 +2169,13 @@ class App(QObject):
 
     def _show_main_window(self, page: str | None = None):
         if self._main is None:
-            self._main = MainWindow(self._config, self._history)
+            self._main = MainWindow(self._config, self._history, meeting=self._meeting_or_none())
+            meeting_page = getattr(self._main, "meeting_panel", None)
+            if meeting_page is not None and hasattr(meeting_page, "start_requested"):
+                meeting_page.start_requested.connect(self._on_meeting_page_start)
+                meeting_page.end_requested.connect(self._end_meeting)
+                meeting_page.resume_requested.connect(self.resume_meeting_capture)
+                meeting_page.aux_models_changed.connect(self._on_models_changed)
             settings = self._main.settings_panel
             settings.set_pending_segment_counter(self._pending_segment_count)
             settings.hotkey_updated.connect(self._on_hotkey_updated)
@@ -1641,6 +2184,7 @@ class App(QObject):
             settings.sound_enabled_changed.connect(self._on_sound_enabled_changed)
             settings.restore_clipboard_changed.connect(self._on_restore_clipboard_changed)
             settings.models_changed.connect(self._on_models_changed)
+            settings.recognition_changed.connect(self._on_recognition_settings_changed)
             settings.theme_changed.connect(self._on_theme_changed)
             settings.finished.connect(self._on_settings_closed)
             settings.hotkey_capture_started.connect(self._hotkey_mgr.pause)
@@ -1694,6 +2238,9 @@ class App(QObject):
     def _show_history_window(self):
         self._show_main_window("history")
 
+    def _show_meeting_window(self):
+        self._show_main_window("meeting")
+
     def eventFilter(self, obj, event):
         if obj is getattr(self, "_main", None) and event.type() == QEvent.Type.Hide:
             self._on_settings_closed()
@@ -1711,10 +2258,21 @@ class App(QObject):
 
     def _on_models_changed(self):
         """Reload STT after model download/select without requiring a full settings save."""
+        # A newly downloaded CAM++ / Silero applies to the next dictation session.
+        self._embedder = None
+        if self._meeting_active():
+            self._update_tray_models()
+            return
         if self._recorder.is_continuous:
             self._stop_continuous_listening()
+        self._apply_dictation_segmenter_profile()
         self._configure_stt()
         self._update_tray_models()
+
+    def _on_recognition_settings_changed(self):
+        """Glossary / language / VAD changed: same handling as a model change
+        (a hotword or language change rebuilds the recognizer)."""
+        self._on_models_changed()
 
     def _on_theme_changed(self, mode: str):
         """Apply appearance without reconfiguring STT / audio."""
@@ -1746,15 +2304,26 @@ class App(QObject):
         ]
         main = _attr("_main")
         if main is not None:
-            for child_attr in ("_settings", "_history"):
+            for child_attr in ("_settings", "_history", "_meeting"):
                 child = getattr(main, child_attr, None)
-                if child is not None:
+                if child is not None and callable(getattr(child, "reapply_theme", None)):
                     surfaces.append(child)
         apply_theme(QApplication.instance(), mode=theme_mode, surfaces=surfaces)
 
     def _on_settings_changed(self):
         # Drop only what the confirmation counted; the sentence cut off by
         # stopping below is still the user's speech and gets transcribed.
+        if self._meeting_active():
+            # The meeting keeps its device, model and queue; audio / engine
+            # changes apply when it ends (_on_meeting_ended reconfigures).
+            log.info("会议进行中，音频与引擎设置将在会议结束后生效")
+            self._sound.enabled = self._config.get("sound_enabled", True)
+            self._tray.set_auto_start(self._config.get("auto_start", False))
+            set_models_dir(self._config.models_dir)
+            self._update_tray_models()
+            self._paster.restore_clipboard = self._config.get("output.restore_clipboard", False)
+            self.apply_appearance_theme()
+            return
         if self._segment_queue:
             log.warning("设置已保存，丢弃 %d 段待识别语音", len(self._segment_queue))
         self._clear_queued_audio()
@@ -1779,9 +2348,13 @@ class App(QObject):
         current = self._config.get("stt.model_id", "")
         if model_id == current:
             return
+        self._config.set("stt.model_id", model_id)
+        if self._meeting_active():
+            log.info("会议进行中，切换的模型将在会议结束后载入")
+            self._update_tray_models()
+            return
         if self._recorder.is_continuous:
             self._stop_continuous_listening()
-        self._config.set("stt.model_id", model_id)
         self._configure_stt()
         self._update_tray_models()
 
@@ -1836,8 +2409,10 @@ class App(QObject):
         """Never silently discard captured or in-flight speech on exit."""
         if self._exit_dialog_open:
             return False
+        meeting_live = self._meeting_active()
         pending = (
-            self._recorder.is_recording
+            meeting_live
+            or self._recorder.is_recording
             or self._recorder.is_continuous
             or self._pipeline_busy()
             or self._segment_queue
@@ -1849,11 +2424,19 @@ class App(QObject):
             box = QMessageBox(self._main)
             box.setWindowTitle("安装更新" if install_update else "退出 SayInk")
             box.setIcon(QMessageBox.Icon.Question)
-            box.setText("仍在录音或有转写尚未完成")
-            box.setInformativeText(
-                "立即退出会丢弃尚未识别、润色或输出的内容。\n"
-                "可以返回应用，结束监听并等待处理完成后再退出。"
-            )
+            if meeting_live:
+                box.setText("会议记录仍在进行")
+                box.setInformativeText(
+                    "已识别的文字稿已保存；立即退出会丢弃尚未识别的语音，"
+                    "这场会议将标记为「已中断」，之后仍可生成纪要。\n"
+                    "建议返回应用，先结束会议再退出。"
+                )
+            else:
+                box.setText("仍在录音或有转写尚未完成")
+                box.setInformativeText(
+                    "立即退出会丢弃尚未识别、润色或输出的内容。\n"
+                    "可以返回应用，结束监听并等待处理完成后再退出。"
+                )
             back = box.addButton("返回继续处理", QMessageBox.ButtonRole.RejectRole)
             discard = box.addButton("放弃并退出", QMessageBox.ButtonRole.DestructiveRole)
             box.setDefaultButton(back)
@@ -1870,6 +2453,7 @@ class App(QObject):
         self._exit_started = True
         log.info("SayInk 正在退出...")
         self._stop_continuous_listening()
+        self._meeting.shutdown()
         self._hotkey_mgr.stop()
         self._hold_open_pending = False
         if self._recorder.is_recording:
@@ -1895,6 +2479,7 @@ class App(QObject):
     def start(self):
         self._hotkey_mgr.start()
         self._show_history_startup_notice()
+        self._meeting.mark_interrupted()
         self._enqueue_history_cleanup()
         QTimer.singleShot(5000, self._updates.maybe_auto_check)
         self._onboarding.schedule(self._recognizer.ready)

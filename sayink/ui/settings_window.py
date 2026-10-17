@@ -39,6 +39,7 @@ from sayink.ui.settings_components import (
     SettingsPage,
     elide_middle,
     empty_state,
+    footnote,
     group_divider,
     kv_row,
     kv_row_elided,
@@ -80,6 +81,8 @@ class SettingsWindow(QWidget):
     sound_enabled_changed = pyqtSignal(bool)
     restore_clipboard_changed = pyqtSignal(bool)
     models_changed = pyqtSignal()
+    # Glossary / language / VAD (stt.*): shared by dictation and meetings.
+    recognition_changed = pyqtSignal()
     theme_changed = pyqtSignal(str)
     hotkey_capture_started = pyqtSignal()
     hotkey_capture_ended = pyqtSignal()
@@ -143,6 +146,8 @@ class SettingsWindow(QWidget):
             self._refresh_active_model_hero()
         if hasattr(self, "_llm_prompt_edit"):
             self._paint_llm_prompt_edit()
+        if hasattr(self, "_meeting_glossary_edit"):
+            self._paint_meeting_glossary_edit()
         if hasattr(self, "_about_version_label"):
             self._about_version_label.setStyleSheet(
                 f"color: {tok.TEXT_SEC}; font-size: {_tok.TYPE_CAPTION}px; font-weight: 700;"
@@ -151,11 +156,12 @@ class SettingsWindow(QWidget):
             )
         if hasattr(self, "_about_update_btn"):
             paint_about_update_row(self)
-        if hasattr(self, "_llm_test_status"):
-            self._llm_test_status.setStyleSheet(
-                f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px;"
-                f" background: transparent; padding: 0 16px 12px 16px;"
-            )
+        for name in ("_llm_test_status", "_minutes_test_status"):
+            if hasattr(self, name):
+                getattr(self, name).setStyleSheet(
+                    f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px;"
+                    f" background: transparent; padding: 0 16px 12px 16px;"
+                )
         if hasattr(self, "_about_paths_toggle"):
             self._about_paths_toggle.setStyleSheet(
                 f"QPushButton#aboutPathsToggle {{"
@@ -451,6 +457,32 @@ class SettingsWindow(QWidget):
         if downloaded_models:
             _add_section("其他已下载", downloaded_models, True)
         _add_section("可下载", available_models, False)
+        self._add_aux_model_section()
+
+    def _add_aux_model_section(self) -> None:
+        """Meeting helpers (speaker embedding, Silero VAD): one section, each
+        card either 「已启用」+删除 or 下载."""
+        from sayink.speech_recognizer import AUX_MODEL_REGISTRY, is_model_downloaded
+
+        section = QWidget()
+        section_lay = QVBoxLayout(section)
+        section_lay.setContentsMargins(0, 0, 0, 0)
+        section_lay.setSpacing(10)
+        section_lay.addWidget(section_header("会议辅助模型"))
+        hint = footnote("会议记录可选：区分说话人、更稳的断句。不影响听写。")
+        section_lay.addWidget(hint)
+        list_host = QWidget()
+        list_lay = QVBoxLayout(list_host)
+        list_lay.setContentsMargins(0, 0, 0, 0)
+        list_lay.setSpacing(12)
+        for m_info in AUX_MODEL_REGISTRY:
+            downloaded = is_model_downloaded(m_info["id"])
+            card = ModelCard(m_info, downloaded, False)
+            card.action_clicked.connect(self._on_card_action)
+            self._model_cards[m_info["id"]] = card
+            list_lay.addWidget(card)
+        section_lay.addWidget(list_host)
+        self._cards_layout.addWidget(section)
 
     def _on_card_action(self, model_id: str, action: str):
         if action == "select":
@@ -491,10 +523,12 @@ class SettingsWindow(QWidget):
             self._config.set("stt.model_id", model_id)
         self._rebuild_model_cards()
         self.models_changed.emit()
-        from sayink.speech_recognizer import get_model_info
+        from sayink.speech_recognizer import get_model_info, is_aux_model
         info = get_model_info(model_id)
         name = info["name"] if info else model_id
-        if self._config.get("stt.model_id", "") == model_id:
+        if is_aux_model(model_id):
+            text = f"{name} 已下载，下一场会议会自动使用。"
+        elif self._config.get("stt.model_id", "") == model_id:
             text = f"{name} 已下载，正在载入内存（约需数十秒）。载入完成前请勿开始录音。"
         else:
             # Only the active model is loaded; a second download just sits
@@ -524,6 +558,9 @@ class SettingsWindow(QWidget):
         ):
             return
         active_id = self._config.get("stt.model_id", "")
+        from sayink.speech_recognizer import is_aux_model
+        if is_aux_model(model_id):
+            active_id = ""  # never the dictation model
         if not delete_model(model_id):
             QMessageBox.warning(
                 self,
@@ -543,7 +580,7 @@ class SettingsWindow(QWidget):
     # ── Page: Polish (LLM) ─────────────────────────────
 
     def _on_llm_enable_toggled(self, enabled: bool):
-        # Keep the enable row visually stable while the tall config block
+        # Keep the enable row visually stable while the prompt block
         # mounts/unmounts (avoids scroll jumping the switch under the cursor).
         page = self._polish_scroll_page()
         anchor_y = 0
@@ -554,7 +591,8 @@ class SettingsWindow(QWidget):
 
         # The before/after example stays visible in both states: it is the
         # information a user needs *before* deciding to turn polishing on.
-        self._llm_container.setVisible(enabled)
+        # The connection stays too: meeting minutes use it with polish off.
+        self._llm_prompt_container.setVisible(enabled)
 
         if page is not None and page.widget() is not None:
             def _restore() -> None:
@@ -604,13 +642,14 @@ class SettingsWindow(QWidget):
                 "重启后仍为空请重新填写。"
             )
             return
-        if not self._llm_enable_row.isChecked():
-            self._llm_test_status.setText("")
-            return
         missing = self._llm_missing_fields()
-        if missing:
+        if missing and self._llm_enable_row.isChecked():
             self._llm_test_status.setText(
                 f"未配置：缺少{'、'.join(missing)}。转写会直接输出原文。"
+            )
+        elif missing:
+            self._llm_test_status.setText(
+                f"尚未填写：{'、'.join(missing)}。文字润色和会议纪要都要用到这组配置。"
             )
         else:
             self._llm_test_status.setText("配置已填写，尚未测试连接。")
@@ -646,6 +685,19 @@ class SettingsWindow(QWidget):
             QTextEdit:focus {{
                 border: 2px solid {_tok.ACCENT_FOCUS};
                 padding: 9px 11px;
+            }}
+        """)
+
+    def _paint_meeting_glossary_edit(self) -> None:
+        self._meeting_glossary_edit.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background: {_tok.INPUT_BG}; color: {_tok.TEXT};
+                border: 1px solid {_tok.HAIRLINE}; border-radius: {_tok.RADIUS_MD}px;
+                padding: 8px 12px; font-size: {_tok.TYPE_BODY_SM}px; font-family: {_tok.FONT};
+            }}
+            QPlainTextEdit:focus {{
+                border: 2px solid {_tok.ACCENT_FOCUS};
+                padding: 7px 11px;
             }}
         """)
 
@@ -891,12 +943,13 @@ class SettingsWindow(QWidget):
 
         llm_on = self._config.get("llm.enabled", False)
         self._llm_enable_row.setChecked(llm_on)
-        self._llm_container.setVisible(llm_on)
+        self._llm_prompt_container.setVisible(llm_on)
         self._llm_url_edit.setText(self._config.get("llm.api_url", ""))
         self._llm_key_edit.setText(self._config.get("llm.api_key", ""))
         self._llm_model_edit.setText(self._config.get("llm.model_name", ""))
         self._llm_prompt_edit.setPlainText(self._config.get("llm.prompt", ""))
         self._llm_prompt_edit.setEnabled(True)
+        self._load_meeting_settings()
 
         self._refresh_about_info()
         self._loading = False
@@ -1207,6 +1260,69 @@ class SettingsWindow(QWidget):
         self._config.set("history.retention_days", self._history_retention_days_spin.value())
         self._config.set("history.max_entries", self._history_max_entries_spin.value())
 
+    # ── Page: General → 会议 ───────────────────────────
+
+    def _on_meeting_setting_changed(self, *_args):
+        if self._loading:
+            return
+        self._config.set("meeting.input_source", str(self._meeting_source_combo.currentData() or "mixed"))
+        self._config.set("meeting.model_id", str(self._meeting_model_combo.currentData() or ""))
+        self._config.set("meeting.show_start_card", bool(self._meeting_start_card_row.isChecked()))
+        vad = str(self._meeting_vad_combo.currentData() or "silero")
+        language = str(self._meeting_language_combo.currentData() or "auto")
+        changed = vad != self._config.get("stt.vad", "silero") or language != self._config.get("stt.language", "auto")
+        self._config.set("stt.vad", vad)
+        self._config.set("stt.language", language)
+        if changed:
+            self.recognition_changed.emit()
+
+    def _on_meeting_glossary_changed(self):
+        if self._loading:
+            return
+        if not hasattr(self, "_meeting_glossary_timer"):
+            self._meeting_glossary_timer = QTimer(self)
+            self._meeting_glossary_timer.setSingleShot(True)
+            self._meeting_glossary_timer.timeout.connect(self._flush_meeting_glossary)
+        self._meeting_glossary_timer.start(500)
+
+    def _flush_meeting_glossary(self):
+        from sayink.speech_recognizer import MAX_HOTWORD_CHARS, MAX_HOTWORDS
+
+        terms: list[dict] = []
+        seen: set[str] = set()
+        for raw in self._meeting_glossary_edit.toPlainText().splitlines():
+            term = raw.strip()[:MAX_HOTWORD_CHARS]
+            if not term or term in seen:
+                continue
+            seen.add(term)
+            terms.append({"term": term})
+            if len(terms) >= MAX_HOTWORDS:
+                break
+        if terms != (self._config.get("stt.glossary", []) or []):
+            self._config.set("stt.glossary", terms)
+            self.recognition_changed.emit()
+
+    def _load_meeting_settings(self) -> None:
+        self._set_combo_by_data(self._meeting_source_combo, self._config.get("meeting.input_source", "mixed"))
+        self._set_combo_by_data(self._meeting_model_combo, self._config.get("meeting.model_id", "") or "")
+        self._set_combo_by_data(self._meeting_vad_combo, self._config.get("stt.vad", "silero"))
+        self._set_combo_by_data(self._meeting_language_combo, self._config.get("stt.language", "auto"))
+        self._meeting_start_card_row.setChecked(bool(self._config.get("meeting.show_start_card", True)))
+        glossary = self._config.get("stt.glossary", []) or []
+        text = "\n".join(str(g.get("term", "")) for g in glossary if isinstance(g, dict) and g.get("term"))
+        if self._meeting_glossary_edit.toPlainText() != text:
+            self._meeting_glossary_edit.setPlainText(text)
+        self._minutes_model_edit.setText(str(self._config.get("meeting.model_name", "") or ""))
+        self._set_combo_by_data(self._minutes_template_combo, self._config.get("meeting.template_id", "general"))
+        self._set_combo_by_data(self._minutes_language_combo, self._config.get("meeting.output_language", "auto"))
+
+    def _flush_minutes_fields(self, *_args):
+        if self._loading:
+            return
+        self._config.set("meeting.model_name", self._minutes_model_edit.text().strip())
+        self._config.set("meeting.template_id", str(self._minutes_template_combo.currentData() or "general"))
+        self._config.set("meeting.output_language", str(self._minutes_language_combo.currentData() or "auto"))
+
     def _apply_hotkey_setting(self, hotkey: str):
         if self._loading or not hotkey:
             return
@@ -1273,8 +1389,10 @@ class SettingsWindow(QWidget):
         from sayink.text_polisher import is_secure_or_local_url
 
         llm_enabled = self._llm_enable_row.isChecked()
+        self._config.set("llm.enabled", llm_enabled)
         llm_url = self._llm_url_edit.text().strip()
-        if llm_enabled and llm_url and not is_secure_or_local_url(llm_url):
+        # Checked with polish off too: meeting minutes send to the same endpoint.
+        if llm_url and not is_secure_or_local_url(llm_url):
             QMessageBox.warning(
                 self,
                 "提示",
@@ -1284,7 +1402,6 @@ class SettingsWindow(QWidget):
             self._llm_url_edit.setText(self._config.get("llm.api_url", ""))
             self._loading = False
             return
-        self._config.set("llm.enabled", llm_enabled)
         self._config.set("llm.api_url", llm_url)
         self._config.set("llm.api_key", self._llm_key_edit.text().strip())
         self._config.set("llm.model_name", self._llm_model_edit.text().strip())
@@ -1300,14 +1417,25 @@ class SettingsWindow(QWidget):
     # ── LLM Test ───────────────────────────────────────
 
     def _test_llm(self):
+        self._llm_test_worker = self._start_llm_test(
+            self._llm_model_edit.text().strip(), self._llm_test_btn, self._llm_test_status
+        )
+
+    def _test_minutes_model(self):
+        model = self._minutes_model_edit.text().strip() or self._llm_model_edit.text().strip()
+        self._minutes_test_status.show()
+        self._minutes_test_worker = self._start_llm_test(
+            model, self._minutes_test_btn, self._minutes_test_status, ok_text=f"连接正常，纪要将使用 {model}。"
+        )
+
+    def _start_llm_test(self, model: str, btn: QPushButton, status: QLabel, *, ok_text: str = "连接正常，可以使用。"):
         url = self._llm_url_edit.text().strip()
         key = self._llm_key_edit.text().strip()
-        model = self._llm_model_edit.text().strip()
         from sayink.text_polisher import polish_settings_complete
 
         if not polish_settings_complete(url, key, model):
-            self._llm_test_status.setText("请填写完整的接口信息。")
-            return
+            status.setText("请填写完整的接口信息。")
+            return None
 
         class _W(QThread):
             def __init__(self, u, k, m):
@@ -1319,21 +1447,29 @@ class SettingsWindow(QWidget):
                 from sayink.text_polisher import TextPolisher
                 self.ok, self.msg = TextPolisher.test_connection(self.u, self.k, self.m)
 
-        self._llm_test_worker = _W(url, key, model)
-        self._llm_test_worker.finished.connect(
-            lambda: self._on_test_done(self._llm_test_worker, self._llm_test_btn)
-        )
-        self._llm_test_btn.setEnabled(False)
-        self._llm_test_btn.setText("测试中...")
-        self._llm_test_worker.start()
+        worker = _W(url, key, model)
+        worker.finished.connect(lambda: self._on_test_done(worker, btn, status, ok_text))
+        btn.setEnabled(False)
+        btn.setText("测试中...")
+        worker.start()
+        return worker
 
-    def _on_test_done(self, w, btn):
+    def _on_test_done(self, w, btn, status: QLabel, ok_text: str):
         btn.setEnabled(True)
         btn.setText("测试连接")
-        if w.ok:
-            self._llm_test_status.setText("连接正常，可以使用。")
-        else:
-            self._llm_test_status.setText(w.msg)
+        status.setText(ok_text if w.ok else w.msg)
+
+    def focus_llm_connection(self) -> None:
+        """Bring 「接口配置」 into view with the first empty field focused."""
+        self.show_page(2)
+        page = self._polish_scroll_page()
+        if page is not None:
+            page.ensureWidgetVisible(self._llm_connection_section)
+        for edit in (self._llm_url_edit, self._llm_key_edit, self._llm_model_edit):
+            if not edit.text().strip():
+                edit.setFocus()
+                return
+        self._llm_url_edit.setFocus()
 
     # ── Cleanup ────────────────────────────────────────
 

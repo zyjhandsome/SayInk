@@ -20,6 +20,18 @@ from sayink.hotkey_manager import HotKeyManager
 from sayink.text_paster import PasteResult
 
 
+def test_refinement_completion_notification_matches_saved_template():
+    from sayink.meeting_store import MeetingNotes
+
+    with app_harness() as h:
+        app = h["app"]
+        app._main = None
+        for template_id, expected in (("refine", "原文已精整"), ("general", "会议纪要已生成")):
+            with patch.object(app.meeting.store, "get_notes", return_value=MeetingNotes("m", template_id=template_id)):
+                app._on_minutes_generated("m")
+            assert expected in h["tray"].showMessage.call_args.args[1]
+
+
 class TestReadmeExitProtection:
     """Returning from exit allows the current session to finish normally."""
 
@@ -572,3 +584,106 @@ class TestReadmeSettingsLifecycle:
             h["hotkey"].pause()
             h["app"]._on_settings_closed()
             h["hotkey"].resume.assert_called_once()
+
+
+class TestReadmeMeetingNotes:
+    """README「AI 会议记录」promises, backed by tests/test_app_meeting_wiring.py
+    and tests/test_meeting_*.py."""
+
+    def _readme(self) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+    def test_readme_documents_the_meeting_feature(self):
+        text = self._readme()
+        assert "### AI 会议记录" in text
+        assert "开始会议" in text and "生成纪要" in text
+        assert "不保存音频" in text
+        assert "（待核对）" in text
+        assert "历史 / 会议 / 通用 / 引擎 / 润色 / 关于" in text
+        assert "Ctrl+1…6" in text
+        # Speaker continuity + guided aux-model download are user-visible promises.
+        assert "下载辅助模型" in text and "下载后开始" in text
+        assert "沿用上一位" in text
+        assert "docs/asr-benchmark.md" in text and "tools/asr_bench.py" in text
+
+    def test_readme_says_dictation_shares_the_meeting_stack(self):
+        """持续转写 reuses the meeting speaker / VAD / glossary stack
+        (tests/test_app_history_wiring.py::TestDictationShares*)."""
+        text = self._readme()
+        assert "与会议记录共用同一套方法" in text
+        assert "重新聚类一次并改写编号" in text
+        assert "会议与识别" in text and "听写与会议共用" in text
+        assert "不会因为参数不同而重新载入模型" in text
+        assert "chat_completion()" in text
+        # Settings copy uses the shared names; the old 会议-prefixed ones are gone.
+        for stale in ("设置 → 通用 → 会议 ", "会议断句方式", "会议术语表"):
+            assert stale not in text
+
+    def test_shared_recognition_settings_live_under_stt(self):
+        from sayink.config import DEFAULT_CONFIG, SHARED_RECOGNITION_KEYS
+
+        assert set(SHARED_RECOGNITION_KEYS) == {"glossary", "language", "vad", "speaker_model_enabled"}
+        for key in SHARED_RECOGNITION_KEYS:
+            assert key in DEFAULT_CONFIG["stt"] and key not in DEFAULT_CONFIG["meeting"]
+
+    def test_main_window_has_six_pages_in_readme_order(self):
+        from sayink.ui.main_window import NAV_LABELS, PAGE_KEYS
+
+        assert NAV_LABELS == ("历史", "会议", "通用", "引擎", "AI 服务", "关于")
+        assert PAGE_KEYS == ("history", "meeting", "general", "engine", "polish", "about")
+
+    def test_meeting_rows_are_saved_even_with_history_off(self):
+        from sayink.meeting_session import MeetingOptions
+
+        with app_harness({"history.enabled": False}) as h:
+            app = h["app"]
+            h["recorder"].start_continuous.side_effect = lambda: setattr(h["recorder"], "is_continuous", True)
+            with patch("sayink.meeting_session.aux_model_path", return_value=None):
+                assert app.start_meeting(MeetingOptions())
+            app._on_segment_ready(np.ones(MIN_AUDIO_SAMPLES * 4, dtype=np.float32))
+            app._on_final_result("会议里说的话")
+            h["paster"].paste_async.assert_not_called()
+            rows = [c.args[0] for c in h["history"].enqueue.call_args_list]
+            assert [r.trigger_mode for r in rows] == ["meeting"]
+
+    def test_esc_and_dictation_hotkeys_never_end_a_meeting(self):
+        from sayink.meeting_session import MeetingOptions
+
+        with app_harness({"audio.trigger_mode": "continuous", "audio.esc_stops_continuous": True}) as h:
+            app = h["app"]
+            h["recorder"].start_continuous.side_effect = lambda: setattr(h["recorder"], "is_continuous", True)
+            with patch("sayink.meeting_session.aux_model_path", return_value=None):
+                assert app.start_meeting(MeetingOptions())
+            app._on_esc_pressed()
+            app._on_recording_start()
+            app._on_continuous_hotkey_start()
+            assert app.meeting.is_active
+            h["recorder"].stop_continuous.assert_not_called()
+
+    def test_meeting_transcripts_survive_history_cleanup_and_clear_all(self, tmp_path):
+        from sayink.history_store import HistoryStore, SegmentRecord
+        from sayink.meeting_store import MeetingStore
+
+        history = HistoryStore(db_path=tmp_path / "history.db")
+        try:
+            meetings = MeetingStore(history)
+            record = meetings.create_meeting(title="周会")
+            history.enqueue(SegmentRecord(
+                session_id=record.id, seq=0, created_at=1, raw_text="会议原话", source="mixed",
+                duration_ms=1000, trigger_mode="meeting", model="m",
+            ))
+            history.enqueue(SegmentRecord(
+                session_id="dictation", seq=0, created_at=1, raw_text="听写原话", source="mic",
+                duration_ms=1000, trigger_mode="hotkey", model="m",
+            ))
+            history.flush(timeout=2.0)
+            history.enqueue_cleanup(retention_days=0, max_entries=0, active_session_id=None)
+            history.enqueue_delete_all()
+            history.flush(timeout=2.0)
+            assert [s.raw_text for s in meetings.get_segments(record.id)] == ["会议原话"]
+            assert history.get_session_segments("dictation") == []
+            assert all(s.session_id != record.id for s in history.list_sessions())
+        finally:
+            history.close(timeout=2.0)

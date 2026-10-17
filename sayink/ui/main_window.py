@@ -30,15 +30,18 @@ from sayink.config import DEFAULT_HOTKEY, TRIGGER_MODE_HOTKEY, format_hotkey
 from sayink.ui import design_tokens as tok
 from sayink.ui.settings_components import sync_group_tab_stop
 
-NAV_LABELS = ("历史", "通用", "引擎", "润色", "关于")
-PAGE_KEYS = ("history", "general", "engine", "polish", "about")
+NAV_LABELS = ("历史", "会议", "通用", "引擎", "AI 服务", "关于")
+PAGE_KEYS = ("history", "meeting", "general", "engine", "polish", "about")
 PAGE_OBJECT_NAMES = (
     "pageHistory",
+    "pageMeeting",
     "pageGeneral",
     "pageEngine",
     "pagePolish",
     "pageAbout",
 )
+# Stack slots: 0 = 历史, 1 = 会议, 2 = settings pages (通用/引擎/AI 服务/关于).
+_STACK_HISTORY, _STACK_MEETING, _STACK_SETTINGS = 0, 1, 2
 
 _CAPTION_H = 42
 _CAPTION_BTN_W = 46
@@ -62,6 +65,8 @@ _WVR_VALIDRECTS = 0x0400
 _MONITOR_DEFAULTTONEAREST = 2
 _HTLEFT, _HTRIGHT, _HTTOP, _HTTOPLEFT, _HTTOPRIGHT = 10, 11, 12, 13, 14
 _HTBOTTOM, _HTBOTTOMLEFT, _HTBOTTOMRIGHT = 15, 16, 17
+# Hide without moving, resizing, or activating another window first.
+_SWP_HIDE_ONLY = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0080
 
 
 _CAPTION_GLYPH = 10.0
@@ -130,11 +135,31 @@ class _CaptionIconButton(QPushButton):
         painter.end()
 
 
+class _FrameEdge(QWidget):
+    """Straight 1px border in the layout gutter.
+
+    The root window must not grow or drop this line via setStyleSheet: that
+    repolishes the whole page tree and is the hitch on maximize and restore.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), self.palette().color(self.backgroundRole()))
+        painter.end()
+
+
 class MainWindow(QWidget):
-    def __init__(self, config, history_store, parent=None) -> None:
+    def __init__(self, config, history_store, parent=None, *, meeting=None) -> None:
         super().__init__(parent)
         self._config = config
         self._history_store = history_store
+        # MeetingController; None (tests / tools) builds a page-less stand-in.
+        self._meeting_controller = meeting
         self._page = "general"
         self._drag_offset = None
         self._live_resizing = False
@@ -214,7 +239,7 @@ class MainWindow(QWidget):
 
         self._min_btn.clicked.connect(self.showMinimized)
         self._max_btn.clicked.connect(self._toggle_maximized)
-        self._close_btn.clicked.connect(self.hide)
+        self._close_btn.clicked.connect(self._hide_window)
 
         cap.addWidget(self._ink_dot, 0, Qt.AlignmentFlag.AlignVCenter)
         cap.addWidget(self._title, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -288,11 +313,15 @@ class MainWindow(QWidget):
         from sayink.ui.settings_window import SettingsWindow
 
         self._stack = QStackedWidget()
-        self._history = HistoryWindow(self._history_store, self)
+        self._stack.setObjectName("mainStack")
+        self._history = HistoryWindow(self._history_store, self, config=self._config)
         self._history.setObjectName(PAGE_OBJECT_NAMES[0])
+        self._meeting = self._build_meeting_page()
+        self._meeting.setObjectName(PAGE_OBJECT_NAMES[1])
         self._settings = SettingsWindow(self._config, self)
-        self._settings.setObjectName(PAGE_OBJECT_NAMES[1])
+        self._settings.setObjectName(PAGE_OBJECT_NAMES[2])
         self._stack.addWidget(self._history)
+        self._stack.addWidget(self._meeting)
         self._stack.addWidget(self._settings)
         body.addWidget(self._stack, 1)
         root.addLayout(body, 1)
@@ -303,6 +332,8 @@ class MainWindow(QWidget):
         self._settings.settings_changed.connect(self._refresh_usage_summary)
         self._settings.hotkey_updated.connect(self._refresh_usage_summary)
         self._history.history_preferences_requested.connect(self._open_history_preferences)
+        self._history.meeting_created.connect(self._open_promoted_meeting)
+        self._history.ai_settings_requested.connect(self._open_ai_connection)
         self._settings._history_enabled_row.toggled.connect(self._history.set_history_enabled)
         self._history.set_history_enabled(bool(self._config.get("history.enabled", False)))
         self._refresh_usage_summary()
@@ -311,16 +342,36 @@ class MainWindow(QWidget):
             shortcut = QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self)
             shortcut.activated.connect(lambda k=key: self.show_page(k))
             self._shortcuts.append(shortcut)
-        for sequence, callback in (("Ctrl+F", self._focus_history_search), ("Ctrl+W", self.hide)):
+        for sequence, callback in (("Ctrl+F", self._focus_history_search), ("Ctrl+W", self._hide_window)):
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.activated.connect(callback)
             self._shortcuts.append(shortcut)
         self._settings.hotkey_capture_started.connect(lambda: self._enable_shortcuts(False))
         self._settings.hotkey_capture_ended.connect(lambda: self._enable_shortcuts(True))
 
+        # Border lives on these four strips so maximize can hide it without
+        # restyling the window that owns every page.
+        self._frame_edges = tuple(_FrameEdge(self) for _ in range(4))
         self.resize(_WINDOW_W, _WINDOW_H)
         self._fit_to_available_screen()
         root.activate()
+
+    def _build_meeting_page(self) -> QWidget:
+        if self._meeting_controller is None:
+            # Without a controller (unit tests, style tools) the slot is a
+            # placeholder; the App always passes one.
+            placeholder = QWidget()
+            lay = QVBoxLayout(placeholder)
+            lay.addWidget(QLabel("会议记录在应用内可用"))
+            return placeholder
+        from sayink.ui.meeting_page import MeetingPage
+
+        page = MeetingPage(self._config, self._meeting_controller, self)
+        # Engine-page cards must flip to 「已启用」 when the download ran here.
+        # (The settings page is built right after this one; resolve it lazily.)
+        page.aux_models_changed.connect(lambda: self._settings._rebuild_model_cards())
+        page.configure_requested.connect(self._open_ai_connection)
+        return page
 
     def _enable_shortcuts(self, enabled: bool) -> None:
         for shortcut in self._shortcuts:
@@ -336,6 +387,16 @@ class MainWindow(QWidget):
         row = self._settings._history_enabled_row
         self._settings._pages.widget(0).ensureWidgetVisible(row)
         row.setFocus()
+
+    def _open_ai_connection(self) -> None:
+        self.show_page("polish")
+        self._settings.focus_llm_connection()
+
+    def _open_promoted_meeting(self, meeting_id: str) -> None:
+        self.show_page("meeting")
+        show_meeting = getattr(self._meeting, "show_meeting", None)
+        if callable(show_meeting):
+            show_meeting(meeting_id)
 
     @staticmethod
     def _status_tone(text: str) -> str:
@@ -377,6 +438,8 @@ class MainWindow(QWidget):
             inset = 6 if self.isMaximized() else 10
             self._size_grip.move(self.width() - 16 - inset, self.height() - 16 - inset)
             self._size_grip.setVisible(not self.isMaximized())
+        self._sync_frame_margin()
+        self._position_frame_edges()
         if self.isMaximized():
             self._clear_round_mask()
             return
@@ -385,6 +448,8 @@ class MainWindow(QWidget):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._fit_to_available_screen()
+        self._sync_frame_margin()
+        self._position_frame_edges()
         self._apply_window_shape()
         # Park focus on the window itself: otherwise Qt hands it to the first
         # tab stop and a nav button shows a focus ring nobody asked for. Tab
@@ -402,19 +467,26 @@ class MainWindow(QWidget):
             return
         if hasattr(self, "_max_btn"):
             self._sync_max_glyph()
-        if hasattr(self, "_caption"):
-            self._apply_chrome_radius()
+        # State changes already resize. Do not restyle or remask here: both
+        # run on the UI thread and show up as a pause, then a corner pop.
+        self._sync_frame_margin()
+        self._position_frame_edges()
 
     def _toggle_maximized(self) -> None:
-        if self.isMaximized():
-            self.showNormal()
-        else:
-            # Drop the rounded clip before the window grows, so intermediate
-            # sizes are not masked and then snapped square.
-            self._clear_round_mask()
-            self.showMaximized()
-        self._apply_chrome_radius()
-        self._sync_max_glyph()
+        # One paint of the final size. Clearing the rounded region or growing
+        # the window with updates on shows a square frame, then waits.
+        self.setUpdatesEnabled(False)
+        try:
+            if self.isMaximized():
+                self.showNormal()
+            else:
+                self._clear_round_mask()
+                self.showMaximized()
+            self._sync_frame_margin()
+            self._position_frame_edges()
+            self._apply_window_shape()
+        finally:
+            self.setUpdatesEnabled(True)
 
     def _chrome_radius(self) -> int:
         return 0 if self.isMaximized() else tok.WINDOW_RADIUS
@@ -441,35 +513,71 @@ class MainWindow(QWidget):
             self.clearMask()
 
     def _apply_chrome_radius(self) -> None:
-        """Update only the corner chrome. A full theme pass flashes on maximize."""
+        """Theme colors for the frame. Maximize does not call this."""
         from sayink.ui import design_tokens as live
 
-        radius = self._chrome_radius()
-        border = "none" if radius <= 0 else f"1px solid {live.TEXT_DIM}"
         self.setStyleSheet(
-            f"QWidget#mainWindow {{ background: {live.BG};"
-            f" border: {border};"
-            f" border-radius: {radius}px; }}"
+            f"QWidget#mainWindow {{ background: {live.BG}; border: none; }}"
         )
         self._caption.setStyleSheet(
             f"QWidget#mainCaption {{"
             f" background: {live.BG};"
             f" border: none;"
             f" border-bottom: 1px solid {live.CONTROL_BORDER};"
-            f" border-top-left-radius: {radius}px;"
-            f" border-top-right-radius: {radius}px;"
             f"}}"
         )
         self._sidebar.setStyleSheet(
             f"QWidget#mainSidebar {{ background: {live.NAV_BG};"
-            f" border-right: 1px solid {live.HAIRLINE};"
-            f" border-bottom-left-radius: {radius}px; }}"
+            f" border-right: 1px solid {live.HAIRLINE}; }}"
         )
-        inset = 0 if radius <= 0 else 1
-        lay = self.layout()
-        if lay is not None:
-            lay.setContentsMargins(inset, inset, inset, inset)
+        if hasattr(self, "_frame_edges"):
+            color = QColor(live.TEXT_DIM)
+            for edge in self._frame_edges:
+                palette = edge.palette()
+                palette.setColor(edge.backgroundRole(), color)
+                edge.setPalette(palette)
+        self._sync_frame_margin()
+        self._position_frame_edges()
         self._apply_window_shape()
+
+    def _sync_frame_margin(self) -> None:
+        """1px gutter while windowed so the border is not covered; flush when maximized.
+
+        Done from the resize that maximize already causes, so it shares that
+        layout pass instead of shifting the old frame first.
+        """
+        lay = self.layout()
+        if lay is None:
+            return
+        margin = 0 if self.isMaximized() else 1
+        current = lay.contentsMargins()
+        if (current.left(), current.top(), current.right(), current.bottom()) == (
+            margin,
+            margin,
+            margin,
+            margin,
+        ):
+            return
+        lay.setContentsMargins(margin, margin, margin, margin)
+
+    def _position_frame_edges(self) -> None:
+        if not hasattr(self, "_frame_edges"):
+            return
+        width, height = self.width(), self.height()
+        # Collapse instead of hide(): QWidget.show() on a child would also
+        # show this window, including during a close that is already in flight.
+        if self.isMaximized() or width <= 0 or height <= 0:
+            geos = ((0, 0, 0, 0),) * 4
+        else:
+            geos = (
+                (0, 0, width, 1),
+                (0, height - 1, width, 1),
+                (0, 0, 1, height),
+                (width - 1, 0, 1, height),
+            )
+        for edge, geo in zip(self._frame_edges, geos):
+            if edge.geometry().getRect() != geo:
+                edge.setGeometry(*geo)
 
     def _apply_window_shape(self) -> None:
         radius = self._chrome_radius()
@@ -490,13 +598,18 @@ class MainWindow(QWidget):
 
     @property
     def settings_panel(self):
-        """The settings pages (通用 / 引擎 / 润色 / 关于); the App talks to it only through this."""
+        """The settings pages (通用 / 引擎 / AI 服务 / 关于); the App talks to it only through this."""
         return self._settings
 
     @property
     def history_panel(self):
         """The 历史 page."""
         return self._history
+
+    @property
+    def meeting_panel(self):
+        """The 会议 page (a :class:`~sayink.ui.meeting_page.MeetingPage` inside the App)."""
+        return self._meeting
 
     def show_page(self, key: str) -> None:
         if key not in PAGE_KEYS:
@@ -509,10 +622,15 @@ class MainWindow(QWidget):
             "about": 3,
         }
         if key == "history":
-            self._stack.setCurrentIndex(0)
+            self._stack.setCurrentIndex(_STACK_HISTORY)
             self._history.refresh()
+        elif key == "meeting":
+            self._stack.setCurrentIndex(_STACK_MEETING)
+            refresh = getattr(self._meeting, "refresh", None)
+            if callable(refresh):
+                refresh()
         else:
-            self._stack.setCurrentIndex(1)
+            self._stack.setCurrentIndex(_STACK_SETTINGS)
             self._settings.show_page(settings_index[key])
         nav_index = PAGE_KEYS.index(key)
         btn = self._nav_buttons[nav_index]
@@ -558,9 +676,33 @@ class MainWindow(QWidget):
             self._drag_offset = None
         return super().eventFilter(obj, event)
 
+    def _hide_window(self) -> None:
+        """Leave the app in the tray. The window should already be gone before Qt tears state down.
+
+        ShowWindow(SW_HIDE) activates another window and, on a maximized
+        frameless window, can restore the normal rect for a frame first.
+        SetWindowPos hides in place.
+        """
+        if getattr(self, "_hiding", False):
+            return
+        self._hiding = True
+        try:
+            if sys.platform == "win32" and self.isVisible():
+                try:
+                    from ctypes import windll
+
+                    hwnd = int(self.winId())
+                    if hwnd:
+                        windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, _SWP_HIDE_ONLY)
+                except Exception:
+                    pass
+            self.hide()
+        finally:
+            self._hiding = False
+
     def closeEvent(self, event) -> None:
         event.ignore()
-        self.hide()
+        self._hide_window()
 
     def reapply_theme(self) -> None:
         from sayink.ui import design_tokens as live
@@ -601,7 +743,9 @@ class MainWindow(QWidget):
             f"color: {live.TEXT}; font-size: {live.TYPE_FOOTNOTE}px; font-weight: 700;"
             f" background: transparent; padding: 0;")
         self._paint_status_dot()
-        self._stack.setStyleSheet(f"background: {live.BG};")
+        # Scoped: a bare declaration cascades to every descendant QWidget and
+        # paints list item widgets opaque, hiding ::item:selected under them.
+        self._stack.setStyleSheet(f"QStackedWidget#mainStack {{ background: {live.BG}; }}")
 
     # ── native edge resize (Windows) ─────────────────────────────
 
@@ -753,7 +897,10 @@ class MainWindow(QWidget):
                     if self._fill_min_max_info(msg):
                         return True, 0
                 if msg.message == _WM_NCCALCSIZE and msg.wParam:
-                    if self._skip_stale_client_copy(msg):
+                    # The 1px valid-rect result is only for a live edge drag.
+                    # Maximize also changes size; applying it there discards the
+                    # old frame, then the window waits and the new size pops in.
+                    if self._live_resizing and self._skip_stale_client_copy(msg):
                         return True, _WVR_VALIDRECTS
                 if msg.message == _WM_ENTERSIZEMOVE:
                     self._live_resizing = True

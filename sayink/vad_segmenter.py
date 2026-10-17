@@ -1,11 +1,23 @@
-"""Simple RMS-based speech segmentation for continuous listening mode."""
+"""Speech segmentation for continuous listening / meeting mode.
+
+The segmenter decides *where* an utterance starts and ends from a per-block
+"is this speech?" verdict. By default that verdict is the adaptive RMS gate
+(:class:`EnergyGate`, the behaviour dictation has always had); meeting mode
+can swap in :class:`SileroGate`, a neural VAD, which tells a quiet talker
+from a fan and a keyboard from a word (docs/meeting-notes-design.md §5.8).
+"""
 
 from __future__ import annotations
+
+import logging
+from pathlib import Path
 
 import numpy as np
 
 from sayink.audio_utils import TARGET_SAMPLE_RATE, rms_volume
 from sayink.speaker_session import dominant_route
+
+log = logging.getLogger("SayInk")
 
 SPEECH_RMS_THRESHOLD = 0.002
 SILENCE_HOLD_SEC = 1.2
@@ -55,6 +67,114 @@ CUT_SEARCH_SEC = 3.0
 # of the window's median; otherwise the cut stays at the limit.
 QUIET_CUT_RATIO = 0.6
 
+VAD_ENERGY = "energy"
+VAD_SILERO = "silero"
+# Silero's exported model takes exactly 512 samples (32 ms) at 16 kHz.
+SILERO_WINDOW = 512
+SILERO_THRESHOLD = 0.5
+# A meeting pause is longer than a dictation pause: speakers think, look at
+# slides, wait for someone else. Holding longer keeps a sentence together.
+MEETING_SILENCE_HOLD_SEC = 1.5
+# A talker who goes on for a long time: cut at a breath, not mid-word, but
+# well inside the ASR context window.
+MEETING_MAX_SPEECH_SEC = 15.0
+
+
+class SpeechGate:
+    """Per-block speech verdict used by :class:`SpeechSegmenter`."""
+
+    name = "gate"
+
+    def is_speech(self, block: np.ndarray, rms: float, *, in_speech: bool) -> bool:
+        raise NotImplementedError
+
+    def reset(self) -> None:
+        """Forget state between utterances (Silero keeps an LSTM state)."""
+
+
+class EnergyGate(SpeechGate):
+    """The adaptive RMS gate: speech is anything louder than the room."""
+
+    name = VAD_ENERGY
+
+    def __init__(self, segmenter: "SpeechSegmenter"):
+        self._segmenter = segmenter
+
+    def is_speech(self, block: np.ndarray, rms: float, *, in_speech: bool) -> bool:
+        seg = self._segmenter
+        gate = seg.hold_threshold if in_speech else seg.effective_threshold
+        return rms >= gate
+
+
+class SileroGate(SpeechGate):
+    """Silero VAD (via sherpa-onnx ``VadModel``) with the energy gate as a floor.
+
+    Each block is scored in 512-sample windows; any speech window makes the
+    block speech. The RMS gate still has to agree that *something* is there
+    (``rms >= noise floor``), so Silero cannot open on digital silence, and
+    the segmenter's noise-floor tracking keeps working underneath.
+    """
+
+    name = VAD_SILERO
+
+    def __init__(self, model_path: str | Path, *, threshold: float = SILERO_THRESHOLD,
+                 num_threads: int = 1):
+        import sherpa_onnx
+
+        silero = sherpa_onnx.SileroVadModelConfig(
+            model=str(model_path),
+            threshold=float(threshold),
+            window_size=SILERO_WINDOW,
+        )
+        config = sherpa_onnx.VadModelConfig()
+        config.silero_vad = silero
+        config.sample_rate = TARGET_SAMPLE_RATE
+        config.num_threads = int(num_threads)
+        self._model = sherpa_onnx.VadModel.create(config)
+        # A property in older sherpa-onnx builds, a method in 1.13.x.
+        window = getattr(self._model, "window_size", SILERO_WINDOW)
+        if callable(window):
+            window = window()
+        self._window = int(window or SILERO_WINDOW)
+        self._carry = np.zeros(0, dtype=np.float32)
+        self._last_verdict = False
+
+    def is_speech(self, block: np.ndarray, rms: float, *, in_speech: bool) -> bool:
+        samples = np.concatenate([self._carry, np.asarray(block, dtype=np.float32).reshape(-1)])
+        verdict = False
+        offset = 0
+        scored = False
+        while offset + self._window <= samples.size:
+            window = samples[offset:offset + self._window]
+            scored = True
+            if self._model.is_speech(window):
+                verdict = True
+            offset += self._window
+        self._carry = samples[offset:]
+        if not scored:
+            # Block shorter than one window (a drained remainder): keep the
+            # previous verdict so a trailing word is not cut off.
+            return self._last_verdict
+        self._last_verdict = verdict
+        return verdict
+
+    def reset(self) -> None:
+        self._model.reset()
+        self._carry = np.zeros(0, dtype=np.float32)
+        self._last_verdict = False
+
+
+def make_speech_gate(kind: str, segmenter: "SpeechSegmenter", *, model_path: str | Path | None = None) -> SpeechGate:
+    """Build the requested gate; falls back to energy when Silero is unavailable."""
+    if kind == VAD_SILERO and model_path:
+        try:
+            gate = SileroGate(model_path)
+            log.info("会议 VAD: Silero (%s)", model_path)
+            return gate
+        except Exception as exc:  # sherpa_onnx missing, model file bad, …
+            log.warning("Silero VAD 不可用，改用能量门限: %s", exc)
+    return EnergyGate(segmenter)
+
 
 class SpeechSegmenter:
     """Accumulates 16 kHz mono audio; returns a segment when speech ends."""
@@ -73,8 +193,10 @@ class SpeechSegmenter:
         short_speech_sec: float = SHORT_SPEECH_SEC,
         short_silence_hold_sec: float = SHORT_SILENCE_HOLD_SEC,
         trailing_silence_keep_sec: float = TRAILING_SILENCE_KEEP_SEC,
+        gate: SpeechGate | None = None,
     ):
         self._rate = sample_rate
+        self._gate: SpeechGate = gate if gate is not None else EnergyGate(self)
         self._speech_threshold = speech_threshold
         self._silence_hold_samples = int(sample_rate * silence_hold_sec)
         self._pre_roll_samples = int(sample_rate * max(0.0, pre_roll_sec))
@@ -98,6 +220,18 @@ class SpeechSegmenter:
     def speech_threshold(self) -> float:
         """Configured base gate (system loopback uses a lower one)."""
         return self._speech_threshold
+
+    @property
+    def gate(self) -> SpeechGate:
+        return self._gate
+
+    def set_gate(self, gate: SpeechGate | None) -> None:
+        self._gate = gate if gate is not None else EnergyGate(self)
+        self._gate.reset()
+
+    @property
+    def gate_name(self) -> str:
+        return self._gate.name
 
     @property
     def effective_threshold(self) -> float:
@@ -132,6 +266,9 @@ class SpeechSegmenter:
     def reset(self) -> None:
         # The noise-floor window deliberately survives reset(): it describes
         # the room, not the utterance.
+        gate = getattr(self, "_gate", None)
+        if gate is not None and not isinstance(gate, EnergyGate):
+            gate.reset()
         self._buffer: list[np.ndarray] = []
         # (sample count, mic energy, system energy, block RMS) per buffered block.
         self._energy: list[tuple[int, float, float, float]] = []
@@ -151,6 +288,11 @@ class SpeechSegmenter:
         """mic, system, or empty for the segment most recently emitted."""
         return self._last_route
 
+    @property
+    def in_speech(self) -> bool:
+        """True while an utterance is being buffered (gate has opened)."""
+        return self._in_speech
+
     def feed(
         self,
         mono_block: np.ndarray,
@@ -164,8 +306,11 @@ class SpeechSegmenter:
 
         rms = rms_volume(block)
         self._track_noise_floor(int(block.size), float(rms))
-        gate = self.hold_threshold if self._in_speech else self.effective_threshold
-        loud = rms >= gate
+        loud = self._gate.is_speech(block, float(rms), in_speech=self._in_speech)
+        if loud and not isinstance(self._gate, EnergyGate):
+            # A neural gate still needs *something* above the room's floor;
+            # Silero scoring a hum as speech must not open on silence.
+            loud = rms >= min(self.hold_threshold, self._speech_threshold)
         if loud:
             if not self._in_speech:
                 self._in_speech = True

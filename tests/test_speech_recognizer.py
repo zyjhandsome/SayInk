@@ -186,6 +186,31 @@ class TestNormalizeAsrOutput:
         assert normalize_asr_output(text) == expected
 
     @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("叮" * 8, "叮叮叮"),
+            ("嗯" * 11 + "，好的。", "嗯嗯嗯，好的。"),
+            ("好的。" + "他走了，" * 7 + "他走了。", "好的。"),
+            ("他走了，" * 8 + "我们继续。", "我们继续。"),
+            ("对，" * 10 + "就这样。", "对对对，就这样。"),
+        ],
+    )
+    def test_loops_are_found_across_punctuation(self, text, expected):
+        assert normalize_asr_output(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "预算是100000000元。",
+            "电话 8888 8888 8888 8888",
+            "他走了，他走了，他走了。",
+            "谢谢谢谢，太好了。",
+        ],
+    )
+    def test_numbers_and_short_repeats_are_untouched(self, text):
+        assert normalize_asr_output(text) == text
+
+    @pytest.mark.parametrize(
         "text",
         [
             "こんにちは、今日はいい天気ですね。",
@@ -855,13 +880,184 @@ class TestCreateRecognizer:
         assert captured["tokenizer"] == str(tmp_path / "tokenizer")
         assert captured["num_threads"] == 2
 
+    def test_funasr_nano_receives_hotwords_and_language(self, tmp_path, monkeypatch):
+        from sayink import speech_recognizer as sr
+
+        captured = {}
+
+        def from_funasr_nano(cls, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+        self._install_sherpa(monkeypatch, from_funasr_nano=from_funasr_nano)
+        monkeypatch.setattr(sr, "get_model_dir", lambda mid: tmp_path)
+        sr._create_recognizer("funasr-nano", 4, hotwords="SayInk,张鑫", language="中文")
+        assert captured["hotwords"] == "SayInk,张鑫"
+        assert captured["language"] == "中文"
+
+    def test_sense_voice_receives_language_only(self, tmp_path, monkeypatch):
+        from sayink import speech_recognizer as sr
+
+        captured = {}
+
+        def from_sense_voice(cls, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+        self._install_sherpa(monkeypatch, from_sense_voice=from_sense_voice)
+        monkeypatch.setattr(sr, "get_model_dir", lambda mid: tmp_path)
+        sr._create_recognizer("sensevoice", 4, language="zh")
+        assert captured["language"] == "zh"
+        assert "hotwords" not in captured
+
+    def test_aux_model_is_not_a_recognizer(self, monkeypatch):
+        from sayink import speech_recognizer as sr
+
+        self._install_sherpa(monkeypatch)
+        with pytest.raises(ValueError):
+            sr._create_recognizer(sr.AUX_MODEL_SILERO_VAD, 4)
+
+
+class TestMeetingModelKnobs:
+    def test_supports_flags(self):
+        from sayink import speech_recognizer as sr
+
+        assert sr.model_supports("funasr-nano", sr.SUPPORTS_HOTWORDS)
+        assert sr.model_supports("funasr-nano", sr.SUPPORTS_LANGUAGE)
+        assert sr.model_supports("qwen3-asr-0.6b", sr.SUPPORTS_HOTWORDS)
+        assert not sr.model_supports("qwen3-asr-0.6b", sr.SUPPORTS_LANGUAGE)
+        assert sr.model_supports("sensevoice", sr.SUPPORTS_LANGUAGE)
+        assert not sr.model_supports("fireredasr2-ctc", sr.SUPPORTS_HOTWORDS)
+        assert not sr.model_supports("nonexistent", sr.SUPPORTS_HOTWORDS)
+
+    def test_language_argument_per_loader(self):
+        from sayink import speech_recognizer as sr
+
+        assert sr.language_argument("funasr-nano", "zh") == "中文"
+        assert sr.language_argument("funasr-nano", "en") == "英文"
+        assert sr.language_argument("funasr-nano", "auto") == ""
+        assert sr.language_argument("sensevoice", "yue") == "yue"
+        assert sr.language_argument("sensevoice", "zh") == "zh"
+        assert sr.language_argument("fireredasr2-ctc", "zh") == ""
+        assert sr.language_argument("funasr-nano", "ko") == ""
+
+    def test_format_hotwords_uses_terms_only_and_dedups(self):
+        from sayink import speech_recognizer as sr
+
+        glossary = [
+            {"term": "SayInk", "variants": ["say ink", "赛音"]},
+            {"term": " 张鑫 ", "variants": ["张新"]},
+            {"term": "SayInk"},
+            "Fun-ASR",
+            {"term": "a,b"},
+            {"term": ""},
+            {"term": "x" * 30},
+        ]
+        assert sr.format_hotwords(glossary) == "SayInk,张鑫,Fun-ASR,a b"
+        assert sr.format_hotwords([]) == ""
+        assert sr.format_hotwords(None) == ""
+
+    def test_format_hotwords_caps_count(self):
+        from sayink import speech_recognizer as sr
+
+        many = [{"term": f"词{i}"} for i in range(200)]
+        assert len(sr.format_hotwords(many).split(",")) == sr.MAX_HOTWORDS
+
+    def test_effective_language_defaults_to_chinese(self):
+        from sayink import speech_recognizer as sr
+
+        assert sr.effective_language("auto") == "zh"
+        assert sr.effective_language("") == "zh"
+        assert sr.effective_language(" EN ") == "en"
+
+    def test_recognition_params_read_shared_stt_settings(self):
+        """Dictation and meetings derive the same (hotwords, language) target
+        from ``stt.*`` so starting a meeting never forces a reload."""
+        from sayink import speech_recognizer as sr
+
+        class _Cfg:
+            def __init__(self, data):
+                self._d = data
+
+            def get(self, key, default=None):
+                return self._d.get(key, default)
+
+        cfg = _Cfg({"stt.glossary": [{"term": "SayInk"}, {"term": "张鑫"}], "stt.language": "en"})
+        assert sr.recognition_params(cfg) == ("SayInk,张鑫", "en")
+        assert sr.recognition_params(_Cfg({})) == ("", "zh")
+        assert sr.recognition_params(_Cfg({"stt.glossary": None, "stt.language": None})) == ("", "zh")
+
+    def test_aux_registry_reachable_via_get_model_info(self):
+        from sayink import speech_recognizer as sr
+
+        spk = sr.get_model_info(sr.AUX_MODEL_SPEAKER)
+        assert spk is not None and spk["aux"] is True
+        assert spk["hf_repo"] == "csukuangfj/speaker-embedding-models"
+        vad = sr.get_model_info(sr.AUX_MODEL_SILERO_VAD)
+        assert vad["files"] == ["silero_vad.onnx"]
+        assert sr.is_aux_model(sr.AUX_MODEL_SPEAKER)
+        assert not sr.is_aux_model("funasr-nano")
+        # Never offered as a dictation model.
+        assert all(not m.get("aux") for m in sr.MODEL_REGISTRY)
+
+    def test_configure_drops_unsupported_knobs_and_reloads_on_change(self, monkeypatch):
+        from sayink import speech_recognizer as sr
+
+        loads: list[tuple] = []
+
+        class FakeWorker:
+            def __init__(self, model_id, num_threads=4, *, hotwords="", language=""):
+                loads.append((model_id, num_threads, hotwords, language))
+                self.loaded = _Sig()
+                self.error = _Sig()
+                self.finished = _Sig()
+                self.running = False
+
+            def start(self):
+                self.running = True
+
+            def isRunning(self):
+                return self.running
+
+            def wait(self, _ms=0):
+                return True
+
+        class _Sig:
+            def connect(self, *_):
+                pass
+
+        def _finish_load(rec):
+            rec._load_worker.running = False
+            rec._on_model_loaded(object(), rec._target())
+            rec._on_load_worker_finished()
+
+        monkeypatch.setattr(sr, "ModelLoadWorker", FakeWorker)
+        monkeypatch.setattr(sr, "is_model_downloaded", lambda mid: True)
+        rec = sr.SpeechRecognizer()
+        rec.configure("fireredasr2-ctc", 4, hotwords="A,B", language="zh")
+        assert loads[-1] == ("fireredasr2-ctc", 4, "", "")
+        # Same effective target → no reload even though knobs differ.
+        rec.configure("fireredasr2-ctc", 4, hotwords="C", language="en")
+        _finish_load(rec)
+        rec.configure("fireredasr2-ctc", 4)
+        assert len(loads) == 1
+
+        rec.configure("funasr-nano", 4, hotwords="A,B", language="zh")
+        assert loads[-1] == ("funasr-nano", 4, "A,B", "中文")
+        _finish_load(rec)
+        rec.configure("funasr-nano", 4, hotwords="A,B", language="zh")
+        assert len(loads) == 2
+        rec.configure("funasr-nano", 4, hotwords="", language="auto")
+        assert loads[-1] == ("funasr-nano", 4, "", "")
+        assert rec.current_hotwords == ""
+
 
 class TestModelLoadWorkerRun:
     def test_run_success_emits_loaded(self, monkeypatch):
         from sayink import speech_recognizer as sr
 
         sentinel = object()
-        monkeypatch.setattr(sr, "_create_recognizer", lambda mid, n: sentinel)
+        monkeypatch.setattr(sr, "_create_recognizer", lambda mid, n, **kw: sentinel)
         worker = sr.ModelLoadWorker("fireredasr2-ctc", 4)
         loaded, errors = [], []
         worker.loaded.connect(loaded.append)
@@ -873,7 +1069,7 @@ class TestModelLoadWorkerRun:
     def test_run_failure_emits_error(self, monkeypatch):
         from sayink import speech_recognizer as sr
 
-        def _boom(mid, n):
+        def _boom(mid, n, **kw):
             raise RuntimeError("load failed")
 
         monkeypatch.setattr(sr, "_create_recognizer", _boom)
@@ -1012,10 +1208,12 @@ class TestSpeechRecognizerBehavior:
 class _FakeLoadWorker:
     instances: list = []
 
-    def __init__(self, model_id, num_threads):
+    def __init__(self, model_id, num_threads, *, hotwords="", language=""):
         from unittest.mock import MagicMock
 
         self.model_id = model_id
+        self.hotwords = hotwords
+        self.language = language
         self.running = False
         self.loaded = MagicMock()
         self.error = MagicMock()

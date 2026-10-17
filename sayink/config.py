@@ -59,6 +59,9 @@ def is_reserved_hotkey(hotkey: str) -> bool:
 
 TRIGGER_MODE_HOTKEY = "hotkey"
 TRIGGER_MODE_CONTINUOUS = "continuous"
+# Not a user-selectable trigger mode: the value written to history rows that
+# belong to a meeting started from the 「会议」 page / tray.
+TRIGGER_MODE_MEETING = "meeting"
 
 DEFAULT_HOTKEY = "alt+x"
 
@@ -97,6 +100,11 @@ DEFAULT_CONFIG = {
         "models_dir": "",
         "download_source": "auto",
         "migration_version": 0,
+        # 识别增强——听写与会议共用（曾是 meeting.* 键，启动时自动迁移）。
+        "glossary": [],            # [{"term": "张鑫", "variants": ["张新"]}] → 热词
+        "language": "auto",        # 语种锁定；auto → zh（支持 language 的模型）
+        "vad": "silero",           # silero / energy；Silero 未下载时自动退回 energy
+        "speaker_model_enabled": True,
     },
     "llm": {
         "enabled": False,
@@ -115,6 +123,21 @@ DEFAULT_CONFIG = {
     "appearance": {
         "theme_mode": "dark",
     },
+    # 会议记录 / 会议纪要（docs/meeting-notes-design.md §4.8）。
+    "meeting": {
+        "input_source": "mixed",
+        "model_id": "",            # 空 = 沿用 stt.model_id
+        "hotkey": "",              # 空 = 未设置
+        "show_start_card": True,
+        "polish_segments": False,
+        "model_name": "",          # 纪要模型；空 = 沿用 llm.model_name
+        "template_id": "general",
+        "output_language": "auto",
+        "aux_prompted": False,     # 首次开会缺辅助模型时问过一次「现在下载？」
+        "confirmed_remote_hosts": [],
+        "single_request_char_limit": 20000,
+        "separate_lanes": False,
+    },
     "update": {
         "auto_check": True,
         "last_check_at": 0,
@@ -123,6 +146,8 @@ DEFAULT_CONFIG = {
 
 
 SECRET_KEY = "llm.api_key"
+# Keys that moved from the meeting section to stt (shared by dictation).
+SHARED_RECOGNITION_KEYS = ("glossary", "language", "vad", "speaker_model_enabled")
 # Run-key value name written by VoiceInk ≤ 2.1.0; removed once on first start.
 LEGACY_AUTO_START_VALUE = "VoiceInk"
 
@@ -177,8 +202,9 @@ class Config:
                 )
                 raw = {}
         self._extra_keys = {k: v for k, v in raw.items() if k not in DEFAULT_CONFIG}
+        moved = self._migrate_recognition_settings(raw)
         self._config = self._merge_defaults(DEFAULT_CONFIG, raw)
-        if self._strip_test_pollution():
+        if self._strip_test_pollution() or moved:
             self.save_immediate()
         # True = 不写欢迎弹窗（升级用户或未配置时用默认 True）；首次本无配置文件时单独打开欢迎
         if not config_existed:
@@ -258,6 +284,30 @@ class Config:
         for k in dirty:
             del self._extra_keys[k]
         return bool(dirty)
+
+    @staticmethod
+    def _migrate_recognition_settings(raw: dict) -> bool:
+        """Glossary / language / VAD / speaker model used to be meeting-only
+        (``meeting.*``); dictation shares them now under ``stt.*``. Move the
+        values once so nobody loses their term list. Returns True on change."""
+        meeting = raw.get("meeting")
+        if not isinstance(meeting, dict):
+            return False
+        moved = False
+        stt = raw.get("stt")
+        if not isinstance(stt, dict):
+            stt = {}
+        for key in SHARED_RECOGNITION_KEYS:
+            if key not in meeting:
+                continue
+            value = meeting.pop(key)
+            if key not in stt:
+                stt[key] = value
+                log.info("升级迁移：meeting.%s → stt.%s", key, key)
+            moved = True
+        if moved:
+            raw["stt"] = stt
+        return moved
 
     def _migrate_stt_model(self) -> None:
         """One-time upgrade: former app defaults → Fun-ASR-Nano."""
@@ -349,7 +399,7 @@ class Config:
             else:
                 result[key] = (
                     copy.deepcopy(default_value)
-                    if isinstance(default_value, dict)
+                    if isinstance(default_value, (dict, list))
                     else default_value
                 )
         return result

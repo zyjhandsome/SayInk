@@ -264,7 +264,13 @@ def main():
     from sayink.platform.windows_identity import configure_windows_app_identity
     configure_windows_app_identity(app)
 
-    app.setStyle("Fusion")
+    from PyQt6.QtCore import Qt
+
+    from sayink.ui.app_styles import DropDownComboStyle
+    app.setStyle(DropDownComboStyle("Fusion"))
+    # Windows' "slide open combo boxes" rolls a snapshot of the popup, then
+    # swaps in the real one; the swap reads as a flash on dark surfaces.
+    app.setEffectEnabled(Qt.UIEffect.UI_AnimateCombo, False)
 
     from sayink.config import Config
     from sayink.ui.theme import apply_theme

@@ -1,0 +1,695 @@
+"""MeetingController: lifecycle, marks, recluster on finalize, speaker rename,
+minutes generation gating, remote-host confirmation; plus the MeetingPage
+smoke under the offscreen platform."""
+
+from __future__ import annotations
+
+import json
+import time
+
+import numpy as np
+import pytest
+from PyQt6.QtCore import QCoreApplication
+from PyQt6.QtWidgets import QLabel
+
+from sayink.config import Config
+from sayink.history_store import HistoryStore, SegmentRecord
+from sayink.meeting_session import (
+    MeetingCapabilities,
+    MeetingController,
+    MeetingOptions,
+    MeetingState,
+    minutes_settings,
+    resolve_capabilities,
+    safe_filename,
+)
+from sayink.meeting_store import STATUS_ENDED, STATUS_INTERRUPTED
+from sayink.vad_segmenter import VAD_ENERGY, VAD_SILERO
+
+
+def _pump(ms: int = 50) -> None:
+    deadline = time.monotonic() + ms / 1000
+    while time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.005)
+
+
+@pytest.fixture
+def config(tmp_path):
+    return Config(config_dir=tmp_path / "cfg")
+
+
+@pytest.fixture
+def history(tmp_path):
+    store = HistoryStore(db_path=tmp_path / "history.db")
+    yield store
+    store.close(timeout=2.0)
+
+
+@pytest.fixture
+def controller(config, history):
+    pending = {"n": 0}
+    ctrl = MeetingController(config, history, pending_segments=lambda: pending["n"])
+    ctrl._test_pending = pending
+    yield ctrl
+    ctrl.shutdown()
+
+
+def _caps(**over) -> MeetingCapabilities:
+    base = dict(
+        model_id="funasr-nano", hotwords="", hotwords_supported=True, language="中文",
+        language_supported=True, vad=VAD_ENERGY, speaker_model_available=False,
+    )
+    base.update(over)
+    return MeetingCapabilities(**base)
+
+
+def _row(meeting_id: str, seq: int, text: str, *, speaker_id: int, started_at: int) -> SegmentRecord:
+    return SegmentRecord(
+        session_id=meeting_id, seq=seq, created_at=started_at + (seq + 1) * 3000,
+        raw_text=text, source="mixed", duration_ms=2000, trigger_mode="meeting",
+        model="funasr-nano", speaker_id=speaker_id, captured_at=started_at + seq * 3000,
+    )
+
+
+class TestCapabilities:
+    def test_energy_fallback_when_silero_missing(self, config, monkeypatch):
+        monkeypatch.setattr("sayink.meeting_session.aux_model_path", lambda _mid: None)
+        caps = resolve_capabilities(config, MeetingOptions(vad=VAD_SILERO), dictation_model_id="funasr-nano")
+        assert caps.vad == VAD_ENERGY
+        assert caps.speaker_model_available is False
+        assert any("Silero" in n for n in caps.notes)
+        assert any("说话人" in n for n in caps.notes)
+
+    def test_model_defaults_to_dictation_and_language_defaults_to_zh(self, config, monkeypatch):
+        monkeypatch.setattr("sayink.meeting_session.aux_model_path", lambda _mid: None)
+        caps = resolve_capabilities(config, MeetingOptions(), dictation_model_id="qwen3-asr-0.6b")
+        assert caps.model_id == "qwen3-asr-0.6b"
+        assert caps.language == "zh"
+        assert caps.hotwords_supported is True
+        assert caps.language_supported is False
+
+    def test_hotwords_note_when_model_cannot_use_them(self, config, monkeypatch):
+        monkeypatch.setattr("sayink.meeting_session.aux_model_path", lambda _mid: None)
+        opts = MeetingOptions(glossary=[{"term": "SayInk"}])
+        caps = resolve_capabilities(config, opts, dictation_model_id="sensevoice")
+        assert caps.hotwords == "SayInk"
+        assert not caps.hotwords_supported
+        assert any("热词" in n for n in caps.notes)
+
+    def test_safe_filename_strips_path_characters(self):
+        assert safe_filename('Q3 复盘: a/b*c?') == "Q3 复盘 a b c"
+        assert safe_filename("") == "会议纪要"
+
+    def test_minutes_settings_prefer_meeting_model(self, config):
+        config.set("llm.api_url", "http://localhost:1234/v1")
+        config.set("llm.api_key", "k")
+        config.set("llm.model_name", "polish-model")
+        assert minutes_settings(config)[2] == "polish-model"
+        config.set("meeting.model_name", "big-model")
+        assert minutes_settings(config)[2] == "big-model"
+
+
+class TestLifecycle:
+    def test_begin_creates_live_record_and_speaker_session(self, controller):
+        states = []
+        controller.state_changed.connect(states.append)
+        record = controller.begin(MeetingOptions(title="周会", input_source="mixed"), _caps())
+        assert controller.is_active
+        assert controller.state is MeetingState.LIVE
+        assert controller.current_id == record.id
+        assert controller.speakers is not None
+        assert controller.embedder is not None and controller.embedder.name == "mel"
+        stored = controller.store.get_meeting(record.id)
+        assert stored is not None and stored.title == "周会" and stored.status == "live"
+        assert states == [MeetingState.LIVE]
+
+    def test_second_begin_refused_while_active(self, controller):
+        controller.begin(MeetingOptions(), _caps())
+        with pytest.raises(RuntimeError):
+            controller.begin(MeetingOptions(), _caps())
+
+    def test_pause_resume(self, controller):
+        controller.begin(MeetingOptions(), _caps())
+        controller.pause("设备中断")
+        assert controller.state is MeetingState.PAUSED
+        assert controller.paused_detail == "设备中断"
+        controller.resume()
+        assert controller.state is MeetingState.LIVE
+        assert controller.paused_detail == ""
+
+    def test_add_mark_records_offset_and_notice(self, controller):
+        record = controller.begin(MeetingOptions(), _caps())
+        notices = []
+        controller.notice.connect(lambda t, d: notices.append((t, d)))
+        offset = controller.add_mark("重点")
+        assert offset is not None and offset >= 0
+        controller.store.flush()
+        marks = controller.store.get_marks(record.id)
+        assert [m.note for m in marks] == ["重点"]
+        assert notices and notices[0][0] == "已标记"
+
+    def test_request_end_waits_for_pending_segments(self, controller):
+        record = controller.begin(MeetingOptions(), _caps())
+        ended = []
+        controller.meeting_ended.connect(ended.append)
+        controller._test_pending["n"] = 2
+        controller.request_end()
+        assert controller.state is MeetingState.DRAINING
+        _pump(400)
+        assert not ended
+        controller._test_pending["n"] = 0
+        _pump(500)
+        assert ended == [record.id]
+        assert controller.state is MeetingState.IDLE
+        assert not controller.is_active
+        stored = controller.store.get_meeting(record.id)
+        assert stored is not None and stored.status == STATUS_ENDED and stored.ended_at
+
+    def test_finalize_reclusters_speakers_and_drops_embeddings(self, controller, history):
+        record = controller.begin(MeetingOptions(), _caps())
+        speakers = controller.speakers
+        base_a = np.zeros(24, dtype=np.float32)
+        base_a[0] = 1.0
+        base_b = np.zeros(24, dtype=np.float32)
+        base_b[1] = 1.0
+        # Speaker A twice, then a near-duplicate of A labelled as a new speaker
+        # because online matching saw it before A's centroid settled.
+        ids = [speakers.assign(base_a, ""), speakers.assign(base_b, ""), speakers.assign(base_a * 0.999, "")]
+        for seq, sid in enumerate(ids):
+            history.enqueue(_row(record.id, seq, f"t{seq}", speaker_id=sid, started_at=record.started_at))
+        history.flush(timeout=2.0)
+        controller.finalize()
+        assert controller.speakers is None and controller.embedder is None
+        rows = controller.store.get_segments(record.id)
+        assert rows[0].speaker_id == rows[2].speaker_id
+        assert rows[1].speaker_id != rows[0].speaker_id
+
+    def test_abandon_on_exit_closes_record(self, controller):
+        record = controller.begin(MeetingOptions(), _caps())
+        controller.abandon_on_exit()
+        assert not controller.is_active
+        stored = controller.store.get_meeting(record.id)
+        assert stored is not None and stored.ended_at
+
+    def test_mark_interrupted_flags_stale_live_meetings(self, controller, history):
+        record = controller.store.create_meeting(title="崩溃前")
+        controller.store.flush()
+        controller.mark_interrupted()
+        controller.store.flush()
+        stored = controller.store.get_meeting(record.id)
+        assert stored is not None and stored.status == STATUS_INTERRUPTED
+
+    def test_meeting_changed_emitted_on_history_commit(self, controller, history):
+        record = controller.begin(MeetingOptions(), _caps())
+        changed = []
+        controller.meeting_changed.connect(changed.append)
+        history.enqueue(_row(record.id, 0, "hi", speaker_id=1, started_at=record.started_at))
+        history.flush(timeout=2.0)
+        _pump(100)
+        assert record.id in changed
+
+
+class TestRenameAndExport:
+    def _ended_meeting(self, controller, history, *, notes_json=None, markdown="", user_edited=False):
+        record = controller.store.create_meeting(title="评审")
+        for seq, (sid, text) in enumerate([(1, "方案 A 通过"), (2, "下周上线")]):
+            history.enqueue(_row(record.id, seq, text, speaker_id=sid, started_at=record.started_at))
+        controller.store.end_meeting(record.id, ended_at=record.started_at + 60_000)
+        if markdown or notes_json:
+            controller.store.save_notes(
+                record.id, template_id="general", model="m",
+                json_payload=json.dumps(notes_json, ensure_ascii=False) if notes_json else "",
+                markdown=markdown, duration_ms=60_000, chunked=False,
+            )
+            if user_edited:
+                controller.store.save_user_markdown(record.id, markdown)
+        controller.store.flush()
+        return record
+
+    def test_rename_rerenders_json_notes(self, controller, history):
+        payload = {
+            "summary": "说话人1 说方案 A 通过。",
+            "key_points": [{"text": "方案 A 通过", "ts": "00:00:00", "speaker_id": 1}],
+            "decisions": [], "action_items": [], "questions": [], "timeline": [], "speaker_view": [],
+        }
+        record = self._ended_meeting(controller, history, notes_json=payload, markdown="# 评审\n说话人1 说方案 A 通过。")
+        replaced = controller.rename_speaker(record.id, 1, "张三")
+        assert replaced == 0
+        notes = controller.store.get_notes(record.id)
+        assert notes is not None and "张三" in notes.markdown and "说话人1" not in notes.markdown
+        assert controller.speaker_names(record.id) == {1: "张三"}
+
+    def test_rename_replaces_in_user_edited_notes(self, controller, history):
+        record = self._ended_meeting(controller, history, markdown="说话人2 负责上线。\n说话人21 不是同一人。", user_edited=True)
+        replaced = controller.rename_speaker(record.id, 2, "李四")
+        assert replaced == 1
+        notes = controller.store.get_notes(record.id)
+        assert notes is not None
+        assert notes.markdown.startswith("李四 负责上线。")
+        assert "说话人21" in notes.markdown
+        assert notes.user_edited
+
+    def test_export_includes_transcript_with_names(self, controller, history):
+        record = self._ended_meeting(controller, history, markdown="# 评审\n\n## 摘要\n通过。")
+        controller.rename_speaker(record.id, 1, "张三")
+        text = controller.export_markdown(record.id)
+        assert text.startswith("# 评审")
+        assert "## 文字稿" in text
+        assert "张三：方案 A 通过" in text
+        assert "说话人2：下周上线" in text
+        bare = controller.export_markdown(record.id, include_transcript=False)
+        assert "## 文字稿" not in bare
+
+    def test_export_without_notes_still_has_header(self, controller, history):
+        record = self._ended_meeting(controller, history)
+        text = controller.export_markdown(record.id)
+        assert text.startswith("# 评审")
+        assert "时长：00:01:00" in text
+
+    def test_delete_meeting_removes_everything(self, controller, history):
+        record = self._ended_meeting(controller, history, markdown="x")
+        controller.delete_meeting(record.id)
+        assert controller.store.get_meeting(record.id) is None
+        assert controller.store.get_segments(record.id) == []
+        assert controller.store.get_notes(record.id) is None
+
+
+class TestGeneration:
+    def test_generate_refuses_without_settings(self, controller, history):
+        record = controller.store.create_meeting()
+        history.enqueue(_row(record.id, 0, "hi", speaker_id=1, started_at=record.started_at))
+        controller.store.end_meeting(record.id)
+        controller.store.flush()
+        failures = []
+        controller.generation_failed.connect(lambda mid, msg: failures.append((mid, msg)))
+        assert controller.generate(record.id) is False
+        assert failures and "未配置" in failures[0][1]
+
+    def test_generate_refuses_empty_transcript(self, controller, config):
+        config.set("llm.api_url", "http://localhost:1234/v1")
+        config.set("llm.api_key", "k")
+        config.set("llm.model_name", "m")
+        record = controller.store.create_meeting()
+        controller.store.end_meeting(record.id)
+        controller.store.flush()
+        failures = []
+        controller.generation_failed.connect(lambda mid, msg: failures.append(msg))
+        assert controller.generate(record.id) is False
+        assert failures == ["文字稿为空，无法生成纪要"]
+
+    def test_generate_dispatches_request_and_saves_result(self, controller, config, history, monkeypatch):
+        config.set("llm.api_url", "http://localhost:1234/v1")
+        config.set("llm.api_key", "k")
+        config.set("llm.model_name", "m")
+        config.set("meeting.template_id", "standup")
+        record = controller.store.create_meeting(title="站会")
+        history.enqueue(_row(record.id, 0, "昨天修了登录", speaker_id=1, started_at=record.started_at))
+        controller.store.end_meeting(record.id, ended_at=record.started_at + 30_000)
+        controller.store.flush()
+        seen = {}
+
+        def fake_generate(request):
+            seen["request"] = request
+
+        monkeypatch.setattr(controller._generator, "generate", fake_generate)
+        assert controller.generate(record.id) is True
+        req = seen["request"]
+        assert req.template.id == "standup"
+        assert req.model_name == "m"
+        assert [line.text for line in req.lines] == ["昨天修了登录"]
+        assert req.chunk_chars == 10_000
+        assert controller.generating_for == record.id
+
+        from sayink.minutes_generator import MinutesResult
+
+        done = []
+        controller.generation_finished.connect(done.append)
+        controller._on_generation_done(MinutesResult(
+            json_payload='{"summary": "ok"}', markdown="# 站会\n\nok", chunked=False,
+            duration_ms=1200, model="m", template_id="standup",
+        ))
+        assert done == [record.id]
+        notes = controller.store.get_notes(record.id)
+        assert notes is not None and notes.markdown.startswith("# 站会") and notes.template_id == "standup"
+        assert controller.generating_for == ""
+
+    def test_remote_host_confirmation_is_remembered(self, controller, config):
+        config.set("llm.api_url", "https://api.example.com/v1")
+        assert controller.remote_host_needing_confirmation() == "api.example.com"
+        controller.confirm_remote_host("api.example.com")
+        assert controller.remote_host_needing_confirmation() == ""
+        config.set("llm.api_url", "http://127.0.0.1:11434/v1")
+        assert controller.remote_host_needing_confirmation() == ""
+
+    def test_cancel_generation_reports_failure(self, controller):
+        controller._generating_for = "abc"
+        failures = []
+        controller.generation_failed.connect(lambda mid, msg: failures.append((mid, msg)))
+        controller.cancel_generation()
+        assert failures == [("abc", "已取消")]
+        assert controller.generating_for == ""
+
+
+class TestMeetingPage:
+    @pytest.fixture
+    def page(self, config, controller):
+        from sayink.ui.meeting_page import MeetingPage
+
+        config.set("llm.api_url", "http://localhost:11434/v1")
+        config.set("llm.model_name", "qwen2.5")
+        widget = MeetingPage(config, controller)
+        yield widget
+        widget.deleteLater()
+
+    def test_empty_state_and_start_card(self, page):
+        from sayink.ui.meeting_page import PAGE_BROWSE, PAGE_START
+
+        assert page.meeting_count() == 0
+        assert page._stack.currentIndex() == PAGE_BROWSE
+        page.show_start_card()
+        assert page._stack.currentIndex() == PAGE_START
+        assert page._opt_source.currentData() == "mixed"
+        page._leave_start_card()
+        assert page._stack.currentIndex() == PAGE_BROWSE
+
+    def test_start_card_emits_options_and_remembers_preferences(self, page, config):
+        received = []
+        page.start_requested.connect(received.append)
+        page.show_start_card()
+        page._opt_title.setText("设计评审")
+        page._opt_participants.setText("甲, 乙")
+        page._opt_source.setCurrentIndex(page._opt_source.findData("microphone"))
+        page._start_from_card()
+        assert len(received) == 1
+        options = received[0]
+        assert isinstance(options, MeetingOptions)
+        assert options.title == "设计评审" and options.participants == "甲, 乙"
+        assert options.input_source == "microphone"
+        assert config.get("meeting.input_source") == "microphone"
+
+    def test_live_view_follows_controller_state(self, page, controller, history):
+        from sayink.ui.meeting_page import PAGE_BROWSE, PAGE_LIVE
+
+        record = controller.begin(MeetingOptions(title="周会"), _caps())
+        assert page._stack.currentIndex() == PAGE_LIVE
+        assert page._live_title.text() == "周会"
+        history.enqueue(_row(record.id, 0, "第一句", speaker_id=1, started_at=record.started_at))
+        history.flush(timeout=2.0)
+        page._render_live()
+        assert "第一句" in page._live_transcript.toPlainText()
+        controller.pause("设备中断")
+        assert page._resume_btn.isVisibleTo(page)
+        controller.resume()
+        assert not page._resume_btn.isVisibleTo(page)
+        controller.finalize()
+        _pump(50)
+        assert page._stack.currentIndex() == PAGE_BROWSE
+        assert page.current_meeting_id == record.id
+        assert page.meeting_count() == 1
+        assert "第一句" in page._transcript_view.toPlainText()
+        assert page._generate_btn.text() == "生成纪要"
+
+    def test_detail_shows_notes_and_rename_updates_transcript(self, page, controller, history):
+        record = controller.store.create_meeting(title="评审")
+        history.enqueue(_row(record.id, 0, "方案通过", speaker_id=1, started_at=record.started_at))
+        controller.store.end_meeting(record.id, ended_at=record.started_at + 5000)
+        controller.store.save_notes(
+            record.id, template_id="general", model="m", json_payload="",
+            markdown="# 评审\n\n说话人1 同意。", duration_ms=10, chunked=False,
+        )
+        controller.store.flush()
+        page.show_meeting(record.id)
+        assert page._generate_btn.text() == "重新生成"
+        assert "同意" in page._notes_view.toPlainText()
+        assert [a.text() for a in page._speaker_menu.actions()] == ["说话人1"]
+        assert "speaker:1" in page._transcript_view.toHtml()
+        page._rename_speaker(1, " 王五 ")
+        assert "王五" in page._transcript_view.toPlainText()
+        assert "王五" in page._notes_view.toPlainText()
+        assert [a.text() for a in page._speaker_menu.actions()] == ["王五"]
+
+    def test_transcript_name_link_opens_rename(self, page, controller, history, monkeypatch):
+        from PyQt6.QtCore import QUrl
+
+        record = controller.store.create_meeting(title="评审")
+        history.enqueue(_row(record.id, 0, "方案通过", speaker_id=2, started_at=record.started_at))
+        controller.store.end_meeting(record.id)
+        controller.store.flush()
+        page.show_meeting(record.id)
+        prompted = []
+        monkeypatch.setattr(page, "_prompt_rename_speaker", prompted.append)
+        page._on_transcript_link(QUrl("speaker:2"))
+        page._on_transcript_link(QUrl("https://example.com"))
+        assert prompted == [2]
+
+    def test_current_content_copy_is_primary_while_reviewing(self, page, controller, history):
+        from sayink.ui import settings_styles as ss
+
+        record = controller.store.create_meeting(title="评审")
+        controller.store.end_meeting(record.id)
+        controller.store.flush()
+        page.show_meeting(record.id)
+        assert page._generate_btn.styleSheet() == ss.BTN_ACCENT_SM
+        controller.store.save_notes(
+            record.id, template_id="general", model="m", json_payload="", markdown="纪要", duration_ms=1,
+        )
+        controller.store.flush()
+        page._render_detail()
+        assert page._generate_btn.styleSheet() == ss.BTN_GHOST_SM
+        assert page._start_btn.styleSheet() == ss.BTN_GHOST_SM
+        assert page._copy_btn.styleSheet() == ss.BTN_PRIMARY
+
+    def test_notes_display_drops_header_duplicates(self):
+        from sayink.ui.meeting_page import notes_for_display
+
+        md = "# 周会\n\n- 时间：2026-10-17 15:14\n- 时长：00:01:25\n- 参会人：甲\n\n## 摘要\n\n- 时间：保留在正文\n"
+        shown = notes_for_display(md, "周会")
+        assert shown.startswith("- 参会人：甲")
+        assert "# 周会" not in shown and "2026-10-17" not in shown
+        assert "- 时间：保留在正文" in shown
+        assert notes_for_display("# 周会（评审）\n\n## 摘要\n", "周会").startswith("# 周会（评审）")
+
+    def test_citations_become_transcript_links(self):
+        from sayink.ui.meeting_page import link_citations
+
+        out = link_citations("- 同意方案 [00:01:05]\n- 已链接 [00:00:01](x)")
+        assert "(ts:65)" in out
+        assert "[00:00:01](x)" in out
+
+    def test_citation_click_highlights_transcript_line(self, page, controller, history):
+        from PyQt6.QtCore import QUrl
+        from sayink.ui import design_tokens as tok
+
+        record = controller.store.create_meeting(title="评审")
+        for seq, text in enumerate(("第一句", "第二句", "第三句")):
+            history.enqueue(_row(record.id, seq, text, speaker_id=1, started_at=record.started_at))
+        history.flush(timeout=2.0)
+        controller.store.end_meeting(record.id)
+        controller.store.flush()
+        page.show_meeting(record.id)
+        page._on_notes_link(QUrl("ts:4"))
+        assert page._content_stack.currentWidget() is page._transcript_view
+        assert page._transcript_highlight == 1
+        assert tok.HIGHLIGHT_BG.lower() in page._transcript_view.toHtml().lower()
+
+    def test_speakers_get_distinct_colors(self):
+        from sayink.ui import design_tokens as tok
+        from sayink.ui.meeting_page import speaker_color
+
+        assert speaker_color(1) != speaker_color(2)
+        assert speaker_color(1 + len(tok.SPEAKER_COLORS)) == speaker_color(1)
+        assert speaker_color(0) == tok.TEXT_SEC
+
+    def test_list_rows_split_title_and_meta(self, page, controller):
+        record = controller.store.create_meeting(title="评审")
+        controller.store.end_meeting(record.id, ended_at=record.started_at + 5000)
+        controller.store.flush()
+        page.refresh()
+        row = page._list.itemWidget(page._list.item(0))
+        assert row.findChild(QLabel, "meetingRowTitle").accessibleName() == "评审"
+        assert "5 秒" in row.findChild(QLabel, "meetingRowMeta").accessibleName()
+        assert "已结束" in row.findChild(QLabel, "meetingRowMeta").accessibleName()
+        assert page._search_edit.parentWidget() is page._list.parentWidget()
+
+    def test_unconfigured_minutes_button_leads_to_settings(self, page, controller, config):
+        config.set("llm.api_url", "")
+        record = controller.store.create_meeting(title="评审")
+        controller.store.end_meeting(record.id)
+        controller.store.flush()
+        page.show_meeting(record.id)
+        assert page._generate_btn.text() == "去配置"
+        asked = []
+        page.configure_requested.connect(lambda: asked.append(True))
+        page._generate_btn.click()
+        assert asked == [True]
+        assert controller.generating_for == ""
+
+        config.set("llm.api_url", "http://localhost:11434/v1")
+        config.set("llm.model_name", "qwen2.5")
+        page.show_meeting(record.id)
+        assert page._generate_btn.text() == "生成纪要"
+
+    def test_list_shares_history_row_states(self, page):
+        from sayink.ui.history_window import session_list_item_css
+
+        css = page._list.styleSheet()
+        assert session_list_item_css().strip() in css
+        assert "border: 2px solid transparent" in css
+        assert "QListWidget:focus" not in css
+        assert "border-radius" not in css.split("QLabel")[0]
+
+    def test_saved_meeting_reads_on_the_page_and_edits_in_a_field(self, page):
+        assert "border: none" in page._notes_view.styleSheet()
+        assert "border: none" in page._transcript_view.styleSheet()
+        assert "border: 1px solid" in page._notes_edit.styleSheet()
+
+    def test_tabs_switch_content_and_tools(self, page, controller):
+        record = controller.store.create_meeting(title="评审")
+        controller.store.end_meeting(record.id)
+        controller.store.flush()
+        page.show_meeting(record.id)
+        assert page._content_stack.currentWidget() is page._notes_stack
+        page._tab_transcript.click()
+        assert page._content_stack.currentWidget() is page._transcript_view
+        assert page._tab_tools.currentIndex() == 1
+        page._tab_notes.click()
+        assert page._content_stack.currentWidget() is page._notes_stack
+
+    def test_regenerate_asks_before_replacing_notes(self, page, controller, monkeypatch):
+        record = controller.store.create_meeting(title="评审")
+        controller.store.end_meeting(record.id)
+        controller.store.save_notes(
+            record.id, template_id="general", model="m", json_payload="", markdown="旧纪要", duration_ms=1,
+        )
+        controller.store.flush()
+        page.show_meeting(record.id)
+        calls = []
+        monkeypatch.setattr(page, "_confirm_regenerate", lambda: False)
+        monkeypatch.setattr(controller, "generate", lambda *a, **k: calls.append(a))
+        page._generate()
+        assert calls == []
+
+    def test_restore_previous_swaps_versions(self, page, controller):
+        record = controller.store.create_meeting(title="评审")
+        controller.store.end_meeting(record.id)
+        for text in ("第一版", "第二版"):
+            controller.store.save_notes(
+                record.id, template_id="general", model="m", json_payload="", markdown=text, duration_ms=1,
+            )
+        controller.store.flush()
+        page.show_meeting(record.id)
+        assert page._restore_action.isEnabled()
+        page._restore_previous()
+        notes = controller.store.get_notes(record.id)
+        assert notes.markdown == "第一版" and notes.previous_markdown == "第二版" and notes.user_edited
+        assert "第一版" in page._notes_view.toPlainText()
+        page._restore_previous()
+        assert controller.store.get_notes(record.id).markdown == "第二版"
+
+    def test_speaker_rename_keeps_previous_version(self, controller, history):
+        record = controller.store.create_meeting(title="评审")
+        history.enqueue(_row(record.id, 0, "好", speaker_id=1, started_at=record.started_at))
+        controller.store.end_meeting(record.id)
+        for text in ("第一版", "第二版 说话人1"):
+            controller.store.save_notes(
+                record.id, template_id="general", model="m", json_payload="", markdown=text, duration_ms=1,
+            )
+        controller.store.flush()
+        controller.rename_speaker(record.id, 1, "王五")
+        notes = controller.store.get_notes(record.id)
+        assert notes.markdown == "第二版 王五" and notes.previous_markdown == "第一版"
+
+    def test_edit_toggle_saves_user_markdown(self, page, controller, history):
+        record = controller.store.create_meeting(title="评审")
+        controller.store.end_meeting(record.id)
+        controller.store.save_notes(
+            record.id, template_id="general", model="m", json_payload="",
+            markdown="原文", duration_ms=10, chunked=False,
+        )
+        controller.store.flush()
+        page.show_meeting(record.id)
+        page._toggle_edit()
+        assert page._edit_btn.text() == "保存修改"
+        page._notes_edit.setPlainText("改过的纪要")
+        page._toggle_edit()
+        notes = controller.store.get_notes(record.id)
+        assert notes is not None and notes.markdown == "改过的纪要" and notes.user_edited
+        assert "手动编辑" in page._notes_state.text()
+        assert "已保存" in page._status_label.text()
+
+
+class TestSpeakerSessionWiring:
+    def test_begin_builds_session_with_embedder_priors(self, controller):
+        from sayink.speaker_embedding import MEL_STICKY_THRESHOLD, STICKY_GAP_MS
+
+        controller.begin(MeetingOptions(), _caps())
+        speakers = controller.speakers
+        assert speakers._sticky_threshold == MEL_STICKY_THRESHOLD
+        assert speakers._sticky_gap_ms == STICKY_GAP_MS
+        assert speakers.threshold == controller.embedder.threshold
+
+    def test_recluster_uses_embedder_recluster_threshold(self, controller, history):
+        """Centroids at 0.80 similarity: below the 0.86 online bar, above the
+        0.75 recluster bar for the mel backend → merged after the meeting."""
+        record = controller.begin(MeetingOptions(), _caps())
+        speakers = controller.speakers
+        a = np.zeros(24, dtype=np.float32)
+        a[0] = 1.0
+        b = np.zeros(24, dtype=np.float32)
+        b[0], b[1] = 0.8, 0.6                        # cos(a, b) = 0.80
+        ids = [speakers.assign(a, ""), speakers.assign(b, "")]
+        assert ids == [1, 2]
+        for seq, sid in enumerate(ids):
+            history.enqueue(_row(record.id, seq, f"t{seq}", speaker_id=sid, started_at=record.started_at))
+        history.flush(timeout=2.0)
+        controller.finalize()
+        rows = controller.store.get_segments(record.id)
+        assert rows[0].speaker_id == rows[1].speaker_id == 1
+
+
+class TestMeetingPageAuxDownload:
+    @pytest.fixture
+    def page(self, config, controller):
+        from sayink.ui.meeting_page import MeetingPage
+
+        widget = MeetingPage(config, controller)
+        yield widget
+        widget.deleteLater()
+
+    def test_start_card_offers_download_when_models_missing(self, page, monkeypatch):
+        missing = [{"id": "speaker-campplus", "name": "说话人嵌入 CAM++", "size_mb": 28}]
+        monkeypatch.setattr("sayink.ui.meeting_page.missing_aux_models", lambda: missing)
+        page.show_start_card()
+        assert page._card_dl_btn.isVisibleTo(page)
+        assert "28 MB" in page._card_dl_btn.text()
+        monkeypatch.setattr("sayink.ui.meeting_page.missing_aux_models", lambda: [])
+        page._update_card_notes()
+        assert not page._card_dl_btn.isVisibleTo(page)
+
+    def test_live_view_offers_download_and_reports_result(self, page, controller, monkeypatch):
+        missing = [{"id": "silero-vad", "name": "Silero VAD", "size_mb": 2}]
+        monkeypatch.setattr("sayink.ui.meeting_page.missing_aux_models", lambda: missing)
+        controller.begin(MeetingOptions(title="x"), _caps())
+        _pump(20)
+        assert page._live_dl_btn.isVisibleTo(page)
+        changed = []
+        page.aux_models_changed.connect(lambda: changed.append(True))
+        monkeypatch.setattr(page._aux_dl, "start", lambda ids=None: True)
+        page._download_aux_models()
+        assert not page._live_dl_btn.isEnabled()
+        page._on_aux_progress(42)
+        assert "42%" in page._live_dl_btn.text()
+        monkeypatch.setattr("sayink.ui.meeting_page.missing_aux_models", lambda: [])
+        page._on_aux_finished(True, "")
+        assert changed == [True]
+        assert "下一场会议生效" in page._live_caps.text()
+        assert not page._live_dl_btn.isVisibleTo(page)
+
+    def test_failed_download_is_explained_on_card(self, page, monkeypatch):
+        missing = [{"id": "silero-vad", "name": "Silero VAD", "size_mb": 2}]
+        monkeypatch.setattr("sayink.ui.meeting_page.missing_aux_models", lambda: missing)
+        page.show_start_card()
+        page._on_aux_finished(False, "Silero VAD 下载失败：网络超时")
+        assert "网络超时" in page._card_notes.text()
+        assert page._card_dl_btn.isVisibleTo(page) and page._card_dl_btn.isEnabled()

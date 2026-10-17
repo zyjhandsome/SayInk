@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import numpy as np
 
 from tests.helpers.app_harness import app_harness
@@ -152,11 +154,19 @@ def test_history_copy_includes_speaker_only_for_a_multi_speaker_session():
 
 
 def test_continuous_paste_has_no_speaker_but_history_does():
-    with app_harness({"audio.trigger_mode": "continuous", "llm.enabled": False}) as h:
+    # Dictation now shares the meeting speaker stack. Pin the spectral
+    # embedder (CAM++ may or may not be downloaded on this machine), use
+    # clips above its 1.0 s short-segment guard, and stamp them far apart so
+    # the 3 s continuity prior does not merge them.
+    with patch("sayink.app.aux_model_path", return_value=None), app_harness(
+        {"audio.trigger_mode": "continuous", "llm.enabled": False}
+    ) as h:
         app = h["app"]
         _start_continuous_user_session(app)
-        for text, audio in (("甲说的", _tone(140)), ("乙说的", _tone(280))):
-            app._begin_transcription(audio)
+        for captured_at, text, audio in ((10_000, "甲说的", _tone(140, 1.2)), (20_000, "乙说的", _tone(280, 1.2))):
+            context = app._capture_segment_context()
+            context.captured_at = captured_at
+            app._begin_transcription(audio, context=context)
             app._on_final_result(text)
             assert h["paster"].paste_async.call_args[0][0] == text
             h["paster"].paste_async.call_args[0][1]("pasted")
@@ -165,10 +175,32 @@ def test_continuous_paste_has_no_speaker_but_history_does():
         assert [record.speaker_route for record in records] == ["", ""]
 
         _start_continuous_user_session(app)
-        app._begin_transcription(_tone(280))
+        app._begin_transcription(_tone(280, 1.2))
         app._on_final_result("下一场")
         h["paster"].paste_async.call_args[0][1]("pasted")
         assert _enqueued_records(h["history"])[-1].speaker_id == 1
+
+
+def test_continuous_same_voice_back_to_back_keeps_one_speaker():
+    """The meeting continuity prior applies to dictation too: a close,
+    similar-sounding follow-up (or one too short to judge) does not open
+    「说话人 2」."""
+    with patch("sayink.app.aux_model_path", return_value=None), app_harness(
+        {"audio.trigger_mode": "continuous", "llm.enabled": False}
+    ) as h:
+        app = h["app"]
+        _start_continuous_user_session(app)
+        for captured_at, text, audio in (
+            (10_000, "我先说", _tone(140, 1.2)),
+            (11_500, "接着说", _tone(150, 1.2)),
+            (13_000, "嗯", _tone(280, 0.5)),
+        ):
+            context = app._capture_segment_context()
+            context.captured_at = captured_at
+            app._begin_transcription(audio, context=context)
+            app._on_final_result(text)
+            h["paster"].paste_async.call_args[0][1]("pasted")
+        assert [r.speaker_id for r in _enqueued_records(h["history"])] == [1, 1, 1]
 
 
 def test_mixed_continuous_history_keeps_the_capture_route():

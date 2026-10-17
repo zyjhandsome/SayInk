@@ -1,6 +1,7 @@
 import ipaddress
 import logging
 import time
+from typing import Callable
 from urllib.parse import urlparse
 
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
@@ -63,6 +64,103 @@ def _request_headers(api_key: str) -> dict:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
 
+
+def chat_completions_url(api_url: str) -> str:
+    url = (api_url or "").rstrip("/")
+    if not url.endswith("/chat/completions"):
+        url = url + "/chat/completions"
+    return url
+
+
+# One extra attempt for connection-level failures and gateway errors.
+# Timeouts are deliberately not retried: the caller's budget is already the
+# longest acceptable wait, and it falls back (raw text / error) anyway.
+CHAT_RETRY_STATUS = frozenset({502, 503, 504})
+CHAT_RETRY_DELAY_SEC = 0.5
+
+
+class LLMCancelled(Exception):
+    """The caller cancelled while a request was in flight."""
+
+
+class LLMResponseError(RuntimeError):
+    """The endpoint answered, but not with a usable chat completion."""
+
+
+class LLMTruncatedError(LLMResponseError):
+    """The provider stopped at its output limit; the text is incomplete."""
+
+
+def chat_completion(
+    client,
+    httpx,
+    *,
+    api_url: str,
+    api_key: str,
+    model_name: str,
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int,
+    is_cancelled: Callable[[], bool] | None = None,
+    retry_delay_sec: float = CHAT_RETRY_DELAY_SEC,
+    label: str = "LLM",
+    reject_truncated: bool = False,
+) -> str:
+    """One OpenAI-compatible chat completion, shared by polishing and minutes.
+
+    POSTs once and retries once after ``retry_delay_sec`` on a transient
+    network error or a 502/503/504. Returns the stripped message content.
+    Raises :class:`LLMCancelled` when ``is_cancelled()`` turns true,
+    :class:`LLMResponseError` for malformed/empty answers, and lets
+    ``httpx`` exceptions (timeout, HTTP status) propagate.
+    """
+    cancelled = is_cancelled or (lambda: False)
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    url = chat_completions_url(api_url)
+    headers = _request_headers(api_key)
+    transient = (httpx.NetworkError, httpx.RemoteProtocolError)
+    response = None
+    for attempt in (1, 2):
+        if cancelled():
+            raise LLMCancelled()
+        try:
+            response = client.post(url, headers=headers, json=payload)
+        except transient as exc:
+            if cancelled():
+                raise LLMCancelled() from exc
+            if attempt == 2:
+                raise
+            log.warning("LLM %s 连接异常，%.1f 秒后重试一次: %s", label, retry_delay_sec, exc)
+        else:
+            if cancelled():
+                raise LLMCancelled()
+            if attempt == 2 or response.status_code not in CHAT_RETRY_STATUS:
+                break
+            log.warning("LLM %s 返回 HTTP %s，%.1f 秒后重试一次", label, response.status_code, retry_delay_sec)
+        time.sleep(retry_delay_sec)
+    if cancelled():
+        raise LLMCancelled()
+    response.raise_for_status()
+    data = response.json()
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not choices or not isinstance(choices, list):
+        raise LLMResponseError("API 响应格式异常")
+    if reject_truncated and isinstance(choices[0], dict) and choices[0].get("finish_reason") in ("length", "max_tokens"):
+        raise LLMTruncatedError("模型输出被截断")
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict):
+        raise LLMResponseError("API 响应格式异常")
+    content = message.get("content")
+    text = str(content).strip() if content is not None else ""
+    if not text:
+        raise LLMResponseError("API 返回空内容")
+    return text
+
 POLISH_PROMPT = (
     "你是一个纯文本润色工具，不是对话助手。\n"
     "你的唯一任务是：将用户发来的语音转写文字做最小程度的润色，使其变为通顺的书面语。\n\n"
@@ -96,11 +194,8 @@ class PolishWorker(QThread):
     result_ready = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    # One extra attempt for connection-level failures and gateway errors.
-    # Timeouts are deliberately not retried: the 15 s budget is already long for
-    # live dictation, and the caller falls back to the raw text anyway.
-    _RETRY_STATUS = frozenset({502, 503, 504})
-    _RETRY_DELAY_SEC = 0.5
+    # See chat_completion(); tests zero this to skip the wait.
+    _RETRY_DELAY_SEC = CHAT_RETRY_DELAY_SEC
 
     def __init__(
         self,
@@ -126,39 +221,6 @@ class PolishWorker(QThread):
         """Set cancellation flag to stop the worker."""
         self._cancelled = True
 
-    def _post_with_retry(self, client, httpx, url: str, headers: dict, payload: dict):
-        """POST once; on a transient network/gateway failure wait briefly and POST again.
-
-        Returns ``None`` when the worker was cancelled in between.
-        """
-        transient = (httpx.NetworkError, httpx.RemoteProtocolError)
-        response = None
-        for attempt in (1, 2):
-            try:
-                response = client.post(url, headers=headers, json=payload)
-            except transient as exc:
-                if self._cancelled:
-                    return None
-                if attempt == 2:
-                    raise
-                log.warning(
-                    "LLM %s 连接异常，%.1f 秒后重试一次: %s",
-                    self._action_label, self._RETRY_DELAY_SEC, exc,
-                )
-            else:
-                if self._cancelled:
-                    return None
-                if attempt == 2 or response.status_code not in self._RETRY_STATUS:
-                    return response
-                log.warning(
-                    "LLM %s 返回 HTTP %s，%.1f 秒后重试一次",
-                    self._action_label, response.status_code, self._RETRY_DELAY_SEC,
-                )
-            time.sleep(self._RETRY_DELAY_SEC)
-            if self._cancelled:
-                return None
-        return response
-
     def run(self):
         if self._cancelled:
             return
@@ -172,56 +234,32 @@ class PolishWorker(QThread):
                 self.error.emit(INSECURE_URL_ERROR)
                 return
 
-            url = self._api_url
-            if not url.endswith("/chat/completions"):
-                url = url.rstrip("/") + "/chat/completions"
-
             log.info("正在调用 LLM %s (%s)...", self._action_label, self._model_name)
             log.debug("原文长度: %d 字符", len(self._text))
 
-            headers = _request_headers(self._api_key)
-
-            payload = {
-                "model": self._model_name,
-                "messages": [
-                    {"role": "system", "content": self._prompt},
-                    {"role": "user", "content": self._text}
-                ],
-                "temperature": 0.3,
-                "max_tokens": 2048
-            }
-
             with httpx.Client(timeout=15.0) as client:
-                response = self._post_with_retry(client, httpx, url, headers, payload)
-                if response is None or self._cancelled:
-                    return
-                response.raise_for_status()
-                data = response.json()
-
-            # 严格的 API 响应校验
-            choices = data.get("choices")
-            if not choices or not isinstance(choices, list) or len(choices) == 0:
-                self.error.emit(f"{self._action_label}失败: API 响应格式异常")
+                polished = chat_completion(
+                    client, httpx,
+                    api_url=self._api_url,
+                    api_key=self._api_key,
+                    model_name=self._model_name,
+                    messages=[
+                        {"role": "system", "content": self._prompt},
+                        {"role": "user", "content": self._text},
+                    ],
+                    temperature=0.3,
+                    max_tokens=2048,
+                    is_cancelled=lambda: self._cancelled,
+                    retry_delay_sec=self._RETRY_DELAY_SEC,
+                    label=self._action_label,
+                )
+            if self._cancelled:
                 return
-
-            message = choices[0].get("message")
-            if not message or not isinstance(message, dict):
-                self.error.emit(f"{self._action_label}失败: API 响应格式异常")
-                return
-
-            content = message.get("content")
-            if content is None:
-                self.error.emit(f"{self._action_label}失败: API 返回空内容")
-                return
-
-            polished = str(content).strip()
-            if not polished:
-                self.error.emit(f"{self._action_label}失败: API 返回空内容")
-                return
-
             log.debug("%s结果长度: %d 字符", self._action_label, len(polished))
             self.result_ready.emit(polished)
 
+        except LLMCancelled:
+            return
         except httpx.TimeoutException:
             log.error("LLM %s超时", self._action_label)
             self.error.emit(f"{self._action_label}超时，请稍后重试")
@@ -296,10 +334,7 @@ class TextPolisher(QObject):
         try:
             import httpx
 
-            url = api_url.rstrip("/")
-            if not url.endswith("/chat/completions"):
-                url = url.rstrip("/") + "/chat/completions"
-
+            url = chat_completions_url(api_url)
             headers = _request_headers(api_key)
 
             payload = {

@@ -28,20 +28,84 @@ CREATE TABLE IF NOT EXISTS history (
   trigger_mode  TEXT    NOT NULL DEFAULT '',
   model         TEXT    NOT NULL DEFAULT '',
   speaker_id    INTEGER NOT NULL DEFAULT 0,
-  speaker_route TEXT    NOT NULL DEFAULT ''
+  speaker_route TEXT    NOT NULL DEFAULT '',
+  captured_at   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_history_session ON history(session_id);
 CREATE INDEX IF NOT EXISTS idx_history_created ON history(created_at);
+
+-- Meetings (docs/meeting-notes-design.md §5.2). Transcript rows stay in
+-- ``history`` with session_id = meetings.id and trigger_mode = 'meeting'.
+CREATE TABLE IF NOT EXISTS meetings (
+  id            TEXT PRIMARY KEY,
+  title         TEXT NOT NULL DEFAULT '',
+  participants  TEXT NOT NULL DEFAULT '',
+  agenda        TEXT NOT NULL DEFAULT '',
+  notes_user    TEXT NOT NULL DEFAULT '',
+  source        TEXT NOT NULL DEFAULT '',
+  model_id      TEXT NOT NULL DEFAULT '',
+  vad           TEXT NOT NULL DEFAULT '',
+  glossary      TEXT NOT NULL DEFAULT '',
+  started_at    INTEGER NOT NULL,
+  ended_at      INTEGER,
+  status        TEXT NOT NULL DEFAULT 'live',
+  deleted_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_meetings_started ON meetings(started_at);
+CREATE TABLE IF NOT EXISTS meeting_marks (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  meeting_id TEXT    NOT NULL,
+  offset_ms  INTEGER NOT NULL,
+  note       TEXT    NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS meeting_speakers (
+  meeting_id     TEXT    NOT NULL,
+  speaker_id     INTEGER NOT NULL,
+  display_name   TEXT    NOT NULL DEFAULT '',
+  suggested_name TEXT    NOT NULL DEFAULT '',
+  PRIMARY KEY (meeting_id, speaker_id)
+);
+CREATE TABLE IF NOT EXISTS meeting_notes (
+  meeting_id        TEXT PRIMARY KEY,
+  template_id       TEXT    NOT NULL DEFAULT '',
+  model             TEXT    NOT NULL DEFAULT '',
+  json_payload      TEXT    NOT NULL DEFAULT '',
+  markdown          TEXT    NOT NULL DEFAULT '',
+  previous_markdown TEXT    NOT NULL DEFAULT '',
+  user_edited       INTEGER NOT NULL DEFAULT 0,
+  generated_at      INTEGER NOT NULL DEFAULT 0,
+  duration_ms       INTEGER NOT NULL DEFAULT 0,
+  chunked           INTEGER NOT NULL DEFAULT 0,
+  transcript_changed INTEGER NOT NULL DEFAULT 0,
+  previous_transcript_changed INTEGER NOT NULL DEFAULT 0,
+  previous_metadata TEXT NOT NULL DEFAULT ''
+);
 """
+
+# Sessions that belong to a meeting are kept out of the dictation history
+# list and never touched by retention cleanup (the meeting page owns them).
+_PROTECTED_SESSIONS_SQL = "SELECT id FROM meetings WHERE status != 'deleted'"
+MEETING_TRIGGER_MODE = "meeting"
 
 
 def _ensure_speaker_columns(conn: sqlite3.Connection) -> None:
-    """Add speaker columns on databases created before continuous diarization."""
+    """Add columns on databases created before continuous diarization / meetings."""
     present = {row[1] for row in conn.execute("PRAGMA table_info(history)")}
     if "speaker_id" not in present:
         conn.execute("ALTER TABLE history ADD COLUMN speaker_id INTEGER NOT NULL DEFAULT 0")
     if "speaker_route" not in present:
         conn.execute("ALTER TABLE history ADD COLUMN speaker_route TEXT NOT NULL DEFAULT ''")
+    if "captured_at" not in present:
+        conn.execute("ALTER TABLE history ADD COLUMN captured_at INTEGER NOT NULL DEFAULT 0")
+
+
+def _ensure_meeting_note_columns(conn: sqlite3.Connection) -> None:
+    present = {row[1] for row in conn.execute("PRAGMA table_info(meeting_notes)")}
+    for name in ("transcript_changed", "previous_transcript_changed"):
+        if name not in present:
+            conn.execute(f"ALTER TABLE meeting_notes ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
+    if "previous_metadata" not in present:
+        conn.execute("ALTER TABLE meeting_notes ADD COLUMN previous_metadata TEXT NOT NULL DEFAULT ''")
 
 _SESSION_SUMMARY_SQL = """
 SELECT
@@ -85,6 +149,9 @@ class SegmentRecord:
     model: str = ""
     speaker_id: int = 0
     speaker_route: str = ""
+    # Wall-clock ms when the segment's speech started (0 for rows written by
+    # older versions, which only know when recognition finished).
+    captured_at: int = 0
 
 
 @dataclass(frozen=True)
@@ -95,6 +162,24 @@ class SessionSummary:
     source: str
     target_app: str
     preview: str
+
+
+def _row_to_segment(r: tuple) -> SegmentRecord:
+    return SegmentRecord(
+        session_id=r[0],
+        seq=r[1],
+        created_at=r[2],
+        raw_text=r[3],
+        polished_text=r[4],
+        source=r[5],
+        duration_ms=r[6],
+        target_app=r[7],
+        trigger_mode=r[8],
+        model=r[9],
+        speaker_id=int(r[10] or 0),
+        speaker_route=r[11] or "",
+        captured_at=int(r[12] or 0) if len(r) > 12 else 0,
+    )
 
 
 def _rows_to_summaries(rows: list[tuple]) -> list[SessionSummary]:
@@ -202,6 +287,7 @@ class HistoryStore:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.executescript(_DDL)
             _ensure_speaker_columns(conn)
+            _ensure_meeting_note_columns(conn)
             conn.execute("PRAGMA user_version=1;")
             conn.commit()
         finally:
@@ -279,6 +365,138 @@ class HistoryStore:
             ("cleanup", (retention_days, max_entries, active_session_id))
         )
 
+    def enqueue_write(
+        self,
+        fn: Callable[[sqlite3.Connection], None],
+        *,
+        failure_notice: str = WRITE_FAILED_NOTICE,
+    ) -> None:
+        """Run ``fn(conn)`` on the single writer thread (meeting tables etc.).
+
+        ``fn`` must not commit; the writer commits after it returns and rolls
+        back if it raises. Keeps the "one writer" invariant for everything
+        stored in ``history.db``.
+        """
+        if self.disabled:
+            return
+        self._queue.put(("write", (fn, failure_notice)))
+
+    def relabel_session_speakers(
+        self,
+        session_id: str,
+        mapping: dict[int, int],
+        *,
+        failure_notice: str = WRITE_FAILED_NOTICE,
+    ) -> None:
+        """Renumber speakers of one session after a re-clustering pass
+        (``{old_id: new_id}``); used by meetings and continuous dictation."""
+        if not mapping or not session_id:
+            return
+        pairs = [(int(new), session_id, int(old)) for old, new in mapping.items() if old != new]
+        if not pairs:
+            return
+
+        def _relabel(conn: sqlite3.Connection) -> None:
+            # Two passes through a temporary offset so a→b, b→a does not collide.
+            conn.executemany(
+                "UPDATE history SET speaker_id = -(? + 1) WHERE session_id = ? AND speaker_id = ?",
+                pairs,
+            )
+            conn.execute(
+                "UPDATE history SET speaker_id = -speaker_id - 1 WHERE session_id = ? AND speaker_id < 0",
+                (session_id,),
+            )
+
+        self.enqueue_write(_relabel, failure_notice=failure_notice)
+
+    def enqueue_update_polished(
+        self,
+        session_id: str,
+        polished_by_seq: dict[int, str],
+        *,
+        failure_notice: str = WRITE_FAILED_NOTICE,
+    ) -> None:
+        """Update ``polished_text`` for specified ``seq`` rows in ``session_id``
+        without touching ``raw_text``."""
+        if self.disabled or not session_id or not polished_by_seq:
+            return
+        rows = [(str(text), session_id, int(seq)) for seq, text in polished_by_seq.items()]
+
+        def _update(conn: sqlite3.Connection) -> None:
+            conn.executemany(
+                "UPDATE history SET polished_text = ? WHERE session_id = ? AND seq = ?",
+                rows,
+            )
+
+        self.enqueue_write(_update, failure_notice=failure_notice)
+
+    def enqueue_merge_sessions(
+        self,
+        target_session_id: str,
+        session_ids: list[str],
+        *,
+        failure_notice: str = WRITE_FAILED_NOTICE,
+    ) -> None:
+        """Merge non-meeting segments of ``session_ids`` into ``target_session_id``
+        in chronological order ``(created_at ASC, seq ASC, id ASC)`` and
+        resequence ``seq`` to ``0..N-1``."""
+        if self.disabled or not target_session_id:
+            return
+        ids = list(dict.fromkeys(s for s in session_ids if s))
+        if len(ids) < 2:
+            return
+        if target_session_id not in ids:
+            ids.insert(0, target_session_id)
+
+        def _merge(conn: sqlite3.Connection) -> None:
+            placeholders = ",".join("?" for _ in ids)
+            ordered_ids = [
+                row[0]
+                for row in conn.execute(
+                    f"""
+                    SELECT id FROM history
+                    WHERE session_id IN ({placeholders})
+                      AND trigger_mode != ?
+                    ORDER BY created_at ASC, seq ASC, id ASC
+                    """,
+                    (*ids, MEETING_TRIGGER_MODE),
+                ).fetchall()
+            ]
+            if not ordered_ids:
+                return
+            conn.executemany(
+                "UPDATE history SET session_id = ?, seq = ? WHERE id = ?",
+                [(target_session_id, new_seq, row_id) for new_seq, row_id in enumerate(ordered_ids)],
+            )
+
+        self.enqueue_write(_merge, failure_notice=failure_notice)
+
+    def flush(self, timeout: float = CLOSE_TIMEOUT_SEC) -> bool:
+        """Block until every write queued before this call has been applied.
+
+        Readers use a separate connection; a caller that reads right after
+        enqueueing (meeting end → render transcript) needs this barrier.
+        """
+        if self.disabled or self._thread is None:
+            return True
+        done = threading.Event()
+        self._queue.put(("barrier", done))
+        return done.wait(timeout=timeout)
+
+    def read(self, fn: Callable[[sqlite3.Connection], Any], default: Any = None) -> Any:
+        """Run ``fn(conn)`` on a short-lived read-only connection."""
+        if self.disabled:
+            return default
+        try:
+            conn = self._readonly_conn()
+            try:
+                return fn(conn)
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception("HistoryStore read failed")
+            return default
+
     def close(self, timeout: float = CLOSE_TIMEOUT_SEC) -> None:
         if self.disabled:
             return
@@ -303,7 +521,8 @@ class HistoryStore:
             with self._readonly_conn() as conn:
                 rows = conn.execute(
                     _SESSION_SUMMARY_SQL
-                    + """
+                    + f"""
+                    WHERE h.trigger_mode != '{MEETING_TRIGGER_MODE}'
                     GROUP BY h.session_id
                     ORDER BY session_created DESC
                     LIMIT ? OFFSET ?
@@ -322,21 +541,49 @@ class HistoryStore:
         try:
             with self._readonly_conn() as conn:
                 rows = conn.execute(
-                    _SESSION_SUMMARY_SQL
-                    + """
-                    WHERE h.session_id IN (
-                      SELECT DISTINCT session_id FROM history
-                      WHERE raw_text LIKE ? ESCAPE '\\' OR polished_text LIKE ? ESCAPE '\\'
+                    f"""
+                    WITH matching AS (
+                        SELECT session_id, seq,
+                               CASE WHEN polished_text LIKE ? ESCAPE '\\'
+                                    THEN polished_text ELSE raw_text END AS matched_text
+                        FROM history
+                        WHERE trigger_mode != '{MEETING_TRIGGER_MODE}'
+                          AND (raw_text LIKE ? ESCAPE '\\' OR polished_text LIKE ? ESCAPE '\\')
                     )
+                    SELECT summaries.session_id, summaries.session_created, summaries.segment_count,
+                           summaries.source, summaries.target_app,
+                           (SELECT matched_text FROM matching m
+                            WHERE m.session_id = summaries.session_id ORDER BY m.seq LIMIT 1)
+                    FROM (
+                    """
+                    + _SESSION_SUMMARY_SQL
+                    + f"""
+                    WHERE h.trigger_mode != '{MEETING_TRIGGER_MODE}'
+                      AND h.session_id IN (SELECT session_id FROM matching)
                     GROUP BY h.session_id
+                    ) summaries
                     ORDER BY session_created DESC
                     """,
-                    (pattern, pattern),
+                    (pattern, pattern, pattern),
                 ).fetchall()
             return _rows_to_summaries(rows)
         except Exception:
             logger.exception("HistoryStore search_sessions failed")
             return []
+
+    def count_sessions(self) -> int | None:
+        """Count all dictation sessions, including those outside the loaded page."""
+        if self.disabled:
+            return None
+        try:
+            with self._readonly_conn() as conn:
+                return conn.execute(
+                    "SELECT COUNT(DISTINCT session_id) FROM history WHERE trigger_mode != ?",
+                    (MEETING_TRIGGER_MODE,),
+                ).fetchone()[0]
+        except Exception:
+            logger.exception("HistoryStore count_sessions failed")
+            return None
 
     def get_session_segments(self, session_id: str) -> list[SegmentRecord]:
         if self.disabled:
@@ -347,30 +594,14 @@ class HistoryStore:
                     """
                     SELECT session_id, seq, created_at, raw_text, polished_text,
                            source, duration_ms, target_app, trigger_mode, model,
-                           speaker_id, speaker_route
+                           speaker_id, speaker_route, captured_at
                     FROM history
                     WHERE session_id = ?
                     ORDER BY seq ASC
                     """,
                     (session_id,),
                 ).fetchall()
-            return [
-                SegmentRecord(
-                    session_id=r[0],
-                    seq=r[1],
-                    created_at=r[2],
-                    raw_text=r[3],
-                    polished_text=r[4],
-                    source=r[5],
-                    duration_ms=r[6],
-                    target_app=r[7],
-                    trigger_mode=r[8],
-                    model=r[9],
-                    speaker_id=int(r[10] or 0),
-                    speaker_route=r[11] or "",
-                )
-                for r in rows
-            ]
+            return [_row_to_segment(r) for r in rows]
         except Exception:
             logger.exception("HistoryStore get_session_segments failed")
             return []
@@ -429,6 +660,22 @@ class HistoryStore:
             elif op == "cleanup":
                 retention_days, max_entries, active_session_id = payload
                 self._do_cleanup(conn, retention_days, max_entries, active_session_id)
+            elif op == "barrier":
+                payload.set()
+                return
+            elif op == "write":
+                fn, notice = payload
+                try:
+                    fn(conn)
+                    conn.commit()
+                except Exception:
+                    logger.exception("HistoryStore custom write failed")
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        logger.exception("HistoryStore rollback after custom write failed")
+                    self._notify_failed(notice)
+                    return
             else:
                 return
             self._notify_committed()
@@ -448,8 +695,8 @@ class HistoryStore:
             INSERT INTO history (
               session_id, seq, created_at, raw_text, polished_text,
               source, duration_ms, target_app, trigger_mode, model,
-              speaker_id, speaker_route
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              speaker_id, speaker_route, captured_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.session_id,
@@ -464,6 +711,7 @@ class HistoryStore:
                 record.model,
                 int(record.speaker_id),
                 record.speaker_route or "",
+                int(record.captured_at or 0),
             ),
         )
         conn.commit()
@@ -479,7 +727,11 @@ class HistoryStore:
         conn.commit()
 
     def _do_delete_all(self, conn: sqlite3.Connection) -> None:
-        conn.execute("DELETE FROM history")
+        # 「清空历史」 is the dictation history's button; meetings have their own
+        # delete action on the meeting page.
+        conn.execute(
+            f"DELETE FROM history WHERE session_id NOT IN ({_PROTECTED_SESSIONS_SQL})"
+        )
         conn.commit()
 
     def _do_cleanup(
@@ -492,9 +744,10 @@ class HistoryStore:
         if retention_days > 0:
             cutoff_ms = int(time.time() * 1000 - retention_days * 86_400_000)
             rows = conn.execute(
-                """
+                f"""
                 SELECT session_id
                 FROM history
+                WHERE session_id NOT IN ({_PROTECTED_SESSIONS_SQL})
                 GROUP BY session_id
                 HAVING MIN(created_at) < ?
                 """,
@@ -515,9 +768,10 @@ class HistoryStore:
             # unable to shrink further when only active remains.
             while True:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT session_id
                     FROM history
+                    WHERE session_id NOT IN ({_PROTECTED_SESSIONS_SQL})
                     GROUP BY session_id
                     ORDER BY MIN(created_at) ASC
                     """

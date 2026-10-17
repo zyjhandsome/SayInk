@@ -130,7 +130,7 @@ Effective theme is always `light` or `dark`.
 | `SPACE_MD` / `--space-md` | `16px` | Standard padding |
 | `SPACE_LG` / `--space-lg` | `24px` | Section padding |
 | `SPACE_XL` | `32px` | Large gaps |
-| `SIDEBAR_WIDTH` | `184px` | Navigation and runtime summary |
+| `SIDEBAR_WIDTH` | `168px` | Navigation and runtime summary |
 | `CONTENT_MAX_WIDTH` | `900px` | Settings document width at larger window sizes |
 | `CONTROL_NUMERIC_WIDTH` | `120px` | History spinboxes (flat stepper + suffix) |
 
@@ -169,10 +169,16 @@ shadow tokens to `design_tokens.py` unless a surface actually paints one.
 - Settings pages: 20px page title, purpose sentence, grouped 14px section labels.
 - Engine hero card shows the *load* state (「已载入 · 可用」/「模型载入中…」) beside the「当前」badge; downloaded ≠ usable.
 - Polish page keeps the before/after example visible while the feature is off.
-- History list: 58px rows (`HH:MM` mono + preview / app · source · N 段), non-selectable day headers (今天 / 昨天 / date), selected row = `ACCENT_SOFT` wash + 3px `ACCENT` left bar. No rounded accent capsule around the row.
-- History detail: title is the session identity (day + time), stats right-aligned, metadata chips, then a「润色 / 原文」segmented view toggle (only when a polished text exists). Segments render as numbered blocks with `HH:MM:SS · duration` captions; search hits highlighted with `AMBER_SOFT`.
-- History action bar is fixed (buttons disable, never disappear): primary copy on the left,「导出」「删除」on the right. Multi-select keeps「复制」enabled and joins each session's effective text, oldest first, with a blank line between sessions.「清空全部历史」is a quiet text action on the list summary row, disabled when there is nothing to clear, and confirms with an in-app card (取消 / 清空). History preferences stay in Settings; the empty state still offers「设置历史记录」when recording is off.
+- History list: 80px rows, a compact `HH:MM` / app · N 段 header, and two lines of preview that elide to the actual width. Non-selectable day headers (今天 / 昨天 / date), selected row = `ACCENT_SOFT` wash + 3px `ACCENT` left bar. Search sits above the list and searches all dictation history, including raw and polished text; search previews show the matching segment and nearby context.
+- History selection:「选择」enters an explicit checkbox mode; Ctrl / Shift multi-selection also enters that mode. The summary and all batch actions show the selected count. Unchecking everything stays empty across refreshes.「完成」returns to one session's preview. Checkboxes retain native keyboard and accessibility semantics; their indicator is painted with theme tokens for visible checked, unchecked and focus states.
+- History detail: title is the session identity (day + time), stats right-aligned; app and descriptive audio source are one quiet text line. Source, full process name, recording mode and model stay available under「详细信息」as static text. Segments render as numbered blocks with `HH:MM:SS · duration` captions; search hits use `AMBER_SOFT`. A new search first opens the matching text version, then respects manual version changes and refreshes.
+- History action bar: the「润色 / 原文」view toggle (only when polished text exists) sits beside one primary copy button that names and copies the visible version. Ctrl+C in the list or unselected detail text copies that version; selected detail text keeps native copy. Batch mode labels copy/export/delete with N 条, copies final text oldest first with blank lines, and explains that polished text takes precedence. Single deletion lives in the detail「更多」menu; batch deletion remains visible, with the existing eight-second undo.
+-「清空全部听写历史…」lives in the list「更多」menu, is disabled on empty history, and confirms with an in-app card (取消 / 清空). The confirmation gives the total stored dictation count, explicitly includes unloaded / search-excluded records, excludes meetings, and states that it cannot be undone. History preferences stay in Settings; the empty state still offers「设置历史记录」when recording is off.
 - History list scrollbar is a single transparent-track thumb. The splitter handle stays transparent at rest so it does not read as a second scrollbar.
+- Meeting review: use a narrower list (default split 240 / 560), stable content tabs, and one primary copy action beside the active tab. Copy labels distinguish notes, transcript and the current draft; transcript copying works before notes exist. Export explicitly offers notes / transcript / complete meeting. New-meeting entry stays available as a secondary action while reviewing a selected record.
+- Meeting notes show generation / manual-edit provenance and the saved template. Template changes affect the next generation and survive refresh; a hint explains a pending change. Editing uses「保存修改」and draft-aware copy/export, saves on navigation, and preserves the draft on failure.
+- Meeting transcript groups consecutive turns from the same speaker while retaining every segment and timestamp. Names are marked as manually assigned; automatic grouping does not imply identity verification.「命名说话人」affects a group;「纠正发言人」reveals per-segment correction, including a new speaker ID. Corrections are restricted to completed / interrupted meetings outside generation, persist locally, and mark earlier notes for review.
+- Meeting citations navigate to a highlighted transcript segment and provide「返回纪要」to restore the previous reading position. Repainting unchanged content and refreshing the list preserve document position. Empty decision / action headings compact only in the reading view; stored Markdown and exported text remain complete.
 
 ### Inputs
 

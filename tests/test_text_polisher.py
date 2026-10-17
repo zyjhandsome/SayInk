@@ -453,6 +453,92 @@ class TestPolishWorkerRetry:
         assert client.post.call_count == 1
 
 
+class TestChatCompletionHelper:
+    """chat_completion() is the one HTTP path shared by 润色 and 会议纪要."""
+
+    def _call(self, client, fake, **overrides):
+        from sayink.text_polisher import chat_completion
+
+        kwargs = dict(
+            api_url="https://api.example.com/v1/",
+            api_key="sk-x",
+            model_name="m",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.2,
+            max_tokens=99,
+            retry_delay_sec=0,
+        )
+        kwargs.update(overrides)
+        return chat_completion(client, fake, **kwargs)
+
+    def test_posts_openai_payload_and_returns_stripped_content(self):
+        fake, client = _fake_httpx_module(_make_response({"choices": [{"message": {"content": "  好的 \n"}}]}))
+        assert self._call(client, fake) == "好的"
+        args, kwargs = client.post.call_args
+        assert args[0] == "https://api.example.com/v1/chat/completions"
+        assert kwargs["headers"]["Authorization"] == "Bearer sk-x"
+        assert kwargs["json"] == {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.2,
+            "max_tokens": 99,
+        }
+
+    def test_url_already_ending_in_chat_completions_is_kept(self):
+        from sayink.text_polisher import chat_completions_url
+
+        assert chat_completions_url("https://x/v1/chat/completions") == "https://x/v1/chat/completions"
+        assert chat_completions_url("https://x/v1/") == "https://x/v1/chat/completions"
+
+    def test_malformed_and_empty_answers_raise_response_error(self):
+        from sayink.text_polisher import LLMResponseError
+
+        for payload, text in (
+            ({"choices": []}, "响应格式异常"),
+            ({"choices": [{"message": "nope"}]}, "响应格式异常"),
+            ({"choices": [{"message": {"content": "  "}}]}, "空内容"),
+            ({"choices": [{"message": {"content": None}}]}, "空内容"),
+        ):
+            fake, client = _fake_httpx_module(_make_response(payload))
+            with pytest.raises(LLMResponseError, match=text):
+                self._call(client, fake)
+
+    def test_gateway_and_network_errors_retry_once_then_propagate(self):
+        bad = _make_response({}, status_ok=False)
+        bad.status_code = 502
+        fake, client = _fake_httpx_module()
+        client.post.side_effect = [bad, bad]
+        with pytest.raises(RuntimeError, match="HTTP 500"):  # the fake's raise_for_status
+            self._call(client, fake)
+        assert client.post.call_count == 2
+
+        fake, client = _fake_httpx_module()
+        client.post.side_effect = [fake.RemoteProtocolError("eof"), fake.RemoteProtocolError("eof")]
+        with pytest.raises(fake.RemoteProtocolError):
+            self._call(client, fake)
+        assert client.post.call_count == 2
+
+    def test_cancel_is_checked_before_and_after_each_attempt(self):
+        from sayink.text_polisher import LLMCancelled
+
+        fake, client = _fake_httpx_module(_make_response({"choices": [{"message": {"content": "x"}}]}))
+        with pytest.raises(LLMCancelled):
+            self._call(client, fake, is_cancelled=lambda: True)
+        client.post.assert_not_called()
+
+        flag = {"c": False}
+
+        def post_then_cancel(*_a, **_k):
+            flag["c"] = True
+            raise fake.ConnectError("reset")
+
+        fake, client = _fake_httpx_module()
+        client.post.side_effect = post_then_cancel
+        with pytest.raises(LLMCancelled):
+            self._call(client, fake, is_cancelled=lambda: flag["c"])
+        assert client.post.call_count == 1
+
+
 class TestPolishSettingsComplete:
     @pytest.mark.parametrize(
         "url",

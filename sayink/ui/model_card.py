@@ -37,6 +37,9 @@ class ModelCard(QFrame):
         self._info = model_info
         self._is_downloaded = is_downloaded
         self._is_active = is_active
+        # Aux models (speaker embedding, neural VAD) are used automatically
+        # by meetings once present: no 「使用此模型」, no 「推荐」 badge.
+        self._is_aux = bool(model_info.get("aux"))
         self._progress_bar = None
         self._action_btn = None
         self._select_btn = None
@@ -56,8 +59,12 @@ class ModelCard(QFrame):
         self._name_lbl.setProperty("viRole", "modelName")
         head.addWidget(self._name_lbl)
         from sayink.speech_recognizer import DEFAULT_MODEL_ID
-        if self._is_active or self._model_id == DEFAULT_MODEL_ID:
+        if self._is_aux:
+            if self._is_downloaded:
+                self._badge = QLabel("已启用")
+        elif self._is_active or self._model_id == DEFAULT_MODEL_ID:
             self._badge = QLabel("当前" if self._is_active else "推荐")
+        if self._badge is not None:
             self._badge.setProperty("viRole", "modelBadge")
             head.addWidget(self._badge)
         head.addStretch()
@@ -75,13 +82,16 @@ class ModelCard(QFrame):
 
         layout.addSpacing(6)
 
-        self._meta_lbl = QLabel(
-            f"{self._info['languages']} · "
-            f"{format_model_ratings(self._info['accuracy'], self._info['speed'])}"
-        )
+        if self._is_aux:
+            self._meta_lbl = QLabel(f"{self._info['languages']} · 会议辅助模型，下载后自动使用")
+        else:
+            self._meta_lbl = QLabel(
+                f"{self._info['languages']} · "
+                f"{format_model_ratings(self._info['accuracy'], self._info['speed'])}"
+            )
+            self._meta_lbl.setToolTip(RATING_TOOLTIP)
         self._meta_lbl.setProperty("viRole", "modelMeta")
         self._meta_lbl.setWordWrap(True)
-        self._meta_lbl.setToolTip(RATING_TOOLTIP)
         layout.addWidget(self._meta_lbl)
 
         layout.addSpacing(12)
@@ -106,7 +116,7 @@ class ModelCard(QFrame):
         )
         btn_h = tok.CONTROL_BTN_SM_HEIGHT
         if self._is_downloaded:
-            if not self._is_active:
+            if not self._is_active and not self._is_aux:
                 self._select_btn = QPushButton("使用此模型")
                 self._select_btn.setFixedHeight(btn_h)
                 self._select_btn.clicked.connect(
