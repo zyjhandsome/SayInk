@@ -5,7 +5,8 @@
 ;   ISCC /DAppVersionStr=2.2.5 /DAppVersionQuad=2.2.5.0 SayInk-Setup.iss
 ; Lite installer (default): no model inside, the app downloads Fun-ASR-Nano
 ; on first start. Full installer: /DBundleModel /DOutputSuffix=-full copies
-; dist\SayInk\models\ and names the file SayInk-Setup-<version>-full.exe.
+; dist\SayInk\models\ (Fun-ASR-Nano, CAM++, Silero VAD) and names the file
+; SayInk-Setup-<version>-full.exe.
 ; The in-app updater only downloads the lite name (sayink/updater.py).
 #ifndef AppVersionStr
 #define AppVersionStr "2.2.5"

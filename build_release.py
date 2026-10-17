@@ -4,7 +4,8 @@ One-shot Windows release build: PyInstaller → Inno Setup → remove staging.
 Final artifact (for distribution):
   dist/SayInk-Setup-<version>.exe       lite installer (default; the app
                                         downloads Fun-ASR-Nano on first start)
-  dist/SayInk-Setup-<version>-full.exe  with --with-model: model bundled
+  dist/SayInk-Setup-<version>-full.exe  with --with-model: Fun-ASR-Nano,
+                                        CAM++ and Silero VAD bundled
 
 The version comes from sayink/version.py. The unpacked folder dist/SayInk/
 is only an intermediate step and is removed after the installer is built
@@ -35,7 +36,7 @@ def main() -> None:
     parser.add_argument(
         "--with-model",
         action="store_true",
-        help="Bundle Fun-ASR-Nano into the installer (SayInk-Setup-<version>-full.exe).",
+        help="Bundle Fun-ASR-Nano, CAM++ and Silero VAD (SayInk-Setup-<version>-full.exe).",
     )
     args = parser.parse_args()
 

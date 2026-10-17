@@ -1,9 +1,11 @@
 """
-Download the default bundled ASR model into <project>/models/ for PyInstaller / Inno builds.
+Download the models a full installer bundles into <project>/models/.
 
+That is Fun-ASR-Nano plus the meeting helpers (CAM++ and Silero VAD).
 Same HuggingFace layout as the in-app downloader. Run from repo root:
 
   python sayink_build/download_bundle_model_for_build.py
+  python sayink_build/download_bundle_model_for_build.py funasr-nano
 
 Requires: pip install httpx (already in requirements.txt)
 """
@@ -21,10 +23,10 @@ if str(ROOT) not in sys.path:
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("download_bundle_model")
 
-from sayink.speech_recognizer import DEFAULT_MODEL_ID, get_model_info, HF_URL
+from sayink.speech_recognizer import get_model_info, HF_URL
 
 
-def main(model_id: str = DEFAULT_MODEL_ID) -> int:
+def _download_one(model_id: str) -> int:
     import httpx
 
     info = get_model_info(model_id)
@@ -71,5 +73,18 @@ def main(model_id: str = DEFAULT_MODEL_ID) -> int:
     return 0
 
 
+def main(model_id: str | None = None) -> int:
+    """Download one model, or every model a full installer bundles."""
+    if model_id:
+        return _download_one(model_id)
+    from build import bundle_model_ids
+
+    rc = 0
+    for mid in bundle_model_ids():
+        rc = _download_one(mid) or rc
+    return rc
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    requested = sys.argv[1] if len(sys.argv) > 1 else None
+    sys.exit(main(requested))

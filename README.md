@@ -165,7 +165,7 @@ pip install -r requirements.txt   # PyQt6、sherpa-onnx、sounddevice、pynput �
 | 安装包 | 大小 | 适合 |
 |--------|------|------|
 | **`SayInk-Setup-2.2.5.exe`**（轻量包，默认） | 约 50 MB | 首次安装、日常更新。不含语音模型，首次启动的欢迎框会带你到 **设置 → 引擎** 下载 Fun-ASR-Nano（约 600 MB，只需一次） |
-| `SayInk-Setup-2.2.5-full.exe`（完整包） | 约 700 MB | 安装后要立刻离线使用、或下载模型困难的机器：模型随安装包一起装好 |
+| `SayInk-Setup-2.2.5-full.exe`（完整包） | 约 740 MB | 安装后要立刻离线使用：Fun-ASR-Nano、说话人嵌入 CAM++、Silero VAD 随安装包装好 |
 
 两种包装出来的程序完全相同；**应用内自动更新一律下载轻量包**。已安装的模型（无论是完整包带的 `安装目录\models`，还是自己下载到 `~/.sayink/models/` 的）在升级时都会保留，不必重新下载。无安装包见 [从源码打包](#从源码打包)。
 
@@ -237,14 +237,14 @@ py -3.10 run.py
 
 ## 从源码打包
 
-**Windows 10/11**，Python 3.10+。生成安装包还需 [Inno Setup 6](https://jrsoftware.org/isdl.php)。默认打出的是**轻量包**（不含模型）；加 `--with-model` 打**完整包**，此时本地须有 **Fun-ASR-Nano** 模型。
+**Windows 10/11**，Python 3.10+。生成安装包还需 [Inno Setup 6](https://jrsoftware.org/isdl.php)。默认打出的是**轻量包**（不含模型）；加 `--with-model` 打**完整包**，此时本地须有 **Fun-ASR-Nano**、**说话人嵌入 CAM++** 和 **Silero VAD**。
 
 ```bash
 pip install -r requirements-build.txt -c constraints-windows-py310.txt   # 运行依赖 + PyInstaller，按已验证版本固定
 python -m sayink_build.dependency_check                 # 打包前检查依赖版本
 python build_release.py                 # → dist/SayInk-Setup-<版本>.exe（轻量包，约 50 MB）
-python sayink_build/download_bundle_model_for_build.py   # 完整包首次：下载模型到 ./models/
-python build_release.py --with-model    # → dist/SayInk-Setup-<版本>-full.exe（完整包，约 700 MB）
+python sayink_build/download_bundle_model_for_build.py   # 完整包首次：下载上述三个模型到 ./models/
+python build_release.py --with-model    # → dist/SayInk-Setup-<版本>-full.exe（完整包，含上述模型）
 # 或仅便携版：
 python build.py                         # → dist/SayInk/SayInk.exe（须整目录分发；加 --with-model 带模型）
 ```
@@ -303,7 +303,7 @@ A: 用 **会议记录**（托盘 → 开始会议）。持续转写只是把话�
 A: 模型写的这句在文字稿里找不到对应原话，可能是概括过头或听错。核对后可直接在会议页编辑纪要，或换个模板重新生成。
 
 **Q: 会议没区分出说话人 / 把一个人拆成了两个？**  
-A: 多半是还没下载「说话人嵌入 CAM++」——开始卡片或进行中页面上点「下载辅助模型」（约 30 MB），或到 设置 → 引擎 下载；下一场会议和下一场持续转写都自动启用。没有它时只能按频谱粗分，同一个人换个说法、音量一变就可能拆成两个编号；程序会让 3 秒内接着说的相近段落沿用上一位、过短的段落不单独判人，并在会议结束时重新聚类一次，但仍不如声纹模型。结果仍不满意可在会议页把编号改成真名，文字稿和纪要会一起改。
+A: 完整安装包已带上 CAM++ 和 Silero VAD。轻量包多半是还没下载「说话人嵌入 CAM++」——开始卡片或进行中页面上点「下载辅助模型」（约 30 MB），或到 设置 → 引擎 下载；下一场会议和下一场持续转写都自动启用。没有它时只能按频谱粗分，同一个人换个说法、音量一变就可能拆成两个编号；程序会让 3 秒内接着说的相近段落沿用上一位、过短的段落不单独判人，并在会议结束时重新聚类一次，但仍不如声纹模型。结果仍不满意可在会议页把编号改成真名，文字稿和纪要会一起改。
 
 **Q: 会议中电脑卡了、麦克风掉了，内容会丢吗？**  
 A: 已识别的句子已经在本机数据库里。设备断开或识别积压太长时只暂停采集，会议页点「继续采集」即可；程序崩溃的话下次启动这场会标为「已中断」，仍可生成纪要。

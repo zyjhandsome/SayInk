@@ -5,15 +5,17 @@ Output: dist/SayInk/ — SayInk.exe, _internal/, and (with --with-model) models/
 
 The default build is the **lite** package: no model inside, the app downloads
 Fun-ASR-Nano on first start (设置 → 引擎). ``--with-model`` (or
-``SAYINK_BUNDLE_MODEL=1``) copies the model next to the exe from
-~/.sayink/models/ or ./models/ and fails when it is missing; fetch it with
-`python sayink_build/download_bundle_model_for_build.py` (writes to `./models/`).
+``SAYINK_BUNDLE_MODEL=1``) copies Fun-ASR-Nano plus the meeting helpers
+(CAM++ speaker embedding and Silero VAD) next to the exe from
+~/.sayink/models/ or ./models/ and fails when any of them is missing; fetch
+them with `python sayink_build/download_bundle_model_for_build.py`
+(writes to `./models/`).
 
 Distribution:
 - **Installer (recommended):** run `python build_release.py` — produces
   `dist/SayInk-Setup-<version>.exe` (lite, ~100 MB); add `--with-model` for
-  `dist/SayInk-Setup-<version>-full.exe` (~700 MB). Version from
-  `sayink/version.py`; staging folder removed after Inno Setup.
+  `dist/SayInk-Setup-<version>-full.exe` (~740 MB, ASR + CAM++ + Silero).
+  Version from `sayink/version.py`; staging folder removed after Inno Setup.
 - **Portable folder:** run this script only, then zip `dist/SayInk/` for
   users who should not run an installer.
 """
@@ -35,7 +37,8 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-# The model copied into dist/SayInk/models/ by a --with-model build.
+# Speech model copied into dist/SayInk/models/ by a --with-model build.
+# Meeting helpers (CAM++, Silero) are required alongside it.
 from sayink.speech_recognizer import DEFAULT_MODEL_ID
 
 BUNDLE_REQUIRE_MODEL_ID = DEFAULT_MODEL_ID
@@ -49,42 +52,65 @@ def bundle_model_requested(argv: list[str] | None = None) -> bool:
     return os.environ.get("SAYINK_BUNDLE_MODEL", "").strip().lower() in ("1", "true", "yes")
 
 
-def _find_model_sources() -> list[tuple[str, Path]]:
-    """Return the default release model if present under project or user models dir."""
+def bundle_model_ids() -> list[str]:
+    """Models a ``--with-model`` build must copy: ASR, then meeting helpers."""
+    from sayink.speech_recognizer import AUX_MODEL_REGISTRY
+
+    return [BUNDLE_REQUIRE_MODEL_ID, *[m["id"] for m in AUX_MODEL_REGISTRY]]
+
+
+def model_search_dirs() -> list[Path]:
+    """Project tree first, then the per-user dirs the app itself downloads into."""
+    return [
+        SCRIPT_DIR / "models",
+        Path.home() / ".sayink" / "models",
+        Path.home() / ".voiceink" / "models",
+    ]
+
+
+def _find_model_sources(search_dirs: list[Path] | None = None) -> list[tuple[str, Path]]:
+    """Return each required bundle model found under ``search_dirs``."""
     try:
         from sayink.speech_recognizer import get_model_info
     except ImportError:
         return []
 
-    info = get_model_info(BUNDLE_REQUIRE_MODEL_ID)
-    if not info:
-        return []
-
-    project_models = SCRIPT_DIR / "models"
-    user_models = Path.home() / ".sayink" / "models"
-    legacy_user_models = Path.home() / ".voiceink" / "models"
-
-    for src_dir in [project_models, user_models, legacy_user_models]:
-        d = src_dir / info["dir_name"]
-        if d.exists() and all((d / f).exists() for f in info["files"]):
-            return [(info["dir_name"], d)]
-    return []
+    dirs = model_search_dirs() if search_dirs is None else search_dirs
+    found: list[tuple[str, Path]] = []
+    for model_id in bundle_model_ids():
+        info = get_model_info(model_id)
+        if not info:
+            continue
+        for src_dir in dirs:
+            candidate = src_dir / info["dir_name"]
+            if candidate.is_dir() and all((candidate / name).is_file() for name in info["files"]):
+                found.append((info["dir_name"], candidate))
+                break
+    return found
 
 
 def _require_bundle_model(downloaded: list[tuple[str, Path]]) -> None:
     from sayink.speech_recognizer import get_model_info
 
-    info = get_model_info(BUNDLE_REQUIRE_MODEL_ID)
-    if not info:
-        print(f"\n[ERROR] Unknown bundle model id: {BUNDLE_REQUIRE_MODEL_ID!r}")
-        sys.exit(1)
-    dirname = info["dir_name"]
-    if any(d == dirname for d, _ in downloaded):
+    present = {dirname for dirname, _ in downloaded}
+    missing: list[dict] = []
+    for model_id in bundle_model_ids():
+        info = get_model_info(model_id)
+        if not info:
+            print(f"\n[ERROR] Unknown bundle model id: {model_id!r}")
+            sys.exit(1)
+        if info["dir_name"] not in present:
+            missing.append(info)
+    if not missing:
         return
-    print("\n[ERROR] 打包 EXE 需要已在本地就绪的 Fun-ASR-Nano 模型。")
-    print("  请先在应用「设置 → 引擎」中下载该模型，或将完整目录放到:")
-    print(f"    {SCRIPT_DIR / 'models' / dirname}")
-    print(f"    或 {Path.home() / '.sayink' / 'models' / dirname}")
+    print("\n[ERROR] 完整包需要这些模型已在本地就绪：")
+    for info in missing:
+        print(f"  - {info['name']}（{info['dir_name']}）")
+    print("  请在应用「设置 → 引擎」下载，或运行:")
+    print("    python sayink_build/download_bundle_model_for_build.py")
+    print("  目录可以是:")
+    for src in model_search_dirs()[:2]:
+        print(f"    {src}")
     sys.exit(1)
 
 
