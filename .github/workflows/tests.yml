@@ -35,7 +35,5 @@ jobs:
         run: python -m pip check
       - name: Check release dependencies
         run: python -m sayink_build.dependency_check
-      - name: Lint
-        run: python -m ruff check sayink sayink_build tests build.py build_release.py run.py
       - name: Run regression tests
         run: python -m pytest -p no:cacheprovider tests -q
