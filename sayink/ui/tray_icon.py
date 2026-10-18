@@ -652,6 +652,7 @@ class TrayIcon(QSystemTrayIcon):
             "listening": "正在听",
             "loading": "模型载入中",
             "meeting": "会议记录中",
+            "meeting_paused": "会议采集已暂停",
         }
         label = lines.get(state, "")
         if label:

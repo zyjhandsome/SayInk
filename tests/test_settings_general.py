@@ -18,12 +18,13 @@ from sayink.audio_devices import (
 from sayink.config import TRIGGER_MODE_CONTINUOUS, TRIGGER_MODE_HOTKEY, Config
 from sayink.ui.design_tokens import (
     ACCENT,
-    AMBER_TEXT,
     SURFACE_PEARL,
     TEXT_DIM,
     TEXT_SEC,
 )
 from sayink.ui.settings_window import SettingsWindow
+
+_REAL_DEVICE_REFRESH = SettingsWindow._refresh_audio_device_lists
 
 
 @pytest.fixture(scope="module")
@@ -84,6 +85,10 @@ def settings_window(_shared_settings, config, monkeypatch):
         monkeypatch.setattr(SettingsWindow, name, lambda self: None)
     win.hide()
     win._loading = False
+    win.set_pending_segment_counter(None)
+    win._segmentation_status = None
+    win._recognition_pending = False
+    win._speaker_runtime_text = "尚未获取说话人增强运行状态"
     win.reload_settings()
     yield win
 
@@ -97,8 +102,7 @@ class TestGeneralPageLayout:
 
     def test_general_footer_note_combines_save_and_hotkey_guidance(self, settings_window):
         assert settings_window._general_footer_note.text() == (
-            "更改将自动保存并立即生效；若录音快捷键与输入法冲突，"
-            "可改用 Alt + Space。"
+            "快捷键与输入法冲突时，可尝试其他组合；修改录音快捷键后自动保存。"
         )
         sheet = settings_window._general_footer_note.styleSheet()
         assert f"color: {TEXT_DIM}" in sheet
@@ -125,7 +129,7 @@ class TestGeneralPageLayout:
             texts = [lb.text() for lb in row.findChildren(QLabel) if lb.text()]
             assert texts == [title], texts
         history_text = " ".join(lb.text() for lb in settings_window._history_enabled_row.findChildren(QLabel))
-        assert "保存语音历史" in history_text
+        assert "保存转写历史" in history_text
         assert "不保存音频" in history_text
 
         footnotes = [
@@ -135,24 +139,17 @@ class TestGeneralPageLayout:
         ]
         assert footnotes
         assert footnotes[0] == (
-            "更改将自动保存并立即生效；若录音快捷键与输入法冲突，"
-            "可改用 Alt + Space。"
+            "快捷键与输入法冲突时，可尝试其他组合；修改录音快捷键后自动保存。"
         )
 
-    def test_about_version_pill_and_usage_callout_match_reference(self, settings_window):
+    def test_about_version_is_plain_information_without_duplicate_usage_callout(self, settings_window):
         version_sheet = settings_window._about_version_label.styleSheet()
-        assert f"background: {SURFACE_PEARL}" in version_sheet
+        assert "background: transparent" in version_sheet
+        assert "border: none" in version_sheet
         assert f"color: {TEXT_SEC}" in version_sheet
         assert f"color: {ACCENT}" not in version_sheet
-
-        assert (
-            settings_window._about_version_label.width()
-            == settings_window._about_update_btn.width()
-        )
-
-        labels = settings_window._about_usage_tip.findChildren(QLabel)
-        assert labels
-        assert all(f"color: {AMBER_TEXT}" not in label.styleSheet() for label in labels)
+        assert settings_window._about_version_label.text().startswith("当前版本 ")
+        assert not hasattr(settings_window, "_about_usage_tip")
 
     def test_settings_stack_contains_only_native_pages(self, settings_window):
         from sayink.ui.settings_components import SettingsPage
@@ -186,7 +183,7 @@ class TestGeneralPageLayout:
             for label in settings_window.findChildren(QLabel)
             if label.objectName() == "settingsGroupTitle"
         }
-        ordered = ["录音", "音频", "偏好"]
+        ordered = ["录音与输入", "识别", "会议默认设置", "应用与历史"]
         assert all(name in titles for name in ordered)
         ys = [titles[name].mapToGlobal(titles[name].rect().center()).y() for name in ordered]
         assert ys == sorted(ys)
@@ -350,16 +347,14 @@ class TestGeneralPageLayout:
 
         assert settings_window._mixed_audio_callout.parent() is not None
 
-    def test_history_limit_rows_follow_toggle(self, settings_window):
+    def test_retention_stays_editable_for_existing_history_when_new_history_is_off(self, settings_window):
         settings_window.show()
         settings_window._history_enabled_row.setChecked(False)
-        settings_window._set_history_limit_rows_visible(
-            settings_window._history_enabled_row.isChecked()
-        )
-        assert not settings_window._history_retention_row.isVisible()
-        assert not settings_window._history_max_entries_row.isVisible()
+        assert settings_window._history_retention_row.isVisible()
+        assert settings_window._history_max_entries_row.isVisible()
+        assert settings_window._history_retention_days_spin.isEnabled()
+        assert "已停止新增" in settings_window._history_cleanup_hint.text()
         settings_window._history_enabled_row.setChecked(True)
-        settings_window._set_history_limit_rows_visible(True)
         assert settings_window._history_retention_row.isVisible()
 
     def test_mixed_callout_only_when_mixed(self, settings_window):
@@ -374,14 +369,17 @@ class TestGeneralPageLayout:
     def test_hotkey_hint_is_one_sentence(self, settings_window, config):
         # Default (hold-to-talk) hint right after load, not the continuous one.
         text = settings_window._hotkey_hint.text()
-        assert "0.18" in text and "0.30" not in text
+        assert "松开后识别" in text and "取消本次录音" in text
+        assert "0.18" in settings_window._hotkey_hint.toolTip()
+        assert settings_window._esc_stop_row.isHidden()
         assert text.count("。") <= 2
         assert "浮窗" not in text
 
         config.set("audio.trigger_mode", TRIGGER_MODE_CONTINUOUS)
         settings_window.reload_settings()
         text = settings_window._hotkey_hint.text()
-        assert "0.30" in text
+        assert "已录内容继续识别" in text
+        assert not settings_window._esc_stop_row.isHidden()
         assert text.count("。") <= 2
         assert "浮窗" not in text
 
@@ -416,13 +414,15 @@ class TestOutputMode:
 
     def test_default_pastes(self, settings_window, config):
         assert config.history_only_output() is False
-        assert not settings_window._history_only_output_row.isChecked()
+        assert settings_window._output_mode_combo.currentData() == "auto"
+        assert "输入当前光标" in settings_window._output_mode_hint.text()
 
     def test_system_or_mixed_source_switches_to_history_only(self, settings_window, config, monkeypatch):
         monkeypatch.setattr(settings_window, "_confirm_discard_pending", lambda: True)
         settings_window._src_sys_rb.setChecked(True)
         assert config.history_only_output() is True
-        assert settings_window._history_only_output_row.isChecked()
+        assert settings_window._output_mode_combo.currentData() == "auto"
+        assert "仅保存到历史" in settings_window._output_mode_hint.text()
         assert not settings_window._mixed_audio_callout.isHidden()
 
     def test_back_to_microphone_restores_paste_only_if_app_chose_it(self, settings_window, config, monkeypatch):
@@ -431,10 +431,11 @@ class TestOutputMode:
         assert config.history_only_output() is True
         settings_window._src_mic_rb.setChecked(True)
         assert config.history_only_output() is False
-        assert not settings_window._history_only_output_row.isChecked()
+        assert settings_window._output_mode_combo.currentData() == "auto"
 
         # The user turns history-only on by hand: the source no longer touches it.
-        settings_window._history_only_output_row.setChecked(True)
+        combo = settings_window._output_mode_combo
+        combo.setCurrentIndex(combo.findData("history"))
         assert config.get("output.mode_auto") is False
         settings_window._src_mixed_rb.setChecked(True)
         settings_window._src_mic_rb.setChecked(True)
@@ -443,9 +444,43 @@ class TestOutputMode:
     def test_user_can_switch_back_to_paste_while_on_mixed(self, settings_window, config, monkeypatch):
         monkeypatch.setattr(settings_window, "_confirm_discard_pending", lambda: True)
         settings_window._src_mixed_rb.setChecked(True)
-        settings_window._history_only_output_row.setChecked(False)
+        combo = settings_window._output_mode_combo
+        combo.setCurrentIndex(combo.findData("paste"))
         assert config.history_only_output() is False
         assert config.get("audio.input_source") == INPUT_SOURCE_MIXED
+
+    def test_explicit_paste_survives_later_source_changes_and_reload(self, settings_window, config, monkeypatch):
+        monkeypatch.setattr(settings_window, "_confirm_discard_pending", lambda: True)
+        combo = settings_window._output_mode_combo
+        combo.setCurrentIndex(combo.findData("paste"))
+        for radio in (settings_window._src_sys_rb, settings_window._src_mic_rb, settings_window._src_mixed_rb):
+            radio.setChecked(True)
+            assert config.history_only_output() is False
+        settings_window.reload_settings()
+        assert combo.currentData() == "paste"
+        assert "保持不变" in settings_window._output_mode_hint.text()
+
+    def test_automatic_choice_resolves_immediately_for_current_source(self, settings_window, config):
+        config.set_output_mode("paste")
+        config.set("audio.input_source", "system")
+        settings_window.reload_settings()
+        combo = settings_window._output_mode_combo
+        combo.setCurrentIndex(combo.findData("auto"))
+        assert config.history_only_output()
+        assert config.output_follows_input_source()
+
+    def test_missing_history_has_local_recovery_and_clipboard_dependency(self, settings_window, config):
+        combo = settings_window._output_mode_combo
+        combo.setCurrentIndex(combo.findData("history"))
+        settings_window._history_enabled_row.setChecked(False)
+        assert "不会保存" in settings_window._output_mode_hint.text()
+        assert not settings_window._enable_history_wrap.isHidden()
+        assert not settings_window._restore_clipboard_row.isEnabled()
+        settings_window._enable_history_btn.click()
+        assert config.get("history.enabled")
+        assert settings_window._enable_history_wrap.isHidden()
+        combo.setCurrentIndex(combo.findData("paste"))
+        assert settings_window._restore_clipboard_row.isEnabled()
 
 
 class TestInputSource:
@@ -498,7 +533,7 @@ class TestToggles:
         for row, title in (
             (settings_window._auto_start_row, "开机时自动启动"),
             (settings_window._sound_row, "录音提示音"),
-            (settings_window._history_enabled_row, "保存语音历史"),
+            (settings_window._history_enabled_row, "保存转写历史"),
         ):
             assert row.height() >= 40, f"{title} row height={row.height()}"
             labels = [lb for lb in row.findChildren(QLabel) if lb.text() == title]
@@ -655,6 +690,53 @@ class TestHotkeyBinding:
 
 
 class TestAdvancedDevices:
+    def test_device_refresh_preserves_selection_without_applying_transient_entries(self, settings_window, config, monkeypatch):
+        from types import SimpleNamespace
+
+        win = settings_window
+        monkeypatch.setattr("sayink.ui.settings_window.list_microphone_devices",
+                            lambda: [SimpleNamespace(index=0, label="USB 麦克风")])
+        monkeypatch.setattr("sayink.ui.settings_window.list_system_capture_devices_for_settings", list)
+        win._loading = True
+        win._mic_device_combo.clear()
+        win._mic_device_combo.addItem("自动选择", -1)
+        win._mic_device_combo.addItem("USB 麦克风", 0)
+        win._mic_device_combo.setCurrentIndex(1)
+        config.set("audio.mic_device_index", 0)
+        win._loading = False
+        applied = []
+        win.settings_changed.connect(lambda: applied.append(True))
+        _REAL_DEVICE_REFRESH(win)
+        assert win._mic_device_combo.currentData() == 0
+        assert config.get("audio.mic_device_index") == 0
+        assert applied == []
+        monkeypatch.setattr("sayink.ui.settings_window.list_microphone_devices", list)
+        _REAL_DEVICE_REFRESH(win)
+        assert win._mic_device_combo.currentData() == 0
+        assert "不可用" in win._audio_device_summary.text()
+        assert applied == []
+
+    def test_advanced_recognition_expands_from_keyboard_and_pending_stays_visible(self, settings_window, qapp):
+        from PyQt6.QtTest import QTest
+        from sayink.runtime_status import SegmentationStatus
+
+        settings_window.show()
+        button = settings_window._advanced_recognition_btn
+        button.setChecked(False)
+        assert settings_window._advanced_recognition_panel.isHidden()
+        button.setFocus()
+        QTest.keyClick(button, Qt.Key.Key_Space)
+        qapp.processEvents()
+        assert settings_window._advanced_recognition_panel.isVisible()
+        QTest.keyClick(button, Qt.Key.Key_Space)
+        settings_window.set_recognition_runtime_status(
+            SegmentationStatus("silero", "energy", False), speaker_status="待加载", pending=True,
+        )
+        assert settings_window._advanced_recognition_panel.isHidden()
+        assert settings_window._recognition_apply_label.isVisible()
+        assert "已保存" in settings_window._recognition_apply_label.text()
+        assert "待本场结束" in settings_window._recognition_apply_label.text()
+
     def test_first_device_index_zero_is_kept(self, settings_window, config):
         combo = settings_window._mic_device_combo
         settings_window._loading = True
@@ -746,6 +828,12 @@ class TestPolishConfigurationStatus:
 
 
 class TestMicProbe:
+    def test_source_change_discards_a_previous_test_conclusion(self, settings_window):
+        settings_window._set_mic_test_status("已检测到声音。")
+        settings_window._src_sys_rb.setChecked(True)
+        assert "已检测到声音" not in settings_window._mic_test_status.text()
+        assert "约 2 秒" in settings_window._mic_test_status.text()
+
     def test_probe_runs_two_second_flow(self, settings_window, monkeypatch):
         monkeypatch.setattr(settings_window, "_refresh_audio_device_lists", lambda: None)
         recorder = settings_window._mic_test_recorder
@@ -766,6 +854,40 @@ class TestMicProbe:
         assert "已检测到声音" in settings_window._mic_test_status.text()
         assert "可以正常使用" not in settings_window._mic_test_status.text()
         assert "峰值" not in settings_window._mic_test_status.text()
+
+    def test_probe_failure_restores_controls_and_cancels_its_timer(self, settings_window, monkeypatch):
+        monkeypatch.setattr(settings_window._mic_test_recorder, "start", lambda: None)
+        settings_window._run_mic_probe()
+        assert settings_window._mic_probe_timer.isActive()
+        assert not settings_window._src_sys_rb.parentWidget().isEnabled()
+        settings_window._on_mic_probe_error("设备不可用")
+        assert not settings_window._mic_probe_timer.isActive()
+        assert settings_window._mic_level_bar.isHidden()
+        assert settings_window._src_sys_rb.parentWidget().isEnabled()
+        assert "设备不可用" in settings_window._mic_test_status.text()
+        settings_window._finish_mic_probe()
+        assert "测试失败" in settings_window._mic_test_status.text()
+
+    def test_quiet_mixed_input_keeps_fallback_warning(self, settings_window, config, monkeypatch):
+        monkeypatch.setattr(settings_window._mic_test_recorder, "start", lambda: None)
+        config.set("audio.input_source", "mixed")
+        settings_window.reload_settings()
+        settings_window._run_mic_probe()
+        settings_window._on_mic_probe_volume(0.003)
+        assert settings_window._mic_level_bar.value() > 0
+        settings_window._on_mic_probe_warning("电脑声音不可用，本次仅麦克风")
+        settings_window._finish_mic_probe()
+        message = settings_window._mic_test_status.text()
+        assert "音量偏低" in message
+        assert "分别" in message
+        assert "本次仅麦克风" in message
+
+    def test_no_input_provides_next_steps(self, settings_window, monkeypatch):
+        monkeypatch.setattr(settings_window._mic_test_recorder, "start", lambda: None)
+        settings_window._run_mic_probe()
+        settings_window._finish_mic_probe()
+        assert "未检测到" in settings_window._mic_test_status.text()
+        assert "手动选择设备" in settings_window._mic_test_status.text()
 
 
 class TestNavigation:
@@ -826,6 +948,7 @@ class TestModelDownloadDone:
             "sayink.speech_recognizer.get_model_info",
             lambda model_id: {"name": f"模型 {model_id}"},
         )
+        monkeypatch.setattr("sayink.speech_recognizer.is_model_downloaded", lambda _mid: False)
         return shown
 
     def test_second_model_download_says_it_is_not_in_use(self, settings_window, config, done_env, monkeypatch):
@@ -847,16 +970,23 @@ class TestModelDownloadDone:
         assert config.get("stt.model_id") == "first"
         assert "载入内存" in done_env[0]
 
+    def test_model_waiting_for_current_session_does_not_claim_it_is_loading(self, settings_window, config, done_env, monkeypatch):
+        monkeypatch.setattr("sayink.speech_recognizer.get_downloaded_models", lambda: ["first"])
+        settings_window._recognition_pending = True
+        settings_window._on_dl_done("first")
+        assert "待本场结束" in done_env[0]
+        assert "正在载入内存" not in done_env[0]
+
 
 class TestMeetingSettings:
-    """通用 → 「会议与识别」 and 润色 → 「会议纪要」 round-trip through config.
+    """公共识别 / 会议默认设置 / 会议纪要 round-trip through config.
 
     Glossary / language / VAD are shared by dictation and meetings, so they
     live under ``stt.*``; only the meeting-specific choices stay in ``meeting.*``.
     """
 
     def test_meeting_defaults_load(self, settings_window, config):
-        assert settings_window._meeting_source_combo.currentData() == "mixed"
+        assert settings_window._meeting_source_combo.currentData() == ""
         assert settings_window._meeting_model_combo.currentData() == ""
         assert settings_window._meeting_vad_combo.currentData() == "silero"
         assert settings_window._meeting_language_combo.currentData() == "auto"
@@ -885,10 +1015,48 @@ class TestMeetingSettings:
         win._meeting_glossary_edit.setPlainText("SayInk")
         win._flush_meeting_glossary()
         assert len(fired) == 3
-        # Meeting-only choices do not force a recognizer reload.
+        # Meeting-only defaults never reload the shared recognizer.
         win._meeting_source_combo.setCurrentIndex(win._meeting_source_combo.findData("microphone"))
-        win._flush_meeting_glossary()  # unchanged glossary → no signal
+        win._flush_meeting_glossary()
         assert len(fired) == 3
+
+    def test_speaker_enhancement_round_trips_through_shared_settings(self, settings_window, config):
+        settings_window._speaker_enabled_row.setChecked(False)
+        assert config.get("stt.speaker_model_enabled") is False
+        settings_window.reload_settings()
+        assert not settings_window._speaker_enabled_row.isChecked()
+
+    def test_actual_vad_failure_and_pending_settings_are_visible(self, settings_window, config, monkeypatch):
+        from sayink.runtime_status import SegmentationStatus
+
+        monkeypatch.setattr("sayink.speech_recognizer.is_model_downloaded", lambda _mid: True)
+        settings_window.set_recognition_runtime_status(
+            SegmentationStatus("silero", "energy", True, "bad onnx", True),
+            speaker_status="CAM++ 已加载", pending=True,
+        )
+        assert "当前会议" in settings_window._vad_runtime_label.text()
+        assert "加载失败" in settings_window._vad_runtime_label.text()
+        assert "bad onnx" == settings_window._vad_runtime_label.toolTip()
+        assert "待本场结束" in settings_window._recognition_apply_label.text()
+        assert "CAM++ 已加载" in settings_window._speaker_runtime_label.text()
+
+    def test_downloaded_alone_is_not_reported_as_loaded(self, settings_window, monkeypatch):
+        monkeypatch.setattr("sayink.speech_recognizer.is_model_downloaded", lambda _mid: True)
+        settings_window._segmentation_status = None
+        settings_window._refresh_recognition_feedback()
+        text = settings_window._vad_runtime_label.text()
+        assert "已下载" in text and "尚未确认加载状态" in text
+        assert "已加载" not in text
+
+    def test_download_during_capture_does_not_claim_a_load_failure(self, settings_window, monkeypatch):
+        from sayink.runtime_status import SegmentationStatus
+
+        monkeypatch.setattr("sayink.speech_recognizer.is_model_downloaded", lambda _mid: True)
+        settings_window.set_recognition_runtime_status(
+            SegmentationStatus("silero", "energy", False), speaker_status="待加载", pending=True,
+        )
+        assert "待本场结束后加载" in settings_window._vad_runtime_label.text()
+        assert "加载失败" not in settings_window._vad_runtime_label.text()
 
     def test_glossary_lines_become_terms_capped_and_deduped(self, settings_window, config):
         win = settings_window
@@ -914,8 +1082,26 @@ class TestMeetingSettings:
     def test_aux_model_download_message_does_not_touch_dictation_model(self, settings_window, config, monkeypatch):
         shown = []
         monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: shown.append(args[2]))
-        monkeypatch.setattr("sayink.speech_recognizer.get_downloaded_models", lambda: [])
+        monkeypatch.setattr("sayink.speech_recognizer.get_downloaded_models", list)
         config.set("stt.model_id", "funasr-nano")
         settings_window._on_dl_done("speaker-campplus")
         assert config.get("stt.model_id") == "funasr-nano"
-        assert "下一场会议" in shown[0]
+        assert "通用 → 识别 → 高级识别设置" in shown[0]
+
+    def test_cancel_all_downloads_cancels_before_waiting(self, settings_window):
+        events: list[str] = []
+
+        class _FakeDl:
+            def isRunning(self):
+                return True
+
+            def cancel(self):
+                events.append("cancel")
+
+            def wait(self, ms):
+                events.append(f"wait:{ms}")
+
+        settings_window._dl_workers["funasr-nano"] = _FakeDl()
+        settings_window.cancel_all_downloads()
+        assert events == ["cancel", "wait:3000"]
+        assert settings_window._dl_workers == {}

@@ -165,7 +165,9 @@ shadow tokens to `design_tokens.py` unless a surface actually paints one.
 - Surface fill, 1px border, radius LG
 - Main navigation: ink wash (`NAV_SELECTED_BG`), semibold label, 40px row height, 2px keyboard focus ring. Focus ring appears only for keyboard navigation (TabFocus) — never as a second "selected" state on open.
 - Sidebar runtime status: hairline + 8px semantic dot (`GREEN` ready / `AMBER` loading / `RED` failure) + text. Not a filled card, so it cannot read as a sixth nav item.
-- Task choices: native radio indicator, title and task-specific explanation; full card is clickable.
+- Task choices: native radio indicator, title and task-specific explanation; full card is clickable. Selected compact cards use `ACCENT_SOFT` and a 2px `ACCENT` outline; unchecked cards keep a 2px neutral outline so selection does not move content. Keyboard focus remains visible on the native radio.
+- General settings use four groups: 录音与输入 / 识别 / 会议默认设置 / 应用与历史. Result destination sits beside audio source, with an explicit automatic policy and two persistent fixed destinations. Low-frequency recognition algorithms and model diagnostics live in a keyboard-accessible disclosure; pending changes and failures remain visible while collapsed.
+- Theme segments have one Tab stop on the selected option and retain arrow-key navigation. Section titles use `TEXT_SEC` / `TYPE_BODY_SM`; behavior-critical explanations use `TEXT_SEC`. Audio testing is a secondary action, with a temporary input meter and actual opened device labels.
 - Settings pages: 20px page title, purpose sentence, grouped 14px section labels.
 - Engine hero card shows the *load* state (「已载入 · 可用」/「模型载入中…」) beside the「当前」badge; downloaded ≠ usable.
 - Polish page keeps the before/after example visible while the feature is off.

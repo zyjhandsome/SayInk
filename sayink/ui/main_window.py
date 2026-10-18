@@ -26,7 +26,6 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from sayink.config import DEFAULT_HOTKEY, TRIGGER_MODE_HOTKEY, format_hotkey
 from sayink.ui import design_tokens as tok
 from sayink.ui.settings_components import sync_group_tab_stop
 
@@ -163,6 +162,7 @@ class MainWindow(QWidget):
         self._page = "general"
         self._drag_offset = None
         self._live_resizing = False
+        self._model_runtime_text = "正在启动…"
         self._setup_window()
         self._setup_ui()
         self.reapply_theme()
@@ -260,8 +260,8 @@ class MainWindow(QWidget):
         self._sidebar.setObjectName("mainSidebar")
         self._sidebar.setFixedWidth(tok.SIDEBAR_WIDTH)
         side = QVBoxLayout(self._sidebar)
-        side.setContentsMargins(12, 16, 12, 16)
-        side.setSpacing(4)
+        side.setContentsMargins(12, 12, 12, 12)
+        side.setSpacing(3)
 
         self._nav_group = QButtonGroup(self)
         self._nav_group.setExclusive(True)
@@ -288,7 +288,7 @@ class MainWindow(QWidget):
         self._status_rule = QWidget()
         self._status_rule.setFixedHeight(1)
         side.addWidget(self._status_rule)
-        side.addSpacing(10)
+        side.addSpacing(6)
         status_row = QHBoxLayout()
         status_row.setContentsMargins(8, 0, 8, 0)
         status_row.setSpacing(8)
@@ -305,7 +305,11 @@ class MainWindow(QWidget):
         self._mode_label.setWordWrap(True)
         self._shortcut_label = QLabel()
         self._shortcut_label.setWordWrap(True)
+        self._output_label = QLabel()
+        self._output_label.setWordWrap(True)
+        self._output_label.setAccessibleName("听写输出去向")
         side.addWidget(self._mode_label)
+        side.addWidget(self._output_label)
         side.addWidget(self._shortcut_label)
         body.addWidget(self._sidebar)
 
@@ -329,20 +333,25 @@ class MainWindow(QWidget):
         self._size_grip.setFixedSize(16, 16)
         self._size_grip.setToolTip("拖动调整窗口大小")
         self._settings.runtime_status_changed.connect(self._set_runtime_status)
+        self._settings.navigation_requested.connect(self.show_page)
         self._settings.settings_changed.connect(self._refresh_usage_summary)
         self._settings.hotkey_updated.connect(self._refresh_usage_summary)
+        self._settings.usage_hint_changed.connect(self._refresh_usage_summary)
         self._history.history_preferences_requested.connect(self._open_history_preferences)
         self._history.meeting_created.connect(self._open_promoted_meeting)
         self._history.ai_settings_requested.connect(self._open_ai_connection)
         self._settings._history_enabled_row.toggled.connect(self._history.set_history_enabled)
         self._history.set_history_enabled(bool(self._config.get("history.enabled", False)))
+        if self._meeting_controller is not None:
+            self._meeting_controller.state_changed.connect(self._refresh_usage_summary)
+            self._meeting_controller.meeting_changed.connect(self._refresh_usage_summary)
         self._refresh_usage_summary()
         self._shortcuts = []
         for index, key in enumerate(PAGE_KEYS):
             shortcut = QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self)
             shortcut.activated.connect(lambda k=key: self.show_page(k))
             self._shortcuts.append(shortcut)
-        for sequence, callback in (("Ctrl+F", self._focus_history_search), ("Ctrl+W", self._hide_window)):
+        for sequence, callback in (("Ctrl+F", self._focus_current_search), ("Ctrl+W", self._hide_window)):
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.activated.connect(callback)
             self._shortcuts.append(shortcut)
@@ -382,6 +391,12 @@ class MainWindow(QWidget):
         self._history._search_edit.setFocus()
         self._history._search_edit.selectAll()
 
+    def _focus_current_search(self) -> None:
+        if self._page == "meeting" and self._meeting_controller is not None:
+            self._meeting.focus_search()
+        else:
+            self._focus_history_search()
+
     def _open_history_preferences(self) -> None:
         self.show_page("general")
         row = self._settings._history_enabled_row
@@ -403,15 +418,15 @@ class MainWindow(QWidget):
         """Map a runtime status string to a semantic token name."""
         if any(word in text for word in ("失败", "错误", "不可用")):
             return "RED"
-        if any(word in text for word in ("载入", "加载", "启动", "未就绪", "下载")):
+        if any(word in text for word in ("载入", "加载", "启动", "未就绪", "下载", "暂停", "整理")):
             return "AMBER"
-        if "就绪" in text:
+        if "就绪" in text or "录制中" in text:
             return "GREEN"
         return "TEXT_DIM"
 
     def _set_runtime_status(self, text: str) -> None:
-        self._runtime_label.setText(text)
-        self._paint_status_dot()
+        self._model_runtime_text = text
+        self._refresh_usage_summary()
 
     def _paint_status_dot(self) -> None:
         from sayink.ui import design_tokens as live
@@ -422,15 +437,43 @@ class MainWindow(QWidget):
         )
 
     def _refresh_usage_summary(self, *_args) -> None:
-        source = {"microphone": "麦克风", "system": "电脑播放", "mixed": "混合音频"}.get(
-            self._config.get("audio.input_source", "microphone"), "麦克风")
-        continuous = self._config.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY) == "continuous"
-        self._mode_label.setText(f"{source} · {'持续转写' if continuous else '按住说话'}")
-        hotkey = format_hotkey(self._config.get("hotkey", DEFAULT_HOTKEY))
-        # One clause per line: the sidebar is narrow and word wrap used to
-        # orphan 「停止」 on its own line (U-09).
-        self._shortcut_label.setText(f"按住 {hotkey}\n" + (
-            "停顿出字\nEsc 或「结束」停止" if continuous else "松开出字\nEsc 取消"))
+        from sayink.ui.dictation_hints import dictation_hints
+        from sayink.meeting_session import MeetingState
+        from sayink.audio_devices import input_source_label
+
+        hints = dictation_hints(self._config)
+        meeting = self._meeting_controller
+        if meeting is not None and meeting.is_active:
+            state = meeting.state
+            label = {
+                MeetingState.LIVE: "会议录制中",
+                MeetingState.PAUSED: "会议已暂停",
+                MeetingState.DRAINING: "正在整理会议",
+            }.get(state, "会议进行中")
+            record = meeting.current
+            source = input_source_label(record.source) if record is not None else "会议音频"
+            self._runtime_label.setText(label)
+            self._runtime_label.setToolTip(meeting.paused_detail if state is MeetingState.PAUSED else self._model_runtime_text)
+            self._mode_label.setText(source)
+            self._output_label.setText("仅保存会议记录")
+            self._output_label.setProperty("outputWarning", False)
+            self._shortcut_label.setText("在会议页暂停或结束\n听写快捷键暂不可用")
+        else:
+            self._runtime_label.setText(self._model_runtime_text)
+            self._runtime_label.setToolTip("")
+            self._mode_label.setText(f"{hints.source}\n{hints.mode}")
+            self._shortcut_label.setText(hints.shortcut)
+            self._output_label.setText(hints.output)
+            self._output_label.setProperty("outputWarning", hints.output_warning)
+        self._paint_status_dot()
+        self._paint_output_hint()
+
+    def _paint_output_hint(self) -> None:
+        color = tok.RED if self._output_label.property("outputWarning") else tok.TEXT_DIM
+        self._output_label.setStyleSheet(
+            f"color: {color}; font-size: {tok.TYPE_CAPTION}px;"
+            " background: transparent; padding: 2px 8px;"
+        )
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -575,7 +618,7 @@ class MainWindow(QWidget):
                 (0, 0, 1, height),
                 (width - 1, 0, 1, height),
             )
-        for edge, geo in zip(self._frame_edges, geos):
+        for edge, geo in zip(self._frame_edges, geos, strict=True):
             if edge.geometry().getRect() != geo:
                 edge.setGeometry(*geo)
 
@@ -697,6 +740,9 @@ class MainWindow(QWidget):
                 except Exception:
                     pass
             self.hide()
+            on_hidden = getattr(self._settings, "on_window_hidden", None)
+            if callable(on_hidden):
+                on_hidden()
         finally:
             self._hiding = False
 
@@ -738,6 +784,7 @@ class MainWindow(QWidget):
         for label in (self._mode_label, self._shortcut_label):
             label.setStyleSheet(f"color: {live.TEXT_SEC}; font-size: {live.TYPE_CAPTION}px;"
                                " background: transparent; padding: 2px 8px;")
+        self._paint_output_hint()
         self._status_rule.setStyleSheet(f"background: {live.HAIRLINE};")
         self._runtime_label.setStyleSheet(
             f"color: {live.TEXT}; font-size: {live.TYPE_FOOTNOTE}px; font-weight: 700;"

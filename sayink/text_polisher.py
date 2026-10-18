@@ -274,7 +274,10 @@ class TextPolisher(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._worker = None
+        self._worker: PolishWorker | None = None
+        # Keep running QThreads alive until ``finished`` fires so GC never
+        # destroys a live QThread after cancel().
+        self._workers: list[PolishWorker] = []
 
     def polish(
         self,
@@ -296,7 +299,7 @@ class TextPolisher(QObject):
             mode,
             custom_prompt=prompt,
         )
-        self._worker = PolishWorker(
+        worker = PolishWorker(
             api_url,
             api_key,
             model_name,
@@ -304,19 +307,37 @@ class TextPolisher(QObject):
             system_prompt,
             mode=mode,
         )
-        self._worker.result_ready.connect(self._on_result)
-        self._worker.error.connect(self._on_error)
-        self._worker.start()
+        worker.result_ready.connect(self._on_result)
+        worker.error.connect(self._on_error)
+        if hasattr(worker, "finished"):
+            worker.finished.connect(lambda w=worker: self._reap_worker(w))
+        self._worker = worker
+        self._workers.append(worker)
+        worker.start()
+
+    def _reap_worker(self, worker: PolishWorker) -> None:
+        try:
+            self._workers.remove(worker)
+        except ValueError:
+            pass
+        if worker is self._worker and not worker.isRunning():
+            self._worker = None
 
     def cancel(self):
         """Cancel running worker properly."""
-        if self._worker and self._worker.isRunning():
-            self._worker.cancel()  # 设置取消标志
-            # 断开信号连接，避免回调
+        worker = self._worker
+        if worker and worker.isRunning():
+            worker.cancel()  # 设置取消标志
             try:
-                self._worker.disconnect()
+                worker.result_ready.disconnect(self._on_result)
             except TypeError:
                 pass
+            try:
+                worker.error.disconnect(self._on_error)
+            except TypeError:
+                pass
+        elif worker is not None:
+            self._reap_worker(worker)
         self._worker = None
 
     def _on_result(self, polished_text: str):

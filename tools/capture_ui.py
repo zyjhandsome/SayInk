@@ -20,7 +20,8 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QFontDatabase
 from PyQt6.QtCore import QCoreApplication, QEvent
 from sayink.config import Config
-from sayink.history_store import SegmentRecord, SessionSummary
+from sayink.history_store import HistoryStore, SegmentRecord, SessionSummary
+from sayink.meeting_session import MeetingController
 from sayink.ui.main_window import MainWindow, PAGE_KEYS
 from sayink.ui.floating_window import FloatingWindow
 from sayink.ui.theme import apply_theme
@@ -71,7 +72,9 @@ def main():
         path = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / font
         if path.exists():
             QFontDatabase.addApplicationFont(str(path))
-    with tempfile.TemporaryDirectory(prefix="sayink-ui-") as temp, \
+    with tempfile.TemporaryDirectory(prefix="sayink-ui-", dir=args.output.resolve()) as temp, \
+         patch("sayink.config.default_secret_store", return_value=None), \
+         patch("sayink.config.Config._sync_registry_auto_start", return_value=None), \
          patch("sayink.ui.settings_window.list_microphone_devices", return_value=[]), \
          patch("sayink.ui.settings_window.list_system_capture_devices_for_settings", return_value=[]), \
          patch("sayink.speech_recognizer.is_model_downloaded", side_effect=lambda mid: mid == DEFAULT_MODEL_ID):
@@ -80,12 +83,19 @@ def main():
         config.set("history.enabled", True)
         config.set("auto_start", False)
         store = PreviewStore()
-        win = MainWindow(config, store)
+        meeting_history = HistoryStore(db_path=Path(temp) / "meetings.db")
+        controller = MeetingController(config, meeting_history, pending_segments=lambda: 0)
+        record = controller.store.create_meeting(title="方案评审（示例）", source="mixed")
+        controller.store.end_meeting(record.id, ended_at=record.started_at + 60_000)
+        meeting_history.enqueue(SegmentRecord(record.id, 0, record.started_at,
+            raw_text="先核对文字稿，再整理并分享会议结论。", trigger_mode="meeting", speaker_id=1))
+        controller.store.flush()
+        win = MainWindow(config, store, meeting=controller)
         from sayink.runtime_status import RuntimeState
         win._settings.set_runtime_status(RuntimeState.READY, "就绪（示例）")
         bar = FloatingWindow()
         for mode in ("light", "dark"):
-            apply_theme(app, mode=mode, surfaces=[win, win._settings, win._history, bar])
+            apply_theme(app, mode=mode, surfaces=[win, win._settings, win._history, win._meeting, bar])
             win.show()
             for key in PAGE_KEYS:
                 win.show_page(key)
@@ -126,6 +136,8 @@ def main():
             bar.grab().save(str(args.output / f"listen-{mode}.png"))
             bar.dismiss_if_idle()
         win.hide()
+        controller.shutdown()
+        meeting_history.close(timeout=2)
         config.save_immediate()
     print(args.output.resolve())
 

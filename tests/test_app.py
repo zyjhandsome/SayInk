@@ -2,7 +2,7 @@ import sys
 
 import pytest
 import numpy as np
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 from unittest.mock import MagicMock
 
 from sayink.app import App, MIN_AUDIO_SAMPLES, _QueuedSegment
@@ -94,21 +94,15 @@ class TestIslandUserCopy:
 
 class TestAppFriendlyError:
     def test_friendly_error_with_keyword(self):
-        app = App.__new__(App)
-        app.ERROR_HINTS = App.ERROR_HINTS
-        result = app._friendly_error("无法访问麦克风")
+        result = App._friendly_error("无法访问麦克风")
         assert "麦克风" in result or "检查" in result
 
     def test_friendly_error_without_keyword(self):
-        app = App.__new__(App)
-        app.ERROR_HINTS = App.ERROR_HINTS
-        result = app._friendly_error("未知错误")
+        result = App._friendly_error("未知错误")
         assert result == "未知错误"
 
     def test_friendly_error_returns_hint(self):
-        app = App.__new__(App)
-        app.ERROR_HINTS = App.ERROR_HINTS
-        result = app._friendly_error("模型加载失败，模型未就绪")
+        result = App._friendly_error("模型加载失败，模型未就绪")
         assert "模型未就绪" in result
 
 
@@ -689,3 +683,28 @@ class TestBeginTranscription:
             assert app._queued_audio() == [audio]
             h["recognizer"].transcribe_final.assert_not_called()
             h["floating"].show_error.assert_called()
+
+
+def test_main_window_build_failure_is_reported_and_retried(monkeypatch):
+    attempts = []
+
+    def broken_main_window(*_args, **_kwargs):
+        attempts.append(1)
+        raise UnicodeEncodeError("locale", "会", 0, 1, "encoding error")
+
+    monkeypatch.setattr("sayink.app.MainWindow", broken_main_window)
+    app = App.__new__(App)
+    app._config = object()
+    app._history = object()
+    app._main = None
+    app._tray = MagicMock()
+
+    app._show_main_window()
+    app._show_main_window("history")
+
+    assert app._main is None
+    assert len(attempts) == 2
+    assert app._tray.showMessage.call_count == 2
+    _title, message, icon, _ms = app._tray.showMessage.call_args[0]
+    assert "主窗口" in message and "sayink.log" in message
+    assert icon == QSystemTrayIcon.MessageIcon.Warning

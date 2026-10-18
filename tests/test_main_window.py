@@ -9,7 +9,7 @@ def qapp():
     return QApplication.instance() or QApplication(sys.argv)
 
 
-def _make_main_window(tmp_path, monkeypatch):
+def _make_main_window(tmp_path, monkeypatch, *, with_meeting=False):
     from sayink.config import Config
     from sayink.history_store import HistoryStore
     from sayink.ui.main_window import MainWindow
@@ -18,7 +18,13 @@ def _make_main_window(tmp_path, monkeypatch):
     monkeypatch.setattr(SettingsWindow, "_refresh_about_info", lambda self: None)
     monkeypatch.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)
     store = HistoryStore(tmp_path / "h.db")
-    win = MainWindow(Config(config_dir=tmp_path), store)
+    config = Config(config_dir=tmp_path)
+    meeting = None
+    if with_meeting:
+        from sayink.meeting_session import MeetingController
+
+        meeting = MeetingController(config, store, pending_segments=lambda: 1)
+    win = MainWindow(config, store, meeting=meeting)
     return win, store
 
 def _use_screen(monkeypatch, width, height):
@@ -33,17 +39,123 @@ def _use_screen(monkeypatch, width, height):
     monkeypatch.setattr(MainWindow, "screen", lambda self: screen)
 
 
-def test_small_scaled_screen_lowers_minimum_to_fit(qapp, tmp_path, monkeypatch):
+@pytest.mark.parametrize("source,mode", [
+    ("microphone", "hotkey"), ("system", "hotkey"), ("mixed", "hotkey"),
+    ("microphone", "continuous"), ("system", "continuous"), ("mixed", "continuous"),
+])
+def test_small_scaled_screen_lowers_minimum_to_fit(qapp, tmp_path, monkeypatch, source, mode):
     # 1366×768 at 150% leaves about 910×472 logical pixels above the taskbar.
     _use_screen(monkeypatch, 910, 472)
     win, store = _make_main_window(tmp_path, monkeypatch)
     try:
+        win._config.set("audio.input_source", source)
+        win._config.set("audio.trigger_mode", mode)
+        win._config.set_output_mode("history")
+        win._config.set("history.enabled", False)
+        win.settings_panel.reload_settings()
         win.show()
         assert win.minimumHeight() <= 472
         assert win.height() <= 472
         assert win.width() <= 910
     finally:
         win.close()
+        store.close()
+
+
+@pytest.mark.parametrize("state", ["browse", "start", "live", "paused", "draining"])
+def test_real_meeting_states_fit_small_screen(qapp, tmp_path, monkeypatch, state):
+    from sayink.meeting_session import MeetingOptions, resolve_capabilities
+
+    _use_screen(monkeypatch, 910, 472)
+    win, store = _make_main_window(tmp_path, monkeypatch, with_meeting=True)
+    controller = win._meeting_controller
+    try:
+        win.show()
+        win.show_page("meeting")
+        page = win.meeting_panel
+        if state == "start":
+            page.show_start_card()
+        elif state != "browse":
+            options = MeetingOptions(input_source="mixed")
+            caps = resolve_capabilities(win._config, options, dictation_model_id="funasr-nano")
+            controller.begin(options, caps)
+            if state == "paused":
+                controller.pause("设备不可用，请检查设备后继续")
+            elif state == "draining":
+                controller.request_end()
+        qapp.processEvents()
+        win._fit_to_available_screen()
+        qapp.processEvents()
+        assert win.minimumHeight() <= 472
+        assert win.height() <= 472
+        assert win.width() <= 910
+        if state != "browse":
+            button = page._card_start if state == "start" else page._end_btn
+            assert button.isVisible()
+            assert button.mapTo(win, button.rect().bottomRight()).y() < win.height()
+        win.show_page("general")
+        qapp.processEvents()
+        assert win.height() <= 472
+    finally:
+        win.hide()
+        controller.shutdown()
+        store.close()
+
+
+def test_meeting_sidebar_tracks_session_and_restores_dictation(qapp, tmp_path, monkeypatch):
+    from sayink.meeting_session import MeetingOptions, resolve_capabilities
+    from sayink.runtime_status import RuntimeState
+
+    win, store = _make_main_window(tmp_path, monkeypatch, with_meeting=True)
+    controller = win._meeting_controller
+    try:
+        win._settings.set_runtime_status(RuntimeState.READY, "就绪")
+        options = MeetingOptions(input_source="mixed")
+        controller.begin(options, resolve_capabilities(win._config, options, dictation_model_id="funasr-nano"))
+        assert win._runtime_label.text() == "会议录制中"
+        assert "电脑" in win._mode_label.text()
+        assert win._output_label.text() == "仅保存会议记录"
+        assert "Esc" not in win._shortcut_label.text()
+        win.show_page("general")
+        controller.pause("手动暂停")
+        assert win._runtime_label.text() == "会议已暂停"
+        win._settings.set_runtime_status(RuntimeState.READY, "模型已就绪")
+        assert win._runtime_label.text() == "会议已暂停"
+        controller.resume()
+        assert win._runtime_label.text() == "会议录制中"
+        controller.finalize()
+        assert win._runtime_label.text() == "模型已就绪"
+        assert "单次转写" in win._mode_label.text()
+        assert "粘贴" in win._output_label.text()
+    finally:
+        win.hide()
+        controller.shutdown()
+        store.close()
+
+
+def test_ctrl_f_uses_meeting_search_and_live_find(qapp, tmp_path, monkeypatch):
+    from PyQt6.QtTest import QTest
+    from sayink.meeting_session import MeetingOptions, resolve_capabilities
+
+    win, store = _make_main_window(tmp_path, monkeypatch, with_meeting=True)
+    controller = win._meeting_controller
+    try:
+        win.show()
+        QApplication.setActiveWindow(win)
+        win.show_page("meeting")
+        win.setFocus()
+        QTest.keyClick(win, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier)
+        assert win.current_page() == "meeting"
+        assert win.meeting_panel._search_edit.hasFocus()
+        options = MeetingOptions()
+        controller.begin(options, resolve_capabilities(win._config, options, dictation_model_id="funasr-nano"))
+        QTest.keyClick(win, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier)
+        assert win.current_page() == "meeting"
+        assert win.meeting_panel._live_find_edit.hasFocus()
+        assert win.meeting_panel._live_find_bar.isVisible()
+    finally:
+        win.hide()
+        controller.shutdown()
         store.close()
 
 
@@ -450,3 +562,16 @@ def test_history_promote_to_meeting_navigates_to_meeting_page_and_selects_it(qap
         ctrl.shutdown()
         store.close()
 
+
+def test_hiding_main_window_cleans_up_settings_panel_transient_state(qapp, tmp_path, monkeypatch):
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        win.show()
+        calls: list[str] = []
+        monkeypatch.setattr(win.settings_panel, "_cancel_mic_probe_if_active", lambda: calls.append("mic"))
+        monkeypatch.setattr(win.settings_panel, "cancel_hotkey_capture", lambda: calls.append("hotkey"))
+        monkeypatch.setattr(win.settings_panel, "_flush_llm_fields", lambda: calls.append("llm"))
+        win.close()
+        assert calls == ["mic", "hotkey", "llm"]
+    finally:
+        store.close()

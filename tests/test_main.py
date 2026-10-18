@@ -116,6 +116,27 @@ class TestWindowsMutex:
         assert main.check_single_instance() is False
         assert closed == [222]
 
+    def test_exception_after_create_mutex_still_closes_handle(self, monkeypatch, temp_lock):
+        monkeypatch.setattr(main.sys, "platform", "win32")
+
+        closed = []
+
+        def _broken_open(access, inherit, name):
+            raise OSError("access denied")
+
+        fake_kernel = types.SimpleNamespace(
+            CreateMutexW=lambda a, b, name: 444,
+            OpenMutexW=_broken_open,
+            GetLastError=lambda: 0,
+            CloseHandle=lambda h: closed.append(h),
+        )
+        fake_windll = types.SimpleNamespace(kernel32=fake_kernel)
+        monkeypatch.setattr(main.ctypes, "windll", fake_windll, raising=False)
+
+        assert main.check_single_instance() is True
+        assert closed == [444]
+        assert main._win_mutex is None
+
 
 class TestLogging:
     def test_setup_logging_writes_rotating_file_and_crash_log(self, tmp_path):

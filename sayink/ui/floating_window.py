@@ -172,6 +172,7 @@ class FloatingWindow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._listening_active = False
+        self._esc_stops_continuous = True
         self._meeting_active = False
         self._meeting_elapsed = "00:00:00"
         self._meeting_paused_detail = ""
@@ -219,6 +220,14 @@ class FloatingWindow(QWidget):
 
     def set_input_source(self, source: str) -> None:
         self._source = source or "microphone"
+
+    def set_esc_stops_continuous(self, enabled: bool) -> None:
+        self._esc_stops_continuous = bool(enabled)
+        if self._meeting_active:
+            return
+        self._end_btn.setAccessibleName("结束持续转写并保留已录内容")
+        shortcut = " · Esc" if enabled else ""
+        self._end_btn.setToolTip(f"结束录音，已录内容继续识别{shortcut}")
 
     def reapply_theme(self) -> None:
         from sayink.ui import design_tokens as tok
@@ -310,8 +319,8 @@ class FloatingWindow(QWidget):
         self._end_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._end_btn.setFixedHeight(30)
         self._end_btn.setMinimumWidth(64)
-        self._end_btn.setAccessibleName("结束持续转写")
-        self._end_btn.setToolTip("结束整场监听 · Esc")
+        self._end_btn.setAccessibleName("结束持续转写并保留已录内容")
+        self._end_btn.setToolTip("结束录音，已录内容继续识别 · Esc")
         self._end_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._end_btn.clicked.connect(self._on_end_clicked)
         self._mark_btn = QPushButton("标记")
@@ -446,8 +455,7 @@ class FloatingWindow(QWidget):
         self._meeting_paused_detail = ""
         self._listening_active = False
         self._capture_active = False
-        self._end_btn.setAccessibleName("结束持续转写")
-        self._end_btn.setToolTip("结束整场监听 · Esc")
+        self.set_esc_stops_continuous(self._esc_stops_continuous)
         self._mark_btn.hide()
         self._live_text = ""
         self.show_success("会议已结束", "可到「会议」页生成纪要")
@@ -535,6 +543,8 @@ class FloatingWindow(QWidget):
         self._listening_active = True
         self._capture_active = False
         self._capture_released = False
+        self.set_esc_stops_continuous(self._esc_stops_continuous)
+        self._status_label.setToolTip(self._end_btn.toolTip())
         label = "正在听" if self._live_text else "正在听 · 停顿后出字"
         self._set_state(label, "STATE_LISTEN", pulse=False)
         self.unsetCursor()
@@ -616,13 +626,14 @@ class FloatingWindow(QWidget):
         if self._live_text:
             self._show_capture_transcript(self._live_text)
             return
-        if continuing and "松开结束" in self._text_label.text():
+        if continuing and "松开识别" in self._text_label.text():
             return
         self._set_state("录音中", "STATE_RECORD", pulse=True)
         self._waveform.set_compact(False)
         self._waveform.show()
         self._waveform.start()
-        self._apply_excerpt("松开结束，Esc 取消")
+        self._apply_excerpt("松开识别 · Esc 取消本次录音，不保留内容")
+        self._status_label.setToolTip("松开快捷键后识别；Esc 取消本次录音，不保留本次内容。")
         self._present()
 
     def dismiss_if_idle(self):

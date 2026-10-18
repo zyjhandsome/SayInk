@@ -34,6 +34,7 @@ def check_single_instance() -> bool:
     """Ensure only one instance of SayInk runs at a time."""
     if sys.platform == "win32":
         # 使用 ctypes 创建 Windows 互斥锁（更可靠，不需要 pywin32）
+        mutex = None
         try:
             mutex_name = MUTEX_NAME
             # CreateMutex 参数: lpMutexAttributes=NULL, bInitialOwner=False, lpName
@@ -57,8 +58,14 @@ def check_single_instance() -> bool:
 
             global _win_mutex
             _win_mutex = mutex
+            mutex = None
             return True
         except Exception as e:
+            if mutex:
+                try:
+                    ctypes.windll.kernel32.CloseHandle(mutex)
+                except Exception:
+                    pass
             _log.warning("互斥锁创建失败，使用文件锁: %s", e)
 
     # 非 Windows 或互斥锁失败时，使用文件锁
@@ -91,7 +98,7 @@ def check_single_instance() -> bool:
 
 def cleanup_lock():
     """清理单实例锁"""
-    global _win_mutex
+    global _win_mutex, _crash_file
 
     # Windows: 关闭互斥锁句柄
     if _win_mutex:
@@ -107,6 +114,16 @@ def cleanup_lock():
             os.remove(_lock_file_path)
         except OSError:
             pass
+
+    if _crash_file is not None:
+        try:
+            import faulthandler
+
+            faulthandler.disable()
+            _crash_file.close()
+        except Exception:
+            pass
+        _crash_file = None
 
 
 def _install_exception_hooks(log: logging.Logger):
@@ -220,7 +237,12 @@ def setup_logging(directory: str | None = None) -> str | None:
         file_handler.setFormatter(fmt)
         handlers.append(file_handler)
         # Native crashes (ONNX Runtime, PortAudio) never reach excepthook.
-        _crash_file = open(os.path.join(directory, "crash.log"), "a", encoding="utf-8")
+        if _crash_file is not None:
+            try:
+                _crash_file.close()
+            except OSError:
+                pass
+        _crash_file = open(os.path.join(directory, "crash.log"), "a", encoding="utf-8")  # noqa: SIM115
         faulthandler.enable(file=_crash_file, all_threads=True)
     except OSError as exc:
         log_path = None
@@ -235,15 +257,15 @@ def setup_logging(directory: str | None = None) -> str | None:
 
 
 def main():
+    setup_logging()
+    log = logging.getLogger("SayInk")
+    _install_exception_hooks(log)
+
     if not check_single_instance():
         _activate_running_instance()
         sys.exit(0)
 
     atexit.register(cleanup_lock)
-
-    setup_logging()
-    log = logging.getLogger("SayInk")
-    _install_exception_hooks(log)
     log.info("SayInk 启动中...")
 
     if sys.platform == "win32":

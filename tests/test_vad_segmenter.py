@@ -52,7 +52,7 @@ class TestSpeechSegmenterBasics:
         seg = SpeechSegmenter(speech_threshold=0.002, min_speech_sec=0.1, adaptive=False)
         block = int(16000 * 0.1)
         emitted = []
-        for i in range(0, 160):  # 16 s in 0.1 s blocks
+        for i in range(160):  # 16 s in 0.1 s blocks
             amp = 0.01 if i == 130 else 0.5  # a breath at 13.0–13.1 s, still above the gate
             out = seg.feed(np.full(block, amp, dtype=np.float32))
             if out is not None:

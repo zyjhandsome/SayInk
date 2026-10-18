@@ -13,6 +13,7 @@ from sayink.ui.settings_components import CompactPickCard
 
 @pytest.fixture
 def main_window(_qapp_session, tmp_path, monkeypatch):
+    monkeypatch.setattr("sayink.speech_recognizer.is_model_downloaded", lambda _mid: False)
     win, store = _make_main_window(tmp_path, monkeypatch)
     win.show()
     _qapp_session.processEvents()
@@ -52,16 +53,15 @@ def test_tab_walks_the_general_page_top_to_bottom_then_back_to_the_current_nav(m
     win.setFocus()
     _qapp_session.processEvents()
 
-    stops = _tab_stops(win, _qapp_session, 23)
-    assert stops[:5] == ["通用", "按住说话", "录音快捷键", "Esc 结束持续转写", "仅麦克风"]
-    assert "持续转写" not in stops and "仅电脑播放" not in stops
-    assert stops[5:8] == ["测试声音（约 2 秒）", "恢复自动选择", "手动选择音频设备"]
-    # 会议与识别 card sits between 音频 and 偏好; 断句/语言/术语表 are shared
-    # with dictation, so their names no longer say 会议.
-    assert stops[8:14] == ["会议音频来源", "会议识别模型", "断句方式", "识别语言", "开始前显示会议信息卡", "术语表"]
-    assert stops[15:20] == ["开机时自动启动", "录音提示音", "只记录到历史，不粘贴", "粘贴后恢复剪贴板", "保存语音历史"]
-    assert stops[20:22] == ["历史保留天数", "最多保留会话数"]
-    assert stops[22] == "通用"
+    stops = _tab_stops(win, _qapp_session, 22)
+    assert stops == [
+        "通用", "单次转写", "录音快捷键", "仅麦克风", "识别结果去向",
+        "测试声音（约 2 秒）", "设备恢复自动选择", "手动选择音频设备",
+        "识别语言", "自定义词汇", "展开高级识别设置",
+        "会议音频来源", "会议识别模型", "开始前显示会议信息卡", "主题模式：暗色",
+        "开机时自动启动", "录音提示音", "粘贴后恢复剪贴板", "保存转写历史",
+        "历史保留天数", "最多保留会话数", "通用",
+    ]
 
 
 def test_tab_enters_radio_groups_on_the_checked_option(main_window, _qapp_session):
@@ -73,7 +73,20 @@ def test_tab_enters_radio_groups_on_the_checked_option(main_window, _qapp_sessio
     _qapp_session.processEvents()
     stops = _tab_stops(win, _qapp_session, 5)
     assert stops[1] == "持续转写"
-    assert stops[4] == "混合"
+    assert stops[4] == "混合音源"
+
+
+def test_theme_segment_uses_arrows_and_keeps_only_current_option_tabbable(main_window, _qapp_session):
+    theme = main_window._settings._theme_combo
+    theme.setCurrentIndex(theme.findData("light"))
+    button = theme.focusProxy()
+    button.setFocus()
+    QTest.keyClick(button, Qt.Key.Key_Right)
+    _qapp_session.processEvents()
+    assert theme.currentData() == "dark"
+    assert main_window._config.get("appearance.theme_mode") == "dark"
+    assert theme.focusProxy().hasFocus()
+    assert sum(bool(b.focusPolicy() & Qt.FocusPolicy.TabFocus) for b in theme._buttons) == 1
 
 
 def test_navigation_shortcuts_pause_during_hotkey_capture(main_window):
@@ -89,12 +102,12 @@ def test_runtime_and_trigger_instructions_follow_actual_state(main_window):
     win._settings.set_runtime_status("模型载入中")
     assert win._runtime_label.text() == "模型载入中"
     win._settings._trigger_hotkey_rb.setChecked(True)
-    assert "0.18" in win._settings._hotkey_hint.text()
+    assert "0.18" in win._settings._hotkey_hint.toolTip()
     assert "松开" in win._settings._hotkey_hint.text()
-    assert "按住说话" in win._mode_label.text()
+    assert "单次转写" in win._mode_label.text()
     win._settings._trigger_continuous_rb.setChecked(True)
     hint = win._settings._hotkey_hint.text()
-    assert "0.30" in hint
+    assert "已录内容继续识别" in hint
     assert "Esc" in hint
     assert "松开后继续" in hint
     assert "停顿" in hint
@@ -141,15 +154,16 @@ def test_trigger_choice_uses_same_name_as_runtime_mode(main_window):
     cards = main_window._settings.findChildren(CompactPickCard)
     titles = [card._title_label.text() for card in cards]
     assert "持续转写" in titles
-    assert "按住说话" in titles
+    assert "单次转写" in titles
+    assert "按住录制" not in titles
     assert "连续口述" not in titles
     # P-01: hold-to-talk is the default; the sidebar names the mode like the card.
-    assert "按住说话" in main_window._mode_label.text()
+    assert "单次转写" in main_window._mode_label.text()
     main_window._settings._trigger_continuous_rb.setChecked(True)
     assert "持续转写" in main_window._mode_label.text()
     # U-09: each clause on its own line so 「停止」 never wraps alone.
     lines = main_window._shortcut_label.text().split("\n")
-    assert lines[-1] == "Esc 或「结束」停止"
+    assert lines[-1] == "Esc 结束并保留"
     assert all(len(line) <= 12 for line in lines)
 
 
@@ -164,12 +178,12 @@ def test_task_choices_have_visible_native_radios(main_window):
 
 def test_radio_choices_support_arrow_keys(main_window, _qapp_session):
     settings = main_window._settings
-    radio = settings._trigger_continuous_rb
+    radio = settings._trigger_hotkey_rb
     radio.setChecked(True)
     radio.setFocus()
     _qapp_session.processEvents()
     QTest.keyClick(radio, Qt.Key.Key_Right)
-    assert settings._trigger_hotkey_rb.isChecked()
+    assert settings._trigger_continuous_rb.isChecked()
 
 
 def test_polish_disabled_hides_prompt_but_keeps_connection_and_example(main_window):

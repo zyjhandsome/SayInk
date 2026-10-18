@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import QEvent, QObject
-from PyQt6.QtWidgets import QAbstractItemView, QComboBox, QFrame, QProxyStyle, QStyle, QStyledItemDelegate
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QAbstractScrollArea,
+    QApplication,
+    QComboBox,
+    QFrame,
+    QProxyStyle,
+    QStyle,
+    QStyledItemDelegate,
+)
 
 from sayink.ui import design_tokens as dt
 
@@ -64,9 +73,31 @@ def widen_combo_popup(view: QAbstractItemView) -> None:
 _POPUP_TRIGGERS = (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick, QEvent.Type.KeyPress)
 
 
+def _forward_wheel_to_scroll_area(combo: QComboBox, event) -> bool:
+    """Keep a closed combo from changing while the page scrolls.
+
+    The open popup list still scrolls itself. Retention days and the session
+    cap are spin boxes, so they are not affected.
+    """
+    view = combo.view()
+    popup = view.window() if view is not None else None
+    if popup is not None and popup is not combo.window() and popup.isVisible():
+        return False
+    event.ignore()
+    parent = combo.parentWidget()
+    while parent is not None:
+        if isinstance(parent, QAbstractScrollArea):
+            QApplication.sendEvent(parent.viewport(), event)
+            return True
+        parent = parent.parentWidget()
+    return True
+
+
 class _PopupWidthFilter(QObject):
     def eventFilter(self, obj, event):
         kind = event.type()
+        if kind == QEvent.Type.Wheel and isinstance(obj, QComboBox):
+            return _forward_wheel_to_scroll_area(obj, event)
         if kind in _POPUP_TRIGGERS and isinstance(obj, QComboBox):
             prepare_combo_popup(obj)
         elif kind == QEvent.Type.Show and isinstance(obj, QAbstractItemView):
@@ -92,8 +123,10 @@ class DropDownComboStyle(QProxyStyle):
             # QComboBox QAbstractItemView::item rules in our stylesheets.
             if not isinstance(target.itemDelegate(), QStyledItemDelegate):
                 target.setItemDelegate(QStyledItemDelegate(target))
-            target.installEventFilter(self._popup_filter)
-            target.view().installEventFilter(self._popup_filter)
+            if not target.property("_popupWidthFilter"):
+                target.installEventFilter(self._popup_filter)
+                target.view().installEventFilter(self._popup_filter)
+                target.setProperty("_popupWidthFilter", True)
         return super().polish(target)
 
 

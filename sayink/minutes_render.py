@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from sayink.minutes_prompts import (
     ALL_SECTIONS,
@@ -168,6 +168,117 @@ def render_markdown(
     return "\n".join(out).rstrip() + "\n"
 
 
+def _render_topics_section(
+    payload: Mapping[str, Any],
+    duration_ms: int | None,
+    fix: Callable[[str], str],
+) -> str:
+    lines: list[str] = []
+    for topic in _as_list(payload.get("topics")):
+        if not isinstance(topic, dict):
+            continue
+        heading = fix(_as_text(topic.get("title")))
+        points = [p for p in _as_list(topic.get("points")) if isinstance(p, dict) and _as_text(p.get("text"))]
+        if not heading and not points:
+            continue
+        if heading:
+            lines.append(f"### {heading}")
+        for point in points:
+            ts = _ts(point.get("ts"), duration_ms)
+            lines.append(f"- {fix(_as_text(point.get('text')))}{(' ' + ts) if ts else ''}")
+    return "\n".join(lines)
+
+
+def _render_bullet_section(
+    key: str,
+    payload: Mapping[str, Any],
+    duration_ms: int | None,
+    transcript_text: str,
+    fix: Callable[[str], str],
+) -> str:
+    lines = []
+    for item in _as_list(payload.get(key)):
+        text = _as_text(item.get("text")) if isinstance(item, dict) else _as_text(item)
+        if not text:
+            continue
+        if key == SECTION_DECISIONS:
+            text = flag_unverified(text, transcript_text)
+        ts = _ts(item.get("ts"), duration_ms) if isinstance(item, dict) else ""
+        lines.append(f"- {fix(text)}{(' ' + ts) if ts else ''}")
+    return "\n".join(lines)
+
+
+def _render_action_items_section(
+    payload: Mapping[str, Any],
+    duration_ms: int | None,
+    transcript_text: str,
+    fix: Callable[[str], str],
+) -> str:
+    lines = []
+    for item in _as_list(payload.get("action_items")):
+        if not isinstance(item, dict):
+            continue
+        task = _as_text(item.get("task"))
+        if not task:
+            continue
+        task = flag_unverified(task, transcript_text)
+        owner = fix(_as_text(item.get("owner"))) or "未指定"
+        due = _as_text(item.get("due")) or "未提及"
+        if due != "未提及":
+            due = flag_unverified(due, transcript_text)
+        ts = _ts(item.get("ts"), duration_ms)
+        lines.append(f"- [ ] {fix(task)} — @{owner} · {due}{(' ' + ts) if ts else ''}")
+    return "\n".join(lines)
+
+
+def _render_chapters_section(
+    payload: Mapping[str, Any],
+    duration_ms: int | None,
+    fix: Callable[[str], str],
+) -> str:
+    lines = []
+    for chapter in _as_list(payload.get("chapters")):
+        if not isinstance(chapter, dict):
+            continue
+        heading = fix(_as_text(chapter.get("title")))
+        if not heading:
+            continue
+        start = _ts(chapter.get("start"), duration_ms)
+        end = _ts(chapter.get("end"), duration_ms)
+        span = f"{start} – {end} " if (start and end) else (f"{start} " if start else "")
+        summary = fix(_as_text(chapter.get("summary")))
+        lines.append(f"- {span}**{heading}**{('：' + summary) if summary else ''}")
+    return "\n".join(lines)
+
+
+def _render_speakers_section(
+    payload: Mapping[str, Any],
+    duration_ms: int | None,
+    names: Mapping[int, str] | None,
+    fix: Callable[[str], str],
+) -> str:
+    lines = []
+    for speaker in _as_list(payload.get("speakers")):
+        if not isinstance(speaker, dict):
+            continue
+        label = _as_text(speaker.get("label"))
+        summary = fix(_as_text(speaker.get("summary")))
+        if not label and not summary:
+            continue
+        match = _SPEAKER_LABEL_RE.search(label)
+        if match:
+            label = speaker_label(int(match.group(1)), dict(names) if names else None)
+        suggested = _as_text(speaker.get("suggested_name"))
+        if suggested.lower() in ("null", "none"):
+            suggested = ""
+        hint = ""
+        if suggested and suggested != label:
+            ts = _ts(speaker.get("evidence_ts"), duration_ms)
+            hint = f"（可能是 {suggested}{(' ' + ts) if ts else ''}）"
+        lines.append(f"- **{label}**{hint}：{summary or EMPTY_SECTION_TEXT}")
+    return "\n".join(lines)
+
+
 def _render_section(
     key: str,
     payload: Mapping[str, Any],
@@ -180,93 +291,16 @@ def _render_section(
 
     if key == SECTION_SUMMARY:
         return fix(_as_text(payload.get("summary")))
-
     if key == SECTION_TOPICS:
-        lines: list[str] = []
-        for topic in _as_list(payload.get("topics")):
-            if not isinstance(topic, dict):
-                continue
-            heading = fix(_as_text(topic.get("title")))
-            points = [p for p in _as_list(topic.get("points")) if isinstance(p, dict) and _as_text(p.get("text"))]
-            if not heading and not points:
-                continue
-            if heading:
-                lines.append(f"### {heading}")
-            for point in points:
-                ts = _ts(point.get("ts"), duration_ms)
-                lines.append(f"- {fix(_as_text(point.get('text')))}{(' ' + ts) if ts else ''}")
-        return "\n".join(lines)
-
+        return _render_topics_section(payload, duration_ms, fix)
     if key in (SECTION_DECISIONS, SECTION_OPEN_QUESTIONS):
-        lines = []
-        for item in _as_list(payload.get(key)):
-            text = _as_text(item.get("text")) if isinstance(item, dict) else _as_text(item)
-            if not text:
-                continue
-            if key == SECTION_DECISIONS:
-                text = flag_unverified(text, transcript_text)
-            ts = _ts(item.get("ts"), duration_ms) if isinstance(item, dict) else ""
-            lines.append(f"- {fix(text)}{(' ' + ts) if ts else ''}")
-        return "\n".join(lines)
-
+        return _render_bullet_section(key, payload, duration_ms, transcript_text, fix)
     if key == SECTION_ACTION_ITEMS:
-        lines = []
-        for item in _as_list(payload.get("action_items")):
-            if not isinstance(item, dict):
-                continue
-            task = _as_text(item.get("task"))
-            if not task:
-                continue
-            task = flag_unverified(task, transcript_text)
-            owner = fix(_as_text(item.get("owner"))) or "未指定"
-            due = _as_text(item.get("due")) or "未提及"
-            if due != "未提及":
-                due = flag_unverified(due, transcript_text)
-            ts = _ts(item.get("ts"), duration_ms)
-            lines.append(f"- [ ] {fix(task)} — @{owner} · {due}{(' ' + ts) if ts else ''}")
-        return "\n".join(lines)
-
+        return _render_action_items_section(payload, duration_ms, transcript_text, fix)
     if key == SECTION_CHAPTERS:
-        lines = []
-        for chapter in _as_list(payload.get("chapters")):
-            if not isinstance(chapter, dict):
-                continue
-            heading = fix(_as_text(chapter.get("title")))
-            if not heading:
-                continue
-            start = _ts(chapter.get("start"), duration_ms)
-            end = _ts(chapter.get("end"), duration_ms)
-            span = ""
-            if start and end:
-                span = f"{start} – {end} "
-            elif start:
-                span = f"{start} "
-            summary = fix(_as_text(chapter.get("summary")))
-            lines.append(f"- {span}**{heading}**{('：' + summary) if summary else ''}")
-        return "\n".join(lines)
-
+        return _render_chapters_section(payload, duration_ms, fix)
     if key == SECTION_SPEAKERS:
-        lines = []
-        for speaker in _as_list(payload.get("speakers")):
-            if not isinstance(speaker, dict):
-                continue
-            label = _as_text(speaker.get("label"))
-            summary = fix(_as_text(speaker.get("summary")))
-            if not label and not summary:
-                continue
-            match = _SPEAKER_LABEL_RE.search(label)
-            if match:
-                label = speaker_label(int(match.group(1)), dict(names) if names else None)
-            suggested = _as_text(speaker.get("suggested_name"))
-            if suggested.lower() in ("null", "none"):
-                suggested = ""
-            hint = ""
-            if suggested and suggested != label:
-                ts = _ts(speaker.get("evidence_ts"), duration_ms)
-                hint = f"（可能是 {suggested}{(' ' + ts) if ts else ''}）"
-            lines.append(f"- **{label}**{hint}：{summary or EMPTY_SECTION_TEXT}")
-        return "\n".join(lines)
-
+        return _render_speakers_section(payload, duration_ms, names, fix)
     return ""
 
 

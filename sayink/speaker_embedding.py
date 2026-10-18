@@ -52,6 +52,8 @@ _QUIET_RMS = 0.005
 
 class SpeakerEmbedder:
     name = "embedder"
+    model_available = False
+    load_error = ""
     threshold = MEL_MATCH_THRESHOLD
     sticky_threshold = MEL_STICKY_THRESHOLD
     recluster_threshold = MEL_RECLUSTER_THRESHOLD
@@ -79,6 +81,7 @@ class ModelEmbedder(SpeakerEmbedder):
     """sherpa-onnx speaker embedding model (CAM++)."""
 
     name = "campplus"
+    model_available = True
     threshold = MODEL_MATCH_THRESHOLD
     sticky_threshold = MODEL_STICKY_THRESHOLD
     recluster_threshold = MODEL_RECLUSTER_THRESHOLD
@@ -125,11 +128,14 @@ class ModelEmbedder(SpeakerEmbedder):
 
 def make_embedder(model_path: str | Path | None, *, enabled: bool = True) -> SpeakerEmbedder:
     """CAM++ when enabled and the model file is there, else the mel summary."""
-    if enabled and model_path and Path(model_path).is_file():
+    fallback = MelEmbedder()
+    fallback.model_available = bool(model_path and Path(model_path).is_file())
+    if enabled and fallback.model_available:
         try:
             embedder = ModelEmbedder(model_path)
             log.info("会议说话人模型: CAM++ (%s)", model_path)
             return embedder
         except Exception as exc:
             log.warning("说话人模型加载失败，改用频谱摘要: %s", exc)
-    return MelEmbedder()
+            fallback.load_error = str(exc)
+    return fallback

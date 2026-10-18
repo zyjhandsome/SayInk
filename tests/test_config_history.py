@@ -30,7 +30,15 @@ class TestHistoryDefaults:
 
         config.set("history.enabled", False)
         assert config.get("history.enabled") is False
-        # Debounced save (500ms) — wait then reload.
-        QTest.qWait(600)
+        # Wait for the observable write, not a 100ms scheduling margin: the
+        # full Qt suite can spend longer than that processing queued paints.
+        for _ in range(40):
+            QTest.qWait(50)
+            try:
+                saved = json.loads((config.config_dir / "config.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if saved.get("history", {}).get("enabled") is False:
+                break
         reloaded = Config(config_dir=config.config_dir)
         assert reloaded.get("history.enabled") is False

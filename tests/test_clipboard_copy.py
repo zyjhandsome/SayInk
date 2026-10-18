@@ -62,3 +62,19 @@ def test_history_window_tells_the_user_when_copy_fails(_qapp_session, monkeypatc
         assert window._feedback_label.text() == COPY_FAILED_TEXT
     finally:
         window.close()
+
+
+def test_pump_blocks_user_input_reentrancy(monkeypatch):
+    from PyQt6.QtCore import QEventLoop
+
+    seen_flags: list = []
+    monkeypatch.setattr(
+        clip.QApplication,
+        "processEvents",
+        staticmethod(lambda flags, ms: seen_flags.append((flags, ms))),
+    )
+    clip._pump(30)
+    assert len(seen_flags) == 1
+    flags, ms = seen_flags[0]
+    assert bool(flags & QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+    assert ms == 30

@@ -13,7 +13,7 @@ them with `python sayink_build/download_bundle_model_for_build.py`
 
 Distribution:
 - **Installer (recommended):** run `python build_release.py` — produces
-  `dist/SayInk-Setup-<version>.exe` (lite, ~100 MB); add `--with-model` for
+  `dist/SayInk-Setup-<version>.exe` (lite, ~50 MB); add `--with-model` for
   `dist/SayInk-Setup-<version>-full.exe` (~740 MB, ASR + CAM++ + Silero).
   Version from `sayink/version.py`; staging folder removed after Inno Setup.
 - **Portable folder:** run this script only, then zip `dist/SayInk/` for
@@ -89,6 +89,25 @@ def _find_model_sources(search_dirs: list[Path] | None = None) -> list[tuple[str
     return found
 
 
+def _require_pinned_content(downloaded: list[tuple[str, Path]]) -> None:
+    """The full installer ships exactly the model files pinned in the registry."""
+    from sayink.speech_recognizer import get_model_info, mismatched_model_files
+
+    infos = {info["dir_name"]: info for info in map(get_model_info, bundle_model_ids()) if info}
+    bad = []
+    for dir_name, src_path in downloaded:
+        print(f"    verifying {dir_name} …")
+        names = mismatched_model_files(infos[dir_name], src_path)
+        if names:
+            bad.append(f"{src_path}: {', '.join(names)}")
+    if bad:
+        print("\n[ERROR] Model files differ from the sha256 pinned in sayink/speech_recognizer.py:")
+        for line in bad:
+            print(f"  {line}")
+        print("Delete them and run: python sayink_build/download_bundle_model_for_build.py")
+        sys.exit(1)
+
+
 def _require_bundle_model(downloaded: list[tuple[str, Path]]) -> None:
     from sayink.speech_recognizer import get_model_info
 
@@ -121,6 +140,7 @@ def _kill_running_sayink():
         ["taskkill", "/IM", "SayInk.exe", "/F"],
         capture_output=True,
         text=True,
+        check=False,
     )
 
 
@@ -243,6 +263,7 @@ def build():
         print("[2/3] Copying models to dist/SayInk/models/ ...")
         downloaded = _find_model_sources()
         _require_bundle_model(downloaded)
+        _require_pinned_content(downloaded)
     else:
         print("[2/3] Lite build: no model bundled (users download Fun-ASR-Nano on first start).")
         if models_dst.exists():

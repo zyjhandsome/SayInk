@@ -4,14 +4,16 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
+    QApplication,
     QVBoxLayout, QHBoxLayout, QWidget,
     QLabel, QLineEdit, QPushButton, QComboBox,
     QMessageBox, QFrame,
     QStackedWidget,
     QFileDialog,
     QSizePolicy, QSpinBox,
+    QWIDGETSIZE_MAX,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QSignalBlocker, QEvent
 
 log = logging.getLogger("SayInk")
 
@@ -20,8 +22,6 @@ from sayink.config import (
     DEFAULT_HOTKEY,
     format_hotkey,
     is_reserved_hotkey,
-    OUTPUT_MODE_HISTORY,
-    OUTPUT_MODE_PASTE,
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_HOTKEY,
 )
@@ -41,8 +41,6 @@ from sayink.ui.settings_components import (
     empty_state,
     footnote,
     group_divider,
-    kv_row,
-    kv_row_elided,
     section_header,
     settings_group,
     sync_group_tab_stop,
@@ -53,13 +51,17 @@ from sayink.ui.settings_pages import (
     build_model_page,
     build_polish_page,
 )
-from sayink.ui.settings_pages.about import paint_about_update_row
+from sayink.ui.settings_pages.about import (
+    AboutSummaryRow, paint_about_update_row, refresh_update_check_time,
+)
+from sayink.ui.dictation_hints import dictation_hints
 from sayink.ui.settings_pages.general import MIXED_AUDIO_NOTE, SYSTEM_AUDIO_NOTE
 from sayink.ui.model_card import ModelCard, RATING_TOOLTIP, format_model_ratings
 from sayink.ui import design_tokens as _tok
 from sayink.ui import settings_styles as _settings_styles
 from sayink.ui.theme import normalize_theme_mode
-from sayink.runtime_status import RuntimeState, coerce_runtime_status
+from sayink.runtime_status import RuntimeState, SegmentationStatus, coerce_runtime_status
+from sayink.recognition_settings import RecognitionSettings
 
 # Non-color layout constants (theme-independent).
 _CONTROL_NUMERIC_WIDTH = _tok.CONTROL_NUMERIC_WIDTH
@@ -89,6 +91,8 @@ class SettingsWindow(QWidget):
     update_check_requested = pyqtSignal()
     update_install_requested = pyqtSignal()
     runtime_status_changed = pyqtSignal(str)
+    navigation_requested = pyqtSignal(str)
+    usage_hint_changed = pyqtSignal()
     closed = pyqtSignal()
     finished = pyqtSignal(int)
 
@@ -98,11 +102,22 @@ class SettingsWindow(QWidget):
         self._pending_segment_count = pending_segment_count
         self._model_cards: dict[str, ModelCard] = {}
         self._dl_workers: dict[str, object] = {}
+        self._test_workers: list[QThread] = []
+        self._llm_test_worker: QThread | None = None
+        self._minutes_test_worker: QThread | None = None
         self._mic_test_recorder = AudioRecorder(self)
         self._mic_probe_active = False
         self._mic_probe_max = 0.0
+        self._mic_probe_warning = ""
+        self._last_audio_test_config: tuple[str, int, int] | None = None
+        self._mic_probe_timer = QTimer(self)
+        self._mic_probe_timer.setSingleShot(True)
+        self._mic_probe_timer.timeout.connect(self._finish_mic_probe)
         self._loading = False
         self._runtime_status = coerce_runtime_status(RuntimeState.LOADING)
+        self._segmentation_status: SegmentationStatus | None = None
+        self._recognition_pending = False
+        self._speaker_runtime_text = "尚未获取说话人增强运行状态"
         self._setup_window()
         self._setup_ui()
         self._load_settings()
@@ -131,11 +146,12 @@ class SettingsWindow(QWidget):
             self._pages.setStyleSheet("background: transparent;")
         if hasattr(self, "_hotkey_hint"):
             self._hotkey_hint.setStyleSheet(
-                f"color: {tok.TEXT_DIM}; font-size: {_tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
+                f"color: {tok.TEXT_SEC}; font-size: {_tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
                 f" background: transparent; padding: 0 16px 12px 16px;"
             )
         if hasattr(self, "_advanced_audio_btn"):
             paint_device_selection_link(self._advanced_audio_btn)
+            paint_device_selection_link(self._advanced_recognition_btn)
         if hasattr(self, "_storage_summary_label"):
             self._storage_summary_label.setStyleSheet(
                 f"color: {tok.TEXT_SEC}; font-size: {_tok.TYPE_BODY_SM}px; background: transparent;"
@@ -148,12 +164,6 @@ class SettingsWindow(QWidget):
             self._paint_llm_prompt_edit()
         if hasattr(self, "_meeting_glossary_edit"):
             self._paint_meeting_glossary_edit()
-        if hasattr(self, "_about_version_label"):
-            self._about_version_label.setStyleSheet(
-                f"color: {tok.TEXT_SEC}; font-size: {_tok.TYPE_CAPTION}px; font-weight: 700;"
-                f" background: {tok.SURFACE_PEARL}; border: 1px solid {tok.HAIRLINE};"
-                f" border-radius: {tok.RADIUS_PILL}px; padding: 3px 10px;"
-            )
         if hasattr(self, "_about_update_btn"):
             paint_about_update_row(self)
         for name in ("_llm_test_status", "_minutes_test_status"):
@@ -162,19 +172,29 @@ class SettingsWindow(QWidget):
                     f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px;"
                     f" background: transparent; padding: 0 16px 12px 16px;"
                 )
-        if hasattr(self, "_about_paths_toggle"):
-            self._about_paths_toggle.setStyleSheet(
-                f"QPushButton#aboutPathsToggle {{"
-                f" color: {tok.TEXT_SEC}; background: transparent; border: 2px solid transparent;"
-                f" font-size: {tok.TYPE_BODY_SM}px; font-weight: 400;"
-                f" text-align: left; padding: 8px 14px;"
-                f"}}"
-                f"QPushButton#aboutPathsToggle:hover {{ color: {tok.TEXT}; }}"
-                f"QPushButton#aboutPathsToggle:focus {{ border: {tok.FOCUS_RING}; }}"
-            )
+        self._refresh_recognition_feedback()
+        self._refresh_output_controls()
+        self._refresh_meeting_defaults()
+        self._mic_level_bar.setStyleSheet(
+            f"QProgressBar {{ border: none; background: {tok.SURFACE_PEARL}; border-radius: 3px; }}"
+            f"QProgressBar::chunk {{ background: {tok.ACCENT}; border-radius: 3px; }}"
+        )
 
     def show_page(self, index: int) -> None:
         self._pages.setCurrentIndex(index)
+        if index == 3:
+            self._refresh_about_info()
+            refresh_update_check_time(self)
+
+    def _open_about_setting(self, page: str, focus: str = "") -> None:
+        self.show_page({"general": 0, "engine": 1, "polish": 2}[page])
+        self.navigation_requested.emit(page)
+        if focus == "hotkey":
+            self._pages.widget(0).ensureWidgetVisible(self._hotkey_edit)
+            self._hotkey_edit.setFocus(Qt.FocusReason.TabFocusReason)
+        elif focus == "polish":
+            self._pages.widget(2).ensureWidgetVisible(self._llm_enable_row)
+            self._llm_enable_row.setFocus(Qt.FocusReason.TabFocusReason)
 
     def _on_nav_changed(self, row: int):
         self.show_page(row)
@@ -246,7 +266,9 @@ class SettingsWindow(QWidget):
         if label is None:
             return
         status = self._runtime_status
-        if status.state is RuntimeState.READY:
+        if self._recognition_pending:
+            fg, bg, text = _tok.AMBER_TEXT, _tok.AMBER_SOFT, "设置待生效 · 本场继续使用原配置"
+        elif status.state is RuntimeState.READY:
             fg, bg, text = _tok.GREEN_TEXT, _tok.GREEN_BG, "已载入 · 可用"
         elif status.state is RuntimeState.UNAVAILABLE:
             fg, bg, text = _tok.RED, _tok.RED_BG, status.label
@@ -257,6 +279,82 @@ class SettingsWindow(QWidget):
             f"background: {bg}; color: {fg}; border-radius: {_tok.RADIUS_PILL}px;"
             f" padding: 3px 10px; font-size: {_tok.TYPE_CAPTION}px; font-weight: 700;"
         )
+
+    def set_recognition_runtime_status(
+        self, status: SegmentationStatus, *, speaker_status: str, pending: bool = False,
+    ) -> None:
+        self._segmentation_status = status
+        self._speaker_runtime_text = speaker_status
+        self._recognition_pending = pending
+        self._paint_model_hero_status()
+        self._refresh_recognition_feedback()
+
+    def _refresh_recognition_feedback(self) -> None:
+        from sayink.speech_recognizer import AUX_MODEL_SILERO_VAD, is_model_downloaded
+
+        shared = RecognitionSettings.from_config(self._config)
+        downloaded = is_model_downloaded(AUX_MODEL_SILERO_VAD)
+        status = self._segmentation_status
+        if status is not None:
+            scope = "当前会议" if status.meeting else "当前听写"
+            text = f"{scope}：{status.label}"
+            if self._recognition_pending and downloaded and status.requested == "silero" and not status.model_available:
+                text = f"{scope}：Silero VAD 已下载，待本场结束后加载 · 当前使用能量断句"
+            self._vad_runtime_label.setToolTip(status.error)
+        elif shared.vad == "energy":
+            text = "已选择能量断句 · 尚未获取实际运行状态"
+        elif downloaded:
+            text = "Silero VAD 已下载 · 尚未确认加载状态"
+        else:
+            text = "Silero VAD 未下载 · 自动使用能量断句"
+        self._vad_runtime_label.setText(text)
+        fg = _tok.TEXT_SEC
+        if status is not None:
+            if status.error:
+                fg = _tok.RED
+            elif status.effective == "silero":
+                fg = _tok.GREEN_TEXT
+            elif status.requested == "silero":
+                fg = _tok.AMBER_TEXT
+        self._vad_runtime_label.setStyleSheet(
+            f"color: {fg}; font-size: {_tok.TYPE_FOOTNOTE}px; background: transparent;"
+        )
+        self._recognition_apply_label.setStyleSheet(
+            f"color: {_tok.AMBER_TEXT if self._recognition_pending else _tok.TEXT_SEC};"
+            f" font-size: {_tok.TYPE_FOOTNOTE}px; background: transparent;"
+        )
+        self._speaker_runtime_label.setText(self._speaker_runtime_text)
+        self._recognition_capability_label.setText("\n".join(shared.notes))
+        self._recognition_capability_label.setVisible(bool(shared.notes))
+        self._set_section_visible(self._recognition_capability_row, bool(shared.notes))
+        apply_text = (
+            "已保存 · 待本场结束且已录语音处理完成后生效。"
+            if self._recognition_pending else
+            "更改自动保存；空闲时应用，录音或处理期间的更改在本场结束后生效。"
+        )
+        if status is not None and status.error:
+            apply_text += " 语音检测模型加载失败，当前按音量分段；可展开高级设置查看。"
+        self._recognition_apply_label.setText(apply_text)
+        if AUX_MODEL_SILERO_VAD not in self._dl_workers:
+            self._set_section_visible(self._vad_download_row, not downloaded)
+            self._set_section_visible(self._vad_download_status_row, bool(downloaded))
+            self._vad_download_status.setText("语音检测模型（Silero VAD）：文件已下载；运行状态见上方。")
+            self._vad_download_btn.setEnabled(True)
+            self._vad_download_btn.setText("下载语音检测模型（约 2 MB）")
+
+    def _download_shared_vad(self) -> None:
+        from sayink.speech_recognizer import AUX_MODEL_SILERO_VAD
+
+        self._start_download(AUX_MODEL_SILERO_VAD)
+
+    def _on_shared_download_progress(self, model_id: str, pct: int) -> None:
+        from sayink.speech_recognizer import AUX_MODEL_SILERO_VAD
+
+        if model_id == AUX_MODEL_SILERO_VAD:
+            self._vad_download_row.show()
+            self._vad_download_status_row.hide()
+            self._vad_download_btn.setEnabled(False)
+            self._vad_download_btn.setText(f"下载中 {int(pct)}%")
 
     def _configure_numeric_spin(self, spin: QSpinBox) -> None:
         """Shared metrics for flat themed QSpinBox steppers."""
@@ -328,6 +426,7 @@ class SettingsWindow(QWidget):
         self._storage_summary_label.setToolTip(str(self._config.models_dir))
 
     def _refresh_active_model_hero(self) -> None:
+        self._refresh_meeting_defaults()
         if not hasattr(self, "_model_hero_layout"):
             return
         while self._model_hero_layout.count():
@@ -458,18 +557,18 @@ class SettingsWindow(QWidget):
             _add_section("其他已下载", downloaded_models, True)
         _add_section("可下载", available_models, False)
         self._add_aux_model_section()
+        self._model_cards_for_id = active_id
 
     def _add_aux_model_section(self) -> None:
-        """Meeting helpers (speaker embedding, Silero VAD): one section, each
-        card either 「已启用」+删除 or 下载."""
+        """Shared helpers: cards show file availability, not runtime activation."""
         from sayink.speech_recognizer import AUX_MODEL_REGISTRY, is_model_downloaded
 
         section = QWidget()
         section_lay = QVBoxLayout(section)
         section_lay.setContentsMargins(0, 0, 0, 0)
         section_lay.setSpacing(10)
-        section_lay.addWidget(section_header("会议辅助模型"))
-        hint = footnote("会议记录可选：区分说话人、更稳的断句。不影响听写。")
+        section_lay.addWidget(section_header("公共识别辅助模型"))
+        hint = footnote("语音检测用于三种录音模式；说话人增强用于持续转写与会议。加载状态见 通用 → 识别 → 高级识别设置。")
         section_lay.addWidget(hint)
         list_host = QWidget()
         list_lay = QVBoxLayout(list_host)
@@ -507,12 +606,14 @@ class SettingsWindow(QWidget):
             source=self._config.get("stt.download_source", "auto"),
         )
         self._dl_workers[model_id] = worker
+        self._on_shared_download_progress(model_id, 0)
         card = self._model_cards.get(model_id)
         if card:
             card.set_download_progress(0)
         worker.progress.connect(lambda pct, c=card: c.set_download_progress(pct) if c else None)
+        worker.progress.connect(lambda pct, mid=model_id: self._on_shared_download_progress(mid, pct))
         worker.finished_ok.connect(lambda mid: self._on_dl_done(mid))
-        worker.error.connect(lambda msg, c=card: self._on_dl_error(msg, c))
+        worker.error.connect(lambda msg, c=card, mid=model_id: self._on_dl_error(msg, c, mid))
         worker.start()
 
     def _on_dl_done(self, model_id: str):
@@ -523,20 +624,29 @@ class SettingsWindow(QWidget):
             self._config.set("stt.model_id", model_id)
         self._rebuild_model_cards()
         self.models_changed.emit()
+        self._refresh_recognition_feedback()
         from sayink.speech_recognizer import get_model_info, is_aux_model
         info = get_model_info(model_id)
         name = info["name"] if info else model_id
         if is_aux_model(model_id):
-            text = f"{name} 已下载，下一场会议会自动使用。"
+            text = (
+                f"{name} 已下载。按识别设置启用；正在录音或处理语音时，"
+                "待本场结束后生效。可在 通用 → 识别 → 高级识别设置 查看实际加载状态。"
+            )
         elif self._config.get("stt.model_id", "") == model_id:
-            text = f"{name} 已下载，正在载入内存（约需数十秒）。载入完成前请勿开始录音。"
+            if self._recognition_pending:
+                text = f"{name} 已下载，待本场结束且已录语音处理完成后载入。可在通用 → 识别查看生效状态。"
+            else:
+                text = f"{name} 已下载，正在载入内存（约需数十秒）。载入完成前请勿开始录音。"
         else:
             # Only the active model is loaded; a second download just sits
             # on disk until the user enables it, so do not claim otherwise.
             text = f"{name} 已下载。当前仍使用原来的模型；点击该模型卡片上的「使用此模型」即可切换。"
         QMessageBox.information(self, "完成", text)
 
-    def _on_dl_error(self, msg: str, card):
+    def _on_dl_error(self, msg: str, card, model_id: str = ""):
+        if model_id and card is None:
+            self._dl_workers.pop(model_id, None)
         if card:
             worker = self._dl_workers.pop(card._model_id, None)
             if worker is not None and getattr(worker, "_cancelled", False) is True:
@@ -545,6 +655,7 @@ class SettingsWindow(QWidget):
                 card.set_download_error(msg)
         else:
             QMessageBox.warning(self, "下载失败", msg)
+        self._refresh_recognition_feedback()
 
     def _delete_model(self, model_id: str):
         from sayink.speech_recognizer import get_model_info, delete_model
@@ -580,36 +691,13 @@ class SettingsWindow(QWidget):
     # ── Page: Polish (LLM) ─────────────────────────────
 
     def _on_llm_enable_toggled(self, enabled: bool):
-        # Keep the enable row visually stable while the prompt block
-        # mounts/unmounts (avoids scroll jumping the switch under the cursor).
-        page = self._polish_scroll_page()
-        anchor_y = 0
-        scroll_before = 0
-        if page is not None and page.widget() is not None:
-            anchor_y = self._llm_enable_row.mapTo(page.widget(), self._llm_enable_row.rect().topLeft()).y()
-            scroll_before = page.verticalScrollBar().value()
-
         # The before/after example stays visible in both states: it is the
         # information a user needs *before* deciding to turn polishing on.
         # The connection stays too: meeting minutes use it with polish off.
-        self._llm_prompt_container.setVisible(enabled)
-
-        if page is not None and page.widget() is not None:
-            def _restore() -> None:
-                if page.widget() is None:
-                    return
-                new_y = self._llm_enable_row.mapTo(
-                    page.widget(), self._llm_enable_row.rect().topLeft()
-                ).y()
-                page.verticalScrollBar().setValue(
-                    max(0, scroll_before + (new_y - anchor_y))
-                )
-                page._sync_scroll_gutter(
-                    page.verticalScrollBar().minimum(),
-                    page.verticalScrollBar().maximum(),
-                )
-
-            QTimer.singleShot(0, _restore)
+        self._without_scroll_jump(
+            self._llm_enable_row,
+            lambda: self._set_section_visible(self._llm_prompt_container, enabled),
+        )
 
         if self._loading:
             return
@@ -654,13 +742,93 @@ class SettingsWindow(QWidget):
         else:
             self._llm_test_status.setText("配置已填写，尚未测试连接。")
 
-    def _polish_scroll_page(self):
-        w = self._llm_enable_row.parentWidget()
+    def _scroll_page_of(self, widget: QWidget) -> SettingsPage | None:
+        w = widget
         while w is not None:
             if isinstance(w, SettingsPage):
                 return w
             w = w.parentWidget()
         return None
+
+    def _polish_scroll_page(self):
+        return self._scroll_page_of(self._llm_enable_row)
+
+    def _set_section_visible(self, panel: QWidget, visible: bool) -> None:
+        """Show or hide a collapsed block without a one-frame layout jump.
+
+        Hiding alone leaves the scroll document at the expanded height until a
+        later polish, and the first layout pass slides the link. Collapsing
+        the maximum height makes that pass agree with the final size.
+        """
+        if panel.isVisible() == visible and (visible or panel.maximumHeight() == 0):
+            return
+        if visible:
+            panel.setMaximumHeight(QWIDGETSIZE_MAX)
+            saved = panel.property("_sectionMinHeight")
+            if isinstance(saved, int) and saved > 0:
+                panel.setMinimumHeight(saved)
+            panel.setVisible(True)
+            return
+        if panel.property("_sectionMinHeight") is None:
+            panel.setProperty("_sectionMinHeight", int(panel.minimumHeight()))
+        panel.setMaximumHeight(0)
+        panel.setVisible(False)
+        panel.updateGeometry()
+
+    def _settle_scroll_anchor(
+        self,
+        page: SettingsPage,
+        anchor: QWidget,
+        anchor_y: int,
+        scroll_before: int,
+    ) -> None:
+        """Finish the show/hide layout before anything is painted.
+
+        The first pass often keeps the old document height, so the link moves
+        and the scrollbar range is stale. A second pass, after resizing to the
+        real size hint, puts the link back. Callers keep updates disabled
+        across this, so the intermediate position is never shown.
+        """
+        host = page.widget()
+        if host is None:
+            return
+        layout = host.layout()
+        bar = page.verticalScrollBar()
+        for _ in range(3):
+            if layout is not None:
+                layout.invalidate()
+                layout.activate()
+            QApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)
+            hint_h = host.sizeHint().height()
+            if hint_h > 0 and host.height() != hint_h:
+                host.resize(host.width(), hint_h)
+            if layout is not None:
+                layout.activate()
+            QApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)
+            new_y = anchor.mapTo(host, anchor.rect().topLeft()).y()
+            bar.setValue(max(0, scroll_before + (new_y - anchor_y)))
+            page._sync_scroll_gutter(bar.minimum(), bar.maximum())
+
+    def _without_scroll_jump(self, anchor: QWidget, change) -> None:
+        """Run ``change`` without the scroll area shoving ``anchor`` around."""
+        page = self._scroll_page_of(anchor)
+        if page is None or not page.isVisible():
+            change()
+            return
+        host = page.widget()
+        anchor_y = (
+            anchor.mapTo(host, anchor.rect().topLeft()).y() if host is not None else 0
+        )
+        scroll_before = page.verticalScrollBar().value()
+        was_enabled = page.updatesEnabled()
+        if was_enabled:
+            page.setUpdatesEnabled(False)
+        try:
+            change()
+            self._settle_scroll_anchor(page, anchor, anchor_y, scroll_before)
+        finally:
+            if was_enabled:
+                page.setUpdatesEnabled(True)
 
     def _toggle_llm_key_visibility(self, visible: bool) -> None:
         self._llm_key_edit.setEchoMode(
@@ -708,6 +876,27 @@ class SettingsWindow(QWidget):
 
     # ── Page: About ────────────────────────────────────
 
+    def _refresh_about_runtime_rows(self) -> None:
+        """Update source / mode / output on About without rescanning models."""
+        if not hasattr(self, "_about_summary_rows"):
+            return
+        hints = dictation_hints(self._config)
+        rows = self._about_summary_rows
+        for key, value in (
+            ("录音快捷键", format_hotkey(self._config.get("hotkey", DEFAULT_HOTKEY))),
+            ("音频来源", hints.source),
+            ("录制方式", hints.mode),
+            ("输出去向", hints.output),
+        ):
+            row = rows.get(key)
+            if row is not None:
+                row.value_label.setText(value)
+        output_row = rows.get("输出去向")
+        if output_row is not None:
+            output_row.setProperty("outputWarning", hints.output_warning)
+            if callable(getattr(output_row, "reapply_styles", None)):
+                output_row.reapply_styles()
+
     def _refresh_about_info(self):
         if not hasattr(self, "_about_runtime_lay"):
             return
@@ -721,11 +910,6 @@ class SettingsWindow(QWidget):
         downloaded = [m for m in MODEL_REGISTRY if is_model_downloaded(m["id"])]
         total_mb = sum(m["size_mb"] for m in downloaded)
 
-        while self._about_runtime_lay.count():
-            item = self._about_runtime_lay.takeAt(0)
-            if item.widget() is not None:
-                item.widget().deleteLater()
-
         from sayink.text_polisher import polish_settings_complete
 
         llm_enabled = self._config.get("llm.enabled", False)
@@ -734,11 +918,15 @@ class SettingsWindow(QWidget):
             self._config.get("llm.api_key", ""),
             self._config.get("llm.model_name", ""),
         )
+        hints = dictation_hints(self._config)
         runtime_items = [
-            ("当前模型", active_name),
-            ("快捷键", format_hotkey(self._config.get("hotkey", DEFAULT_HOTKEY))),
+            ("语音识别模型", active_name),
+            ("录音快捷键", format_hotkey(self._config.get("hotkey", DEFAULT_HOTKEY))),
+            ("音频来源", hints.source),
+            ("录制方式", hints.mode),
+            ("输出去向", hints.output),
             (
-                "润色",
+                "文字润色",
                 "已开启 · 待验证"
                 if llm_enabled and llm_configured
                 else "已开启 · 未配置"
@@ -747,8 +935,10 @@ class SettingsWindow(QWidget):
             ),
         ]
         for key, val in runtime_items:
-            self._about_runtime_lay.addWidget(group_divider())
-            self._about_runtime_lay.addWidget(kv_row(key, val))
+            self._about_summary_rows[key].value_label.setText(val)
+        output_row = self._about_summary_rows["输出去向"]
+        output_row.setProperty("outputWarning", hints.output_warning)
+        output_row.reapply_styles()
 
         while self._about_paths_lay.count():
             item = self._about_paths_lay.takeAt(0)
@@ -763,12 +953,9 @@ class SettingsWindow(QWidget):
         ]
         for key, val in path_items:
             self._about_paths_lay.addWidget(group_divider())
-            if key in ("模型目录", "配置文件", "日志目录"):
-                self._about_paths_lay.addWidget(kv_row_elided(key, val, max_len=42))
-            else:
-                self._about_paths_lay.addWidget(kv_row(key, val))
-
-        self._refresh_about_hero_status()
+            row = AboutSummaryRow(key, val)
+            row.value_label.setToolTip(val)
+            self._about_paths_lay.addWidget(row)
 
     def _on_about_update_button(self) -> None:
         if self._about_update_btn.text() == "下载并安装":
@@ -785,6 +972,7 @@ class SettingsWindow(QWidget):
         if not hasattr(self, "_about_update_status"):
             return
         self._about_update_status.setText(text)
+        refresh_update_check_time(self)
         if action == "install":
             self._about_update_btn.setText("下载并安装")
             self._about_update_btn.setEnabled(True)
@@ -804,22 +992,7 @@ class SettingsWindow(QWidget):
 
     def _config_trigger_label(self, mode: str | None = None) -> str:
         m = mode or self._config.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY)
-        return "持续转写" if m == TRIGGER_MODE_CONTINUOUS else "按住录音"
-
-    def _refresh_about_hero_status(self) -> None:
-        if not hasattr(self, "_about_usage_tip"):
-            return
-        hotkey = format_hotkey(self._config.get("hotkey", DEFAULT_HOTKEY))
-        if self._config.get("audio.trigger_mode") == TRIGGER_MODE_CONTINUOUS:
-            tip = (
-                f"持续转写：按住 {hotkey} 开始监听，说话停顿约 1 秒后自动输入，不用点结束；"
-                f"Esc 或听写条「结束」停止整场"
-            )
-        else:
-            tip = f"按住 {hotkey} 说话，松开后识别并粘贴"
-        labels = self._about_usage_tip.findChildren(QLabel)
-        if labels:
-            labels[0].setText(tip)
+        return "持续转写" if m == TRIGGER_MODE_CONTINUOUS else "单次转写"
 
     # ── Shared ─────────────────────────────────────────
 
@@ -852,15 +1025,19 @@ class SettingsWindow(QWidget):
         self._system_device_combo.setEnabled(sys_on)
         mixed = self._src_mixed_rb.isChecked()
         show_note = mixed or src == INPUT_SOURCE_SYSTEM
-        for lbl in self._mixed_audio_callout.findChildren(QLabel):
-            lbl.setText(MIXED_AUDIO_NOTE if mixed else SYSTEM_AUDIO_NOTE)
+        self._mixed_audio_callout.setText(MIXED_AUDIO_NOTE if mixed else SYSTEM_AUDIO_NOTE)
         self._mixed_audio_callout.setVisible(show_note)
         if hasattr(self, "_mixed_audio_callout_wrap"):
-            self._mixed_audio_callout_wrap.setVisible(show_note)
+            self._set_section_visible(self._mixed_audio_callout_wrap, show_note)
+        self._refresh_audio_device_summary()
 
-    def _set_history_limit_rows_visible(self, visible: bool) -> None:
-        self._history_retention_row.setVisible(visible)
-        self._history_max_entries_row.setVisible(visible)
+    def _refresh_history_controls(self) -> None:
+        # Retention still applies to existing dictation even when new history
+        # is off, so its controls remain visible and usable in both states.
+        prefix = "" if self._history_enabled_row.isChecked() else "已停止新增听写；"
+        self._history_cleanup_hint.setText(
+            prefix + "已有听写仍按以上规则保留，超限清理无法撤销。保存新听写及启动时执行；会议记录不受影响。"
+        )
 
     def _apply_input_source_radios(self, source: str):
         if source == INPUT_SOURCE_SYSTEM:
@@ -879,7 +1056,53 @@ class SettingsWindow(QWidget):
             self._trigger_continuous_rb.setChecked(True)
         sync_group_tab_stop(self._trigger_group)
 
-    def _load_settings(self):
+    def _saved_device_indices(self) -> tuple[int, int]:
+        return (
+            int(self._config.get("audio.mic_device_index", -1)),
+            int(self._config.get("audio.system_device_index", -1)),
+        )
+
+    def _ensure_automatic_device_items(self) -> None:
+        for combo in (self._mic_device_combo, self._system_device_combo):
+            blocker = QSignalBlocker(combo)
+            if combo.findData(-1) < 0:
+                combo.insertItem(0, "自动选择", -1)
+            del blocker
+
+    def _saved_devices_are_listed(self) -> bool:
+        mic, system = self._saved_device_indices()
+        return (
+            self._mic_device_combo.findData(mic) >= 0
+            and self._system_device_combo.findData(system) >= 0
+        )
+
+    def _sync_saved_audio_devices(self, *, refresh_devices: bool) -> None:
+        """Fill the device combos. Automatic (-1) does not scan PortAudio.
+
+        Scanning on every window open and every mode click blocked the UI
+        for as long as Windows took to enumerate endpoints.
+        """
+        mic, system = self._saved_device_indices()
+        automatic = mic < 0 and system < 0
+        missing = not self._saved_devices_are_listed()
+        if refresh_devices and not automatic and missing:
+            self._refresh_audio_device_lists()
+        else:
+            self._ensure_automatic_device_items()
+        mic_ok = self._set_combo_by_data(self._mic_device_combo, mic)
+        sys_ok = self._set_combo_by_data(self._system_device_combo, system)
+        if refresh_devices and (not mic_ok or not sys_ok):
+            self._reset_audio_devices_to_auto()
+
+    def _model_cards_match_config(self) -> bool:
+        if not self._model_cards:
+            return False
+        from sayink.speech_recognizer import DEFAULT_MODEL_ID
+
+        active = self._config.get("stt.model_id", DEFAULT_MODEL_ID)
+        return getattr(self, "_model_cards_for_id", None) == active
+
+    def _load_settings(self, *, refresh_devices: bool = True, heavy: bool = True):
         self._loading = True
         self._hotkey_edit.set_value(self._config.get("hotkey", DEFAULT_HOTKEY))
         self._auto_start_row.setChecked(self._config.get("auto_start", False))
@@ -887,7 +1110,8 @@ class SettingsWindow(QWidget):
         self._restore_clipboard_row.setChecked(
             self._config.get("output.restore_clipboard", False)
         )
-        self._history_only_output_row.setChecked(self._config.history_only_output())
+        output_choice = "auto" if self._config.output_follows_input_source() else self._config.output_mode()
+        self._set_combo_by_data(self._output_mode_combo, output_choice)
         self._esc_stop_row.setChecked(
             bool(self._config.get("audio.esc_stops_continuous", True))
         )
@@ -906,7 +1130,7 @@ class SettingsWindow(QWidget):
         self._history_max_entries_spin.setValue(
             int(self._config.get("history.max_entries", 5000))
         )
-        self._set_history_limit_rows_visible(self._history_enabled_row.isChecked())
+        self._refresh_history_controls()
 
         theme_mode = normalize_theme_mode(
             self._config.get("appearance.theme_mode", "dark")
@@ -928,18 +1152,14 @@ class SettingsWindow(QWidget):
         # radio happened to be checked before.
         self._refresh_hotkey_hint()
 
-        self._refresh_audio_device_lists()
-        mic_ok = self._set_combo_by_data(
-            self._mic_device_combo, int(self._config.get("audio.mic_device_index", -1))
-        )
-        sys_ok = self._set_combo_by_data(
-            self._system_device_combo, int(self._config.get("audio.system_device_index", -1))
-        )
-        if not mic_ok or not sys_ok:
-            self._reset_audio_devices_to_auto()
+        self._sync_saved_audio_devices(refresh_devices=refresh_devices)
 
         self._refresh_dir_label()
-        self._rebuild_model_cards()
+        cards_changed = not self._model_cards_match_config()
+        if cards_changed:
+            self._rebuild_model_cards()
+        if heavy or cards_changed:
+            self._refresh_about_info()
 
         llm_on = self._config.get("llm.enabled", False)
         self._llm_enable_row.setChecked(llm_on)
@@ -951,9 +1171,12 @@ class SettingsWindow(QWidget):
         self._llm_prompt_edit.setEnabled(True)
         self._load_meeting_settings()
 
-        self._refresh_about_info()
         self._loading = False
+        self._refresh_output_controls()
+        self._refresh_audio_device_summary()
+        self._refresh_meeting_defaults()
         self._update_llm_configuration_status()
+        self.usage_hint_changed.emit()
 
     def _set_combo_by_data(self, combo: QComboBox, value: int) -> bool:
         idx = combo.findData(value)
@@ -965,6 +1188,7 @@ class SettingsWindow(QWidget):
         return False
 
     def _reset_audio_devices_to_auto(self):
+        self._cancel_mic_probe_if_active()
         if not self._loading and not self._confirm_discard_pending():
             return
         was_loading = self._loading
@@ -975,10 +1199,16 @@ class SettingsWindow(QWidget):
         if not was_loading:
             self._persist_runtime_settings()
         self._set_mic_test_status("已恢复为「自动选择」，请再点「测试声音」。")
+        self._refresh_audio_device_summary()
 
     def _refresh_audio_device_lists(self):
         mic_sel = self._mic_device_combo.currentData() if self._mic_device_combo.count() else -1
         sys_sel = self._system_device_combo.currentData() if self._system_device_combo.count() else -1
+
+        # Enumeration must not apply the transient empty / automatic entries
+        # or emit a setting change before the previous selection is restored.
+        mic_blocker = QSignalBlocker(self._mic_device_combo)
+        sys_blocker = QSignalBlocker(self._system_device_combo)
 
         self._mic_device_combo.clear()
         self._mic_device_combo.addItem("自动选择", -1)
@@ -996,19 +1226,35 @@ class SettingsWindow(QWidget):
         except Exception as e:
             self._system_device_combo.addItem(f"枚举失败: {e}", -1)
 
-        if mic_sel is not None:
-            self._set_combo_by_data(self._mic_device_combo, int(mic_sel))
-        if sys_sel is not None:
-            self._set_combo_by_data(self._system_device_combo, int(sys_sel))
+        for combo, selected in ((self._mic_device_combo, mic_sel), (self._system_device_combo, sys_sel)):
+            if selected is None:
+                continue
+            if int(selected) >= 0 and combo.findData(int(selected)) < 0:
+                combo.addItem("原设备已不可用，请重新选择", int(selected))
+            self._set_combo_by_data(combo, int(selected))
+        del mic_blocker, sys_blocker
+        self._refresh_audio_device_summary()
+
+    def _set_checked_link(self, button, checked: bool) -> None:
+        if button.isChecked() == checked:
+            return
+        blocker = QSignalBlocker(button)
+        button.setChecked(checked)
+        del blocker
 
     def _toggle_advanced_audio(self, visible: bool):
-        self._advanced_audio_panel.setVisible(visible)
-        self._advanced_audio_btn.setText(
-            "收起手动设备" if visible else "手动选择音频设备"
-        )
-        self._advanced_audio_btn.setChecked(visible)
-        if visible and self._mic_device_combo.count() <= 1:
-            self._refresh_audio_device_lists()
+        def change() -> None:
+            # Fill the combos while the panel is still hidden. Clearing them
+            # after it is on screen flashes an empty dropdown.
+            if visible and self._mic_device_combo.count() <= 1:
+                self._refresh_audio_device_lists()
+            self._set_section_visible(self._advanced_audio_panel, visible)
+            self._advanced_audio_btn.setText(
+                "收起手动设备" if visible else "手动选择音频设备"
+            )
+            self._set_checked_link(self._advanced_audio_btn, visible)
+
+        self._without_scroll_jump(self._advanced_audio_btn, change)
 
     def _current_audio_probe_config(self) -> tuple[str, int, int]:
         return (
@@ -1016,6 +1262,54 @@ class SettingsWindow(QWidget):
             int(self._mic_device_combo.currentData() if self._mic_device_combo.currentData() is not None else -1),
             int(self._system_device_combo.currentData() if self._system_device_combo.currentData() is not None else -1),
         )
+
+    def _toggle_advanced_recognition(self, visible: bool) -> None:
+        def change() -> None:
+            self._set_section_visible(self._advanced_recognition_panel, visible)
+            self._advanced_recognition_btn.setText(
+                "收起高级识别设置" if visible else "高级识别设置"
+            )
+            self._advanced_recognition_btn.setAccessibleName(
+                "收起高级识别设置" if visible else "展开高级识别设置"
+            )
+            self._set_checked_link(self._advanced_recognition_btn, visible)
+
+        self._without_scroll_jump(self._advanced_recognition_btn, change)
+
+    def _refresh_audio_device_summary(self) -> None:
+        if not hasattr(self, "_audio_device_summary"):
+            return
+        source = self._selected_input_source()
+        current = self._current_audio_probe_config()
+        if current != self._last_audio_test_config:
+            self._cancel_mic_probe_if_active()
+            self._last_audio_test_config = current
+            self._set_mic_test_status("测试会临时采集约 2 秒声音，不保存音频或转写文本。")
+        lines = []
+        for key, title, combo in (
+            (INPUT_SOURCE_MICROPHONE, "麦克风", self._mic_device_combo),
+            (INPUT_SOURCE_SYSTEM, "电脑声音", self._system_device_combo),
+        ):
+            if source not in (key, INPUT_SOURCE_MIXED):
+                continue
+            automatic = _device_index(combo.currentData()) < 0
+            device = "自动选择（测试或录音时确定设备）" if automatic else combo.currentText()
+            lines.append(f"{title}：{device}")
+        self._audio_device_summary.setText("\n".join(lines))
+        # Mixed lists two devices and a single source lists one. Keep the
+        # two-line slot so switching 混合音源 / 电脑声音 does not pull the
+        # rows underneath upward.
+        summary_height = self._audio_device_summary.fontMetrics().lineSpacing() * 2 + 2
+        if self._audio_device_summary.minimumHeight() < summary_height:
+            self._audio_device_summary.setMinimumHeight(summary_height)
+
+    def _set_probe_controls_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self._mic_test_btn, self._mic_reset_btn, self._advanced_audio_btn,
+            self._advanced_audio_panel, self._src_mic_rb.parentWidget(),
+            self._src_sys_rb.parentWidget(), self._src_mixed_rb.parentWidget(),
+        ):
+            widget.setEnabled(enabled)
 
     def _disconnect_mic_probe_signals(self):
         try:
@@ -1051,7 +1345,10 @@ class SettingsWindow(QWidget):
         )
         self._mic_probe_active = True
         self._mic_probe_max = 0.0
-        self._mic_test_btn.setEnabled(False)
+        self._mic_probe_warning = ""
+        self._set_probe_controls_enabled(False)
+        self._mic_level_bar.setValue(0)
+        self._mic_level_bar.show()
         instruction = {
             INPUT_SOURCE_MICROPHONE: "请对麦克风说话",
             INPUT_SOURCE_SYSTEM: "请播放一段电脑声音",
@@ -1062,53 +1359,73 @@ class SettingsWindow(QWidget):
         self._mic_test_recorder.error.connect(self._on_mic_probe_error)
         self._mic_test_recorder.warning.connect(self._on_mic_probe_warning)
         self._mic_test_recorder.start()
-        QTimer.singleShot(2000, self._finish_mic_probe)
+        if self._mic_probe_active:
+            devices = self._mic_test_recorder.capture_device_labels
+            if devices:
+                self._audio_device_summary.setText("本次测试设备：\n" + "\n".join(devices))
+            self._mic_probe_timer.start(2000)
 
     def _on_mic_probe_volume(self, volume: float):
+        if not self._mic_probe_active:
+            return
         self._mic_probe_max = max(self._mic_probe_max, float(volume))
+        self._mic_level_bar.setValue(round(min(1.0, max(0.0, float(volume)) ** 0.5 * 2) * 100))
 
     def _on_mic_probe_error(self, msg: str):
         if not self._mic_probe_active:
             return
         self._mic_probe_active = False
+        self._mic_probe_timer.stop()
         self._disconnect_mic_probe_signals()
         if self._mic_test_recorder.is_recording:
             self._mic_test_recorder.cancel()
-        self._mic_test_btn.setEnabled(True)
+        self._set_probe_controls_enabled(True)
+        self._mic_level_bar.hide()
         self._set_mic_test_status(f"测试失败：{msg}。可展开「手动选择音频设备」后重试。")
 
     def _on_mic_probe_warning(self, msg: str):
         if not self._mic_probe_active:
             return
+        self._mic_probe_warning = msg
         self._set_mic_test_status(msg)
 
     def _finish_mic_probe(self):
         if not self._mic_probe_active:
             return
         self._mic_probe_active = False
+        self._mic_probe_timer.stop()
         self._disconnect_mic_probe_signals()
         if self._mic_test_recorder.is_recording:
             self._mic_test_recorder.stop()
-        self._mic_test_btn.setEnabled(True)
+        self._set_probe_controls_enabled(True)
+        self._mic_level_bar.hide()
         threshold = 0.0015
         peak = self._mic_probe_max
-        warn = self._mic_test_recorder.last_start_warning
+        warn = self._mic_probe_warning or self._mic_test_recorder.last_start_warning
         if peak >= threshold:
             base = "已检测到声音。"
+            if peak < 0.005:
+                base += "输入音量偏低，可靠近麦克风或提高来源音量。"
+            elif peak > 0.8:
+                base += "输入音量偏高，建议降低来源音量后重测。"
+            if self._selected_input_source() == INPUT_SOURCE_MIXED:
+                base += "混合输入请分别说话、播放声音，确认两路都能采集。"
             self._set_mic_test_status(f"{base} {warn}".strip() if warn else base)
         else:
             self._set_mic_test_status(
-                "几乎无输入。可直接恢复自动选择后重测，或展开下方手动选择设备。"
+                "未检测到明显声音。请先说话或播放声音，再测试；也可恢复自动选择或手动选择设备。"
             )
 
     def _cancel_mic_probe_if_active(self):
         if not self._mic_probe_active and not self._mic_test_recorder.is_recording:
             return
         self._mic_probe_active = False
+        self._mic_probe_timer.stop()
         self._disconnect_mic_probe_signals()
         if self._mic_test_recorder.is_recording:
             self._mic_test_recorder.cancel()
-        self._mic_test_btn.setEnabled(True)
+        self._set_probe_controls_enabled(True)
+        self._mic_level_bar.hide()
 
     # ── Instant apply ──────────────────────────────────
 
@@ -1179,19 +1496,21 @@ class SettingsWindow(QWidget):
         self._config.save_immediate()
         self.settings_changed.emit()
         self._refresh_hotkey_hint()
-        self._refresh_about_info()
+        # The full About refresh rescans every model file and rebuilds rows.
+        # A mode or source click only changes the runtime summary.
+        self._refresh_about_runtime_rows()
 
     def _refresh_hotkey_hint(self) -> None:
         if not hasattr(self, "_hotkey_hint"):
             return
-        esc_stops = bool(self._config.get("audio.esc_stops_continuous", True))
-        stop_hint = "Esc 或听写条「结束」停止整场。" if esc_stops else "听写条「结束」停止整场。"
-        self._hotkey_hint.setText(
-            "按住约 0.30 秒开始，松开后继续听；说话停顿约 1 秒后自动输入，不用点结束。"
-            + stop_hint
-            if self._selected_trigger_mode() == TRIGGER_MODE_CONTINUOUS else
-            "按住约 0.18 秒开始录音，松开后识别并输入；录音中按 Esc 取消。"
-        )
+        self._hotkey_hint.setText(dictation_hints(self._config).detail)
+        self._hotkey_hint.setToolTip("启动阈值：按住录音约 0.18 秒；持续转写约 0.30 秒，避免误触。")
+        continuous = self._selected_trigger_mode() == TRIGGER_MODE_CONTINUOUS
+        self._set_section_visible(self._esc_stop_row, continuous)
+        self._set_section_visible(self._esc_stop_divider, continuous)
+        self._trigger_hotkey_rb.parentWidget().set_copy("单次转写", "按住录音 · 松开后识别")
+        self._refresh_output_controls()
+        self._refresh_meeting_defaults()
 
     def _on_theme_mode_changed(self, _index: int = 0):
         if self._loading:
@@ -1224,6 +1543,7 @@ class SettingsWindow(QWidget):
             return
         self._config.set("audio.esc_stops_continuous", bool(checked))
         self._refresh_hotkey_hint()
+        self.usage_hint_changed.emit()
 
     def _on_restore_clipboard_toggled(self, checked: bool):
         if self._loading:
@@ -1231,28 +1551,97 @@ class SettingsWindow(QWidget):
         self._config.set("output.restore_clipboard", checked)
         self.restore_clipboard_changed.emit(checked)
 
-    def _on_history_only_output_toggled(self, checked: bool):
+    def _on_output_mode_changed(self, _index: int = 0):
         if self._loading:
             return
-        # A hand-made choice is never undone by a later input-source change.
-        self._config.set_output_mode(
-            OUTPUT_MODE_HISTORY if checked else OUTPUT_MODE_PASTE, auto=False
-        )
-        self._config.save_immediate()
+
+        def change() -> None:
+            choice = self._output_mode_combo.currentData()
+            if choice == "auto":
+                self._config.set("output.follow_input_source", True)
+                self._config.follow_input_source_for_output(self._selected_input_source())
+            else:
+                self._config.set_output_mode(choice, auto=False)
+            self._config.save_immediate()
+            self._refresh_hotkey_hint()
+            self._refresh_about_runtime_rows()
+            self.usage_hint_changed.emit()
+
+        self._without_scroll_jump(self._output_mode_combo, change)
 
     def _sync_output_mode_with_source(self, source: str) -> None:
-        changed = self._config.follow_input_source_for_output(source)
-        if changed is None:
+        self._config.follow_input_source_for_output(source)
+
+    def _refresh_output_controls(self) -> None:
+        hints = dictation_hints(self._config)
+        automatic = self._config.output_follows_input_source()
+        choice = "auto" if automatic else self._config.output_mode()
+        was_blocked = self._output_mode_combo.blockSignals(True)
+        self._set_combo_by_data(self._output_mode_combo, choice)
+        self._output_mode_combo.blockSignals(was_blocked)
+        history_only = self._config.history_only_output()
+        destination = "仅保存到历史，不输入其他应用" if history_only else "输入当前光标"
+        rule = "自动模式随音源切换" if automatic else "固定选择，切换音源后保持不变"
+        text = f"当前：{destination}。{rule}。"
+        color = _tok.TEXT_SEC
+        if hints.output_warning:
+            text = "历史已关闭：结果不会保存或输入其他应用。请开启转写历史，或改为输入当前光标。"
+            color = _tok.RED
+        elif not history_only and self._selected_input_source() != INPUT_SOURCE_MICROPHONE:
+            text += " 电脑声音的识别结果也会输入光标处，请确认目标窗口。"
+        self._output_mode_hint.setText(text)
+        self._output_mode_hint.setStyleSheet(
+            f"color: {color}; font-size: {_tok.TYPE_FOOTNOTE}px; background: transparent;"
+        )
+        self._set_section_visible(self._enable_history_wrap, hints.output_warning)
+        self._restore_clipboard_row.setEnabled(not history_only)
+        self._restore_clipboard_row.setToolTip("仅在结果输入当前光标时使用" if history_only else "")
+
+    def _refresh_meeting_defaults(self) -> None:
+        from sayink.speech_recognizer import get_model_info, is_model_downloaded
+
+        if not hasattr(self, "_meeting_defaults_hint"):
             return
-        self._loading = True
-        self._history_only_output_row.setChecked(changed == OUTPUT_MODE_HISTORY)
-        self._loading = False
+        source = dictation_hints(self._config).source
+        model_id = self._config.get("stt.model_id", "")
+        info = get_model_info(model_id)
+        model_name = info["name"] if info else model_id or "尚未选择"
+        follow = f"跟随录音（{source}）"
+        if self._meeting_source_combo.itemText(0) != follow:
+            self._meeting_source_combo.setItemText(0, follow)
+        longest = self._meeting_source_combo.fontMetrics().horizontalAdvance(
+            "跟随录音（麦克风 + 电脑声音）"
+        ) + 40
+        if self._meeting_source_combo.minimumWidth() < longest:
+            self._meeting_source_combo.setMinimumWidth(longest)
+        if self._meeting_model_combo.itemText(0) != "跟随录音模型":
+            self._meeting_model_combo.setItemText(0, "跟随录音模型")
+        selected = self._meeting_model_combo.currentData()
+        selected_info = get_model_info(selected) if selected else None
+        effective_name = selected_info["name"] if selected_info else model_name
+        model_missing = bool(selected and not is_model_downloaded(selected))
+        if model_missing:
+            effective_name = f"{effective_name} 未下载，请到「引擎」下载或选择跟随录音模型"
+        effective_source = self._meeting_source_combo.currentText()
+        self._meeting_defaults_hint.setText(
+            f"新会议：{effective_source} · {effective_name}。仅影响之后开始的会议。"
+        )
+        self._meeting_defaults_hint.setStyleSheet(
+            f"color: {_tok.AMBER_TEXT if model_missing else _tok.TEXT_SEC};"
+            f" font-size: {_tok.TYPE_FOOTNOTE}px; background: transparent;"
+        )
 
     def _on_history_enabled_toggled(self, checked: bool):
-        self._set_history_limit_rows_visible(checked)
-        if self._loading:
-            return
-        self._config.set("history.enabled", checked)
+        def change() -> None:
+            self._refresh_history_controls()
+            if self._loading:
+                return
+            self._config.set("history.enabled", checked)
+            self._refresh_hotkey_hint()
+            self._refresh_about_runtime_rows()
+            self.usage_hint_changed.emit()
+
+        self._without_scroll_jump(self._history_enabled_row, change)
 
     def _on_history_limits_changed(self, _value: int):
         if self._loading:
@@ -1265,16 +1654,28 @@ class SettingsWindow(QWidget):
     def _on_meeting_setting_changed(self, *_args):
         if self._loading:
             return
-        self._config.set("meeting.input_source", str(self._meeting_source_combo.currentData() or "mixed"))
+        self._config.set("meeting.input_source", str(self._meeting_source_combo.currentData() or ""))
         self._config.set("meeting.model_id", str(self._meeting_model_combo.currentData() or ""))
         self._config.set("meeting.show_start_card", bool(self._meeting_start_card_row.isChecked()))
+        self._refresh_meeting_defaults()
+
+    def _on_recognition_setting_changed(self, *_args):
+        if self._loading:
+            return
         vad = str(self._meeting_vad_combo.currentData() or "silero")
         language = str(self._meeting_language_combo.currentData() or "auto")
-        changed = vad != self._config.get("stt.vad", "silero") or language != self._config.get("stt.language", "auto")
+        speaker = self._speaker_enabled_row.isChecked()
+        changed = (
+            vad != self._config.get("stt.vad", "silero")
+            or language != self._config.get("stt.language", "auto")
+            or speaker != self._config.get("stt.speaker_model_enabled", True)
+        )
         self._config.set("stt.vad", vad)
         self._config.set("stt.language", language)
+        self._config.set("stt.speaker_model_enabled", speaker)
         if changed:
             self.recognition_changed.emit()
+        self._refresh_recognition_feedback()
 
     def _on_meeting_glossary_changed(self):
         if self._loading:
@@ -1301,13 +1702,15 @@ class SettingsWindow(QWidget):
         if terms != (self._config.get("stt.glossary", []) or []):
             self._config.set("stt.glossary", terms)
             self.recognition_changed.emit()
+            self._refresh_recognition_feedback()
 
     def _load_meeting_settings(self) -> None:
-        self._set_combo_by_data(self._meeting_source_combo, self._config.get("meeting.input_source", "mixed"))
+        self._set_combo_by_data(self._meeting_source_combo, self._config.get("meeting.input_source", "") or "")
         self._set_combo_by_data(self._meeting_model_combo, self._config.get("meeting.model_id", "") or "")
         self._set_combo_by_data(self._meeting_vad_combo, self._config.get("stt.vad", "silero"))
         self._set_combo_by_data(self._meeting_language_combo, self._config.get("stt.language", "auto"))
         self._meeting_start_card_row.setChecked(bool(self._config.get("meeting.show_start_card", True)))
+        self._speaker_enabled_row.setChecked(bool(self._config.get("stt.speaker_model_enabled", True)))
         glossary = self._config.get("stt.glossary", []) or []
         text = "\n".join(str(g.get("term", "")) for g in glossary if isinstance(g, dict) and g.get("term"))
         if self._meeting_glossary_edit.toPlainText() != text:
@@ -1315,6 +1718,7 @@ class SettingsWindow(QWidget):
         self._minutes_model_edit.setText(str(self._config.get("meeting.model_name", "") or ""))
         self._set_combo_by_data(self._minutes_template_combo, self._config.get("meeting.template_id", "general"))
         self._set_combo_by_data(self._minutes_language_combo, self._config.get("meeting.output_language", "auto"))
+        self._refresh_recognition_feedback()
 
     def _flush_minutes_fields(self, *_args):
         if self._loading:
@@ -1348,15 +1752,17 @@ class SettingsWindow(QWidget):
         self._config.set("hotkey", hotkey)
         if hotkey != old:
             self.hotkey_updated.emit(hotkey)
-        self._refresh_about_info()
+        self._refresh_about_runtime_rows()
 
     def _on_input_source_radio_toggled(self, checked: bool):
         if not checked or self._loading:
             return
+        anchor = self._src_mic_rb.parentWidget()
+        self._without_scroll_jump(anchor, self._sync_source_device_widgets)
         if not self._confirm_discard_pending():
             self._revert_input_source_radios()
             return
-        self._persist_runtime_settings()
+        self._without_scroll_jump(anchor, self._persist_runtime_settings)
 
     def _on_trigger_mode_radio_toggled(self, checked: bool):
         if not checked or self._loading:
@@ -1364,7 +1770,9 @@ class SettingsWindow(QWidget):
         if not self._confirm_discard_pending():
             self._revert_trigger_mode_radios()
             return
-        self._persist_runtime_settings()
+        self._without_scroll_jump(
+            self._trigger_hotkey_rb.parentWidget(), self._persist_runtime_settings
+        )
 
     def _on_audio_device_changed(self, _index: int):
         if self._loading:
@@ -1438,8 +1846,8 @@ class SettingsWindow(QWidget):
             return None
 
         class _W(QThread):
-            def __init__(self, u, k, m):
-                super().__init__()
+            def __init__(self, u, k, m, parent=None):
+                super().__init__(parent)
                 self.u, self.k, self.m = u, k, m
                 self.ok, self.msg = False, ""
 
@@ -1447,14 +1855,19 @@ class SettingsWindow(QWidget):
                 from sayink.text_polisher import TextPolisher
                 self.ok, self.msg = TextPolisher.test_connection(self.u, self.k, self.m)
 
-        worker = _W(url, key, model)
-        worker.finished.connect(lambda: self._on_test_done(worker, btn, status, ok_text))
+        worker = _W(url, key, model, self)
+        self._test_workers.append(worker)
+        worker.finished.connect(lambda w=worker: self._on_test_done(w, btn, status, ok_text))
         btn.setEnabled(False)
         btn.setText("测试中...")
         worker.start()
         return worker
 
     def _on_test_done(self, w, btn, status: QLabel, ok_text: str):
+        try:
+            self._test_workers.remove(w)
+        except ValueError:
+            pass
         btn.setEnabled(True)
         btn.setText("测试连接")
         status.setText(ok_text if w.ok else w.msg)
@@ -1473,24 +1886,39 @@ class SettingsWindow(QWidget):
 
     # ── Cleanup ────────────────────────────────────────
 
-    def reload_settings(self) -> None:
-        """Reload form fields from the current config."""
-        self._load_settings()
+    def reload_settings(self, *, refresh_devices: bool = True, heavy: bool = True) -> None:
+        """Reload form fields from the current config.
+
+        ``refresh_devices=False`` keeps the open path off PortAudio.
+        ``heavy=False`` skips rebuilding model cards and the About summary
+        when they already match the config.
+        """
+        self._load_settings(refresh_devices=refresh_devices, heavy=heavy)
 
     def cancel_hotkey_capture(self) -> None:
         """Stop in-progress shortcut capture and resume global hotkey listening."""
         self._hotkey_edit.cancel_capture_if_active()
 
     def cancel_all_downloads(self):
-        """Wait for any in-progress download workers to finish."""
-        for model_id, worker in list(self._dl_workers.items()):
-            if hasattr(worker, 'isRunning') and worker.isRunning():
+        """Cancel and wait for any in-progress download workers to finish."""
+        for worker in list(self._dl_workers.values()):
+            if hasattr(worker, "cancel"):
+                worker.cancel()
+            if hasattr(worker, "isRunning") and worker.isRunning():
                 worker.wait(3000)
         self._dl_workers.clear()
+        for worker in list(self._test_workers):
+            if hasattr(worker, "isRunning") and worker.isRunning():
+                worker.wait(1000)
+        self._test_workers.clear()
 
-    def closeEvent(self, event):
+    def on_window_hidden(self) -> None:
+        """Stop transient probes/captures and flush edits when the host window hides."""
         self._cancel_mic_probe_if_active()
         self.cancel_hotkey_capture()
         self._flush_llm_fields()
+
+    def closeEvent(self, event):
+        self.on_window_hidden()
         self.cancel_all_downloads()
         super().closeEvent(event)

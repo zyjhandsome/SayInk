@@ -444,21 +444,23 @@ class TestSurfaceThemeReapply:
         assert "ℹ" not in labels
 
     def test_tray_icons_use_semantic_tokens_and_rebuild_on_reapply(self):
-        import inspect
         import sys
 
+        from PyQt6.QtGui import QColor
         from PyQt6.QtWidgets import QApplication
 
+        from sayink.ui import design_tokens as tok
         from sayink.ui.theme import apply_theme
-        from sayink.ui import tray_icon as tray_mod
-        from sayink.ui.tray_icon import TrayIcon
-
-        src = inspect.getsource(tray_mod._microphone_pixmap)
-        assert "#FF6961" not in src
-        assert "#D64545" not in src
-        assert "STATE_RECORD" in src
+        from sayink.ui.tray_icon import TrayIcon, _microphone_pixmap
 
         QApplication.instance() or QApplication(sys.argv)
+        tok.activate("light")
+        rec_img = _microphone_pixmap(None, True, 32).toImage()
+        plate = rec_img.pixelColor(8, 16)
+        target = QColor(tok.STATE_RECORD)
+        assert abs(plate.red() - target.red()) <= 25
+        assert plate.red() > plate.blue() * 3
+
         tray = TrayIcon()
         before = tray._recording_icon
         apply_theme(mode="light", surfaces=(tray,))
@@ -491,16 +493,28 @@ class TestSurfaceThemeReapply:
 
 
 class TestSettingsThemeAwareBroadcast:
-    def test_settings_reapply_theme_has_no_virole_walk(self):
-        import inspect
-
+    def test_settings_reapply_theme_delegates_to_reapply_subtree(self, monkeypatch):
         from sayink.ui.settings_window import SettingsWindow
 
-        src = inspect.getsource(SettingsWindow.reapply_theme)
-        assert "viRole" not in src
-        assert "reapply_subtree" in src
+        called: list[object] = []
+        monkeypatch.setattr(
+            "sayink.ui.settings_components.reapply_subtree",
+            lambda root: called.append(root),
+        )
 
-    def test_settings_callout_follows_dark_broadcast(self, tmp_path: Path, monkeypatch):
+        class _Stub:
+            setStyleSheet = lambda self, _css: None
+            _paint_model_hero_status = lambda self: None
+            _refresh_recognition_feedback = lambda self: None
+            _refresh_output_controls = lambda self: None
+            _refresh_meeting_defaults = lambda self: None
+            _mic_level_bar = type("_Bar", (), {"setStyleSheet": lambda self, _css: None})()
+
+        stub = _Stub()
+        SettingsWindow.reapply_theme(stub)
+        assert called == [stub]
+
+    def test_audio_source_description_follows_theme_without_warning_chrome(self, tmp_path: Path, monkeypatch):
         import sys
 
         from PyQt6.QtWidgets import QApplication
@@ -517,12 +531,15 @@ class TestSettingsThemeAwareBroadcast:
 
         apply_theme(mode="light")
         win = SettingsWindow(Config(config_dir=tmp_path))
-        light_border = tok.tokens_for("light")["CALLOUT_BORDER"].upper()
+        win._src_mixed_rb.setChecked(True)
+        light_text = tok.tokens_for("light")["TEXT_SEC"].upper()
         apply_theme(mode="dark", surfaces=(win,))
         try:
             css = win._mixed_audio_callout.styleSheet().upper()
-            assert tok.tokens_for("dark")["CALLOUT_BORDER"].upper() in css
-            assert light_border not in css
+            assert tok.tokens_for("dark")["TEXT_SEC"].upper() in css
+            assert light_text not in css
+            assert "BACKGROUND: TRANSPARENT" in css
+            assert tok.tokens_for("dark")["AMBER_SOFT"].upper() not in css
         finally:
             win.close()
             apply_theme(mode="light")

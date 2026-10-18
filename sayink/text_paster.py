@@ -3,7 +3,7 @@ import os
 import sys
 import subprocess
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, ClassVar
 
 import pyperclip
 from PyQt6.QtCore import QTimer
@@ -288,7 +288,7 @@ def _verify_paste_target(hwnd_before: int) -> bool:
 
 
 class TextPaster:
-    OWN_TITLES = {"SayInk 设置", "SayInk"}
+    OWN_TITLES: ClassVar[set[str]] = {"SayInk 设置", "SayInk"}
 
     def __init__(self, restore_clipboard: bool = False):
         self.restore_clipboard = restore_clipboard
@@ -297,6 +297,14 @@ class TextPaster:
         # the next paste must not mistake the previous transcript for it.
         self._saved_clipboard: str | None = None
         self._restore_pending = False
+
+    def cancel(self) -> None:
+        """Forget a paste whose shortcut has not been sent yet.
+
+        Keystrokes already delivered cannot be recalled. Closures compare
+        ``seq`` with ``_paste_seq`` and do nothing once this has moved on.
+        """
+        self._paste_seq += 1
 
     def _is_own_window(self, info: tuple) -> bool:
         """Check if the foreground window belongs to this process."""
@@ -397,6 +405,8 @@ class TextPaster:
             callback(PasteResult("clipboard", target_app=target_app, detail=detail))
 
         def _do_paste():
+            if seq != self._paste_seq:
+                return
             # Keystrokes cannot be recalled once sent, so a focus change during
             # the delay must stop the shortcut rather than be reported afterwards.
             if not _verify_paste_target(hwnd):
@@ -412,6 +422,8 @@ class TextPaster:
             QTimer.singleShot(VERIFY_AFTER_PASTE_MS, _verify)
 
         def _verify():
+            if seq != self._paste_seq:
+                return
             if _verify_paste_target(hwnd):
                 # pyperclip only reads text; an empty read may be an image we
                 # cannot put back, so leave the transcript rather than wipe it.

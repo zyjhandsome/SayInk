@@ -52,7 +52,7 @@ def _probe_system_font_families() -> tuple[str, ...]:
         if QApplication.instance() is None:
             return ()
         return tuple(QFontDatabase.families())
-    except Exception as exc:  # noqa: BLE001 — probe must never crash startup
+    except Exception as exc:
         log.warning("读取系统字体列表失败，回落 YaHei: %s", exc)
         return ()
 
@@ -73,7 +73,7 @@ def _family_covers_cjk(family: str) -> bool:
             return True
         metrics = QFontMetrics(QFont(family))
         return all(metrics.inFont(ch) for ch in _CJK_SAMPLE)
-    except Exception as exc:  # noqa: BLE001 — probe must never crash startup
+    except Exception as exc:
         log.warning("检测字体中文覆盖失败 %s: %s", family, exc)
         return True
 
@@ -125,16 +125,17 @@ def refresh_ui_font(
     preferred: Optional[Sequence[str]] = None,
 ) -> str:
     """Resolve and publish FONT / FONT_DISPLAY / FONT_MONO for QSS and QFont."""
-    global UI_FONT_FAMILY, FONT, FONT_DISPLAY, FONT_MONO
     family = resolve_ui_font_family(
         available_families=available_families,
         preferred=preferred,
     )
     mono = resolve_mono_font_family(available_families=available_families)
-    UI_FONT_FAMILY = family
-    FONT = f'"{family}"'
-    FONT_DISPLAY = FONT
-    FONT_MONO = f'"{mono}"'
+    g = globals()
+    g["UI_FONT_FAMILY"] = family
+    g["FONT"] = f'"{family}"'
+    g["FONT_DISPLAY"] = g["FONT"]
+    g["FONT_MONO"] = f'"{mono}"'
+    _notify_derived_styles()
     return family
 
 RADIUS_XS = 4
@@ -322,6 +323,19 @@ def tokens_for(effective: str) -> dict[str, Any]:
     return dict(axis)
 
 
+def _notify_derived_styles() -> None:
+    """Keep cached QSS fragments in sync whenever tokens or UI fonts change."""
+    import sys
+
+    ss = sys.modules.get("sayink.ui.settings_styles")
+    if ss is not None and hasattr(ss, "reload_styles"):
+        ss.reload_styles()
+        return
+    sc = sys.modules.get("sayink.ui.settings_components")
+    if sc is not None and hasattr(sc, "reload_styles"):
+        sc.reload_styles()
+
+
 def activate(effective: str) -> None:
     """Publish the effective theme onto module-level color aliases."""
     vals = tokens_for(effective)
@@ -338,6 +352,7 @@ def activate(effective: str) -> None:
     g["STATE_WARN"] = vals["AMBER"]
     g["STATE_MUTED"] = vals["FLOAT_TEXT_SEC"]
     g["STATE_ERROR"] = vals["STATE_RECORD"]
+    _notify_derived_styles()
 
 
 # Initialize light as the default module namespace (imports before activate).

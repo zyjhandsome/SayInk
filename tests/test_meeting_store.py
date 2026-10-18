@@ -174,6 +174,11 @@ class TestMeetingStore:
         rec = meetings.create_meeting(started_at=int(time.time() * 1000))
         assert rec.display_title.endswith("会议")
 
+    def test_display_title_fallback_on_an_ansi_code_page(self, meetings, ansi_locale):
+        started = int(time.mktime((2026, 3, 5, 9, 7, 0, 0, 0, -1)) * 1000)
+        rec = meetings.create_meeting(started_at=started)
+        assert rec.display_title == "03-05 09:07 会议"
+
     def test_marks_speakers_notes(self, meetings):
         rec = meetings.create_meeting(meeting_id="m1")
         meetings.add_mark("m1", 12_000, "重点")

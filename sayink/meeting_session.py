@@ -17,7 +17,6 @@ import re
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -25,7 +24,13 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from sayink.config import Config
 from sayink.history_store import HistoryStore
-from sayink.meeting_store import STATUS_LIVE, MeetingNotes, MeetingRecord, MeetingStore
+from sayink.meeting_store import (
+    STATUS_INTERRUPTED,
+    STATUS_LIVE,
+    MeetingNotes,
+    MeetingRecord,
+    MeetingStore,
+)
 from sayink.minutes_generator import MinutesGenerator, MinutesRequest, MinutesResult
 from sayink.minutes_prompts import (
     GENERAL_TEMPLATE_ID,
@@ -37,18 +42,12 @@ from sayink.minutes_prompts import (
     transcript_lines,
 )
 from sayink.minutes_render import render_markdown, replace_names_in_markdown
+from sayink.recognition_settings import RecognitionSettings, audio_source, aux_model_path
 from sayink.speaker_embedding import STICKY_GAP_MS, SpeakerEmbedder, make_embedder
 from sayink.speaker_session import SpeakerSession, recluster
 from sayink.speech_recognizer import (
     AUX_MODEL_SILERO_VAD,
     AUX_MODEL_SPEAKER,
-    SUPPORTS_HOTWORDS,
-    SUPPORTS_LANGUAGE,
-    effective_language,
-    format_hotwords,
-    get_model_dir,
-    is_model_downloaded,
-    model_supports,
 )
 from sayink.text_polisher import is_local_endpoint, polish_settings_complete
 from sayink.vad_segmenter import VAD_ENERGY, VAD_SILERO
@@ -79,14 +78,13 @@ class MeetingOptions:
 
     @classmethod
     def from_config(cls, config: Config) -> "MeetingOptions":
-        # Glossary / VAD / language are shared with dictation (stt.*).
-        glossary = config.get("stt.glossary", []) or []
+        shared = RecognitionSettings.from_config(config)
         return cls(
-            input_source=str(config.get("meeting.input_source", "mixed") or "mixed"),
+            input_source=audio_source(config, meeting=True),
             model_id=str(config.get("meeting.model_id", "") or ""),
-            glossary=[g for g in glossary if isinstance(g, dict) and g.get("term")],
-            vad=str(config.get("stt.vad", VAD_SILERO) or VAD_SILERO),
-            language=str(config.get("stt.language", "auto") or "auto"),
+            glossary=shared.glossary,
+            vad=shared.vad,
+            language=shared.language,
         )
 
 
@@ -101,51 +99,52 @@ class MeetingCapabilities:
     language_supported: bool
     vad: str
     speaker_model_available: bool
+    vad_requested: str = VAD_SILERO
+    vad_error: str = ""
+    speaker_enabled: bool = True
+    speaker_load_failed: bool = False
 
     @property
     def notes(self) -> list[str]:
         out: list[str] = []
         if self.hotwords and not self.hotwords_supported:
             out.append("当前识别模型不支持识别期热词，本场术语只用于纪要。")
-        if self.vad == VAD_ENERGY:
-            out.append("Silero VAD 模型未下载，使用能量断句（引擎页可下载）。")
-        if not self.speaker_model_available:
+        if not self.language_supported:
+            out.append("当前模型不支持指定识别语言，将按模型自身能力识别。")
+        if self.vad_requested == VAD_SILERO and self.vad == VAD_ENERGY:
+            if self.vad_error:
+                out.append("Silero VAD 加载失败，已回退能量分段；可在通用 → 识别 → 高级识别设置查看状态。")
+            else:
+                out.append("Silero VAD 模型未下载，使用能量断句（引擎页可下载）。")
+        if not self.speaker_enabled:
+            out.append("CAM++ 说话人增强已关闭，使用频谱粗略区分。")
+        elif self.speaker_load_failed:
+            out.append("CAM++ 加载失败，已回退频谱粗略区分。")
+        elif not self.speaker_model_available:
             out.append("说话人识别模型未下载，说话人区分较粗略（引擎页可下载）。")
         return out
 
 
-def aux_model_path(model_id: str) -> Path | None:
-    """Path to a downloaded aux model's single file, or None."""
-    if not is_model_downloaded(model_id):
-        return None
-    try:
-        model_dir = get_model_dir(model_id)
-    except ValueError:
-        return None
-    from sayink.speech_recognizer import get_model_info
-
-    info = get_model_info(model_id)
-    if not info:
-        return None
-    return model_dir / info["files"][0]
-
-
 def resolve_capabilities(config: Config, options: MeetingOptions, *, dictation_model_id: str) -> MeetingCapabilities:
     model_id = options.model_id or dictation_model_id
-    hotwords = format_hotwords(options.glossary)
-    language = effective_language(options.language)
+    shared = replace(
+        RecognitionSettings.from_config(config), model_id=model_id,
+        glossary=options.glossary, language=options.language, vad=options.vad,
+    )
     vad = options.vad
     if vad == VAD_SILERO and aux_model_path(AUX_MODEL_SILERO_VAD) is None:
         vad = VAD_ENERGY
-    speaker_available = bool(config.get("stt.speaker_model_enabled", True)) and aux_model_path(AUX_MODEL_SPEAKER) is not None
+    speaker_available = shared.speaker_model_enabled and aux_model_path(AUX_MODEL_SPEAKER) is not None
     return MeetingCapabilities(
         model_id=model_id,
-        hotwords=hotwords,
-        hotwords_supported=model_supports(model_id, SUPPORTS_HOTWORDS),
-        language=language,
-        language_supported=model_supports(model_id, SUPPORTS_LANGUAGE),
+        hotwords=shared.hotwords,
+        hotwords_supported=shared.hotwords_supported,
+        language=shared.effective_language,
+        language_supported=shared.language_supported,
         vad=vad,
         speaker_model_available=speaker_available,
+        vad_requested=options.vad,
+        speaker_enabled=shared.speaker_model_enabled,
     )
 
 
@@ -277,9 +276,13 @@ class MeetingController(QObject):
         if self.is_active:
             raise RuntimeError("已有会议在进行中")
         self._options = options
-        self._capabilities = capabilities
         speaker_path = aux_model_path(AUX_MODEL_SPEAKER) if capabilities.speaker_model_available else None
         self._embedder = make_embedder(speaker_path, enabled=capabilities.speaker_model_available)
+        self._capabilities = replace(
+            capabilities,
+            speaker_model_available=self._embedder.name == "campplus",
+            speaker_load_failed=capabilities.speaker_model_available and self._embedder.name != "campplus",
+        )
         self._speakers = SpeakerSession(
             threshold=self._embedder.threshold,
             keep_history=True,
@@ -307,6 +310,12 @@ class MeetingController(QObject):
         return record
 
     def pause(self, detail: str = "") -> None:
+        if self._state is MeetingState.PAUSED:
+            if detail != self._paused_detail:
+                self._paused_detail = detail
+                # Same state, but the page and bar read the new reason.
+                self.state_changed.emit(MeetingState.PAUSED)
+            return
         if self._state is not MeetingState.LIVE:
             return
         self._paused_detail = detail
@@ -389,7 +398,8 @@ class MeetingController(QObject):
             return
         self._clock.stop()
         self._drain_timer.stop()
-        self._store.end_meeting(self._current.id)
+        # The exit dialog tells the user this meeting is「已中断」, not a normal end.
+        self._store.end_meeting(self._current.id, status=STATUS_INTERRUPTED)
         self._store.flush(timeout=3.0)
         self._set_state(MeetingState.IDLE)
         self._current = None
@@ -423,10 +433,17 @@ class MeetingController(QObject):
             self._current = replace(self._current, **{k: v for k, v in fields.items() if v is not None})
         self.meeting_changed.emit(meeting_id)
 
-    def rename_speaker(self, meeting_id: str, speaker_id: int, name: str) -> int:
+    def rename_speaker(self, meeting_id: str, speaker_id: int, name: str) -> int | None:
         """Store the name; re-render JSON-backed notes, or whole-word replace
         user-edited notes. Returns the number of replacements made in
-        edited notes (0 when re-rendered)."""
+        edited notes (0 when re-rendered).
+
+        ``None`` when a minutes job is still writing this meeting: the naming
+        dialog can stay open across that job, and a late rename would lose
+        to the worker's save.
+        """
+        if self._generating_for == meeting_id:
+            return None
         name = (name or "").strip()
         existing = {s.speaker_id: s for s in self._store.get_speakers(meeting_id)}
         old_label = existing[speaker_id].label if speaker_id in existing else speaker_label(speaker_id)
@@ -592,9 +609,21 @@ class MeetingController(QObject):
     def generate(self, meeting_id: str, *, template_id: str | None = None, model_name: str | None = None) -> bool:
         """Start minutes generation; False (with ``generation_failed``) when
         the configuration or the transcript makes it impossible."""
+        if self._generating_for:
+            # One worker, and its result is stored against this id. Starting
+            # another meeting here would cancel the first and can file the
+            # finished text under the wrong meeting.
+            if self._generating_for != meeting_id:
+                self.generation_failed.emit(
+                    meeting_id, "另一场会议正在生成，请等它结束或先取消",
+                )
+            return False
         record = self._store.get_meeting(meeting_id)
         if record is None:
             self.generation_failed.emit(meeting_id, "会议不存在")
+            return False
+        if record.status == STATUS_LIVE:
+            self.generation_failed.emit(meeting_id, "会议仍在进行，请先结束后再生成")
             return False
         api_url, api_key, default_model = minutes_settings(self._config)
         model = (model_name or "").strip() or default_model

@@ -44,7 +44,7 @@ def probe_system_is_light() -> bool:
         if value is None:
             return True
         return bool(int(value))
-    except Exception as exc:  # noqa: BLE001 — probe must never crash startup
+    except Exception as exc:
         log.warning("读取系统外观失败，回落 light: %s", exc)
         return True
 
@@ -132,7 +132,7 @@ def apply_theme(
         from sayink.ui import settings_styles as ss
 
         ss.reload_styles()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.warning("重建设置样式失败: %s", exc)
 
     qt_app = app or QApplication.instance()
@@ -154,6 +154,6 @@ def apply_theme(
         if callable(reapply):
             try:
                 reapply()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 log.warning("表面换肤失败 %s: %s", type(surface).__name__, exc)
     return effective

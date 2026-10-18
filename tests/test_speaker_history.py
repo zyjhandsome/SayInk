@@ -209,7 +209,9 @@ def test_mixed_continuous_history_keeps_the_capture_route():
     ) as h:
         app = h["app"]
         _start_continuous_user_session(app)
-        tone = _tone(180)
+        # Long enough for both CAM++ and the offline mel fallback. Short
+        # clips deliberately keep the previous speaker instead of guessing.
+        tone = _tone(180, 1.2)
         app._begin_transcription(tone, route="mic")
         app._on_final_result("我这边")
         h["paster"].paste_async.call_args[0][1]("pasted")

@@ -23,10 +23,12 @@ if str(ROOT) not in sys.path:
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("download_bundle_model")
 
-from sayink.speech_recognizer import get_model_info, HF_URL
+from sayink.speech_recognizer import HF_URL, file_sha256, get_model_info, model_file_url
 
 
 def _download_one(model_id: str) -> int:
+    import hashlib
+
     import httpx
 
     info = get_model_info(model_id)
@@ -36,7 +38,6 @@ def _download_one(model_id: str) -> int:
 
     model_dir = ROOT / "models" / info["dir_name"]
     model_dir.mkdir(parents=True, exist_ok=True)
-    hf_base = f"{HF_URL}/{info['hf_repo']}/resolve/main/"
     files = info["files"]
     timeout = httpx.Timeout(connect=60.0, read=600.0, write=60.0, pool=60.0)
 
@@ -45,19 +46,28 @@ def _download_one(model_id: str) -> int:
     for i, filename in enumerate(files, start=1):
         target = model_dir / filename
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() and target.stat().st_size > 0:
-            log.info("[%d/%d] skip (exists): %s", i, len(files), filename)
-            continue
+        expected = info["sha256"][filename]
+        if target.exists():
+            if file_sha256(target) == expected:
+                log.info("[%d/%d] skip (verified): %s", i, len(files), filename)
+                continue
+            log.warning("[%d/%d] %s differs from the pinned hash, downloading again", i, len(files), filename)
 
-        url = hf_base + filename.replace("\\", "/")
+        url = model_file_url(HF_URL, info, filename.replace("\\", "/"))
         log.info("[%d/%d] downloading %s ...", i, len(files), filename)
         tmp = target.with_suffix(target.suffix + ".part")
         try:
+            digest = hashlib.sha256()
             with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as resp:
                 resp.raise_for_status()
                 with open(tmp, "wb") as f:
                     for chunk in resp.iter_bytes(256 * 1024):
                         f.write(chunk)
+                        digest.update(chunk)
+            if digest.hexdigest() != expected:
+                log.error("%s does not match the pinned sha256; not keeping it", filename)
+                tmp.unlink(missing_ok=True)
+                return 1
             tmp.replace(target)
         except Exception:
             if tmp.exists():

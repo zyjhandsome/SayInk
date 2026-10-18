@@ -86,6 +86,9 @@ DEFAULT_CONFIG = {
         # True while the mode was picked by the app (input source changed),
         # so returning to the microphone can undo it; a manual choice sticks.
         "mode_auto": False,
+        # None preserves legacy behavior: automatic unless history was chosen
+        # manually. Explicit choices persist True / False independently.
+        "follow_input_source": None,
     },
     "audio": {
         "input_source": "microphone",
@@ -125,7 +128,7 @@ DEFAULT_CONFIG = {
     },
     # 会议记录 / 会议纪要（docs/meeting-notes-design.md §4.8）。
     "meeting": {
-        "input_source": "mixed",
+        "input_source": "",        # 空 = 跟随 audio.input_source；保留已有独立选择
         "model_id": "",            # 空 = 沿用 stt.model_id
         "hotkey": "",              # 空 = 未设置
         "show_start_card": True,
@@ -499,27 +502,29 @@ class Config:
             mode = OUTPUT_MODE_PASTE
         self.set("output.mode", mode)
         self.set("output.mode_auto", bool(auto))
+        self.set("output.follow_input_source", bool(auto))
+
+    def output_follows_input_source(self) -> bool:
+        follow = self.get("output.follow_input_source")
+        if isinstance(follow, bool):
+            return follow
+        return self.output_mode() == OUTPUT_MODE_PASTE or bool(self.get("output.mode_auto", False))
 
     def follow_input_source_for_output(self, source: str) -> str | None:
         """Keep output mode in step with the audio source.
 
-        Picking 「仅电脑播放」 or 「混合」 switches to history-only output so a
-        meeting is not typed into the front window; going back to the
-        microphone undoes that, but only when the app made the choice. A
-        history-only mode the user set by hand is left alone, and the user can
-        flip the switch back at any time. Returns the new mode if changed.
+        In automatic mode, system / mixed capture goes to history and the
+        microphone goes to the cursor. Either explicit destination sticks
+        across later source changes. Legacy manual history is preserved.
+        Returns the new effective mode only when it changed.
         """
-        current = self.output_mode()
-        auto = bool(self.get("output.mode_auto", False))
-        if source in HISTORY_ONLY_INPUT_SOURCES:
-            if current == OUTPUT_MODE_PASTE:
-                self.set_output_mode(OUTPUT_MODE_HISTORY, auto=True)
-                return OUTPUT_MODE_HISTORY
+        if not self.output_follows_input_source():
             return None
-        if current == OUTPUT_MODE_HISTORY and auto:
-            self.set_output_mode(OUTPUT_MODE_PASTE, auto=False)
-            return OUTPUT_MODE_PASTE
-        return None
+        mode = OUTPUT_MODE_HISTORY if source in HISTORY_ONLY_INPUT_SOURCES else OUTPUT_MODE_PASTE
+        changed = mode != self.output_mode()
+        self.set_output_mode(mode, auto=mode == OUTPUT_MODE_HISTORY)
+        self.set("output.follow_input_source", True)
+        return mode if changed else None
 
     @property
     def models_dir(self) -> Path:

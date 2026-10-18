@@ -596,6 +596,27 @@ def test_search_debounces_into_like_search(qapp):
     assert window.session_items()[0].data(Qt.ItemDataRole.UserRole) == "older"
 
 
+def test_open_session_cannot_be_deleted_or_merged(qapp):
+    store = FakeHistoryStore()
+    window = HistoryWindow(store)
+    window.set_open_session("newer")
+
+    window.session_items()[0].setSelected(True)
+    window._delete_selected_sessions()
+    assert window._pending_delete == []
+    assert "正在转写" in window._feedback_label.text()
+
+    for item in window.session_items():
+        item.setSelected(True)
+    window._merge_selected_sessions()
+    assert window._pending_merge == []
+    assert "正在转写" in window._feedback_label.text()
+
+    window.session_items()[1].setSelected(True)
+    window._delete_selected_sessions()
+    assert [session.session_id for session in window._pending_delete] == ["older"]
+
+
 def test_delete_selected_sessions_commits_after_undo_timeout(qapp, monkeypatch):
     store = FakeHistoryStore()
     window = HistoryWindow(store)

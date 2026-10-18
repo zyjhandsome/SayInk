@@ -20,6 +20,37 @@ from sayink.hotkey_manager import HotKeyManager
 from sayink.text_paster import PasteResult
 
 
+def test_recording_bar_receives_the_saved_esc_preference_on_startup():
+    with app_harness({"audio.esc_stops_continuous": False}) as h:
+        h["floating"].set_esc_stops_continuous.assert_called_with(False)
+
+
+class TestReadmeSharedRecognition:
+    def test_meeting_follows_dictation_audio_and_shared_parameters(self):
+        from sayink.meeting_session import MeetingOptions
+
+        with app_harness({"audio.input_source": "system", "stt.language": "en",
+                          "stt.glossary": [{"term": "SayInk"}]}) as h:
+            options = MeetingOptions.from_config(h["config"])
+            assert options.input_source == "system"
+            h["recorder"].start_continuous.side_effect = lambda: setattr(h["recorder"], "is_continuous", True)
+            assert h["app"].start_meeting(options)
+            assert h["recorder"].configure.call_args.kwargs["input_source"] == "system"
+            assert h["recognizer"].configure.call_args.kwargs["hotwords"] == "SayInk"
+            assert h["recognizer"].configure.call_args.kwargs["language"] == "en"
+
+    def test_single_transcription_keeps_output_until_key_release(self):
+        with app_harness({"audio.trigger_mode": "hotkey"}) as h:
+            app = h["app"]
+            h["recorder"].is_recording = True
+            app._on_segment_ready(np.ones(3200, dtype=np.float32))
+            app._on_final_result("内部已断句")
+            h["paster"].paste_async.assert_not_called()
+            h["recorder"].is_recording = False
+            assert app._emit_hold_output_if_ready()
+            assert h["paster"].paste_async.call_args.args[0] == "内部已断句"
+
+
 def test_refinement_completion_notification_matches_saved_template():
     from sayink.meeting_store import MeetingNotes
 
@@ -504,9 +535,9 @@ class TestReadmeReliabilityPromises:
         assert DEFAULT_CONFIG["output"]["mode"] == OUTPUT_MODE_PASTE
         assert "**按住说话**（默认）" in text
         assert "持续转写（默认）" not in text
-        assert "只记录到历史，不粘贴" in text
-        assert "改回「仅麦克风」会自动恢复粘贴" in text
-        assert "手动改过的选择不会再被来源切换覆盖" in text
+        assert "仅保存到历史" in text
+        assert "自动模式下，麦克风默认输入光标" in text
+        assert "两种固定选择都会在切换音源与重启后保留" in text
         assert "未保存 · 历史已关闭" in text
 
     def test_expected_latency_is_documented_and_matches_vad_hold(self):
@@ -603,7 +634,7 @@ class TestReadmeMeetingNotes:
         assert "开始会议" in text and "生成纪要" in text
         assert "不保存音频" in text
         assert "（待核对）" in text
-        assert "历史 / 会议 / 通用 / 引擎 / 润色 / 关于" in text
+        assert "历史 / 会议 / 通用 / 引擎 / AI 服务 / 关于" in text
         assert "Ctrl+1…6" in text
         # Speaker continuity + guided aux-model download are user-visible promises.
         assert "下载辅助模型" in text and "下载后开始" in text
@@ -616,8 +647,9 @@ class TestReadmeMeetingNotes:
         text = self._readme()
         assert "与会议记录共用同一套方法" in text
         assert "重新聚类一次并改写编号" in text
-        assert "会议与识别" in text and "听写与会议共用" in text
-        assert "不会因为参数不同而重新载入模型" in text
+        assert "高级识别设置" in text and "单次转录、连续转录与会议共用" in text
+        assert "跟随听写设置" in text and "仅用于本场" in text
+        assert "加载失败并回退" in text and "已保存，待生效" in text
         assert "chat_completion()" in text
         # Settings copy uses the shared names; the old 会议-prefixed ones are gone.
         for stale in ("设置 → 通用 → 会议 ", "会议断句方式", "会议术语表"):

@@ -13,31 +13,42 @@ from __future__ import annotations
 
 import logging
 
-from PyQt6.QtCore import QEventLoop, QTimer
+from PyQt6.QtCore import QEventLoop
 from PyQt6.QtWidgets import QApplication
 
 log = logging.getLogger("SayInk")
 
 _ATTEMPTS = 6
 _SETTLE_MS = 30
+_busy = False
 
 
 def _pump(ms: int) -> None:
-    """Run the event loop for ``ms`` so cross-process clipboard reads are served."""
-    loop = QEventLoop()
-    QTimer.singleShot(ms, loop.quit)
-    loop.exec()
+    """Serve cross-process OLE clipboard reads for ``ms`` without dispatching
+    mouse/keyboard events that could re-enter UI slots."""
+    QApplication.processEvents(
+        QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+        | QEventLoop.ProcessEventsFlag.WaitForMoreEvents,
+        ms,
+    )
 
 
 def copy_text(text: str) -> bool:
     """Put ``text`` on the clipboard; return True once it is really there."""
-    clipboard = QApplication.clipboard()
-    for attempt in range(_ATTEMPTS):
-        clipboard.setText(text)
-        _pump(_SETTLE_MS)
-        if clipboard.text() == text:
-            if attempt:
-                log.debug("剪贴板写入在第 %d 次重试后成功", attempt)
-            return True
-    log.warning("剪贴板写入失败（可能被剪贴板管理器占用）")
-    return False
+    global _busy
+    if _busy:
+        return False
+    _busy = True
+    try:
+        clipboard = QApplication.clipboard()
+        for attempt in range(_ATTEMPTS):
+            clipboard.setText(text)
+            _pump(_SETTLE_MS)
+            if clipboard.text() == text:
+                if attempt:
+                    log.debug("剪贴板写入在第 %d 次重试后成功", attempt)
+                return True
+        log.warning("剪贴板写入失败（可能被剪贴板管理器占用）")
+        return False
+    finally:
+        _busy = False

@@ -3,8 +3,10 @@ balancing and the captured_at timestamp handed out with each segment."""
 
 from __future__ import annotations
 
+import os
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -83,9 +85,10 @@ class TestGateInterface:
 
 
 class _FakeVadModel:
-    created = []
+    created: tuple = ()
 
     def __init__(self):
+        type(self).created = (*type(self).created, self)
         self.window_size = 512
         self.calls = 0
         self.resets = 0
@@ -135,6 +138,11 @@ def fake_sherpa(monkeypatch):
 
 
 class TestSileroGate:
+    def test_null_native_model_is_reported_as_failed_load(self, fake_sherpa, monkeypatch):
+        monkeypatch.setattr(fake_sherpa.VadModel, "create", lambda _config: None)
+        with pytest.raises(RuntimeError, match="未能载入"):
+            SileroGate("models/silero_vad.onnx")
+
     def test_scores_in_512_windows_and_carries_remainder(self, fake_sherpa):
         gate = SileroGate("models/silero_vad.onnx")
         model = fake_sherpa.VadModel.last
@@ -171,12 +179,17 @@ class TestSileroGate:
         assert gate._window == 512
         assert gate.is_speech(np.zeros(1024, dtype=np.float32), 0.01, in_speech=False) is False
 
-    def test_real_silero_model_loads_when_installed(self):
+    def test_real_silero_model_loads_when_installed(self, monkeypatch):
         from sayink.meeting_session import AUX_MODEL_SILERO_VAD, aux_model_path
 
+        # The suite runs on a fake home, so the app's own models folder is
+        # only used when pointed at explicitly.
+        real_models = os.environ.get("SAYINK_REAL_MODELS_DIR")
+        if real_models:
+            monkeypatch.setattr("sayink.speech_recognizer._custom_models_dir", Path(real_models))
         path = aux_model_path(AUX_MODEL_SILERO_VAD)
         if path is None:
-            pytest.skip("Silero VAD model not downloaded on this machine")
+            pytest.skip("Silero VAD model not found; set SAYINK_REAL_MODELS_DIR to the app's models folder")
         pytest.importorskip("sherpa_onnx")
         gate = SileroGate(path)
         assert gate._window > 0
@@ -247,6 +260,36 @@ class TestRecorderProfile:
         rec.set_segmenter_profile(vad=VAD_ENERGY, meeting=True)
         rec.configure("mixed", -1, -1)
         assert rec._segmenter._silence_hold_samples == int(RATE * 1.5)
+
+    def test_rebuilding_the_segmenter_reuses_a_loaded_silero_gate(self, monkeypatch):
+        """A mode or source change must not load Silero again on the UI thread."""
+        from sayink.audio_recorder import AudioRecorder
+
+        created: list[str] = []
+
+        class Gate:
+            name = "silero"
+            fallback_reason = ""
+
+            def __init__(self, path: str):
+                self.model_path = path
+
+            def reset(self) -> None:
+                return None
+
+        def make(_kind, _segmenter, *, model_path=None):
+            created.append(str(model_path))
+            return Gate(str(model_path))
+
+        monkeypatch.setattr("sayink.audio_recorder.make_speech_gate", make)
+        rec = AudioRecorder()
+        rec.set_segmenter_profile(vad="silero", vad_model_path="models/silero.onnx")
+        rec.configure("system")
+        rec.set_segmenter_profile(vad="silero", vad_model_path="models/silero.onnx")
+        assert created == ["models/silero.onnx"]
+        assert rec.vad_name == "silero"
+        rec.set_segmenter_profile(vad="silero", vad_model_path="models/other.onnx")
+        assert created == ["models/silero.onnx", "models/other.onnx"]
 
     def test_segment_captured_at_is_stamped(self, monkeypatch):
         from sayink import audio_recorder as ar

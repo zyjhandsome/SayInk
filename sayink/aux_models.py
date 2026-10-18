@@ -67,6 +67,7 @@ class AuxModelDownloads(QObject):
         self._queue: list[dict] = []
         self._done: list[dict] = []
         self._worker: object | None = None
+        self._workers: list[object] = []
         self._current: dict | None = None
         self._total_mb = 0
         self._cancelled = False
@@ -106,11 +107,24 @@ class AuxModelDownloads(QObject):
         self._current = self._queue.pop(0)
         worker = self._factory(str(self._current["id"]), self._source)
         self._worker = worker
+        self._workers.append(worker)
         worker.progress.connect(self._on_worker_progress)
         worker.finished_ok.connect(self._on_worker_done)
         worker.error.connect(self._on_worker_error)
+        if hasattr(worker, "finished"):
+            worker.finished.connect(lambda w=worker: self._reap_worker(w))
         log.info("下载会议辅助模型 %s", self._current["id"])
         worker.start()
+
+    def _reap_worker(self, worker: object) -> None:
+        try:
+            self._workers.remove(worker)
+        except ValueError:
+            pass
+
+    def _release_if_not_qthread(self, worker: object | None) -> None:
+        if worker is not None and not hasattr(worker, "finished"):
+            self._reap_worker(worker)
 
     def _on_worker_progress(self, pct: int) -> None:
         current_mb = int((self._current or {}).get("size_mb") or 0)
@@ -121,11 +135,15 @@ class AuxModelDownloads(QObject):
     def _on_worker_done(self, model_id: str) -> None:
         if self._current is not None:
             self._done.append(self._current)
+        prev = self._worker
         self._worker = None
+        self._release_if_not_qthread(prev)
         self._next()
 
     def _on_worker_error(self, message: str) -> None:
+        prev = self._worker
         self._worker = None
+        self._release_if_not_qthread(prev)
         self._queue.clear()
         name = str((self._current or {}).get("name") or "")
         self._current = None

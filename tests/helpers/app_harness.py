@@ -33,8 +33,11 @@ def _config_set(store: dict, key: str, value):
 
 
 @contextmanager
-def app_harness(config_overrides: dict | None = None):
-    """Build a real App with mocked heavy dependencies and configurable store."""
+def app_harness(config_overrides: dict | None = None, *, real_history: bool = False):
+    """Build a real App with mocked heavy dependencies and configurable store.
+
+    ``real_history`` keeps the SQLite history store, in ``config_dir``.
+    """
     store = deepcopy(DEFAULT_CONFIG)
     if config_overrides:
         for key, value in config_overrides.items():
@@ -68,13 +71,19 @@ def app_harness(config_overrides: dict | None = None):
             patch("sayink.app.SoundManager"),
             patch("sayink.app.FloatingWindow"),
             patch("sayink.app.TrayIcon"),
-            patch("sayink.app.HistoryStore", create=True),
+            # Auxiliary availability must not depend on the developer's real
+            # downloads or load native neural models in a mocked App test.
+            patch("sayink.app.aux_model_path", return_value=None),
+            patch("sayink.meeting_session.aux_model_path", return_value=None),
             # App.__init__ probes the models directory on disk; without this the
             # suite's outcome depends on whether the machine has the model
             # downloaded (startup show_error fires on a clean checkout).
             patch("sayink.speech_recognizer.is_model_downloaded", return_value=True),
         ]
-        started = [p.start() for p in patches]
+        if not real_history:
+            patches.append(patch("sayink.app.HistoryStore", create=True))
+        for p in patches:
+            p.start()
 
         from sayink.app import App
 
@@ -97,7 +106,7 @@ def app_harness(config_overrides: dict | None = None):
             "sound": app._sound,
             "floating": app._floating,
             "tray": app._tray,
-            "history": getattr(app, "_history", started[-1].return_value),
+            "history": app._history,
         }
 
         # Sensible defaults for README flows
@@ -113,5 +122,7 @@ def app_harness(config_overrides: dict | None = None):
         try:
             yield harness
         finally:
+            if real_history:
+                app._history.close(timeout=2.0)
             for p in reversed(patches):
                 p.stop()

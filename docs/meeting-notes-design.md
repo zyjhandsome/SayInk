@@ -2,9 +2,9 @@
 
 | 项 | 内容 |
 |---|---|
-| 状态 | 设计稿，待评审；**未实现**，README 暂不改动（实现合并时按「变更审查清单」同步） |
-| 日期 | 2026-10-17 |
-| 基线版本 | SayInk 2.2.4（`sayink/version.py`） |
+| 状态 | 会议工作台已在 **2.2.5** 落地（列表、文字稿、纪要、六套模板、说话人改名与单段纠正）。**仍未完成：** 真实会议的 CER / RTF 基线、说话人拆人 / 并人标定。排期以 §5.8.0 为准；§1.2 与下文里「未实现 / 参数全部留空」是 2026-10-17 的设计快照 |
+| 日期 | 2026-10-17 设计；2026-10-18 按代码修订状态 |
+| 基线版本 | 设计时 2.2.4；当前 `sayink/version.py` 为 **2.2.5** |
 | 范围 | 在 SayInk 内新增「会议」能力：实时听会 → 带说话人的文字稿 → 会后一键生成结构化纪要 → 编辑 / 重生成 / 导出 Markdown |
 | 不在范围 | 导入本地录音文件；保存会议音频；实时逐分钟纪要；飞书 / 钉钉 / Notion 推送；对会议内容追问（Chat） |
 
@@ -45,6 +45,8 @@
 | 主窗口侧栏五页 + 听写条 + 托盘 | `ui/main_window.py`、`floating_window.py`、`tray_icon.py` | 新增一页「会议」和会议态听写条即可 |
 
 ### 1.2 缺口
+
+**本节是 2026-10-17 设计时的缺口，不是当前代码状态。** 会议对象、纪要、说话人改名、Silero、热词与语种（部分模型）、混音配平、词表入口都已在 2.2.5 落地。仍空的是真实语料上的 CER / RTF，以及说话人拆人 / 并人标定，见 §5.8.0。
 
 按「对纪要质量的影响 × 实现成本」排序；编号在后文引用。
 
@@ -510,23 +512,42 @@ stateDiagram-v2
 
 ### 5.8 文字稿质量改进计划（ASR 侧）
 
-本节是缺口 1 的实施方案。原则：**先建基线，再改参数，最后换模型**；所有改动先只在会议模式生效，口述模式按基线数据另行决定。
+本节是缺口 1 的实施方案。原则：**先建基线，再改参数，最后换模型**。识别语言、词表、断句和说话人增强后来改成听写与会议共用（见 `docs/shared-recognition.md`），不再是「先只改会议模式」。
+
+#### 5.8.0 当前对照（2026-10-18）
+
+| 项 | 状态 |
+|---|---|
+| 会议页、纪要、六套内置模板（含原文精整）、时间戳跳转、说话人改名 / 单段纠正 | 已落地 |
+| Fun-ASR-Nano / Qwen3 的 `hotwords`；Fun-ASR-Nano / SenseVoice 的 `language`；SenseVoice 的 `use_itn=True` | 已接入 `_create_recognizer` |
+| 词表入口 | 设置 → 通用 → 识别；纪要提示词也会带上术语 |
+| Silero VAD | 三种模式的默认断句；模型缺失时退回能量门限 |
+| 混合采集按轨响度配平 | 已接入 |
+| `meeting.model_id`、片段 `captured_at` | 已接入 |
+| `tools/asr_bench.py` | 能跑。默认 `--vad silero`，用会议停顿（1.5 s / 最长 15 s）切段后再解码；`--vad energy` 对比能量门限；`--vad off` 是整段一次解码，**不能**写入基线表。Silero 文件缺失时退回能量门限并在输出里写明 |
+| CER / RTF / 热词命中 | **结果表仍空。** 只填脱敏真人会议；合成语音不入表。填表前不换默认模型 |
+| 说话人拆人率 / 并人率 | **未标定。** 测量方法见 `docs/meeting-speaker-eval.md`，表是空的 |
+| Paraformer / FireRed / Zipformer 的 `hr_*` 与 `rule_fsts` | 未接。等基线证明这些模型要当默认或弱机推荐再接 |
+| `provider`（GPU / DirectML） | 未接，各加载器走库默认 CPU |
+| `meeting.separate_lanes` | 只有默认值 `false`，没有读取方 |
+| 自定义纪要模板 | `meeting.custom_templates` 可读，设置页没有编辑器 |
+| Qwen3-ASR 1.7B | 仍来自 `ilmina/…`，SHA-256 已钉死；不是默认模型 |
 
 #### 5.8.1 代码事实
 
 | 事实 | 位置 | 影响 |
 |---|---|---|
-| sherpa-onnx 1.13.8 的 `from_funasr_nano` 签名含 `language`、`itn`、`hotwords`、`max_new_tokens=512`；`from_qwen3_asr` 含 `hotwords`、`max_new_tokens=128`；`from_paraformer / from_sense_voice / from_fire_red_asr` 含 `rule_fsts`（ITN）与 `hr_dict_dir / hr_rule_fsts / hr_lexicon`（同音替换）| `speech_recognizer.py` `_create_recognizer` 只传 model / tokens / num_threads（SenseVoice 另传 `use_itn=True`） | 热词、语种锁定、ITN、同音纠错全部未启用 |
+| sherpa-onnx 1.13.8 的 `from_funasr_nano` 签名含 `language`、`itn`、`hotwords`；`from_qwen3_asr` 含 `hotwords`；`from_paraformer / from_sense_voice / from_fire_red_asr` 含 `rule_fsts` 与 `hr_*` | Fun-ASR-Nano 已传 `language` + `hotwords`，Qwen3 已传 `hotwords`，SenseVoice 已传 `language` 且 `use_itn=True`。Paraformer / FireRed / Zipformer **仍不传** `hr_*` / `rule_fsts`。加载器都不传 `provider` | 非大模型路线的同音替换和 ITN 仍未启用；GPU 未接 |
 | 语种漂移靠事后正则：Qwen3 的 `language Chinese<asr_text>` 前缀、中文里混入的日 / 韩短句被过滤 | `speech_recognizer.py` 第 44–64、205 行附近 | 治标；`language="zh"` 可从解码端消除 |
-| VAD 为 RMS 门限 0.002，自适应底噪抬高（上限 0.01），瞬响 < 0.2 s 忽略，pre-roll 0.3 s | `vad_segmenter.py` | 噪声 / 回声误判、弱远端吞起音 |
-| 混合采集：两轨各 ×1/N 平均后混；「仅电脑播放」单独 ×2.5 | `audio_utils.mix_to_mono`、`audio_recorder.py` 第 171 行 | 混合模式远端更弱 |
+| 断句默认 Silero；能量门限仍是回退。会议停顿 1.5 s，最长 15 s | `stt.vad`、`vad_segmenter.py`、`audio_recorder.set_segmenter_profile` | 收益尚未用真人会议对照能量门限 |
+| 混合采集按轨响度配平后再混 | `audio_utils.LaneBalancer` | 旧「两轨各减半」的描述已过时 |
 | Qwen3-ASR 1.7B 的权重来自第三方账号 `ilmina/…`，其余均为 k2-fsa 官方 | `MODEL_REGISTRY` | 可复现性与更新风险 |
 | 注册表导出件日期：SenseVoice 2024-07-17、Paraformer 2024-03-09、Zipformer CTC 2025-07-03、Fun-ASR-Nano 2025-12-30、FireRedASR2 2026-02-25/26、Qwen3-ASR 2026-03-25 | `MODEL_REGISTRY` | 需要「上游版本核对」流程 |
 
 #### 5.8.2 评测基线 `tools/asr_bench.py`
 
-- 输入：目录（`*.wav` 16 kHz 单声道 + 同名 `.txt` 参考文本 + 可选 `glossary.txt`）；参数：`--model`、`--vad silero|energy`、`--glossary`、`--threads`。
-- 输出：CER（按字，中文标点与空格归一后计算）、词表命中率、每段耗时、整体 RTF、峰值内存；JSON + Markdown 表。
+- 输入：目录（`*.wav` 单声道 16-bit PCM，脚本重采样到 16 kHz + 同名 `.txt` 参考文本 + 可选 `glossary.txt`）；参数：`--models`、`--vad silero|energy|off`、`--hotwords`、`--language`、`--threads`。默认 `silero`，按会议停顿切段后逐段解码。`off` 整段一次解码，不写入基线表。
+- 输出：CER（按字，中文标点与空格归一后计算）、词表命中率、术语写法正确率、整体 RTF（只计解码，不计切段）、载入秒数；JSON + Markdown 表。峰值内存未测。
 - 数据：
   - **私有集**：3–5 段自己的真实线上会议（脱敏，混合采集与仅电脑播放各有），人工校对参考文本，总计 ≥ 60 分钟。与 §5.5 说话人标定共用同一批录音。
   - **公开集**：AliMeeting（ICASSP 2022 M2MeT，中文多人会议，远场 + 近场）抽 30 分钟 Eval 子集，作为可对外引用的数字。
@@ -565,7 +586,7 @@ stateDiagram-v2
 | 阶段 | 内容 | 退出标准 | 预估 |
 |---|---|---|---|
 | **M1 MVP** | **文字稿质量**：评测基线首版、词表三处注入、会议语种锁定、Silero VAD、混合采集按轨归一、`meeting.model_id`、`captured_at`（§5.8.3 #1–#7、#11）；**会议**：会议对象与三态页面、开始卡片、实时文字稿、标记 / 笔记、结束 flush、通用模板单次 / 分块生成、Markdown 编辑 / 预览、复制 / 导出、说话人改名、嵌入模型在线聚类 + 降级、互斥与恢复、设置项、README 与测试 | §1.3 成功标准 1、2、4、5、6、7；`docs/asr-benchmark.md` 首版；真实会议冒烟通过 | 约 4–5 周（1 人） |
-| **M2** | 5 套内置模板 + 自定义模板；时间戳跳转；笔记引导生成；姓名建议；会后重聚类与阈值标定报告；崩溃恢复细化；ITN 规则、标点后挂、两轨分别识别评估（§5.8.3 #8–#10）；按基线决定会议默认模型（§5.8.4） | 成功标准 3；`docs/meeting-speaker-eval.md` 发布；模型选型结论写入基线文档 | 约 2.5 周 |
+| **M2** | 5 套内置模板 + 自定义模板；时间戳跳转；笔记引导生成；姓名建议；会后重聚类与阈值标定报告；崩溃恢复细化；ITN 规则、标点后挂、两轨分别识别评估（§5.8.3 #8–#10）；按基线决定会议默认模型（§5.8.4） | 成功标准 3；`docs/meeting-speaker-eval.md` 里有至少 3 段真人结果（方法文档本身不算完成）；模型选型结论写入基线文档 | 约 2.5 周 |
 | **M3（候选）** | pyannote 段内换人；无声自动提示；.docx；指定文件夹自动写入；旧持续转写会话转会议；低置信片段标灰（§5.8.3 #12）；候选新模型（#13） | 视用户反馈 | 按需 |
 
 M1 内部顺序建议：评测基线（先有尺子）→ 数据层（`meeting_store`、`history_store` 调整、`captured_at`）→ 识别链路（词表注入、语种锁定、Silero VAD、混音归一，用基线验证）→ `MeetingSession` 与 `App` 接缝（可先无 UI，用测试驱动）→ 纪要生成与渲染（纯函数先行）→ 会议页 → 听写条 / 托盘 / 设置 → 说话人嵌入模型 → 文档与冒烟。
@@ -584,7 +605,7 @@ M1 内部顺序建议：评测基线（先有尺子）→ 数据层（`meeting_s
 | 六项导航在 880 px 最小宽度与小屏缩放下的侧栏高度 | 布局回归 | 复用现有 `_fit_to_available_screen`；截图回归加会议页 |
 | 隐私叙事：README 承诺「不保存声纹」 | 嵌入向量是否算声纹 | 只在内存、会后清零、不跨场，README 明确写出；不提供导出向量 |
 | 同音替换器 `hr_*` 依赖 sherpa-onnx 的词典 / FST 发布件，格式与可用性需验证 | 非 LLM 模型的词表注入落空 | M1 首周做可行性 spike；不可用则这些模型只走提示词注入，并在引擎页标明「不支持识别期热词」 |
-| Silero VAD 与现有切分逻辑耦合（自适应底噪、HOLD gate）拆分不干净 | 口述模式回归 | `SpeechGate` 接口隔离，口述默认仍 `EnergyGate`；`test_readme_features.py` 持续模式用例全跑 |
+| Silero VAD 与现有切分逻辑耦合（自适应底噪、HOLD gate）拆分不干净 | 口述模式回归 | `SpeechGate` 已隔离。三种模式默认 Silero，模型缺失时退回能量门限 |
 | 开会前按 `meeting.model_id` 重载模型要数十秒 | 「开始会议」不即时 | 开始卡片显示「载入模型约 N 秒（上次用时）」；模型相同则不重载 |
 | 私有评测集标注成本与脱敏 | 基线延期 | 首版只做 60 分钟；公开集 AliMeeting 保证可对外引用 |
 

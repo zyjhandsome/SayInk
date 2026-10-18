@@ -122,6 +122,24 @@ class TestLikeSearch:
         assert store.search_sessions("审核")[0].preview == "确认审核时间"
         assert store.list_sessions()[0].preview == "开场白"
 
+    def test_delete_sessions_keeps_meeting_transcripts(self, store):
+        from sayink.meeting_store import MeetingStore
+
+        meetings = MeetingStore(store)
+        record = meetings.create_meeting(title="周会")
+        store.enqueue(_record(
+            record.id, 0, raw_text="只有会议里有的句子", trigger_mode="meeting", created_at=1000,
+        ))
+        store.enqueue(_record("dictation", 0, raw_text="听写句子", created_at=2000))
+        store.flush(timeout=2.0)
+
+        store.enqueue_delete_sessions([record.id, "dictation"])
+        store.flush(timeout=2.0)
+
+        assert [s.raw_text for s in store.get_session_segments(record.id)] == ["只有会议里有的句子"]
+        assert store.get_session_segments("dictation") == []
+        assert meetings.get_meeting(record.id) is not None
+
     def test_count_includes_unloaded_sessions_and_excludes_meetings(self, store):
         for index in range(60):
             store.enqueue(_record(f"s{index}", 0, raw_text="听写", created_at=index + 1))
@@ -275,7 +293,7 @@ class TestConcurrency:
                     store.enqueue(
                         _record("live", i % 5, raw_text=f"x{i}", created_at=10_000 + i)
                     )
-            except BaseException as exc:  # noqa: BLE001 — collect any failure
+            except BaseException as exc:
                 errors.append(exc)
 
         def deleter():
@@ -285,7 +303,7 @@ class TestConcurrency:
                     store.enqueue(
                         _record(f"dead-{i}", 0, raw_text="tmp", created_at=i)
                     )
-            except BaseException as exc:  # noqa: BLE001
+            except BaseException as exc:
                 errors.append(exc)
 
         threads = [threading.Thread(target=writer), threading.Thread(target=deleter)]

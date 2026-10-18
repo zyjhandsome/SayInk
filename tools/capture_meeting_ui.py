@@ -9,6 +9,7 @@ import argparse
 import os
 import sys
 import tempfile
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -17,13 +18,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from PyQt6.QtCore import QCoreApplication, QEvent
+from PyQt6.QtCore import QCoreApplication, QEvent, QRect
 from PyQt6.QtGui import QFontDatabase
 from PyQt6.QtWidgets import QApplication
 
 from sayink.config import Config
 from sayink.history_store import HistoryStore, SegmentRecord
-from sayink.meeting_session import MeetingController
+from sayink.meeting_session import MeetingController, MeetingOptions, resolve_capabilities
 from sayink.ui.main_window import MainWindow
 from sayink.ui.meeting_page import _SegmentSpeakerDialog
 from sayink.ui.theme import apply_theme
@@ -71,9 +72,14 @@ def main():
             QFontDatabase.addApplicationFont(str(path))
     with tempfile.TemporaryDirectory(prefix="sample-", dir=args.output) as temp, \
          patch("sayink.config.default_secret_store", return_value=None), \
+         patch("sayink.config.Config._sync_registry_auto_start", return_value=None), \
          patch("winreg.QueryValueEx", side_effect=FileNotFoundError), \
          patch("sayink.ui.settings_window.list_microphone_devices", return_value=[]), \
          patch("sayink.ui.settings_window.list_system_capture_devices_for_settings", return_value=[]), \
+         patch("sayink.ui.meeting_page.missing_aux_models", return_value=[
+             {"id": "speaker-campplus", "name": "说话人增强", "size_mb": 28},
+             {"id": "silero-vad", "name": "语音检测", "size_mb": 2},
+         ]), \
          patch("sayink.speech_recognizer.is_model_downloaded", return_value=False):
         config = Config(config_dir=Path(temp) / "config")
         config.set("llm.api_url", "http://localhost:11434/v1")
@@ -115,6 +121,39 @@ def main():
             win.grab().save(str(args.output / name))
 
         for theme in ("dark", "light"):
+            apply_theme(app, mode=theme, surfaces=[win, win._settings, win._history, page])
+            page.show_start_card()
+            capture(f"start-{theme}.png")
+            options = MeetingOptions(title="会议录制（示例）", input_source="mixed")
+            caps = resolve_capabilities(config, options, dictation_model_id="funasr-nano")
+            live = controller.begin(options, replace(caps, speaker_model_available=False))
+            history.enqueue(SegmentRecord(live.id, 0, live.started_at,
+                raw_text="这里是本场会议的实时文字稿，可核对、复制，或暂停采集。", trigger_mode="meeting", speaker_id=1))
+            history.flush()
+            page._render_live()
+            capture(f"live-{theme}.png")
+            page.focus_search()
+            page._live_find_edit.setText("核对")
+            capture(f"live-find-{theme}.png")
+            page._close_live_find()
+            controller.pause("你已暂停采集；暂停期间不采集新音频，已录内容继续识别。")
+            capture(f"paused-{theme}.png")
+            class CompactScreen:
+                def availableGeometry(self):
+                    return QRect(0, 0, 910, 472)
+
+            with patch.object(MainWindow, "screen", return_value=CompactScreen()):
+                win._fit_to_available_screen()
+                capture(f"small-paused-{theme}.png")
+                assert win.height() <= 472
+            controller.finalize()
+            win._fit_to_available_screen()
+            win.resize(1040, 720)
+            page._search_edit.setText("没有匹配的示例会议")
+            page._perform_search()
+            capture(f"no-results-{theme}.png")
+            page._search_edit.clear()
+            page._perform_search()
             controller.store.save_notes(current.id, template_id="general", model="m", json_payload="", markdown=NOTES)
             controller.store.flush()
             page.show_meeting(current.id)

@@ -260,11 +260,16 @@ def test_microphone_icon_includes_windows_small_sizes():
 
 
 def test_idle_mic_uses_text_token():
-    import inspect
+    from PyQt6.QtGui import QColor
 
     from sayink.ui import design_tokens as tok
     from sayink.ui.tray_icon import _microphone_pixmap
 
-    source = inspect.getsource(_microphone_pixmap)
-    assert "TEXT" in source
-    assert tok.ACCENT not in source.split("recording")[0]
+    tok.activate("light")
+    # Sample the plate near the top-left inner corner (outside the center mic glyph).
+    img = _microphone_pixmap(None, False, 32).toImage()
+    expected = QColor(tok.TEXT)
+    pixel = img.pixelColor(6, 6)
+    assert abs(pixel.red() - expected.red()) <= 2
+    assert abs(pixel.green() - expected.green()) <= 2
+    assert abs(pixel.blue() - expected.blue()) <= 2

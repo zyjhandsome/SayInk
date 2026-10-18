@@ -43,6 +43,52 @@ class TestAppStyles:
         assert isinstance(GLOBAL_APP_STYLESHEET, str)
         assert len(GLOBAL_APP_STYLESHEET.strip()) > 0
 
+    def test_combo_wheel_scrolls_the_page_instead_of_changing_the_value(self):
+        import sys
+
+        from PyQt6.QtCore import QPoint, QPointF, Qt
+        from PyQt6.QtGui import QWheelEvent
+        from PyQt6.QtWidgets import QApplication, QComboBox, QLabel, QScrollArea, QVBoxLayout, QWidget
+
+        from sayink.ui.app_styles import DropDownComboStyle
+
+        app = QApplication.instance() or QApplication(sys.argv)
+        style = DropDownComboStyle("Fusion")
+        area = QScrollArea()
+        host = QWidget()
+        lay = QVBoxLayout(host)
+        combo = QComboBox()
+        combo.setStyle(style)
+        combo.addItems(["自动（中文优先）", "中文", "English"])
+        combo.setCurrentIndex(0)
+        lay.addWidget(combo)
+        lay.addWidget(QLabel("占位\n" * 40))
+        area.setWidget(host)
+        area.setWidgetResizable(True)
+        area.resize(280, 160)
+        area.show()
+        app.processEvents()
+        try:
+            local = QPointF(combo.rect().center())
+            global_pos = QPointF(combo.mapToGlobal(combo.rect().center()))
+            event = QWheelEvent(
+                local,
+                global_pos,
+                QPoint(0, 0),
+                QPoint(0, -120),
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+                Qt.ScrollPhase.NoScrollPhase,
+                False,
+            )
+            before = area.verticalScrollBar().value()
+            QApplication.sendEvent(combo, event)
+            app.processEvents()
+            assert combo.currentIndex() == 0
+            assert area.verticalScrollBar().value() > before
+        finally:
+            area.close()
+
     def test_dropdown_popup_opens_below_and_fits_longest_item(self):
         import sys
 
@@ -119,6 +165,17 @@ class TestAppStyles:
 
 
 class TestColorContrastContracts:
+    def test_general_behavior_text_and_selected_cards_have_sufficient_contrast(self):
+        from sayink.ui.design_tokens import tokens_for
+
+        for theme, alpha in (("light", 0.08), ("dark", 0.16)):
+            t = tokens_for(theme)
+            selected = _blend(t["ACCENT"], t["SURFACE"], alpha)
+            for foreground in (t["TEXT"], t["TEXT_SEC"]):
+                for background in (t["SURFACE"], t["SURFACE_PEARL"], selected):
+                    assert _contrast(foreground, background) >= 4.5, (theme, foreground, background)
+            assert _contrast(t["ACCENT"], t["SURFACE"]) >= 3
+
     def test_small_text_and_semantic_text_meet_aa_on_light_surfaces(self):
         from sayink.ui.design_tokens import tokens_for
 

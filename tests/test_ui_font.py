@@ -138,9 +138,21 @@ class TestApplyThemeRefreshesFont:
 
 
 class TestFloatingWindowUsesResolvedFont:
-    def test_setup_ui_does_not_hardcode_segoe_variable_literal(self):
-        source = Path("sayink/ui/floating_window.py").read_text(encoding="utf-8")
-        assert 'QFont("Segoe UI Variable"' not in source
+    def test_setup_ui_uses_resolved_ui_font_family(self, monkeypatch):
+        import sys
+
+        from PyQt6.QtWidgets import QApplication
+
+        from sayink.ui import design_tokens as dt
+        from sayink.ui.floating_window import FloatingWindow
+
+        QApplication.instance() or QApplication(sys.argv)
+        monkeypatch.setattr(dt, "UI_FONT_FAMILY", "Mock UI Font")
+        win = FloatingWindow()
+        try:
+            assert win._status_label.font().family() == "Mock UI Font"
+        finally:
+            win.close()
 
 
 class TestTypographyScaleTokens:
@@ -186,9 +198,23 @@ class TestThemeSurfacePolish:
             assert t["CHIP_BG_PRESS"] != t["CHIP_BG"]
 
     def test_float_reapply_uses_primary_tokens_not_string_replace(self):
-        source = Path("sayink/ui/floating_window.py").read_text(encoding="utf-8")
-        assert "CHIP_BG.replace" not in source
-        assert "PRIMARY_CONTAINER_HOVER" in source
+        import sys
+
+        from PyQt6.QtWidgets import QApplication
+
+        from sayink.ui import design_tokens as dt
+        from sayink.ui.floating_window import FloatingWindow
+
+        QApplication.instance() or QApplication(sys.argv)
+        dt.activate("dark")
+        win = FloatingWindow()
+        try:
+            win.reapply_theme()
+            sheet = win._end_btn.styleSheet()
+            assert dt.PRIMARY_CONTAINER in sheet
+            assert dt.PRIMARY_CONTAINER_HOVER in sheet
+        finally:
+            win.close()
 
     def test_usage_tip_bar_follows_dark_axis(self):
         import sys

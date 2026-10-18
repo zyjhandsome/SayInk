@@ -357,7 +357,7 @@ _SOURCE_CHIP = {
 
 _TRIGGER_CHIP = {
     "continuous": "持续转写",
-    "hotkey": "按住录音",
+    "hotkey": "单次转写",
     "file_import": "导入文件",
 }
 
@@ -611,6 +611,7 @@ class HistoryWindow(QWidget):
         self._sessions_by_id: dict[str, SessionSummary] = {}
         self._pending_delete: list[SessionSummary] = []
         self._pending_merge: list[SessionSummary] = []
+        self._open_session_id: str | None = None
         self._search_query = ""
         self._history_enabled = True
         self._session_limit = 50
@@ -1789,6 +1790,10 @@ class HistoryWindow(QWidget):
             if sid in self._sessions_by_id
         ]
 
+    def set_open_session(self, session_id: str | None) -> None:
+        """Session still receiving transcript rows; delete and merge leave it alone."""
+        self._open_session_id = session_id or None
+
     def _active_session_id(self) -> str | None:
         ids = self._selected_session_ids()
         if len(ids) == 1:
@@ -1806,7 +1811,7 @@ class HistoryWindow(QWidget):
             return {ordered[0].seq: cleaned}
         parts = [p.strip() for p in re.split(r"\n\s*\n", cleaned) if p.strip()]
         if len(parts) == len(ordered):
-            return {seg.seq: part for seg, part in zip(ordered, parts)}
+            return {seg.seq: part for seg, part in zip(ordered, parts, strict=True)}
         out: dict[int, str] = {ordered[0].seq: cleaned}
         for seg in ordered[1:]:
             out[seg.seq] = "\u200b"
@@ -2045,6 +2050,9 @@ class HistoryWindow(QWidget):
         sessions = self._selected_sessions()
         if len(sessions) < 2:
             return
+        if self._open_session_id and any(s.session_id == self._open_session_id for s in sessions):
+            self._show_feedback("这场正在转写，请先结束再合并")
+            return
         if self._pending_delete:
             self._commit_pending_delete_now()
         if self._pending_merge:
@@ -2065,13 +2073,19 @@ class HistoryWindow(QWidget):
         self._undo_timer.start()
 
     def _delete_selected_sessions(self) -> None:
-        ids = self._selected_session_ids()
-        if not ids:
+        selected = self._selected_sessions()
+        if not selected:
+            return
+        blocked = [s for s in selected if s.session_id == self._open_session_id]
+        deletable = [s for s in selected if s not in blocked]
+        if not deletable:
+            self._show_feedback("这场正在转写，请先结束再删除")
             return
         if self._pending_merge:
             self._commit_pending_merge_now()
         # Undo replaces the confirmation dialog: one safety net, not two.
-        self._pending_delete.extend(self._selected_sessions())
+        ids = {s.session_id for s in deletable}
+        self._pending_delete.extend(deletable)
         self._load_sessions([
             session for session in self._sessions_by_id.values()
             if session.session_id not in ids

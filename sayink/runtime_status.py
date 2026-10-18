@@ -34,6 +34,29 @@ class RuntimeStatus:
     label: str
 
 
+@dataclass(frozen=True)
+class SegmentationStatus:
+    """Actual recorder gate, distinct from a preference or a file on disk."""
+
+    requested: str
+    effective: str
+    model_available: bool = False
+    error: str = ""
+    meeting: bool = False
+
+    @property
+    def label(self) -> str:
+        if self.requested != "silero":
+            return "能量断句 · 当前生效"
+        if not self.model_available:
+            return "Silero VAD 未下载 · 当前使用能量断句"
+        if not self.effective:
+            return "Silero VAD 已下载 · 正在加载…"
+        if self.effective == "silero":
+            return "Silero VAD 已下载 · 已加载 · 当前生效"
+        return "Silero VAD 已下载 · 加载失败 · 已回退能量断句"
+
+
 def runtime_status_from_flags(*, is_loading: bool, is_ready: bool) -> RuntimeStatus:
     if is_loading:
         return RuntimeStatus(RuntimeState.LOADING, "模型载入中…")

@@ -61,7 +61,7 @@ class ModelCard(QFrame):
         from sayink.speech_recognizer import DEFAULT_MODEL_ID
         if self._is_aux:
             if self._is_downloaded:
-                self._badge = QLabel("已启用")
+                self._badge = QLabel("已下载")
         elif self._is_active or self._model_id == DEFAULT_MODEL_ID:
             self._badge = QLabel("当前" if self._is_active else "推荐")
         if self._badge is not None:
@@ -83,7 +83,8 @@ class ModelCard(QFrame):
         layout.addSpacing(6)
 
         if self._is_aux:
-            self._meta_lbl = QLabel(f"{self._info['languages']} · 会议辅助模型，下载后自动使用")
+            scope = "三种转录模式共用" if self._model_id == "silero-vad" else "连续转录与会议共用"
+            self._meta_lbl = QLabel(f"{self._info['languages']} · {scope}；加载状态见「公共识别」")
         else:
             self._meta_lbl = QLabel(
                 f"{self._info['languages']} · "

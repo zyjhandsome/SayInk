@@ -3,7 +3,7 @@ import numpy as np
 from sayink.speech_recognizer import (
     MODEL_REGISTRY, normalize_asr_output, get_model_info,
     is_model_downloaded, get_model_dir, _get_models_dir,
-    SAMPLE_RATE, DEFAULT_MODEL_ID,
+    SAMPLE_RATE, DEFAULT_MODEL_ID, restore_glossary_case,
 )
 
 
@@ -256,6 +256,34 @@ class TestNormalizeAsrOutput:
         )
         result = normalize_asr_output(text)
         assert result == "我觉得你有点矛盾。是不是下雨了呢？"
+
+
+class TestRestoreGlossaryCase:
+    """FireRedASR2 emits English in one case (``GITHUB``); the glossary says how it is spelled."""
+
+    def test_uppercase_model_output_takes_the_glossary_spelling(self):
+        glossary = [{"term": "GitHub", "variants": []}, {"term": "SayInk"}]
+        assert restore_glossary_case("代码在GITHUB上，用sayink听写", glossary) == "代码在GitHub上，用SayInk听写"
+
+    def test_plain_string_entries_count_as_terms(self):
+        assert restore_glossary_case("打开 VSCODE", ["VSCode"]) == "打开 VSCode"
+
+    def test_only_whole_words_are_rewritten(self):
+        assert restore_glossary_case("OPENAI 和 AI", ["AI"]) == "OPENAI 和 AI"
+        assert restore_glossary_case("goals 和 GO", ["Go"]) == "goals 和 Go"
+
+    def test_longer_term_wins_over_a_term_inside_it(self):
+        glossary = ["code", "Visual Studio Code"]
+        assert restore_glossary_case("VISUAL STUDIO CODE 写 CODE", glossary) == "Visual Studio Code 写 code"
+
+    def test_chinese_terms_and_empty_glossary_leave_text_alone(self):
+        assert restore_glossary_case("张新说GITHUB", [{"term": "张鑫"}]) == "张新说GITHUB"
+        assert restore_glossary_case("GITHUB", []) == "GITHUB"
+        assert restore_glossary_case("GITHUB", None) == "GITHUB"
+        assert restore_glossary_case("", ["GitHub"]) == ""
+
+    def test_regex_characters_in_terms_are_literal(self):
+        assert restore_glossary_case("学 c++ 和 .net", ["C++", ".NET"]) == "学 C++ 和 .NET"
 
 
 class TestModelRegistry:
@@ -537,7 +565,7 @@ class TestResolveStartupModelId:
             "sayink.speech_recognizer.is_model_downloaded", lambda mid: False
         )
         monkeypatch.setattr(
-            "sayink.speech_recognizer.get_downloaded_models", lambda: []
+            "sayink.speech_recognizer.get_downloaded_models", list
         )
         assert resolve_startup_model_id("sensevoice") == "sensevoice"
 
@@ -719,7 +747,7 @@ class TestLongUtteranceSlicing:
         starts = [_slice_start(audio, piece) for piece in slices]
         assert starts[0] == 0
         assert starts[-1] + slices[-1].size == audio.size
-        for earlier, later in zip(starts, starts[1:]):
+        for earlier, later in zip(starts, starts[1:], strict=False):
             assert later > earlier
             assert later < earlier + slices[0].size
 
@@ -1206,7 +1234,7 @@ class TestSpeechRecognizerBehavior:
 
 
 class _FakeLoadWorker:
-    instances: list = []
+    instances: tuple = ()
 
     def __init__(self, model_id, num_threads, *, hotwords="", language=""):
         from unittest.mock import MagicMock
@@ -1218,7 +1246,7 @@ class _FakeLoadWorker:
         self.loaded = MagicMock()
         self.error = MagicMock()
         self.finished = MagicMock()
-        _FakeLoadWorker.instances.append(self)
+        _FakeLoadWorker.instances = (*_FakeLoadWorker.instances, self)
 
     def start(self):
         self.running = True
@@ -1239,7 +1267,7 @@ class TestSwitchModelDuringLoad:
     def _recognizer(self, monkeypatch):
         import sayink.speech_recognizer as sr
 
-        _FakeLoadWorker.instances = []
+        _FakeLoadWorker.instances = ()
         monkeypatch.setattr(sr, "ModelLoadWorker", _FakeLoadWorker)
         monkeypatch.setattr(sr, "is_model_downloaded", lambda _mid: True)
         return sr.SpeechRecognizer()
@@ -1297,12 +1325,22 @@ class _FakeHttpStream:
         yield self._body
 
 
+_TINY_REVISION = "0123456789abcdef0123456789abcdef01234567"
+
+
+def _sha256(body: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(body).hexdigest()
+
+
 class TestModelDownloadSources:
     def _worker(self, monkeypatch, tmp_path, responses, source="auto"):
         import httpx
         import sayink.speech_recognizer as sr
 
-        info = {"id": "tiny", "name": "Tiny", "hf_repo": "org/tiny", "dir_name": "tiny", "files": ["a.bin"]}
+        info = {"id": "tiny", "name": "Tiny", "hf_repo": "org/tiny", "dir_name": "tiny", "files": ["a.bin"],
+                "revision": _TINY_REVISION, "sha256": {"a.bin": _sha256(b"weights")}}
         monkeypatch.setattr(sr, "get_model_info", lambda _mid: info)
         monkeypatch.setattr(sr, "_get_models_dir", lambda: tmp_path)
         monkeypatch.setattr(sr, "is_model_downloaded", lambda _mid: (tmp_path / "tiny" / "a.bin").exists())
@@ -1339,14 +1377,39 @@ class TestModelDownloadSources:
         assert not (tmp_path / "tiny" / "a.bin").exists()
         assert not (tmp_path / "tiny" / "a.bin.tmp").exists()
 
+    def test_download_uses_the_pinned_revision(self, monkeypatch, tmp_path):
+        responses = [_FakeHttpStream(b"weights")]
+        worker, urls, done, _errors = self._worker(monkeypatch, tmp_path, responses, source="huggingface")
+        worker.run()
+        assert urls == [f"https://huggingface.co/org/tiny/resolve/{_TINY_REVISION}/a.bin"]
+        assert done == ["tiny"]
+
+    def test_file_with_wrong_checksum_is_not_kept(self, monkeypatch, tmp_path):
+        responses = [_FakeHttpStream(b"tampered")]
+        worker, _urls, done, errors = self._worker(monkeypatch, tmp_path, responses, source="huggingface")
+        worker.run()
+        assert done == []
+        assert errors and "校验失败" in errors[0]
+        assert not (tmp_path / "tiny" / "a.bin").exists()
+        assert not (tmp_path / "tiny" / "a.bin.tmp").exists()
+
+    def test_auto_tries_the_mirror_after_a_checksum_mismatch(self, monkeypatch, tmp_path):
+        responses = [_FakeHttpStream(b"tampered"), _FakeHttpStream(b"weights")]
+        worker, urls, done, errors = self._worker(monkeypatch, tmp_path, responses)
+        worker.run()
+        assert urls[1].startswith("https://hf-mirror.com/")
+        assert done == ["tiny"] and errors == []
+        assert (tmp_path / "tiny" / "a.bin").read_bytes() == b"weights"
+
     def test_progress_is_weighted_by_bytes(self, monkeypatch, tmp_path):
         import httpx
         import sayink.speech_recognizer as sr
 
         mb = 1024 * 1024
-        info = {"id": "tiny", "name": "Tiny", "hf_repo": "org/tiny", "dir_name": "tiny",
-                "size_mb": 4, "files": ["small.bin", "big.bin"]}
         bodies = {"small.bin": b"s" * mb, "big.bin": b"b" * (3 * mb)}
+        info = {"id": "tiny", "name": "Tiny", "hf_repo": "org/tiny", "dir_name": "tiny",
+                "size_mb": 4, "files": ["small.bin", "big.bin"], "revision": _TINY_REVISION,
+                "sha256": {name: _sha256(body) for name, body in bodies.items()}}
         monkeypatch.setattr(sr, "get_model_info", lambda _mid: info)
         monkeypatch.setattr(sr, "_get_models_dir", lambda: tmp_path)
         monkeypatch.setattr(sr, "is_model_downloaded", lambda _mid: True)
@@ -1359,6 +1422,17 @@ class TestModelDownloadSources:
         worker.progress.connect(progress.append)
         worker.run()
         assert progress == [25, 99, 100]
+
+    def test_every_registry_file_is_pinned_to_a_commit_and_hash(self):
+        import re
+
+        from sayink.speech_recognizer import AUX_MODEL_REGISTRY, MODEL_REGISTRY
+
+        for info in MODEL_REGISTRY + AUX_MODEL_REGISTRY:
+            assert re.fullmatch(r"[0-9a-f]{40}", info.get("revision", "")), info["id"]
+            hashes = info.get("sha256", {})
+            assert set(hashes) == set(info["files"]), info["id"]
+            assert all(re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes.values()), info["id"]
 
     def test_download_endpoints_default_to_auto(self):
         from sayink.speech_recognizer import download_endpoints, HF_URL, HF_MIRROR_URL

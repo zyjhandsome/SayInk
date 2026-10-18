@@ -576,3 +576,26 @@ class TestRefinement:
         data = json.loads(prompt.split("\n", 1)[1])
         assert data["glossary"] == ["SayInk"]
         assert set(data) == {"glossary", "before_context", "units", "after_context"}
+
+
+def test_minutes_generator_retains_cancelled_worker_until_finished(monkeypatch):
+    import threading
+    from PyQt6.QtCore import QCoreApplication
+    from sayink.minutes_generator import MinutesGenerator
+
+    release = threading.Event()
+    monkeypatch.setattr(MinutesWorker, "run", lambda self: release.wait(2.0))
+
+    gen = MinutesGenerator()
+    gen.generate(_request([TranscriptLine(0, 1, "讨论预算。")]))
+    worker = gen._worker
+    assert worker is not None
+
+    gen.cancel()
+    assert gen._worker is None
+    assert worker in gen._workers
+
+    release.set()
+    assert worker.wait(2000)
+    QCoreApplication.processEvents()
+    assert worker not in gen._workers

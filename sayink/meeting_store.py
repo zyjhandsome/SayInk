@@ -62,7 +62,8 @@ class MeetingRecord:
     def display_title(self) -> str:
         if self.title.strip():
             return self.title.strip()
-        return time.strftime("%m-%d %H:%M 会议", time.localtime(self.started_at / 1000))
+        # strftime formats stay ASCII: Windows encodes them with the ANSI code page.
+        return time.strftime("%m-%d %H:%M", time.localtime(self.started_at / 1000)) + " 会议"
 
 
 @dataclass(frozen=True)
@@ -123,7 +124,7 @@ def _note_metadata(conn: sqlite3.Connection, meeting_id: str) -> dict[str, Any]:
     row = conn.execute(
         "SELECT " + ", ".join(_NOTE_METADATA_COLUMNS) + " FROM meeting_notes WHERE meeting_id = ?", (meeting_id,)
     ).fetchone()
-    return dict(zip(_NOTE_METADATA_COLUMNS, row)) if row else {}
+    return dict(zip(_NOTE_METADATA_COLUMNS, row, strict=True)) if row else {}
 
 
 def _row_to_meeting(r: tuple) -> MeetingRecord:
@@ -295,13 +296,21 @@ class MeetingStore:
         self._write(_promote)
         return record
 
-    def end_meeting(self, meeting_id: str, ended_at: int | None = None) -> None:
+    def end_meeting(
+        self,
+        meeting_id: str,
+        ended_at: int | None = None,
+        *,
+        status: str = STATUS_ENDED,
+    ) -> None:
         stamp = now_ms() if ended_at is None else int(ended_at)
+        if status not in (STATUS_ENDED, STATUS_INTERRUPTED):
+            status = STATUS_ENDED
 
         def _end(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE meetings SET ended_at = ?, status = ? WHERE id = ? AND status != ?",
-                (stamp, STATUS_ENDED, meeting_id, STATUS_DELETED),
+                (stamp, status, meeting_id, STATUS_DELETED),
             )
 
         self._write(_end)

@@ -97,6 +97,14 @@ class TestCheck:
         ctl.hooks["about"].assert_called_once()
         assert ctl.state is UpdateState.CHECKING
 
+    def test_opening_about_during_background_check_also_receives_failure(self, ctl):
+        with patch("sayink.updater.UpdateCheckWorker"):
+            ctl.check(interactive=False)
+        ctl.sink.set_update_status.assert_not_called()
+        ctl.sync_status()  # The user opens About while the startup check runs.
+        ctl.on_check_failed("offline")
+        ctl.sink.set_update_status.assert_called_with("检查失败，请稍后再试", action="check")
+
     def test_auto_check_respects_config(self, ctl):
         ctl._config.set("update.auto_check", False)
         with patch("sayink.updater.UpdateCheckWorker") as worker_cls:
@@ -119,13 +127,36 @@ class TestInstall:
         assert ctl.state is UpdateState.DOWNLOADING
         ctl.on_download_progress(5 * 1024 * 1024, 10 * 1024 * 1024)
         ctl.sink.set_update_status.assert_called_with("正在下载 5 / 10 MB", action="busy")
-        # While downloading, re-opening the About page must not overwrite the progress text.
+        # Recreate/reopen About during a tray-only download and recover progress.
         ctl.sink.reset_mock()
         ctl.sync_status()
-        ctl.sink.set_update_status.assert_not_called()
+        ctl.sink.set_update_status.assert_called_once_with("正在下载 5 / 10 MB", action="busy")
         ctl.on_download_failed("网络中断")
         assert ctl.state is UpdateState.AVAILABLE
         ctl.sink.set_update_status.assert_called_with("网络中断", action="install")
+        ctl.sink.reset_mock()
+        ctl.sync_status()
+        ctl.sink.set_update_status.assert_called_once_with("网络中断", action="install")
+
+    def test_check_during_download_keeps_progress_and_does_not_start_another_worker(self, ctl):
+        ctl.pending_release = _release()
+        with patch("sayink.updater.UpdateDownloadWorker"):
+            ctl.install()
+        ctl.on_download_progress(5 * 1024 * 1024, 10 * 1024 * 1024)
+        with patch("sayink.updater.UpdateCheckWorker") as worker_cls:
+            ctl.check(interactive=True)
+        worker_cls.assert_not_called()
+        assert ctl.state is UpdateState.DOWNLOADING
+        ctl.sink.set_update_status.assert_called_with("正在下载 5 / 10 MB", action="busy")
+
+    def test_recheck_after_failed_download_replaces_old_failure(self, ctl):
+        ctl.pending_release = _release()
+        ctl.on_download_failed("网络中断")
+        with patch("sayink.updater.UpdateCheckWorker"):
+            ctl.check(interactive=True)
+        ctl.on_check_result(None)
+        ctl.sync_status()
+        ctl.sink.set_update_status.assert_called_with("已是最新版本", action="check")
 
     def test_downloaded_installer_waits_for_exit_confirmation(self, ctl):
         ctl.hooks["confirm"].return_value = False

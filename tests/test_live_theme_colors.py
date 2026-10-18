@@ -32,6 +32,27 @@ def test_empty_state_restyles_when_theme_changes():
     assert "#667085" not in sheet
 
 
+def test_footnote_and_settings_group_follow_activate_without_manual_reload_styles():
+    from sayink.ui.settings_components import footnote, page_header, settings_group
+
+    activate("light")
+    root = QWidget()
+    note = footnote("提示说明")
+    note.setParent(root)
+    group = settings_group()
+    group.setParent(root)
+    header = page_header("通用", "副标题")
+    header.setParent(root)
+    assert "#667085" in note.styleSheet()
+    assert "#FFFFFF" in group.styleSheet()
+
+    activate("dark")
+    reapply_subtree(root)
+    assert "#9CA3AF" in note.styleSheet()
+    assert "#667085" not in note.styleSheet()
+    assert "#181818" in group.styleSheet()
+
+
 def test_widgets_built_after_a_theme_switch_use_the_live_palette():
     """Colors bound at import time (``from design_tokens import TEXT``) go
     stale after ``activate()``; builders must read ``tok.X`` live."""

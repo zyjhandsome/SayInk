@@ -39,36 +39,36 @@ LINK_BTN_STYLE = ""
 
 def reload_styles() -> None:
     """Rebuild style fragments from the currently activated design tokens."""
-    global SECTION_LABEL, PAGE_TITLE, PAGE_SUBTITLE, FOOTNOTE
-    global GROUP_STYLE, HERO_CARD_STYLE, ROW_RADIO_STYLE, NAV_BTN_STYLE, LINK_BTN_STYLE
     from sayink.ui import design_tokens as tok
 
-    SECTION_LABEL = (
+    g = globals()
+    g["SECTION_LABEL"] = (
         f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 700;"
         f" padding: 0 2px 2px 2px; letter-spacing: 0;"
         f" background: transparent;"
     )
-    PAGE_TITLE = (
+    g["PAGE_TITLE"] = (
         f"color: {tok.TEXT}; font-family: {tok.FONT_DISPLAY}; font-size: {tok.TYPE_TITLE_LG}px;"
         f" font-weight: 700; letter-spacing: 0; padding: 2px 0 0 0;"
     )
-    PAGE_SUBTITLE = (
+    g["PAGE_SUBTITLE"] = (
         f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_BODY_SM}px; padding: 0;"
         f" line-height: 1.45; letter-spacing: 0;"
     )
-    FOOTNOTE = (
+    g["FOOTNOTE"] = (
         f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.45;"
         f" padding: 0 2px 0 2px; letter-spacing: 0;"
     )
-    GROUP_STYLE = f"""
+    group_style = f"""
     QFrame#settingsGroup {{
         background: {tok.SURFACE};
         border: 1px solid {tok.BORDER};
         border-radius: {tok.RADIUS_LG}px;
     }}
 """
-    HERO_CARD_STYLE = GROUP_STYLE.replace("settingsGroup", "settingsHeroCard")
-    ROW_RADIO_STYLE = f"""
+    g["GROUP_STYLE"] = group_style
+    g["HERO_CARD_STYLE"] = group_style.replace("settingsGroup", "settingsHeroCard")
+    g["ROW_RADIO_STYLE"] = f"""
     QRadioButton {{
         color: {tok.TEXT};
         spacing: 12px;
@@ -104,7 +104,7 @@ def reload_styles() -> None:
         padding: 8px 12px;
     }}
 """
-    NAV_BTN_STYLE = f"""
+    g["NAV_BTN_STYLE"] = f"""
     QPushButton#settingsNavBtn {{
         text-align: left;
         padding: 0 12px 0 12px;
@@ -132,7 +132,7 @@ def reload_styles() -> None:
         padding: 0 14px 0 12px;
     }}
 """
-    LINK_BTN_STYLE = f"""
+    g["LINK_BTN_STYLE"] = f"""
     QPushButton {{
         color: {tok.TEXT_SEC}; background: transparent; border: none;
         font-size: {tok.TYPE_FOOTNOTE}px; text-align: left; padding: 4px 0;
@@ -278,6 +278,18 @@ def kv_row_elided(key: str, value: str, *, max_len: int = 44) -> QWidget:
     return row
 
 
+def _paint_css(widget, css: str) -> None:
+    """Apply a stylesheet only when it actually changed.
+
+    ``setStyleSheet`` with the same text still polishes the widget, and that
+    polish is what flashes a card when a neighboring choice is clicked.
+    """
+    if widget.property("_paintedCss") == css:
+        return
+    widget.setProperty("_paintedCss", css)
+    widget.setStyleSheet(css)
+
+
 def footnote(text: str) -> QLabel:
     lbl = QLabel(text)
     lbl.setProperty("viRole", "footnote")
@@ -384,6 +396,11 @@ def stylesheet_for_role(role: object) -> str | None:
             f"color: {live.TEXT_DIM}; font-size: {live.TYPE_FOOTNOTE}px; line-height: 1.4;"
             f" background: transparent;"
         )
+    if role == "importantHint":
+        return (
+            f"color: {live.TEXT_SEC}; font-size: {live.TYPE_FOOTNOTE}px;"
+            f" background: transparent;"
+        )
     if role == "footnote":
         return FOOTNOTE
     if role == "polishPreviewHeading":
@@ -464,7 +481,7 @@ def reapply_subtree(root: QWidget) -> None:
             label.setStyleSheet(css)
         elif label.objectName() == "settingsGroupTitle":
             label.setStyleSheet(
-                f"color: {live.TEXT_DIM}; font-size: {live.TYPE_FOOTNOTE}px; font-weight: 700;"
+                f"color: {live.TEXT_SEC}; font-size: {live.TYPE_BODY_SM}px; font-weight: 700;"
                 f" padding: 0 2px 2px 2px; background: transparent;"
                 f" letter-spacing: 0;"
             )
@@ -508,7 +525,7 @@ def settings_section(
         hdr = QLabel(title)
         hdr.setObjectName("settingsGroupTitle")
         hdr.setStyleSheet(
-            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700;"
+            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 700;"
             f" padding: 2px 2px 2px 2px; background: transparent;"
             f" letter-spacing: 0;"
         )
@@ -923,22 +940,38 @@ class CompactPickCard(QFrame):
     def reapply_styles(self) -> None:
         self._sync_style(self._radio.isChecked())
 
+    def set_copy(self, title: str, subtitle: str) -> None:
+        if self._title_label.text() == title and self._subtitle_label.text() == subtitle:
+            return
+        self._subtitle = subtitle
+        self._title_label.setText(title)
+        self._subtitle_label.setText(subtitle)
+        self.setAccessibleName(title)
+        self._radio.setAccessibleName(title)
+        self._radio.setAccessibleDescription(subtitle)
+        self._sync_style(self._radio.isChecked())
+
     def _sync_style(self, checked: bool) -> None:
         from sayink.ui import design_tokens as tok
 
+        was_checked = self.property("accessibleChecked")
         self.setProperty("accessibleChecked", checked)
         self.setAccessibleDescription(
             f"{self._subtitle}，{'已选中' if checked else '未选中'}".strip("，")
         )
-        self._title_label.setStyleSheet(
+        _paint_css(
+            self._title_label,
             f"color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 700;"
-            f" background: transparent;"
+            f" background: transparent;",
         )
-        self._subtitle_label.setStyleSheet(
+        _paint_css(
+            self._subtitle_label,
             f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.35;"
-            f" background: transparent;"
+            f" background: transparent;",
         )
-        self._radio.setStyleSheet(f"""
+        _paint_css(
+            self._radio,
+            f"""
             QRadioButton {{ padding: 2px; spacing: 0; border: 2px solid transparent; border-radius: 6px; background: transparent; }}
             QRadioButton:focus {{ border-color: {tok.ACCENT_FOCUS}; }}
             QRadioButton::indicator {{ width: 16px; height: 16px; border-radius: 8px;
@@ -947,28 +980,36 @@ class CompactPickCard(QFrame):
                 background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
                     stop:0 {tok.PRIMARY_CONTAINER}, stop:0.55 {tok.PRIMARY_CONTAINER},
                     stop:0.56 {tok.SURFACE}, stop:1 {tok.SURFACE}); }}
-        """)
-        # Ink wash selected row — no accent ring or left bar.
-        if checked:
-            self.setStyleSheet(f"""
-                CompactPickCard {{
-                    background: {tok.NAV_SELECTED_BG};
-                    border: 1px solid {tok.HAIRLINE};
-                    border-radius: {tok.RADIUS_MD}px;
-                }}
-            """)
-        else:
-            self.setStyleSheet(f"""
-                CompactPickCard {{
-                    background: {tok.SURFACE_PEARL};
-                    border: 1px solid {tok.BORDER};
-                    border-radius: {tok.RADIUS_MD}px;
-                }}
-                CompactPickCard:hover {{
-                    border-color: {tok.CONTROL_BORDER};
-                    background: {tok.SURFACE};
-                }}
-            """)
+            """,
+        )
+        # One stylesheet for both states. Swapping it on every click cleared
+        # the card for a frame and the row jumped.
+        _paint_css(
+            self,
+            f"""
+            CompactPickCard {{
+                background: {tok.SURFACE_PEARL};
+                border: 2px solid {tok.BORDER};
+                border-radius: {tok.RADIUS_MD}px;
+            }}
+            CompactPickCard:hover {{
+                border-color: {tok.CONTROL_BORDER};
+                background: {tok.SURFACE};
+            }}
+            CompactPickCard[accessibleChecked="true"] {{
+                background: {tok.ACCENT_SOFT};
+                border: 2px solid {tok.ACCENT};
+            }}
+            CompactPickCard[accessibleChecked="true"]:hover {{
+                border-color: {tok.ACCENT};
+                background: {tok.ACCENT_SOFT};
+            }}
+            """,
+        )
+        if was_checked != checked:
+            self.style().unpolish(self)
+            self.style().polish(self)
+        self.update()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1004,8 +1045,8 @@ class AudioSourcePicker(QWidget):
 
         specs = [
             (mic_radio, "仅麦克风", "日常口述"),
-            (sys_radio, "仅电脑播放", "会议回放"),
-            (mixed_radio, "混合", "麦 + 系统"),
+            (sys_radio, "电脑声音", "录制系统播放的音频"),
+            (mixed_radio, "混合音源", "麦克风 + 电脑声音"),
         ]
         for rb, title, sub in specs:
             lay.addWidget(CompactPickCard(title, sub, rb), 1)
@@ -1026,8 +1067,8 @@ class TriggerModePicker(QWidget):
         lay.setSpacing(8)
 
         specs = [
-            (continuous_radio, "持续转写", "按住启动 · Esc 或「结束」停止"),
-            (hotkey_radio, "按住说话", "按住录音 · 松开后识别并输入"),
+            (hotkey_radio, "单次转写", "按住录音 · 松开后识别"),
+            (continuous_radio, "持续转写", "启动后持续录音 · 停顿后出字"),
         ]
         for rb, title, sub in specs:
             lay.addWidget(CompactPickCard(title, sub, rb), 1)
@@ -1067,6 +1108,7 @@ class ThemeModeSegment(QWidget):
             host_lay.addWidget(btn)
         root.addWidget(self._host)
         self._buttons[0].setChecked(True)
+        self._sync_tab_stop()
         self.reapply_styles()
 
     def findData(self, data) -> int:
@@ -1089,8 +1131,17 @@ class ThemeModeSegment(QWidget):
         btn = self._buttons[index]
         if not btn.isChecked():
             btn.setChecked(True)
+        self._sync_tab_stop()
         if changed and not self.signalsBlocked():
             self.currentIndexChanged.emit(index)
+
+    def _sync_tab_stop(self) -> None:
+        self.setFocusProxy(self._buttons[self._index])
+        for index, button in enumerate(self._buttons):
+            button.setFocusPolicy(
+                Qt.FocusPolicy.StrongFocus if index == self._index else Qt.FocusPolicy.ClickFocus
+            )
+            button.setAccessibleName(f"主题模式：{self._items[index][0]}")
 
     def reapply_styles(self) -> None:
         from sayink.ui import design_tokens as tok
@@ -1258,11 +1309,13 @@ def paint_device_selection_link(btn: QPushButton) -> None:
     btn.setStyleSheet(f"""
         QPushButton#deviceSelectionLink {{
             color: {tok.ACCENT_TEXT}; background: transparent; border: none;
+            border-bottom: 1px solid transparent;
             font-size: {tok.TYPE_BODY_SM}px; font-weight: 400; text-align: left; padding: 4px 0;
         }}
         QPushButton#deviceSelectionLink:hover {{ color: {tok.ACCENT_TEXT_HOVER}; }}
         QPushButton#deviceSelectionLink:focus {{
             outline: none;
+            border: none;
             border-bottom: 1px solid {tok.ACCENT_FOCUS};
         }}
     """)
@@ -1416,6 +1469,8 @@ class SwitchControl(QCheckBox):
         from sayink.ui import design_tokens as tok
 
         p = QPainter(self)
+        if not self.isEnabled():
+            p.setOpacity(0.45)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         w, h = self._TRACK_W, self._TRACK_H
@@ -1615,7 +1670,7 @@ def chain_tab_order(widgets: list[QWidget]) -> None:
         for stop in _tab_stops(widget):
             if stop not in stops:
                 stops.append(stop)
-    for first, second in zip(stops, stops[1:]):
+    for first, second in zip(stops, stops[1:], strict=False):
         QWidget.setTabOrder(first, second)
 
 
@@ -1624,8 +1679,8 @@ def sync_group_tab_stop(group) -> None:
     checked button (arrows move inside the group, as on native Windows).
 
     Qt only drops TabFocus from the other buttons once one of them has had
-    focus; before that, Tab entered the group at the first button in order —
-    the unchecked 「持续转写」 card ahead of the checked default (U-07)."""
+    focus; before that, Tab entered the group at the first button in order
+    instead of the checked card (U-07)."""
     for button in group.buttons():
         base = button.property("baseFocusPolicy")
         if base is None:
@@ -1674,15 +1729,30 @@ class SettingsPage(QScrollArea):
             self.verticalScrollBar().maximum(),
         )
 
-    def _sync_scroll_gutter(self, vmin: int = 0, vmax: int = 0) -> None:
+    def _scrollbar_gutter_px(self) -> int:
+        """Reserve the styled bar, not the platform size hint.
+
+        The stylesheet draws a 6px bar. ``sizeHint()`` is often the Windows
+        metric (~16px). Reserving that, then swapping in the real 6px bar,
+        changes the page width, reflows wrapped lines, and the height flip
+        shows and hides the bar again — the expand/collapse flicker.
+        """
         bar = self.verticalScrollBar()
-        gutter = bar.sizeHint().width()
-        if gutter <= 0:
-            gutter = 6
-        if vmax > vmin:
-            self.setViewportMargins(0, 0, 0, 0)
-        else:
-            self.setViewportMargins(0, 0, gutter, 0)
+        width = bar.width()
+        if 0 < width <= 12:
+            return width
+        return 6
+
+    def _sync_scroll_gutter(self, vmin: int = 0, vmax: int = 0) -> None:
+        if getattr(self, "_syncing_gutter", False):
+            return
+        self._syncing_gutter = True
+        try:
+            gutter = 0 if vmax > vmin else self._scrollbar_gutter_px()
+            if self.viewportMargins().right() != gutter:
+                self.setViewportMargins(0, 0, gutter, 0)
+        finally:
+            self._syncing_gutter = False
 
     def set_compact(self, compact: bool = True) -> None:
         m = (18, 12, 18, 14) if compact else (PAGE_MARGIN_H, PAGE_MARGIN_V, PAGE_MARGIN_H, PAGE_MARGIN_V)

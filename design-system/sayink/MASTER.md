@@ -3,6 +3,7 @@
 > **NON-CANONICAL (raw skill output).** Do **not** treat this file as the product authority.
 > Canonical desktop tokens live in [`../MASTER.md`](../MASTER.md) and `sayink/ui/design_tokens.py`.
 > This copy may still contain landing-page / Inter / red-primary defaults from ui-ux-pro-max generation.
+> **2026-10-18 settings review:** Four task groups, explicit output policy, advanced recognition disclosure, selected compact-card outlines and keyboard behavior are specified in the canonical [`../MASTER.md`](../MASTER.md). This archived palette does not override them.
 
 > **LOGIC:** When building a specific page, first check `design-system/pages/[page-name].md`.
 > If that file exists, its rules **override** this Master file.

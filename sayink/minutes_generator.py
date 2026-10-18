@@ -227,7 +227,7 @@ class MinutesWorker(QThread):
             )
         except LLMCancelled:
             log.info("纪要生成已取消")
-        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+        except Exception as exc:
             if self._cancelled:
                 return
             try:
@@ -282,6 +282,7 @@ class MinutesGenerator(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._worker: MinutesWorker | None = None
+        self._workers: list[MinutesWorker] = []
 
     @property
     def is_running(self) -> bool:
@@ -293,17 +294,35 @@ class MinutesGenerator(QObject):
         worker.progress.connect(self.progress)
         worker.finished_ok.connect(self._on_done)
         worker.error.connect(self._on_error)
+        if hasattr(worker, "finished"):
+            worker.finished.connect(lambda w=worker: self._reap_worker(w))
         self._worker = worker
+        self._workers.append(worker)
         worker.start()
+
+    def _reap_worker(self, worker: MinutesWorker) -> None:
+        try:
+            self._workers.remove(worker)
+        except ValueError:
+            pass
+        if worker is self._worker and not worker.isRunning():
+            self._worker = None
 
     def cancel(self) -> None:
         worker = self._worker
         if worker is not None and worker.isRunning():
             worker.cancel()
-            try:
-                worker.disconnect()
-            except TypeError:
-                pass
+            for sig, slot in (
+                (worker.progress, self.progress),
+                (worker.finished_ok, self._on_done),
+                (worker.error, self._on_error),
+            ):
+                try:
+                    sig.disconnect(slot)
+                except TypeError:
+                    pass
+        elif worker is not None:
+            self._reap_worker(worker)
         self._worker = None
 
     def _on_done(self, result) -> None:
@@ -315,7 +334,9 @@ class MinutesGenerator(QObject):
         self.error.emit(message)
 
     def shutdown(self) -> None:
-        worker = self._worker
         self.cancel()
-        if worker is not None and worker.isRunning():
-            worker.wait(2000)
+        for worker in list(self._workers):
+            if worker.isRunning():
+                worker.cancel()
+                worker.wait(2000)
+            self._reap_worker(worker)

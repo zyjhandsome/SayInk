@@ -29,10 +29,12 @@ from sayink.audio_utils import (
     to_mono,
 )
 from sayink.pawp_capture import decode_pawp_device_index, is_encoded_pawp_device_index
+from sayink.runtime_status import SegmentationStatus
 from sayink.vad_segmenter import (
     MEETING_MAX_SPEECH_SEC,
     MEETING_SILENCE_HOLD_SEC,
     VAD_ENERGY,
+    VAD_SILERO,
     SpeechSegmenter,
     make_speech_gate,
 )
@@ -56,6 +58,7 @@ class _CaptureLane:
 
 
 class AudioRecorder(QObject):
+    segmentation_changed = pyqtSignal(object)
     volume_changed = pyqtSignal(float)
     recording_finished = pyqtSignal(np.ndarray)
     segment_ready = pyqtSignal(np.ndarray)
@@ -99,7 +102,12 @@ class AudioRecorder(QObject):
         self._segment_route = ""
         self._vad_kind = VAD_ENERGY
         self._vad_model_path: str | None = None
+        # Silero's ONNX session stays here. Rebuilding the segmenter (a mode
+        # or source change) must not load the model again on the UI thread.
+        self._silero_gate = None
+        self._silero_gate_path: str | None = None
         self._meeting_profile = False
+        self._segmentation_status = SegmentationStatus(VAD_ENERGY, VAD_ENERGY)
         # Per-lane loudness balancing for mixed capture (every profile).
         self._balancer: LaneBalancer | None = LaneBalancer()
         # Wall-clock ms at which the block that opened the current utterance
@@ -125,8 +133,8 @@ class AudioRecorder(QObject):
         vad_model_path: str | None = None,
         meeting: bool = False,
     ) -> None:
-        """Pick the VAD and the pause lengths; meeting mode holds longer and
-        may use Silero (docs/meeting-notes-design.md §5.8)."""
+        """Use the shared VAD choice with mode-specific pause lengths.
+        Meeting mode holds longer; both profiles can use Silero."""
         self._vad_kind = vad or VAD_ENERGY
         self._vad_model_path = str(vad_model_path) if vad_model_path else None
         self._meeting_profile = bool(meeting)
@@ -136,6 +144,11 @@ class AudioRecorder(QObject):
         self._rebuild_segmenter()
 
     def _rebuild_segmenter(self) -> None:
+        if self._vad_kind == "silero" and self._vad_model_path:
+            self._segmentation_status = SegmentationStatus(
+                self._vad_kind, "", True, meeting=self._meeting_profile,
+            )
+            self.segmentation_changed.emit(self._segmentation_status)
         threshold = 0.0006 if self._input_source == INPUT_SOURCE_SYSTEM else 0.002
         if self._meeting_profile:
             segmenter = SpeechSegmenter(
@@ -145,9 +158,30 @@ class AudioRecorder(QObject):
             )
         else:
             segmenter = SpeechSegmenter(speech_threshold=threshold)
-        gate = make_speech_gate(self._vad_kind, segmenter, model_path=self._vad_model_path)
+        gate = self._speech_gate(segmenter)
         segmenter.set_gate(gate)
         self._segmenter = segmenter
+        self._segmentation_status = SegmentationStatus(
+            self._vad_kind, gate.name, bool(self._vad_model_path),
+            gate.fallback_reason, self._meeting_profile,
+        )
+        self.segmentation_changed.emit(self._segmentation_status)
+
+    def _speech_gate(self, segmenter: SpeechSegmenter):
+        path = self._vad_model_path or ""
+        if self._vad_kind == VAD_SILERO and path:
+            cached = self._silero_gate
+            if cached is not None and self._silero_gate_path == path:
+                return cached
+        gate = make_speech_gate(self._vad_kind, segmenter, model_path=self._vad_model_path)
+        if gate.name == VAD_SILERO and path:
+            self._silero_gate = gate
+            self._silero_gate_path = path
+        return gate
+
+    @property
+    def segmentation_status(self) -> SegmentationStatus:
+        return self._segmentation_status
 
     @property
     def vad_name(self) -> str:
@@ -370,6 +404,14 @@ class AudioRecorder(QObject):
     @property
     def last_start_warning(self) -> str:
         return self._last_start_warning
+
+    @property
+    def capture_device_labels(self) -> tuple[str, ...]:
+        """Devices actually opened, including a successful fallback device."""
+        return tuple(
+            f"{'麦克风' if lane.endpoint.role == 'microphone' else '电脑声音'}：{lane.endpoint.device.name}"
+            for lane in self._lanes
+        )
 
     def _drain_mixed_mono(self, final: bool = False) -> Optional[np.ndarray]:
         """Mix what every lane has delivered so far. Lanes call back on their
@@ -654,7 +696,7 @@ class AudioRecorder(QObject):
 
     def _friendly_open_error(self, msg: str) -> str:
         lower = msg.lower()
-        if msg.startswith("无法打开音频设备") or msg.startswith("音频设备启动失败"):
+        if msg.startswith(("无法打开音频设备", "音频设备启动失败")):
             if "audio device" in lower and "realtek" not in lower:
                 return (
                     "无法打开「Audio Device」类虚拟扬声器。"
@@ -748,7 +790,7 @@ class AudioRecorder(QObject):
         self._terminate_pawp()
 
         tracks = []
-        for role, chunks, sample_rate in lane_chunks:
+        for _role, chunks, sample_rate in lane_chunks:
             if not chunks:
                 continue
             raw = np.concatenate(chunks)

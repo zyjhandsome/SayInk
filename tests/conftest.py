@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import locale
 import sys
 from unittest.mock import MagicMock
 
@@ -58,10 +59,78 @@ def _isolate_registry_auto_start(monkeypatch):
         monkeypatch.setattr(winreg, "QueryValueEx", _no_entry)
 
 
+def _point_home_at(mp: pytest.MonkeyPatch, home) -> None:
+    """Point ``~`` and ``%APPDATA%`` at an empty folder.
+
+    Otherwise Config(), user_data_dir() and the models directory resolve to
+    the developer's real ``~/.sayink``: tests read real settings and
+    downloaded models (green locally, red in CI) and can rewrite them.
+    Callers use their own MonkeyPatch so a test's ``monkeypatch.undo()``
+    cannot drop the isolation.
+    """
+    mp.setenv("USERPROFILE", str(home))
+    mp.setenv("HOME", str(home))
+    mp.setenv("APPDATA", str(home / "AppData" / "Roaming"))
+    mp.setattr("sayink.user_data._resolved", {})
+    mp.setattr("sayink.speech_recognizer._custom_models_dir", None)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_user_home_for_shared_fixtures(tmp_path_factory):
+    """Module-scoped fixtures are built before any function-scoped one."""
+    with pytest.MonkeyPatch.context() as mp:
+        _point_home_at(mp, tmp_path_factory.mktemp("session_home"))
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_home(tmp_path_factory):
+    with pytest.MonkeyPatch.context() as mp:
+        _point_home_at(mp, tmp_path_factory.mktemp("home"))
+        yield
+
+
 @pytest.fixture(autouse=True)
 def _no_real_credential_manager(monkeypatch):
     """Never read or write the developer's real Windows credentials."""
     monkeypatch.setattr("sayink.config.default_secret_store", lambda: None)
+
+
+_ANSI_LOCALES = ("English_United States.1252", "en_US.ISO8859-1")
+
+
+def _switch_to_ansi_locale() -> bool:
+    """Set LC_CTYPE to an English Windows code page, as on the CI runner.
+
+    On Windows ``time.strftime`` encodes its format string with this code
+    page, so Chinese text in a format only breaks on non-Chinese systems
+    and never on a Chinese development machine.
+    """
+    for name in _ANSI_LOCALES:
+        try:
+            locale.setlocale(locale.LC_CTYPE, name)
+            return True
+        except locale.Error:
+            continue
+    return False
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _ansi_code_page_like_ci():
+    previous = locale.setlocale(locale.LC_CTYPE)
+    _switch_to_ansi_locale()
+    yield
+    locale.setlocale(locale.LC_CTYPE, previous)
+
+
+@pytest.fixture
+def ansi_locale():
+    """Pin the code page for tests that exist to guard against it."""
+    previous = locale.setlocale(locale.LC_CTYPE)
+    if not _switch_to_ansi_locale():
+        pytest.skip("no ANSI code page locale available")
+    yield
+    locale.setlocale(locale.LC_CTYPE, previous)
 
 
 @pytest.fixture

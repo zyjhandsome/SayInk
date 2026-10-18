@@ -124,6 +124,15 @@ class TestLifecycle:
         assert stored is not None and stored.title == "周会" and stored.status == "live"
         assert states == [MeetingState.LIVE]
 
+    def test_speaker_load_failure_is_distinct_from_a_missing_download(self, controller, monkeypatch):
+        from sayink.speaker_embedding import MelEmbedder
+
+        monkeypatch.setattr("sayink.meeting_session.make_embedder", lambda *_args, **_kw: MelEmbedder())
+        controller.begin(MeetingOptions(), _caps(speaker_model_available=True))
+        assert not controller.capabilities.speaker_model_available
+        assert controller.capabilities.speaker_load_failed
+        assert any("CAM++ 加载失败" in note for note in controller.capabilities.notes)
+
     def test_second_begin_refused_while_active(self, controller):
         controller.begin(MeetingOptions(), _caps())
         with pytest.raises(RuntimeError):
@@ -137,6 +146,16 @@ class TestLifecycle:
         controller.resume()
         assert controller.state is MeetingState.LIVE
         assert controller.paused_detail == ""
+
+    def test_pause_updates_detail_while_already_paused(self, controller):
+        controller.begin(MeetingOptions(), _caps())
+        seen = []
+        controller.state_changed.connect(seen.append)
+        controller.pause("识别跟不上，已暂停采集 · 处理完会自动继续")
+        controller.pause("音频设备打开失败 · 请检查设备后在会议页「继续采集」")
+        assert controller.state is MeetingState.PAUSED
+        assert controller.paused_detail == "音频设备打开失败 · 请检查设备后在会议页「继续采集」"
+        assert seen[-1] is MeetingState.PAUSED
 
     def test_add_mark_records_offset_and_notice(self, controller):
         record = controller.begin(MeetingOptions(), _caps())
@@ -191,6 +210,7 @@ class TestLifecycle:
         assert not controller.is_active
         stored = controller.store.get_meeting(record.id)
         assert stored is not None and stored.ended_at
+        assert stored.status == STATUS_INTERRUPTED
 
     def test_mark_interrupted_flags_stale_live_meetings(self, controller, history):
         record = controller.store.create_meeting(title="崩溃前")
@@ -248,6 +268,16 @@ class TestRenameAndExport:
         assert notes is not None
         assert notes.markdown.startswith("李四 负责上线。")
         assert "说话人21" in notes.markdown
+
+    def test_rename_speaker_does_not_touch_notes_while_generating(self, controller, history):
+        record = self._ended_meeting(
+            controller, history, markdown="说话人2 负责上线。", user_edited=True,
+        )
+        controller._generating_for = record.id
+        assert controller.rename_speaker(record.id, 2, "李四") is None
+        assert controller.speaker_names(record.id) == {}
+        notes = controller.store.get_notes(record.id)
+        assert notes is not None and notes.markdown == "说话人2 负责上线。"
         assert notes.user_edited
 
     def test_export_includes_transcript_with_names(self, controller, history):
@@ -314,6 +344,8 @@ class TestGeneration:
 
         monkeypatch.setattr(controller._generator, "generate", fake_generate)
         assert controller.generate(record.id) is True
+        assert controller.generate(record.id) is False
+        assert controller.generating_for == record.id
         req = seen["request"]
         assert req.template.id == "standup"
         assert req.model_name == "m"
@@ -333,6 +365,49 @@ class TestGeneration:
         notes = controller.store.get_notes(record.id)
         assert notes is not None and notes.markdown.startswith("# 站会") and notes.template_id == "standup"
         assert controller.generating_for == ""
+
+    def test_generate_refuses_a_second_meeting_without_cancelling_the_first(
+        self, controller, config, history, monkeypatch,
+    ):
+        config.set("llm.api_url", "http://localhost:1234/v1")
+        config.set("llm.api_key", "k")
+        config.set("llm.model_name", "m")
+        first = controller.store.create_meeting(title="第一场")
+        second = controller.store.create_meeting(title="第二场")
+        history.enqueue(_row(first.id, 0, "第一场内容", speaker_id=1, started_at=first.started_at))
+        history.enqueue(_row(second.id, 0, "第二场内容", speaker_id=1, started_at=second.started_at))
+        controller.store.end_meeting(first.id, ended_at=first.started_at + 1000)
+        controller.store.end_meeting(second.id, ended_at=second.started_at + 1000)
+        controller.store.flush()
+        calls = []
+        monkeypatch.setattr(controller._generator, "generate", calls.append)
+        failures = []
+        controller.generation_failed.connect(lambda mid, msg: failures.append((mid, msg)))
+
+        assert controller.generate(first.id) is True
+        assert controller.generate(second.id) is False
+        assert calls and len(calls) == 1
+        assert controller.generating_for == first.id
+        assert failures and failures[0][0] == second.id
+        assert "另一场" in failures[0][1]
+
+    def test_generate_refuses_a_live_meeting(self, controller, config, history, monkeypatch):
+        config.set("llm.api_url", "http://localhost:1234/v1")
+        config.set("llm.api_key", "k")
+        config.set("llm.model_name", "m")
+        record = controller.begin(MeetingOptions(), _caps())
+        history.enqueue(_row(record.id, 0, "还在说", speaker_id=1, started_at=record.started_at))
+        history.flush(timeout=2.0)
+        calls = []
+        monkeypatch.setattr(controller._generator, "generate", calls.append)
+        failures = []
+        controller.generation_failed.connect(lambda mid, msg: failures.append((mid, msg)))
+
+        assert controller.generate(record.id) is False
+        assert calls == []
+        assert controller.generating_for == ""
+        assert failures and failures[0][0] == record.id
+        assert "进行" in failures[0][1]
 
     def test_remote_host_confirmation_is_remembered(self, controller, config):
         config.set("llm.api_url", "https://api.example.com/v1")
@@ -369,11 +444,28 @@ class TestMeetingPage:
         assert page._stack.currentIndex() == PAGE_BROWSE
         page.show_start_card()
         assert page._stack.currentIndex() == PAGE_START
-        assert page._opt_source.currentData() == "mixed"
+        assert page._opt_source.currentData() == ""
         page._leave_start_card()
         assert page._stack.currentIndex() == PAGE_BROWSE
 
-    def test_start_card_emits_options_and_remembers_preferences(self, page, config):
+    def test_open_start_card_follows_dictation_source_without_replacing_a_choice(self, page, config):
+        config.set("audio.input_source", "system")
+        page.show_start_card()
+        assert page._opt_source.itemText(0) == "跟随听写（当前：电脑播放）"
+        assert page._opt_source.currentData() == ""
+
+        config.set("audio.input_source", "mixed")
+        page.refresh()
+        assert page._opt_source.itemText(0) == "跟随听写（当前：麦克风 + 电脑播放）"
+        assert page._opt_source.currentData() == ""
+
+        page._opt_source.setCurrentIndex(page._opt_source.findData("microphone"))
+        config.set("audio.input_source", "system")
+        page.refresh()
+        assert page._opt_source.itemText(0) == "跟随听写（当前：电脑播放）"
+        assert page._opt_source.currentData() == "microphone"
+
+    def test_start_card_emits_options_without_changing_defaults(self, page, config):
         received = []
         page.start_requested.connect(received.append)
         page.show_start_card()
@@ -386,7 +478,21 @@ class TestMeetingPage:
         assert isinstance(options, MeetingOptions)
         assert options.title == "设计评审" and options.participants == "甲, 乙"
         assert options.input_source == "microphone"
-        assert config.get("meeting.input_source") == "microphone"
+        assert config.get("meeting.input_source") == ""
+
+    def test_start_card_model_and_language_are_session_overrides(self, page, config):
+        config.set("stt.language", "zh")
+        config.set("meeting.model_id", "funasr-nano")
+        page.show_start_card()
+        page._opt_model.addItem("临时模型", "sensevoice")
+        page._opt_model.setCurrentIndex(page._opt_model.findData("sensevoice"))
+        page._opt_language.setCurrentIndex(page._opt_language.findData("en"))
+        received = []
+        page.start_requested.connect(received.append)
+        page._start_from_card()
+        assert received[0].model_id == "sensevoice" and received[0].language == "en"
+        assert config.get("meeting.model_id") == "funasr-nano"
+        assert config.get("stt.language") == "zh"
 
     def test_live_view_follows_controller_state(self, page, controller, history):
         from sayink.ui.meeting_page import PAGE_BROWSE, PAGE_LIVE
@@ -663,7 +769,7 @@ class TestMeetingPageAuxDownload:
         page.show_start_card()
         assert page._card_dl_btn.isVisibleTo(page)
         assert "28 MB" in page._card_dl_btn.text()
-        monkeypatch.setattr("sayink.ui.meeting_page.missing_aux_models", lambda: [])
+        monkeypatch.setattr("sayink.ui.meeting_page.missing_aux_models", list)
         page._update_card_notes()
         assert not page._card_dl_btn.isVisibleTo(page)
 
@@ -680,7 +786,7 @@ class TestMeetingPageAuxDownload:
         assert not page._live_dl_btn.isEnabled()
         page._on_aux_progress(42)
         assert "42%" in page._live_dl_btn.text()
-        monkeypatch.setattr("sayink.ui.meeting_page.missing_aux_models", lambda: [])
+        monkeypatch.setattr("sayink.ui.meeting_page.missing_aux_models", list)
         page._on_aux_finished(True, "")
         assert changed == [True]
         assert "下一场会议生效" in page._live_caps.text()

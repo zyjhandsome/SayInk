@@ -44,6 +44,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QStackedWidget,
     QTextBrowser,
@@ -66,6 +67,8 @@ from sayink.meeting_session import (
     safe_filename,
 )
 from sayink.meeting_store import STATUS_ENDED, STATUS_INTERRUPTED, STATUS_LIVE, MeetingRecord
+from sayink.audio_devices import input_source_label
+from sayink.recognition_settings import audio_source
 from sayink.minutes_prompts import describe_template, format_timestamp, get_template, list_templates, transcript_lines
 from sayink.speech_recognizer import DEFAULT_MODEL_ID, MODEL_REGISTRY, is_model_downloaded
 from sayink.ui.clipboard import copy_text
@@ -105,7 +108,13 @@ def _meeting_row_meta(record: MeetingRecord) -> str:
     duration = _duration_label(record.duration_ms) if record.ended_at else ""
     stamp = time.localtime(record.started_at / 1000)
     today = time.localtime()
-    when = time.strftime("今天 %H:%M" if stamp[:3] == today[:3] else "%m-%d %H:%M" if stamp.tm_year == today.tm_year else "%Y-%m-%d %H:%M", stamp)
+    # strftime formats stay ASCII: Windows encodes them with the ANSI code page.
+    if stamp[:3] == today[:3]:
+        when = "今天 " + time.strftime("%H:%M", stamp)
+    elif stamp.tm_year == today.tm_year:
+        when = time.strftime("%m-%d %H:%M", stamp)
+    else:
+        when = time.strftime("%Y-%m-%d %H:%M", stamp)
     bits = [status, when] if status else [when]
     if duration:
         bits.append(duration)
@@ -342,6 +351,7 @@ class _SegmentSpeakerDialog(QDialog):
 class MeetingPage(QWidget):
     start_requested = pyqtSignal(object)   # MeetingOptions
     end_requested = pyqtSignal()
+    pause_requested = pyqtSignal()
     resume_requested = pyqtSignal()
     configure_requested = pyqtSignal()     # minutes need the AI service connection
     aux_models_changed = pyqtSignal()      # a helper model was downloaded here
@@ -369,6 +379,8 @@ class MeetingPage(QWidget):
         self._refresh_timer.setInterval(400)
         self._refresh_timer.timeout.connect(self._refresh_now)
         self._pending_refresh_id = ""
+        self._live_html = ""
+        self._live_meeting_id = ""
         self._setup_ui()
         self._ctrl.state_changed.connect(self._on_state_changed)
         self._ctrl.meeting_changed.connect(self._on_meeting_changed)
@@ -444,7 +456,12 @@ class MeetingPage(QWidget):
         self._empty_label = QLabel("还没有会议记录。\n点击右上角「开始会议」，或从托盘菜单开始。")
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_label.setWordWrap(True)
-        left_lay.addWidget(self._empty_label, 0)
+        left_lay.addWidget(self._empty_label, 1)
+        self._clear_search_btn = QPushButton("清除搜索")
+        self._clear_search_btn.setMaximumWidth(160)
+        self._clear_search_btn.clicked.connect(self._search_edit.clear)
+        self._clear_search_btn.hide()
+        left_lay.addWidget(self._clear_search_btn, 0, Qt.AlignmentFlag.AlignHCenter)
         self._splitter.addWidget(left)
 
         right = QWidget()
@@ -537,15 +554,16 @@ class MeetingPage(QWidget):
         notes_lay.addWidget(self._template_label)
         self._template_combo = QComboBox()
         self._template_combo.setAccessibleName("会议模板")
-        self._template_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._template_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
         for template in list_templates(self._custom_templates()):
             self._template_combo.addItem(template.name, template.id)
             self._template_combo.setItemData(
                 self._template_combo.count() - 1, describe_template(template), Qt.ItemDataRole.ToolTipRole
             )
         self._template_combo.currentIndexChanged.connect(self._on_template_changed)
-        self._template_combo.setMinimumWidth(90)
-        self._template_combo.setMaximumWidth(150)
+        self._template_combo.setFixedWidth(150)
         self._template_combo.setToolTip(str(self._template_combo.itemData(0, Qt.ItemDataRole.ToolTipRole) or ""))
         self._template_label.setBuddy(self._template_combo)
         notes_lay.addWidget(self._template_combo)
@@ -625,14 +643,24 @@ class MeetingPage(QWidget):
 
     def _build_start_card(self) -> QWidget:
         page = QWidget()
-        lay = QVBoxLayout(page)
+        page_lay = QVBoxLayout(page)
+        page_lay.setContentsMargins(0, 0, 0, 0)
+        page_lay.setSpacing(10)
+        self._start_scroll = QScrollArea()
+        self._start_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._start_scroll.setWidgetResizable(True)
+        self._start_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        self._start_scroll.setWidget(content)
+        page_lay.addWidget(self._start_scroll, 1)
+        lay = QVBoxLayout(content)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(10)
         self._card_title = QLabel("开始会议")
         lay.addWidget(self._card_title)
         self._card_hint = QLabel(
             "填写的信息会写进纪要并帮助模型理解上下文；全部可留空。"
-            "不保存音频，只保存文字。"
+            "本卡片的音源、模型和语言仅用于本场。不保存音频，只保存文字。"
         )
         self._card_hint.setWordWrap(True)
         lay.addWidget(self._card_hint)
@@ -655,6 +683,7 @@ class MeetingPage(QWidget):
         row.setSpacing(10)
         self._opt_source = QComboBox()
         self._opt_source.setAccessibleName("会议音频来源")
+        self._opt_source.addItem("跟随听写设置", "")
         for key, label in _SOURCE_LABELS:
             self._opt_source.addItem(label, key)
         row.addWidget(self._opt_source, 2)
@@ -692,7 +721,7 @@ class MeetingPage(QWidget):
         self._card_start.setDefault(True)
         self._card_start.clicked.connect(self._start_from_card)
         actions.addWidget(self._card_start)
-        lay.addLayout(actions)
+        page_lay.addLayout(actions)
         self._opt_source.currentIndexChanged.connect(self._update_card_notes)
         self._opt_model.currentIndexChanged.connect(self._update_card_notes)
         return page
@@ -714,6 +743,24 @@ class MeetingPage(QWidget):
         self._live_status.setWordWrap(True)
         self._live_status.hide()
         lay.addWidget(self._live_status)
+
+        self._live_find_bar = QWidget()
+        find_lay = QHBoxLayout(self._live_find_bar)
+        find_lay.setContentsMargins(0, 0, 0, 0)
+        self._live_find_edit = QLineEdit()
+        self._live_find_edit.setPlaceholderText("查找本场文字稿；按 Enter 查找下一处")
+        self._live_find_edit.setAccessibleName("查找本场文字稿")
+        self._live_find_edit.setClearButtonEnabled(True)
+        self._live_find_edit.textChanged.connect(lambda: self._find_live_text(restart=True))
+        self._live_find_edit.returnPressed.connect(self._find_live_text)
+        find_lay.addWidget(self._live_find_edit, 1)
+        self._live_find_status = QLabel()
+        find_lay.addWidget(self._live_find_status)
+        self._live_find_close_btn = QPushButton("关闭查找")
+        self._live_find_close_btn.clicked.connect(self._close_live_find)
+        find_lay.addWidget(self._live_find_close_btn)
+        self._live_find_bar.hide()
+        lay.addWidget(self._live_find_bar)
 
         self._live_split = QSplitter(Qt.Orientation.Horizontal)
         self._live_split.setChildrenCollapsible(False)
@@ -755,8 +802,13 @@ class MeetingPage(QWidget):
         self._user_notes_timer.timeout.connect(self._save_user_notes)
         self._user_notes.textChanged.connect(lambda: self._user_notes_timer.start())
         side_lay.addWidget(self._user_notes, 1)
-        side.setMinimumWidth(240)
-        self._live_split.addWidget(side)
+        self._live_side_scroll = QScrollArea()
+        self._live_side_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._live_side_scroll.setWidgetResizable(True)
+        self._live_side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._live_side_scroll.setMinimumWidth(240)
+        self._live_side_scroll.setWidget(side)
+        self._live_split.addWidget(self._live_side_scroll)
         self._live_split.setStretchFactor(0, 3)
         self._live_split.setStretchFactor(1, 2)
         lay.addWidget(self._live_split, 1)
@@ -770,7 +822,14 @@ class MeetingPage(QWidget):
         self._live_dl_btn.clicked.connect(self._download_aux_models)
         self._live_dl_btn.hide()
         actions.addWidget(self._live_dl_btn)
+        self._pause_btn = QPushButton("暂停采集")
+        self._pause_btn.setAccessibleName("暂停会议采集")
+        self._pause_btn.setToolTip("暂停期间不采集新音频；已录内容继续识别，会议记录保留。")
+        self._pause_btn.clicked.connect(self.pause_requested.emit)
+        actions.addWidget(self._pause_btn)
         self._resume_btn = QPushButton("继续采集")
+        self._resume_btn.setAccessibleName("继续会议采集")
+        self._resume_btn.setToolTip("继续采集新的会议音频。")
         self._resume_btn.clicked.connect(self.resume_requested.emit)
         self._resume_btn.hide()
         actions.addWidget(self._resume_btn)
@@ -822,7 +881,7 @@ class MeetingPage(QWidget):
             }}
             QLineEdit:focus {{ border: 2px solid {tok.ACCENT}; padding: 5px 11px; }}
         """
-        for edit in (self._search_edit, self._opt_title, self._opt_participants, self._mark_note):
+        for edit in (self._search_edit, self._opt_title, self._opt_participants, self._mark_note, self._live_find_edit):
             edit.setStyleSheet(edit_css)
         # Reads as a heading; the frame only appears once the user goes to edit it.
         self._detail_title.setStyleSheet(f"""
@@ -903,7 +962,8 @@ class MeetingPage(QWidget):
         for btn in (self._start_btn, self._card_start, self._mark_btn, self._resume_btn):
             btn.setStyleSheet(ss.BTN_ACCENT_SM)
         for btn in (self._generate_btn, self._edit_btn, self._copy_btn, self._export_btn, self._card_cancel,
-                    self._cancel_btn, self._correct_speaker_btn, self._return_notes_btn):
+                    self._cancel_btn, self._correct_speaker_btn, self._return_notes_btn, self._clear_search_btn,
+                    self._pause_btn, self._live_find_close_btn):
             btn.setStyleSheet(ss.BTN_GHOST_SM)
         no_indicator = "QPushButton::menu-indicator { image: none; width: 0px; }"
         self._more_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
@@ -924,6 +984,8 @@ class MeetingPage(QWidget):
         return [t for t in custom if isinstance(t, dict)]
 
     def refresh(self) -> None:
+        if self._stack.currentIndex() == PAGE_START:
+            self._sync_follow_source_label()
         if self._store.disabled:
             self._list_summary.setText("历史数据库不可用，会议记录无法保存")
             return
@@ -949,8 +1011,14 @@ class MeetingPage(QWidget):
                 self._list.setCurrentItem(item)
         self._list.blockSignals(False)
         count = len(records)
-        self._list_summary.setText(f"共 {count} 场会议" if count else "")
-        self._empty_label.setVisible(count == 0 and not self._search_query)
+        self._list_summary.setText(f"找到 {count} 场会议" if self._search_query else f"共 {count} 场会议")
+        self._empty_label.setText(
+            "未找到匹配的会议。\n试试其他关键词，或清除搜索查看全部会议。" if self._search_query else
+            "还没有会议记录。\n点击右上角「开始会议」，或从托盘菜单开始。"
+        )
+        self._empty_label.setVisible(count == 0)
+        self._list.setVisible(count > 0)
+        self._clear_search_btn.setVisible(count == 0 and bool(self._search_query))
         if keep and keep in self._records:
             self._render_detail()
         elif records:
@@ -960,6 +1028,7 @@ class MeetingPage(QWidget):
                 return
             self._detail_id = ""
             self._clear_detail()
+        self._detail_pane.setVisible(bool(records) or self._editing_notes)
 
     def _build_list_row(self, record: MeetingRecord) -> QWidget:
         row = QWidget()
@@ -976,8 +1045,43 @@ class MeetingPage(QWidget):
         return row
 
     def _perform_search(self) -> None:
+        if not self._save_notes_draft():
+            self._search_edit.blockSignals(True)
+            self._search_edit.setText(self._search_query)
+            self._search_edit.blockSignals(False)
+            return
         self._search_query = self._search_edit.text().strip()
         self.refresh()
+
+    def focus_search(self) -> None:
+        if self._stack.currentIndex() == PAGE_LIVE:
+            self._live_find_bar.show()
+            self._live_find_edit.setFocus()
+            self._live_find_edit.selectAll()
+        elif self._stack.currentIndex() == PAGE_START:
+            self._opt_title.setFocus()
+        else:
+            self._search_edit.setFocus()
+            self._search_edit.selectAll()
+
+    def _close_live_find(self) -> None:
+        self._live_find_bar.hide()
+        self._live_transcript.setFocus()
+
+    def _find_live_text(self, *, restart: bool = False) -> None:
+        query = self._live_find_edit.text()
+        view = self._live_transcript
+        if restart or not query:
+            cursor = view.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            view.setTextCursor(cursor)
+        found = bool(query) and view.find(query)
+        if query and not found and not restart:
+            cursor = view.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            view.setTextCursor(cursor)
+            found = view.find(query)
+        self._live_find_status.setText("未找到" if query and not found else "")
 
     def meeting_count(self) -> int:
         return self._list.count()
@@ -1028,6 +1132,7 @@ class MeetingPage(QWidget):
     def _clear_detail(self) -> None:
         self._save_notes_draft()
         self._detail_title.clear()
+        self._detail_title.setPlaceholderText("会议标题")
         self._detail_meta.clear()
         self._notes_state.clear()
         self._content_hint.hide()
@@ -1063,6 +1168,7 @@ class MeetingPage(QWidget):
 
         notes = self._store.get_notes(self._detail_id)
         generating = self._ctrl.generating_for == self._detail_id
+        another_generating = bool(self._ctrl.generating_for) and not generating
         from sayink.ui import settings_styles as ss
 
         has_notes = notes is not None and bool(notes.markdown)
@@ -1075,9 +1181,13 @@ class MeetingPage(QWidget):
         else:
             self._generate_btn.setText("重新生成" if has_notes else "生成纪要")
             self._generate_btn.setAccessibleName(self._generate_btn.text())
-            self._generate_btn.setToolTip("")
+            self._generate_btn.setToolTip(
+                "另一场会议正在生成，请等它结束或先取消" if another_generating else ""
+            )
         self._generate_btn.setStyleSheet(ss.BTN_GHOST_SM if has_notes and configured else ss.BTN_ACCENT_SM)
-        self._generate_btn.setEnabled(not generating and record.status != STATUS_LIVE)
+        self._generate_btn.setEnabled(
+            not generating and not another_generating and record.status != STATUS_LIVE
+        )
         self._restore_action.setEnabled(not generating and notes is not None and bool(notes.previous_markdown))
         self._cancel_btn.setVisible(generating)
         default_template = notes.template_id if notes is not None and notes.template_id else self._config.get("meeting.template_id", "general")
@@ -1328,6 +1438,11 @@ class MeetingPage(QWidget):
     def _generate(self) -> None:
         if not self._detail_id:
             return
+        if self._ctrl.generating_for and self._ctrl.generating_for != self._detail_id:
+            self._set_status("另一场会议正在生成，请等它结束或先取消")
+            return
+        if self._ctrl.generating_for == self._detail_id:
+            return
         if not minutes_settings_complete(self._config):
             self.configure_requested.emit()
             return
@@ -1567,7 +1682,9 @@ class MeetingPage(QWidget):
         if not self._save_notes_draft():
             return
         name = name.strip()
-        self._ctrl.rename_speaker(self._detail_id, speaker_id, name)
+        if self._ctrl.rename_speaker(self._detail_id, speaker_id, name) is None:
+            self._set_status("纪要生成中，请在完成后为说话人命名。")
+            return
         self._render_detail()
         self._set_status(f"已将说话人{speaker_id}改为「{name}」" if name else f"已恢复「说话人{speaker_id}」")
 
@@ -1583,7 +1700,8 @@ class MeetingPage(QWidget):
         self._opt_title.clear()
         self._opt_participants.clear()
         self._opt_agenda.clear()
-        index = self._opt_source.findData(defaults.input_source)
+        self._sync_follow_source_label()
+        index = self._opt_source.findData(self._config.get("meeting.input_source", "") or "")
         self._opt_source.setCurrentIndex(max(0, index))
         self._opt_model.blockSignals(True)
         self._opt_model.clear()
@@ -1600,6 +1718,12 @@ class MeetingPage(QWidget):
         self._start_btn.setVisible(False)
         self._stack.setCurrentIndex(PAGE_START)
         self._opt_title.setFocus()
+
+    def _sync_follow_source_label(self) -> None:
+        """The follow option names the dictation source; a card choice stays put."""
+        self._opt_source.setItemText(
+            0, f"跟随听写（当前：{input_source_label(audio_source(self._config))}）"
+        )
 
     def _update_card_notes(self) -> None:
         options = self._options_from_card()
@@ -1621,7 +1745,7 @@ class MeetingPage(QWidget):
             return
         label = f"下载辅助模型（约 {aux_models_size_mb(missing)} MB）" if missing else ""
         what = describe_aux_models(missing)
-        self._card_dl_btn.setToolTip(f"{what}：下载完成后本场会议即可区分说话人、使用 Silero 断句")
+        self._card_dl_btn.setToolTip(f"{what}：下载后按公共识别设置在开始时加载；实际状态可在公共识别查看")
         self._live_dl_btn.setToolTip(f"{what}：本场会议已按当前方式进行，下载后从下一场开始生效")
         for button in (self._card_dl_btn, self._live_dl_btn):
             button.setText(label)
@@ -1638,6 +1762,10 @@ class MeetingPage(QWidget):
             button.setEnabled(False)
             button.setText("下载中 0%")
 
+    def cancel_downloads(self) -> None:
+        """Cancel any in-progress helper-model download on app exit."""
+        self._aux_dl.cancel()
+
     def _on_aux_progress(self, pct: int) -> None:
         for button in (self._card_dl_btn, self._live_dl_btn):
             button.setText(f"下载中 {int(pct)}%")
@@ -1647,7 +1775,9 @@ class MeetingPage(QWidget):
             self.aux_models_changed.emit()
             if self._stack.currentIndex() == PAGE_START:
                 self._update_card_notes()
-                self._card_notes.setText("· 辅助模型已下载，本场会议将区分说话人并使用 Silero 断句。")
+                self._card_notes.setText(
+                    "· 辅助模型已下载，将按公共识别设置在开始时加载。\n" + self._card_notes.text()
+                )
                 self._card_notes.show()
             elif self._stack.currentIndex() == PAGE_LIVE:
                 self._live_caps.setText(f"{self._live_caps.text()} · 辅助模型已下载，下一场会议生效")
@@ -1666,7 +1796,7 @@ class MeetingPage(QWidget):
             title=self._opt_title.text().strip(),
             participants=self._opt_participants.text().strip(),
             agenda=self._opt_agenda.toPlainText().strip(),
-            input_source=str(self._opt_source.currentData() or defaults.input_source),
+            input_source=str(self._opt_source.currentData() or audio_source(self._config)),
             model_id=str(self._opt_model.currentData() or ""),
             glossary=defaults.glossary,
             vad=defaults.vad,
@@ -1679,25 +1809,35 @@ class MeetingPage(QWidget):
 
     def _start_from_card(self) -> None:
         options = self._options_from_card()
-        # Remember the picks that are preferences, not per-meeting facts.
-        self._config.set("meeting.input_source", options.input_source)
-        self._config.set("meeting.model_id", options.model_id)
-        self._config.set("stt.language", options.language)
+        # These are session overrides. Only Settings changes saved defaults.
         self.start_requested.emit(options)
 
     # ── live view ─────────────────────────────────────────────────
 
     def _enter_live(self) -> None:
         record = self._ctrl.current
+        meeting_id = record.id if record is not None else ""
+        if meeting_id != self._live_meeting_id:
+            self._live_meeting_id = meeting_id
+            self._live_html = ""
+            self._live_transcript.clear()
+            self._live_find_edit.clear()
+            self._live_find_bar.hide()
         self._live_title.setText(record.display_title if record is not None else "会议进行中")
         self._live_clock.setText(self._ctrl.elapsed_text())
         caps = self._ctrl.capabilities
         if caps is not None:
-            bits = [f"模型 {caps.model_id}", "Silero 断句" if caps.vad == "silero" else "能量断句"]
+            vad_label = "Silero VAD 已加载" if caps.vad == "silero" else "能量断句"
+            if caps.vad_error:
+                vad_label += "（Silero 加载失败，已回退）"
+            elif caps.vad_requested == "silero" and caps.vad == "energy":
+                vad_label += "（Silero 未下载）"
+            bits = [f"模型 {caps.model_id}", vad_label]
             bits.append("说话人模型" if caps.speaker_model_available else "说话人（粗略）")
             if caps.hotwords and caps.hotwords_supported:
                 bits.append("热词已启用")
-            self._live_caps.setText(" · ".join(bits))
+            self._live_caps.setToolTip(" · ".join(bits))
+            self._live_caps.setText("说话人区分已增强" if caps.speaker_model_available else "说话人区分较粗略")
         self._sync_aux_buttons()
         self._user_notes.blockSignals(True)
         self._user_notes.setPlainText(record.notes_user if record is not None else "")
@@ -1714,16 +1854,19 @@ class MeetingPage(QWidget):
             self._live_status.setText(f"采集已暂停：{self._ctrl.paused_detail or '等待继续'}")
             self._live_status.show()
             self._resume_btn.show()
+            self._pause_btn.hide()
             self._end_btn.setEnabled(True)
         elif state is MeetingState.DRAINING:
             self._live_status.setText("正在整理文字稿，请稍候…")
             self._live_status.show()
             self._resume_btn.hide()
+            self._pause_btn.hide()
             self._end_btn.setEnabled(False)
             self._mark_btn.setEnabled(False)
         else:
             self._live_status.hide()
             self._resume_btn.hide()
+            self._pause_btn.show()
             self._end_btn.setEnabled(True)
             self._mark_btn.setEnabled(True)
 
@@ -1757,10 +1900,20 @@ class MeetingPage(QWidget):
         segments = self._store.get_segments(meeting_id)
         names = self._ctrl.speaker_names(meeting_id)
         bar = self._live_transcript.verticalScrollBar()
+        cursor = self._live_transcript.textCursor()
+        position, anchor = cursor.position(), cursor.anchor()
+        scroll = bar.value()
         at_end = bar.value() >= bar.maximum() - 24
-        self._live_transcript.setHtml(self._transcript_html(transcript_lines(segments, started_at), names))
-        if at_end:
-            bar.setValue(bar.maximum())
+        rendered = self._transcript_html(transcript_lines(segments, started_at), names)
+        if rendered != self._live_html:
+            self._live_html = rendered
+            self._live_transcript.setHtml(rendered)
+            cursor = self._live_transcript.textCursor()
+            last = self._live_transcript.document().characterCount() - 1
+            cursor.setPosition(min(anchor, last))
+            cursor.setPosition(min(position, last), QTextCursor.MoveMode.KeepAnchor)
+            self._live_transcript.setTextCursor(cursor)
+            bar.setValue(bar.maximum() if at_end and position == anchor else scroll)
         marks = self._store.get_marks(meeting_id)
         self._marks_view.setHtml(
             "".join(

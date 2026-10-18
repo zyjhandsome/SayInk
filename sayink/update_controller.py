@@ -63,8 +63,10 @@ class UpdateController(QObject):
         self.state = UpdateState.IDLE
         self.pending_release = None
         self._interactive = False
+        self._check_status_visible = False
         self._check_worker = None
         self._download_worker = None
+        self._download_status: tuple[str, str] | None = None
 
     # ── Entry points ───────────────────────────────────
 
@@ -89,6 +91,10 @@ class UpdateController(QObject):
         from sayink.updater import UpdateCheckWorker
         from sayink.version import __version__
 
+        if self.state is UpdateState.DOWNLOADING:
+            if interactive:
+                self.sync_status()
+            return
         worker = self._check_worker
         if worker is not None and worker.isRunning():
             self._interactive = self._interactive or interactive
@@ -97,6 +103,8 @@ class UpdateController(QObject):
                 self.sync_status()
             return
         self._interactive = interactive
+        self._check_status_visible = False
+        self._download_status = None
         self.state = UpdateState.CHECKING
         if interactive:
             self.sync_status()
@@ -116,11 +124,11 @@ class UpdateController(QObject):
         if worker is not None and worker.isRunning():
             return
         if not release.sha256:
-            self._set_status(MISSING_DIGEST_MESSAGE, action="check")
+            self._set_download_status(MISSING_DIGEST_MESSAGE, action="check")
             return
         dest = Path(tempfile.gettempdir()) / "SayInk" / release.asset_name
         self.state = UpdateState.DOWNLOADING
-        self._set_status("正在下载…", action="busy")
+        self._set_download_status("正在下载…", action="busy")
         worker = UpdateDownloadWorker(
             release.asset_url,
             dest,
@@ -138,7 +146,11 @@ class UpdateController(QObject):
 
     def sync_status(self) -> None:
         """Re-paint the About page from the current state (e.g. when it opens)."""
-        if self.status_sink() is None or self.state is UpdateState.DOWNLOADING:
+        if self.status_sink() is None:
+            return
+        if self._download_status is not None:
+            text, action = self._download_status
+            self._set_status(text, action=action)
             return
         if self.state is UpdateState.AVAILABLE and self.pending_release is not None:
             self._set_status(f"发现 {self.pending_release.version}", action="install")
@@ -147,12 +159,18 @@ class UpdateController(QObject):
         elif self.state is UpdateState.ERROR:
             self._set_status("检查失败，请稍后再试", action="check")
         elif self.state is UpdateState.CHECKING:
+            self._check_status_visible = True
             self._set_status("正在检查…", action="busy")
 
     def _set_status(self, text: str, *, action: str) -> None:
         sink = self.status_sink()
         if sink is not None:
             sink.set_update_status(text, action=action)
+
+    def _set_download_status(self, text: str, *, action: str) -> None:
+        # Reopening About must retain progress and a failed download's reason.
+        self._download_status = (text, action)
+        self._set_status(text, action=action)
 
     def _remember_check(self) -> None:
         self._config.set("update.last_check_at", time.time())
@@ -174,7 +192,7 @@ class UpdateController(QObject):
     def on_check_failed(self, _message: str) -> None:
         self._remember_check()
         self.state = UpdateState.ERROR
-        if self._interactive:
+        if self._interactive or self._check_status_visible:
             self.sync_status()
 
     def on_download_progress(self, got: int, total: int) -> None:
@@ -184,11 +202,11 @@ class UpdateController(QObject):
             text = f"正在下载 {got_mb:.0f} / {total_mb:.0f} MB"
         else:
             text = f"正在下载 {got_mb:.0f} MB"
-        self._set_status(text, action="busy")
+        self._set_download_status(text, action="busy")
 
     def on_download_failed(self, message: str) -> None:
         self.state = UpdateState.AVAILABLE
-        self._set_status(message, action="install")
+        self._set_download_status(message, action="install")
 
     def on_downloaded(self, path: str) -> None:
         from sayink.updater import launch_installer
@@ -197,7 +215,7 @@ class UpdateController(QObject):
             return
         if not self._confirm_exit():
             self.state = UpdateState.AVAILABLE
-            self._set_status(
+            self._set_download_status(
                 "下载完成。请结束监听并等待处理完成，再安装更新。", action="install"
             )
             return
@@ -206,6 +224,6 @@ class UpdateController(QObject):
         except Exception as exc:
             log.warning("无法启动安装包: %s", exc)
             self.state = UpdateState.AVAILABLE
-            self._set_status("下载完成，但无法启动安装包", action="install")
+            self._set_download_status("下载完成，但无法启动安装包", action="install")
             return
         self._finish_quit()

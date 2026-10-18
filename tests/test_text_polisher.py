@@ -600,3 +600,31 @@ class TestTestConnectionRun:
                 "https://api.example.com/v1", "k", "m"
             )
         assert ok is True
+
+
+class TestPolishWorkerLifecycle:
+    def test_cancelled_worker_stays_retained_until_thread_finishes(self, monkeypatch):
+        """A running QThread dropped by cancel() would be destroyed during GC
+        and abort Qt; keep a reference until ``finished`` fires."""
+        import threading
+
+        from sayink.text_polisher import PolishWorker
+
+        release = threading.Event()
+        monkeypatch.setattr(PolishWorker, "run", lambda self: release.wait(2.0))
+
+        polisher = TextPolisher()
+        polisher.polish("需要润色", "https://api.example.com/v1", "k", "m")
+        worker = polisher._worker
+        assert worker is not None
+
+        polisher.cancel()
+        assert polisher._worker is None
+        assert worker in polisher._workers
+
+        release.set()
+        assert worker.wait(2000)
+        from PyQt6.QtCore import QCoreApplication
+
+        QCoreApplication.processEvents()
+        assert worker not in polisher._workers

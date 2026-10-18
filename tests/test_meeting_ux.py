@@ -8,7 +8,7 @@ from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtWidgets import QApplication, QDialog, QFileDialog
 
 from sayink.history_store import HistoryStore, SegmentRecord
-from sayink.meeting_session import MeetingController
+from sayink.meeting_session import MeetingController, MeetingOptions, resolve_capabilities
 from sayink.meeting_store import MeetingStore
 from sayink.ui.meeting_page import MeetingPage, notes_for_display
 
@@ -34,6 +34,147 @@ def meeting(config, tmp_path):
     page.deleteLater()
     controller.shutdown()
     history.close(timeout=2)
+
+
+def test_meeting_list_renders_on_an_ansi_code_page(config, tmp_path, ansi_locale):
+    history = HistoryStore(db_path=tmp_path / "meetings.db")
+    controller = MeetingController(config, history, pending_segments=lambda: 0)
+    record = controller.store.create_meeting()
+    controller.store.end_meeting(record.id, ended_at=record.started_at + 60_000)
+    controller.store.flush()
+    page = MeetingPage(config, controller)
+    try:
+        assert page.meeting_count() == 1
+        row_text = page._list.item(0).data(Qt.ItemDataRole.AccessibleTextRole)
+        assert row_text.splitlines()[0].endswith(" 会议")
+        assert " · 今天 " in row_text.splitlines()[1]
+    finally:
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_empty_search_explains_result_and_clears_old_details(meeting):
+    page, _controller, _history, record = meeting
+    page.show()
+    page._search_edit.setText("没有这场会议")
+    page._perform_search()
+    assert page.meeting_count() == 0
+    assert "找到 0 场" in page._list_summary.text()
+    assert "未找到" in page._empty_label.text()
+    assert page._empty_label.isVisible()
+    assert page._clear_search_btn.isVisible()
+    assert page._detail_pane.isHidden()
+    assert page._detail_title.placeholderText() == "会议标题"
+    page._clear_search_btn.click()
+    page._perform_search()
+    assert page.meeting_count() == 1
+    assert page.current_meeting_id == record.id
+    assert page._detail_pane.isVisible()
+    assert page._clear_search_btn.isHidden()
+
+
+def test_failed_draft_save_does_not_replace_search_results(meeting, monkeypatch):
+    page, controller, _history, record = meeting
+    page._toggle_edit()
+    page._notes_edit.setPlainText("尚未保存的草稿")
+    monkeypatch.setattr(controller, "save_user_markdown", lambda *_: False)
+    page._search_edit.setText("没有这场会议")
+    page._perform_search()
+    assert page.current_meeting_id == record.id
+    assert page._search_edit.text() == ""
+    assert page._notes_edit.toPlainText() == "尚未保存的草稿"
+    assert page._editing_notes
+
+
+def test_live_updates_preserve_selection_and_reading_position(meeting):
+    from PyQt6.QtGui import QTextCursor
+
+    page, controller, history, _record = meeting
+    options = MeetingOptions(title="实时核对", input_source="mixed")
+    caps = resolve_capabilities(page._config, options, dictation_model_id="funasr-nano")
+    record = controller.begin(options, caps)
+    page.resize(900, 600)
+    page.show()
+    for seq in range(30):
+        history.enqueue(SegmentRecord(record.id, seq, record.started_at + seq * 1000,
+            raw_text="核对之前的发言，不要跳回开头。" * 10, trigger_mode="meeting",
+            captured_at=record.started_at + seq * 1000))
+    history.flush()
+    page._render_live()
+    QApplication.processEvents()
+    view = page._live_transcript
+    cursor = view.textCursor()
+    cursor.setPosition(200)
+    cursor.setPosition(220, QTextCursor.MoveMode.KeepAnchor)
+    view.setTextCursor(cursor)
+    view.verticalScrollBar().setValue(60)
+    selection = view.textCursor().selectedText()
+    assert selection
+    assert view.verticalScrollBar().value() == 60
+    history.enqueue(SegmentRecord(record.id, 30, record.started_at + 30_000,
+        raw_text="新发言", trigger_mode="meeting", captured_at=record.started_at + 30_000))
+    history.flush()
+    page._render_live()
+    assert view.textCursor().selectedText() == selection
+    assert view.verticalScrollBar().value() == 60
+    cursor.clearSelection()
+    view.setTextCursor(cursor)
+    view.verticalScrollBar().setValue(view.verticalScrollBar().maximum())
+    history.enqueue(SegmentRecord(record.id, 31, record.started_at + 31_000,
+        raw_text="继续跟随新发言", trigger_mode="meeting", captured_at=record.started_at + 31_000))
+    history.flush()
+    page._render_live()
+    assert view.verticalScrollBar().value() == view.verticalScrollBar().maximum()
+
+
+def test_find_live_transcript_keeps_meeting_recording(meeting):
+    page, controller, history, _record = meeting
+    options = MeetingOptions(title="实时查找")
+    record = controller.begin(options, resolve_capabilities(page._config, options, dictation_model_id="funasr-nano"))
+    history.enqueue(SegmentRecord(record.id, 0, record.started_at,
+        raw_text="确认发布范围，然后确认测试结果。", trigger_mode="meeting"))
+    history.flush()
+    page.show()
+    page._render_live()
+    page.focus_search()
+    assert page._live_find_bar.isVisible()
+    page._live_find_edit.setText("确认")
+    first = page._live_transcript.textCursor().selectionStart()
+    assert page._live_transcript.textCursor().selectedText() == "确认"
+    page._find_live_text()
+    assert page._live_transcript.textCursor().selectionStart() > first
+    page._find_live_text()
+    assert page._live_transcript.textCursor().selectionStart() == first
+    page._live_find_edit.setText("不存在")
+    assert page._live_find_status.text() == "未找到"
+    assert controller.is_active
+    page._close_live_find()
+    assert page._live_find_bar.isHidden()
+
+
+def test_meeting_pause_action_and_user_facing_status(meeting):
+    page, controller, _history, _record = meeting
+    options = MeetingOptions()
+    caps = resolve_capabilities(page._config, options, dictation_model_id="funasr-nano")
+    controller.begin(options, caps)
+    page.show()
+    requested = []
+    page.pause_requested.connect(lambda: requested.append(True))
+    assert page._pause_btn.isVisible()
+    page._pause_btn.click()
+    assert requested == [True]
+    assert "funasr" not in page._live_caps.text()
+    assert "Silero" not in page._live_caps.text()
+    assert "funasr" in page._live_caps.toolTip()
+    controller.pause("你已暂停采集")
+    assert page._pause_btn.isHidden()
+    assert page._resume_btn.isVisible()
+    assert page._resume_btn.accessibleName() == "继续会议采集"
+    assert page._resume_btn.toolTip()
+    controller.resume()
+    assert page._pause_btn.isVisible()
+    assert page._resume_btn.isHidden()
 
 
 def test_copy_tracks_tab_and_works_without_minutes(meeting, monkeypatch):
@@ -202,6 +343,20 @@ def test_generation_locks_edit_template_and_restore_then_unlocks_on_failure(meet
     controller._on_generation_error("本次结果未保存")
     assert page._template_combo.isEnabled() and page._edit_btn.isEnabled()
     assert page._restore_action.isEnabled() and page._generate_btn.isEnabled()
+
+
+def test_generate_stays_disabled_while_another_meeting_is_generating(meeting):
+    page, controller, _history, record = meeting
+    other = controller.store.create_meeting(title="另一场")
+    controller.store.end_meeting(other.id)
+    controller.store.flush()
+    controller._generating_for = other.id
+    page._render_detail()
+    assert page.current_meeting_id == record.id
+    assert not page._generate_btn.isEnabled()
+    assert "另一场" in page._generate_btn.toolTip()
+    assert page._edit_btn.isEnabled()
+    assert not page._cancel_btn.isVisible()
 
 
 def test_switching_meeting_saves_draft_to_its_original_record(meeting):

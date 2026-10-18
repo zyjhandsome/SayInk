@@ -122,13 +122,37 @@ class TestWelcome:
         ctl.show_welcome()
 
         assert [t for t, _ in box.last.buttons] == ["知道了"]
-        assert "语音模型已就绪" in box.last.text
+        assert "语音模型已下载" in box.last.text
         assert ctl.opened == []
+
+    def test_missing_model_text_quotes_the_registry_size(self):
+        from sayink.speech_recognizer import DEFAULT_MODEL_ID, get_model_info
+
+        info = get_model_info(DEFAULT_MODEL_ID)
+        text = _controller(_Config()).welcome_text(model_missing=True)
+        assert f"{info['name']}（约 {info['size_mb']} MB，仅需一次）" in text
 
     def test_text_follows_trigger_mode(self):
         cfg = _Config(hotkey="alt+x")
-        assert "按住说话" in _controller(cfg).welcome_text(model_missing=False)
+        assert "单次转写" in _controller(cfg).welcome_text(model_missing=False)
         assert "自动持续转写" in _controller(cfg, continuous=True).welcome_text(model_missing=False)
+
+    def test_text_follows_source_output_and_escape_preference(self):
+        cfg = _Config(hotkey="ctrl+shift+z")
+        cfg.set("audio.input_source", "system")
+        cfg.set("output.mode", "history")
+        cfg.set("history.enabled", False)
+        text = _controller(cfg).welcome_text(model_missing=False)
+        assert "单次转写" in text
+        assert "结果当前不会保存" in text
+        assert "偏好" not in text
+        assert "Alt+X" not in text
+        cfg.set("audio.esc_stops_continuous", False)
+        cfg.set("history.enabled", True)
+        text = _controller(cfg, continuous=True).welcome_text(model_missing=False)
+        assert "结果仅保存到「历史」" in text
+        assert "Esc" not in text
+        assert "松开后继续录制" in text
 
     def test_is_scheduled_once_even_if_ready_and_fallback_both_fire(self):
         cfg = _Config(first_run_welcome_seen=False)

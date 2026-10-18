@@ -125,7 +125,8 @@ class TestDownload:
         body = b"installer-bytes"
 
         class _Response:
-            headers = {"Content-Length": str(len(body))}
+            def __init__(self):
+                self.headers = {"Content-Length": str(len(body))}
 
             def read(self, _n):
                 return self._buf.read(_n)
@@ -154,7 +155,8 @@ class TestDownload:
 
 def _response(body: bytes, length: int | None = None):
     class _Response:
-        headers = {"Content-Length": str(len(body) if length is None else length)}
+        def __init__(self):
+            self.headers = {"Content-Length": str(len(body) if length is None else length)}
 
         def read(self, n):
             return self._buf.read(n)

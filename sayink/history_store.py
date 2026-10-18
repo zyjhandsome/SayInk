@@ -720,9 +720,16 @@ class HistoryStore:
         if not session_ids:
             return
         placeholders = ",".join("?" for _ in session_ids)
+        # Meeting transcripts share this table. A history delete must not orphan
+        # a meeting by removing its rows, even if a caller passes the meeting id.
         conn.execute(
-            f"DELETE FROM history WHERE session_id IN ({placeholders})",
-            session_ids,
+            f"""
+            DELETE FROM history
+            WHERE session_id IN ({placeholders})
+              AND trigger_mode != ?
+              AND session_id NOT IN ({_PROTECTED_SESSIONS_SQL})
+            """,
+            (*session_ids, MEETING_TRIGGER_MODE),
         )
         conn.commit()
 

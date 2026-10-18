@@ -155,6 +155,19 @@ def paste_env(monkeypatch):
 
 
 class TestPasteAsyncFlow:
+    def test_cancel_drops_a_shortcut_that_has_not_been_sent(self, paste_env, monkeypatch):
+        paste_env["set_foreground"]([(1234, "Editor", 1)])
+        pending = []
+        monkeypatch.setattr(tp.QTimer, "singleShot", lambda ms, fn: pending.append(fn))
+        paster = TextPaster()
+        results = []
+        paster.paste_async("还没发出", results.append)
+        paster.cancel()
+        for fn in pending:
+            fn()
+        assert paste_env["shortcut_calls"] == 0
+        assert results == []
+
     def test_verified_paste_returns_pasted(self, paste_env):
         # Same foreground window before and after → verified paste.
         paste_env["set_foreground"]([(1234, "Notepad", 4242)])

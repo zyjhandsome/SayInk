@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import re
 import shutil
@@ -343,7 +344,7 @@ def merge_slice_texts(parts: list[str], max_overlap_chars: int = 12) -> str:
             # letter for letter (两百个 / 两白个). Tolerate one mismatch per
             # five characters, but only for overlaps long enough that two
             # genuinely different phrases (前十五秒 / 后十五秒) cannot collide.
-            if size >= FUZZY_OVERLAP_MIN_CHARS and sum(a != b for a, b in zip(head, tail)) <= size // 5:
+            if size >= FUZZY_OVERLAP_MIN_CHARS and sum(a != b for a, b in zip(head, tail, strict=True)) <= size // 5:
                 cut = size
                 break
         merged += piece[cut:]
@@ -387,6 +388,11 @@ def download_endpoints(source: str) -> tuple[str, ...]:
 # ``supports`` lists the per-model knobs the meeting mode can use
 # (docs/meeting-notes-design.md §5.8): "hotwords" (glossary injected into the
 # decoder prompt) and "language" (lock the transcription language).
+#
+# ``revision`` pins downloads to one commit of ``hf_repo`` and ``sha256`` is
+# checked for every file, so a later push to a (third-party) repository or a
+# mirror serving other bytes cannot change what users install. Moving to a new
+# upload means updating both.
 
 SUPPORTS_HOTWORDS = "hotwords"
 SUPPORTS_LANGUAGE = "language"
@@ -403,6 +409,11 @@ MODEL_REGISTRY = [
         "loader": "sense_voice",
         "hf_repo": "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
         "dir_name": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+        "revision": "2365baeacb507f821a0c8120fcee3d484dba7a07",
+        "sha256": {
+            "model.int8.onnx": "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51",
+            "tokens.txt": "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc",
+        },
         "files": ["model.int8.onnx", "tokens.txt"],
         "supports": (SUPPORTS_LANGUAGE,),
     },
@@ -417,6 +428,11 @@ MODEL_REGISTRY = [
         "loader": "paraformer",
         "hf_repo": "csukuangfj/sherpa-onnx-paraformer-zh-2024-03-09",
         "dir_name": "sherpa-onnx-paraformer-zh-2024-03-09",
+        "revision": "906992d326ebf0c5171cde675aa0902be9e5bc6c",
+        "sha256": {
+            "model.int8.onnx": "90bc03034ae1bef9575f8cc798cd1519c8be8aa9e8b458a033e32017ff4d584c",
+            "tokens.txt": "6c0e3b35cece259829e6cb5b8d90d13db88f61ea3a2953d11898e4b2bfd7a2e2",
+        },
         "files": ["model.int8.onnx", "tokens.txt"],
     },
     {
@@ -430,6 +446,11 @@ MODEL_REGISTRY = [
         "loader": "fire_red_asr_ctc",
         "hf_repo": "csukuangfj2/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25",
         "dir_name": "sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25",
+        "revision": "423be1acfdc5d8aaa5a485fb6263fe4ea8570b06",
+        "sha256": {
+            "model.int8.onnx": "ca3dbabd82170110cc0b343c2890866d449984bc9cd92b9a18371ff80a81bb99",
+            "tokens.txt": "1bc613de2112d257e61a349c3e72d1b1a9cf19c33d3ca954197ad2171e5ea07b",
+        },
         "files": ["model.int8.onnx", "tokens.txt"],
     },
     {
@@ -443,6 +464,11 @@ MODEL_REGISTRY = [
         "loader": "paraformer",
         "hf_repo": "csukuangfj/sherpa-onnx-paraformer-trilingual-zh-cantonese-en",
         "dir_name": "sherpa-onnx-paraformer-trilingual-zh-cantonese-en",
+        "revision": "8d90151338178bb433354c9fb677bd3acb8023cd",
+        "sha256": {
+            "model.int8.onnx": "eb3cdd288f535cf73258f491cdd7d68ad5a00aee135c0bba4c0884ea8d926144",
+            "tokens.txt": "8e4593d7a2eb2404ff82976b5494265e9a06283ca4d5e8605bf7b4fed557a492",
+        },
         "files": ["model.int8.onnx", "tokens.txt"],
     },
     {
@@ -456,6 +482,12 @@ MODEL_REGISTRY = [
         "loader": "fire_red_asr",
         "hf_repo": "csukuangfj2/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26",
         "dir_name": "sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26",
+        "revision": "374cff185e952c40fcf2f6da972a3b6cf340608d",
+        "sha256": {
+            "encoder.int8.onnx": "54048d66b6e8f3c80ea7ce95efe794587b0fd81d7271651d0decd3803852ae82",
+            "decoder.int8.onnx": "b840ce7196ae4a14d05ae84bbf56082b6b61ccec5610fda907dddbcea37354ff",
+            "tokens.txt": "1bc613de2112d257e61a349c3e72d1b1a9cf19c33d3ca954197ad2171e5ea07b",
+        },
         "files": ["encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt"],
     },
     {
@@ -469,6 +501,11 @@ MODEL_REGISTRY = [
         "loader": "zipformer_ctc",
         "hf_repo": "csukuangfj/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03",
         "dir_name": "sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03",
+        "revision": "d5f3d5789fb467496dbef554e3fb6f177a65bc5a",
+        "sha256": {
+            "model.int8.onnx": "e291b9c468b651e2697caa09bc684326c3addc6a019e78eb537cfd1a8248ca07",
+            "tokens.txt": "6fed8c6c248516f38e7faa19404b57413e8ce259f1cbc1fa4aebc86eac32fdfd",
+        },
         "files": ["model.int8.onnx", "tokens.txt"],
     },
     {
@@ -482,6 +519,15 @@ MODEL_REGISTRY = [
         "loader": "qwen3_asr",
         "hf_repo": "csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25",
         "dir_name": "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25",
+        "revision": "68818b2313fe77bd06f6a7c5068ff3ef59d02b8a",
+        "sha256": {
+            "conv_frontend.onnx": "d22dc4423e0940e49884e903d2ea2f7e5567c14fc1aed97e4e26d6b8f208ef9e",
+            "encoder.int8.onnx": "60748d3e6744a57c9c91e1b17424a6c2990567e8adceb0783940c03ed98fa9d9",
+            "decoder.int8.onnx": "4f6885be5959ae26af3089d38ee7972c5fafbeeb1cf8d5e76eab6d8b61ca5771",
+            "tokenizer/vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+            "tokenizer/merges.txt": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+            "tokenizer/tokenizer_config.json": "4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c",
+        },
         "files": [
             "conv_frontend.onnx",
             "encoder.int8.onnx",
@@ -503,6 +549,15 @@ MODEL_REGISTRY = [
         "loader": "qwen3_asr",
         "hf_repo": "ilmina/qwen3-asr-1.7b-sherpa-onnx",
         "dir_name": "sherpa-onnx-qwen3-asr-1.7B-int8-2026-03-25",
+        "revision": "66fb5ea2d4d1682ff8a663bf7e788913604996a0",
+        "sha256": {
+            "conv_frontend.onnx": "fa894a4ba53da6a4238f2a6ca0b09362e505d39cecbd646051b033e2e8d7e2fb",
+            "encoder.int8.onnx": "436fbd910a0c8914851e5ac1354e807be9f283d08a5da728adaa609731c41469",
+            "decoder.int8.onnx": "c43c853fa6e97d08365cb8a5502b360b595cd43c00dc60e4d8ca7cc18cad460b",
+            "tokenizer/vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+            "tokenizer/merges.txt": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+            "tokenizer/tokenizer_config.json": "4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c",
+        },
         "files": [
             "conv_frontend.onnx",
             "encoder.int8.onnx",
@@ -524,6 +579,15 @@ MODEL_REGISTRY = [
         "loader": "funasr_nano",
         "hf_repo": "csukuangfj/sherpa-onnx-funasr-nano-int8-2025-12-30",
         "dir_name": "sherpa-onnx-funasr-nano-int8-2025-12-30",
+        "revision": "6f16bd378457e13f36ccf3910df9017f96c346fb",
+        "sha256": {
+            "encoder_adaptor.int8.onnx": "f36dea2e30fbc33b5db1d7a7265cc976c5e5586c77b042d5adb1ad27c72db422",
+            "llm.int8.onnx": "dfbf9aa3be41bccc257587f151e15c63fbe1b549f2b517f5ccd5bdce3bf4322a",
+            "embedding.int8.onnx": "95e61cd0c9c3b9543339a4cf973c95c116815e745ccc1e0285cbd81f76d18644",
+            "Qwen3-0.6B/vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+            "Qwen3-0.6B/merges.txt": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+            "Qwen3-0.6B/tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        },
         "files": [
             "encoder_adaptor.int8.onnx",
             "llm.int8.onnx",
@@ -544,24 +608,32 @@ AUX_MODEL_REGISTRY = [
     {
         "id": AUX_MODEL_SPEAKER,
         "name": "说话人嵌入 CAM++",
-        "description": "3D-Speaker CAM++ 中英声纹模型，会议中区分说话人",
+        "description": "3D-Speaker CAM++ 中英声纹模型，连续转录与会议共用的说话人增强",
         "languages": "中/英",
         "size_mb": 28,
         "loader": "speaker_embedding",
         "hf_repo": "csukuangfj/speaker-embedding-models",
         "dir_name": "3dspeaker-campplus-zh-en",
+        "revision": "0743f301363dec56491a490f6d6cbc9d67f9a3bf",
+        "sha256": {
+            "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx": "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
+        },
         "files": ["3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"],
         "aux": True,
     },
     {
         "id": AUX_MODEL_SILERO_VAD,
         "name": "Silero VAD",
-        "description": "神经网络语音活动检测，会议中更稳的断句",
+        "description": "神经网络语音活动检测，单次转录、连续转录与会议共用的断句能力",
         "languages": "通用",
         "size_mb": 2,
         "loader": "silero_vad",
         "hf_repo": "csukuangfj/vad",
         "dir_name": "silero-vad",
+        "revision": "fba88cd2e921609e7675c3aaf51e0b9b295da4bc",
+        "sha256": {
+            "silero_vad.onnx": "a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28",
+        },
         "files": ["silero_vad.onnx"],
         "aux": True,
     },
@@ -621,8 +693,10 @@ def effective_language(language: str) -> str:
 def recognition_params(config) -> tuple[str, str]:
     """``(hotwords, language)`` for :meth:`SpeechRecognizer.configure` from the
     shared ``stt.glossary`` / ``stt.language`` settings."""
-    glossary = config.get("stt.glossary", []) or []
-    return format_hotwords(glossary), effective_language(str(config.get("stt.language", "auto") or "auto"))
+    from sayink.recognition_settings import RecognitionSettings
+
+    shared = RecognitionSettings.from_config(config)
+    return shared.hotwords, shared.effective_language
 
 
 MAX_HOTWORDS = 50
@@ -645,6 +719,27 @@ def format_hotwords(glossary) -> str:
         if len(seen) >= MAX_HOTWORDS:
             break
     return ",".join(seen)
+
+
+def restore_glossary_case(text: str, glossary) -> str:
+    """Spell glossary terms the way the glossary does.
+
+    Some models only know one case for English (FireRedASR2 says ``GITHUB``),
+    and models without hotword support never see the glossary at all. A whole
+    word that matches a term case-insensitively takes the term's spelling;
+    longer terms win, so ``code`` does not re-case ``Visual Studio Code``.
+    """
+    spelling: dict[str, str] = {}
+    for entry in glossary or ():
+        term = entry.get("term", "") if isinstance(entry, dict) else entry
+        term = str(term or "").strip()
+        if re.search(r"[A-Za-z]", term):
+            spelling.setdefault(term.lower(), term)
+    if not text or not spelling:
+        return text
+    alternatives = "|".join(re.escape(t) for t in sorted(spelling.values(), key=len, reverse=True))
+    pattern = re.compile(rf"(?<![A-Za-z])(?:{alternatives})(?![A-Za-z])", re.IGNORECASE)
+    return pattern.sub(lambda m: spelling.get(m.group(0).lower(), m.group(0)), text)
 
 
 _custom_models_dir: Path | None = None
@@ -723,6 +818,26 @@ def get_model_dir(model_id: str) -> Path:
     if not info:
         raise ValueError(f"未知模型: {model_id}")
     return _get_models_dir() / info["dir_name"]
+
+
+def model_file_url(endpoint: str, info: dict, filename: str) -> str:
+    return f"{endpoint}/{info['hf_repo']}/resolve/{info['revision']}/{filename}"
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def mismatched_model_files(info: dict, folder: Path) -> list[str]:
+    """Files of ``info`` under ``folder`` that are missing or differ from the pins."""
+    return [
+        name for name in info["files"]
+        if not (folder / name).is_file() or file_sha256(folder / name) != info["sha256"][name]
+    ]
 
 
 _LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/"
@@ -821,6 +936,10 @@ class IncompleteDownloadError(IOError):
     pass
 
 
+class ChecksumMismatchError(IOError):
+    pass
+
+
 class ModelDownloadWorker(QThread):
     """Downloads model files from HuggingFace (or a mirror)."""
     progress = pyqtSignal(int)
@@ -855,11 +974,14 @@ class ModelDownloadWorker(QThread):
         else:
             self._emit_pct(int((index + file_fraction) / total_files * 100))
 
-    def _download_file(self, url: str, target: Path, index: int, total_files: int) -> None:
+    def _download_file(
+        self, url: str, target: Path, index: int, total_files: int, expected_sha256: str
+    ) -> None:
         import httpx
 
         tmp_path = target.with_name(target.name + ".tmp")
         try:
+            digest = hashlib.sha256()
             with httpx.stream("GET", url, timeout=60.0, follow_redirects=True) as resp:
                 resp.raise_for_status()
                 total = int(resp.headers.get("content-length", 0))
@@ -869,6 +991,7 @@ class ModelDownloadWorker(QThread):
                         if self._cancelled:
                             raise _DownloadCancelled()
                         f.write(chunk)
+                        digest.update(chunk)
                         downloaded += len(chunk)
                         fraction = downloaded / total if total > 0 else 0.0
                         self._emit_progress(index, total_files, fraction, downloaded)
@@ -878,6 +1001,8 @@ class ModelDownloadWorker(QThread):
                 )
             if downloaded == 0:
                 raise IncompleteDownloadError(f"{target.name} 为空文件")
+            if digest.hexdigest() != expected_sha256:
+                raise ChecksumMismatchError(f"{target.name} 校验失败：内容与固定版本不一致")
             tmp_path.replace(target)
         finally:
             if tmp_path.exists():
@@ -913,10 +1038,10 @@ class ModelDownloadWorker(QThread):
 
                 last_err: Exception | None = None
                 for endpoint in self._endpoints:
-                    url = f"{endpoint}/{info['hf_repo']}/resolve/main/{filename}"
+                    url = model_file_url(endpoint, info, filename)
                     log.info("下载: %s", url)
                     try:
-                        self._download_file(url, target, i, total_files)
+                        self._download_file(url, target, i, total_files, info["sha256"][filename])
                         self._done_bytes += target.stat().st_size
                         last_err = None
                         break

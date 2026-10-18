@@ -244,17 +244,30 @@ def test_listen_bar_is_thin_without_extra_actions(win):
     assert not hasattr(win, "_settings_btn")
 
 
+def test_end_action_respects_esc_preference_and_preserves_meeting_semantics(win):
+    win.set_esc_stops_continuous(False)
+    win.show_listening()
+    assert "Esc" not in win._end_btn.toolTip()
+    assert "继续识别" in win._end_btn.toolTip()
+    win.show_meeting()
+    win.set_esc_stops_continuous(True)
+    assert win._end_btn.accessibleName() == "结束会议"
+    assert "Esc" not in win._end_btn.toolTip()
+    win.end_meeting_state()
+    assert "Esc" in win._end_btn.toolTip()
+
+
 def test_hold_bar_stays_put_until_the_key_is_released(win):
     from sayink.ui.design_tokens import STATE_RECORD
 
     win.show_recording()
     held_height = win.height()
-    assert "松开结束" in win._text_label.text()
+    assert "松开识别" in win._text_label.text()
 
     win.show_recognizing()
     assert win.height() == held_height
     assert win._status_label.text() == "录音中"
-    assert "松开结束" in win._text_label.text()
+    assert "松开识别" in win._text_label.text()
     assert STATE_RECORD.lower() in win._status_label.styleSheet().lower()
 
     win.show_live_transcript("开头" + "啊" * 40 + "这句还在")
@@ -281,7 +294,7 @@ def test_hold_bar_switches_to_recognizing_once_the_key_is_released(win):
     win.show_recording()
     win.end_capture()
     assert win._status_label.text() == "正在识别"
-    assert "松开结束" not in win._text_label.text()
+    assert "松开识别" not in win._text_label.text()
     assert STATE_RECOGNIZE.lower() in win._status_label.styleSheet().lower()
     assert not win._dot._timer.isActive()
     assert not win._waveform.isVisible()
@@ -316,14 +329,14 @@ def test_end_capture_is_a_noop_outside_a_hold(win):
     win.end_capture()
     win.show_recording()
     assert win._capture_released is False
-    assert "松开结束" in win._text_label.text()
+    assert "松开识别" in win._text_label.text()
 
 
 def test_hold_recording_shows_live_transcript(win):
     win.show_recording()
     win.show_live_transcript("开头" + "啊" * 80 + "这句还在")
     assert "这句还在" in win._text_label.text()
-    assert "松开结束" not in win._text_label.text()
+    assert "松开识别" not in win._text_label.text()
     assert win._waveform.isVisible()
     assert win._waveform.width() <= 40
 

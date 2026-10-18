@@ -27,7 +27,7 @@ class TestBuildRecordingPlan:
         fake_mic = ad.AudioDeviceInfo(0, "Mic", "WASAPI", 16000, 1, False, False)
 
         monkeypatch.setattr(ad, "list_microphone_devices", lambda: [fake_mic])
-        monkeypatch.setattr(ad, "list_system_capture_devices", lambda: [])
+        monkeypatch.setattr(ad, "list_system_capture_devices", list)
         monkeypatch.setattr(ad, "pick_default_microphone", lambda: fake_mic)
         monkeypatch.setattr(ad, "pick_default_system_capture", lambda: None)
 
@@ -87,8 +87,8 @@ class TestBuildRecordingPlan:
     def test_system_missing_raises(self, monkeypatch):
         from sayink import audio_devices as ad
 
-        monkeypatch.setattr(ad, "list_microphone_devices", lambda: [])
-        monkeypatch.setattr(ad, "list_system_capture_devices", lambda: [])
+        monkeypatch.setattr(ad, "list_microphone_devices", list)
+        monkeypatch.setattr(ad, "list_system_capture_devices", list)
         monkeypatch.setattr(ad, "pick_default_microphone", lambda: None)
         monkeypatch.setattr(ad, "pick_default_system_capture", lambda: None)
 
@@ -100,7 +100,7 @@ class TestBuildRecordingPlan:
         from sayink import audio_devices as ad
 
         fake_sys = ad.AudioDeviceInfo(17, "Speakers [Loopback]", "WASAPI", 48000, 4, True, True)
-        monkeypatch.setattr(ad, "list_microphone_devices", lambda: [])
+        monkeypatch.setattr(ad, "list_microphone_devices", list)
         monkeypatch.setattr(ad, "list_system_capture_devices", lambda: [fake_sys])
         monkeypatch.setattr(ad, "pick_default_microphone", lambda: None)
         monkeypatch.setattr(ad, "pick_default_system_capture", lambda: fake_sys)
@@ -116,7 +116,7 @@ class TestBuildRecordingPlan:
 
         fake_mic = ad.AudioDeviceInfo(0, "Mic", "WASAPI", 16000, 1, False, False)
         monkeypatch.setattr(ad, "list_microphone_devices", lambda: [fake_mic])
-        monkeypatch.setattr(ad, "list_system_capture_devices", lambda: [])
+        monkeypatch.setattr(ad, "list_system_capture_devices", list)
         monkeypatch.setattr(ad, "pick_default_microphone", lambda: fake_mic)
         monkeypatch.setattr(ad, "pick_default_system_capture", lambda: None)
 

@@ -116,3 +116,36 @@ def test_cancel_reports_cancelled(monkeypatch):
 
 def test_registry_models_are_all_aux():
     assert all(m.get("aux") for m in AUX_MODEL_REGISTRY)
+
+
+def test_running_qthread_worker_stays_retained_until_finished(monkeypatch):
+    """When ``error`` fires just before ``run()`` returns, dropping the sole
+    reference to a running QThread aborts Qt if GC runs in between."""
+    import threading
+    from PyQt6.QtCore import QCoreApplication
+    from sayink.speech_recognizer import ModelDownloadWorker
+
+    monkeypatch.setattr("sayink.aux_models.is_model_downloaded", lambda mid: False)
+    release = threading.Event()
+
+    def slow_error(self):
+        self.error.emit("HTTP 503")
+        release.wait(2.0)
+
+    monkeypatch.setattr(ModelDownloadWorker, "run", slow_error)
+    batch = AuxModelDownloads()
+    assert batch.start([AUX_MODEL_SILERO_VAD]) is True
+    worker = batch._worker
+    assert isinstance(worker, ModelDownloadWorker)
+
+    deadline = threading.Event()
+    batch.finished.connect(lambda _ok, _msg: deadline.set())
+    while not deadline.is_set():
+        QCoreApplication.processEvents()
+
+    assert batch._worker is None
+    assert worker in batch._workers
+    release.set()
+    assert worker.wait(2000)
+    QCoreApplication.processEvents()
+    assert worker not in batch._workers

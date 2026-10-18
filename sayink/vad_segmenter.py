@@ -1,10 +1,9 @@
-"""Speech segmentation for continuous listening / meeting mode.
+"""Shared speech segmentation for hold-to-talk, continuous listening and meetings.
 
 The segmenter decides *where* an utterance starts and ends from a per-block
-"is this speech?" verdict. By default that verdict is the adaptive RMS gate
-(:class:`EnergyGate`, the behaviour dictation has always had); meeting mode
-can swap in :class:`SileroGate`, a neural VAD, which tells a quiet talker
-from a fan and a keyboard from a word (docs/meeting-notes-design.md §5.8).
+"is this speech?" verdict. All modes can use :class:`SileroGate`; the adaptive
+RMS :class:`EnergyGate` remains the fallback when its model is unavailable.
+Pause durations are mode-specific while the detection algorithm is shared.
 """
 
 from __future__ import annotations
@@ -84,6 +83,7 @@ class SpeechGate:
     """Per-block speech verdict used by :class:`SpeechSegmenter`."""
 
     name = "gate"
+    fallback_reason = ""
 
     def is_speech(self, block: np.ndarray, rms: float, *, in_speech: bool) -> bool:
         raise NotImplementedError
@@ -131,6 +131,8 @@ class SileroGate(SpeechGate):
         config.sample_rate = TARGET_SAMPLE_RATE
         config.num_threads = int(num_threads)
         self._model = sherpa_onnx.VadModel.create(config)
+        if self._model is None:
+            raise RuntimeError("Silero VAD 模型未能载入")
         # A property in older sherpa-onnx builds, a method in 1.13.x.
         window = getattr(self._model, "window_size", SILERO_WINDOW)
         if callable(window):
@@ -169,10 +171,13 @@ def make_speech_gate(kind: str, segmenter: "SpeechSegmenter", *, model_path: str
     if kind == VAD_SILERO and model_path:
         try:
             gate = SileroGate(model_path)
-            log.info("会议 VAD: Silero (%s)", model_path)
+            log.info("公共 VAD: Silero (%s)", model_path)
             return gate
         except Exception as exc:  # sherpa_onnx missing, model file bad, …
             log.warning("Silero VAD 不可用，改用能量门限: %s", exc)
+            gate = EnergyGate(segmenter)
+            gate.fallback_reason = str(exc)
+            return gate
     return EnergyGate(segmenter)
 
 

@@ -10,35 +10,35 @@ class FlowLayout(QLayout):
         self._items: list[QLayoutItem] = []
         self.setSpacing(spacing)
 
-    def addItem(self, item: QLayoutItem) -> None:  # noqa: N802 - Qt override
+    def addItem(self, item: QLayoutItem) -> None:
         self._items.append(item)
 
     def count(self) -> int:
         return len(self._items)
 
-    def itemAt(self, index: int) -> QLayoutItem | None:  # noqa: N802 - Qt override
+    def itemAt(self, index: int) -> QLayoutItem | None:
         return self._items[index] if 0 <= index < len(self._items) else None
 
-    def takeAt(self, index: int) -> QLayoutItem | None:  # noqa: N802 - Qt override
+    def takeAt(self, index: int) -> QLayoutItem | None:
         return self._items.pop(index) if 0 <= index < len(self._items) else None
 
-    def expandingDirections(self) -> Qt.Orientation:  # noqa: N802 - Qt override
+    def expandingDirections(self) -> Qt.Orientation:
         return Qt.Orientation(0)
 
-    def hasHeightForWidth(self) -> bool:  # noqa: N802 - Qt override
+    def hasHeightForWidth(self) -> bool:
         return True
 
-    def heightForWidth(self, width: int) -> int:  # noqa: N802 - Qt override
+    def heightForWidth(self, width: int) -> int:
         return self._arrange(QRect(0, 0, width, 0), apply=False)
 
-    def setGeometry(self, rect: QRect) -> None:  # noqa: N802 - Qt override
+    def setGeometry(self, rect: QRect) -> None:
         super().setGeometry(rect)
         self._arrange(rect, apply=True)
 
-    def sizeHint(self) -> QSize:  # noqa: N802 - Qt override
+    def sizeHint(self) -> QSize:
         return self.minimumSize()
 
-    def minimumSize(self) -> QSize:  # noqa: N802 - Qt override
+    def minimumSize(self) -> QSize:
         size = QSize()
         for item in self._items:
             size = size.expandedTo(item.minimumSize())

@@ -34,6 +34,20 @@ def _enqueued_records(history):
     return [call.args[0] for call in history.enqueue.call_args_list]
 
 
+def test_live_continuous_session_is_published_as_open_history() -> None:
+    with app_harness({"audio.trigger_mode": "continuous"}) as h:
+        app = h["app"]
+        from unittest.mock import MagicMock
+
+        panel = MagicMock()
+        app._main = MagicMock()
+        app._main.history_panel = panel
+        h["recorder"].is_continuous = True
+        context = app._capture_segment_context()
+        assert context is not None
+        panel.set_open_session.assert_called_with(context.session_id)
+
+
 def test_start_enqueues_history_cleanup_once_with_active_session() -> None:
     with app_harness(
         {
@@ -413,12 +427,12 @@ class TestDictationSharesRecognitionSettings:
                 vad="silero", vad_model_path="C:/models/silero_vad.onnx", meeting=False
             )
 
-    def test_dictation_segmenter_falls_back_to_energy_without_model(self) -> None:
+    def test_dictation_preserves_silero_request_for_recorder_fallback_status(self) -> None:
         with app_harness({"stt.vad": "silero"}) as h:
             app = h["app"]
             with patch("sayink.app.aux_model_path", return_value=None):
                 app._apply_dictation_segmenter_profile()
-            h["recorder"].set_segmenter_profile.assert_called_with(vad="energy", vad_model_path=None, meeting=False)
+            h["recorder"].set_segmenter_profile.assert_called_with(vad="silero", vad_model_path=None, meeting=False)
 
         with app_harness({"stt.vad": "energy"}) as h:
             app = h["app"]
@@ -684,6 +698,8 @@ def test_stuck_paste_releases_queue_and_keeps_words_on_clipboard() -> None:
         assert app._output_busy is False
         copy.assert_called_once_with("AAA。")
         # No second paste attempt: Ctrl+V may already have landed.
+        # A shortcut still waiting out its delay must not fire after this.
+        paster.cancel.assert_called_once()
         assert paster.paste_async.call_count == 1
         assert h["recognizer"].transcribe_final.call_count == 2
 

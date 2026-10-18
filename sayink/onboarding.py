@@ -14,6 +14,7 @@ from PyQt6.QtCore import QObject, Qt, QTimer
 from PyQt6.QtWidgets import QMessageBox, QWidget
 
 from sayink.config import DEFAULT_HOTKEY, format_hotkey
+from sayink.speech_recognizer import DEFAULT_MODEL_ID, get_model_info
 
 log = logging.getLogger("SayInk")
 
@@ -103,35 +104,35 @@ class OnboardingController(QObject):
     # ── Dialogs ────────────────────────────────────────
 
     def welcome_text(self, *, model_missing: bool) -> str:
+        hotkey = format_hotkey(self._config.get("hotkey", DEFAULT_HOTKEY))
         if self._is_continuous_mode():
-            hotkey = format_hotkey(self._config.get("hotkey", DEFAULT_HOTKEY))
+            stop = "按 Esc 或听写条「结束」停止" if self._config.get("audio.esc_stops_continuous", True) else "点听写条「结束」停止"
             mode_tip = (
-                f"当前为「自动持续转写」：按住 {hotkey} 开始监听，"
-                "按 Esc 或听写条「结束」停止。"
+                f"当前为「自动持续转写」：按住 {hotkey} 启动，松开后继续录制；{stop}。"
             )
         else:
-            hk = format_hotkey(self._config.get("hotkey", DEFAULT_HOTKEY))
-            mode_tip = (
-                f"当前为「按住说话」（默认）：按住 {hk} 说话，松开后识别并粘贴。"
-                "开会、长口述可在设置 → 通用 中切换到「持续转写」。"
+            mode_tip = f"当前为「单次转写」：按住 {hotkey} 录音，松开后识别；Esc 取消本次录音。"
+        if model_missing:
+            info = get_model_info(DEFAULT_MODEL_ID) or {}
+            model_tip = (
+                f"本机还没有语音模型：请先在设置 → 引擎 中下载 {info.get('name', DEFAULT_MODEL_ID)}"
+                f"（约 {info.get('size_mb', '?')} MB，仅需一次），下载前无法听写。\n\n"
             )
-        model_tip = (
-            "本机还没有语音模型：请先在设置 → 引擎 中下载 Fun-ASR-Nano（约 600 MB，仅需一次），"
-            "下载前无法听写。\n\n"
-            if model_missing
-            else "语音模型已就绪，启动后会自动载入。\n\n"
+        else:
+            model_tip = "语音模型已下载，载入完成后即可试用。\n\n"
+        history_only = self._config.get("output.mode", "paste") == "history"
+        result_tip = (
+            "结果仅保存到「历史」，不会输入其他应用。" if history_only and self._config.get("history.enabled", False) else
+            "结果当前不会保存或输入其他应用：请在通用页开启转写历史，或修改「结果去向」。" if history_only else
+            "试用时，先把光标放到要输入文字的位置。"
         )
         return (
-            "SayInk 在本地完成语音识别（可选通过网络调用大模型润色）。\n\n"
-            f"{mode_tip}\n\n"
-            "SayInk 主要用来口述输入：识别结果直接粘贴到光标处。\n"
-            "音频来源在设置 → 通用 中选择：\n"
-            "· 仅麦克风：你的说话（默认）\n"
-            "· 仅电脑播放 / 混合：听会议或视频里的声音；选这两项后结果只记录到历史、"
-            "不粘贴到当前窗口，可在「偏好」里改回\n\n"
+            "SayInk 在本地完成语音识别；可选的 AI 润色会使用你配置的服务。\n\n"
             + model_tip
-            + "默认快捷键为 Alt+X；可在设置 → 通用 中更改。\n"
-            "Windows：双击托盘图标可打开主窗口。"
+            + f"{mode_tip}\n\n"
+            + result_tip + "\n\n"
+            "音源与结果去向：通用页。\n"
+            "双击托盘图标可打开主窗口。"
         )
 
     def show_welcome(self) -> None:

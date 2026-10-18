@@ -287,16 +287,15 @@ def build_btn_accent_sm() -> str:
 
 def reload_styles() -> None:
     """Rebuild module-level style aliases from the active token axis."""
-    global WINDOW_CSS, BTN_PRIMARY, BTN_GHOST, BTN_GHOST_SM
-    global BTN_DANGER_SM, BTN_GREEN_SM, BTN_ACCENT_SM
     sc.reload_styles()
-    WINDOW_CSS = build_window_css()
-    BTN_PRIMARY = build_btn_primary()
-    BTN_GHOST = build_btn_ghost()
-    BTN_GHOST_SM = build_btn_ghost_sm()
-    BTN_DANGER_SM = build_btn_danger_sm()
-    BTN_GREEN_SM = build_btn_green_sm()
-    BTN_ACCENT_SM = build_btn_accent_sm()
+    g = globals()
+    g["WINDOW_CSS"] = build_window_css()
+    g["BTN_PRIMARY"] = build_btn_primary()
+    g["BTN_GHOST"] = build_btn_ghost()
+    g["BTN_GHOST_SM"] = build_btn_ghost_sm()
+    g["BTN_DANGER_SM"] = build_btn_danger_sm()
+    g["BTN_GREEN_SM"] = build_btn_green_sm()
+    g["BTN_ACCENT_SM"] = build_btn_accent_sm()
 
 
 WINDOW_CSS = ""
