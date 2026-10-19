@@ -280,21 +280,33 @@ class UpdateDownloadWorker(QThread):
         self._dest = dest
         self._expected_size = expected_size
         self._sha256 = sha256
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _on_progress(self, got: int, total: int) -> None:
+        if self._cancelled:
+            raise RuntimeError("更新下载已取消")
+        self.progress.emit(got, total)
 
     def run(self) -> None:
         from urllib.request import urlopen
 
+        if self._cancelled:
+            return
         try:
             download_installer(
                 self._url,
                 self._dest,
                 urlopen,
-                on_progress=lambda got, total: self.progress.emit(got, total),
+                on_progress=self._on_progress,
                 expected_size=self._expected_size,
                 sha256=self._sha256,
                 reuse_existing=True,
             )
-            self.finished_path.emit(str(self._dest))
+            if not self._cancelled:
+                self.finished_path.emit(str(self._dest))
         except MissingDigestError as exc:
             log.warning("更新包缺少校验值: %s", exc)
             self.failed.emit(MISSING_DIGEST_MESSAGE)
@@ -302,5 +314,7 @@ class UpdateDownloadWorker(QThread):
             log.warning("更新包校验失败: %s", exc)
             self.failed.emit("下载的安装包不完整或已损坏，请重试")
         except Exception as exc:
+            if self._cancelled:
+                return
             log.info("下载更新失败: %s", exc)
             self.failed.emit("下载失败，请稍后再试")

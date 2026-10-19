@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS meeting_speakers (
   speaker_id     INTEGER NOT NULL,
   display_name   TEXT    NOT NULL DEFAULT '',
   suggested_name TEXT    NOT NULL DEFAULT '',
+  name_locked    INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (meeting_id, speaker_id)
 );
 CREATE TABLE IF NOT EXISTS meeting_notes (
@@ -107,6 +108,10 @@ def _ensure_speaker_columns(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_meeting_note_columns(conn: sqlite3.Connection) -> None:
+    speaker_columns = {row[1] for row in conn.execute("PRAGMA table_info(meeting_speakers)")}
+    if "name_locked" not in speaker_columns:
+        conn.execute("ALTER TABLE meeting_speakers ADD COLUMN name_locked INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE meeting_speakers SET name_locked = 1 WHERE display_name != ''")
     present = {row[1] for row in conn.execute("PRAGMA table_info(meeting_notes)")}
     for name in ("transcript_changed", "previous_transcript_changed"):
         if name not in present:

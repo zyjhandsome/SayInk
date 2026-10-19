@@ -188,7 +188,7 @@ def test_long_update_error_does_not_squeeze_configuration_links(window):
     settings.set_update_status("本次启动尚未检查更新", action="check")
 
 
-def test_saved_documents_share_font_and_readable_line_length(window):
+def test_saved_documents_share_font_and_follow_their_width_policy(window):
     set_theme(window, "light")
     window.resize(1560, 750)
     for key, reader in (("history", window._history._details), ("meeting", window._meeting._notes_view)):
@@ -196,7 +196,10 @@ def test_saved_documents_share_font_and_readable_line_length(window):
         settle()
         assert reader.font().pixelSize() == tok.READING_FONT_PX
         margin = reader.document().rootFrame().frameFormat().rightMargin()
-        assert reader.viewport().width() - margin <= tok.READING_MAX_WIDTH
+        if key == "meeting":
+            assert margin <= 8
+        else:
+            assert reader.viewport().width() - margin <= tok.READING_MAX_WIDTH
 
 
 def test_resizing_an_editor_keeps_text_undo_as_the_next_action(window):

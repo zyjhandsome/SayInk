@@ -1455,21 +1455,29 @@ class SpeechRecognizer(QObject):
             return
         self.error.emit(error_msg)
 
-    def shutdown(self):
+    @property
+    def running_workers(self):
+        return tuple(worker for worker in [self._load_worker, *self._workers]
+                     if worker is not None and worker.isRunning())
+
+    def shutdown(self, *, wait_ms: int = 1000):
         """Stop all running workers for clean app exit."""
-        if self._load_worker and self._load_worker.isRunning():
+        self._reload_after_current = False
+        if self._load_worker:
             try:
                 self._load_worker.disconnect()
             except TypeError:
                 pass
-            self._load_worker.wait(1000)
+            if wait_ms and self._load_worker.isRunning():
+                self._load_worker.wait(wait_ms)
 
         # Ignore any pending results and let running workers finish cooperatively.
         self._active_seq = -1
         for worker in list(self._workers):
             if worker.isRunning():
                 worker.cancel()
-                worker.wait(1000)
+                if wait_ms:
+                    worker.wait(wait_ms)
 
     @property
     def is_ready(self) -> bool:

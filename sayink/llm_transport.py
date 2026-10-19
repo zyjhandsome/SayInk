@@ -100,15 +100,16 @@ def _check_choice(choice, *, streamed=False):
     return content or "", reason
 
 
-async def _stream_text(response, *, first_timeout, idle_timeout, on_delta):
+async def _stream_text(response, *, first_timeout, idle_timeout, on_delta, on_status=None):
     pieces, event_lines = [], []
     finished = False
     visible_chars = reasoning_chars = 0
-    first_deadline = time.monotonic() + first_timeout
+    activity_deadline = time.monotonic() + first_timeout
+    phase = None
     lines = response.aiter_lines().__aiter__()
 
     def consume():
-        nonlocal finished, visible_chars, reasoning_chars
+        nonlocal finished, visible_chars, reasoning_chars, activity_deadline, phase
         if not event_lines:
             return
         raw = "\n".join(event_lines)
@@ -129,17 +130,28 @@ async def _stream_text(response, *, first_timeout, idle_timeout, on_delta):
         if not isinstance(choices, list) or not choices:
             raise LLMResponseError("流式响应缺少正文")
         choice = choices[0]
+        reasoning = ""
         if isinstance(choice, dict) and isinstance(choice.get("delta"), dict):
             delta = choice["delta"]
             reasoning = delta.get("reasoning_content")
-            if isinstance(reasoning, str):
-                reasoning_chars += len(reasoning)
+            if not isinstance(reasoning, str):
+                reasoning = ""
+            reasoning_chars += len(reasoning)
             if choice.get("finish_reason") in ("length", "max_tokens"):
                 log.warning("模型输出被截断 visible_chars=%d reasoning_chars=%d finish_reason=%s",
                             visible_chars, reasoning_chars, choice["finish_reason"])
         content, reason = _check_choice(choice, streamed=True)
         if finished and content:
             raise LLMResponseError("流式响应在结束后仍返回正文")
+        if content or reasoning:
+            # Hidden reasoning is model activity too. Heartbeats and metadata
+            # alone must not keep a stalled generation alive indefinitely.
+            activity_deadline = time.monotonic() + idle_timeout
+            next_phase = "content" if content else "reasoning"
+            if next_phase != phase:
+                phase = next_phase
+                if on_status:
+                    on_status("正在接收正文…" if content else "模型正在思考…")
         if content:
             visible_chars += len(content)
             pieces.append(content)
@@ -151,8 +163,19 @@ async def _stream_text(response, *, first_timeout, idle_timeout, on_delta):
 
     while True:
         try:
-            wait = idle_timeout if pieces else max(0.001, first_deadline - time.monotonic())
-            line = await asyncio.wait_for(lines.__anext__(), wait)
+            wait = max(0.001, activity_deadline - time.monotonic())
+            # Python 3.10's nested wait_for can swallow cancellation when a
+            # line arrives at the same time as the outer job deadline.
+            read = asyncio.ensure_future(lines.__anext__())
+            try:
+                done, _ = await asyncio.wait({read}, timeout=wait)
+                if not done:
+                    raise asyncio.TimeoutError()
+                line = read.result()
+            finally:
+                if not read.done():
+                    read.cancel()
+                await asyncio.gather(read, return_exceptions=True)
         except StopAsyncIteration:
             consume()
             break
@@ -172,12 +195,13 @@ async def _stream_text(response, *, first_timeout, idle_timeout, on_delta):
 
 async def completion(client, httpx, *, api_url, api_key, model_name, messages,
                      max_tokens, timeout_sec=120, idle_timeout_sec=45, total_timeout_sec=600,
-                     retry_delay_sec=1, on_delta=None, on_retry=None, on_reset=None, capabilities=None,
+                     retry_delay_sec=1, on_delta=None, on_retry=None, on_reset=None, on_status=None, capabilities=None,
                      thinking_mode=None):
     """Stream by default; downgrade only on an explicit unsupported-stream error.
 
     Each attempt has its own preview. A failed attempt can never be joined
     to the next one's output. The deadline includes retries and server delays.
+    Status changes replace retry notices as soon as the next attempt starts.
     """
     capabilities = capabilities if capabilities is not None else {}
     payload = dict(model=model_name, messages=messages, stream=capabilities.get("stream", True))
@@ -197,6 +221,8 @@ async def completion(client, httpx, *, api_url, api_key, model_name, messages,
         downgraded = False
         while True:
             attempts += 1
+            if on_status:
+                on_status("正在连接模型…")
             if on_reset:
                 on_reset()
             response = None
@@ -242,10 +268,16 @@ async def completion(client, httpx, *, api_url, api_key, model_name, messages,
                         if not retryable or attempts >= 2:
                             response.raise_for_status()
                         delay = _retry_after(response, retry_delay_sec * attempts)
+                        retry_cause = f"HTTP {response.status_code}"
+                        retry_reason = ("模型服务限流" if response.status_code == 429
+                                        else f"模型服务暂时异常（{retry_cause}）")
                     else:
+                        if on_status:
+                            on_status("已连接，等待模型响应…")
                         if "text/event-stream" in response.headers.get("content-type", "").lower():
                             text = await _stream_text(response, first_timeout=timeout_sec,
-                                                      idle_timeout=idle_timeout_sec, on_delta=on_delta)
+                                                      idle_timeout=idle_timeout_sec, on_delta=on_delta,
+                                                      on_status=on_status)
                         else:
                             # Some compatible gateways ignore stream=True and return JSON.
                             await response.aread()
@@ -257,17 +289,32 @@ async def completion(client, httpx, *, api_url, api_key, model_name, messages,
                             text = text.strip()
                             if not text:
                                 raise LLMResponseError("API 返回空内容")
+                            if on_status:
+                                on_status("正在接收正文…")
                             if on_delta:
                                 on_delta(text)
+                        if on_status:
+                            on_status("正文已接收，正在检查…")
                         log.info("纪要请求完成 model=%s output_chars=%d elapsed=%.2fs finish_reason=stop",
                                  model_name, len(text), time.monotonic() - started)
                         return text
-            except (httpx.NetworkError, httpx.RemoteProtocolError, httpx.TimeoutException, asyncio.TimeoutError, LLMBrokenStream):
+            except (httpx.NetworkError, httpx.RemoteProtocolError, httpx.TimeoutException, asyncio.TimeoutError, LLMBrokenStream) as exc:
+                retry_cause = type(exc).__name__
+                if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
+                    retry_reason = "等待模型响应超时"
+                elif isinstance(exc, (httpx.RemoteProtocolError, LLMBrokenStream)):
+                    retry_reason = "模型响应中断"
+                else:
+                    retry_reason = "模型连接异常"
                 if attempts >= 2:
+                    log.warning("纪要请求失败 model=%s attempt=%d cause=%s elapsed=%.2fs",
+                                model_name, attempts, retry_cause, time.monotonic() - started)
                     raise
                 delay = retry_delay_sec * attempts
+            log.warning("纪要请求准备重试 model=%s attempt=%d cause=%s delay=%.2fs elapsed=%.2fs",
+                        model_name, attempts, retry_cause, delay, time.monotonic() - started)
             if on_retry:
-                on_retry(f"连接暂时不可用，{delay:g} 秒后重试…")
+                on_retry(f"{retry_reason}，{delay:g} 秒后重试…")
             await asyncio.sleep(delay)
 
     try:

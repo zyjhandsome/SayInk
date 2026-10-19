@@ -869,7 +869,7 @@ class HistoryWindow(QWidget):
         # idle row keeps the text from jumping when the selection moves.
         bg = tok.ACCENT_SOFT if selected else "transparent"
         bar = tok.ACCENT if selected else "transparent"
-        row.setStyleSheet(
+        css = (
             "QWidget#historyStreamRow {"
             f" background: {bg};"
             " border: none;"
@@ -877,6 +877,8 @@ class HistoryWindow(QWidget):
             " border-radius: 0;"
             "}"
         )
+        if row.styleSheet() != css:
+            row.setStyleSheet(css)
 
     def _sync_row_selection(self) -> None:
         if not hasattr(self, "_session_list"):
@@ -1325,6 +1327,16 @@ class HistoryWindow(QWidget):
                 else:
                     rebuilt.append(s)
             sessions = sorted(rebuilt, key=lambda s: s.created_at, reverse=True)
+        from sayink.ui import design_tokens as tok
+
+        rows_key = (tuple(sessions), tuple(_day_label(session.created_at) for session in sessions),
+                    self._search_query, self._has_more, self._history_enabled,
+                    getattr(self._store, "disabled", False) is True,
+                    tok.FONT, tok.FONT_MONO, tok.TEXT, tok.TEXT_SEC, tok.TEXT_DIM, tok.ACCENT, tok.ACCENT_SOFT)
+        if getattr(self, "_session_rows_key", None) == rows_key:
+            # Details can change without changing a session's preview/count.
+            self._on_selection_changed()
+            return
         # Rebuilding the list clears the selection first. That signal would
         # treat the open session as closed and snap the detail back to the top
         # on the next paint. Restore selection, then refresh the detail once.
@@ -1394,6 +1406,7 @@ class HistoryWindow(QWidget):
         self._sync_clear_all_enabled()
         self._restyle_rows()
         self._on_selection_changed()
+        self._session_rows_key = rows_key
 
     def _add_group_header(self, day: str, *, first: bool) -> None:
         item = QListWidgetItem("")
@@ -1564,6 +1577,10 @@ class HistoryWindow(QWidget):
         bottom while the reader is following the latest turn. If they have
         scrolled up into earlier turns, keep that offset across the refresh.
         """
+        key = (html, plain, session_id)
+        revision = self._details.document().revision()
+        if getattr(self, "_detail_document_key", None) == (key, revision):
+            return
         bar = self._details.verticalScrollBar()
         if session_id is not None:
             same = session_id == self._detail_session_id
@@ -1587,6 +1604,7 @@ class HistoryWindow(QWidget):
                 self._details.setPlainText(plain or "")
         finally:
             self._detail_scroll_lock = False
+        self._detail_document_key = (key, self._details.document().revision())
         # setHtml moves the caret to the start on a later event-loop turn,
         # which would undo a synchronous scroll. Re-apply after that reset.
         self._detail_scroll_timer.start(0)

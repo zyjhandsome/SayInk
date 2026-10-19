@@ -125,6 +125,59 @@ def _quiet_settings(monkeypatch, tmp_path):
     return SettingsWindow(Config(config_dir=tmp_path))
 
 
+def test_download_shutdown_keeps_live_threads_and_returns_immediately(tmp_path, monkeypatch):
+    import threading
+    from PyQt6.QtWidgets import QApplication
+    from sayink.speech_recognizer import ModelDownloadWorker
+
+    release = threading.Event()
+    monkeypatch.setattr(ModelDownloadWorker, "run", lambda self: release.wait(5))
+    win = _quiet_settings(monkeypatch, tmp_path)
+    win._start_download("funasr-nano")
+    worker = win._dl_workers["funasr-nano"]
+    try:
+        started = time.perf_counter()
+        win.cancel_all_downloads()
+        assert time.perf_counter() - started < 0.4
+        assert worker in win.running_workers
+    finally:
+        release.set()
+        assert worker.wait(2000)
+        QApplication.processEvents()
+        assert worker not in win.running_workers
+        win.close()
+
+
+def test_download_result_does_not_release_thread_before_it_finishes(tmp_path, monkeypatch):
+    import threading
+    from PyQt6.QtWidgets import QApplication
+    from sayink.speech_recognizer import ModelDownloadWorker
+
+    release, sent = threading.Event(), threading.Event()
+
+    def run(worker):
+        worker.error.emit("offline test")
+        sent.set()
+        release.wait(5)
+
+    monkeypatch.setattr(ModelDownloadWorker, "run", run)
+    monkeypatch.setattr("sayink.ui.settings_window.QMessageBox.warning", lambda *args: None)
+    win = _quiet_settings(monkeypatch, tmp_path)
+    win._start_download("funasr-nano")
+    worker = win._dl_workers["funasr-nano"]
+    try:
+        assert sent.wait(2)
+        QApplication.processEvents()
+        assert "funasr-nano" not in win._dl_workers
+        assert worker in win.running_workers
+    finally:
+        release.set()
+        assert worker.wait(2000)
+        QApplication.processEvents()
+        assert worker not in win.running_workers
+        win.close()
+
+
 def test_audio_devices_are_listed_before_the_panel_is_shown(tmp_path, monkeypatch):
     win = _quiet_settings(monkeypatch, tmp_path)
     try:

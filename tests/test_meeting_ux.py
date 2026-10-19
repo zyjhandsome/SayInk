@@ -4,7 +4,8 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
-from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtCore import QPoint, Qt, QUrl
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDialog, QFileDialog, QPushButton
 
 from sayink.ui.design_tokens import SECONDARY_CONTAINER
@@ -55,6 +56,20 @@ def test_meeting_list_renders_on_an_ansi_code_page(config, tmp_path, ansi_locale
         page.deleteLater()
         controller.shutdown()
         history.close(timeout=2)
+
+
+def test_unchanged_meeting_refresh_reuses_rows(meeting):
+    page, controller, _history, record = meeting
+    item = page._list.item(0)
+    row = page._list.itemWidget(item)
+    page.refresh()
+    assert page._list.item(0) is item
+    assert page._list.itemWidget(item) is row
+    controller.store.save_user_markdown(record.id, "更新后的正文。")
+    controller.store.flush()
+    page.refresh()
+    assert page._list.item(0) is item
+    assert "更新后的正文。" in page._notes_view.toPlainText()
 
 
 def test_empty_search_explains_result_and_clears_old_details(meeting):
@@ -131,6 +146,34 @@ def test_live_updates_preserve_selection_and_reading_position(meeting):
     assert view.verticalScrollBar().value() == view.verticalScrollBar().maximum()
 
 
+def test_live_updates_append_without_removing_existing_text(meeting):
+    page, controller, history, _record = meeting
+    options = MeetingOptions(title="长会议增量显示", input_source="microphone")
+    caps = resolve_capabilities(page._config, options, dictation_model_id="funasr-nano")
+    record = controller.begin(options, caps)
+    for seq in range(40):
+        history.enqueue(SegmentRecord(record.id, seq, record.started_at + seq * 1000,
+                                      raw_text=f"第 {seq} 条完整发言。" * 10, speaker_id=1, trigger_mode="meeting"))
+    history.flush()
+    page._render_live()
+    reader = page._live_transcript
+    before, blocks = reader.toPlainText(), reader.document().blockCount()
+    changes = []
+    reader.document().contentsChange.connect(lambda _pos, removed, _added: changes.append(removed))
+    history.enqueue(SegmentRecord(record.id, 40, record.started_at + 40_000,
+                                  raw_text="新发言只追加一次。", speaker_id=2, trigger_mode="meeting"))
+    history.flush()
+
+    page._render_live()
+
+    assert reader.toPlainText().startswith(before)
+    assert reader.toPlainText().count("新发言只追加一次。") == 1
+    assert reader.document().blockCount() == blocks + 1
+    assert not any(changes)
+    page._render_live()
+    assert reader.toPlainText().count("新发言只追加一次。") == 1
+
+
 def test_find_live_transcript_keeps_meeting_recording(meeting):
     page, controller, history, _record = meeting
     options = MeetingOptions(title="实时查找")
@@ -184,19 +227,45 @@ def test_copy_tracks_tab_and_works_without_minutes(meeting, monkeypatch):
     page, controller, _history, record = meeting
     copied = []
     monkeypatch.setattr("sayink.ui.meeting_page.copy_text", lambda text: copied.append(text) or True)
+    page.show()
     page._copy_btn.click()
     assert copied[-1].startswith("# 设计评审")
     page._tab_transcript.click()
-    assert page._copy_btn.text() == "复制文字稿"
-    page._copy_btn.click()
+    assert page._transcript_copy_btn.text() == "复制文字稿"
+    assert page._transcript_copy_btn.isVisible()
+    assert not page._copy_btn.isVisible()
+    QApplication.processEvents()
+    QTest.mouseClick(page._transcript_copy_btn, Qt.MouseButton.LeftButton)
     assert copied[-1] == controller.transcript_text(record.id)
     assert "说话人2：下周开始验证" in copied[-1]
     controller.store.save_notes(record.id, template_id="general", model="m", json_payload="", markdown="")
     controller.store.flush()
     page._render_detail()
-    assert page._copy_btn.isEnabled()
+    assert page._transcript_copy_btn.isVisible() and page._transcript_copy_btn.isEnabled()
     page._tab_notes.click()
+    assert not page._transcript_copy_btn.isVisible()
+    assert page._copy_btn.isVisible()
     assert not page._copy_btn.isEnabled()
+
+
+def test_transcript_copy_reports_clipboard_failure(meeting, monkeypatch):
+    page, _controller, _history, _record = meeting
+    page.show()
+    monkeypatch.setattr("sayink.ui.meeting_page.copy_text", lambda _text: False)
+    page._tab_transcript.click()
+    page._transcript_copy_btn.click()
+    assert "复制失败" in page._status_label.text()
+
+
+def test_transcript_copy_is_disabled_for_empty_meeting(meeting):
+    page, controller, _history, _record = meeting
+    empty = controller.store.create_meeting(title="空录音")
+    controller.store.end_meeting(empty.id)
+    assert controller.store.flush()
+    page.show()
+    page.show_meeting(empty.id)
+    page._tab_transcript.click()
+    assert page._transcript_copy_btn.isVisible() and not page._transcript_copy_btn.isEnabled()
 
 
 def test_draft_copy_and_export_use_unsaved_text_without_saving_it(meeting, monkeypatch, tmp_path):
@@ -573,6 +642,56 @@ def test_citation_return_restores_position_and_refresh_keeps_reading(meeting):
     assert bar.value() == 420
 
 
+@pytest.mark.parametrize("content", ["minutes", "refine", "transcript", "preview"])
+def test_meeting_text_reflows_into_space_freed_by_splitter(meeting, content):
+    page, controller, history, record = meeting
+    paragraph = "右侧正文应根据面板宽度重新换行，拖动分隔条后应利用扩展后的空间。" * 40
+    if content == "transcript":
+        history.enqueue(SegmentRecord(record.id, 20, record.started_at + 20_000,
+                                      raw_text=paragraph, speaker_id=1, trigger_mode="meeting"))
+        history.flush()
+    else:
+        controller.store.save_notes(record.id, template_id="refine" if content == "refine" else "general",
+                                    model="m", json_payload="", markdown="## 摘要\n\n" + paragraph)
+        controller.store.flush()
+    page._render_detail()
+    page.resize(1800, 750)
+    page.show()
+    if content == "transcript":
+        page._tab_transcript.click()
+    elif content == "preview":
+        controller._generating_for = record.id
+        controller.generation_preview_text = "生成预览 · 尚未保存\n\n" + paragraph
+        controller.generation_preview.emit(record.id, controller.generation_preview_text)
+    reader = page._transcript_view if content == "transcript" else page._notes_view
+    saved = controller.store.get_notes(record.id)
+    text = reader.toPlainText()
+    page._splitter.setSizes([700, 1100])
+    for _ in range(4):
+        QApplication.processEvents()
+    cursor = reader.document().find("右侧正文应根据面板宽度重新换行")
+    assert not cursor.isNull()
+    reader.setTextCursor(cursor)
+    selected = cursor.selectedText()
+    block = cursor.block()
+    narrow_width, narrow_lines = reader.viewport().width(), block.layout().lineCount()
+
+    page._splitter.setSizes([260, 1540])
+    for _ in range(4):
+        QApplication.processEvents()
+
+    assert reader.viewport().width() > narrow_width + 300
+    assert block.layout().lineCount() < narrow_lines
+    assert reader.document().rootFrame().frameFormat().rightMargin() <= 8
+    assert reader.horizontalScrollBar().maximum() == 0
+    assert reader.toPlainText() == text and reader.textCursor().selectedText() == selected
+    assert controller.store.get_notes(record.id) == saved
+    page._splitter.setSizes([700, 1100])
+    for _ in range(4):
+        QApplication.processEvents()
+    assert block.layout().lineCount() == narrow_lines
+
+
 def _shares_one_line(widgets) -> bool:
     tops = [widget.geometry().top() for widget in widgets]
     bottoms = [widget.geometry().bottom() for widget in widgets]
@@ -602,7 +721,8 @@ def test_template_and_action_clusters_wrap_as_whole_rows():
     QApplication.processEvents()
     assert len({button.geometry().y() for button in left}) == 1
     assert len({button.geometry().y() for button in right}) == 1
-    assert right[0].geometry().y() > left[0].geometry().y()
+    # Actions stay on the first row; the leading cluster drops intact.
+    assert left[0].geometry().y() > right[0].geometry().y()
     assert right[0].geometry().x() < right[1].geometry().x() < right[2].geometry().x()
     bar.resize(980, 80)
     QApplication.processEvents()
@@ -634,6 +754,54 @@ def test_notes_tab_shares_one_line_with_transcript_and_export(meeting):
     assert page._copy_btn.geometry().bottom() <= bar.height()
     assert _shares_one_line((page._template_label, page._template_combo, page._manage_templates_btn))
     assert page._generate_btn.geometry().x() < page._edit_btn.geometry().x() < page._copy_btn.geometry().x()
+
+
+def _top(widget, origin) -> int:
+    return widget.mapTo(origin, QPoint(0, 0)).y()
+
+
+def _right(widget, origin) -> int:
+    return widget.mapTo(origin, QPoint(0, 0)).x() + widget.width()
+
+
+def test_switching_meeting_tabs_keeps_the_action_row_still(meeting):
+    """纪要 and 文字稿 must share the gap under the tabs and the button baseline."""
+    page, *_rest = meeting
+    page.show()
+
+    def gaps():
+        for _ in range(4):
+            QApplication.processEvents()
+        page._tab_notes.click()
+        for _ in range(4):
+            QApplication.processEvents()
+        tab_bottom = _top(page._tab_bar, page) + page._tab_bar.height()
+        notes_top = _top(page._copy_btn, page)
+        notes_right = _right(page._copy_btn, page)
+        page._tab_transcript.click()
+        for _ in range(4):
+            QApplication.processEvents()
+        transcript_top = _top(page._transcript_copy_btn, page)
+        return (
+            notes_top - tab_bottom,
+            transcript_top - tab_bottom,
+            notes_top,
+            transcript_top,
+            notes_right,
+            _right(page._transcript_copy_btn, page),
+            page._copy_btn.height(),
+            page._transcript_copy_btn.height(),
+            page._template_combo.height(),
+        )
+
+    for width in (1560, 1100, 960, 880):
+        page.resize(width, 700)
+        notes_gap, transcript_gap, notes_top, transcript_top, notes_right, transcript_right, notes_h, transcript_h, combo_h = gaps()
+        assert notes_gap == transcript_gap, (width, notes_gap, transcript_gap)
+        assert notes_top == transcript_top, (width, notes_top, transcript_top)
+        assert notes_right == transcript_right
+        assert notes_h == transcript_h == combo_h
+        assert notes_gap > 0
 
 
 def test_only_empty_decision_sections_are_compacted_for_display():

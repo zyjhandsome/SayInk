@@ -14,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol
 
-from PyQt6.QtCore import QObject
+from PyQt6.QtCore import QObject, QThread
 
 log = logging.getLogger("SayInk")
 
@@ -67,6 +67,15 @@ class UpdateController(QObject):
         self._check_worker = None
         self._download_worker = None
         self._download_status: tuple[str, str] | None = None
+
+    @property
+    def running_workers(self):
+        return tuple(worker for worker in self.findChildren(QThread) if worker.isRunning())
+
+    def shutdown(self) -> None:
+        for worker in self.running_workers:
+            if hasattr(worker, "cancel"):
+                worker.cancel()
 
     # ── Entry points ───────────────────────────────────
 
@@ -178,6 +187,8 @@ class UpdateController(QObject):
     # ── Worker slots ───────────────────────────────────
 
     def on_check_result(self, info) -> None:
+        if self._exit_started():
+            return
         self._remember_check()
         self.pending_release = info
         if info is None:
@@ -190,6 +201,8 @@ class UpdateController(QObject):
             self._tray.show_update_notice(f"{info.version} 可以安装")
 
     def on_check_failed(self, _message: str) -> None:
+        if self._exit_started():
+            return
         self._remember_check()
         self.state = UpdateState.ERROR
         if self._interactive or self._check_status_visible:
@@ -205,6 +218,8 @@ class UpdateController(QObject):
         self._set_download_status(text, action="busy")
 
     def on_download_failed(self, message: str) -> None:
+        if self._exit_started():
+            return
         self.state = UpdateState.AVAILABLE
         self._set_download_status(message, action="install")
 

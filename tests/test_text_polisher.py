@@ -617,6 +617,59 @@ class TestTestConnectionRun:
 
 
 class TestPolishWorkerLifecycle:
+    def test_idle_callbacks_without_a_live_sender_are_ignored(self):
+        polisher = TextPolisher()
+        results, errors = [], []
+        polisher.polish_complete.connect(results.append)
+        polisher.polish_error.connect(errors.append)
+        polisher._on_result("stale result")
+        polisher._on_error("stale error")
+        assert results == errors == []
+
+    @pytest.mark.parametrize("replace", [False, True])
+    def test_queued_cancelled_results_cannot_escape_into_next_request(self, monkeypatch, replace):
+        from PyQt6.QtCore import QCoreApplication, QObject, Qt, pyqtSignal
+
+        class Worker(QObject):
+            result_ready = pyqtSignal(str)
+            error = pyqtSignal(str)
+            finished = pyqtSignal()
+
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                self.running = True
+
+            def start(self):
+                pass
+
+            def isRunning(self):
+                return self.running
+
+            def cancel(self):
+                pass
+
+        monkeypatch.setattr("sayink.text_polisher.PolishWorker", Worker)
+        polisher = TextPolisher()
+        results, errors = [], []
+        polisher.polish_complete.connect(results.append)
+        polisher.polish_error.connect(errors.append)
+        polisher.polish("old", "https://example.test", "", "m")
+        old = polisher._worker
+        old.result_ready.disconnect(polisher._on_result)
+        old.error.disconnect(polisher._on_error)
+        old.result_ready.connect(polisher._on_result, Qt.ConnectionType.QueuedConnection)
+        old.error.connect(polisher._on_error, Qt.ConnectionType.QueuedConnection)
+        old.result_ready.emit("stale result")
+        old.error.emit("stale error")
+        old.running = False  # Thread exited before its queued result reached the UI.
+        polisher.cancel()
+        if replace:
+            polisher.polish("new", "https://example.test", "", "m")
+            polisher._worker.result_ready.emit("current result")
+        QCoreApplication.processEvents()
+        assert results == (["current result"] if replace else [])
+        assert errors == []
+
     def test_cancelled_worker_stays_retained_until_thread_finishes(self, monkeypatch):
         """A running QThread dropped by cancel() would be destroyed during GC
         and abort Qt; keep a reference until ``finished`` fires."""

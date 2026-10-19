@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from sayink.speech_recognizer import (
     AUX_MODEL_REGISTRY,
@@ -75,6 +75,10 @@ class AuxModelDownloads(QObject):
     @property
     def running(self) -> bool:
         return self._worker is not None
+
+    @property
+    def running_workers(self):
+        return tuple(worker for worker in self._workers if isinstance(worker, QThread) and worker.isRunning())
 
     def start(self, model_ids: list[str] | None = None) -> bool:
         """Begin downloading ``model_ids`` (default: everything missing).

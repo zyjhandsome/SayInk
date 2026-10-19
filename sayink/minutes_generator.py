@@ -29,7 +29,7 @@ from sayink.minutes_prompts import (
     chunk_transcript,
     render_transcript,
 )
-from sayink.minutes_render import extract_json, render_markdown
+from sayink.minutes_render import apply_speaker_names, extract_json, render_markdown
 from sayink.text_polisher import INSECURE_URL_ERROR, LLMCancelled, LLMResponseError, LLMTruncatedError, is_secure_or_local_url
 from sayink.llm_transport import Cancellation, LLMContextError, completion
 from sayink.minutes_validation import validate_markdown, validate_minutes
@@ -203,6 +203,7 @@ class MinutesWorker(QThread):
             on_delta=self._on_delta,
             on_reset=self._reset_preview,
             on_retry=lambda text: self.progress.emit(self._stage + " · " + text),
+            on_status=lambda text: self.progress.emit(self._stage + " · " + text),
             capabilities=self._capabilities,
             thinking_mode="disabled" if self._req.template.is_refinement else None,
         )
@@ -462,6 +463,10 @@ class MinutesWorker(QThread):
         if self._cancelled:
             return
         if payload is not None:
+            # Owned metadata: do not accept a name map supplied by the model.
+            payload.pop("_speaker_names", None)
+            if req.speaker_names:
+                payload["_speaker_names"] = {str(sid): name for sid, name in req.speaker_names.items()}
             markdown = render_markdown(
                 payload,
                 template=req.template,
@@ -473,7 +478,7 @@ class MinutesWorker(QThread):
             )
             json_payload = json.dumps(payload, ensure_ascii=False)
         else:
-            markdown = markdown_text.strip() + "\n"
+            markdown = apply_speaker_names(markdown_text.strip(), req.speaker_names) + "\n"
             json_payload = ""
         self.finished_ok.emit(
             MinutesResult(
@@ -602,29 +607,34 @@ class MinutesGenerator(QObject):
         self._worker = None
 
     def _on_done(self, result) -> None:
-        if self.sender() is not self._worker:
+        if self._worker is None or self.sender() is not self._worker:
             return
         self._worker = None
         self.finished_ok.emit(result)
 
     def _on_error(self, message: str) -> None:
-        if self.sender() is not self._worker:
+        if self._worker is None or self.sender() is not self._worker:
             return
         self._worker = None
         self.error.emit(message)
 
     def _on_progress(self, text: str) -> None:
-        if self.sender() is self._worker:
+        if self._worker is not None and self.sender() is self._worker:
             self.progress.emit(text)
 
     def _on_preview(self, text: str) -> None:
-        if self.sender() is self._worker:
+        if self._worker is not None and self.sender() is self._worker:
             self.preview.emit(text)
 
-    def shutdown(self) -> None:
+    @property
+    def running_workers(self):
+        return tuple(worker for worker in self._workers if worker.isRunning())
+
+    def shutdown(self, *, wait_ms: int = 2000) -> None:
         self.cancel()
         for worker in list(self._workers):
             if worker.isRunning():
                 worker.cancel()
-                worker.wait(2000)
+                if wait_ms:
+                    worker.wait(wait_ms)
             self._reap_worker(worker)

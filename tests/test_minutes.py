@@ -293,6 +293,21 @@ def _run(worker):
 
 
 class TestMinutesWorker:
+    def test_known_names_are_recorded_as_owned_metadata(self, fake_httpx):
+        fake_httpx.script.append(json.dumps({"summary": "张三负责发布。", "_speaker_names": {"9": "猜测姓名"}}))
+        results, errors, _ = _run(MinutesWorker(_request(speaker_names={1: "张三"})))
+        assert errors == []
+        payload = json.loads(results[0].json_payload)
+        assert payload["_speaker_names"] == {"1": "张三"}
+        assert "张三负责发布" in results[0].markdown
+
+    def test_markdown_fallback_uses_the_same_known_names(self, fake_httpx):
+        fake_httpx.script.extend(["not JSON", "# 周会\n\n## 摘要\n说话人1负责发布，稍后验证。"])
+        results, errors, _ = _run(MinutesWorker(_request(speaker_names={1: "张三"})))
+        assert errors == [] and not results[0].json_payload
+        assert "张三负责发布" in results[0].markdown
+        assert "说话人1" not in results[0].markdown
+
     def test_single_request_json(self, fake_httpx):
         fake_httpx.script.append(json.dumps({"title": "周会", "summary": "一切顺利", "decisions": [{"text": "继续", "ts": "00:00:05"}]}))
         results, errors, _ = _run(MinutesWorker(_request()))
@@ -375,6 +390,24 @@ class TestMinutesWorker:
         results, errors, _ = _run(MinutesWorker(_request()))
         assert errors == [] and len(fake_httpx.calls) == 2
         assert "ok" in results[0].markdown
+
+    @pytest.mark.parametrize("template", BUILTIN_TEMPLATES, ids=lambda template: template.id)
+    def test_recovered_retry_status_is_cleared_before_preview(self, fake_httpx, template):
+        lines = [TranscriptLine(0, 1, "本周已经确认完成验收。")]
+        body = (_refined(refinement_chunks(lines)[0]) if template.is_refinement
+                else json.dumps({"summary": "本周已经确认完成验收。"}))
+        fake_httpx.script.extend([_Timeout("timeout"), body])
+        worker = MinutesWorker(_request(lines, template=template))
+        latest, preview_statuses = [""], []
+        worker.progress.connect(lambda text: latest.__setitem__(0, text))
+        worker.preview.connect(lambda text: preview_statuses.append(latest[0]) if text else None)
+
+        results, errors, progress = _run(worker)
+
+        assert not errors and len(results) == 1 and len(fake_httpx.calls) == 2
+        assert any("重试" in text for text in progress)
+        assert preview_statuses and all("重试" not in text for text in preview_statuses)
+        assert "重试" not in progress[-1]
 
     def test_cancel_suppresses_output(self, fake_httpx):
         fake_httpx.script.append(json.dumps({"summary": "ok"}))
@@ -708,6 +741,22 @@ def test_queued_result_from_cancelled_worker_cannot_complete_new_job(monkeypatch
         assert worker.wait(2000)
     QCoreApplication.processEvents()
     generator.shutdown()
+
+
+def test_idle_generation_callbacks_with_a_deleted_sender_are_ignored():
+    from sayink.minutes_generator import MinutesGenerator
+
+    generator = MinutesGenerator()
+    events = []
+    generator.finished_ok.connect(events.append)
+    generator.error.connect(events.append)
+    generator.progress.connect(events.append)
+    generator.preview.connect(events.append)
+    generator._on_done("stale result")
+    generator._on_error("stale error")
+    generator._on_progress("stale progress")
+    generator._on_preview("stale preview")
+    assert events == []
 
 
 def test_embedded_json_preview_never_exposes_protocol(fake_httpx):

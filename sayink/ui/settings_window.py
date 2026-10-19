@@ -111,6 +111,7 @@ class SettingsWindow(QWidget):
         self._pending_segment_count = pending_segment_count
         self._model_cards: dict[str, ModelCard] = {}
         self._dl_workers: dict[str, object] = {}
+        self._download_threads: list[QThread] = []
         self._test_workers: list[QThread] = []
         self._llm_test_worker: QThread | None = None
         self._minutes_test_worker: QThread | None = None
@@ -618,18 +619,37 @@ class SettingsWindow(QWidget):
             source=self._config.get("stt.download_source", "auto"),
         )
         self._dl_workers[model_id] = worker
+        if isinstance(worker, QThread):
+            self._download_threads.append(worker)
+            worker.finished.connect(lambda w=worker: self._reap_download_thread(w))
         self._on_shared_download_progress(model_id, 0)
         card = self._model_cards.get(model_id)
         if card:
             card.set_download_progress(0)
-        worker.progress.connect(lambda pct, c=card: c.set_download_progress(pct) if c else None)
+        worker.progress.connect(lambda pct, mid=model_id: self._update_download_card(mid, pct))
         worker.progress.connect(lambda pct, mid=model_id: self._on_shared_download_progress(mid, pct))
         worker.finished_ok.connect(lambda mid: self._on_dl_done(mid))
-        worker.error.connect(lambda msg, c=card, mid=model_id: self._on_dl_error(msg, c, mid))
+        worker.error.connect(lambda msg, mid=model_id: self._on_dl_error(msg, self._model_cards.get(mid), mid))
         worker.start()
 
+    def _update_download_card(self, model_id: str, pct: int) -> None:
+        card = self._model_cards.get(model_id)
+        if card is not None:
+            card.set_download_progress(pct)
+
+    def _reap_download_thread(self, worker) -> None:
+        if worker.isRunning():
+            return
+        if worker in self._download_threads:
+            self._download_threads.remove(worker)
+        for model_id, active in list(self._dl_workers.items()):
+            if active is worker:
+                self._dl_workers.pop(model_id, None)
+
     def _on_dl_done(self, model_id: str):
-        self._dl_workers.pop(model_id, None)
+        worker = self._dl_workers.pop(model_id, None)
+        if worker is not None and getattr(worker, "_cancelled", False) is True:
+            return
         from sayink.speech_recognizer import get_downloaded_models
         downloaded = get_downloaded_models()
         if len(downloaded) == 1 and downloaded[0] == model_id:
@@ -657,15 +677,14 @@ class SettingsWindow(QWidget):
         QMessageBox.information(self, "完成", text)
 
     def _on_dl_error(self, msg: str, card, model_id: str = ""):
-        if model_id and card is None:
-            self._dl_workers.pop(model_id, None)
+        worker = self._dl_workers.pop(model_id or (card._model_id if card else ""), None)
+        cancelled = worker is not None and getattr(worker, "_cancelled", False) is True
         if card:
-            worker = self._dl_workers.pop(card._model_id, None)
-            if worker is not None and getattr(worker, "_cancelled", False) is True:
+            if cancelled:
                 card.set_download_cancelled()
             else:
                 card.set_download_error(msg)
-        else:
+        elif not cancelled:
             QMessageBox.warning(self, "下载失败", msg)
         self._refresh_recognition_feedback()
 
@@ -1973,18 +1992,17 @@ class SettingsWindow(QWidget):
         """Stop in-progress shortcut capture and resume global hotkey listening."""
         self._hotkey_edit.cancel_capture_if_active()
 
+    @property
+    def running_workers(self):
+        workers = [*self._download_threads, *self.findChildren(QThread)]
+        return tuple(worker for worker in dict.fromkeys(workers) if worker.isRunning())
+
     def cancel_all_downloads(self):
-        """Cancel and wait for any in-progress download workers to finish."""
-        for worker in list(self._dl_workers.values()):
+        """Cancel without blocking Qt; retain live workers until finished."""
+        workers = [*self._dl_workers.values(), *self._download_threads]
+        for worker in dict.fromkeys(workers):
             if hasattr(worker, "cancel"):
                 worker.cancel()
-            if hasattr(worker, "isRunning") and worker.isRunning():
-                worker.wait(3000)
-        self._dl_workers.clear()
-        for worker in list(self._test_workers):
-            if hasattr(worker, "isRunning") and worker.isRunning():
-                worker.wait(1000)
-        self._test_workers.clear()
 
     def on_window_hidden(self) -> None:
         """Stop transient probes/captures and flush edits when the host window hides."""

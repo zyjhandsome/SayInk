@@ -1151,7 +1151,7 @@ class TestMeetingSettings:
         assert config.get("stt.model_id") == "funasr-nano"
         assert "通用 → 识别 → 高级识别设置" in shown[0]
 
-    def test_cancel_all_downloads_cancels_before_waiting(self, settings_window):
+    def test_cancel_all_downloads_cancels_without_waiting_and_keeps_running_workers(self, settings_window):
         events: list[str] = []
 
         class _FakeDl:
@@ -1164,7 +1164,8 @@ class TestMeetingSettings:
             def wait(self, ms):
                 events.append(f"wait:{ms}")
 
-        settings_window._dl_workers["funasr-nano"] = _FakeDl()
+        worker = _FakeDl()
+        settings_window._dl_workers["funasr-nano"] = worker
         settings_window.cancel_all_downloads()
-        assert events == ["cancel", "wait:3000"]
-        assert settings_window._dl_workers == {}
+        assert events == ["cancel"]
+        assert settings_window._dl_workers["funasr-nano"] is worker

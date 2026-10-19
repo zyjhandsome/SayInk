@@ -16,6 +16,10 @@ def event(content=None, finish=None):
             + "\n\n").encode()
 
 
+def reasoning_event():
+    return b'data: {"choices":[{"delta":{"reasoning_content":"hidden thought"},"finish_reason":null}]}\n\n'
+
+
 class ByteStream(httpx.AsyncByteStream):
     def __init__(self, chunks, *, delay=0):
         self.chunks, self.delay, self.closed = chunks, delay, False
@@ -92,6 +96,99 @@ def test_gateway_ignoring_stream_can_return_json():
     assert run(lambda request: httpx.Response(200, json={
         "choices": [{"message": {"content": "plain"}, "finish_reason": "stop"}]
     })) == "plain"
+
+
+def test_continuous_reasoning_does_not_trigger_first_content_timeout():
+    calls, deltas = [], []
+
+    def handler(request):
+        calls.append(request)
+        return streaming([reasoning_event()] * 8 + [event("answer"), event(finish="stop")], delay=0.02)
+
+    assert run(handler, timeout_sec=0.06, idle_timeout_sec=0.5, on_delta=deltas.append) == "answer"
+    assert len(calls) == 1 and deltas == ["answer"]
+
+
+@pytest.mark.parametrize("failure,expected", [
+    (httpx.ConnectError("private connection detail"), "连接异常"),
+    (httpx.ReadTimeout("private timeout detail"), "等待模型响应超时"),
+    (httpx.RemoteProtocolError("private protocol detail"), "响应中断"),
+    ("broken", "响应中断"),
+    (429, "限流"),
+    (500, "HTTP 500"),
+    (502, "HTTP 502"),
+    (503, "HTTP 503"),
+    (504, "HTTP 504"),
+])
+def test_retry_reason_and_status_track_recovered_stream(failure, expected, caplog):
+    calls, statuses = [], []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            if isinstance(failure, Exception):
+                raise failure
+            if failure == "broken":
+                return streaming([event("discarded")])
+            return httpx.Response(failure, headers={"retry-after": "0"}, json={"error": {}})
+        return streaming([reasoning_event(), event("answer"), event(finish="stop")])
+
+    assert run(handler, on_status=statuses.append, on_retry=statuses.append) == "answer"
+    retry_at = next(i for i, text in enumerate(statuses) if "重试" in text)
+    assert expected in statuses[retry_at]
+    assert statuses[retry_at + 1:] == [
+        "正在连接模型…", "已连接，等待模型响应…", "模型正在思考…", "正在接收正文…", "正文已接收，正在检查…",
+    ]
+    assert len(calls) == 2
+    assert "cause=" in caplog.text and "private" not in caplog.text and "hidden thought" not in caplog.text
+
+
+@pytest.mark.parametrize("reasoning", [False, True])
+def test_heartbeats_do_not_mask_stalled_model_output(reasoning):
+    streams = []
+
+    def handler(request):
+        chunks = ([reasoning_event()] if reasoning else []) + [b": keepalive\n\n"] * 100
+        response = streaming(chunks, delay=0.01)
+        streams.append(response.stream)
+        return response
+
+    with pytest.raises(LLMResponseError, match="超时"):
+        run(handler, timeout_sec=0.05, idle_timeout_sec=0.05, total_timeout_sec=2)
+    assert len(streams) == 2 and all(stream.closed for stream in streams)
+
+
+def test_active_reasoning_still_obeys_total_deadline():
+    streams = []
+
+    def handler(request):
+        response = streaming([reasoning_event()] * 100, delay=0.01)
+        streams.append(response.stream)
+        return response
+
+    with pytest.raises(LLMResponseError, match="超时"):
+        run(handler, timeout_sec=1, idle_timeout_sec=1, total_timeout_sec=0.05)
+    assert len(streams) == 1 and streams[0].closed
+
+
+@pytest.mark.parametrize("cancel_at", ["模型正在思考…", "正在接收正文…"])
+def test_cancel_interrupts_active_stream_and_closes_it(cancel_at):
+    cancellation, streams = Cancellation(), []
+
+    def handler(request):
+        response = streaming([reasoning_event(), event("answer")] * 100 + [event(finish="stop")])
+        streams.append(response.stream)
+        return response
+
+    async def work():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await completion(client, httpx, api_url="https://example.test", api_key="", model_name="m",
+                             messages=[], max_tokens=100,
+                             on_status=lambda text: cancellation.cancel() if text == cancel_at else None)
+
+    with pytest.raises(LLMCancelled):
+        cancellation.run(work())
+    assert len(streams) == 1 and streams[0].closed
 
 
 def test_reasoning_model_parameter_compatibility_is_bounded_and_remembered():

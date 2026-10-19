@@ -273,6 +273,10 @@ class TextPolisher(QObject):
         # destroys a live QThread after cancel().
         self._workers: list[PolishWorker] = []
 
+    @property
+    def running_workers(self):
+        return tuple(worker for worker in self._workers if worker.isRunning())
+
     def polish(
         self,
         text: str,
@@ -310,6 +314,8 @@ class TextPolisher(QObject):
         worker.start()
 
     def _reap_worker(self, worker: PolishWorker) -> None:
+        if worker.isRunning():
+            return
         try:
             self._workers.remove(worker)
         except ValueError:
@@ -335,9 +341,13 @@ class TextPolisher(QObject):
         self._worker = None
 
     def _on_result(self, polished_text: str):
+        if self._worker is None or self.sender() is not self._worker:
+            return
         self.polish_complete.emit(polished_text)
 
     def _on_error(self, error_msg: str):
+        if self._worker is None or self.sender() is not self._worker:
+            return
         self.polish_error.emit(error_msg)
 
     @staticmethod

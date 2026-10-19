@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import numpy as np
 import pyperclip
-from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMessageBox
 
 from sayink.config import (
@@ -846,6 +846,8 @@ class App(QObject):
             self._floating.show_meeting(self._meeting.elapsed_text())
 
     def _on_recording_start(self):
+        if self.__dict__.get("_exit_started", False):
+            return
         if self._meeting_blocks_hotkey():
             return
         self._apply_pending_recognition_settings()
@@ -1043,6 +1045,8 @@ class App(QObject):
             QTimer.singleShot(1200, self._refresh_continuous_ui_after_output)
 
     def _on_recorder_error(self, error_msg: str):
+        if self.__dict__.get("_exit_started", False):
+            return
         if self._meeting_active():
             # The meeting stays open. A dictation-style error toast would hide
             # the meeting bar a few seconds later.
@@ -1066,6 +1070,8 @@ class App(QObject):
         self._floating.show_error(self._friendly_error(error_msg))
 
     def _on_recorder_warning(self, warning_msg: str):
+        if self.__dict__.get("_exit_started", False):
+            return
         log.warning("%s", warning_msg)
         self._floating.show_warning("音频采集受限", warning_msg)
         self._tray.showMessage(
@@ -1076,6 +1082,8 @@ class App(QObject):
         )
 
     def _start_continuous_listening(self):
+        if self.__dict__.get("_exit_started", False):
+            return
         if not self._is_continuous_mode():
             return
         if not self._recognizer.is_ready:
@@ -1152,6 +1160,8 @@ class App(QObject):
         front: bool = False,
         context: _SegmentContext | None = None,
     ) -> None:
+        if self.__dict__.get("_exit_started", False):
+            return
         segment = _QueuedSegment(audio=audio, route=route, context=context)
         if front:
             self._segment_queue.insert(0, segment)
@@ -1314,6 +1324,8 @@ class App(QObject):
     # ── Recognition ───────────────────────────────────
 
     def _on_recording_finished(self, full_audio: np.ndarray):
+        if self.__dict__.get("_exit_started", False):
+            return
         if full_audio.size < MIN_AUDIO_SAMPLES:
             if self._emit_hold_output_if_ready():
                 return
@@ -1403,6 +1415,8 @@ class App(QObject):
             self._floating.show_live_transcript(text)
 
     def _on_partial_result(self, text: str) -> None:
+        if self.__dict__.get("_exit_started", False):
+            return
         piece = (text or "").strip()
         if not piece:
             return
@@ -1458,6 +1472,8 @@ class App(QObject):
         return self._applied_recognition_settings.glossary
 
     def _on_final_result(self, text: str):
+        if self.__dict__.get("_exit_started", False):
+            return
         text = restore_glossary_case(normalize_asr_output(text), self._glossary_for_pending_segment())
         if self._hold_paste_sent and not self._is_continuous_mode():
             self._is_transcribing = False
@@ -1703,6 +1719,8 @@ class App(QObject):
     # ── Output ────────────────────────────────────────
 
     def _output_text(self, text: str, *, degraded_from_polish: bool = False):
+        if self.__dict__.get("_exit_started", False):
+            return
         self._is_transcribing = False
         text = normalize_asr_output(text)
         if not text.strip():
@@ -1830,6 +1848,8 @@ class App(QObject):
         degraded_from_polish: bool = False,
         record: SegmentRecord | None = None,
     ):
+        if self.__dict__.get("_exit_started", False):
+            return
         self._output_busy = False
         self._output_stage = OutputStage.IDLE
         self._output_stage_text = ""
@@ -2376,6 +2396,8 @@ class App(QObject):
         )
 
     def _show_main_window(self, page: str | None = None):
+        if self.__dict__.get("_exit_started", False):
+            return
         if self._main is None:
             try:
                 self._main = MainWindow(self._config, self._history, meeting=self._meeting_or_none())
@@ -2685,9 +2707,13 @@ class App(QObject):
         if self._exit_started:
             return
         self._exit_started = True
+        self._clear_queued_audio()
+        self._output_stage = OutputStage.IDLE
         log.info("SayInk 正在退出...")
+        for timer in self.findChildren(QTimer):
+            timer.stop()
         self._stop_continuous_listening()
-        self._meeting.shutdown()
+        self._meeting.shutdown(wait_ms=0)
         self._hotkey_mgr.stop()
         self._hold_open_pending = False
         if self._recorder.is_recording:
@@ -2704,12 +2730,27 @@ class App(QObject):
 
         if self._main is not None:
             self._main.history_panel.flush_pending_delete()
-        self._recognizer.shutdown()
+        self._recognizer.shutdown(wait_ms=0)
         self._polisher.cancel()
+        self._updates.shutdown()
         self._tray.hide()
         # Queued history writes finish before the process goes away; the
         # writer is a daemon thread, so this wait is their only chance.
         self._history.close()
+        self._complete_quit_when_idle()
+
+    def _complete_quit_when_idle(self):
+        owners = [self._recognizer, self._polisher, self._meeting, self._updates, self._settings_widget()]
+        if self._main is not None:
+            owners.append(self._main.meeting_panel)
+        # Native model loading cannot safely be force-terminated. Keep the Qt
+        # event loop and each owner's worker references alive until it exits.
+        pending = [worker for owner in owners if owner is not None
+                   for worker in getattr(owner, "running_workers", ())
+                   if isinstance(worker, QThread) and worker.isRunning()]
+        if pending:
+            QTimer.singleShot(80, self._complete_quit_when_idle)
+            return
         self._config.save_immediate()
         QApplication.quit()
 

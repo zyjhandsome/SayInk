@@ -80,10 +80,11 @@ class MeetingSpeaker:
     speaker_id: int
     display_name: str = ""
     suggested_name: str = ""
+    name_locked: bool = False
 
     @property
     def label(self) -> str:
-        return self.display_name or self.suggested_name or f"说话人{self.speaker_id}"
+        return self.display_name or (self.suggested_name if not self.name_locked else "") or f"说话人{self.speaker_id}"
 
 
 @dataclass(frozen=True)
@@ -398,19 +399,46 @@ class MeetingStore:
         def _upsert(conn: sqlite3.Connection) -> None:
             conn.execute(
                 """
-                INSERT INTO meeting_speakers (meeting_id, speaker_id, display_name, suggested_name)
-                VALUES (?, ?, COALESCE(?, ''), COALESCE(?, ''))
+                INSERT INTO meeting_speakers (meeting_id, speaker_id, display_name, suggested_name, name_locked)
+                VALUES (?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, 0))
                 ON CONFLICT(meeting_id, speaker_id) DO UPDATE SET
                   display_name = COALESCE(?, display_name),
-                  suggested_name = COALESCE(?, suggested_name)
+                  suggested_name = COALESCE(?, suggested_name),
+                  name_locked = COALESCE(?, name_locked)
                 """,
                 (
                     meeting_id, int(speaker_id), display_name, suggested_name,
-                    display_name, suggested_name,
+                    1 if display_name is not None else None,
+                    display_name, suggested_name, 1 if display_name is not None else None,
                 ),
             )
 
         self._write(_upsert)
+
+    def save_inferred_names(self, meeting_id: str, names: dict[int, str], *, markdown: str | None = None) -> None:
+        """Commit validated automatic labels and their rendered notes together.
+
+        Manual names (including an explicitly restored number) are protected.
+        Renaming keeps notes metadata, edits and the previous version intact.
+        """
+        def _save(conn: sqlite3.Connection) -> None:
+            row = conn.execute("SELECT status FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+            if row is None or row[0] not in (STATUS_ENDED, STATUS_INTERRUPTED):
+                return
+            conn.execute(
+                "UPDATE meeting_speakers SET suggested_name = '' WHERE meeting_id = ? "
+                "AND display_name = '' AND name_locked = 0", (meeting_id,),
+            )
+            for sid, name in names.items():
+                conn.execute(
+                    "INSERT INTO meeting_speakers (meeting_id, speaker_id, suggested_name) VALUES (?, ?, ?) "
+                    "ON CONFLICT(meeting_id, speaker_id) DO UPDATE SET suggested_name = excluded.suggested_name "
+                    "WHERE meeting_speakers.display_name = '' AND meeting_speakers.name_locked = 0",
+                    (meeting_id, sid, name),
+                )
+            if markdown is not None:
+                conn.execute("UPDATE meeting_notes SET markdown = ? WHERE meeting_id = ?", (markdown, meeting_id))
+        self._write(_save)
 
     def relabel_segments(self, meeting_id: str, mapping: dict[int, int]) -> None:
         """Apply a post-meeting re-clustering (old speaker_id → new speaker_id).
@@ -663,11 +691,11 @@ class MeetingStore:
     def get_speakers(self, meeting_id: str) -> list[MeetingSpeaker]:
         def _q(conn: sqlite3.Connection) -> list[MeetingSpeaker]:
             rows = conn.execute(
-                "SELECT meeting_id, speaker_id, display_name, suggested_name FROM meeting_speakers "
+                "SELECT meeting_id, speaker_id, display_name, suggested_name, name_locked FROM meeting_speakers "
                 "WHERE meeting_id = ? ORDER BY speaker_id ASC",
                 (meeting_id,),
             ).fetchall()
-            return [MeetingSpeaker(r[0], int(r[1]), r[2] or "", r[3] or "") for r in rows]
+            return [MeetingSpeaker(r[0], int(r[1]), r[2] or "", r[3] or "", bool(r[4])) for r in rows]
 
         return self._history.read(_q, default=[]) or []
 

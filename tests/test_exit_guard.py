@@ -62,6 +62,34 @@ def test_idle_exit_needs_no_confirmation():
             quit_app.assert_called_once()
 
 
+def test_exit_waits_for_native_worker_without_blocking_the_event_loop():
+    import threading
+    from PyQt6.QtCore import QThread
+
+    release = threading.Event()
+
+    class Worker(QThread):
+        def run(self):
+            release.wait(5)
+
+    worker = Worker()
+    worker.start()
+    try:
+        with app_harness() as h:
+            h["recognizer"].running_workers = (worker,)
+            with patch("sayink.app.QTimer.singleShot") as later, patch("sayink.app.QApplication.quit") as quit_app:
+                h["app"]._finish_quit()
+                quit_app.assert_not_called()
+                callback = later.call_args.args[1]
+                release.set()
+                assert worker.wait(2000)
+                callback()
+                quit_app.assert_called_once()
+    finally:
+        release.set()
+        assert worker.wait(2000)
+
+
 def test_closing_confirmation_preserves_pending_work():
     with app_harness() as h:
         h["app"]._is_transcribing = True
@@ -73,6 +101,33 @@ def test_closing_confirmation_preserves_pending_work():
             dialog.setEscapeButton.assert_called_once_with("return")
             quit_app.assert_not_called()
         h["recognizer"].shutdown.assert_not_called()
+
+
+def test_late_callbacks_after_exit_cannot_start_work_or_write_to_closed_history():
+    with app_harness() as h:
+        app = h["app"]
+        app._exit_started = True
+        h["history"].reset_mock()
+        h["recognizer"].reset_mock()
+        h["paster"].reset_mock()
+        h["recorder"].reset_mock()
+        h["floating"].reset_mock()
+        app._on_recording_start()
+        app._start_continuous_listening()
+        app._on_recorder_error("late error")
+        app._on_recorder_warning("late warning")
+        app._enqueue_audio(np.ones(1600, dtype=np.float32))
+        app._on_recording_finished(np.ones(1600, dtype=np.float32))
+        app._on_partial_result("late partial")
+        app._on_final_result("late result")
+        app._output_text("late output")
+        app._handle_paste_result("sent")
+        assert not app._segment_queue
+        assert not h["recognizer"].mock_calls
+        assert not h["paster"].mock_calls
+        assert not h["history"].mock_calls
+        assert not h["recorder"].mock_calls
+        assert not h["floating"].mock_calls
 
 
 def test_reentrant_exit_does_not_open_another_confirmation():

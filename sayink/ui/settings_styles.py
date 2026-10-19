@@ -297,6 +297,74 @@ def build_btn_green_sm() -> str:
 """
 
 
+def build_toolbar_combo_css() -> str:
+    """Template picker in a meeting toolbar: same outer box as the small buttons.
+
+    The shared form combo is 40px. Leaving it at that height centers the 34px
+    action buttons under a taller row, so switching to a button-only toolbar
+    moves those buttons closer to the tabs.
+    """
+    down = _spin_arrow_urls()[1]
+    h = t.CONTROL_BTN_SM_HEIGHT
+    return f"""
+    QComboBox {{
+        background: {t.INPUT_BG};
+        color: {t.TEXT};
+        border: 1px solid {t.CONTROL_BORDER};
+        border-radius: {t.RADIUS_SM}px;
+        padding: 0px 28px 0px 12px;
+        font-size: {t.TYPE_BODY_SM}px;
+        min-height: {h}px;
+        max-height: {h}px;
+    }}
+    QComboBox:hover {{
+        border-color: {t.TEXT_DIM};
+    }}
+    QComboBox:focus, QComboBox:on {{
+        border: 2px solid {t.ACCENT_FOCUS};
+        padding: 0px 27px 0px 11px;
+    }}
+    QComboBox:disabled {{
+        color: {t.TEXT_DIM};
+        background: {t.BAR_OFF};
+        border-color: {t.HAIRLINE};
+    }}
+    QComboBox::drop-down {{
+        subcontrol-origin: padding;
+        subcontrol-position: center right;
+        width: 28px;
+        border: none;
+        background: transparent;
+    }}
+    QComboBox::down-arrow {{
+        image: url("{down}");
+        width: 10px;
+        height: 6px;
+    }}
+    QComboBox QAbstractItemView {{
+        background: {t.SURFACE_PEARL};
+        color: {t.TEXT};
+        border: 1px solid {t.HAIRLINE};
+        border-radius: {t.RADIUS_LG}px;
+        padding: 4px;
+        selection-background-color: {t.ROW_SELECTED};
+        selection-color: {t.TEXT};
+        outline: none;
+    }}
+    QComboBox QAbstractItemView::item {{
+        min-height: 28px;
+        padding: 4px 28px 4px 10px;
+        border-radius: {t.RADIUS_SM}px;
+        color: {t.TEXT};
+    }}
+    QComboBox QAbstractItemView::item:hover,
+    QComboBox QAbstractItemView::item:selected {{
+        background: {t.ROW_SELECTED};
+        color: {t.TEXT};
+    }}
+"""
+
+
 def build_btn_accent_sm() -> str:
     # 1px border matching fill keeps the box identical to ghost SM.
     h, pad_h, focus_pad_h, font_px = _btn_sm_metrics()

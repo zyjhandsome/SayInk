@@ -13,6 +13,7 @@ State machine (docs/meeting-notes-design.md §5.3)::
 from __future__ import annotations
 
 import logging
+import json
 import re
 import time
 from dataclasses import dataclass, field, replace
@@ -42,10 +43,11 @@ from sayink.minutes_prompts import (
     speaker_label,
     transcript_lines,
 )
-from sayink.minutes_render import render_markdown, replace_names_in_markdown
+from sayink.minutes_render import apply_speaker_names, render_markdown, replace_names_in_markdown
 from sayink.recognition_settings import RecognitionSettings, audio_source, aux_model_path
 from sayink.speaker_embedding import STICKY_GAP_MS, SpeakerEmbedder, make_embedder
 from sayink.speaker_session import SpeakerSession, recluster
+from sayink.speaker_naming import infer_speaker_names
 from sayink.speech_recognizer import (
     AUX_MODEL_SILERO_VAD,
     AUX_MODEL_SPEAKER,
@@ -363,6 +365,7 @@ class MeetingController(QObject):
         self._store.end_meeting(meeting_id, ended_at=ended_at)
         self._apply_recluster(meeting_id)
         self._store.flush()
+        self.auto_name_speakers(meeting_id)
         self._speakers = None
         self._embedder = None
         self._current = self._store.get_meeting(meeting_id) or MeetingRecord(
@@ -468,13 +471,61 @@ class MeetingController(QObject):
                         chunked=notes.chunked, generated_at=notes.generated_at, keep_previous=True,
                     )
             else:
+                payload = notes.payload()
+                payload.setdefault("_speaker_names", {str(sid): row.label for sid, row in existing.items()})
+                notes = replace(notes, json_payload=json.dumps(payload, ensure_ascii=False))
                 self._rerender_notes(meeting_id, notes)
             self._store.flush()
+        self.auto_name_speakers(meeting_id)
         self.meeting_changed.emit(meeting_id)
         return replaced
 
     def speaker_names(self, meeting_id: str) -> dict[int, str]:
-        return {s.speaker_id: s.display_name for s in self._store.get_speakers(meeting_id) if s.display_name}
+        return {
+            s.speaker_id: s.label for s in self._store.get_speakers(meeting_id)
+            if s.display_name or (s.suggested_name and not s.name_locked)
+        }
+
+    def auto_name_speakers(self, meeting_id: str) -> bool:
+        """Resolve only explicit introductions in raw speech, after clustering.
+
+        Polished/model-generated text is never evidence for a person's name.
+        This also upgrades older meetings when they are next organised.
+        """
+        record = self._store.get_meeting(meeting_id)
+        if record is None or record.status == STATUS_LIVE or self._generating_for == meeting_id:
+            return False
+        segments = self._store.get_segments(meeting_id)
+        rows = self._store.get_speakers(meeting_id)
+        manual = {s.speaker_id: s.display_name for s in rows if s.display_name or s.name_locked}
+        inferred = infer_speaker_names(
+            transcript_lines(segments, record.started_at, prefer_polished=False), manual_names=manual,
+        )
+        previous = {s.speaker_id: s.suggested_name for s in rows if s.suggested_name and not s.display_name and not s.name_locked}
+        if inferred == previous:
+            return True
+        names = {**inferred, **{sid: name for sid, name in manual.items() if name}}
+        notes = self._store.get_notes(meeting_id)
+        markdown = None
+        if notes is not None and notes.markdown:
+            if notes.user_edited or not notes.json_payload:
+                markdown = notes.markdown
+                for sid in previous.keys() | inferred.keys():
+                    old = previous.get(sid) or speaker_label(sid)
+                    new = names.get(sid) or speaker_label(sid)
+                    markdown, _ = replace_names_in_markdown(markdown, old, new)
+            else:
+                markdown = self._render_notes(meeting_id, notes, names=names)
+        self._store.save_inferred_names(meeting_id, inferred, markdown=markdown)
+        if not self._store.flush():
+            return False
+        if self.speaker_names(meeting_id) != names:
+            return False
+        saved = self._store.get_notes(meeting_id) if markdown is not None else None
+        if markdown is not None and (saved is None or saved.markdown != markdown):
+            return False
+        self.meeting_changed.emit(meeting_id)
+        return True
 
     def correct_segment_speaker(self, meeting_id: str, seq: int, speaker_id: int) -> bool:
         record = self._store.get_meeting(meeting_id)
@@ -489,6 +540,7 @@ class MeetingController(QObject):
         saved = next((s for s in self._store.get_segments(meeting_id) if s.seq == seq), None)
         if saved is None or saved.speaker_id != speaker_id:
             return False
+        self.auto_name_speakers(meeting_id)
         self.meeting_changed.emit(meeting_id)
         return True
 
@@ -515,13 +567,24 @@ class MeetingController(QObject):
         return tuple(lines)
 
     def _rerender_notes(self, meeting_id: str, notes: MeetingNotes) -> None:
+        markdown = self._render_notes(meeting_id, notes)
+        if markdown is None:
+            return
+        self._store.save_notes(
+            meeting_id, template_id=notes.template_id, model=notes.model,
+            json_payload=notes.json_payload, markdown=markdown,
+            duration_ms=notes.duration_ms, chunked=notes.chunked, generated_at=notes.generated_at,
+            keep_previous=True,
+        )
+
+    def _render_notes(self, meeting_id: str, notes: MeetingNotes, *, names: dict[int, str] | None = None) -> str | None:
         record = self._store.get_meeting(meeting_id)
         if record is None:
-            return
+            return None
         payload = notes.payload()
         lines = transcript_lines(self._store.get_segments(meeting_id), record.started_at)
-        names = self.speaker_names(meeting_id)
-        markdown = render_markdown(
+        names = self.speaker_names(meeting_id) if names is None else names
+        return render_markdown(
             payload,
             template=get_template(notes.template_id or GENERAL_TEMPLATE_ID, self._custom_templates()),
             title_fallback=record.display_title,
@@ -529,12 +592,6 @@ class MeetingController(QObject):
             transcript_text="\n".join(line.render(names) for line in lines),
             speaker_names=names,
             meta_lines=self._meeting_meta_lines(record),
-        )
-        self._store.save_notes(
-            meeting_id, template_id=notes.template_id, model=notes.model,
-            json_payload=notes.json_payload, markdown=markdown,
-            duration_ms=notes.duration_ms, chunked=notes.chunked, generated_at=notes.generated_at,
-            keep_previous=True,
         )
 
     def save_user_markdown(self, meeting_id: str, markdown: str) -> bool:
@@ -551,6 +608,12 @@ class MeetingController(QObject):
     def restore_previous_notes(self, meeting_id: str) -> None:
         self._store.restore_previous_notes(meeting_id)
         self._store.flush()
+        notes = self._store.get_notes(meeting_id)
+        if notes is not None:
+            markdown = apply_speaker_names(notes.markdown, self.speaker_names(meeting_id))
+            if markdown != notes.markdown:
+                self._store.save_user_markdown(meeting_id, markdown)
+                self._store.flush()
         self.meeting_changed.emit(meeting_id)
 
     def delete_meeting(self, meeting_id: str) -> None:
@@ -643,6 +706,9 @@ class MeetingController(QObject):
         if not lines:
             self.generation_failed.emit(meeting_id, "文字稿为空，无法整理原文" if template.is_refinement else "文字稿为空，无法生成纪要")
             return False
+        if not self.auto_name_speakers(meeting_id):
+            self.generation_failed.emit(meeting_id, "说话人名称保存失败，请重试")
+            return False
         names = self.speaker_names(meeting_id)
         marks = [(m.offset_ms, m.note) for m in self._store.get_marks(meeting_id)]
         context = MeetingContext(
@@ -732,11 +798,15 @@ class MeetingController(QObject):
         if meeting_id:
             self.generation_failed.emit(meeting_id, message)
 
-    def shutdown(self) -> None:
+    @property
+    def running_workers(self):
+        return self._generator.running_workers
+
+    def shutdown(self, *, wait_ms: int = 2000) -> None:
         self.abandon_on_exit()
         self._clock.stop()
         self._drain_timer.stop()
-        self._generator.shutdown()
+        self._generator.shutdown(wait_ms=wait_ms)
 
 
 def record_template_id(config: Config, notes: MeetingNotes | None) -> str:

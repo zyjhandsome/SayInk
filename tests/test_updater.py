@@ -19,6 +19,40 @@ def _payload(version: str, name: str, url: str) -> dict:
     }
 
 
+def test_cancelled_download_never_starts_a_network_request(tmp_path, monkeypatch):
+    from sayink.updater import UpdateDownloadWorker
+
+    calls = []
+    monkeypatch.setattr("sayink.updater.download_installer", lambda *args, **kwargs: calls.append(args))
+    worker = UpdateDownloadWorker("https://example.test/file", tmp_path / "setup.exe")
+    results = []
+    worker.finished_path.connect(results.append)
+    worker.failed.connect(results.append)
+    worker.cancel()
+    worker.run()
+    assert not calls and not results
+
+
+def test_cancel_during_download_stops_at_next_chunk_without_false_completion(tmp_path, monkeypatch):
+    from sayink.updater import UpdateDownloadWorker
+
+    worker = UpdateDownloadWorker("https://example.test/file", tmp_path / "setup.exe")
+    results, progress = [], []
+    worker.finished_path.connect(results.append)
+    worker.failed.connect(results.append)
+    worker.progress.connect(lambda got, total: progress.append((got, total)))
+
+    def download(*args, on_progress, **kwargs):
+        on_progress(1, 3)
+        worker.cancel()
+        on_progress(2, 3)
+        raise AssertionError("cancelled download continued")
+
+    monkeypatch.setattr("sayink.updater.download_installer", download)
+    worker.run()
+    assert not results and progress == [(1, 3)]
+
+
 class TestReleaseSelection:
     def test_newer_release_with_the_matching_installer_is_offered(self):
         info = release_from_payload(

@@ -169,6 +169,42 @@ def test_renders_sessions_as_reverse_order_group_rows(qapp):
     assert second.data(Qt.ItemDataRole.UserRole) == "older"
 
 
+def test_unchanged_refresh_reuses_rows_and_preserves_selected_text(qapp):
+    from PyQt6.QtGui import QTextCursor
+
+    window = HistoryWindow(FakeHistoryStore())
+    try:
+        item = window.session_items()[0]
+        row = window._session_list.itemWidget(item)
+        cursor = window._details.textCursor()
+        cursor.setPosition(2)
+        cursor.setPosition(8, QTextCursor.MoveMode.KeepAnchor)
+        window._details.setTextCursor(cursor)
+        selected = cursor.selectedText()
+        assert selected
+        window.refresh()
+        assert window.session_items()[0] is item
+        assert window._session_list.itemWidget(item) is row
+        assert window._details.textCursor().selectedText() == selected
+    finally:
+        window.close()
+
+
+def test_detail_updates_even_when_list_summary_is_unchanged(qapp):
+    from dataclasses import replace
+
+    store = FakeHistoryStore()
+    window = HistoryWindow(store)
+    try:
+        item = window.session_items()[0]
+        store.segments["newer"][0] = replace(store.segments["newer"][0], polished_text="updated detail text")
+        window.refresh()
+        assert window.session_items()[0] is item
+        assert "updated detail text" in window._details.toPlainText()
+    finally:
+        window.close()
+
+
 def test_expand_session_renders_effective_segments(qapp):
     store = FakeHistoryStore()
     window = HistoryWindow(store)

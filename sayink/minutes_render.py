@@ -122,7 +122,7 @@ def flag_unverified(text: str, transcript_text: str) -> str:
 
 
 def apply_speaker_names(text: str, names: Mapping[int, str] | None) -> str:
-    """Replace 「说话人N」 with the display name chosen by the user."""
+    """Replace 「说话人N」 with a manual or source-validated display name."""
     if not names or not text:
         return text
 
@@ -132,6 +132,42 @@ def apply_speaker_names(text: str, names: Mapping[int, str] | None) -> str:
         return name or match.group(0)
 
     return _SPEAKER_LABEL_RE.sub(_swap, text)
+
+
+def _canonical_speaker_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Keep generated literal names connected to stable speaker numbers.
+
+    The worker records its own name snapshot, never a model's identity guess.
+    Canonicalise before rendering so later corrections and even name swaps do
+    not get undone by old literal names embedded in the stored JSON.
+    """
+    snapshot = payload.get("_speaker_names")
+    if not isinstance(snapshot, dict):
+        return payload
+    owners: dict[str, set[int]] = {}
+    for sid, name in snapshot.items():
+        if str(sid).isdigit() and int(sid) > 0 and isinstance(name, str) and name.strip():
+            owners.setdefault(name.strip(), set()).add(int(sid))
+    aliases = {name: speaker_label(next(iter(ids))) for name, ids in owners.items() if len(ids) == 1}
+    if not aliases:
+        return payload
+    patterns = []
+    for name in sorted(aliases, key=len, reverse=True):
+        head = r"(?<![0-9A-Za-z])" if re.match(r"[0-9A-Za-z]", name) else ""
+        tail = r"(?![0-9A-Za-z])" if re.search(r"[0-9A-Za-z]$", name) else ""
+        patterns.append(head + re.escape(name) + tail)
+    pattern = re.compile("|".join(patterns))
+
+    def canonical(value):
+        if isinstance(value, str):
+            return pattern.sub(lambda match: aliases[match.group()], value)
+        if isinstance(value, list):
+            return [canonical(item) for item in value]
+        if isinstance(value, dict):
+            return {key: canonical(item) for key, item in value.items() if key != "_speaker_names"}
+        return value
+
+    return canonical(dict(payload))
 
 
 def render_markdown(
@@ -145,11 +181,11 @@ def render_markdown(
     meta_lines: Sequence[str] = (),
 ) -> str:
     """Render the structured minutes; missing sections become placeholders."""
-    payload = payload or {}
+    payload = _canonical_speaker_payload(payload or {})
     if template.is_refinement:
         from sayink.transcript_refiner import render_refinement
 
-        return render_refinement(payload)
+        return apply_speaker_names(render_refinement(payload), speaker_names)
     title = _as_text(payload.get("title")) or title_fallback
     out: list[str] = [f"# {apply_speaker_names(title, speaker_names)}"]
     if meta_lines:
@@ -272,7 +308,7 @@ def _render_speakers_section(
         if suggested.lower() in ("null", "none"):
             suggested = ""
         hint = ""
-        if suggested and suggested != label:
+        if suggested and suggested != label and not (match and names and int(match.group(1)) in names):
             ts = _ts(speaker.get("evidence_ts"), duration_ms)
             hint = f"（可能是 {suggested}{(' ' + ts) if ts else ''}）"
         lines.append(f"- **{label}**{hint}：{summary or EMPTY_SECTION_TEXT}")

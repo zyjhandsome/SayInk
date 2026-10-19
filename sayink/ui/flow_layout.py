@@ -262,7 +262,12 @@ class WrappingToolBar(QWidget):
 
 
 class PairedToolBar(QWidget):
-    """Two clusters. They share a row when they fit; otherwise the right cluster drops intact."""
+    """Two clusters. They share a row when they fit.
+
+    When they do not, the trailing cluster stays on the first row and the
+    leading cluster drops intact. Action buttons live in the trailing cluster,
+    so swapping the leading tools (another tab) does not move them.
+    """
 
     def __init__(self, parent: QWidget | None = None, *, spacing: int = 8) -> None:
         super().__init__(parent)
@@ -355,6 +360,8 @@ class PairedToolBar(QWidget):
         if 0 < widget.maximumWidth() < 16_777_215:
             width = min(width, widget.maximumWidth())
         height = max(hint.height(), widget.minimumHeight())
+        if 0 < widget.maximumHeight() < 16_777_215:
+            height = min(height, widget.maximumHeight())
         return QSize(width, height)
 
     def _span(self, widgets: list[QWidget]) -> int:
@@ -386,20 +393,28 @@ class PairedToolBar(QWidget):
                 self._pack(left, 0, 0, row_h)
                 self._pack(right, max(0, width - right_w), 0, row_h)
             return row_h
+        # Trailing actions stay on the first row. The leading cluster drops
+        # as a whole, so a tab that only has actions does not sit higher.
         y = 0
-        if left:
-            if apply:
-                self._pack(left, 0, 0, row_h)
-            y = row_h + gap
-        if not right:
-            return row_h
-        if width <= 0 or right_w <= width:
-            if apply:
-                self._pack(right, 0, y, row_h)
-            return y + row_h
+        if right:
+            if right_w <= width:
+                if apply:
+                    self._pack(right, max(0, width - right_w), 0, row_h)
+                y = row_h
+            else:
+                y = self._wrap_line(right, 0, row_h, width, gap, apply)
+        if not left:
+            return max(y, row_h)
+        if y:
+            y += gap
+        if apply:
+            self._pack(left, 0, y, row_h)
+        return y + row_h
+
+    def _wrap_line(self, widgets: list[QWidget], y: int, row_h: int, width: int, gap: int, apply: bool) -> int:
         x = 0
         line = y
-        for widget in right:
+        for widget in widgets:
             item_w = self._box(widget).width()
             if x > 0 and x + item_w > width:
                 line += row_h + gap
