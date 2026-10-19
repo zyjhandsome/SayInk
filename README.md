@@ -2,7 +2,7 @@
 
 本地离线的**口述输入**工具：**按住快捷键说话，松开后识别并粘贴到光标处**（默认），本地 ASR 识别，可选大模型润色。也可切换为 **自动持续转写**（按住开始整场监听，停顿后自动出字），或采集**电脑播放声** / **混合**来听会议——这两种来源下结果**只记录到历史、不粘贴**，不会误输入到当前窗口。开会请用独立的 **AI 会议记录**：本机实时转写并区分说话人，结束后用你配置的大模型生成**会议纪要**（摘要、要点、决议、待办、问题、时间线），不保存音频。
 
-版本号以 **`sayink/version.py`** 中的 `__version__` 为准（当前 **2.2.6**）；安装包文件名、Inno 元数据与 Windows 下 `SayInk.exe` 属性均与之同步。
+版本号以 **`sayink/version.py`** 中的 `__version__` 为准（当前 **2.2.7**）；安装包文件名、Inno 元数据与 Windows 下 `SayInk.exe` 属性均与之同步。
 
 > **原名 VoiceInk。** 从 VoiceInk 升级：安装 SayInk 会先卸载旧版 VoiceInk，并把 `~/.voiceink`（设置、历史、已下载模型）整体改名为 `~/.sayink`，凭据管理器里的 API Key 也会自动迁移；无需重新配置或重新下载模型。
 
@@ -166,8 +166,8 @@ pip install -r requirements.txt   # PyQt6、sherpa-onnx、sounddevice、pynput �
 
 | 安装包 | 大小 | 适合 |
 |--------|------|------|
-| **`SayInk-Setup-2.2.6.exe`**（轻量包，默认） | 约 50 MB | 首次安装、日常更新。不含语音模型，首次启动的欢迎框会带你到 **设置 → 引擎** 下载 Fun-ASR-Nano（约 950 MB，只需一次） |
-| `SayInk-Setup-2.2.6-full.exe`（完整包） | 约 740 MB | 安装后要立刻离线使用：Fun-ASR-Nano、说话人嵌入 CAM++、Silero VAD 随安装包装好 |
+| **`SayInk-Setup-2.2.7.exe`**（轻量包，默认） | 约 72 MB | 首次安装、日常更新。已带说话人嵌入 CAM++ 和 Silero VAD。不含 Fun-ASR-Nano，首次启动的欢迎框会带你到 **设置 → 引擎** 下载（约 950 MB，只需一次） |
+| `SayInk-Setup-2.2.6-full.exe`（完整包） | 约 740 MB | 安装后要立刻离线使用：Fun-ASR-Nano、说话人嵌入 CAM++、Silero VAD 随安装包装好。2.2.7 未重打完整包，这一份仍然可用 |
 
 两种包装出来的程序完全相同；**应用内自动更新一律下载轻量包**。已安装的模型（无论是完整包带的 `安装目录\models`，还是自己下载到 `~/.sayink/models/` 的）在升级时都会保留，不必重新下载。无安装包见 [从源码打包](#从源码打包)。
 
@@ -239,16 +239,16 @@ py -3.10 run.py
 
 ## 从源码打包
 
-**Windows 10/11**，Python 3.10+。生成安装包还需 [Inno Setup 6](https://jrsoftware.org/isdl.php)。默认打出的是**轻量包**（不含模型）；加 `--with-model` 打**完整包**，此时本地须有 **Fun-ASR-Nano**、**说话人嵌入 CAM++** 和 **Silero VAD**。
+**Windows 10/11**，Python 3.10+。生成安装包还需 [Inno Setup 6](https://jrsoftware.org/isdl.php)。默认打出的是**轻量包**（带说话人嵌入 CAM++ 和 Silero VAD，不含 Fun-ASR-Nano）；加 `--with-model` 打**完整包**，再带上 **Fun-ASR-Nano**。两种包装前，对应模型都要已在本地。
 
 ```bash
 pip install -r requirements-build.txt -c constraints-windows-py310.txt   # 运行依赖 + PyInstaller，按已验证版本固定
 python -m sayink_build.dependency_check                 # 打包前检查依赖版本
-python build_release.py                 # → dist/SayInk-Setup-<版本>.exe（轻量包，约 50 MB）
-python sayink_build/download_bundle_model_for_build.py   # 完整包首次：下载上述三个模型到 ./models/
-python build_release.py --with-model    # → dist/SayInk-Setup-<版本>-full.exe（完整包，含上述模型）
+python sayink_build/download_bundle_model_for_build.py   # 把 Fun-ASR-Nano、CAM++、Silero VAD 下载到 ./models/
+python build_release.py                 # → dist/SayInk-Setup-<版本>.exe（轻量包，约 72 MB，含 CAM++ 和 Silero VAD）
+python build_release.py --with-model    # → dist/SayInk-Setup-<版本>-full.exe（完整包，再含 Fun-ASR-Nano）
 # 或仅便携版：
-python build.py                         # → dist/SayInk/SayInk.exe（须整目录分发；加 --with-model 带模型）
+python build.py                         # → dist/SayInk/SayInk.exe（须整目录分发；加 --with-model 再带 Fun-ASR-Nano）
 ```
 
 `build_release.py` 打包前会做发布检查（`sayink_build/release_gate.py`）：已跟踪文件没有未提交改动、源码目录没有未跟踪文件；远端 `v<版本>` tag 指向当前提交；该提交的 `tests.yml` CI 已通过。任何一项不满足就停止打包。所以发版顺序是：提交并推送 → 等 CI 变绿 → 打 tag 并推送 → 打包 → 上传。本地试打包加 `--skip-release-checks`，这种产物不得发布。
@@ -269,7 +269,7 @@ py -3.10 -m pytest tests/test_readme_features.py tests/test_theme_resolve.py tes
 
 **全量测试与验证环境：** Windows x64 / Python 3.10 使用已验证的固定依赖约束：`python -m pip install -r requirements-dev.txt -c constraints-windows-py310.txt`。其他平台使用 `requirements-dev.txt`。设置 `QT_QPA_PLATFORM=offscreen`，运行 `python -m pytest -p no:cacheprovider tests -q`。`tests/conftest.py` 让整个测试会话跑在英文 Windows 代码页（cp1252，与 CI 运行机相同）上，并把用户目录和 `%APPDATA%` 指向临时目录：中文开发机上的结果与 CI 一致，测试也不会读写真实的 `~/.sayink`。唯一加载真实模型的检查（Silero VAD）默认跳过；想在本机跑，把 `SAYINK_REAL_MODELS_DIR` 设为应用的模型目录（如 `%USERPROFILE%\.sayink\models`），它只读取、不写入。
 
-GitHub Actions 的 `.github/workflows/tests.yml` 会在 push / PR 时执行 `ruff check`（配置见 `ruff.toml`，只查语法错误、未定义 / 未使用名称等硬错误）、Windows 回归、`pip check` 与发布依赖检查。本地可用 `python -m ruff check sayink sayink_build tests build.py build_release.py run.py`。`python -m sayink_build.dependency_check` 核对当前环境与 `requirements.txt`；`build.py` 也会先检查依赖，再清理旧构建目录，低于要求的引擎不能继续打包。固定约束覆盖 Python 包版本，不包含 Windows 系统组件或安装包签名；模型权重另由模型表里的固定提交和 SHA-256 锁定，`build.py --with-model` 打包前会逐个校验要带上的模型文件。
+GitHub Actions 的 `.github/workflows/tests.yml` 会在 push / PR 时执行 `ruff check`（配置见 `ruff.toml`，只查语法错误、未定义 / 未使用名称等硬错误）、Windows 回归、`pip check` 与发布依赖检查。本地可用 `python -m ruff check sayink sayink_build tests build.py build_release.py run.py`。`python -m sayink_build.dependency_check` 核对当前环境与 `requirements.txt`；`build.py` 也会先检查依赖，再清理旧构建目录，低于要求的引擎不能继续打包。固定约束覆盖 Python 包版本，不包含 Windows 系统组件或安装包签名；模型权重另由模型表里的固定提交和 SHA-256 锁定，`build.py` 打包前会逐个校验这次要带上的模型文件。
 
 记录结论时写明 Python、PyQt6、sherpa-onnx 版本：sherpa-onnx 低于下限（1.13.8）的环境只能证明测试里的应用逻辑，不能代表发布依赖。发版前仍应在干净环境中跑全量测试，并冒烟安装包。当前可靠性优化与验证记录见 [`docs/reliability-first-pass.md`](docs/reliability-first-pass.md)。
 
@@ -307,7 +307,7 @@ A: 用 **会议记录**（托盘 → 开始会议）。持续转写只是把话�
 A: 模型写的这句在文字稿里找不到对应原话，可能是概括过头或听错。核对后可直接在会议页编辑纪要，或换个模板重新生成。
 
 **Q: 会议没区分出说话人 / 把一个人拆成了两个？**  
-A: 完整安装包已带上 CAM++ 和 Silero VAD。轻量包多半是还没下载「说话人嵌入 CAM++」——开始卡片或进行中页面上点「下载辅助模型」（约 30 MB），或到 设置 → 引擎 下载；下一场会议和下一场持续转写都自动启用。没有它时只能按频谱粗分，同一个人换个说法、音量一变就可能拆成两个编号；程序会让 3 秒内接着说的相近段落沿用上一位、过短的段落不单独判人，并在会议结束时重新聚类一次，但仍不如声纹模型。结果仍不满意可在会议页把编号改成真名，文字稿和纪要会一起改。
+A: 2.2.7 起轻量包和完整包都带上 CAM++ 和 Silero VAD。更早的轻量包要在开始卡片或进行中页面上点「下载辅助模型」（约 30 MB），或到 设置 → 引擎 下载；下一场会议和下一场持续转写都自动启用。没有它时只能按频谱粗分，同一个人换个说法、音量一变就可能拆成两个编号；程序会让 3 秒内接着说的相近段落沿用上一位、过短的段落不单独判人，并在会议结束时重新聚类一次，但仍不如声纹模型。结果仍不满意可在会议页把编号改成真名，文字稿和纪要会一起改。
 
 **Q: 会议中电脑卡了、麦克风掉了，内容会丢吗？**  
 A: 已识别的句子已经在本机数据库里。设备断开或识别积压太长时只暂停采集，会议页点「继续采集」即可；程序崩溃的话下次启动这场会标为「已中断」，仍可生成纪要。
@@ -368,6 +368,6 @@ A: 同样处理：`history.db` 改名为 `history.corrupt-<时间>.db` 保留，
 A: 只从 GitHub Releases 下载，先存为 `.part`，核对大小与 GitHub 公布的 SHA-256 后才会运行；不完整或校验不符的安装包会被删除并提示重试。GitHub 没有公布该安装包 SHA-256 时，SayInk 不会下载或自动安装，会提示到发布页手动下载。安装包目前没有代码签名，Windows 可能提示「未知发布者」。
 
 **Q: 升级会不会重新下载模型？**  
-A: 不会。自动更新只下载不含模型的轻量包（约 50 MB）；安装目录里完整包带来的 `models\` 和 `~/.sayink/models/` 里自己下载的模型都原样保留，升级后直接载入。只有卸载时选择「删除用户配置和模型数据」才会清掉。
+A: 不会重新下载 Fun-ASR-Nano。自动更新下载轻量包（约 72 MB，含 CAM++ 和 Silero VAD）；安装目录里已有的 `models\` 和 `~/.sayink/models/` 里自己下载的模型都原样保留，升级后直接载入。只有卸载时选择「删除用户配置和模型数据」才会清掉。
 
 ---

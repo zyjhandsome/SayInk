@@ -598,7 +598,8 @@ class TestReadmeReliabilityPromises:
         assert "升级会不会重新下载模型" in text
         assert "build_release.py --with-model" in text
         assert "Fun-ASR-Nano、说话人嵌入 CAM++、Silero VAD 随安装包装好" in text
-        assert "完整安装包已带上 CAM++ 和 Silero VAD" in text
+        assert "轻量包和完整包都带上 CAM++ 和 Silero VAD" in text
+        assert "不含 Fun-ASR-Nano" in text
 
     def test_unverified_claims_are_marked(self):
         text = self._readme()

@@ -6,9 +6,10 @@ Prerequisites:
 - SayInk must already be built with PyInstaller (run build.py first), or use
   ../build_release.py for a one-shot build.
 
-Output: dist/SayInk-Setup-<version>.exe (lite, no model inside; version from
-sayink/version.py). With --with-model the staging folder must contain
-models/ and the output is dist/SayInk-Setup-<version>-full.exe.
+Output: dist/SayInk-Setup-<version>.exe (lite: CAM++ and Silero VAD inside,
+Fun-ASR-Nano downloaded on first start; version from sayink/version.py).
+With --with-model the staging folder must also contain Fun-ASR-Nano and the
+output is dist/SayInk-Setup-<version>-full.exe.
 
 By default, the intermediate folder dist/SayInk/ is deleted after a
 successful compile so dist/ only contains the setup EXE. Pass --keep-staging
@@ -110,22 +111,26 @@ def check_prerequisites(*, with_model: bool = False):
 
     print(f"[OK] Icon file found: {icon_file}")
 
-    # Check models
+    # Check models. Lite ships the meeting helpers; full also ships Fun-ASR-Nano.
+    from build import BUNDLE_REQUIRE_MODEL_ID, bundle_aux_model_ids, bundle_model_ids
+    from sayink.speech_recognizer import get_model_info
+
     models_dir = resolve_staging_dir() / "models"
-    has_models = models_dir.exists() and any(models_dir.iterdir())
-    if with_model and not has_models:
-        print("\n[ERROR] --with-model requested but the staging folder has no models/.")
-        print("  Run: python build.py --with-model")
+    present = {p.name for p in models_dir.iterdir() if p.is_dir()} if models_dir.is_dir() else set()
+    required_ids = bundle_model_ids() if with_model else bundle_aux_model_ids()
+    required = {get_model_info(model_id)["dir_name"] for model_id in required_ids}
+    asr_dir = get_model_info(BUNDLE_REQUIRE_MODEL_ID)["dir_name"]
+    missing = sorted(required - present)
+    if missing:
+        flavor = "完整包" if with_model else "轻量包"
+        print(f"\n[ERROR] {flavor}的暂存目录缺少模型：{', '.join(missing)}")
+        print("  Run: python build.py" + (" --with-model" if with_model else ""))
         return False
-    if has_models and not with_model:
-        print(f"\n[ERROR] Lite installer requested but {models_dir} exists.")
-        print("  Run python build.py (lite) again, or pass --with-model for the full installer.")
+    if not with_model and asr_dir in present:
+        print(f"\n[ERROR] Lite installer must not include {asr_dir}.")
+        print("  Run python build.py without --with-model, or pass --with-model for the full installer.")
         return False
-    if has_models:
-        model_count = len(list(models_dir.iterdir()))
-        print(f"[OK] Models found: {model_count} models in {models_dir}")
-    else:
-        print("[OK] Lite build: no model inside; the app downloads Fun-ASR-Nano on first start")
+    print(f"[OK] Models found: {len(present)} in {models_dir}")
 
     return True
 
@@ -135,7 +140,14 @@ def build_installer(*, keep_staging: bool = False, with_model: bool = False):
     print("=" * 60)
     print("  SayInk Installer Build Script")
     print(f"  Version {__version__}  (Inno / Win file quad {file_version_quad()})")
-    print(f"  Flavor  {'full (model bundled)' if with_model else 'lite (no model)'}")
+    print(
+        "  Flavor  "
+        + (
+            "full (Fun-ASR-Nano, CAM++ and Silero VAD)"
+            if with_model
+            else "lite (CAM++ and Silero VAD)"
+        )
+    )
     print("=" * 60)
     print()
 
@@ -158,11 +170,11 @@ def build_installer(*, keep_staging: bool = False, with_model: bool = False):
                 f"/DAppVersionStr={__version__}",
                 f"/DAppVersionQuad={file_version_quad()}",
                 f"/DOutputSuffix={FULL_SUFFIX if with_model else ''}",
-                *(["/DBundleModel"] if with_model else []),
                 str(installer_script),
             ],
             cwd=str(SCRIPT_DIR),
             timeout=7200,  # 2 h — ~1 GB+ payloads with ultra compression
+            check=False,
         )
 
         if result.returncode != 0:

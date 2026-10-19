@@ -20,11 +20,35 @@ def _plant(root: Path, info: dict) -> None:
 
 
 def test_bundle_ids_are_asr_then_meeting_helpers():
+    assert build_mod.bundle_aux_model_ids() == [AUX_MODEL_SPEAKER, AUX_MODEL_SILERO_VAD]
     assert build_mod.bundle_model_ids() == [
         "funasr-nano",
         AUX_MODEL_SPEAKER,
         AUX_MODEL_SILERO_VAD,
     ]
+
+
+def test_lite_bundle_copies_helpers_and_leaves_the_asr_model(tmp_path: Path):
+    root = tmp_path / "models"
+    for model_id in ("funasr-nano", AUX_MODEL_SPEAKER, AUX_MODEL_SILERO_VAD):
+        _plant(root, get_model_info(model_id))
+
+    found = build_mod._find_model_sources([root], build_mod.bundle_aux_model_ids())
+    names = {name for name, _ in found}
+
+    assert names == {"3dspeaker-campplus-zh-en", "silero-vad"}
+    build_mod._require_bundle_model(found, build_mod.bundle_aux_model_ids())
+
+
+def test_lite_bundle_refuses_to_ship_without_a_helper(tmp_path: Path):
+    info = get_model_info(AUX_MODEL_SPEAKER)
+    _plant(tmp_path, info)
+    with pytest.raises(SystemExit) as exc:
+        build_mod._require_bundle_model(
+            [(info["dir_name"], tmp_path / info["dir_name"])],
+            build_mod.bundle_aux_model_ids(),
+        )
+    assert exc.value.code == 1
 
 
 def test_find_model_sources_picks_each_required_model(tmp_path: Path):

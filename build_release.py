@@ -2,10 +2,11 @@
 One-shot Windows release build: PyInstaller → Inno Setup → remove staging.
 
 Final artifact (for distribution):
-  dist/SayInk-Setup-<version>.exe       lite installer (default; the app
+  dist/SayInk-Setup-<version>.exe       lite installer (default; bundles
+                                        CAM++ and Silero VAD, and the app
                                         downloads Fun-ASR-Nano on first start)
-  dist/SayInk-Setup-<version>-full.exe  with --with-model: Fun-ASR-Nano,
-                                        CAM++ and Silero VAD bundled
+  dist/SayInk-Setup-<version>-full.exe  with --with-model: also bundles
+                                        Fun-ASR-Nano
 
 The version comes from sayink/version.py. The unpacked folder dist/SayInk/
 is only an intermediate step and is removed after the installer is built
@@ -43,7 +44,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--with-model",
         action="store_true",
-        help="Bundle Fun-ASR-Nano, CAM++ and Silero VAD (SayInk-Setup-<version>-full.exe).",
+        help="Also bundle Fun-ASR-Nano (SayInk-Setup-<version>-full.exe). Lite already bundles CAM++ and Silero VAD.",
     )
     parser.add_argument(
         "--skip-release-checks",
@@ -63,7 +64,11 @@ def main(argv: list[str] | None = None) -> None:
 
     env = dict(os.environ)
     env["SAYINK_BUNDLE_MODEL"] = "1" if args.with_model else "0"
-    flavor = "full (model bundled)" if args.with_model else "lite (model downloaded on first start)"
+    flavor = (
+        "full (Fun-ASR-Nano, CAM++ and Silero VAD)"
+        if args.with_model
+        else "lite (CAM++ and Silero VAD; Fun-ASR-Nano downloaded on first start)"
+    )
 
     print(f"Step 1/2: PyInstaller (dist/SayInk/), {flavor} …")
     r = subprocess.run([sys.executable, str(ROOT / "build.py")], cwd=ROOT, env=env, check=False)

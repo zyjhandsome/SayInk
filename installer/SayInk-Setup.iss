@@ -2,17 +2,16 @@
 ; Creates a professional Windows installer with custom installation path
 ;
 ; Constants are normally passed by build_installer.py:
-;   ISCC /DAppVersionStr=2.2.6 /DAppVersionQuad=2.2.6.0 SayInk-Setup.iss
-; Lite installer (default): no model inside, the app downloads Fun-ASR-Nano
-; on first start. Full installer: /DBundleModel /DOutputSuffix=-full copies
-; dist\SayInk\models\ (Fun-ASR-Nano, CAM++, Silero VAD) and names the file
-; SayInk-Setup-<version>-full.exe.
+;   ISCC /DAppVersionStr=2.2.7 /DAppVersionQuad=2.2.7.0 SayInk-Setup.iss
+; Both installers copy dist\SayInk\models\. Lite has CAM++ and Silero VAD;
+; the app downloads Fun-ASR-Nano on first start. Full installer:
+; /DOutputSuffix=-full, and models\ also contains Fun-ASR-Nano.
 ; The in-app updater only downloads the lite name (sayink/updater.py).
 #ifndef AppVersionStr
-#define AppVersionStr "2.2.6"
+#define AppVersionStr "2.2.7"
 #endif
 #ifndef AppVersionQuad
-#define AppVersionQuad "2.2.6.0"
+#define AppVersionQuad "2.2.7.0"
 #endif
 #ifndef OutputSuffix
 #define OutputSuffix ""
@@ -72,10 +71,9 @@ Type: filesandordirs; Name: "{app}\_internal"
 ; Paths match build.py PyInstaller output: dist\SayInk\
 Source: "..\dist\SayInk\SayInk.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\SayInk\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
-#ifdef BundleModel
-; Full installer only: model copied by `build.py --with-model`.
+; Lite and full both ship models\. Upgrade does not delete {app}\models, so a
+; previously installed Fun-ASR-Nano stays when a lite package is applied.
 Source: "..\dist\SayInk\models\*"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs
-#endif
 
 [Icons]
 Name: "{group}\SayInk"; Filename: "{app}\SayInk.exe"

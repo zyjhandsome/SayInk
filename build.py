@@ -1,20 +1,19 @@
 """
 Build script for packaging SayInk as a standalone Windows application.
 
-Output: dist/SayInk/ — SayInk.exe, _internal/, and (with --with-model) models/.
+Output: dist/SayInk/ — SayInk.exe, _internal/, and models/.
 
-The default build is the **lite** package: no model inside, the app downloads
-Fun-ASR-Nano on first start (设置 → 引擎). ``--with-model`` (or
-``SAYINK_BUNDLE_MODEL=1``) copies Fun-ASR-Nano plus the meeting helpers
-(CAM++ speaker embedding and Silero VAD) next to the exe from
-~/.sayink/models/ or ./models/ and fails when any of them is missing; fetch
-them with `python sayink_build/download_bundle_model_for_build.py`
-(writes to `./models/`).
+The default **lite** package copies the meeting helpers (CAM++ speaker
+embedding and Silero VAD). Fun-ASR-Nano is not included; the app downloads it
+on first start (设置 → 引擎). ``--with-model`` (or ``SAYINK_BUNDLE_MODEL=1``)
+also copies Fun-ASR-Nano. Both flavors fail when a model they must ship is
+missing. Fetch the files with
+`python sayink_build/download_bundle_model_for_build.py` (writes to `./models/`).
 
 Distribution:
 - **Installer (recommended):** run `python build_release.py` — produces
-  `dist/SayInk-Setup-<version>.exe` (lite, ~50 MB); add `--with-model` for
-  `dist/SayInk-Setup-<version>-full.exe` (~740 MB, ASR + CAM++ + Silero).
+  `dist/SayInk-Setup-<version>.exe` (lite: CAM++ + Silero); add `--with-model`
+  for `dist/SayInk-Setup-<version>-full.exe` (~740 MB, also Fun-ASR-Nano).
   Version from `sayink/version.py`; staging folder removed after Inno Setup.
 - **Portable folder:** run this script only, then zip `dist/SayInk/` for
   users who should not run an installer.
@@ -37,8 +36,8 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-# Speech model copied into dist/SayInk/models/ by a --with-model build.
-# Meeting helpers (CAM++, Silero) are required alongside it.
+# Fun-ASR-Nano is copied only by a --with-model build. Meeting helpers
+# (CAM++, Silero) ship in both the lite and the full installer.
 from sayink.speech_recognizer import DEFAULT_MODEL_ID
 
 BUNDLE_REQUIRE_MODEL_ID = DEFAULT_MODEL_ID
@@ -52,11 +51,16 @@ def bundle_model_requested(argv: list[str] | None = None) -> bool:
     return os.environ.get("SAYINK_BUNDLE_MODEL", "").strip().lower() in ("1", "true", "yes")
 
 
-def bundle_model_ids() -> list[str]:
-    """Models a ``--with-model`` build must copy: ASR, then meeting helpers."""
+def bundle_aux_model_ids() -> list[str]:
+    """Meeting helpers shipped in the lite installer as well as the full one."""
     from sayink.speech_recognizer import AUX_MODEL_REGISTRY
 
-    return [BUNDLE_REQUIRE_MODEL_ID, *[m["id"] for m in AUX_MODEL_REGISTRY]]
+    return [m["id"] for m in AUX_MODEL_REGISTRY]
+
+
+def bundle_model_ids() -> list[str]:
+    """Models a ``--with-model`` build must copy: ASR, then meeting helpers."""
+    return [BUNDLE_REQUIRE_MODEL_ID, *bundle_aux_model_ids()]
 
 
 def model_search_dirs() -> list[Path]:
@@ -68,16 +72,20 @@ def model_search_dirs() -> list[Path]:
     ]
 
 
-def _find_model_sources(search_dirs: list[Path] | None = None) -> list[tuple[str, Path]]:
-    """Return each required bundle model found under ``search_dirs``."""
+def _find_model_sources(
+    search_dirs: list[Path] | None = None,
+    model_ids: list[str] | None = None,
+) -> list[tuple[str, Path]]:
+    """Return each requested bundle model found under ``search_dirs``."""
     try:
         from sayink.speech_recognizer import get_model_info
     except ImportError:
         return []
 
     dirs = model_search_dirs() if search_dirs is None else search_dirs
+    wanted = bundle_model_ids() if model_ids is None else model_ids
     found: list[tuple[str, Path]] = []
-    for model_id in bundle_model_ids():
+    for model_id in wanted:
         info = get_model_info(model_id)
         if not info:
             continue
@@ -108,12 +116,16 @@ def _require_pinned_content(downloaded: list[tuple[str, Path]]) -> None:
         sys.exit(1)
 
 
-def _require_bundle_model(downloaded: list[tuple[str, Path]]) -> None:
+def _require_bundle_model(
+    downloaded: list[tuple[str, Path]],
+    model_ids: list[str] | None = None,
+) -> None:
     from sayink.speech_recognizer import get_model_info
 
+    required = bundle_model_ids() if model_ids is None else model_ids
     present = {dirname for dirname, _ in downloaded}
     missing: list[dict] = []
-    for model_id in bundle_model_ids():
+    for model_id in required:
         info = get_model_info(model_id)
         if not info:
             print(f"\n[ERROR] Unknown bundle model id: {model_id!r}")
@@ -122,7 +134,8 @@ def _require_bundle_model(downloaded: list[tuple[str, Path]]) -> None:
             missing.append(info)
     if not missing:
         return
-    print("\n[ERROR] 完整包需要这些模型已在本地就绪：")
+    flavor = "完整包" if BUNDLE_REQUIRE_MODEL_ID in required else "轻量包"
+    print(f"\n[ERROR] {flavor}需要这些模型已在本地就绪：")
     for info in missing:
         print(f"  - {info['name']}（{info['dir_name']}）")
     print("  请在应用「设置 → 引擎」下载，或运行:")
@@ -258,27 +271,28 @@ def build():
     print()
     with_model = bundle_model_requested()
     models_dst = dist_dir / "models"
-    downloaded: list[tuple[str, Path]] = []
+    model_ids = bundle_model_ids() if with_model else bundle_aux_model_ids()
     if with_model:
-        print("[2/3] Copying models to dist/SayInk/models/ ...")
-        downloaded = _find_model_sources()
-        _require_bundle_model(downloaded)
-        _require_pinned_content(downloaded)
+        print("[2/3] Copying Fun-ASR-Nano, CAM++ and Silero VAD to dist/SayInk/models/ ...")
     else:
-        print("[2/3] Lite build: no model bundled (users download Fun-ASR-Nano on first start).")
-        if models_dst.exists():
-            shutil.rmtree(models_dst)
+        print("[2/3] Lite build: bundling CAM++ and Silero VAD (Fun-ASR-Nano is downloaded on first start).")
+    downloaded = _find_model_sources(model_ids=model_ids)
+    _require_bundle_model(downloaded, model_ids)
+    _require_pinned_content(downloaded)
 
-    if downloaded:
-        models_dst.mkdir(parents=True, exist_ok=True)
-        for dir_name, src_path in downloaded:
-            dst_path = models_dst / dir_name
-            if dst_path.exists():
-                shutil.rmtree(dst_path)
-            shutil.copytree(src_path, dst_path)
-            print(f"    + {dir_name}")
-    elif with_model:
-        print("    (no models found, users will need to download in settings)")
+    models_dst.mkdir(parents=True, exist_ok=True)
+    for dir_name, src_path in downloaded:
+        dst_path = models_dst / dir_name
+        if dst_path.exists():
+            shutil.rmtree(dst_path)
+        shutil.copytree(src_path, dst_path)
+        print(f"    + {dir_name}")
+    if not with_model:
+        from sayink.speech_recognizer import get_model_info
+
+        asr_dir = models_dst / get_model_info(BUNDLE_REQUIRE_MODEL_ID)["dir_name"]
+        if asr_dir.exists():
+            shutil.rmtree(asr_dir)
 
     total_size = sum(
         f.stat().st_size for f in dist_dir.rglob("*") if f.is_file()
