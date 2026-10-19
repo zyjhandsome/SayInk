@@ -2,6 +2,7 @@ import logging
 import shutil
 from pathlib import Path
 
+from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -65,8 +66,16 @@ from sayink.recognition_settings import RecognitionSettings
 
 # Non-color layout constants (theme-independent).
 _CONTROL_NUMERIC_WIDTH = _tok.CONTROL_NUMERIC_WIDTH
-# Shared width so 显示 / 测试连接 / 恢复默认 share one right-edge column.
-_LLM_ACTION_BTN_WIDTH = 88
+# Shared width so 显示 / 隐藏 / 测试连接 / 测试中… / 恢复默认 / 管理模板
+# share one right edge and none of those labels clip.
+_LLM_ACTION_LABELS = ("显示", "隐藏", "测试连接", "测试中…", "恢复默认", "管理模板")
+
+
+def _llm_action_button_width() -> int:
+    font = QFont(_tok.UI_FONT_FAMILY)
+    font.setPixelSize(_tok.TYPE_BODY_SM)
+    widest = max(QFontMetrics(font).horizontalAdvance(label) for label in _LLM_ACTION_LABELS)
+    return widest + _tok.CONTROL_BTN_SM_PAD_H * 2 + 8
 
 
 def _device_index(data) -> int:
@@ -168,10 +177,9 @@ class SettingsWindow(QWidget):
             paint_about_update_row(self)
         for name in ("_llm_test_status", "_minutes_test_status"):
             if hasattr(self, name):
-                getattr(self, name).setStyleSheet(
-                    f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px;"
-                    f" background: transparent; padding: 0 16px 12px 16px;"
-                )
+                self._paint_llm_status(getattr(self, name))
+        if hasattr(self, "_llm_key_toggle"):
+            self._paint_llm_key_toggle()
         self._refresh_recognition_feedback()
         self._refresh_output_controls()
         self._refresh_meeting_defaults()
@@ -723,28 +731,36 @@ class SettingsWindow(QWidget):
 
     def _update_llm_configuration_status(self) -> None:
         if getattr(self._config, "secret_persist_failed", False) is True:
-            self._llm_test_status.setText(
+            self._set_llm_status(
+                self._llm_test_status,
                 "API 密钥未能存入 Windows 凭据管理器，仅本次运行有效，"
-                "也没有写入配置文件；重启后需重新填写。"
+                "也没有写入配置文件；重启后需重新填写。",
+                "error",
             )
             return
         if getattr(self._config, "secret_read_failed", False) is True:
-            self._llm_test_status.setText(
+            self._set_llm_status(
+                self._llm_test_status,
                 "无法从 Windows 凭据管理器读取已保存的 API 密钥，这里暂时显示为空；"
-                "重启后仍为空请重新填写。"
+                "重启后仍为空请重新填写。",
+                "error",
             )
             return
         missing = self._llm_missing_fields()
         if missing and self._llm_enable_row.isChecked():
-            self._llm_test_status.setText(
-                f"未配置：缺少{'、'.join(missing)}。转写会直接输出原文。"
+            self._set_llm_status(
+                self._llm_test_status,
+                f"未配置：缺少{'、'.join(missing)}。转写会直接输出原文。",
+                "idle",
             )
         elif missing:
-            self._llm_test_status.setText(
-                f"尚未填写：{'、'.join(missing)}。文字润色和会议纪要都要用到这组配置。"
+            self._set_llm_status(
+                self._llm_test_status,
+                f"尚未填写：{'、'.join(missing)}。文字润色和会议纪要都要用到这组配置。",
+                "idle",
             )
         else:
-            self._llm_test_status.setText("配置已填写，尚未测试连接。")
+            self._set_llm_status(self._llm_test_status, "配置已填写，尚未测试连接。", "idle")
 
     def _scroll_page_of(self, widget: QWidget) -> SettingsPage | None:
         w = widget
@@ -839,11 +855,59 @@ class SettingsWindow(QWidget):
             QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
         )
         self._llm_key_toggle.setText("隐藏" if visible else "显示")
+        self._llm_key_toggle.setProperty("viBtn", "accentSm" if visible else "ghostSm")
+        self._paint_llm_key_toggle()
+
+    def _paint_llm_key_toggle(self) -> None:
+        """Plain outline while the key is masked; filled accent while it is visible."""
+        visible = self._llm_key_toggle.isChecked()
+        self._llm_key_toggle.setToolTip("当前正在显示密钥，点击隐藏" if visible else "点击显示密钥")
+        self._llm_key_toggle.setAccessibleName("隐藏 API 密钥" if visible else "显示 API 密钥")
+        self._llm_key_toggle.setStyleSheet(
+            _settings_styles.BTN_ACCENT_SM if visible else _settings_styles.BTN_GHOST_SM
+        )
+
+    def _set_llm_status(self, label: QLabel, text: str, tone: str) -> None:
+        label.setProperty("viTone", tone)
+        label.setText(text)
+        self._paint_llm_status(label)
+
+    def _paint_llm_status(self, label: QLabel) -> None:
+        """Idle hints stay quiet. A test in progress, a success, or a failure is a colored bar."""
+        tone = label.property("viTone") or "idle"
+        if tone == "ok":
+            color, bg, weight, pad = _tok.GREEN_TEXT, _tok.GREEN_BG, 600, "8px 16px"
+        elif tone == "error":
+            color, bg, weight, pad = _tok.RED, _tok.RED_BG, 600, "8px 16px"
+        elif tone == "busy":
+            color, bg, weight, pad = _tok.TEXT, _tok.SURFACE_PEARL, 600, "8px 16px"
+        else:
+            color, bg, weight, pad = _tok.TEXT_SEC, "transparent", 400, "0 16px 12px 16px"
+        label.setStyleSheet(
+            f"color: {color}; background: {bg}; font-size: {_tok.TYPE_FOOTNOTE}px;"
+            f" font-weight: {weight}; border-radius: 6px; padding: {pad};"
+        )
+
+    def _release_button_without_shifting_focus(self, btn: QPushButton) -> None:
+        """Disable a button that the click just focused.
+
+        Disabling the focused widget makes Qt move focus to the next control,
+        which lit up 「启用文字润色」. Giving that focus to the model field
+        instead selected its text. Drop focus altogether so neither responds.
+        """
+        if QApplication.focusWidget() is btn:
+            btn.clearFocus()
+        btn.setEnabled(False)
+        moved = QApplication.focusWidget()
+        if moved is not None and moved is not btn:
+            moved.clearFocus()
 
     def _style_llm_action_btn(self, btn: QPushButton) -> None:
         """Shared metrics so polish actions share one right-edge column."""
         btn.setProperty("viBtn", "ghostSm")
-        btn.setFixedWidth(_LLM_ACTION_BTN_WIDTH)
+        btn.setAutoDefault(False)
+        btn.setDefault(False)
+        btn.setFixedWidth(_llm_action_button_width())
         btn.setMinimumHeight(32)
         btn.setStyleSheet(_settings_styles.BTN_GHOST_SM)
 
@@ -1848,7 +1912,7 @@ class SettingsWindow(QWidget):
         from sayink.text_polisher import polish_settings_complete
 
         if not polish_settings_complete(url, key, model):
-            status.setText("请填写完整的接口信息。")
+            self._set_llm_status(status, "请填写完整的接口信息。", "error")
             return None
 
         class _W(QThread):
@@ -1864,8 +1928,9 @@ class SettingsWindow(QWidget):
         worker = _W(url, key, model, self)
         self._test_workers.append(worker)
         worker.finished.connect(lambda w=worker: self._on_test_done(w, btn, status, ok_text))
-        btn.setEnabled(False)
-        btn.setText("测试中...")
+        self._release_button_without_shifting_focus(btn)
+        btn.setText("测试中…")
+        self._set_llm_status(status, "正在测试连接…", "busy")
         worker.start()
         return worker
 
@@ -1876,7 +1941,10 @@ class SettingsWindow(QWidget):
             pass
         btn.setEnabled(True)
         btn.setText("测试连接")
-        status.setText(ok_text if w.ok else w.msg)
+        if w.ok:
+            self._set_llm_status(status, ok_text, "ok")
+        else:
+            self._set_llm_status(status, w.msg, "error")
 
     def focus_llm_connection(self) -> None:
         """Bring 「接口配置」 into view with the first empty field focused."""

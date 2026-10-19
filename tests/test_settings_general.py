@@ -306,6 +306,7 @@ class TestGeneralPageLayout:
         )
         settings_window._test_llm()
         assert settings_window._llm_test_status.text() == "请填写完整的接口信息。"
+        assert settings_window._llm_test_status.property("viTone") == "error"
         assert boxes == []
 
     def test_polish_preview_stays_visible_when_enabled(self, settings_window):
@@ -323,10 +324,58 @@ class TestGeneralPageLayout:
         assert "直接输出原文" in status
 
     def test_password_toggle_updates_its_text(self, settings_window):
+        from sayink.ui import settings_styles as ss
+
         settings_window._llm_key_toggle.setChecked(True)
         assert settings_window._llm_key_toggle.text() == "隐藏"
+        assert settings_window._llm_key_toggle.property("viBtn") == "accentSm"
+        assert settings_window._llm_key_toggle.styleSheet() == ss.BTN_ACCENT_SM
         settings_window._llm_key_toggle.setChecked(False)
         assert settings_window._llm_key_toggle.text() == "显示"
+        assert settings_window._llm_key_toggle.property("viBtn") == "ghostSm"
+        assert settings_window._llm_key_toggle.styleSheet() == ss.BTN_GHOST_SM
+
+    def test_connection_test_is_obvious_and_does_not_focus_polish_switch(
+        self, settings_window, qapp, monkeypatch
+    ):
+        from sayink.ui import design_tokens as tok
+
+        monkeypatch.setattr(
+            "sayink.text_polisher.TextPolisher.test_connection",
+            lambda *_args, **_kwargs: (True, "ok"),
+        )
+        settings_window._llm_url_edit.setText("https://api.example.com/v1")
+        settings_window._llm_key_edit.setText("sk-test")
+        settings_window._llm_model_edit.setText("demo-model")
+        settings_window.show()
+        qapp.processEvents()
+        try:
+            settings_window._llm_test_btn.setFocus()
+            settings_window._test_llm()
+            qapp.processEvents()
+            btn = settings_window._llm_test_btn
+            btn.ensurePolished()
+            assert btn.text() == "测试中…"
+            assert btn.width() >= btn.fontMetrics().horizontalAdvance("测试中…") + tok.CONTROL_BTN_SM_PAD_H * 2
+            status = settings_window._llm_test_status
+            assert status.text() == "正在测试连接…"
+            assert status.property("viTone") == "busy"
+            assert not settings_window._llm_enable_row.hasFocus()
+            assert not settings_window._llm_enable_row._switch.hasFocus()
+            assert not settings_window._llm_model_edit.hasFocus()
+            assert not settings_window._llm_model_edit.hasSelectedText()
+
+            worker = settings_window._llm_test_worker
+            assert worker is not None and worker.wait(3000)
+            qapp.processEvents()
+            assert status.text() == "连接正常，可以使用。"
+            assert status.property("viTone") == "ok"
+            css = status.styleSheet().upper()
+            assert tok.GREEN_TEXT.upper() in css
+            assert tok.GREEN_BG.upper() in css
+            assert not settings_window._llm_enable_row._switch.hasFocus()
+        finally:
+            settings_window.hide()
 
     def test_audio_source_cards_are_horizontal(self, settings_window):
         from PyQt6.QtWidgets import QHBoxLayout
