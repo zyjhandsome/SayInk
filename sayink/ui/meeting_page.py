@@ -74,6 +74,7 @@ from sayink.minutes_prompts import describe_template, format_timestamp, get_temp
 from sayink.speech_recognizer import DEFAULT_MODEL_ID, MODEL_REGISTRY, is_model_downloaded
 from sayink.ui.clipboard import copy_text
 from sayink.ui import design_tokens as tok
+from sayink.ui.flow_layout import PairedToolBar
 from sayink.ui.reading import fit_reading_width
 from sayink.ui.history_window import _ElidedLabel, _SessionList, session_list_item_css
 
@@ -204,15 +205,17 @@ class _ReadingView(QTextBrowser):
     def _restore_reading_position(self) -> None:
         self.verticalScrollBar().setValue(self._reading_anchor)
 
-    def _set_reading(self, text: str, *, markdown: bool) -> None:
+    def _set_reading(self, text: str, *, markdown: bool, plain: bool = False) -> None:
         from sayink.ui import design_tokens as tok
 
-        key = (markdown, text, tok.ACCENT_TEXT, tok.TEXT_SEC)
+        key = (markdown, plain, text, tok.ACCENT_TEXT, tok.TEXT_SEC)
         if self._reading_key == key:
             return
         value = self.verticalScrollBar().value()
         self._reading_key = key
-        if markdown:
+        if plain:
+            self.setPlainText(text)
+        elif markdown:
             self.setMarkdown(text)
         else:
             self.setHtml(text)
@@ -225,6 +228,9 @@ class _ReadingView(QTextBrowser):
 
     def set_reading_html(self, text: str) -> None:
         self._set_reading(text, markdown=False)
+
+    def set_reading_plain(self, text: str) -> None:
+        self._set_reading(text, markdown=False, plain=True)
 
     def clear(self) -> None:
         self._reading_key = None
@@ -307,11 +313,6 @@ class _SegmentSpeakerDialog(QDialog):
         self.setStyleSheet(ss.WINDOW_CSS + f"""
             QDialog#meetingSpeakerCorrection {{ background: {tok.SURFACE}; color: {tok.TEXT}; }}
             QLabel {{ background: transparent; color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; }}
-            QComboBox {{ background: {tok.SURFACE_PEARL}; color: {tok.TEXT};
-                         border: 1px solid {tok.CONTROL_BORDER}; border-radius: {tok.RADIUS_SM}px;
-                         min-height: 30px; padding: 4px 8px; font-size: {tok.TYPE_BODY_SM}px; }}
-            QComboBox QAbstractItemView {{ background: {tok.SURFACE}; color: {tok.TEXT};
-                                          selection-background-color: {tok.ACCENT_SOFT}; }}
         """)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 16, 20, 16)
@@ -384,6 +385,7 @@ class MeetingPage(QWidget):
         self._ctrl.meeting_changed.connect(self._on_meeting_changed)
         self._ctrl.clock_tick.connect(self._live_clock.setText)
         self._ctrl.generation_progress.connect(self._on_generation_progress)
+        self._ctrl.generation_preview.connect(self._on_generation_preview)
         self._ctrl.generation_finished.connect(self._on_generation_finished)
         self._ctrl.generation_failed.connect(self._on_generation_failed)
         self.reapply_theme()
@@ -512,8 +514,18 @@ class MeetingPage(QWidget):
         self._notes_state = QLabel()
         self._notes_state.setWordWrap(True)
         self._notes_state.setAccessibleName("纪要来源与保存状态")
+        self._state_row = QWidget()
+        self._state_row.setObjectName("meetingState")
+        state_lay = QHBoxLayout(self._state_row)
+        state_lay.setContentsMargins(0, 0, 0, 0)
+        state_lay.setSpacing(8)
+        state_lay.addWidget(self._notes_state, 1)
+        self._cancel_btn = QPushButton("取消")
+        self._cancel_btn.clicked.connect(self._ctrl.cancel_generation)
+        self._cancel_btn.hide()
+        state_lay.addWidget(self._cancel_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         right_lay.addWidget(self._detail_meta)
-        right_lay.addWidget(self._notes_state)
+        right_lay.addWidget(self._state_row)
 
         self._status_label = QLabel("")
         self._status_label.setWordWrap(True)
@@ -526,7 +538,7 @@ class MeetingPage(QWidget):
         self._tab_bar = QWidget()
         self._tab_bar.setObjectName("meetingTabs")
         tabs_lay = QHBoxLayout(self._tab_bar)
-        tabs_lay.setContentsMargins(3, 3, 3, 3)
+        tabs_lay.setContentsMargins(3, 2, 3, 2)
         tabs_lay.setSpacing(2)
         self._tab_group = QButtonGroup(self)
         self._tab_group.setExclusive(True)
@@ -535,14 +547,14 @@ class MeetingPage(QWidget):
         for index, button in enumerate((self._tab_notes, self._tab_transcript)):
             button.setCheckable(True)
             button.setObjectName("meetingTab")
+            button.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             self._tab_group.addButton(button, index)
-            tabs_lay.addWidget(button)
+            tabs_lay.addWidget(button, 0, Qt.AlignmentFlag.AlignVCenter)
         self._tab_notes.setChecked(True)
         self._tab_group.idClicked.connect(self._switch_tab)
-        tab_row.addWidget(self._tab_bar, 0)
-        tab_row.addWidget(self._copy_btn)
+        tab_row.addWidget(self._tab_bar, 0, Qt.AlignmentFlag.AlignVCenter)
         tab_row.addStretch(1)
-        tab_row.addWidget(self._export_btn)
+        tab_row.addWidget(self._export_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         right_lay.addLayout(tab_row)
 
         self._tab_tools = QStackedWidget()
@@ -550,48 +562,37 @@ class MeetingPage(QWidget):
         notes_outer = QVBoxLayout(notes_tools)
         notes_outer.setContentsMargins(0, 0, 0, 0)
         notes_outer.setSpacing(8)
-        notes_lay = QHBoxLayout()
-        notes_outer.addLayout(notes_lay)
-        notes_lay.setContentsMargins(0, 0, 0, 0)
-        notes_lay.setSpacing(8)
         self._template_label = QLabel("模板")
-        notes_lay.addWidget(self._template_label)
         self._template_combo = QComboBox()
         self._template_combo.setAccessibleName("会议模板")
-        self._template_combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
-        )
+        self._template_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         for template in list_templates(self._custom_templates()):
             self._template_combo.addItem(template.name, template.id)
             self._template_combo.setItemData(
                 self._template_combo.count() - 1, describe_template(template), Qt.ItemDataRole.ToolTipRole
             )
         self._template_combo.currentIndexChanged.connect(self._on_template_changed)
-        self._template_combo.setMinimumWidth(150)
-        self._template_combo.setMinimumContentsLength(8)
+        self._template_combo.setMinimumWidth(120)
+        self._template_combo.setMaximumWidth(240)
         self._template_combo.setToolTip(str(self._template_combo.itemData(0, Qt.ItemDataRole.ToolTipRole) or ""))
         self._template_label.setBuddy(self._template_combo)
-        notes_lay.addWidget(self._template_combo, 1)
         self._manage_templates_btn = QPushButton("管理模板")
         self._manage_templates_btn.setToolTip("新建自定义模板，或复制内置模板后修改")
         self._manage_templates_btn.clicked.connect(self._manage_templates)
-        notes_lay.addWidget(self._manage_templates_btn)
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-        notes_outer.addLayout(actions)
         self._generate_btn = QPushButton("生成纪要")
         self._generate_btn.setAccessibleName("生成纪要")
         self._generate_btn.clicked.connect(self._generate)
-        actions.addWidget(self._generate_btn)
-        self._cancel_btn = QPushButton("取消")
-        self._cancel_btn.clicked.connect(self._ctrl.cancel_generation)
-        self._cancel_btn.hide()
-        actions.addWidget(self._cancel_btn)
         self._edit_btn = QPushButton("编辑正文")
         self._edit_btn.setToolTip("直接修改纪要文本")
         self._edit_btn.clicked.connect(self._toggle_edit)
-        actions.addWidget(self._edit_btn)
-        actions.addStretch(1)
+        self._notes_bar = PairedToolBar(spacing=8)
+        self._notes_bar.add_left(self._template_label)
+        self._notes_bar.add_left(self._template_combo)
+        self._notes_bar.add_left(self._manage_templates_btn)
+        self._notes_bar.add_right(self._generate_btn)
+        self._notes_bar.add_right(self._edit_btn)
+        self._notes_bar.add_right(self._copy_btn)
+        notes_outer.addWidget(self._notes_bar)
         self._tab_tools.addWidget(notes_tools)
         self._tab_tools.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
@@ -883,7 +884,7 @@ class MeetingPage(QWidget):
         )
         dim = f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
         for label in (self._list_summary, self._detail_meta, self._card_hint, self._live_caps,
-                      self._card_notes, self._empty_label, self._template_label, self._notes_state, self._content_hint,
+                      self._card_notes, self._empty_label, self._template_label, self._content_hint,
                       self._notes_empty):
             label.setStyleSheet(dim)
         for label in (self._marks_title, self._notes_title):
@@ -918,22 +919,11 @@ class MeetingPage(QWidget):
             QLineEdit:hover {{ border: 1px solid {tok.HAIRLINE}; }}
             QLineEdit:focus {{ background: {tok.SURFACE_PEARL}; border: 2px solid {tok.ACCENT}; padding: 3px 3px; }}
         """)
-        self._tab_bar.setStyleSheet(f"""
-            QWidget#meetingTabs {{ background: {tok.SURFACE_PEARL}; border: 1px solid {tok.HAIRLINE};
-                                   border-radius: {tok.RADIUS_MD}px; }}
-            QPushButton#meetingTab {{ background: transparent; color: {tok.TEXT_SEC}; border: 2px solid transparent;
-                                      border-radius: {tok.RADIUS_SM}px; padding: 2px 12px;
-                                      min-height: {tok.CONTROL_BTN_SM_HEIGHT - 8}px;
-                                      font-size: {tok.TYPE_BODY_SM}px; }}
-            QPushButton#meetingTab:hover:!checked {{ color: {tok.TEXT}; background: {tok.ROW_HOVER}; }}
-            QPushButton#meetingTab:checked {{ background: {tok.SURFACE}; color: {tok.TEXT}; font-weight: 700; }}
-            QPushButton#meetingTab:focus {{ border-color: {tok.ACCENT_FOCUS}; }}
-        """)
-        self._tab_bar.setMinimumHeight(tok.CONTROL_BTN_SM_HEIGHT)
+        self._paint_notes_state()
         self._template_combo.setMinimumHeight(tok.CONTROL_BTN_SM_HEIGHT)
         from sayink.ui.tray_icon import _menu_font, _menu_stylesheet
 
-        for menu in (self._more_menu, self._speaker_menu):
+        for menu in (self._more_menu, self._speaker_menu, self._export_menu):
             menu.setFont(_menu_font())
             menu.setStyleSheet(_menu_stylesheet())
         text_css = f"""
@@ -977,6 +967,23 @@ class MeetingPage(QWidget):
                     self._cancel_btn, self._correct_speaker_btn, self._return_notes_btn, self._clear_search_btn,
                     self._pause_btn, self._live_find_close_btn, self._manage_templates_btn):
             btn.setStyleSheet(ss.BTN_GHOST_SM)
+        # Match 导出's real box (style min-height plus its border) so the tab
+        # capsule and the button share one line. Both labels use the same weight.
+        tab_h = max(self._export_btn.sizeHint().height(), tok.CONTROL_BTN_SM_HEIGHT)
+        chip_h = max(20, tab_h - 8)
+        self._tab_bar.setStyleSheet(f"""
+            QWidget#meetingTabs {{ background: {tok.SURFACE_PEARL}; border: 1px solid {tok.HAIRLINE};
+                                   border-radius: {tok.RADIUS_MD}px; }}
+            QPushButton#meetingTab {{ background: transparent; color: {tok.TEXT_SEC};
+                                      border: 1px solid transparent; border-radius: {tok.RADIUS_SM}px;
+                                      padding: 0 12px; min-height: {chip_h}px; max-height: {chip_h}px;
+                                      font-size: {tok.TYPE_BODY_SM}px; font-weight: 400; }}
+            QPushButton#meetingTab:hover:!checked {{ color: {tok.TEXT}; background: {tok.ROW_HOVER}; }}
+            QPushButton#meetingTab:checked {{ background: {tok.SECONDARY_CONTAINER}; color: {tok.TEXT};
+                                              border-color: transparent; font-weight: 400; }}
+            QPushButton#meetingTab:focus {{ border-color: {tok.ACCENT_FOCUS}; }}
+        """)
+        self._tab_bar.setFixedHeight(tab_h)
         no_indicator = "QPushButton::menu-indicator { image: none; width: 0px; }"
         self._more_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
         self._speaker_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
@@ -1162,6 +1169,7 @@ class MeetingPage(QWidget):
         self._detail_title.setPlaceholderText("会议标题")
         self._detail_meta.clear()
         self._notes_state.clear()
+        self._paint_notes_state()
         self._content_hint.hide()
         self._return_notes_btn.hide()
         self._notes_view.clear()
@@ -1228,6 +1236,10 @@ class MeetingPage(QWidget):
         self._template_combo.setEnabled(not generating)
         self._manage_templates_btn.setEnabled(not self._ctrl.generating_for)
         self._sync_result_actions(notes)
+        if generating and configured:
+            busy = "整理中…" if self._is_refinement() else "生成中…"
+            self._generate_btn.setText(busy)
+            self._generate_btn.setAccessibleName(busy)
         markdown = notes.markdown if notes is not None else ""
         if self._editing_notes:
             self._notes_stack.setCurrentWidget(self._notes_edit)
@@ -1235,7 +1247,9 @@ class MeetingPage(QWidget):
         else:
             self._notes_stack.setCurrentWidget(self._notes_view)
             self._edit_btn.setText("编辑正文")
-            if markdown and notes is not None and self._is_refinement(notes.template_id):
+            if generating and self._ctrl.generation_preview_text:
+                self._notes_view.set_reading_plain(self._ctrl.generation_preview_text)
+            elif markdown and notes is not None and self._is_refinement(notes.template_id):
                 self._notes_view.set_reading_html("".join(
                     "<p>" + html.escape(p).replace("\n", "<br>") + "</p>"
                     for p in markdown.strip().split("\n\n") if p.strip()
@@ -1331,25 +1345,54 @@ class MeetingPage(QWidget):
         self._restore_action.setText("恢复上一版" + previous_label)
 
     def _sync_notes_state(self, notes) -> None:
+        if self._ctrl.generating_for == self._detail_id:
+            progress = self._status_label.text().strip()
+            if not progress:
+                progress = "正在整理原文…" if self._is_refinement() else "正在生成纪要…"
+            self._notes_state.setText(progress)
+            self._notes_state.setToolTip("整理进行中。完成前仍显示上一版，点「取消」可停下。")
+            self._status_label.hide()
+            self._paint_notes_state()
+            return
         if self._editing_notes:
             state = "正在编辑 · 尚未保存"
         elif notes is None or not notes.markdown:
             state = "尚未整理原文" if self._is_refinement() else "尚未生成纪要"
         else:
             state = "已手动编辑" if notes.user_edited else "AI 生成"
-            template_index = self._template_combo.findData(notes.template_id)
-            if template_index >= 0:
-                state += " · " + self._template_combo.itemText(template_index)
         if notes is not None and notes.transcript_changed:
             state += f" · 文字稿已更正，{self._result_label()}发言人需核对"
         elif notes is not None and "（待核对）" in notes.markdown:
             state += " · 含待核对内容"
-        self._notes_state.setText(self._result_label() + " · " + state)
+        self._notes_state.setText(state)
         self._notes_state.setToolTip(
             "保留细节与语气的 AI 整理稿，可切换到文字稿核对；手动编辑不等于内容已经核实。"
             if self._result_label() == "精整正文" else
             "纪要根据文字稿生成；点击引用可核对来源。手动编辑不等于内容已经核实。"
         )
+        self._paint_notes_state()
+
+    def _paint_notes_state(self) -> None:
+        from sayink.ui import design_tokens as tok
+
+        generating = bool(self._detail_id) and self._ctrl.generating_for == self._detail_id
+        row = self._state_row.layout()
+        if generating:
+            self._state_row.setStyleSheet(
+                f"QWidget#meetingState {{ background: {tok.SURFACE_PEARL}; border: 1px solid {tok.HAIRLINE};"
+                f" border-radius: {tok.RADIUS_MD}px; }}"
+            )
+            self._notes_state.setStyleSheet(
+                f"color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 700;"
+                f" background: transparent; border: none; padding: 0;"
+            )
+            row.setContentsMargins(10, 4, 6, 4)
+            return
+        self._state_row.setStyleSheet("QWidget#meetingState { background: transparent; border: none; }")
+        self._notes_state.setStyleSheet(
+            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent; border: none; padding: 0;"
+        )
+        row.setContentsMargins(0, 0, 0, 0)
 
     def _sync_content_hint(self) -> None:
         transcript = self._content_stack.currentIndex() == 1
@@ -1359,6 +1402,8 @@ class MeetingPage(QWidget):
                     "说话人由系统自动区分；姓名来自手动命名。")
         elif self._editing_notes:
             hint = "复制与导出使用当前草稿。切换会议或离开本页时自动保存。"
+        elif self._ctrl.generating_for == self._detail_id:
+            hint = "生成预览尚未保存；复制和导出仍使用上一版。点「取消」可停下。"
         else:
             notes = self._store.get_notes(self._detail_id) if self._detail_id else None
             if notes is not None and notes.markdown and self._template_combo.currentData() != notes.template_id:
@@ -1390,7 +1435,9 @@ class MeetingPage(QWidget):
         has_notes = bool(self._current_notes_text().strip())
         has_transcript = bool(self._detail_id and self._transcript_offsets)
         self._copy_btn.setEnabled(has_transcript if transcript else has_notes)
-        self._copy_btn.setStyleSheet(ss.BTN_PRIMARY)
+        # Same filled action as 历史's copy button. The large primary style is
+        # taller than the shared small-button box and made the two toolbars disagree.
+        self._copy_btn.setStyleSheet(ss.BTN_ACCENT_SM)
         self._export_actions["notes"].setEnabled(has_notes)
         self._export_actions["transcript"].setEnabled(has_transcript)
         self._export_actions["all"].setEnabled(bool(self._detail_id))
@@ -1547,6 +1594,19 @@ class MeetingPage(QWidget):
         if meeting_id == self._detail_id:
             self._set_status(text)
             self._render_detail()
+
+    def _on_generation_preview(self, meeting_id: str, text: str) -> None:
+        if meeting_id != self._detail_id or self._editing_notes:
+            return
+        if not text:
+            self._render_detail()
+            return
+        self._notes_stack.setCurrentWidget(self._notes_view)
+        bar = self._notes_view.verticalScrollBar()
+        position = bar.value()
+        at_end = position >= bar.maximum() - 24
+        self._notes_view.set_reading_plain(text)
+        self._notes_view.restore_reading_position(bar.maximum() if at_end else position)
 
     def _on_generation_finished(self, meeting_id: str) -> None:
         self._pending_templates.pop(meeting_id, None)

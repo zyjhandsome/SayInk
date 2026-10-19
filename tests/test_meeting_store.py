@@ -45,6 +45,29 @@ def meetings(history):
     return MeetingStore(history)
 
 
+def test_generation_checkpoints_survive_restart_and_are_invalidated(tmp_path):
+    path = tmp_path / "resumable.db"
+    first = HistoryStore(db_path=path)
+    store = MeetingStore(first)
+    meeting = store.create_meeting()
+    assert store.flush()
+    store.save_generation_checkpoint(meeting.id, "config1", "step1", '{"summary":"done"}')
+    first.close(timeout=2)
+    second = HistoryStore(db_path=path)
+    try:
+        store = MeetingStore(second)
+        assert store.generation_checkpoints(meeting.id, "config1") == {"step1": '{"summary":"done"}'}
+        assert store.generation_checkpoints(meeting.id, "config2") == {}
+        store.save_generation_checkpoint(meeting.id, "config2", "step2", '{"summary":"new"}')
+        assert store.generation_checkpoints(meeting.id, "config1") == {}
+        store.delete_meeting(meeting.id)
+        assert store.flush()
+        store.save_generation_checkpoint(meeting.id, "config2", "late", "ignored")
+        assert store.generation_checkpoints(meeting.id, "config2") == {}
+    finally:
+        second.close(timeout=2)
+
+
 class TestHistoryHooks:
     def test_flush_is_a_barrier_for_queued_writes(self, history):
         history.enqueue(_seg("m1", 0, "a", created_at=1000))

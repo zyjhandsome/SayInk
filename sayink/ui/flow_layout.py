@@ -152,6 +152,12 @@ class WrappingToolBar(QWidget):
         hint = widget.sizeHint()
         if hint.width() <= 0 or hint.height() <= 0:
             hint = hint.expandedTo(widget.minimumSizeHint())
+        width = hint.width()
+        if widget.minimumWidth() > 0:
+            width = max(width, widget.minimumWidth())
+        if 0 < widget.maximumWidth() < 16_777_215:
+            width = min(width, widget.maximumWidth())
+        hint.setWidth(width)
         return hint
 
     def _flex_min(self, widget: QWidget) -> int:
@@ -253,3 +259,161 @@ class WrappingToolBar(QWidget):
                 x += item_w + gap
                 line_h = max(line_h, item_h)
         return y + line_h
+
+
+class PairedToolBar(QWidget):
+    """Two clusters. They share a row when they fit; otherwise the right cluster drops intact."""
+
+    def __init__(self, parent: QWidget | None = None, *, spacing: int = 8) -> None:
+        super().__init__(parent)
+        self._spacing = spacing
+        self._left: list[QWidget] = []
+        self._right: list[QWidget] = []
+        self._pending = False
+        self._arranging = False
+        policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def add_left(self, widget: QWidget) -> None:
+        self._adopt(widget, self._left)
+
+    def add_right(self, widget: QWidget) -> None:
+        self._adopt(widget, self._right)
+
+    def _adopt(self, widget: QWidget, group: list[QWidget]) -> None:
+        widget.setParent(self)
+        widget.installEventFilter(self)
+        group.append(widget)
+        self._schedule()
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._arrange(width, apply=False)
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._span(self._shown(self._left)) + self._spacing + self._span(self._shown(self._right)),
+                     self._arrange(10**6, apply=False))
+
+    def minimumSizeHint(self) -> QSize:
+        shown = self._shown(self._left) + self._shown(self._right)
+        if not shown:
+            return QSize(0, 0)
+        return QSize(max(self._box(widget).width() for widget in shown),
+                     max(self._box(widget).height() for widget in shown))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._sync_height()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._sync_height()
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.LayoutRequest and not self._arranging:
+            self._schedule()
+        return super().event(event)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() in (QEvent.Type.Show, QEvent.Type.Hide, QEvent.Type.LayoutRequest):
+            self._schedule()
+        return False
+
+    def _schedule(self) -> None:
+        if self._pending:
+            return
+        self._pending = True
+        QTimer.singleShot(0, self._flush)
+
+    def _flush(self) -> None:
+        self._pending = False
+        self.updateGeometry()
+        if self.isVisible() or self.width() > 0:
+            self._sync_height()
+
+    def _sync_height(self) -> None:
+        if self._arranging:
+            return
+        height = self._arrange(self.width(), apply=True)
+        if height != self.minimumHeight():
+            self.setMinimumHeight(height)
+            self.updateGeometry()
+
+    def _shown(self, widgets: list[QWidget]) -> list[QWidget]:
+        return [widget for widget in widgets if not widget.isHidden()]
+
+    def _box(self, widget: QWidget) -> QSize:
+        hint = widget.sizeHint()
+        if hint.width() <= 0 or hint.height() <= 0:
+            hint = hint.expandedTo(widget.minimumSizeHint())
+        width = hint.width()
+        if widget.minimumWidth() > 0:
+            width = max(width, widget.minimumWidth())
+        if 0 < widget.maximumWidth() < 16_777_215:
+            width = min(width, widget.maximumWidth())
+        height = max(hint.height(), widget.minimumHeight())
+        return QSize(width, height)
+
+    def _span(self, widgets: list[QWidget]) -> int:
+        if not widgets:
+            return 0
+        return sum(self._box(widget).width() for widget in widgets) + self._spacing * (len(widgets) - 1)
+
+    def _arrange(self, width: int, *, apply: bool) -> int:
+        if self._arranging:
+            return self.height()
+        self._arranging = True
+        try:
+            return self._place(width, apply=apply)
+        finally:
+            self._arranging = False
+
+    def _place(self, width: int, *, apply: bool) -> int:
+        left = self._shown(self._left)
+        right = self._shown(self._right)
+        if not left and not right:
+            return 0
+        gap = self._spacing
+        row_h = max(self._box(widget).height() for widget in left + right)
+        left_w = self._span(left)
+        right_w = self._span(right)
+        together = left_w + right_w + (gap if left and right else 0)
+        if width <= 0 or together <= width:
+            if apply:
+                self._pack(left, 0, 0, row_h)
+                self._pack(right, max(0, width - right_w), 0, row_h)
+            return row_h
+        y = 0
+        if left:
+            if apply:
+                self._pack(left, 0, 0, row_h)
+            y = row_h + gap
+        if not right:
+            return row_h
+        if width <= 0 or right_w <= width:
+            if apply:
+                self._pack(right, 0, y, row_h)
+            return y + row_h
+        x = 0
+        line = y
+        for widget in right:
+            item_w = self._box(widget).width()
+            if x > 0 and x + item_w > width:
+                line += row_h + gap
+                x = 0
+            if apply:
+                box = self._box(widget)
+                item_h = min(box.height(), row_h)
+                widget.setGeometry(x, line + max(0, (row_h - item_h) // 2), item_w, item_h)
+            x += item_w + gap
+        return line + row_h
+
+    def _pack(self, widgets: list[QWidget], x: int, y: int, height: int) -> None:
+        for widget in widgets:
+            box = self._box(widget)
+            item_h = min(box.height(), height)
+            widget.setGeometry(x, y + max(0, (height - item_h) // 2), box.width(), item_h)
+            x += box.width() + self._spacing

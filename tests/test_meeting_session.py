@@ -350,7 +350,7 @@ class TestGeneration:
         assert req.template.id == "standup"
         assert req.model_name == "m"
         assert [line.text for line in req.lines] == ["昨天修了登录"]
-        assert req.chunk_chars == 10_000
+        assert req.chunk_chars == 8_000
         assert controller.generating_for == record.id
 
         from sayink.minutes_generator import MinutesResult
@@ -436,6 +436,23 @@ class TestMeetingPage:
         widget = MeetingPage(config, controller)
         yield widget
         widget.deleteLater()
+
+    def test_streaming_preview_never_replaces_saved_notes_and_reverts_on_failure(self, page, controller):
+        record = controller.store.create_meeting(title="preview")
+        controller.store.end_meeting(record.id)
+        controller.store.save_notes(record.id, template_id="general", model="m", json_payload="",
+                                    markdown="# Previous\n\nSaved result")
+        assert controller.store.flush()
+        page.show_meeting(record.id)
+        controller._generating_for = record.id
+        controller._on_generation_progress("正在生成纪要…")
+        controller._on_generation_preview("生成预览 · 尚未保存\n\nDraft text")
+        assert "Draft text" in page._notes_view.toPlainText()
+        assert controller.store.get_notes(record.id).markdown == "# Previous\n\nSaved result"
+        assert not page._edit_btn.isEnabled()
+        controller._on_generation_error("network interrupted")
+        assert "Draft text" not in page._notes_view.toPlainText()
+        assert "Saved result" in page._notes_view.toPlainText()
 
     def test_empty_state_and_start_card(self, page):
         from sayink.ui.meeting_page import PAGE_BROWSE, PAGE_START
@@ -564,7 +581,7 @@ class TestMeetingPage:
         page._render_detail()
         assert page._generate_btn.styleSheet() == ss.BTN_GHOST_SM
         assert page._start_btn.styleSheet() == ss.BTN_GHOST_SM
-        assert page._copy_btn.styleSheet() == ss.BTN_PRIMARY
+        assert page._copy_btn.styleSheet() == ss.BTN_ACCENT_SM
 
     def test_notes_display_drops_header_duplicates(self):
         from sayink.ui.meeting_page import notes_for_display

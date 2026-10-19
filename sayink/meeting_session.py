@@ -31,9 +31,10 @@ from sayink.meeting_store import (
     MeetingRecord,
     MeetingStore,
 )
-from sayink.minutes_generator import MinutesGenerator, MinutesRequest, MinutesResult
+from sayink.minutes_generator import MinutesGenerator, MinutesRequest, MinutesResult, request_fingerprint
 from sayink.minutes_prompts import (
     GENERAL_TEMPLATE_ID,
+    DEFAULT_CHUNK_CHARS,
     MeetingContext,
     TranscriptLine,
     format_timestamp,
@@ -174,6 +175,7 @@ class MeetingController(QObject):
     meeting_changed = pyqtSignal(str)           # transcript / marks / speakers / notes changed
     clock_tick = pyqtSignal(str)                # "hh:mm:ss" once a second while LIVE/PAUSED
     generation_progress = pyqtSignal(str, str)  # meeting_id, text
+    generation_preview = pyqtSignal(str, str)   # meeting_id, unsaved readable preview
     generation_finished = pyqtSignal(str)       # meeting_id
     generation_failed = pyqtSignal(str, str)    # meeting_id, message
     notice = pyqtSignal(str, str)               # title, detail (for bar / tray)
@@ -207,9 +209,11 @@ class MeetingController(QObject):
         self._drain_timer.timeout.connect(self._poll_drain)
         self._generator = MinutesGenerator(self)
         self._generator.progress.connect(self._on_generation_progress)
+        self._generator.preview.connect(self._on_generation_preview)
         self._generator.finished_ok.connect(self._on_generation_done)
         self._generator.error.connect(self._on_generation_error)
         self._generating_for = ""
+        self.generation_preview_text = ""
         self._history.add_committed_callback(self._on_history_committed_threadsafe)
 
     # -- accessors -----------------------------------------------------------
@@ -661,10 +665,16 @@ class MeetingController(QObject):
             duration_ms=record.duration_ms,
             title_fallback=record.display_title,
             output_language=str(self._config.get("meeting.output_language", "auto") or "auto"),
-            chunk_chars=int(self._config.get("meeting.single_request_char_limit", 20000) or 20000) // 2,
+            chunk_chars=min(DEFAULT_CHUNK_CHARS, max(64, int(self._config.get("meeting.single_request_char_limit", 20000) or 20000))),
+            context_window_tokens=int(self._config.get("meeting.context_window_tokens", 32768)),
+            max_output_tokens=int(self._config.get("meeting.max_output_tokens", 4096)),
             meta_lines=self._meeting_meta_lines(record),
         )
+        fingerprint = request_fingerprint(request)
+        request.checkpoints = self._store.generation_checkpoints(meeting_id, fingerprint)
+        request.save_checkpoint = lambda key, raw: self._store.save_generation_checkpoint(meeting_id, fingerprint, key, raw)
         self._generating_for = meeting_id
+        self.generation_preview_text = ""
         self.generation_progress.emit(meeting_id, "正在整理原文…" if template.is_refinement else "正在生成纪要…")
         self._generator.generate(request)
         return True
@@ -673,6 +683,7 @@ class MeetingController(QObject):
         if self._generating_for:
             meeting_id = self._generating_for
             self._generating_for = ""
+            self.generation_preview_text = ""
             self._generator.cancel()
             self.generation_failed.emit(meeting_id, "已取消")
 
@@ -684,9 +695,15 @@ class MeetingController(QObject):
         if self._generating_for:
             self.generation_progress.emit(self._generating_for, text)
 
+    def _on_generation_preview(self, text: str) -> None:
+        if self._generating_for:
+            self.generation_preview_text = text
+            self.generation_preview.emit(self._generating_for, text)
+
     def _on_generation_done(self, result: MinutesResult) -> None:
         meeting_id = self._generating_for
         self._generating_for = ""
+        self.generation_preview_text = ""
         if not meeting_id:
             return
         self._store.save_notes(
@@ -698,6 +715,12 @@ class MeetingController(QObject):
             duration_ms=result.duration_ms,
             chunked=result.chunked,
         )
+        flushed = self._store.flush()
+        saved = self._store.get_notes(meeting_id)
+        if not flushed or saved is None or saved.markdown != result.markdown or saved.json_payload != result.json_payload:
+            self.generation_failed.emit(meeting_id, "纪要保存失败，已完成的分段会保留，请重试")
+            return
+        self._store.clear_generation_checkpoints(meeting_id)
         self._store.flush()
         self.generation_finished.emit(meeting_id)
         self.meeting_changed.emit(meeting_id)
@@ -705,6 +728,7 @@ class MeetingController(QObject):
     def _on_generation_error(self, message: str) -> None:
         meeting_id = self._generating_for
         self._generating_for = ""
+        self.generation_preview_text = ""
         if meeting_id:
             self.generation_failed.emit(meeting_id, message)
 

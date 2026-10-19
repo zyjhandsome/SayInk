@@ -260,7 +260,9 @@ class MainWindow(QWidget):
         self._sidebar.setObjectName("mainSidebar")
         self._sidebar.setFixedWidth(tok.SIDEBAR_WIDTH)
         side = QVBoxLayout(self._sidebar)
-        side.setContentsMargins(12, 12, 12, 12)
+        # Vertical margins stay tight so the status block still fits a
+        # 1366×768 screen at 150% (about 472 logical pixels).
+        side.setContentsMargins(12, 8, 12, 6)
         side.setSpacing(3)
 
         self._nav_group = QButtonGroup(self)
@@ -288,7 +290,7 @@ class MainWindow(QWidget):
         self._status_rule = QWidget()
         self._status_rule.setFixedHeight(1)
         side.addWidget(self._status_rule)
-        side.addSpacing(6)
+        side.addSpacing(4)
         status_row = QHBoxLayout()
         status_row.setContentsMargins(8, 0, 8, 0)
         status_row.setSpacing(8)
@@ -300,7 +302,7 @@ class MainWindow(QWidget):
         self._runtime_label.setAccessibleName("当前运行状态")
         status_row.addWidget(self._runtime_label, 1, Qt.AlignmentFlag.AlignVCenter)
         side.addLayout(status_row)
-        side.addSpacing(6)
+        side.addSpacing(4)
         self._mode_label = QLabel()
         self._mode_label.setWordWrap(True)
         self._shortcut_label = QLabel()

@@ -371,6 +371,7 @@ class MeetingStore:
             conn.execute("DELETE FROM meeting_marks WHERE meeting_id = ?", (meeting_id,))
             conn.execute("DELETE FROM meeting_speakers WHERE meeting_id = ?", (meeting_id,))
             conn.execute("DELETE FROM meeting_notes WHERE meeting_id = ?", (meeting_id,))
+            conn.execute("DELETE FROM meeting_generation_cache WHERE meeting_id = ?", (meeting_id,))
             conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
 
         self._write(_delete)
@@ -436,6 +437,36 @@ class MeetingStore:
         self._write(_update)
 
     # -- notes -------------------------------------------------------------
+
+    def generation_checkpoints(self, meeting_id: str, fingerprint: str) -> dict[str, str]:
+        def _query(conn):
+            return dict(conn.execute(
+                "SELECT step_key, payload FROM meeting_generation_cache WHERE meeting_id = ? AND fingerprint = ?",
+                (meeting_id, fingerprint),
+            ).fetchall())
+        return self._history.read(_query, default={}) or {}
+
+    def save_generation_checkpoint(self, meeting_id: str, fingerprint: str, step_key: str, payload: str) -> None:
+        saved = []
+        def _save(conn):
+            # A deleted meeting must never be resurrected by an old worker.
+            row = conn.execute("SELECT status FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+            if row is None or row[0] == STATUS_DELETED:
+                saved.append(False)
+                return
+            conn.execute("DELETE FROM meeting_generation_cache WHERE meeting_id = ? AND fingerprint != ?",
+                         (meeting_id, fingerprint))
+            conn.execute("INSERT OR REPLACE INTO meeting_generation_cache VALUES (?, ?, ?, ?)",
+                         (meeting_id, fingerprint, step_key, payload))
+            saved.append(True)
+        self._write(_save)
+        if not self.flush(timeout=2.0):
+            raise RuntimeError("分段进度未能保存，请重试")
+        if not saved or (saved[0] and self.generation_checkpoints(meeting_id, fingerprint).get(step_key) != payload):
+            raise RuntimeError("分段进度保存失败，请重试")
+
+    def clear_generation_checkpoints(self, meeting_id: str) -> None:
+        self._write(lambda conn: conn.execute("DELETE FROM meeting_generation_cache WHERE meeting_id = ?", (meeting_id,)))
 
     def save_notes(
         self,

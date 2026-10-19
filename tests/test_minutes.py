@@ -4,9 +4,8 @@ guardrails and the generator's single / map-reduce / fallback flows."""
 from __future__ import annotations
 
 import json
-import sys
-import types
 
+import httpx
 import pytest
 
 from sayink.history_store import SegmentRecord
@@ -90,8 +89,9 @@ class TestTranscript:
         assert len(chunks) > 1
         assert all(len(c) <= 200 for c in chunks)
         assert "\n".join(chunks).count("\n") == 9
-        # One over-long line stays whole.
-        assert len(chunk_transcript([TranscriptLine(0, 1, "x" * 500)], None, max_chars=100)) == 1
+        pieces = chunk_transcript([TranscriptLine(0, 1, "x" * 500)], None, max_chars=100)
+        assert len(pieces) > 1 and all(len(piece) <= 100 for piece in pieces)
+        assert "".join(piece.split("：", 1)[1] for piece in pieces) == "x" * 500
 
 
 class TestTemplatesAndPrompts:
@@ -223,29 +223,10 @@ class TestRender:
         assert merged["speakers"] == []
 
 
-# ── generator with a fake httpx ────────────────────────────────────────────
-
-class _Response:
-    def __init__(self, status, content, finish_reason="stop"):
-        self.status_code = status
-        self._content = content
-        self._finish_reason = finish_reason
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise _HTTPStatusError(self)
-
-    def json(self):
-        return {"choices": [{"message": {"content": self._content}, "finish_reason": self._finish_reason}]}
+# ── generator with real HTTPX and an offline transport ─────────────────────
 
 
-class _HTTPStatusError(Exception):
-    def __init__(self, response):
-        super().__init__(f"HTTP {response.status_code}")
-        self.response = response
-
-
-class _Timeout(Exception):
+class _Timeout(httpx.ReadTimeout):
     pass
 
 
@@ -254,35 +235,35 @@ def fake_httpx(monkeypatch):
     calls: list[dict] = []
     script: list = []
 
-    class Client:
-        def __init__(self, timeout=None):
-            self.timeout = timeout
+    def respond(request):
+        payload = json.loads(request.content)
+        calls.append({"url": str(request.url), "headers": dict(request.headers), "payload": payload})
+        # Preserve the existing assertions' canonical header spelling.
+        if "authorization" in request.headers:
+            calls[-1]["headers"]["Authorization"] = request.headers["authorization"]
+        item = fake.responder(payload) if fake.responder else script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        if isinstance(item, httpx.Response):
+            return item
+        status, content, finish = 200, item, "stop"
+        if isinstance(item, tuple):
+            status, content = item[:2]
+            finish = item[2] if len(item) > 2 else "stop"
+        if status >= 400:
+            return httpx.Response(status, json={"error": {"message": content}})
+        events = [
+            {"choices": [{"delta": {"content": content}, "finish_reason": None}]},
+            {"choices": [{"delta": {}, "finish_reason": finish}]},
+        ]
+        body = "".join("data: " + json.dumps(event, ensure_ascii=False) + "\n\n" for event in events) + "data: [DONE]\n\n"
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body.encode())
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def post(self, url, headers=None, json=None):
-            calls.append({"url": url, "headers": headers, "payload": json})
-            item = script.pop(0)
-            if isinstance(item, Exception):
-                raise item
-            if isinstance(item, tuple):
-                return _Response(*item)
-            return _Response(200, item)
-
-    fake = types.ModuleType("httpx")
-    fake.Client = Client
-    fake.NetworkError = type("NetworkError", (Exception,), {})
-    fake.RemoteProtocolError = type("RemoteProtocolError", (Exception,), {})
-    fake.TimeoutException = _Timeout
-    fake.HTTPStatusError = _HTTPStatusError
-    monkeypatch.setitem(sys.modules, "httpx", fake)
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(respond), **kwargs))
     monkeypatch.setattr("sayink.minutes_generator._RETRY_DELAY_SEC", 0.0)
-    fake.calls = calls
-    fake.script = script
+    from types import SimpleNamespace
+    fake = SimpleNamespace(calls=calls, script=script, responder=None)
     return fake
 
 
@@ -370,7 +351,7 @@ class TestMinutesWorker:
         lines = [TranscriptLine(i * 1000, 1, "内容" * 30) for i in range(40)]
         fake_httpx.script.extend([json.dumps({"summary": "A"}), "坏掉了"])
         results, errors, _ = _run(MinutesWorker(_request(lines, chunk_chars=1000)))
-        assert results == [] and "第 2 段" in errors[0]
+        assert results == [] and "第 2/" in errors[0]
 
     def test_non_http_url_rejected_without_network(self, fake_httpx):
         results, errors, _ = _run(MinutesWorker(_request(api_url="ftp://api.example.com/v1")))
@@ -382,7 +363,7 @@ class TestMinutesWorker:
         assert results == [] and "文字稿为空" in errors[0]
 
     def test_timeout_and_http_errors(self, fake_httpx):
-        fake_httpx.script.append(_Timeout())
+        fake_httpx.script.extend([_Timeout("timeout"), _Timeout("timeout")])
         _, errors, _ = _run(MinutesWorker(_request()))
         assert "超时" in errors[0]
         fake_httpx.script.append((401, ""))
@@ -566,7 +547,7 @@ class TestRefinement:
     def test_failed_later_chunk_does_not_publish_partial_document(self, fake_httpx):
         lines = [TranscriptLine(0, 1, "第一段具体内容。" * 60), TranscriptLine(1, 1, "第二段具体内容。" * 60)]
         chunks = refinement_chunks(lines, max_chars=600)
-        fake_httpx.script.extend([_refined(chunks[0]), '{"paragraphs": []}', '{"paragraphs": []}'])
+        fake_httpx.script.extend([_refined(chunks[0])] + ['{"paragraphs": []}'] * 25)
         results, errors, _ = _run(MinutesWorker(_request(lines, template=get_template("refine"), chunk_chars=600)))
         assert results == [] and "本次结果未保存" in errors[0] and "第 2 段" in errors[0]
 
@@ -599,3 +580,248 @@ def test_minutes_generator_retains_cancelled_worker_until_finished(monkeypatch):
     assert worker.wait(2000)
     QCoreApplication.processEvents()
     assert worker not in gen._workers
+
+
+def test_failed_job_resumes_validated_chunks(fake_httpx):
+    lines, count = TestMinutesWorker._long_lines()
+    checkpoints = {}
+    save = lambda key, raw: checkpoints.update({key: raw})
+    fake_httpx.script.extend([json.dumps({"summary": "first"}), (401, "invalid key")])
+    _, errors, _ = _run(MinutesWorker(_request(lines, chunk_chars=1000, save_checkpoint=save)))
+    assert errors and len(checkpoints) == 1
+    initial_calls = len(fake_httpx.calls)
+    fake_httpx.script.extend([json.dumps({"summary": "other"})] * (count - 1))
+    fake_httpx.script.append(json.dumps({"summary": "merged"}))
+    results, errors, progress = _run(MinutesWorker(_request(
+        lines, chunk_chars=1000, checkpoints=dict(checkpoints), save_checkpoint=save,
+    )))
+    assert results and not errors
+    assert len(fake_httpx.calls) - initial_calls == count  # Remaining chunks + merge.
+    assert any("复用" in text for text in progress)
+
+
+def test_fingerprint_covers_source_provider_model_template_and_language():
+    from dataclasses import replace
+    from sayink.minutes_generator import request_fingerprint
+    request = _request()
+    baseline = request_fingerprint(request)
+    for key, value in dict(api_url="https://other.test", api_key="other", model_name="other", output_language="en",
+                           template=get_template("standup"), context=MeetingContext(notes_user="changed"),
+                           lines=[TranscriptLine(0, 1, "different")], max_output_tokens=2048).items():
+        assert request_fingerprint(replace(request, **{key: value})) != baseline
+    assert request_fingerprint(replace(request, checkpoints={"ignored": "ignored"})) == baseline
+
+
+def test_empty_and_malformed_minutes_never_publish(fake_httpx):
+    for payload in ({}, {"title": "only title"}, {"summary": 12}, {"summary": "x", "decisions": "wrong"}):
+        fake_httpx.script.append(json.dumps(payload))
+        results, errors, _ = _run(MinutesWorker(_request()))
+        assert not results and errors
+
+
+def test_truncated_summary_is_split_instead_of_being_saved(fake_httpx):
+    text = "继续讨论预算。" * 50
+    fake_httpx.script.extend([
+        (200, json.dumps({"summary": "must not save"}), "length"),
+        json.dumps({"summary": "left"}), json.dumps({"summary": "right"}), json.dumps({"summary": "whole"}),
+    ])
+    results, errors, _ = _run(MinutesWorker(_request([TranscriptLine(0, 1, text)])))
+    assert not errors and results[0].chunked
+    assert "must not save" not in results[0].markdown and len(fake_httpx.calls) == 4
+    for call in fake_httpx.calls[1:3]:
+        assert "[00:00:00] 说话人1：" in call["payload"]["messages"][1]["content"]
+
+
+def test_input_plan_counts_context_and_leaves_output_room(fake_httpx):
+    from sayink.minutes_generator import estimate_prompt_tokens
+    request = _request([TranscriptLine(i * 1000, 1, "中文内容" * 100) for i in range(20)],
+                       context_window_tokens=14000, chunk_chars=20000)
+    worker = MinutesWorker(request)
+    system = build_system_prompt(request.template)
+    chunks = worker._plan_chunks(system)
+    assert len(chunks) > 1
+    assert all(estimate_prompt_tokens(system, worker._chunk_prompt(chunks, i)) <= 14000 - 4096 - 1024
+               for i in range(len(chunks)))
+    request.context.notes_user = "备注" * 20000
+    results, errors, _ = _run(MinutesWorker(request))
+    assert not results and errors and not fake_httpx.calls
+
+
+def test_merge_inherits_language_template_notes_and_preserves_tasks(fake_httpx):
+    from sayink.minutes_generator import _preserve_facts
+    from sayink.minutes_prompts import build_merge_prompt, build_merge_system_prompt
+    template = get_template("standup")
+    system = build_merge_system_prompt(template, output_language="en")
+    assert "write the minutes in English" in system and template.focus in system
+    context = MeetingContext(notes_user="watch budget", glossary_terms=["SayInk"])
+    assert "watch budget" in build_merge_prompt(context, [{"summary": "x"}])
+    assert "SayInk" in build_merge_prompt(context, [{"summary": "x"}])
+    task = {"task": "ship", "owner": "A", "due": "Friday", "ts": "00:00:01"}
+    merged = _preserve_facts({"summary": "merged", "action_items": []}, [{"action_items": [task]}])
+    assert merged["action_items"] == [task]
+
+
+def test_hierarchical_merge_never_sends_oversized_requests(fake_httpx):
+    from sayink.llm_transport import Cancellation
+    from sayink.minutes_prompts import build_merge_prompt, build_merge_system_prompt
+    request = _request(context_window_tokens=18000)
+    worker = MinutesWorker(request)
+    parts = [{"summary": f"section{i}:" + "细节" * 600} for i in range(9)]
+    system = build_merge_system_prompt(request.template)
+    assert not worker._fits(system, build_merge_prompt(request.context, parts))
+    fake_httpx.script.extend([json.dumps({"summary": "merged"})] * 20)
+    async def merge():
+        async with httpx.AsyncClient() as client:
+            return await worker._merge(client, httpx, parts)
+    assert Cancellation().run(merge())["summary"] == "merged"
+    assert len(fake_httpx.calls) > 1
+    for call in fake_httpx.calls:
+        messages = call["payload"]["messages"]
+        assert worker._fits(messages[0]["content"], messages[1]["content"])
+
+
+def test_queued_result_from_cancelled_worker_cannot_complete_new_job(monkeypatch):
+    import threading
+    from PyQt6.QtCore import QCoreApplication
+    from sayink.minutes_generator import MinutesGenerator
+    emitted, release = threading.Event(), threading.Event()
+    old = []
+    def work(self):
+        if not old:
+            old.append(self)
+            self.finished_ok.emit("old result")
+            emitted.set()
+        release.wait(2)
+    monkeypatch.setattr(MinutesWorker, "run", work)
+    generator = MinutesGenerator()
+    results = []
+    generator.finished_ok.connect(results.append)
+    generator.generate(_request())
+    assert emitted.wait(1)
+    generator.cancel()
+    generator.generate(_request())
+    new = generator._worker
+    QCoreApplication.processEvents()
+    assert not results and generator._worker is new
+    release.set()
+    for worker in list(generator._workers):
+        assert worker.wait(2000)
+    QCoreApplication.processEvents()
+    generator.shutdown()
+
+
+def test_embedded_json_preview_never_exposes_protocol(fake_httpx):
+    worker = MinutesWorker(_request())
+    previews = []
+    worker.preview.connect(previews.append)
+    worker._on_delta('Here is the result: {"summary":"readable text"}')
+    assert previews and "readable text" in previews[-1]
+    assert '"summary"' not in previews[-1] and "Here is the result" not in previews[-1]
+
+
+@pytest.mark.parametrize("fallback", ["# Empty\n\n## Summary", "please retry later", '{"summary":"wrong format"}'])
+def test_markdown_fallback_needs_actual_document_body(fake_httpx, fallback):
+    fake_httpx.script.extend(["not JSON", fallback])
+    results, errors, _ = _run(MinutesWorker(_request()))
+    assert not results and errors and "Markdown" in errors[0]
+
+
+def _echo_refinement_request(payload):
+    data = json.loads(payload["messages"][1]["content"].split("\n", 1)[1])
+    paragraphs = [{"source_ids": [unit["source_id"]], "text": unit["text"]} for unit in data["units"]]
+    return data, json.dumps({"paragraphs": paragraphs}, ensure_ascii=False)
+
+
+def test_real_transcript_recovers_from_repeated_truncation_without_losing_sources(fake_httpx):
+    import re
+    from pathlib import Path
+    from sayink.minutes_prompts import parse_timestamp
+    text = (Path(__file__).parent / "fixtures" / "refinement_20261019.txt").read_text(encoding="utf-8")
+    lines = []
+    for row in text.splitlines():
+        match = re.fullmatch(r"\[([^]]+)\] 说话人(\d+)：(.*)", row)
+        lines.append(TranscriptLine(parse_timestamp(match[1]), int(match[2]), match[3]))
+    sizes = []
+    def responder(payload):
+        data, reply = _echo_refinement_request(payload)
+        size = sum(len(unit["text"]) for unit in data["units"])
+        sizes.append(size)
+        return (200, reply, "length" if size > 250 else "stop")
+    fake_httpx.responder = responder
+    result, errors, progress = _run(MinutesWorker(_request(lines, template=get_template("refine"))))
+    assert not errors and result and result[0].chunked
+    original = refinement_chunks(lines, max_chars=4096 // 3)
+    units = [unit for chunk in original for unit in chunk]
+    paragraphs = json.loads(result[0].json_payload)["paragraphs"]
+    assert [source for paragraph in paragraphs for source in paragraph["source_ids"]] == [unit.source_id for unit in units]
+    assert "".join(paragraph["text"].replace("\n", "") for paragraph in paragraphs) == "".join(line.text for line in lines)
+    assert sizes[0] > 250 and any(size <= 250 for size in sizes)
+    assert any("自动拆小" in line for line in progress)
+
+
+def test_single_source_can_be_split_and_reassembled_with_its_original_id(fake_httpx):
+    lines = [TranscriptLine(0, 1, "讨论 API 的完整行为。如果下周通过，可能交付83万元的方案。" * 4)]
+    count = []
+    def responder(payload):
+        data, reply = _echo_refinement_request(payload)
+        size = sum(len(unit["text"]) for unit in data["units"])
+        count.append(size)
+        return (200, reply, "length" if size > 80 else "stop")
+    fake_httpx.responder = responder
+    results, errors, _ = _run(MinutesWorker(_request(lines, template=get_template("refine"))))
+    assert not errors and results and len(count) > 2
+    paragraphs = json.loads(results[0].json_payload)["paragraphs"]
+    assert [p["source_ids"] for p in paragraphs] == [[1]]
+    assert paragraphs[0]["text"].replace("\n", "") == lines[0].text
+
+
+def test_split_children_resume_without_resending_the_truncated_parent(fake_httpx):
+    checkpoints = {}
+    lines = [TranscriptLine(0, 1, "先讨论预算，回款83万元。" * 12), TranscriptLine(1000, 1, "再讨论计划，下周可能交付。" * 12)]
+    count = [0]
+    def failing(payload):
+        _data, reply = _echo_refinement_request(payload)
+        count[0] += 1
+        if count[0] == 1:
+            return 200, reply, "length"
+        if count[0] == 3:
+            return 401, "auth failure"
+        return reply
+    fake_httpx.responder = failing
+    save = lambda key, raw: checkpoints.update({key: raw})
+    result, errors, _ = _run(MinutesWorker(_request(lines, template=get_template("refine"), save_checkpoint=save)))
+    assert not result and errors and count[0] == 3
+    initial_calls = len(fake_httpx.calls)
+    fake_httpx.responder = lambda payload: _echo_refinement_request(payload)[1]
+    result, errors, _ = _run(MinutesWorker(_request(lines, template=get_template("refine"),
+                                                 checkpoints=dict(checkpoints), save_checkpoint=save)))
+    assert result and not errors and len(fake_httpx.calls) - initial_calls == 1
+
+
+def test_perpetual_truncation_is_bounded_and_does_not_publish(fake_httpx):
+    count = []
+    def responder(payload):
+        data, reply = _echo_refinement_request(payload)
+        count.append(sum(len(unit["text"]) for unit in data["units"]))
+        return 200, reply, "length"
+    fake_httpx.responder = responder
+    results, errors, _ = _run(MinutesWorker(_request([TranscriptLine(0, 1, "不得遗漏有效信息。" * 45)], template=get_template("refine"))))
+    assert not results and errors and "最小处理片段" in errors[0]
+    assert len(count) <= 10
+
+
+def test_repeated_fidelity_failure_is_split_without_relaxing_checks(fake_httpx):
+    lines = [TranscriptLine(0, 1, "本月回款83万元。" * 6), TranscriptLine(1000, 1, "下月预算38万元。" * 6)]
+    prompts = []
+    def responder(payload):
+        data, reply = _echo_refinement_request(payload)
+        prompts.append(payload["messages"][1]["content"])
+        if len(data["units"]) > 1:
+            return reply.replace("83", "38")
+        return reply
+    fake_httpx.responder = responder
+    results, errors, progress = _run(MinutesWorker(_request(lines, template=get_template("refine"))))
+    assert not errors and results and results[0].chunked
+    assert "必须恢复" in prompts[1] and "83万元" in prompts[1]
+    assert any("未通过核对" in text for text in progress)
+    assert results[0].markdown.count("83万元") == 6 and results[0].markdown.count("38万元") == 6

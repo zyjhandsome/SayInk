@@ -140,6 +140,8 @@ DEFAULT_CONFIG = {
         "aux_prompted": False,     # 首次开会缺辅助模型时问过一次「现在下载？」
         "confirmed_remote_hosts": [],
         "single_request_char_limit": 20000,
+        "context_window_tokens": 32768,
+        "max_output_tokens": 4096,
         "separate_lanes": False,
     },
     "update": {

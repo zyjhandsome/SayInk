@@ -110,6 +110,9 @@ class TestAppStyles:
             app.processEvents()
             view = combo.view()
             popup = view.window()
+            from sayink.ui.app_styles import ComboValueDelegate
+
+            assert isinstance(combo.itemDelegate(), ComboValueDelegate)
             assert popup.geometry().top() >= combo.mapToGlobal(combo.rect().bottomLeft()).y()
             assert popup.width() > combo.width()
             assert view.viewport().width() >= view.sizeHintForColumn(0)
@@ -139,23 +142,24 @@ class TestAppStyles:
         combo.show()
         app.processEvents()
         container = combo.view().window()
-        widths_at_show = []
+        widths_at_open = []
 
         # Installed after the style's filter, so it runs first and sees the
-        # width Qt laid out before any post-show correction.
+        # width Qt laid out before any post-show correction. The list view
+        # itself often only receives Resize, not Show.
         class Probe(QObject):
             def eventFilter(self, obj, event):
-                if event.type() == QEvent.Type.Show:
-                    widths_at_show.append(container.width())
+                if obj.window() is container and event.type() in (QEvent.Type.Show, QEvent.Type.Resize):
+                    widths_at_open.append(container.width())
                 return False
 
         probe = Probe()
-        combo.view().installEventFilter(probe)
+        container.installEventFilter(probe)
         try:
             QTest.mousePress(combo, Qt.MouseButton.LeftButton)
             app.processEvents()
             view = combo.view()
-            assert widths_at_show and widths_at_show[0] == container.width()
+            assert widths_at_open and min(widths_at_open) == container.width()
             used = container.width() - view.viewport().width()
             assert view.viewport().width() >= view.sizeHintForColumn(0), used
         finally:
@@ -606,8 +610,10 @@ class TestSettingsControlAlignment:
 
         assert Path(st._spin_arrow_urls()[0]).is_file()
         assert Path(st._spin_arrow_urls()[1]).is_file()
-        # Same pitfall for combos: ::drop-down without ::down-arrow hides the chevron.
-        assert "QComboBox::drop-down" not in st.WINDOW_CSS
+        # The arrow subcontrol needs an explicit image; a bare drop-down hides it.
+        assert "QComboBox::drop-down" in st.WINDOW_CSS
+        assert "QComboBox::down-arrow" in st.WINDOW_CSS
+        assert "spin_chevron_down.png" in st.WINDOW_CSS
         assert "QComboBox {" in st.WINDOW_CSS
         assert f"border: 1px solid {CONTROL_BORDER}" in st.WINDOW_CSS
 

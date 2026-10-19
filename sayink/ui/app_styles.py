@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QEvent, QObject
+from PyQt6.QtCore import QEvent, QObject, QPointF, Qt
+from PyQt6.QtGui import QPainter, QPen
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QAbstractScrollArea,
@@ -56,6 +57,10 @@ def widen_combo_popup(view: QAbstractItemView) -> None:
     if not isinstance(combo, QComboBox) or combo.count() == 0:
         return
     needed = combo_popup_width_hint(combo)
+    if needed <= 0:
+        return
+    # Minimum width survives the geometry Qt assigns while opening the list.
+    container.setMinimumWidth(needed)
     if needed <= container.width():
         return
     geometry = container.geometry()
@@ -94,15 +99,64 @@ def _forward_wheel_to_scroll_area(combo: QComboBox, event) -> bool:
 
 
 class _PopupWidthFilter(QObject):
+    def __init__(self):
+        super().__init__()
+        self._adjusting = False
+
     def eventFilter(self, obj, event):
         kind = event.type()
         if kind == QEvent.Type.Wheel and isinstance(obj, QComboBox):
             return _forward_wheel_to_scroll_area(obj, event)
+        if self._adjusting:
+            return False
         if kind in _POPUP_TRIGGERS and isinstance(obj, QComboBox):
             prepare_combo_popup(obj)
-        elif kind == QEvent.Type.Show and isinstance(obj, QAbstractItemView):
-            widen_combo_popup(obj)
+        elif kind in (QEvent.Type.Show, QEvent.Type.Resize) and isinstance(obj, (QAbstractItemView, QFrame)):
+            # List-mode popups often resize into place without a Show on the
+            # view. Apply the width there, or the list stays as narrow as the field.
+            self._adjusting = True
+            try:
+                view = obj if isinstance(obj, QAbstractItemView) else obj.findChild(QAbstractItemView)
+                if view is not None:
+                    widen_combo_popup(view)
+            finally:
+                self._adjusting = False
         return False
+
+
+def _combo_for_view(view) -> QComboBox | None:
+    widget = view
+    while widget is not None:
+        if isinstance(widget, QComboBox):
+            return widget
+        widget = widget.parentWidget()
+    return None
+
+
+class ComboValueDelegate(QStyledItemDelegate):
+    """Keep a check on the saved value while hover only tints the row under the pointer."""
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        super().paint(painter, option, index)
+        combo = _combo_for_view(option.widget)
+        if combo is None or index.row() != combo.currentIndex():
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(option.palette.text().color())
+        pen.setWidthF(1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        rect = option.rect
+        x = rect.right() - 16
+        y = rect.center().y()
+        painter.drawPolyline(
+            QPointF(x, y),
+            QPointF(x + 3.5, y + 3.5),
+            QPointF(x + 9, y - 4),
+        )
+        painter.restore()
 
 
 class DropDownComboStyle(QProxyStyle):
@@ -121,11 +175,15 @@ class DropDownComboStyle(QProxyStyle):
         if isinstance(target, QComboBox):
             # The list-mode popup otherwise gets a QItemDelegate, which ignores the
             # QComboBox QAbstractItemView::item rules in our stylesheets.
-            if not isinstance(target.itemDelegate(), QStyledItemDelegate):
-                target.setItemDelegate(QStyledItemDelegate(target))
+            if not isinstance(target.itemDelegate(), ComboValueDelegate):
+                target.setItemDelegate(ComboValueDelegate(target))
             if not target.property("_popupWidthFilter"):
                 target.installEventFilter(self._popup_filter)
-                target.view().installEventFilter(self._popup_filter)
+                view = target.view()
+                view.installEventFilter(self._popup_filter)
+                container = view.window()
+                if container is not None and container is not target.window():
+                    container.installEventFilter(self._popup_filter)
                 target.setProperty("_popupWidthFilter", True)
         return super().polish(target)
 

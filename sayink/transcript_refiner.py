@@ -82,6 +82,10 @@ class RefinementUnit:
 class RefinementValidationError(ValueError):
     """The reply cannot safely replace the source transcript."""
 
+    def __init__(self, message: str, *, retry_hint: str = ""):
+        super().__init__(message)
+        self.retry_hint = retry_hint or message
+
 
 def refinement_chunks(lines: Sequence[TranscriptLine], *, max_chars: int = REFINE_CHUNK_CHARS) -> list[list[RefinementUnit]]:
     """Split even an unusually long ASR line without dropping a character."""
@@ -122,12 +126,12 @@ def refinement_user_prompt(
     chunks: Sequence[Sequence[RefinementUnit]], index: int,
     names: dict[int, str], glossary: Sequence[str], *, retry_reason: str = "",
 ) -> str:
-    def context(units):
-        return [{"speaker": speaker_label(u.speaker_id, names), "text": u.text} for u in units]
+    def context(units, *, tail=False):
+        return [{"speaker": speaker_label(u.speaker_id, names), "text": u.text[-200:] if tail else u.text[:200]} for u in units]
 
     data = {
         "glossary": list(glossary),
-        "before_context": context(chunks[index - 1][-1:]) if index else [],
+        "before_context": context(chunks[index - 1][-1:], tail=True) if index else [],
         "units": [{"source_id": u.source_id, "speaker": speaker_label(u.speaker_id, names), "text": u.text}
                   for u in chunks[index]],
         "after_context": context(chunks[index + 1][:1]) if index + 1 < len(chunks) else [],
@@ -136,6 +140,41 @@ def refinement_user_prompt(
     if retry_reason:
         instruction += f"上次结果未通过检查：{retry_reason}。请从原文重新完整整理，勿概括或遗漏。"
     return instruction + "\n" + json.dumps(data, ensure_ascii=False)
+
+
+def split_refinement_units(units: Sequence[RefinementUnit]) -> tuple[list[RefinementUnit], list[RefinementUnit]] | None:
+    """Split a failed group without renumbering its original source units.
+
+    A single source is split using temporary local ids. Its caller validates
+    the reconstructed text and restores the parent id exactly once.
+    """
+    if len(units) > 1:
+        half, size = sum(len(unit.text) for unit in units) / 2, 0
+        cut = 1
+        for index, unit in enumerate(units[:-1], start=1):
+            size += len(unit.text)
+            cut = index
+            if size >= half:
+                break
+        return list(units[:cut]), list(units[cut:])
+    if not units or len(units[0].text) <= 80:
+        return None
+    unit = units[0]
+    cut = len(unit.text) // 2
+    boundaries = list(re.finditer(r"[。！？；.!?;\n，, ]", unit.text[:cut]))
+    if boundaries and boundaries[-1].end() >= cut // 2:
+        cut = boundaries[-1].end()
+    if unit.text[cut - 1].isascii() and unit.text[cut - 1].isalnum() and unit.text[cut].isascii() and unit.text[cut].isalnum():
+        start, end = cut, cut
+        while start and unit.text[start - 1].isascii() and unit.text[start - 1].isalnum():
+            start -= 1
+        while end < len(unit.text) and unit.text[end].isascii() and unit.text[end].isalnum():
+            end += 1
+        cut = start if start else end
+    if cut <= 0 or cut >= len(unit.text):
+        return None
+    return ([RefinementUnit(1, unit.speaker_id, unit.text[:cut])],
+            [RefinementUnit(2, unit.speaker_id, unit.text[cut:])])
 
 
 _NUMBER = re.compile(
@@ -193,8 +232,14 @@ def validate_refinement(payload: dict | None, units: Sequence[RefinementUnit]) -
             raise RefinementValidationError("正文包含标题、列表或对话标签")
         if any(len(_compact(p)) > 800 for p in re.split(r"\n\s*\n", text)):
             raise RefinementValidationError("段落过长，请按话题细分段落")
-        if Counter(_NUMBER.findall(original)) != Counter(_NUMBER.findall(rewritten)):
-            raise RefinementValidationError("数字或单位被改动")
+        source_numbers, edited_numbers = Counter(_NUMBER.findall(original)), Counter(_NUMBER.findall(rewritten))
+        if source_numbers != edited_numbers:
+            missing = list((source_numbers - edited_numbers).elements())[:12]
+            extra = list((edited_numbers - source_numbers).elements())[:12]
+            raise RefinementValidationError("数字或单位被改动", retry_hint=(
+                f"数字或单位被改动；必须恢复：{json.dumps(missing, ensure_ascii=False)}；"
+                f"不得新增：{json.dumps(extra, ensure_ascii=False)}。重复出现的数字也要按原话完整保留。"
+            ))
         source_names = {n.casefold() for n in _ENGLISH.findall(original)}
         edited_names = {n.casefold() for n in _ENGLISH.findall(rewritten)}
         if source_names != edited_names:

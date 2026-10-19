@@ -80,6 +80,13 @@ CREATE TABLE IF NOT EXISTS meeting_notes (
   previous_transcript_changed INTEGER NOT NULL DEFAULT 0,
   previous_metadata TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS meeting_generation_cache (
+  meeting_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  step_key TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (meeting_id, fingerprint, step_key)
+);
 """
 
 # Sessions that belong to a meeting are kept out of the dictation history

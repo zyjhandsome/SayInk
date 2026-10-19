@@ -5,7 +5,10 @@ import sqlite3
 
 import pytest
 from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtWidgets import QApplication, QDialog, QFileDialog
+from PyQt6.QtWidgets import QApplication, QDialog, QFileDialog, QPushButton
+
+from sayink.ui.design_tokens import SECONDARY_CONTAINER
+from sayink.ui.flow_layout import PairedToolBar
 
 from sayink.history_store import HistoryStore, SegmentRecord
 from sayink.meeting_session import MeetingController, MeetingOptions, resolve_capabilities
@@ -388,11 +391,17 @@ def test_generation_locks_edit_template_and_restore_then_unlocks_on_failure(meet
     controller.store.save_notes(record.id, template_id="refine", model="m", json_payload="", markdown="精整正文。")
     controller.store.flush()
     controller._generating_for = record.id
-    controller.generation_progress.emit(record.id, "正在整理原文…")
+    controller.generation_progress.emit(record.id, "正在整理原文… 第 1/2 段")
     assert not page._template_combo.isEnabled()
     assert not page._edit_btn.isEnabled()
     assert not page._restore_action.isEnabled()
     assert not page._generate_btn.isEnabled()
+    assert page._generate_btn.text() == "整理中…"
+    assert not page._cancel_btn.isHidden()
+    assert page._notes_state.text() == "正在整理原文… 第 1/2 段"
+    assert not page._status_label.isVisible()
+    assert "取消" in page._content_hint.text()
+    assert "font-weight: 700" in page._notes_state.styleSheet()
     page._restore_previous()
     assert controller.store.get_notes(record.id).template_id == "refine"
     controller._on_generation_error("本次结果未保存")
@@ -562,6 +571,69 @@ def test_citation_return_restores_position_and_refresh_keeps_reading(meeting):
     page.refresh()
     QApplication.processEvents()
     assert bar.value() == 420
+
+
+def _shares_one_line(widgets) -> bool:
+    tops = [widget.geometry().top() for widget in widgets]
+    bottoms = [widget.geometry().bottom() for widget in widgets]
+    return min(bottoms) > max(tops)
+
+
+def test_template_and_action_clusters_wrap_as_whole_rows():
+    bar = PairedToolBar(spacing=8)
+    left = []
+    right = []
+    for text in ("模板", "原文精整", "管理模板"):
+        button = QPushButton(text)
+        button.setMinimumWidth(120)
+        bar.add_left(button)
+        left.append(button)
+    for text in ("重新整理", "编辑正文", "复制精整正文"):
+        button = QPushButton(text)
+        button.setMinimumWidth(120)
+        bar.add_right(button)
+        right.append(button)
+    cancel = QPushButton("取消")
+    cancel.setMinimumWidth(72)
+    cancel.hide()
+    bar.add_right(cancel)
+    bar.resize(420, 160)
+    bar.show()
+    QApplication.processEvents()
+    assert len({button.geometry().y() for button in left}) == 1
+    assert len({button.geometry().y() for button in right}) == 1
+    assert right[0].geometry().y() > left[0].geometry().y()
+    assert right[0].geometry().x() < right[1].geometry().x() < right[2].geometry().x()
+    bar.resize(980, 80)
+    QApplication.processEvents()
+    assert right[0].geometry().y() == left[0].geometry().y()
+    assert right[0].geometry().x() > left[-1].geometry().right()
+    cancel.show()
+    QApplication.processEvents()
+    assert cancel.geometry().y() == right[0].geometry().y()
+    assert cancel.geometry().x() > right[2].geometry().right()
+    bar.deleteLater()
+
+
+def test_notes_tab_shares_one_line_with_transcript_and_export(meeting):
+    page, *_rest = meeting
+    page.resize(1100, 720)
+    page.show()
+    QApplication.processEvents()
+    assert page._tab_notes.geometry().y() == page._tab_transcript.geometry().y()
+    assert page._tab_notes.height() == page._tab_transcript.height()
+    assert page._tab_bar.height() == page._export_btn.height()
+    assert page._tab_bar.geometry().y() == page._export_btn.geometry().y()
+    css = page._tab_bar.styleSheet()
+    assert SECONDARY_CONTAINER in css
+    assert "font-weight: 700" not in css
+    QApplication.processEvents()
+    bar = page._notes_bar
+    actions = (page._generate_btn, page._edit_btn, page._copy_btn)
+    assert _shares_one_line(actions)
+    assert page._copy_btn.geometry().bottom() <= bar.height()
+    assert _shares_one_line((page._template_label, page._template_combo, page._manage_templates_btn))
+    assert page._generate_btn.geometry().x() < page._edit_btn.geometry().x() < page._copy_btn.geometry().x()
 
 
 def test_only_empty_decision_sections_are_compacted_for_display():
