@@ -282,7 +282,10 @@ def _build_theme_row(win) -> QWidget:
 def _build_toggle_rows(win, lay: QVBoxLayout) -> None:
     win._auto_start_row = ToggleOptionRow("开机时自动启动")
     win._sound_row = ToggleOptionRow("录音提示音")
-    win._restore_clipboard_row = ToggleOptionRow("粘贴后恢复剪贴板")
+    win._restore_clipboard_row = ToggleOptionRow(
+        "粘贴后恢复剪贴板",
+        "贴进光标后换回你原来复制的文字；关闭则转写留在剪贴板",
+    )
     win._auto_start_row.toggled.connect(win._on_auto_start_toggled)
     win._sound_row.toggled.connect(win._on_sound_toggled)
     win._restore_clipboard_row.toggled.connect(win._on_restore_clipboard_toggled)

@@ -120,14 +120,19 @@ class TestGeneralPageLayout:
         assert settings_window._mic_test_btn.text() == "测试声音（约 2 秒）"
         assert settings_window._advanced_audio_btn.text() == "手动选择音频设备"
 
-        # Simple preferences remain terse; history explains what is retained.
+        # Simple preferences stay terse; clipboard restore and history need a hint.
         for row, title in (
             (settings_window._auto_start_row, "开机时自动启动"),
             (settings_window._sound_row, "录音提示音"),
-            (settings_window._restore_clipboard_row, "粘贴后恢复剪贴板"),
         ):
             texts = [lb.text() for lb in row.findChildren(QLabel) if lb.text()]
             assert texts == [title], texts
+        clipboard_text = " ".join(
+            lb.text() for lb in settings_window._restore_clipboard_row.findChildren(QLabel)
+        )
+        assert "粘贴后恢复剪贴板" in clipboard_text
+        assert "原来复制的文字" in clipboard_text
+        assert "转写留在剪贴板" in clipboard_text
         history_text = " ".join(lb.text() for lb in settings_window._history_enabled_row.findChildren(QLabel))
         assert "保存转写历史" in history_text
         assert "不保存音频" in history_text
