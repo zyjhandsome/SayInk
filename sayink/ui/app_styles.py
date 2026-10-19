@@ -50,29 +50,43 @@ def prepare_combo_popup(combo: QComboBox) -> None:
         container.setMinimumWidth(combo_popup_width_hint(combo))
 
 
+def _list_width_for_items(view: QAbstractItemView, combo: QComboBox) -> int:
+    """Width the list itself needs so its viewport can show the longest item."""
+    margins = view.viewportMargins()
+    width = view.sizeHintForColumn(0) + 2 * view.frameWidth() + margins.left() + margins.right()
+    if combo.count() > combo.maxVisibleItems():
+        width += view.verticalScrollBar().sizeHint().width()
+    return width
+
+
 def widen_combo_popup(view: QAbstractItemView) -> None:
     """Fallback for popups opened without a press (``showPopup()`` from code)."""
     container = view.window()
     combo = container.parentWidget() if container is not None else None
-    if not isinstance(combo, QComboBox) or combo.count() == 0:
+    if not isinstance(combo, QComboBox) or combo.count() == 0 or container is combo.window():
         return
     needed = combo_popup_width_hint(combo)
     if needed <= 0:
         return
     # Minimum width survives the geometry Qt assigns while opening the list.
     container.setMinimumWidth(needed)
-    if needed <= container.width():
-        return
-    geometry = container.geometry()
-    geometry.setWidth(needed)
-    screen = combo.screen()
-    if screen is not None:
-        available = screen.availableGeometry()
-        if geometry.right() > available.right():
-            geometry.moveRight(available.right())
-        if geometry.left() < available.left():
-            geometry.moveLeft(available.left())
-    container.setGeometry(geometry)
+    if needed > container.width():
+        geometry = container.geometry()
+        geometry.setWidth(needed)
+        screen = combo.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            if geometry.right() > available.right():
+                geometry.moveRight(available.right())
+            if geometry.left() < available.left():
+                geometry.moveLeft(available.left())
+        container.setGeometry(geometry)
+    # Offscreen and some styles resize the frame without stretching the list,
+    # so the window is wide while the items stay clipped to the field.
+    view.setMinimumWidth(_list_width_for_items(view, combo))
+    layout = container.layout()
+    if layout is not None:
+        layout.activate()
 
 
 _POPUP_TRIGGERS = (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick, QEvent.Type.KeyPress)
