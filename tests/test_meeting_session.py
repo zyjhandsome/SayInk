@@ -624,7 +624,7 @@ class TestMeetingPage:
         controller.store.end_meeting(record.id)
         controller.store.flush()
         page.show_meeting(record.id)
-        assert page._generate_btn.text() == "去配置"
+        assert page._generate_btn.text() == "配置 AI 接口"
         asked = []
         page.configure_requested.connect(lambda: asked.append(True))
         page._generate_btn.click()

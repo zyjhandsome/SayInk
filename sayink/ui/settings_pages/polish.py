@@ -146,7 +146,7 @@ def _build_minutes_section(win) -> QWidget:
     """「会议纪要」: same endpoint and key as polish; its own model / template / language."""
     from PyQt6.QtWidgets import QComboBox
 
-    from sayink.minutes_prompts import describe_template, list_templates
+    from sayink.ui.minutes_templates import MinutesTemplatesDialog, populate_template_combo
     from sayink.ui.settings_components import labeled_row
 
     group = settings_group()
@@ -176,13 +176,25 @@ def _build_minutes_section(win) -> QWidget:
     lay.addWidget(group_divider())
     win._minutes_template_combo = QComboBox()
     win._minutes_template_combo.setAccessibleName("默认会议模板")
-    for template in list_templates([]):
-        win._minutes_template_combo.addItem(template.name, template.id)
-        win._minutes_template_combo.setItemData(
-            win._minutes_template_combo.count() - 1, describe_template(template), Qt.ItemDataRole.ToolTipRole
-        )
+    populate_template_combo(win._minutes_template_combo, win._config)
     win._minutes_template_combo.currentIndexChanged.connect(win._flush_minutes_fields)
-    lay.addWidget(labeled_row("默认模板", win._minutes_template_combo, "生成时可在会议页临时更换"))
+    win._minutes_manage_btn = QPushButton("管理模板")
+    win._style_llm_action_btn(win._minutes_manage_btn)
+
+    def manage_templates():
+        dialog = MinutesTemplatesDialog(win._config, win._minutes_template_combo.currentData(), win)
+        if dialog.exec() == dialog.DialogCode.Accepted:
+            populate_template_combo(win._minutes_template_combo, win._config, dialog.selected_template_id)
+            win._flush_minutes_fields()
+
+    win._minutes_manage_btn.clicked.connect(manage_templates)
+    template_wrap = QWidget()
+    template_row = QHBoxLayout(template_wrap)
+    template_row.setContentsMargins(0, 0, 0, 0)
+    template_row.setSpacing(8)
+    template_row.addWidget(win._minutes_template_combo, 1)
+    template_row.addWidget(win._minutes_manage_btn)
+    lay.addWidget(stacked_field_row("默认模板", template_wrap, "生成时可在会议页临时更换；管理模板可新建或复制后修改"))
     lay.addWidget(group_divider())
     win._minutes_language_combo = QComboBox()
     win._minutes_language_combo.setAccessibleName("纪要输出语言")
@@ -203,7 +215,7 @@ def build_polish_page(win) -> QWidget:
     page.add(_build_connection_section(win))
     page.add(footnote(
         "支持 OpenAI、DeepSeek、通义千问、Ollama 等 OpenAI 兼容接口。"
-        "远程接口须使用 HTTPS；本机或局域网地址可用 HTTP。"
+        "地址以 http:// 或 https:// 开头即可；公网 HTTP 会明文传输密钥和转写内容。"
     ))
     page.add(_build_polish_section(win))
     page.add(_build_minutes_section(win))
@@ -218,6 +230,4 @@ def build_polish_page(win) -> QWidget:
         lambda: win._llm_prompt_timer.start(600)
     )
 
-    page.set_compact()
-    page.set_spacing(10)
     return page

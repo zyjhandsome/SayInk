@@ -60,5 +60,4 @@ def build_model_page(win) -> QWidget:
     win._cards_layout.setContentsMargins(0, 0, 0, 0)
     win._cards_layout.setSpacing(24)
     page.add(win._cards_container)
-    page.set_compact()
     return page

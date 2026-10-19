@@ -599,7 +599,9 @@ class TestSettingsControlAlignment:
         assert "QSpinBox::up-arrow" in st.WINDOW_CSS
         assert "QSpinBox::down-arrow" in st.WINDOW_CSS
         assert "spin_chevron_up.png" in st.WINDOW_CSS
-        assert "min-height: 32px" in st.build_spinbox_css()
+        from sayink.ui.design_tokens import CONTROL_FIELD_HEIGHT
+
+        assert f"min-height: {CONTROL_FIELD_HEIGHT - 14}px" in st.build_spinbox_css()
         from pathlib import Path
 
         assert Path(st._spin_arrow_urls()[0]).is_file()

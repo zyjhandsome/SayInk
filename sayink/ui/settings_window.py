@@ -139,11 +139,11 @@ class SettingsWindow(QWidget):
         self.setStyleSheet(_settings_styles.WINDOW_CSS)
         self._paint_model_hero_status()
         if hasattr(self, "_content_wrap"):
-            self._content_wrap.setStyleSheet("background: transparent;")
+            self._content_wrap.setStyleSheet("QWidget#settingsContent { background: transparent; }")
         if hasattr(self, "_pages_host"):
-            self._pages_host.setStyleSheet("background: transparent;")
+            self._pages_host.setStyleSheet("QWidget#settingsPagesHost { background: transparent; }")
         if hasattr(self, "_pages"):
-            self._pages.setStyleSheet("background: transparent;")
+            self._pages.setStyleSheet("QStackedWidget#settingsPages { background: transparent; }")
         if hasattr(self, "_hotkey_hint"):
             self._hotkey_hint.setStyleSheet(
                 f"color: {tok.TEXT_SEC}; font-size: {_tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
@@ -182,6 +182,10 @@ class SettingsWindow(QWidget):
 
     def show_page(self, index: int) -> None:
         self._pages.setCurrentIndex(index)
+        if index == 2:
+            from sayink.ui.minutes_templates import populate_template_combo
+
+            populate_template_combo(self._minutes_template_combo, self._config)
         if index == 3:
             self._refresh_about_info()
             refresh_update_check_time(self)
@@ -217,34 +221,34 @@ class SettingsWindow(QWidget):
         # auto-saved, so persistent action chrome would only consume space.
         content_wrap = QWidget()
         self._content_wrap = content_wrap
-        content_wrap.setStyleSheet("background: transparent;")
+        content_wrap.setObjectName("settingsContent")
+        content_wrap.setStyleSheet("QWidget#settingsContent { background: transparent; }")
         content_lay = QVBoxLayout(content_wrap)
         content_lay.setContentsMargins(0, 0, 0, 0)
         content_lay.setSpacing(0)
 
         pages_host = QWidget()
         self._pages_host = pages_host
-        pages_host.setStyleSheet("background: transparent;")
+        pages_host.setObjectName("settingsPagesHost")
+        pages_host.setStyleSheet("QWidget#settingsPagesHost { background: transparent; }")
         pages_lay = QHBoxLayout(pages_host)
         # Top/bottom inset so section titles (e.g. 偏好) are not flush-clipped
         # against the content column edge when scrolled.
-        pages_lay.setContentsMargins(12, 8, 12, 12)
+        # Host + document margins match the 24px workspace inset. The page
+        # reserves its own scrollbar gutter so switching pages never shifts it.
+        pages_lay.setContentsMargins(6, 8, 6, 12)
         pages_lay.setSpacing(0)
 
         self._pages = QStackedWidget()
+        self._pages.setObjectName("settingsPages")
         self._pages.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
         )
-        self._pages.setStyleSheet("background: transparent;")
+        self._pages.setStyleSheet("QStackedWidget#settingsPages { background: transparent; }")
         self._pages.addWidget(build_general_page(self))
         self._pages.addWidget(build_model_page(self))
         self._pages.addWidget(build_polish_page(self))
         self._pages.addWidget(build_about_page(self))
-        for i in range(self._pages.count()):
-            page = self._pages.widget(i)
-            if isinstance(page, SettingsPage):
-                page.set_compact(True)
-                page.set_spacing(16)
         pages_lay.addWidget(self._pages, 1)
         content_lay.addWidget(pages_host, 1)
         root.addWidget(content_wrap, 1)
@@ -1716,7 +1720,9 @@ class SettingsWindow(QWidget):
         if self._meeting_glossary_edit.toPlainText() != text:
             self._meeting_glossary_edit.setPlainText(text)
         self._minutes_model_edit.setText(str(self._config.get("meeting.model_name", "") or ""))
-        self._set_combo_by_data(self._minutes_template_combo, self._config.get("meeting.template_id", "general"))
+        from sayink.ui.minutes_templates import populate_template_combo
+
+        populate_template_combo(self._minutes_template_combo, self._config)
         self._set_combo_by_data(self._minutes_language_combo, self._config.get("meeting.output_language", "auto"))
         self._refresh_recognition_feedback()
 
@@ -1804,7 +1810,7 @@ class SettingsWindow(QWidget):
             QMessageBox.warning(
                 self,
                 "提示",
-                "远程 API 须使用 HTTPS；本机或局域网地址（localhost、192.168.x.x 等）可用 HTTP。",
+                "接口地址须以 http:// 或 https:// 开头。",
             )
             self._loading = True
             self._llm_url_edit.setText(self._config.get("llm.api_url", ""))

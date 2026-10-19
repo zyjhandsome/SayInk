@@ -47,7 +47,7 @@ class AboutSummaryRow(QWidget):
             self.action_button = QPushButton(action)
             self.action_button.setCursor(Qt.CursorShape.PointingHandCursor)
             self.action_button.setAccessibleName(f"{action}：{key}")
-            self.action_button.setFixedHeight(28)
+            self.action_button.setMinimumHeight(28)
             self.action_button.clicked.connect(callback)
             lay.addWidget(self.action_button, 0, Qt.AlignmentFlag.AlignVCenter)
         self.reapply_styles()
@@ -68,7 +68,7 @@ class AboutSummaryRow(QWidget):
             self.action_button.setStyleSheet(
                 f"QPushButton {{ color: {tok.ACCENT_TEXT}; background: transparent;"
                 f" border: 2px solid transparent; border-radius: {tok.RADIUS_SM}px;"
-                f" font-size: {tok.TYPE_FOOTNOTE}px; min-height: 0; padding: 2px 6px; }}"
+                f" font-size: {tok.TYPE_FOOTNOTE}px; min-height: 20px; padding: 2px 6px; }}"
                 f"QPushButton:hover {{ background: {tok.ROW_HOVER}; }}"
                 f"QPushButton:pressed {{ background: {tok.NAV_SELECTED_BG}; }}"
                 f"QPushButton:focus {{ border-color: {tok.ACCENT_FOCUS}; }}"
@@ -132,8 +132,6 @@ def paint_about_update_row(win) -> None:
 
 def build_about_page(win) -> QWidget:
     page = SettingsPage()
-    # About is a short document; keep values readable even in a maximized window.
-    page.widget().setMaximumWidth(760)
     page.add(page_header("关于", "SayInk · 让语音成为文字"))
     win._about_info_group = settings_group()
     win._about_info_lay = QVBoxLayout(win._about_info_group)

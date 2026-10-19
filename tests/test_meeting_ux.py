@@ -236,6 +236,61 @@ def test_template_choice_survives_refresh_and_is_used_for_generation(meeting, mo
     assert controller.store.get_notes(record.id).markdown == "修改之后再生成"
 
 
+def test_custom_template_added_in_settings_is_available_for_generation(meeting, monkeypatch):
+    page, controller, _history, record = meeting
+    page._config.set("meeting.custom_templates", [{"id": "custom-project", "name": "项目跟进", "focus": "列出阻塞", "sections": ["action_items"]}])
+    page.refresh()
+    page._template_combo.setCurrentIndex(page._template_combo.findData("custom-project"))
+    called = []
+    monkeypatch.setattr(page, "_confirm_regenerate", lambda: True)
+    monkeypatch.setattr(controller, "generate", lambda mid, **kwargs: called.append((mid, kwargs)))
+    page._generate()
+    assert called == [(record.id, {"template_id": "custom-project"})]
+
+
+def test_empty_minutes_instructions_wrap_in_a_narrow_pane(meeting):
+    page, controller, _history, _record = meeting
+    page._config.set("llm.api_url", "")
+    empty = controller.store.create_meeting(title="待整理")
+    controller.store.end_meeting(empty.id)
+    controller.store.flush()
+    page.resize(720, 520)
+    page.show_meeting(empty.id)
+    page.show()
+    QApplication.processEvents()
+    assert page._notes_stack.currentWidget() is page._notes_empty
+    assert page._notes_empty.wordWrap()
+    assert "配置 AI 接口" in page._notes_empty.text()
+    assert page._notes_empty.heightForWidth(250) > page._notes_empty.fontMetrics().height()
+
+
+@pytest.mark.parametrize("mode", ["light", "dark"])
+def test_minutes_tabs_keep_text_space_when_focused(meeting, mode):
+    from PyQt6.QtWidgets import QStyle, QStyleOptionButton
+    from sayink.ui import design_tokens
+
+    page, _controller, _history, _record = meeting
+    design_tokens.activate(mode)
+    page.reapply_theme()
+    page.resize(880, 580)
+    page.show()
+    QApplication.setActiveWindow(page)
+    QApplication.processEvents()
+    for button in (page._tab_notes, page._tab_transcript):
+        button.clearFocus()
+        QApplication.processEvents()
+        option = QStyleOptionButton()
+        button.initStyleOption(option)
+        normal = button.style().subElementRect(QStyle.SubElement.SE_PushButtonContents, option, button)
+        button.setFocus(Qt.FocusReason.TabFocusReason)
+        QApplication.processEvents()
+        assert button.hasFocus()
+        button.initStyleOption(option)
+        focused = button.style().subElementRect(QStyle.SubElement.SE_PushButtonContents, option, button)
+        assert normal == focused
+        assert focused.height() >= button.fontMetrics().boundingRect(button.text()).height()
+
+
 def test_refinement_choice_changes_next_action_but_keeps_current_result_labels(meeting):
     page, controller, _history, record = meeting
     page._template_combo.setCurrentIndex(page._template_combo.findData("refine"))

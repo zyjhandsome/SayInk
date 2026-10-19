@@ -530,7 +530,7 @@ stateDiagram-v2
 | Paraformer / FireRed / Zipformer 的 `hr_*` 与 `rule_fsts` | 未接。等基线证明这些模型要当默认或弱机推荐再接 |
 | `provider`（GPU / DirectML） | 未接，各加载器走库默认 CPU |
 | `meeting.separate_lanes` | 只有默认值 `false`，没有读取方 |
-| 自定义纪要模板 | `meeting.custom_templates` 可读，设置页没有编辑器 |
+| 自定义纪要模板 | 会议页与 AI 服务页的「管理模板」支持新建、复制、编辑、删除；内置模板可复制后修改，配置保存在 `meeting.custom_templates` |
 | Qwen3-ASR 1.7B | 仍来自 `ilmina/…`，SHA-256 已钉死；不是默认模型 |
 
 #### 5.8.1 代码事实

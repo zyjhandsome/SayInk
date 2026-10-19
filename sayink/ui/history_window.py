@@ -34,8 +34,10 @@ from PyQt6.QtWidgets import (
 
 from sayink.history_store import SegmentRecord, SessionSummary
 from sayink.ui import settings_styles as _settings_styles
+from sayink.ui import design_tokens as tok
 from sayink.ui.clipboard import copy_text
 from sayink.ui.flow_layout import FlowLayout
+from sayink.ui.reading import fit_reading_width
 
 COPY_FAILED_TEXT = "复制失败，请再试一次"
 
@@ -257,6 +259,24 @@ class _SessionCheckBox(QCheckBox):
 
 class _DetailTextEdit(QTextEdit):
     copy_session_requested = pyqtSignal()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_reading_width()
+
+    def setHtml(self, text: str) -> None:
+        super().setHtml(text)
+        self._fit_reading_width()
+
+    def setPlainText(self, text: str) -> None:
+        super().setPlainText(text)
+        self._fit_reading_width()
+
+    def _fit_reading_width(self) -> None:
+        # Editors use their full width. Document-frame changes during editing
+        # would add formatting commands to the user's undo history.
+        if self.isReadOnly():
+            fit_reading_width(self)
 
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.StandardKey.Copy) and not self.textCursor().hasSelection():
@@ -658,28 +678,13 @@ class HistoryWindow(QWidget):
                 "QWidget#historyLeftPane { background: transparent; border: none; }"
             )
         if hasattr(self, "_title_label"):
-            self._title_label.setStyleSheet(
-                f"font-family: {tok.FONT_DISPLAY}; font-size: {tok.TYPE_TITLE_LG}px; font-weight: 700;"
-                f" background: transparent; color: {tok.TEXT};"
-            )
+            from sayink.ui.settings_components import PAGE_TITLE
+
+            self._title_label.setStyleSheet(PAGE_TITLE)
         if hasattr(self, "_right_pane"):
             self._right_pane.setStyleSheet("background: transparent;")
         if hasattr(self, "_search_edit"):
-            self._search_edit.setStyleSheet(f"""
-                QLineEdit {{
-                    background: {tok.SURFACE_PEARL};
-                    color: {tok.TEXT};
-                    border: 1px solid {tok.HAIRLINE};
-                    border-radius: {tok.RADIUS_MD}px;
-                    padding: 6px 12px;
-                    min-height: 26px;
-                    font-size: {tok.TYPE_BODY_SM}px;
-                }}
-                QLineEdit:focus {{
-                    border: 2px solid {tok.ACCENT};
-                    padding: 5px 11px;
-                }}
-            """)
+            self._search_edit.setStyleSheet(ss.build_search_field_css())
         if hasattr(self, "_session_list"):
             self._session_list.setStyleSheet(f"""
                 QListWidget {{
@@ -743,7 +748,7 @@ class HistoryWindow(QWidget):
                         border: 1px solid {tok.CONTROL_BORDER};
                         border-radius: {tok.RADIUS_MD}px;
                         padding: 8px;
-                        font-size: {tok.TYPE_TITLE_SM}px;
+                        font-size: {tok.READING_FONT_PX}px;
                         selection-background-color: {tok.ACCENT_SOFT};
                         selection-color: {tok.TEXT};
                     }}
@@ -758,7 +763,7 @@ class HistoryWindow(QWidget):
                         color: {tok.TEXT};
                         border: none;
                         padding: 4px 0;
-                        font-size: {tok.TYPE_TITLE_SM}px;
+                        font-size: {tok.READING_FONT_PX}px;
                         selection-background-color: {tok.ACCENT_SOFT};
                         selection-color: {tok.TEXT};
                     }}
@@ -810,12 +815,12 @@ class HistoryWindow(QWidget):
         from sayink.ui import design_tokens as tok
 
         css = (
-            f"QPushButton {{ background: transparent; color: {tok.TEXT_SEC}; border: none;"
-            f" border-radius: {tok.RADIUS_SM}px; padding: 0 12px; min-height: 26px; max-height: 26px;"
+            f"QPushButton {{ background: transparent; color: {tok.TEXT_SEC}; border: 2px solid transparent;"
+            f" border-radius: {tok.RADIUS_SM}px; padding: 2px 10px; min-height: 26px;"
             f" font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 400; }}"
             f"QPushButton:hover {{ color: {tok.TEXT}; }}"
             f"QPushButton:checked {{ background: {tok.SURFACE}; color: {tok.TEXT}; font-weight: 700; }}"
-            f"QPushButton:focus {{ border: 2px solid {tok.ACCENT_FOCUS}; padding: 0 10px; }}"
+            f"QPushButton:focus {{ border-color: {tok.ACCENT_FOCUS}; }}"
         )
         for btn in (self._view_polished_btn, self._view_raw_btn):
             btn.setStyleSheet(css)
@@ -932,7 +937,7 @@ class HistoryWindow(QWidget):
             self._copy_btn.setText("复制润色" if self._view_polished else "复制原文")
         else:
             self._copy_btn.setText("复制")
-        self._copy_btn.setStyleSheet(ss.BTN_PRIMARY)
+        self._copy_btn.setStyleSheet(ss.BTN_ACCENT_SM)
         self._sync_copy_tooltips(has_polished)
 
     def _copy_follows_raw_view(self, has_polished: bool) -> bool:
@@ -996,12 +1001,14 @@ class HistoryWindow(QWidget):
 
     def _setup_ui(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(24, 20, 24, 20)
+        outer.setContentsMargins(*tok.WORKSPACE_MARGINS)
         outer.setSpacing(14)
 
         top = QHBoxLayout()
         top.setSpacing(16)
-        self._title_label = QLabel("历史")
+        from sayink.ui.settings_components import page_title_label
+
+        self._title_label = page_title_label("历史")
         top.addWidget(self._title_label, 1, Qt.AlignmentFlag.AlignVCenter)
         outer.addLayout(top)
 
@@ -1018,7 +1025,7 @@ class HistoryWindow(QWidget):
         stream_lay = QVBoxLayout(stream)
         stream_lay.setContentsMargins(0, 0, 0, 0)
         stream_lay.setSpacing(8)
-        stream.setMinimumWidth(240)
+        stream.setMinimumWidth(tok.WORKSPACE_LIST_MIN_WIDTH)
         self._search_edit = QLineEdit(stream)
         self._search_edit.setPlaceholderText("搜索全部听写历史")
         self._search_edit.setAccessibleName("搜索全部听写历史")
@@ -1045,7 +1052,7 @@ class HistoryWindow(QWidget):
         self._manage_btn = QPushButton("更多")
         self._manage_btn.setAccessibleName("历史列表管理")
         self._manage_menu = QMenu(self._manage_btn)
-        self._clear_all_action = self._manage_menu.addAction("清空全部听写历史…")
+        self._clear_all_action = self._manage_menu.addAction("清空全部听写历史")
         self._clear_all_action.triggered.connect(self._clear_all_history)
         self._manage_btn.setMenu(self._manage_menu)
         self._summary_row.addWidget(self._manage_btn)
@@ -1161,12 +1168,8 @@ class HistoryWindow(QWidget):
         self._detail_more_btn = QPushButton("更多")
         self._detail_more_btn.setAccessibleName("当前会话的更多操作")
         self._detail_menu = QMenu(self._detail_more_btn)
-        self._polish_action = self._detail_menu.addAction("AI 润色")
-        self._polish_action.triggered.connect(self._polish_selected_session)
-        self._to_meeting_action = self._detail_menu.addAction("转为会议并整理…")
+        self._to_meeting_action = self._detail_menu.addAction("转为会议并整理")
         self._to_meeting_action.triggered.connect(self._promote_selected_to_meeting)
-        self._export_action = self._detail_menu.addAction("导出 Markdown…")
-        self._export_action.triggered.connect(self._export_selected)
         self._detail_menu.addSeparator()
         self._delete_action = self._detail_menu.addAction("删除这条会话")
         self._delete_action.triggered.connect(self._delete_selected_sessions)
@@ -1210,10 +1213,10 @@ class HistoryWindow(QWidget):
         right_lay.addWidget(self._history_preferences_btn, 0, Qt.AlignmentFlag.AlignLeft)
 
         split.addWidget(self._right_pane)
-        self._right_pane.setMinimumWidth(380)
-        split.setStretchFactor(0, 2)
-        split.setStretchFactor(1, 3)
-        split.setSizes([250, 490])
+        self._right_pane.setMinimumWidth(tok.WORKSPACE_DETAIL_MIN_WIDTH)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 2)
+        split.setSizes(list(tok.WORKSPACE_SPLIT_SIZES))
         outer.addWidget(split, 1)
 
         # ── overlay toast (copy feedback + undo delete) ──
@@ -1666,7 +1669,7 @@ class HistoryWindow(QWidget):
             body = _highlight_html(text, self._search_query, mark_css).replace("\n", "<br>")
             blocks.append(
                 f'<p style="margin:0 0 {20 if many else 0}px 0; color:{tok.TEXT};'
-                f' font-size:{tok.TYPE_TITLE_SM}px; line-height:165%;">{body}</p>'
+                f' font-size:{tok.READING_FONT_PX}px; line-height:{tok.READING_LINE_HEIGHT}%;">{body}</p>'
             )
         return "".join(blocks)
 
@@ -1703,15 +1706,12 @@ class HistoryWindow(QWidget):
         self._copy_btn.setEnabled(count >= 1 and not self._editing_session)
         self._apply_copy_action_styles(count == 1 and has_polished)
         polishing = self._polishing_session_id is not None
-        self._polish_btn.setVisible(not self._selection_mode and not self._editing_session and (polishing or not has_polished))
+        self._polish_btn.setVisible(not self._selection_mode and not self._editing_session)
         self._polish_btn.setEnabled(count == 1 and not polishing)
         if polishing and count == 1 and selected[0] == self._polishing_session_id:
-            self._polish_btn.setText("润色中…")
-            self._polish_action.setText("润色中…")
+            self._polish_btn.setText("正在润色")
         else:
             self._polish_btn.setText("重新润色" if has_polished else "润色")
-            self._polish_action.setText("重新润色" if has_polished else "AI 润色")
-        self._polish_action.setEnabled(count == 1 and not polishing)
         self._edit_btn.setVisible(not self._selection_mode)
         self._edit_btn.setEnabled(count == 1 and not polishing)
         self._edit_btn.setText("保存" if self._editing_session else "编辑")
@@ -1731,7 +1731,6 @@ class HistoryWindow(QWidget):
         self._export_btn.setVisible(not self._editing_session)
         self._export_btn.setEnabled(count > 0 and not self._editing_session)
         self._export_btn.setText(f"导出 {count} 条" if self._selection_mode else "导出")
-        self._export_action.setEnabled(count > 0 and not self._editing_session)
         self._delete_btn.setEnabled(count > 0)
         self._delete_btn.setText(f"删除 {count} 条")
         self._delete_btn.setVisible(self._selection_mode)

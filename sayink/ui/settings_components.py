@@ -18,10 +18,8 @@ from sayink.ui.design_tokens import (
     PAGE_MARGIN_H,
     PAGE_MARGIN_V,
     RADIUS_MD,
-    SPACE_LG,
     SPACE_MD,
     SPACE_SM,
-    SPACE_XS,
 )
 
 # ── Style fragments (rebuilt from active token axis via reload_styles) ──
@@ -49,7 +47,7 @@ def reload_styles() -> None:
     )
     g["PAGE_TITLE"] = (
         f"color: {tok.TEXT}; font-family: {tok.FONT_DISPLAY}; font-size: {tok.TYPE_TITLE_LG}px;"
-        f" font-weight: 700; letter-spacing: 0; padding: 2px 0 0 0;"
+        f" font-weight: 700; letter-spacing: 0; padding: 0; background: transparent;"
     )
     g["PAGE_SUBTITLE"] = (
         f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_BODY_SM}px; padding: 0;"
@@ -155,15 +153,21 @@ def section_header(text: str) -> QLabel:
     return lbl
 
 
+def page_title_label(title: str) -> QLabel:
+    label = QLabel(title)
+    label.setProperty("viRole", "pageTitle")
+    label.setStyleSheet(PAGE_TITLE)
+    label.setMinimumHeight(tok.CONTROL_BTN_SM_HEIGHT + 2)
+    label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    return label
+
+
 def page_header(title: str, subtitle: str = "") -> QWidget:
     wrap = QWidget()
     lay = QVBoxLayout(wrap)
     lay.setContentsMargins(0, 0, 0, 4)
     lay.setSpacing(4)
-    t = QLabel(title)
-    t.setProperty("viRole", "pageTitle")
-    t.setStyleSheet(PAGE_TITLE)
-    lay.addWidget(t)
+    lay.addWidget(page_title_label(title))
     if subtitle:
         lay.addWidget(page_intro(subtitle))
     return wrap
@@ -404,10 +408,7 @@ def stylesheet_for_role(role: object) -> str | None:
     if role == "footnote":
         return FOOTNOTE
     if role == "polishPreviewHeading":
-        return (
-            f"color: {live.TEXT}; font-size: {live.TYPE_TITLE}px; font-weight: 700;"
-            f" background: transparent;"
-        )
+        return SECTION_LABEL
     if role == "polishPreviewLabel":
         return (
             f"color: {live.TEXT_DIM}; font-size: {live.TYPE_BODY_SM}px; font-weight: 700;"
@@ -452,7 +453,6 @@ def stylesheet_for_role(role: object) -> str | None:
 
 def reapply_subtree(root: QWidget) -> None:
     """Broadcast theme refresh to widgets that already know how to restyle."""
-    from sayink.ui import design_tokens as live
     from sayink.ui import settings_styles as ss
 
     for obj in root.findChildren(QWidget):
@@ -480,11 +480,7 @@ def reapply_subtree(root: QWidget) -> None:
         if css:
             label.setStyleSheet(css)
         elif label.objectName() == "settingsGroupTitle":
-            label.setStyleSheet(
-                f"color: {live.TEXT_SEC}; font-size: {live.TYPE_BODY_SM}px; font-weight: 700;"
-                f" padding: 0 2px 2px 2px; background: transparent;"
-                f" letter-spacing: 0;"
-            )
+            label.setStyleSheet(SECTION_LABEL)
 
     for btn in root.findChildren(QPushButton):
         name = btn.objectName() or ""
@@ -524,11 +520,8 @@ def settings_section(
     if title:
         hdr = QLabel(title)
         hdr.setObjectName("settingsGroupTitle")
-        hdr.setStyleSheet(
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 700;"
-            f" padding: 2px 2px 2px 2px; background: transparent;"
-            f" letter-spacing: 0;"
-        )
+        hdr.setProperty("viRole", "sectionLabel")
+        hdr.setStyleSheet(SECTION_LABEL)
         if header_action is None:
             lay.addWidget(hdr)
         else:
@@ -1717,8 +1710,8 @@ class SettingsPage(QScrollArea):
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
         )
         self._layout = QVBoxLayout(body)
-        self._layout.setContentsMargins(PAGE_MARGIN_H, PAGE_MARGIN_V, PAGE_MARGIN_H, PAGE_MARGIN_V)
-        self._layout.setSpacing(SPACE_LG + SPACE_XS)  # 24+8 — clearer section rhythm
+        self._layout.setContentsMargins(*tok.SETTINGS_CONTENT_MARGINS)
+        self._layout.setSpacing(tok.SETTINGS_SECTION_SPACING)
         self._layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.setWidget(body)
         # Keep AsNeeded, but reserve the bar gutter when it is hidden so
@@ -1755,7 +1748,7 @@ class SettingsPage(QScrollArea):
             self._syncing_gutter = False
 
     def set_compact(self, compact: bool = True) -> None:
-        m = (18, 12, 18, 14) if compact else (PAGE_MARGIN_H, PAGE_MARGIN_V, PAGE_MARGIN_H, PAGE_MARGIN_V)
+        m = tok.SETTINGS_CONTENT_MARGINS if compact else (PAGE_MARGIN_H, PAGE_MARGIN_V, PAGE_MARGIN_H, PAGE_MARGIN_V)
         self._layout.setContentsMargins(*m)
 
     def set_spacing(self, px: int) -> None:

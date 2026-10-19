@@ -22,18 +22,18 @@ def build_spinbox_css() -> str:
     up, down = _spin_arrow_urls()
     return f"""
     QSpinBox {{
-        background: {t.SURFACE};
+        background: {t.INPUT_BG};
         color: {t.TEXT};
         border: 1px solid {t.CONTROL_BORDER};
         border-radius: {t.RADIUS_MD}px;
-        padding: 4px 28px 4px 10px;
+        padding: 6px 28px 6px 12px;
         font-size: {t.TYPE_BODY_SM}px;
-        min-height: 32px;
-        max-height: 34px;
+        min-height: {t.CONTROL_FIELD_HEIGHT - 14}px;
+        max-height: {t.CONTROL_FIELD_HEIGHT - 14}px;
     }}
     QSpinBox:focus {{
         border: 2px solid {t.ACCENT_FOCUS};
-        padding: 3px 27px 3px 9px;
+        padding: 5px 27px 5px 11px;
     }}
     QSpinBox::up-button, QSpinBox::down-button {{
         subcontrol-origin: border;
@@ -88,50 +88,50 @@ def build_window_css() -> str:
         color: {t.TEXT};
         border: 1px solid {t.CONTROL_BORDER};
         border-radius: {t.RADIUS_MD}px;
-        padding: 8px 12px;
+        padding: 6px 12px;
         font-size: {t.TYPE_BODY_SM}px;
-        min-height: 36px;
+        min-height: {t.CONTROL_FIELD_HEIGHT - 14}px;
         selection-background-color: {t.PRIMARY_CONTAINER};
         selection-color: {t.PRIMARY_ON};
     }}
     QLineEdit:focus {{
         border: 2px solid {t.ACCENT_FOCUS};
-        padding: 7px 11px;
+        padding: 5px 11px;
     }}
     {sc.ROW_RADIO_STYLE}
     {sc.NAV_BTN_STYLE}
     HotkeyEdit {{
-        background: {t.SURFACE};
+        background: {t.INPUT_BG};
         color: {t.TEXT};
         border: 1px solid {t.CONTROL_BORDER};
         border-radius: {t.RADIUS_MD}px;
-        padding: 10px 12px;
+        padding: 6px 12px;
         font-size: {t.TYPE_BODY_SM}px;
         font-weight: 700;
         font-family: {t.FONT_MONO};
-        min-height: 24px;
+        min-height: {t.CONTROL_FIELD_HEIGHT - 14}px;
     }}
     HotkeyEdit:focus {{
         border: 2px solid {t.ACCENT_FOCUS};
-        padding: 10px 12px;
-        background: {t.SURFACE};
+        padding: 5px 11px;
+        background: {t.INPUT_BG};
     }}
     QScrollArea {{
         border: none;
         background: transparent;
     }}
     QComboBox {{
-        background: {t.SURFACE};
+        background: {t.INPUT_BG};
         color: {t.TEXT};
         border: 1px solid {t.CONTROL_BORDER};
         border-radius: {t.RADIUS_MD}px;
-        padding: 8px 28px 8px 12px;
+        padding: 6px 28px 6px 12px;
         font-size: {t.TYPE_BODY_SM}px;
-        min-height: 32px;
+        min-height: {t.CONTROL_FIELD_HEIGHT - 14}px;
     }}
     QComboBox:focus {{
         border: 2px solid {t.ACCENT_FOCUS};
-        padding: 8px 28px 8px 12px;
+        padding: 5px 27px 5px 11px;
     }}
     QComboBox QAbstractItemView {{
         background: {t.SURFACE};
@@ -190,7 +190,20 @@ def build_btn_primary() -> str:
         border-color: {t.PRIMARY_CONTAINER_PRESSED};
     }}
     QPushButton:disabled {{ background: {t.BAR_OFF}; border-color: {t.BAR_OFF}; color: {t.TEXT_DIM}; }}
-    QPushButton:focus {{ border: 2px solid {t.ACCENT_FOCUS}; padding: 9px 14px; }}
+    QPushButton:focus {{ border: 2px solid {t.ACCENT_FOCUS}; padding: 8px 13px; }}
+"""
+
+
+def build_search_field_css() -> str:
+    """Search uses a compact shared field in both list/detail workspaces."""
+    return f"""
+    QLineEdit {{
+        background: {t.SURFACE_PEARL}; color: {t.TEXT};
+        border: 1px solid {t.HAIRLINE}; border-radius: {t.RADIUS_MD}px;
+        padding: 6px 12px; min-height: {t.SEARCH_CONTENT_HEIGHT}px;
+        font-size: {t.TYPE_BODY_SM}px;
+    }}
+    QLineEdit:focus {{ border: 2px solid {t.ACCENT_FOCUS}; padding: 5px 11px; }}
 """
 
 
@@ -201,7 +214,7 @@ def build_btn_ghost() -> str:
         border-radius: {t.RADIUS_MD}px; padding: 10px 22px; font-size: {t.TYPE_BODY}px;
     }}
     QPushButton:hover {{ background: {t.SURFACE}; color: {t.TEXT}; border-color: {t.TEXT_DIM}; }}
-    QPushButton:focus {{ outline: none; border: 2px solid {t.ACCENT_FOCUS}; }}
+    QPushButton:focus {{ outline: none; border: 2px solid {t.ACCENT_FOCUS}; padding: 9px 21px; }}
 """
 
 

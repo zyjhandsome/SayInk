@@ -372,9 +372,9 @@ class TestMinutesWorker:
         results, errors, _ = _run(MinutesWorker(_request(lines, chunk_chars=1000)))
         assert results == [] and "第 2 段" in errors[0]
 
-    def test_insecure_url_rejected_without_network(self, fake_httpx):
-        results, errors, _ = _run(MinutesWorker(_request(api_url="http://api.example.com/v1")))
-        assert results == [] and "HTTPS" in errors[0]
+    def test_non_http_url_rejected_without_network(self, fake_httpx):
+        results, errors, _ = _run(MinutesWorker(_request(api_url="ftp://api.example.com/v1")))
+        assert results == [] and "http://" in errors[0]
         assert fake_httpx.calls == []
 
     def test_empty_transcript(self, fake_httpx):

@@ -453,7 +453,7 @@ class TrayIcon(QSystemTrayIcon):
 
         self._model_menu = menu.addMenu("切换模型")
         _paint_menu(self._model_menu)
-        empty = self._model_menu.addAction("加载中...")
+        empty = self._model_menu.addAction("正在加载")
         empty.setEnabled(False)
 
         self._auto_start_action = menu.addAction("开机自启")

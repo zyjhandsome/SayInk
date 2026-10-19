@@ -699,12 +699,12 @@ def test_export_is_ghost_and_copy_primary_follows_polish(qapp):
         assert ss.BTN_PRIMARY not in (window._export_btn.styleSheet(),)
         newer, older = window.session_items()
         window._session_list.setCurrentItem(newer)
-        assert window._copy_btn.styleSheet() == ss.BTN_PRIMARY
+        assert window._copy_btn.styleSheet() == ss.BTN_ACCENT_SM
         assert window._copy_btn.text() == "复制润色"
         window._view_raw_btn.setChecked(True)
         assert window._copy_btn.text() == "复制原文"
         window._session_list.setCurrentItem(older)
-        assert window._copy_btn.styleSheet() == ss.BTN_PRIMARY
+        assert window._copy_btn.styleSheet() == ss.BTN_ACCENT_SM
         # Without a polished text there is nothing to contrast「原文」against.
         assert window._copy_btn.text() == "复制"
     finally:
@@ -861,7 +861,7 @@ def test_copy_feedback_is_shown_for_single_selection(qapp):
 def test_clear_all_is_in_the_list_management_menu(qapp):
     window = HistoryWindow(FakeHistoryStore())
     try:
-        assert window._clear_all_action.text() == "清空全部听写历史…"
+        assert window._clear_all_action.text() == "清空全部听写历史"
         assert window._clear_all_action in window._manage_menu.actions()
         assert window._summary_row.indexOf(window._manage_btn) >= 0
         assert window._summary_row.indexOf(window._list_summary) >= 0
@@ -1254,8 +1254,9 @@ def test_single_session_on_demand_ai_polish_and_error_protection(qapp):
     polisher.polish_complete.emit("AI 润色后的新文本")
     assert store.updated_polished == [("older", {0: "AI 润色后的新文本"})]
     assert "AI 润色后的新文本" in window._details.toPlainText()
-    assert window._polish_action.text() == "重新润色"
-    assert window._polish_btn.isHidden()
+    assert window._polish_btn.text() == "重新润色"
+    assert not window._polish_btn.isHidden()
+    assert all(action.text() not in {"AI 润色", "重新润色", "导出 Markdown"} for action in window._detail_menu.actions())
 
 
 def test_batch_merge_sessions_with_8s_undo_and_commit(qapp):

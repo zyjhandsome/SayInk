@@ -134,13 +134,15 @@ def get_template(template_id: str, custom: Iterable[dict[str, Any]] | None = Non
     """Built-in or user template by id; unknown ids fall back to 「通用会议」."""
     for entry in custom or ():
         if isinstance(entry, dict) and entry.get("id") == template_id:
+            output_mode = "refine" if entry.get("output_mode") == "refine" else "minutes"
             sections = tuple(s for s in entry.get("sections", ALL_SECTIONS) if s in ALL_SECTIONS) or ALL_SECTIONS
             return MinutesTemplate(
                 id=str(entry["id"]),
                 name=str(entry.get("name") or entry["id"]),
                 focus=str(entry.get("focus") or ""),
-                sections=sections,
+                sections=() if output_mode == "refine" else sections,
                 builtin=False,
+                output_mode=output_mode,
             )
     for template in BUILTIN_TEMPLATES:
         if template.id == template_id:

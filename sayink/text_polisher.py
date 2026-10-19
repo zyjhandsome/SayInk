@@ -8,14 +8,12 @@ from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
 log = logging.getLogger("SayInk")
 
-# Local endpoints that are allowed to use plain HTTP (e.g. Ollama, LM Studio,
-# litellm running on the same machine). Everything else must use HTTPS.
+# Hosts treated as this machine or the LAN. Plain HTTP is allowed for any
+# host; this set only decides whether an API key is optional and whether
+# sending a meeting transcript needs an extra confirmation.
 _LOCAL_HOSTNAMES = {"localhost", "127.0.0.1", "::1"}
 
-INSECURE_URL_ERROR = (
-    "安全错误: 远程 API URL 必须使用 HTTPS 协议"
-    "（本机或局域网地址，如 localhost、192.168.x.x，可用 HTTP）"
-)
+INSECURE_URL_ERROR = "接口地址须以 http:// 或 https:// 开头，并包含主机名"
 
 
 def is_local_endpoint(url: str) -> bool:
@@ -33,18 +31,15 @@ def is_local_endpoint(url: str) -> bool:
 
 
 def is_secure_or_local_url(url: str) -> bool:
-    """Allow HTTPS anywhere; plain HTTP only for this machine or the home/office LAN.
+    """Allow any ``http`` or ``https`` URL that has a host.
 
-    Covers local OpenAI-compatible servers such as Ollama on
-    ``http://localhost:11434/v1`` or on another PC at ``http://192.168.1.20:11434/v1``.
-    Public addresses must use HTTPS because the API key travels in the header.
+    The scheme is the only gate. Public HTTP is permitted because the user
+    types the address; the key and transcript then travel in cleartext.
+    Other schemes are rejected. Whether the host is local is a separate
+    question (:func:`is_local_endpoint`).
     """
-    url = (url or "").strip()
-    if url.startswith("https://"):
-        return True
-    if url.startswith("http://"):
-        return is_local_endpoint(url)
-    return False
+    parsed = urlparse((url or "").strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
 
 
 def api_key_required(url: str) -> bool:
@@ -228,9 +223,8 @@ class PolishWorker(QThread):
         try:
             import httpx
 
-            # HTTPS 安全检查（本地 localhost 端点允许 HTTP，兼容 Ollama 等）
             if not is_secure_or_local_url(self._api_url):
-                log.warning("API URL 未使用 HTTPS 且非本地端点，存在安全风险")
+                log.warning("API URL 不是 http 或 https 地址")
                 self.error.emit(INSECURE_URL_ERROR)
                 return
 
@@ -348,7 +342,6 @@ class TextPolisher(QObject):
 
     @staticmethod
     def test_connection(api_url: str, api_key: str, model_name: str) -> tuple[bool, str]:
-        # HTTPS 安全检查（本地 localhost 端点允许 HTTP，兼容 Ollama 等）
         if not is_secure_or_local_url(api_url):
             return False, INSECURE_URL_ERROR
 

@@ -135,6 +135,7 @@ DEFAULT_CONFIG = {
         "polish_segments": False,
         "model_name": "",          # 纪要模型；空 = 沿用 llm.model_name
         "template_id": "general",
+        "custom_templates": [],
         "output_language": "auto",
         "aux_prompted": False,     # 首次开会缺辅助模型时问过一次「现在下载？」
         "confirmed_remote_hosts": [],

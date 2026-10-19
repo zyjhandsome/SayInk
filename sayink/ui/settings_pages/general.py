@@ -467,8 +467,6 @@ def build_general_page(win) -> QWidget:
     win._general_footer_note.setObjectName("generalFooterNote")
     win._general_footer_note.setAccessibleName("设置保存与快捷键提示")
     page.add(win._general_footer_note)
-    page._layout.setContentsMargins(2, 20, 2, 12)
-    page.set_spacing(18)
 
     # U-07: keyboard order follows the visual order top to bottom, regardless
     # of how the widgets above were constructed. Radio groups count as one

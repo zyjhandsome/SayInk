@@ -795,14 +795,23 @@ class TestPolishConfigurationStatus:
         text = settings_window._llm_test_status.text()
         assert "接口地址" in text and "会议纪要" in text
 
-    def test_insecure_remote_url_rejected_with_polish_off(self, settings_window, config, monkeypatch):
+    def test_non_http_url_rejected_with_polish_off(self, settings_window, config, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warnings.append(a)))
+        settings_window._llm_enable_row.setChecked(False)
+        settings_window._llm_url_edit.setText("ftp://api.example.com/v1")
+        settings_window._flush_llm_fields()
+        assert warnings
+        assert config.get("llm.api_url", "") != "ftp://api.example.com/v1"
+
+    def test_public_http_url_is_saved(self, settings_window, config, monkeypatch):
         warnings = []
         monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warnings.append(a)))
         settings_window._llm_enable_row.setChecked(False)
         settings_window._llm_url_edit.setText("http://api.example.com/v1")
         settings_window._flush_llm_fields()
-        assert warnings
-        assert config.get("llm.api_url", "") != "http://api.example.com/v1"
+        assert warnings == []
+        assert config.get("llm.api_url", "") == "http://api.example.com/v1"
 
     def test_minutes_model_test_uses_shared_endpoint(self, settings_window, monkeypatch):
         calls = []

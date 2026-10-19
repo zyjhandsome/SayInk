@@ -26,6 +26,11 @@ class TestSecureOrLocalUrl:
             "http://10.0.0.5:8000/v1",
             "http://172.16.3.4/v1",
             "http://ollama-box.local:11434/v1",
+            "http://api.example.com/v1",
+            "http://8.8.8.8/v1",
+            "http://172.32.0.1/v1",
+            "http://insecure-remote.com/chat/completions",
+            "HTTP://api.example.com/v1",
         ],
     )
     def test_allowed_urls(self, url):
@@ -34,12 +39,10 @@ class TestSecureOrLocalUrl:
     @pytest.mark.parametrize(
         "url",
         [
-            "http://api.example.com/v1",
-            "http://8.8.8.8/v1",
-            "http://172.32.0.1/v1",
-            "http://local.example.com/v1",
-            "http://insecure-remote.com/chat/completions",
             "ftp://localhost/x",
+            "file:///etc/passwd",
+            "api.example.com/v1",
+            "http://",
             "",
             "   ",
         ],
@@ -234,22 +237,23 @@ class TestTextPolisherCancel:
 
 
 class TestTestConnection:
-    def test_https_required(self):
+    def test_scheme_required(self):
         success, message = TextPolisher.test_connection(
-            "http://api.example.com",
+            "api.example.com",
             "key",
             "model"
         )
         assert success is False
-        assert "HTTPS" in message or "安全" in message
+        assert message == INSECURE_URL_ERROR
 
-    def test_https_rejected(self):
+    def test_non_http_scheme_rejected(self):
         success, message = TextPolisher.test_connection(
-            "http://insecure-api.com/chat/completions",
+            "ftp://insecure-api.com/chat/completions",
             "key",
             "model"
         )
         assert success is False
+        assert message == INSECURE_URL_ERROR
 
 
 class TestApiUrlConstruction:
@@ -330,13 +334,22 @@ class TestPolishWorkerRun:
         self._run_worker(worker, fake)
         assert client.post.call_args.kwargs["headers"]["Authorization"] == "Bearer sk-x"
 
-    def test_run_rejects_remote_http(self):
+    def test_run_rejects_non_http_scheme(self):
         fake, client = _fake_httpx_module(_make_response({}))
-        worker = PolishWorker("http://api.example.com/v1", "k", "m", "文本")
+        worker = PolishWorker("ftp://api.example.com/v1", "k", "m", "文本")
         results, errors = self._run_worker(worker, fake)
         assert results == []
         assert errors == [INSECURE_URL_ERROR]
         client.post.assert_not_called()
+
+    def test_run_allows_remote_http(self):
+        payload = {"choices": [{"message": {"content": "远程明文"}}]}
+        fake, client = _fake_httpx_module(_make_response(payload))
+        worker = PolishWorker("http://api.example.com/v1", "k", "m", "文本")
+        results, errors = self._run_worker(worker, fake)
+        assert results == ["远程明文"]
+        assert errors == []
+        client.post.assert_called_once()
 
     def test_run_cancelled_before_start_does_nothing(self):
         fake, client = _fake_httpx_module(_make_response({}))
@@ -584,14 +597,15 @@ class TestTestConnectionRun:
         assert ok is True
         assert "成功" in msg
 
-    def test_remote_http_rejected_without_request(self):
+    def test_remote_http_is_requested(self):
         fake, client = _fake_httpx_module(_make_response({}))
         with patch.dict(sys.modules, {"httpx": fake}):
             ok, msg = TextPolisher.test_connection(
                 "http://api.example.com/v1", "k", "m"
             )
-        assert ok is False
-        client.post.assert_not_called()
+        assert ok is True
+        assert "成功" in msg
+        client.post.assert_called_once()
 
     def test_https_success(self):
         fake, _ = _fake_httpx_module(_make_response({}))
