@@ -57,4 +57,10 @@ class TestGetForegroundProcessName:
         monkeypatch.setitem(sys.modules, "win32api", mock_win32api)
         monkeypatch.setitem(sys.modules, "win32process", MagicMock())
         monkeypatch.setitem(sys.modules, "win32con", MagicMock())
+        # The refused full query falls back to the limited image-name query,
+        # which would otherwise ask the OS about whatever real process happens
+        # to own pid 99 on this machine (svchost.exe on a CI runner).
+        limited_calls = []
+        monkeypatch.setattr(tp, "_process_name_limited", lambda info: limited_calls.append(info) or "")
         assert tp.get_foreground_process_name() == ""
+        assert limited_calls == [(1, "X", 99)]
