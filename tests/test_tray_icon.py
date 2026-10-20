@@ -174,7 +174,7 @@ class TestTrayMenuStyleAndGrouping:
         assert labels[7] == "会议记录"
         assert labels[8] == "---"
         assert labels[9] == "切换模型"
-        assert labels[10] == "开机自启"
+        assert labels[10] == "开机时自动启动"  # same wording as the settings row
         assert actions[10].isCheckable()
         assert labels[11] == "---"
         assert labels[12] == "退出"

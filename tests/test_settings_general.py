@@ -27,6 +27,16 @@ from sayink.ui.settings_window import SettingsWindow
 _REAL_DEVICE_REFRESH = SettingsWindow._refresh_audio_device_lists
 
 
+def test_experimental_activity_toggle_is_off_by_default_and_saves_separately(settings_window, config):
+    assert not settings_window._speaker_activity_row.isChecked()
+    original_speaker = config.get("stt.speaker_model_enabled")
+    settings_window._speaker_activity_row.setChecked(True)
+    assert config.get("stt.speaker_activity_enabled") is True
+    assert config.get("stt.speaker_model_enabled") == original_speaker
+    settings_window._load_meeting_settings()
+    assert settings_window._speaker_activity_row.isChecked()
+
+
 @pytest.fixture(scope="module")
 def qapp():
     app = QApplication.instance() or QApplication(sys.argv)
@@ -334,6 +344,23 @@ class TestGeneralPageLayout:
         assert settings_window._llm_key_toggle.text() == "显示"
         assert settings_window._llm_key_toggle.property("viBtn") == "ghostSm"
         assert settings_window._llm_key_toggle.styleSheet() == ss.BTN_GHOST_SM
+
+    def test_revealed_key_is_masked_again_when_the_window_hides(self, settings_window):
+        from PyQt6.QtWidgets import QLineEdit
+
+        settings_window._llm_key_toggle.setChecked(True)
+        assert settings_window._llm_key_edit.echoMode() == QLineEdit.EchoMode.Normal
+        settings_window.on_window_hidden()
+        assert not settings_window._llm_key_toggle.isChecked()
+        assert settings_window._llm_key_edit.echoMode() == QLineEdit.EchoMode.Password
+
+    def test_device_link_accessible_name_follows_its_state(self, settings_window):
+        btn = settings_window._advanced_audio_btn
+        btn.setChecked(True)
+        assert btn.accessibleName() == "收起手动选择音频设备"
+        btn.setChecked(False)
+        assert btn.accessibleName() == "展开手动选择音频设备"
+        assert btn.text() == "手动选择音频设备"
 
     def test_connection_test_is_obvious_and_does_not_focus_polish_switch(
         self, settings_window, qapp, monkeypatch
@@ -1131,6 +1158,91 @@ class TestMeetingSettings:
         assert len(terms) == 50
         win.reload_settings()
         assert win._meeting_glossary_edit.toPlainText().splitlines()[:2] == ["SayInk", "FireRedASR2"]
+
+    def test_glossary_lines_keep_mis_hearings_as_variants(self, settings_window, config):
+        win = settings_window
+        win._meeting_glossary_edit.setPlainText("五证=五中、无证\nSayInk\n张鑫 ＝ 张新, 张欣")
+        win._flush_meeting_glossary()
+        assert config.get("stt.glossary") == [
+            {"term": "五证", "variants": ["五中", "无证"]},
+            {"term": "SayInk"},
+            {"term": "张鑫", "variants": ["张新", "张欣"]},
+        ]
+        win.reload_settings()
+        assert win._meeting_glossary_edit.toPlainText().splitlines() == ["五证=五中、无证", "SayInk", "张鑫=张新、张欣"]
+
+    def test_plain_string_glossary_entries_from_a_hand_edited_config_are_shown(self, settings_window, config):
+        """The recognizer accepts ``"SayInk"`` as a hotword; hiding it in the
+        editor used to delete it on the next edit of the list."""
+        win = settings_window
+        config.set("stt.glossary", ["SayInk", {"term": "张鑫", "variants": ["张新"]}, "", None])
+        win.reload_settings()
+        assert win._meeting_glossary_edit.toPlainText().splitlines() == ["SayInk", "张鑫=张新"]
+
+    def test_llm_mode_round_trips_and_each_mode_keeps_its_own_prompt(self, settings_window, config):
+        from sayink.text_polisher import CORRECTION_PROMPT, POLISH_PROMPT
+
+        win = settings_window
+        win._llm_enable_row.setChecked(True)
+        win._llm_prompt_edit.setPlainText("润色专用提示词")
+        win._flush_llm_fields()
+        assert config.get("llm.prompt") == "润色专用提示词"
+
+        win._llm_mode_combo.setCurrentIndex(win._llm_mode_combo.findData("correct"))
+        assert config.get("llm.mode") == "correct"
+        # The polish prompt stays with polish; correction starts with its built-in.
+        assert win._llm_prompt_edit.toPlainText() == ""
+        assert config.get("llm.prompt") == "润色专用提示词"
+        win._llm_prompt_edit.setPlainText("纠错专用提示词")
+        win._flush_llm_fields()
+        assert config.get("llm.prompt_correct") == "纠错专用提示词"
+        # The before/after example follows the mode instead of promising a rewrite.
+        labels = [lbl.text() for lbl in win._llm_preview_card.findChildren(QLabel)]
+        assert "纠错" in labels and "润色" not in labels
+
+        win.reload_settings()
+        assert win._llm_mode_combo.currentData() == "correct"
+        assert win._llm_prompt_edit.toPlainText() == "纠错专用提示词"
+        assert "纠错" in [lbl.text() for lbl in win._llm_preview_card.findChildren(QLabel)]
+
+        # 恢复默认 means "use the built-in": the editor is cleared, nothing is
+        # pinned, and the built-in prompt of the selected mode is what runs.
+        win._reset_prompt()
+        assert win._llm_prompt_edit.toPlainText() == ""
+        assert config.get("llm.prompt_correct") == ""
+        from sayink.text_polisher import build_system_prompt
+        assert build_system_prompt("correct", custom_prompt=config.get("llm.prompt_correct")) == CORRECTION_PROMPT
+
+        win._llm_mode_combo.setCurrentIndex(win._llm_mode_combo.findData("polish"))
+        assert config.get("llm.mode") == "polish"
+        assert win._llm_prompt_edit.toPlainText() == "润色专用提示词"
+        assert "润色" in [lbl.text() for lbl in win._llm_preview_card.findChildren(QLabel)]
+        # A built-in copy left in the config by an older build shows as empty.
+        config.set("llm.prompt", POLISH_PROMPT)
+        win.reload_settings()
+        assert win._llm_prompt_edit.toPlainText() == ""
+
+    def test_invalid_llm_url_only_reverts_the_url(self, settings_window, config, monkeypatch):
+        from PyQt6.QtWidgets import QMessageBox
+
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: None)
+        win = settings_window
+        win._llm_enable_row.setChecked(True)
+        win._llm_url_edit.setText("ftp://nope")
+        win._llm_model_edit.setText("my-model")
+        win._llm_mode_combo.setCurrentIndex(win._llm_mode_combo.findData("correct"))
+        assert win._llm_url_edit.text() == config.get("llm.api_url", "")
+        assert config.get("llm.model_name") == "my-model"
+        assert config.get("llm.mode") == "correct"
+
+    def test_loading_flag_comes_down_even_when_a_field_is_corrupt(self, settings_window, config):
+        win = settings_window
+        config.set("history.retention_days", None)
+        win.reload_settings()
+        assert win._loading is False
+        assert win._history_retention_days_spin.value() == 90
+        win._sound_row.setChecked(not config.get("sound_enabled", True))
+        assert config.get("sound_enabled") == win._sound_row.isChecked()
 
     def test_minutes_fields_persist(self, settings_window, config):
         win = settings_window

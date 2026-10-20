@@ -4,6 +4,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFontMetrics, QPainter, QColor, QFont, QCursor
 import math
+from sayink.runtime_status import MEETING_STATE_LABELS
 from sayink.ui import design_tokens as tok
 from sayink.ui.island_chrome import (
     island_window_flags,
@@ -18,6 +19,7 @@ BAR_WIDTH = 420
 BAR_EXCERPT_WIDTH = BAR_WIDTH
 COMPACT_HEIGHT = BAR_HEIGHT
 MODEL_LOADING_TITLE = "模型载入中 · 请勿录音"
+_MEETING_SHORT = MEETING_STATE_LABELS["live_short"]
 # call_when_painted() gives up waiting for a paint after this long (the bar
 # may be off screen or unchanged, and then no paint arrives).
 PAINT_WAIT_MAX_MS = 100
@@ -417,7 +419,7 @@ class FloatingWindow(QWidget):
         self._capture_released = False
         self._end_btn.setAccessibleName("结束会议")
         self._end_btn.setToolTip("结束会议并整理文字稿")
-        self._set_state(f"会议中 · {self._meeting_elapsed}", "STATE_RECORD", pulse=True)
+        self._set_state(f"{_MEETING_SHORT} · {self._meeting_elapsed}", "STATE_RECORD", pulse=True)
         self.unsetCursor()
         self._waveform.set_compact(True)
         self._waveform.show()
@@ -437,10 +439,12 @@ class FloatingWindow(QWidget):
         current = self._status_label.text()
         _prefix, sep, rest = current.partition(" · ")
         # Only the clock changes; other feedback (「正在听 · 已记录」) keeps its text.
-        if current.startswith("会议中") and sep and rest.count(":") == 2 and len(rest) == 8:
-            self._status_label.setText(f"会议中 · {elapsed}")
+        if current.startswith(_MEETING_SHORT) and sep and rest.count(":") == 2 and len(rest) == 8:
+            self._status_label.setText(f"{_MEETING_SHORT} · {elapsed}")
 
-    def show_meeting_paused(self, detail: str = "", *, title: str = "会议已暂停") -> None:
+    def show_meeting_paused(
+        self, detail: str = "", *, title: str = MEETING_STATE_LABELS["paused"]
+    ) -> None:
         self._meeting_active = True
         self._listening_active = True
         self._meeting_paused_detail = detail
@@ -685,7 +689,9 @@ class FloatingWindow(QWidget):
             self._apply_excerpt(display)
         self._present()
 
-    def show_polishing(self, text: str = ""):
+    def show_polishing(self, text: str = "", *, action: str = "润色"):
+        """``action`` is the configured LLM step: 润色 or 纠错."""
+        busy = f"{action}中"
         if self._hold_capture():
             if self._live_text:
                 self._show_capture_transcript(self._live_text)
@@ -695,11 +701,11 @@ class FloatingWindow(QWidget):
             self._restore_compact_height()
         if self._listening_active or (self._capture_active and self._live_text):
             if self._listening_active:
-                label, color = "正在听 · 润色中", "STATE_LISTEN"
+                label, color = f"正在听 · {busy}", "STATE_LISTEN"
             elif self._capture_released:
-                label, color = "润色中", "STATE_POLISH"
+                label, color = busy, "STATE_POLISH"
             else:
-                label, color = "录音中 · 润色中", "STATE_LISTEN"
+                label, color = f"录音中 · {busy}", "STATE_LISTEN"
             self._set_state(label, color, pulse=False)
             self._waveform.set_compact(bool(self._live_text))
             self._waveform.show()
@@ -709,7 +715,7 @@ class FloatingWindow(QWidget):
                 self._present()
                 return
         else:
-            self._set_state("润色中", "STATE_POLISH", pulse=False)
+            self._set_state(busy, "STATE_POLISH", pulse=False)
             self._waveform.stop()
             self._waveform.hide()
         if text:

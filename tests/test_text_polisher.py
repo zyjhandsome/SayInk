@@ -312,6 +312,23 @@ class TestPolishWorkerRun:
         # URL gets /chat/completions appended
         assert client.post.call_args[0][0].endswith("/chat/completions")
 
+    def test_cancel_during_the_request_closes_the_connection_and_emits_nothing(self):
+        """Exit must not wait the full 15 s timeout on a request already sent:
+        cancel() drops the client from the main thread."""
+        payload = {"choices": [{"message": {"content": "迟到的结果"}}]}
+        fake, client = _fake_httpx_module(_make_response(payload))
+        worker = PolishWorker("https://api.example.com/v1", "k", "m", "原始文本")
+
+        def slow_post(*args, **kwargs):
+            worker.cancel()  # arrives while post() is blocking
+            return _make_response(payload)
+
+        client.post.side_effect = slow_post
+        results, errors = self._run_worker(worker, fake)
+        assert results == [] and errors == []
+        client.close.assert_called_once()
+        assert worker._client is None
+
     def test_run_allows_local_http_endpoint(self):
         payload = {"choices": [{"message": {"content": "本地润色"}}]}
         fake, _ = _fake_httpx_module(_make_response(payload))

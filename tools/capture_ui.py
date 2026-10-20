@@ -48,8 +48,8 @@ class PreviewStore:
     def list_sessions(self, limit=50, offset=0):
         return self.sessions[offset:offset + limit]
 
-    def search_sessions(self, query):
-        return [s for s in self.sessions if query in s.preview]
+    def search_sessions(self, query, limit=None):
+        return [s for s in self.sessions if query in s.preview][:limit]
 
     def get_session_segments(self, sid):
         return self.segments.get(sid, [])
@@ -131,7 +131,7 @@ def main():
             win._history._search_edit.clear()
             win._history._perform_search()
             bar.show_listening()
-            bar.update_partial_text("这是一条用于检查听写状态的示例文本。")
+            bar.update_partial_text("这是一条用于检查转写状态的示例文本。")
             settle(app)
             bar.grab().save(str(args.output / f"listen-{mode}.png"))
             bar.dismiss_if_idle()

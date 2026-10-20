@@ -88,6 +88,9 @@ def app_harness(config_overrides: dict | None = None, *, real_history: bool = Fa
         from sayink.app import App
 
         app = App()
+        if not real_history:
+            # A MagicMock attribute is truthy; the mocked DB is "working".
+            app._history.disabled = False
         # start() schedules these with QTimer; if they fired during a later
         # test's processEvents, a modal dialog or a real network check would
         # block the suite.

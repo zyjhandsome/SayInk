@@ -7,6 +7,12 @@ from functools import lru_cache
 import numpy as np
 
 TARGET_SAMPLE_RATE = 16000
+# Longest piece of audio any live stage handles at once. The segmenter cuts
+# utterances here (inside the Fun-ASR-Nano / Qwen3-ASR context window), and
+# the speaker-turn detector, overlap detector and recognizer slicer all size
+# their buffers from the same number: raising the cut alone would make the
+# detectors return "uncertain" for every segment without doing any work.
+MAX_SEGMENT_SEC = 15.0
 # Downsampling 48 kHz → 16 kHz without a low-pass folds 8–24 kHz (the hiss of
 # s / x / sh / c, fan noise) back into the speech band at ~85 % level. The
 # filter passes up to this fraction of the target rate and stops at Nyquist.
@@ -139,9 +145,12 @@ def mix_to_mono(
         else:
             t = t[:max_len]
         mixed += t * (scale * float(gain))
-    peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
-    if peak > 1.0:
-        mixed = (mixed / peak).astype(np.float32)
+    # The recorder calls this per 100 ms block. Rescaling only the blocks
+    # that happen to sum above full scale used to step the level up and
+    # down at block boundaries; clipping the rare overshoot keeps the gain
+    # continuous (the balancer already targets RMS 0.05, far below 1.0).
+    if mixed.size and float(np.max(np.abs(mixed))) > 1.0:
+        mixed = np.clip(mixed, -1.0, 1.0).astype(np.float32)
     return mixed
 
 

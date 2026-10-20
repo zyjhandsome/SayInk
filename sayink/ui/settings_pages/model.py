@@ -16,7 +16,7 @@ from sayink.ui.settings_components import (
 
 def build_model_page(win) -> QWidget:
     page = SettingsPage()
-    page.add(page_header("引擎", "语音在本机识别。下载模型后，需等待载入完成才能听写。"))
+    page.add(page_header("引擎", "语音在本机识别。下载模型后，需等待载入完成才能转写。"))
     win._model_hero_host = settings_group()
     win._model_hero_layout = QVBoxLayout(win._model_hero_host)
     win._model_hero_layout.setContentsMargins(0, 0, 0, 0)
@@ -51,9 +51,6 @@ def build_model_page(win) -> QWidget:
     win._download_source_combo.currentIndexChanged.connect(win._on_download_source_changed)
     source_lay.addWidget(labeled_row("下载源", win._download_source_combo))
     page.add(settings_section("下载", source_group))
-
-    win._dir_path_label = QLabel()
-    win._dir_path_label.setVisible(False)
 
     win._cards_container = QWidget()
     win._cards_layout = QVBoxLayout(win._cards_container)

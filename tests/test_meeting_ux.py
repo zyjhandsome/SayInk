@@ -528,7 +528,7 @@ def test_save_failure_preserves_draft_and_meeting_selection(meeting, monkeypatch
 
 def test_single_segment_correction_keeps_other_rows_and_marks_minutes(meeting):
     page, controller, history, record = meeting
-    history.enqueue(SegmentRecord(record.id, 7, record.started_at, raw_text="听写隔离", trigger_mode="hotkey", speaker_id=2))
+    history.enqueue(SegmentRecord(record.id, 7, record.started_at, raw_text="转写隔离", trigger_mode="hotkey", speaker_id=2))
     history.flush()
     controller.rename_speaker(record.id, 1, "小林")
     assert controller.correct_segment_speaker(record.id, 7, 1)
@@ -558,7 +558,7 @@ def test_correction_is_refused_during_live_recording_or_generation(meeting):
 
 def test_text_correction_preserves_source_and_only_updates_target_segment(meeting):
     page, controller, history, record = meeting
-    history.enqueue(SegmentRecord(record.id, 7, record.started_at, raw_text="普通听写", trigger_mode="hotkey"))
+    history.enqueue(SegmentRecord(record.id, 7, record.started_at, raw_text="普通转写", trigger_mode="hotkey"))
     history.flush()
     before = controller.store.get_segments(record.id)
     notes = controller.store.get_notes(record.id)

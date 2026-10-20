@@ -185,7 +185,7 @@ class SessionSummary:
     preview: str
 
 
-def _row_to_segment(r: tuple) -> SegmentRecord:
+def row_to_segment(r: tuple) -> SegmentRecord:
     return SegmentRecord(
         session_id=r[0],
         seq=r[1],
@@ -232,7 +232,7 @@ BUSY_TIMEOUT_MS = 5000
 CLOSE_TIMEOUT_SEC = 10.0
 
 
-def _escape_like(text: str) -> str:
+def escape_like(text: str) -> str:
     """Make ``%`` and ``_`` literal in a LIKE pattern (searching 100% or a_b)."""
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
@@ -404,30 +404,71 @@ class HistoryStore:
             return
         self._queue.put(("write", (fn, failure_notice)))
 
+    @staticmethod
+    def _row_filter(trigger_mode: str | None, respect_locks: bool) -> tuple[str, tuple]:
+        """Extra ``WHERE`` terms shared by the two relabel passes: meetings
+        restrict to their own rows and never move a user-locked segment."""
+        sql, params = "", ()
+        if trigger_mode is not None:
+            sql += " AND trigger_mode = ?"
+            params += (trigger_mode,)
+        if respect_locks:
+            sql += " AND speaker_locked = 0"
+        return sql, params
+
     def relabel_session_speakers(
         self,
         session_id: str,
         mapping: dict[int, int],
         *,
+        trigger_mode: str | None = None,
+        respect_locks: bool = False,
         failure_notice: str = WRITE_FAILED_NOTICE,
     ) -> None:
         """Renumber speakers of one session after a re-clustering pass
         (``{old_id: new_id}``); used by meetings and continuous dictation."""
         if not mapping or not session_id:
             return
-        pairs = [(int(new), session_id, int(old)) for old, new in mapping.items() if old != new]
+        extra_sql, extra = self._row_filter(trigger_mode, respect_locks)
+        pairs = [(int(new), session_id, int(old), *extra) for old, new in mapping.items() if old != new]
         if not pairs:
             return
 
         def _relabel(conn: sqlite3.Connection) -> None:
             # Two passes through a temporary offset so a→b, b→a does not collide.
             conn.executemany(
-                "UPDATE history SET speaker_id = -(? + 1) WHERE session_id = ? AND speaker_id = ?",
+                "UPDATE history SET speaker_id = -(? + 1) WHERE session_id = ? AND speaker_id = ?" + extra_sql,
                 pairs,
             )
             conn.execute(
-                "UPDATE history SET speaker_id = -speaker_id - 1 WHERE session_id = ? AND speaker_id < 0",
-                (session_id,),
+                "UPDATE history SET speaker_id = -speaker_id - 1 WHERE session_id = ? AND speaker_id < 0" + extra_sql,
+                (session_id, *extra),
+            )
+
+        self.enqueue_write(_relabel, failure_notice=failure_notice)
+
+    def relabel_session_segments(
+        self,
+        session_id: str,
+        assignments: dict[int, int],
+        *,
+        trigger_mode: str | None = None,
+        failure_notice: str = WRITE_FAILED_NOTICE,
+    ) -> None:
+        """Apply a per-segment speaker re-assignment ``{seq: speaker_id}`` to
+        one session after the end-of-session clustering pass. Rows the user
+        locked keep their speaker."""
+        if not assignments or not session_id:
+            return
+        extra_sql, extra = self._row_filter(trigger_mode, respect_locks=False)
+        rows = [(int(speaker_id), session_id, int(seq), int(speaker_id), *extra)
+                for seq, speaker_id in assignments.items()]
+
+        def _relabel(conn: sqlite3.Connection) -> None:
+            conn.executemany(
+                "UPDATE history SET speaker_id = ? "
+                "WHERE session_id = ? AND seq = ? AND speaker_locked = 0 AND speaker_id != ?" + extra_sql,
+                rows,
             )
 
         self.enqueue_write(_relabel, failure_notice=failure_notice)
@@ -557,10 +598,21 @@ class HistoryStore:
             logger.exception("HistoryStore list_sessions failed")
             return []
 
-    def search_sessions(self, q: str) -> list[SessionSummary]:
+    def search_sessions(self, q: str, limit: int | None = None) -> list[SessionSummary]:
+        """Newest-first sessions whose text contains ``q``.
+
+        ``limit`` bounds the result like ``list_sessions`` does: the history
+        page renders a widget per row, so a common word matching thousands of
+        sessions must not be rendered in one go.
+        """
         if self.disabled or not q:
             return []
-        pattern = f"%{_escape_like(q)}%"
+        pattern = f"%{escape_like(q)}%"
+        params: tuple[Any, ...] = (pattern, pattern, pattern)
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = "LIMIT ?"
+            params += (max(0, int(limit)),)
         try:
             with self._readonly_conn() as conn:
                 rows = conn.execute(
@@ -586,8 +638,9 @@ class HistoryStore:
                     GROUP BY h.session_id
                     ) summaries
                     ORDER BY session_created DESC
+                    {limit_sql}
                     """,
-                    (pattern, pattern, pattern),
+                    params,
                 ).fetchall()
             return _rows_to_summaries(rows)
         except Exception:
@@ -624,7 +677,7 @@ class HistoryStore:
                     """,
                     (session_id,),
                 ).fetchall()
-            return [_row_to_segment(r) for r in rows]
+            return [row_to_segment(r) for r in rows]
         except Exception:
             logger.exception("HistoryStore get_session_segments failed")
             return []

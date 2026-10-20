@@ -7,11 +7,14 @@ from pathlib import Path
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
+from sayink.audio_utils import MAX_SEGMENT_SEC, TARGET_SAMPLE_RATE
 from sayink.runtime_status import ModelLoadPhase
+from sayink.speaker_turns import RecognizedTurn, analyze_turns
+from sayink.vad_segmenter import CUT_SEARCH_SEC
 
 log = logging.getLogger("SayInk")
 
-SAMPLE_RATE = 16000
+SAMPLE_RATE = TARGET_SAMPLE_RATE
 
 # Default STT model for new installs, config fallback, and release EXE bundling.
 DEFAULT_MODEL_ID = "funasr-nano"
@@ -237,11 +240,11 @@ def normalize_asr_output(text: str) -> str:
 
 
 # Fun-ASR-Nano and Qwen3-ASR keep only the start of an utterance once audio
-# exceeds the exported KV window (about 20s). Continuous mode already slices
-# at MAX_SPEECH_SEC (15 s) in vad_segmenter; this covers hold-to-talk, where
-# a single held utterance has no upper bound.
+# exceeds the exported KV window (about 20s). Every live mode (hold-to-talk
+# included) is already segmented at MAX_SPEECH_SEC by vad_segmenter, so this
+# is a safety net for audio handed in whole (queued clips, tools, tests).
 CONTEXT_LIMITED_LOADERS = frozenset({"funasr_nano", "qwen3_asr"})
-CONTEXT_SLICE_SEC = 15.0
+CONTEXT_SLICE_SEC = MAX_SEGMENT_SEC
 CONTEXT_SLICE_OVERLAP_SEC = 0.4
 
 
@@ -254,7 +257,9 @@ def slice_window_for_loader(loader: str) -> tuple[float, float] | None:
 
 # A slice boundary moves back to the quietest 100 ms frame inside this window
 # (a breath or syllable gap) instead of landing mid-word at exactly slice_sec.
-SLICE_CUT_SEARCH_SEC = 3.0
+# Same window as the segmenter's quiet cut; that one works on its per-block
+# energy log, this one on raw samples, so the search itself is not shared.
+SLICE_CUT_SEARCH_SEC = CUT_SEARCH_SEC
 SLICE_CUT_FRAME_SEC = 0.1
 
 
@@ -604,11 +609,12 @@ MODEL_REGISTRY = [
 # offered as the STT model). They share the download / storage machinery.
 AUX_MODEL_SPEAKER = "speaker-campplus"
 AUX_MODEL_SILERO_VAD = "silero-vad"
+AUX_MODEL_SPEAKER_ACTIVITY = "speaker-activity"
 AUX_MODEL_REGISTRY = [
     {
         "id": AUX_MODEL_SPEAKER,
         "name": "说话人嵌入 CAM++",
-        "description": "3D-Speaker CAM++ 中英声纹模型，连续转录与会议共用的说话人增强",
+        "description": "3D-Speaker CAM++ 中英声纹模型，持续转写与会议共用的说话人增强",
         "languages": "中/英",
         "size_mb": 28,
         "loader": "speaker_embedding",
@@ -624,7 +630,7 @@ AUX_MODEL_REGISTRY = [
     {
         "id": AUX_MODEL_SILERO_VAD,
         "name": "Silero VAD",
-        "description": "神经网络语音活动检测，单次转录、连续转录与会议共用的断句能力",
+        "description": "神经网络语音活动检测，单次转写、持续转写与会议共用的断句能力",
         "languages": "通用",
         "size_mb": 2,
         "loader": "silero_vad",
@@ -636,6 +642,24 @@ AUX_MODEL_REGISTRY = [
         },
         "files": ["silero_vad.onnx"],
         "aux": True,
+    },
+    {
+        "id": AUX_MODEL_SPEAKER_ACTIVITY,
+        "name": "多人发言检测（实验性）",
+        "description": "检测疑似重叠与未分开的多人发言，阻止这些片段训练单人声音档案；不分离声音",
+        "languages": "通用",
+        "size_mb": 2,
+        "loader": "speaker_activity",
+        "hf_repo": "csukuangfj/sherpa-onnx-pyannote-segmentation-3-0",
+        "dir_name": "pyannote-segmentation-3-0",
+        "revision": "340b52f1f5cd12d45a30fa284691417eaad2ff92",
+        "sha256": {
+            "model.int8.onnx": "10a438c2e0d90ed5f5da545cec2244d887315f6dbbbf1d3d564d00745b01952e",
+            "LICENSE": "14d7016ad68e7394d6e6b78d96cc2ae431c905287b89674cfdf021e79e62b8ba",
+        },
+        "files": ["model.int8.onnx", "LICENSE"],
+        "aux": True,
+        "optional": True,
     },
 ]
 
@@ -745,11 +769,29 @@ def restore_glossary_case(text: str, glossary) -> str:
 _custom_models_dir: Path | None = None
 
 
-def set_models_dir(path: Path | None):
+def set_models_dir(path: Path | None) -> bool:
+    """Use ``path`` for models; ``None`` restores the default location.
+
+    A configured folder that cannot be created (removed drive, revoked
+    permission) must not take the whole app down at startup: the default
+    directory is used instead and False is returned so the caller can tell
+    the user.
+    """
     global _custom_models_dir
-    _custom_models_dir = path
     if path:
-        path.mkdir(parents=True, exist_ok=True)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning("模型目录 %s 不可用，改用默认目录: %s", path, exc)
+            _custom_models_dir = None
+            return False
+    _custom_models_dir = path
+    return True
+
+
+def model_dir_names() -> list[str]:
+    """Folder names SayInk itself creates under the models directory."""
+    return [info["dir_name"] for info in (*MODEL_REGISTRY, *AUX_MODEL_REGISTRY)]
 
 
 def is_dir_writable(path: Path) -> bool:
@@ -1032,9 +1074,19 @@ class ModelDownloadWorker(QThread):
                 target = model_dir / filename
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if target.exists():
-                    self._done_bytes += target.stat().st_size
-                    self._emit_progress(i, total_files, 1.0, 0)
-                    continue
+                    # Keep a leftover only when it is byte-for-byte the pinned
+                    # file. An empty stub, git-lfs pointer or truncated earlier
+                    # download used to be "kept", so every retry re-failed with
+                    # 「模型文件不完整」 without a single network call.
+                    if (
+                        _is_usable_model_file(target)
+                        and file_sha256(target) == info["sha256"][filename]
+                    ):
+                        self._done_bytes += target.stat().st_size
+                        self._emit_progress(i, total_files, 1.0, 0)
+                        continue
+                    log.warning("模型文件 %s 已存在但校验不通过，重新下载", target.name)
+                    target.unlink()
 
                 last_err: Exception | None = None
                 for endpoint in self._endpoints:
@@ -1235,6 +1287,7 @@ class TranscribeWorker(QThread):
     result_ready = pyqtSignal(str)
     partial_ready = pyqtSignal(str)
     error = pyqtSignal(str)
+    meeting_ready = pyqtSignal(object)
 
     def __init__(
         self,
@@ -1244,6 +1297,7 @@ class TranscribeWorker(QThread):
         max_slice_sec: float | None = None,
         overlap_sec: float = CONTEXT_SLICE_OVERLAP_SEC,
         retry_empty: bool = False,
+        turn_analyzer=None,
     ):
         super().__init__()
         self._recognizer = recognizer
@@ -1252,6 +1306,7 @@ class TranscribeWorker(QThread):
         self._max_slice_sec = max_slice_sec
         self._overlap_sec = overlap_sec
         self._retry_empty = retry_empty
+        self._turn_analyzer = turn_analyzer
 
     def cancel(self):
         """Set cancellation flag."""
@@ -1276,6 +1331,9 @@ class TranscribeWorker(QThread):
                 return
 
             log.info("开始识别 (%.1f 秒音频)...", len(audio) / SAMPLE_RATE)
+            if self._turn_analyzer is not None:
+                self._run_meeting(audio)
+                return
             if self._max_slice_sec and audio.size > int(self._max_slice_sec * SAMPLE_RATE):
                 pieces = plan_audio_slices(
                     audio, SAMPLE_RATE, self._max_slice_sec, self._overlap_sec
@@ -1310,12 +1368,37 @@ class TranscribeWorker(QThread):
             log.error("识别失败: %s", e)
             self.error.emit(f"识别失败: {e}")
 
+    def _run_meeting(self, audio: np.ndarray) -> None:
+        turns = analyze_turns(audio, self._turn_analyzer, cancelled=lambda: self._cancelled)
+        if self._cancelled:
+            return
+        results = []
+        for turn in turns:
+            if self._cancelled:
+                return
+            part = audio[turn.start:turn.stop]
+            pieces = (plan_audio_slices(part, SAMPLE_RATE, self._max_slice_sec, self._overlap_sec)
+                      if self._max_slice_sec and len(part) > int(self._max_slice_sec * SAMPLE_RATE) else [part])
+            texts = []
+            for piece in pieces:
+                if self._cancelled:
+                    return
+                texts.append(self._decode_slice(piece))
+            text = merge_slice_texts(texts) if len(texts) > 1 else texts[0]
+            results.append(RecognizedTurn(turn.start, turn.stop, text, turn.embedding, turn.learnable))
+            preview = join_segment_texts([t.text for t in results])
+            if preview:
+                self.partial_ready.emit(preview)
+        if not self._cancelled:
+            self.meeting_ready.emit(results)
+
 
 # ── Main Recognizer ──────────────────────────────────────────────
 
 class SpeechRecognizer(QObject):
     """Offline speech recognizer supporting multiple sherpa-onnx models."""
     final_result = pyqtSignal(str)
+    meeting_result = pyqtSignal(object)
     partial_result = pyqtSignal(str)
     error = pyqtSignal(str)
     ready = pyqtSignal()
@@ -1435,7 +1518,7 @@ class SpeechRecognizer(QObject):
         if is_model_downloaded(self._model_id):
             self._load_model()
 
-    def transcribe_final(self, full_audio: np.ndarray, *, retry_empty: bool = False):
+    def transcribe_final(self, full_audio: np.ndarray, *, retry_empty: bool = False, turn_analyzer=None):
         if not self._is_ready or self._recognizer is None:
             self.error.emit("语音模型未就绪，请等待模型加载完成")
             return
@@ -1456,7 +1539,7 @@ class SpeechRecognizer(QObject):
         loader = info.get("loader", "") if info else ""
         window = slice_window_for_loader(loader)
         if window is None:
-            worker = TranscribeWorker(self._recognizer, full_audio, retry_empty=retry_empty)
+            worker = TranscribeWorker(self._recognizer, full_audio, retry_empty=retry_empty, turn_analyzer=turn_analyzer)
         else:
             slice_sec, overlap_sec = window
             worker = TranscribeWorker(
@@ -1465,6 +1548,7 @@ class SpeechRecognizer(QObject):
                 max_slice_sec=slice_sec,
                 overlap_sec=overlap_sec,
                 retry_empty=retry_empty,
+                turn_analyzer=turn_analyzer,
             )
         worker.result_ready.connect(
             lambda text, s=seq: self._on_final_result(text, s)
@@ -1472,11 +1556,26 @@ class SpeechRecognizer(QObject):
         worker.partial_ready.connect(
             lambda text, s=seq: self._on_partial_result(text, s)
         )
+        worker.meeting_ready.connect(lambda turns, s=seq: self._on_meeting_result(turns, s))
         worker.error.connect(lambda e, s=seq: self._on_worker_error(e, s))
         worker.finished.connect(lambda w=worker: self._reap_worker(w))
         self._current_worker = worker
         self._workers.append(worker)
         worker.start()
+
+    def cancel_current(self) -> bool:
+        """Discard the in-flight transcription (the user pressed Esc).
+
+        The worker is asked to stop cooperatively and its sequence is retired,
+        so a result or error that is already on its way is ignored. Returns
+        True when a worker was actually running.
+        """
+        worker = self._current_worker
+        running = worker is not None and worker.isRunning()
+        if running:
+            worker.cancel()
+        self._active_seq = -1
+        return running
 
     def _reap_worker(self, worker: "TranscribeWorker") -> None:
         try:
@@ -1496,6 +1595,10 @@ class SpeechRecognizer(QObject):
             log.debug("忽略过时识别结果 (seq=%d, active=%d)", seq, self._active_seq)
             return
         self.final_result.emit(text)
+
+    def _on_meeting_result(self, turns, seq: int):
+        if seq == self._active_seq:
+            self.meeting_result.emit(turns)
 
     def _on_worker_error(self, error_msg: str, seq: int):
         if seq != self._active_seq:

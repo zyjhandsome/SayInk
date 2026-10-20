@@ -64,8 +64,15 @@ def _mel_filterbank(sample_rate: int) -> np.ndarray:
 _MEL_BANK = _mel_filterbank(TARGET_SAMPLE_RATE)
 
 
-def voice_embedding(audio: np.ndarray, sample_rate: int = TARGET_SAMPLE_RATE) -> np.ndarray:
-    """Unit log-mel summary. Quiet or tiny clips return a zero vector."""
+def voice_embedding(audio: np.ndarray) -> np.ndarray:
+    """Unit log-mel summary of 16 kHz audio. Quiet or tiny clips return a
+    zero vector.
+
+    The pipeline only ever hands over TARGET_SAMPLE_RATE audio; the former
+    ``sample_rate`` parameter rebuilt the mel bank for other rates while the
+    fixed 512-point FFT silently truncated their longer frames.
+    """
+    sample_rate = TARGET_SAMPLE_RATE
     samples = np.asarray(audio, dtype=np.float32).reshape(-1)
     empty = np.zeros(_EMBED_DIM, dtype=np.float32)
     if samples.size < sample_rate // 10:
@@ -81,7 +88,7 @@ def voice_embedding(audio: np.ndarray, sample_rate: int = TARGET_SAMPLE_RATE) ->
         return empty
     window = np.hamming(frame_len).astype(np.float32)
     n_frames = 1 + (framed.size - frame_len) // hop
-    bank = _MEL_BANK if sample_rate == TARGET_SAMPLE_RATE else _mel_filterbank(sample_rate)
+    bank = _MEL_BANK
     mels = np.empty((n_frames, _N_MELS), dtype=np.float32)
     for index in range(n_frames):
         start = index * hop
@@ -280,6 +287,8 @@ def recluster(
 ) -> dict[int, int]:
     """Post-meeting pass over the kept embeddings: agglomerative merge of
     speaker centroids whose cosine similarity exceeds ``threshold``.
+    Every original centroid in a merged group must agree with every member
+    of the other group; one intermediate voice cannot bridge dissimilar ones.
 
     Online assignment is greedy — the same person can be split in two when
     the first few segments were noisy. Returns ``{old_id: new_id}`` with ids
@@ -308,8 +317,10 @@ def recluster(
         norm = float(np.linalg.norm(total))
         centroids[speaker_id] = total / norm if norm >= 1e-6 else total
 
-    # Union-find over pairs above the threshold (closest pairs first).
+    # Complete-linkage merge over the original group centroids. A single
+    # borderline bridge must not merge two mutually dissimilar speakers.
     parent = {sid: sid for sid in centroids}
+    members = {sid: {sid} for sid in centroids}
 
     def find(x: int) -> int:
         while parent[x] != x:
@@ -330,11 +341,16 @@ def recluster(
         if ra != rb:
             if ra in protected and rb in protected:
                 continue
+            if any(float(np.dot(centroids[left], centroids[right])) < threshold
+                   for left in members[ra] for right in members[rb]):
+                continue
             # Manual identities keep their number and cannot swallow each other.
             if ra in protected or (rb not in protected and order.index(ra) < order.index(rb)):
                 parent[rb] = ra
+                members[ra].update(members.pop(rb))
             else:
                 parent[ra] = rb
+                members[rb].update(members.pop(ra))
 
     roots_in_order: list[int] = []
     for sid in order:

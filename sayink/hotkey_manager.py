@@ -11,7 +11,7 @@ from sayink.platform import SYNTHETIC_KEY_TAG
 log = logging.getLogger("SayInk")
 
 # 短按防误触（毫秒）；计时器必须在 Qt 主线程启动，否则 Windows 上可能永不触发
-MIN_HOLD_MS = 180  # 按住说话
+MIN_HOLD_MS = 180  # 单次转写
 MIN_HOLD_CONTINUOUS_MS = 300  # 持续转写：误触代价更高，门槛更长
 # 松开早于该时长视为输入法/系统误触（如 Ctrl+Space 切换输入法），不提示用户
 MIN_SHORT_TAP_MS = 50
@@ -384,29 +384,28 @@ class HotKeyManager(QObject):
         )
 
     def _on_hold_timeout(self):
-        if not self._hold_pending or self._paused:
-            self._hold_pending = False
-            return
-        if not self._hotkey_still_held():
-            self._hold_pending = False
-            return
-
-        if self._continuous_trigger_mode:
-            self._hold_pending = False
-            self._hold_activated = True
-            log.debug("快捷键按住达标，请求开启持续监听")
-            self.continuous_listen_start.emit()
-            return
-
+        # The "still held" check and the state flip happen under one lock:
+        # a release slipping in between would see a pending, not-yet-active
+        # hold (so it only reports a short tap, never a stop) while this
+        # thread goes on to start a recording that nothing will stop.
+        start_continuous = start_recording = False
         with self._lock:
-            if self._is_recording:
+            if not self._hold_pending or self._paused or not self._hotkey_still_held_locked():
                 self._hold_pending = False
                 return
-            self._is_recording = True
-        self._hold_pending = False
-        self._hold_activated = True
-        log.debug("快捷键按住达标，开始录音")
-        self.recording_start.emit()
+            self._hold_pending = False
+            self._hold_activated = True
+            if self._continuous_trigger_mode:
+                start_continuous = True
+            elif not self._is_recording:
+                self._is_recording = True
+                start_recording = True
+        if start_continuous:
+            log.debug("快捷键按住达标，请求开启持续监听")
+            self.continuous_listen_start.emit()
+        elif start_recording:
+            log.debug("快捷键按住达标，开始录音")
+            self.recording_start.emit()
 
     def _normalize_key(self, key):
         # A hotkey written with the generic modifier ("shift+x") accepts either

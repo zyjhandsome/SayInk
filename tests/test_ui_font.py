@@ -58,7 +58,7 @@ class TestResolveUiFontFamily:
         apply_theme(mode="light", system_is_light=True)
         family = refresh_ui_font()
         metrics = QFontMetrics(QFont(family))
-        missing = [ch for ch in "设置听写历史配置" if not metrics.inFont(ch)]
+        missing = [ch for ch in "设置转写历史配置" if not metrics.inFont(ch)]
         assert missing == [], f"{family} missing {missing}"
 
 

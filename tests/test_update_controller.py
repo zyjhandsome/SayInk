@@ -86,6 +86,8 @@ class TestCheck:
         ctl.on_check_failed("boom")
         assert ctl.state is UpdateState.ERROR
         ctl.sink.set_update_status.assert_not_called()
+        # An offline start is not a "check": the next start tries again.
+        assert not ctl._config.get("update.last_check_at")
         with patch("sayink.updater.UpdateCheckWorker"):
             ctl.check(interactive=True)
         ctl.on_check_failed("boom")

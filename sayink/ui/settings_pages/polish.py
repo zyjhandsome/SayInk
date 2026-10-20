@@ -91,8 +91,19 @@ def _build_connection_section(win) -> QWidget:
     return win._llm_connection_section
 
 
+LLM_MODE_HINT = (
+    "润色：去掉口语赘词、补标点、理顺语序。"
+    "纠错：只改同音错别字和「自定义词汇」里的术语写法，其余一字不动，改动过大时回退原文"
+)
+
+
 def _build_polish_section(win) -> QWidget:
-    """「文字润色」: the switch and example always; the prompt only while it is on."""
+    """「文字润色」: the switch and example always; the mode and prompt only while it is on."""
+    from PyQt6.QtWidgets import QComboBox
+
+    from sayink.text_polisher import LLM_MODE_CORRECT, LLM_MODE_POLISH
+    from sayink.ui.settings_components import labeled_row
+
     wrap = QWidget()
     lay = QVBoxLayout(wrap)
     lay.setContentsMargins(0, 0, 0, 0)
@@ -104,7 +115,7 @@ def _build_polish_section(win) -> QWidget:
     polish_card_lay.setSpacing(0)
     win._llm_enable_row = ToggleOptionRow(
         "启用文字润色",
-        "关闭时直接输出原文；开启后，听写文字会发送至上方配置的服务",
+        "关闭时直接输出原文；开启后，转写文字会发送至上方配置的服务",
     )
     win._llm_enable_row.toggled.connect(win._on_llm_enable_toggled)
     polish_card_lay.addWidget(win._llm_enable_row)
@@ -117,7 +128,18 @@ def _build_polish_section(win) -> QWidget:
     win._llm_prompt_container = QWidget()
     p_lay = QVBoxLayout(win._llm_prompt_container)
     p_lay.setContentsMargins(0, 0, 0, 0)
-    p_lay.setSpacing(0)
+    p_lay.setSpacing(10)
+    mode_group = settings_group()
+    mode_lay = QVBoxLayout(mode_group)
+    mode_lay.setContentsMargins(0, 0, 0, 0)
+    mode_lay.setSpacing(0)
+    win._llm_mode_combo = QComboBox()
+    win._llm_mode_combo.setAccessibleName("处理方式")
+    win._llm_mode_combo.addItem("润色", LLM_MODE_POLISH)
+    win._llm_mode_combo.addItem("纠错", LLM_MODE_CORRECT)
+    win._llm_mode_combo.currentIndexChanged.connect(win._on_llm_mode_changed)
+    mode_lay.addWidget(labeled_row("处理方式", win._llm_mode_combo, LLM_MODE_HINT))
+    p_lay.addWidget(settings_section("", mode_group))
     prompt_group = settings_group()
     prompt_lay = QVBoxLayout(prompt_group)
     prompt_lay.setContentsMargins(16, 12, 16, 12)
@@ -135,9 +157,9 @@ def _build_polish_section(win) -> QWidget:
     win._llm_prompt_edit.setAccessibleName("润色提示词")
     win._llm_prompt_edit.setFixedHeight(128)
     win._paint_llm_prompt_edit()
-    win._llm_prompt_edit.setPlaceholderText("留空则使用内置默认提示词")
+    win._llm_prompt_edit.setPlaceholderText("留空则使用所选处理方式的内置提示词")
     prompt_lay.addWidget(win._llm_prompt_edit)
-    p_lay.addWidget(settings_section("润色提示词", prompt_group))
+    p_lay.addWidget(settings_section("提示词", prompt_group))
     lay.addWidget(win._llm_prompt_container)
     return wrap
 
@@ -210,7 +232,7 @@ def build_polish_page(win) -> QWidget:
     page = SettingsPage()
     page.add(page_header(
         "AI 服务",
-        "接入一个大模型接口，用于听写润色和会议纪要。两项功能共用下方的接口配置，可分别开启。",
+        "接入一个大模型接口，用于转写润色和会议纪要。两项功能共用下方的接口配置，可分别开启。",
     ))
     page.add(_build_connection_section(win))
     page.add(footnote(

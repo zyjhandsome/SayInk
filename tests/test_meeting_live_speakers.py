@@ -78,7 +78,7 @@ def test_distinct_manual_names_cannot_be_merged_or_overwritten_on_finalize(live_
 def test_live_correction_locks_only_the_selected_segment_through_finalize(live_meeting, monkeypatch):
     page, controller, history, record = live_meeting
     history.enqueue(SegmentRecord(record.id, 5, record.started_at, raw_text="", speaker_id=1, trigger_mode="meeting"))
-    history.enqueue(SegmentRecord(record.id, 11, record.started_at, raw_text="普通听写", speaker_id=3, trigger_mode="hotkey"))
+    history.enqueue(SegmentRecord(record.id, 11, record.started_at, raw_text="普通转写", speaker_id=3, trigger_mode="hotkey"))
     assert history.flush()
 
     def choose(dialog):

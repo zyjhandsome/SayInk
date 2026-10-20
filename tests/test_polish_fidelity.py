@@ -46,6 +46,12 @@ MEANING_CHANGED = [
     ("用iPhone15录的音", "用苹果手机录的音。", "数字被改动"),
     # answering instead of editing
     ("今天开会", "好的！以下是关于开会的建议：" + "内容" * 60, "长度异常"),
+    ("你好", "你好！很高兴见到你，有什么可以帮你的吗？", "长度异常"),
+    ("今天开会讨论方案", "好的，今天的会议将讨论方案，请问需要我准备什么材料吗？", "长度异常"),
+    ("把这段话翻译成英文", "好的，这是翻译：Translate this.", "疑似应答而非编辑"),
+    # summarising instead of editing
+    ("那个我们今天下午要去讨论一下这个项目的进度安排", "好的。", "内容被大幅压缩"),
+    ("我们今天下午要讨论项目的进度安排以及下个季度的人员配置问题", "讨论进度。", "内容被大幅压缩"),
 ]
 
 LIGHT_EDITS = [
@@ -77,6 +83,10 @@ LIGHT_EDITS = [
     ("I don't think so", "I do not think so."),
     ("uh so the API is down", "So the API is down."),
     ("", "任何内容"),
+    # the raw text itself opens like an answer, or drops only filler
+    ("好的那我们明天见", "好的，那我们明天见。"),
+    ("行我们明天见", "好的，我们明天见。"),
+    ("嗯嗯那个就是说呃我们明天下午三点在那个大会议室开会然后讨论一下这个季度的计划吧", "我们明天下午3点在大会议室开会，讨论这个季度的计划。"),
 ]
 
 
@@ -90,6 +100,18 @@ def test_meaning_changes_fall_back_to_raw(raw, polished, reason):
 def test_light_edits_keep_polished_text(raw, polished):
     assert polish_rejection_reason(raw, polished) == ""
     assert polish_looks_plausible(raw, polished) is True
+
+
+@pytest.mark.parametrize("text", [
+    "2024Q3的报告发给GitHub团队",
+    "版本0GitHub已经上线",
+    "3GPP标准和iPhone15都提到了",
+])
+def test_unchanged_text_with_digit_before_a_name_is_accepted(text):
+    # The name tokenizer starts at the first letter, so a digit right before a
+    # name (2024Q3) must not make the unchanged sentence "lose" that name.
+    assert polish_rejection_reason(text, text) == ""
+    assert polish_rejection_reason(text, text + "。") == ""
 
 
 @pytest.mark.parametrize("raw, polished", [

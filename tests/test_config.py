@@ -293,6 +293,26 @@ def test_scalar_in_place_of_section_falls_back_to_section_defaults(config_home):
     assert not list(config_home.glob("config.corrupt-*.json"))
 
 
+def test_unknown_nested_keys_survive_a_save_by_an_older_build(config_home):
+    """A newer release's ``stt.foo`` (or a hand-added key) must not be erased
+    the first time this build saves; only top-level extras were kept before."""
+    import json
+
+    from sayink.config import Config
+
+    (config_home / "config.json").write_text(
+        json.dumps({"stt": {"model_id": "sensevoice", "future_knob": {"a": 1}}, "top_extra": 7}),
+        encoding="utf-8",
+    )
+    cfg = Config(config_dir=config_home)
+    cfg.set("hotkey", "ctrl+space")
+    cfg.save_immediate()
+    saved = json.loads((config_home / "config.json").read_text(encoding="utf-8"))
+    assert saved["stt"]["future_knob"] == {"a": 1}
+    assert saved["stt"]["model_id"] == "sensevoice"
+    assert saved["top_extra"] == 7
+
+
 def test_save_survives_mkstemp_failure(config, monkeypatch):
     import tempfile
 

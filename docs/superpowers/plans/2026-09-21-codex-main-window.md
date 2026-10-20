@@ -521,7 +521,7 @@ git commit -m "feat(ui): restyle choices and history actions as ink-quiet rows"
 ### Task 7: README and leftover docs
 
 **Files:**
-- Modify: `README.md` (空间岛 → 主窗口 + 听写条; 托盘「打开 SayInk」; 设置走侧栏)
+- Modify: `README.md` (空间岛 → 主窗口 + 转写条; 托盘「打开 SayInk」; 设置走侧栏)
 - Modify: `tests/test_readme_features.py` if it snapshots island copy
 - Modify: `docs/superpowers/specs/2026-09-19-island-ui-redesign-design.md` first lines: `Status: superseded by 2026-09-21-codex-main-window-design.md`
 
@@ -531,13 +531,13 @@ git commit -m "feat(ui): restyle choices and history actions as ink-quiet rows"
 
 - [ ] **Step 1: Write failing README contract**
 
-If `tests/test_readme_features.py` asserts 「空间岛」as the settings shell, change the expected phrases to 主窗口 / 听写条 / 打开 SayInk. Add:
+If `tests/test_readme_features.py` asserts 「空间岛」as the settings shell, change the expected phrases to 主窗口 / 转写条 / 打开 SayInk. Add:
 
 ```python
 def test_readme_describes_main_window_not_island():
     text = Path("README.md").read_text(encoding="utf-8")
     assert "打开 SayInk" in text
-    assert "听写条" in text or "薄" in text
+    assert "转写条" in text or "薄" in text
     assert "双击托盘会唤醒空间岛" not in text
 ```
 

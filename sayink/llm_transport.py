@@ -8,10 +8,9 @@ import threading
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlsplit
-
 from sayink.text_polisher import (
     LLMCancelled, LLMResponseError, LLMTruncatedError, _request_headers, chat_completions_url,
+    thinking_payload_extra,
 )
 
 log = logging.getLogger("SayInk")
@@ -210,9 +209,7 @@ async def completion(client, httpx, *, api_url, api_key, model_name, messages,
         payload["temperature"] = 0.2
     # These official dual-mode models otherwise default to high-effort
     # thinking, which shares the small output budget with the actual edit.
-    if (thinking_mode == "disabled" and urlsplit(api_url).hostname == "api.deepseek.com"
-            and model_name in ("deepseek-flash", "deepseek-v4-pro")):
-        payload["thinking"] = {"type": "disabled"}
+    payload.update(thinking_payload_extra(api_url, model_name, thinking_mode))
     url, headers = chat_completions_url(api_url), _request_headers(api_key)
     started = time.monotonic()
 

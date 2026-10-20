@@ -1,4 +1,4 @@
-"""Tests for README「自动持续转写」的 VAD 分段逻辑。"""
+"""Tests for README「持续转写」的 VAD 分段逻辑。"""
 
 import numpy as np
 import pytest
@@ -354,3 +354,39 @@ class TestTrailingSilence:
         out = seg.flush()
         assert out is not None
         assert out.size == int(RATE * (1.0 + TRAILING_SILENCE_KEEP_SEC))
+
+
+class TestMeetingSegmenterFactory:
+    """One constructor for the recorder and the bench tools."""
+
+    def test_factory_applies_the_meeting_pause_and_cut_lengths(self):
+        from sayink.vad_segmenter import (
+            MEETING_MAX_SPEECH_SEC,
+            MEETING_SILENCE_HOLD_SEC,
+            VAD_ENERGY,
+            make_meeting_segmenter,
+        )
+
+        seg = make_meeting_segmenter(speech_threshold=0.0006)
+        assert seg.speech_threshold == pytest.approx(0.0006)
+        assert seg._silence_hold_samples == int(RATE * MEETING_SILENCE_HOLD_SEC)
+        assert seg._max_samples == int(RATE * MEETING_MAX_SPEECH_SEC)
+        assert seg.gate_name == VAD_ENERGY
+
+    def test_factory_falls_back_to_energy_and_says_why(self, tmp_path):
+        from sayink.vad_segmenter import VAD_ENERGY, VAD_SILERO, make_meeting_segmenter
+
+        seg = make_meeting_segmenter(vad=VAD_SILERO, model_path=tmp_path / "missing.onnx")
+        assert seg.gate_name == VAD_ENERGY and seg.gate.fallback_reason
+
+    def test_factory_uses_the_callers_gate_when_given(self):
+        from sayink.vad_segmenter import EnergyGate, make_meeting_segmenter
+
+        seen = []
+
+        def factory(segmenter):
+            seen.append(segmenter)
+            return EnergyGate(segmenter)
+
+        seg = make_meeting_segmenter(gate_factory=factory)
+        assert seen == [seg]

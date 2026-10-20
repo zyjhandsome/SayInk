@@ -26,8 +26,15 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from sayink.runtime_status import MEETING_STATE_LABELS, RuntimeState, coerce_runtime_status
 from sayink.ui import design_tokens as tok
 from sayink.ui.settings_components import sync_group_tab_stop
+
+_STATE_TONES = {
+    RuntimeState.READY: "GREEN",
+    RuntimeState.LOADING: "AMBER",
+    RuntimeState.UNAVAILABLE: "RED",
+}
 
 NAV_LABELS = ("历史", "会议", "通用", "引擎", "AI 服务", "关于")
 PAGE_KEYS = ("history", "meeting", "general", "engine", "polish", "about")
@@ -163,6 +170,9 @@ class MainWindow(QWidget):
         self._drag_offset = None
         self._live_resizing = False
         self._model_runtime_text = "正在启动…"
+        self._model_runtime_state = RuntimeState.LOADING
+        # A live meeting owns the dot while it runs (see _refresh_usage_summary).
+        self._status_tone_override = ""
         self._setup_window()
         self._setup_ui()
         self.reapply_theme()
@@ -309,7 +319,7 @@ class MainWindow(QWidget):
         self._shortcut_label.setWordWrap(True)
         self._output_label = QLabel()
         self._output_label.setWordWrap(True)
-        self._output_label.setAccessibleName("听写输出去向")
+        self._output_label.setAccessibleName("转写输出去向")
         side.addWidget(self._mode_label)
         side.addWidget(self._output_label)
         side.addWidget(self._shortcut_label)
@@ -415,25 +425,21 @@ class MainWindow(QWidget):
         if callable(show_meeting):
             show_meeting(meeting_id)
 
-    @staticmethod
-    def _status_tone(text: str) -> str:
-        """Map a runtime status string to a semantic token name."""
-        if any(word in text for word in ("失败", "错误", "不可用")):
-            return "RED"
-        if any(word in text for word in ("载入", "加载", "启动", "未就绪", "下载", "暂停", "整理")):
-            return "AMBER"
-        if "就绪" in text or "录制中" in text:
-            return "GREEN"
-        return "TEXT_DIM"
+    def _status_tone(self) -> str:
+        """Semantic token for the status dot, from the typed state the engine
+        page uses for its own pill — never guessed from the label text."""
+        return self._status_tone_override or _STATE_TONES.get(self._model_runtime_state, "TEXT_DIM")
 
-    def _set_runtime_status(self, text: str) -> None:
-        self._model_runtime_text = text
+    def _set_runtime_status(self, status) -> None:
+        status = coerce_runtime_status(status)
+        self._model_runtime_text = status.label
+        self._model_runtime_state = status.state
         self._refresh_usage_summary()
 
     def _paint_status_dot(self) -> None:
         from sayink.ui import design_tokens as live
 
-        color = getattr(live, self._status_tone(self._runtime_label.text()), live.TEXT_DIM)
+        color = getattr(live, self._status_tone(), live.TEXT_DIM)
         self._status_dot.setStyleSheet(
             f"background: {color}; border-radius: {_STATUS_DOT_PX // 2}px;"
         )
@@ -448,19 +454,21 @@ class MainWindow(QWidget):
         if meeting is not None and meeting.is_active:
             state = meeting.state
             label = {
-                MeetingState.LIVE: "会议录制中",
-                MeetingState.PAUSED: "会议已暂停",
-                MeetingState.DRAINING: "正在整理会议",
-            }.get(state, "会议进行中")
+                MeetingState.LIVE: MEETING_STATE_LABELS["live"],
+                MeetingState.PAUSED: MEETING_STATE_LABELS["paused"],
+                MeetingState.DRAINING: MEETING_STATE_LABELS["draining"],
+            }.get(state, MEETING_STATE_LABELS["active"])
             record = meeting.current
             source = input_source_label(record.source) if record is not None else "会议音频"
             self._runtime_label.setText(label)
             self._runtime_label.setToolTip(meeting.paused_detail if state is MeetingState.PAUSED else self._model_runtime_text)
+            self._status_tone_override = "GREEN" if state is MeetingState.LIVE else "AMBER"
             self._mode_label.setText(source)
             self._output_label.setText("仅保存会议记录")
             self._output_label.setProperty("outputWarning", False)
-            self._shortcut_label.setText("在会议页暂停或结束\n听写快捷键暂不可用")
+            self._shortcut_label.setText("在会议页暂停或结束\n转写快捷键暂不可用")
         else:
+            self._status_tone_override = ""
             self._runtime_label.setText(self._model_runtime_text)
             self._runtime_label.setToolTip("")
             self._mode_label.setText(f"{hints.source}\n{hints.mode}")

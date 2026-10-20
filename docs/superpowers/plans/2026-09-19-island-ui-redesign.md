@@ -336,7 +336,7 @@ Expected: FAIL (`_set_history_limit_rows_visible` missing and/or callout always 
 1. Hotkey hint text (set wherever `_hotkey_hint` is filled, including `_load_settings` / trigger-mode refresh):
 
 ```text
-持续模式按住约 0.30 秒开始，松开不结束；Esc 或结束可结束整场。
+持续转写模式按住约 0.30 秒开始，松开不结束；Esc 或结束可结束整场。
 ```
 
 2. In `_sync_source_device_widgets`, `self._mixed_audio_callout.setVisible(self._src_mixed_rb.isChecked())`. Also hide the callout wrapper if it has extra padding.

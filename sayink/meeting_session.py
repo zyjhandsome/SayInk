@@ -36,18 +36,26 @@ from sayink.meeting_store import (
 from sayink.minutes_generator import MinutesGenerator, MinutesRequest, MinutesResult, request_fingerprint
 from sayink.minutes_prompts import (
     GENERAL_TEMPLATE_ID,
+    REFINE_TEMPLATE_ID,
     DEFAULT_CHUNK_CHARS,
     MeetingContext,
     TranscriptLine,
+    find_template,
     format_timestamp,
     get_template,
     speaker_label,
     transcript_lines,
 )
 from sayink.minutes_render import apply_speaker_names, render_markdown, replace_names_in_markdown
-from sayink.recognition_settings import RecognitionSettings, audio_source, aux_model_path
-from sayink.speaker_embedding import STICKY_GAP_MS, SpeakerEmbedder, make_embedder
+from sayink.recognition_settings import (
+    ADVANCED_RECOGNITION_PATH,
+    RecognitionSettings,
+    audio_source,
+    aux_model_path,
+)
+from sayink.speaker_embedding import SpeakerEmbedder, make_embedder
 from sayink.meeting_speakers import MeetingSpeakerSession
+from sayink.speaker_clustering import reassign_turns
 from sayink.speaker_session import SpeakerSession, recluster
 from sayink.speaker_naming import infer_speaker_names
 from sayink.speech_recognizer import (
@@ -108,6 +116,7 @@ class MeetingCapabilities:
     vad_error: str = ""
     speaker_enabled: bool = True
     speaker_load_failed: bool = False
+    speaker_activity_enabled: bool = False
 
     @property
     def notes(self) -> list[str]:
@@ -118,7 +127,7 @@ class MeetingCapabilities:
             out.append("当前模型不支持指定识别语言，将按模型自身能力识别。")
         if self.vad_requested == VAD_SILERO and self.vad == VAD_ENERGY:
             if self.vad_error:
-                out.append("Silero VAD 加载失败，已回退能量分段；可在通用 → 识别 → 高级识别设置查看状态。")
+                out.append(f"Silero VAD 加载失败，已回退能量分段；可在 {ADVANCED_RECOGNITION_PATH} 查看状态。")
             else:
                 out.append("Silero VAD 模型未下载，使用能量断句（引擎页可下载）。")
         if not self.speaker_enabled:
@@ -150,6 +159,7 @@ def resolve_capabilities(config: Config, options: MeetingOptions, *, dictation_m
         speaker_model_available=speaker_available,
         vad_requested=options.vad,
         speaker_enabled=shared.speaker_model_enabled,
+        speaker_activity_enabled=shared.speaker_activity_enabled,
     )
 
 
@@ -182,6 +192,7 @@ class MeetingController(QObject):
     generation_preview = pyqtSignal(str, str)   # meeting_id, unsaved readable preview
     generation_finished = pyqtSignal(str)       # meeting_id
     generation_failed = pyqtSignal(str, str)    # meeting_id, message
+    generation_cancelled = pyqtSignal(str)      # meeting_id (user cancelled; not a failure)
     notice = pyqtSignal(str, str)               # title, detail (for bar / tray)
 
     def __init__(
@@ -283,20 +294,19 @@ class MeetingController(QObject):
         """Create the meeting row and the in-memory speaker session."""
         if self.is_active:
             raise RuntimeError("已有会议在进行中")
+        if self._store.disabled:
+            # Without the DB every segment write is a silent no-op.
+            raise RuntimeError("历史数据库不可用，会议文字稿无法保存")
         self._options = options
         speaker_path = aux_model_path(AUX_MODEL_SPEAKER) if capabilities.speaker_model_available else None
-        self._embedder = make_embedder(speaker_path, enabled=capabilities.speaker_model_available)
+        self._embedder = make_embedder(speaker_path, enabled=capabilities.speaker_model_available,
+                                      activity_enabled=capabilities.speaker_activity_enabled)
         self._capabilities = replace(
             capabilities,
             speaker_model_available=self._embedder.name == "campplus",
             speaker_load_failed=capabilities.speaker_model_available and self._embedder.name != "campplus",
         )
-        self._speakers = MeetingSpeakerSession(
-            threshold=self._embedder.threshold,
-            keep_history=True,
-            sticky_threshold=self._embedder.sticky_threshold,
-            sticky_gap_ms=STICKY_GAP_MS,
-        )
+        self._speakers = MeetingSpeakerSession.for_embedder(self._embedder)
         record = self._store.create_meeting(
             title=options.title,
             participants=options.participants,
@@ -365,6 +375,10 @@ class MeetingController(QObject):
         self._drain_timer.stop()
         ended_at = int(time.time() * 1000)
         self._store.end_meeting(meeting_id, ended_at=ended_at)
+        # The last segments may still sit in the writer queue; the re-cluster
+        # reads the table, so they must be committed first or they keep
+        # their greedy live label.
+        self._store.flush()
         self._apply_recluster(meeting_id)
         self._store.flush()
         self.auto_name_speakers(meeting_id)
@@ -384,13 +398,32 @@ class MeetingController(QObject):
         self._set_state(MeetingState.IDLE)
 
     def _apply_recluster(self, meeting_id: str) -> None:
+        """End-of-meeting pass: cluster every turn and re-assign each segment.
+
+        Named or manually corrected speakers keep their numbers and locked
+        segments never move. Falls back to the centroid merge when the
+        session cannot provide per-turn evidence.
+        """
         speakers = self._speakers
         if speakers is None or speakers.speaker_count < 2:
             return
         embedder = self._embedder
-        threshold = embedder.recluster_threshold if embedder is not None else speakers.threshold
         protected = {s.speaker_id for s in self._store.get_speakers(meeting_id) if s.name_locked or s.display_name}
-        protected.update(s.speaker_id for s in self._store.get_segments(meeting_id) if s.speaker_locked)
+        segments = self._store.get_segments(meeting_id)
+        locked = {s.seq for s in segments if s.speaker_locked}
+        protected.update(s.speaker_id for s in segments if s.speaker_locked)
+        turns = [t for t in speakers.turns if t.key >= 0] if isinstance(speakers, MeetingSpeakerSession) else []
+        if turns:
+            threshold = embedder.cluster_threshold if embedder is not None else speakers.threshold
+            assignments = reassign_turns(turns, threshold=threshold, protected_ids=protected, locked_keys=locked)
+            current = {s.seq: s.speaker_id for s in segments}
+            changed = {seq: sid for seq, sid in assignments.items() if seq >= 0 and current.get(seq) not in (None, sid)}
+            if changed:
+                log.info("会议 %s 说话人重新归属 %d 段", meeting_id[:8], len(changed))
+                self._store.set_segment_speakers(meeting_id, changed)
+                self._store.flush()
+            return
+        threshold = embedder.recluster_threshold if embedder is not None else speakers.threshold
         mapping = recluster(speakers.history, threshold=threshold, protected_ids=protected)
         if mapping and any(old != new for old, new in mapping.items()):
             log.info("会议 %s 说话人重聚类: %s", meeting_id[:8], mapping)
@@ -470,21 +503,23 @@ class MeetingController(QObject):
         notes = self._store.get_notes(meeting_id)
         if notes is not None and notes.markdown:
             new_label = name or speaker_label(speaker_id)
-            if notes.user_edited or not notes.json_payload:
+            markdown = None
+            payload_json = notes.json_payload
+            if not notes.user_edited and notes.json_payload:
+                payload = notes.payload()
+                payload.setdefault("_speaker_names", {str(sid): row.label for sid, row in existing.items()})
+                payload_json = json.dumps(payload, ensure_ascii=False)
+                markdown = self._render_notes(meeting_id, replace(notes, json_payload=payload_json))
+            if markdown is not None:
+                self._save_rendered_notes(meeting_id, notes, markdown, json_payload=payload_json)
+            else:
+                # Hand-edited notes, Markdown-only notes, or a document whose
+                # template no longer exists: patch the names in the text.
                 new_md, replaced = replace_names_in_markdown(notes.markdown, old_label, new_label)
                 if replaced and notes.user_edited:
                     self._store.save_user_markdown(meeting_id, new_md)
                 elif replaced:
-                    self._store.save_notes(
-                        meeting_id, template_id=notes.template_id, model=notes.model,
-                        json_payload="", markdown=new_md, duration_ms=notes.duration_ms,
-                        chunked=notes.chunked, generated_at=notes.generated_at, keep_previous=True,
-                    )
-            else:
-                payload = notes.payload()
-                payload.setdefault("_speaker_names", {str(sid): row.label for sid, row in existing.items()})
-                notes = replace(notes, json_payload=json.dumps(payload, ensure_ascii=False))
-                self._rerender_notes(meeting_id, notes)
+                    self._save_rendered_notes(meeting_id, notes, new_md, json_payload=notes.json_payload)
             self._store.flush()
         self.auto_name_speakers(meeting_id)
         self.meeting_changed.emit(meeting_id)
@@ -518,14 +553,14 @@ class MeetingController(QObject):
         notes = self._store.get_notes(meeting_id)
         markdown = None
         if notes is not None and notes.markdown:
-            if notes.user_edited or not notes.json_payload:
+            if not notes.user_edited and notes.json_payload:
+                markdown = self._render_notes(meeting_id, notes, names=names)
+            if markdown is None:
                 markdown = notes.markdown
                 for sid in previous.keys() | inferred.keys():
                     old = previous.get(sid) or speaker_label(sid)
                     new = names.get(sid) or speaker_label(sid)
                     markdown, _ = replace_names_in_markdown(markdown, old, new)
-            else:
-                markdown = self._render_notes(meeting_id, notes, names=names)
         self._store.save_inferred_names(meeting_id, inferred, markdown=markdown)
         if not self._store.flush():
             return False
@@ -614,27 +649,39 @@ class MeetingController(QObject):
             lines.append(f"参会人：{record.participants.strip()}")
         return tuple(lines)
 
-    def _rerender_notes(self, meeting_id: str, notes: MeetingNotes) -> None:
-        markdown = self._render_notes(meeting_id, notes)
-        if markdown is None:
-            return
+    def _save_rendered_notes(self, meeting_id: str, notes: MeetingNotes, markdown: str, *, json_payload: str) -> None:
         self._store.save_notes(
             meeting_id, template_id=notes.template_id, model=notes.model,
-            json_payload=notes.json_payload, markdown=markdown,
+            json_payload=json_payload, markdown=markdown,
             duration_ms=notes.duration_ms, chunked=notes.chunked, generated_at=notes.generated_at,
             keep_previous=True,
         )
+
+    def _notes_template(self, notes: MeetingNotes, payload: dict):
+        """The template the saved notes were rendered with, or ``None`` when
+        it is gone (a deleted custom template): re-rendering through 「通用会议」
+        would replace 原文精整 prose with empty sections, or change the
+        section set of a custom minutes template."""
+        template = find_template(notes.template_id or GENERAL_TEMPLATE_ID, self._custom_templates())
+        refine_payload = payload.get("kind") == "refine"
+        if template is not None and template.is_refinement == refine_payload:
+            return template
+        # Refinement prose renders the same through any refinement template.
+        return get_template(REFINE_TEMPLATE_ID) if refine_payload else None
 
     def _render_notes(self, meeting_id: str, notes: MeetingNotes, *, names: dict[int, str] | None = None) -> str | None:
         record = self._store.get_meeting(meeting_id)
         if record is None:
             return None
         payload = notes.payload()
+        template = self._notes_template(notes, payload)
+        if template is None:
+            return None
         lines = transcript_lines(self._store.get_segments(meeting_id), record.started_at)
         names = self.speaker_names(meeting_id) if names is None else names
         return render_markdown(
             payload,
-            template=get_template(notes.template_id or GENERAL_TEMPLATE_ID, self._custom_templates()),
+            template=template,
             title_fallback=record.display_title,
             duration_ms=record.duration_ms,
             transcript_text="\n".join(line.render(names) for line in lines),
@@ -657,10 +704,16 @@ class MeetingController(QObject):
         self._store.restore_previous_notes(meeting_id)
         self._store.flush()
         notes = self._store.get_notes(meeting_id)
-        if notes is not None:
+        if notes is not None and notes.markdown:
+            # Speakers may have been named since that version was written.
+            # Patch the labels; whether it counts as hand-edited is the
+            # restored version's own flag, not a side effect of restoring.
             markdown = apply_speaker_names(notes.markdown, self.speaker_names(meeting_id))
             if markdown != notes.markdown:
-                self._store.save_user_markdown(meeting_id, markdown)
+                if notes.user_edited:
+                    self._store.save_user_markdown(meeting_id, markdown)
+                else:
+                    self._save_rendered_notes(meeting_id, notes, markdown, json_payload=notes.json_payload)
                 self._store.flush()
         self.meeting_changed.emit(meeting_id)
 
@@ -779,7 +832,12 @@ class MeetingController(QObject):
             duration_ms=record.duration_ms,
             title_fallback=record.display_title,
             output_language=str(self._config.get("meeting.output_language", "auto") or "auto"),
-            chunk_chars=min(DEFAULT_CHUNK_CHARS, max(64, int(self._config.get("meeting.single_request_char_limit", 20000) or 20000))),
+            # The config may lower the per-request cap, never raise it above
+            # the generator's ceiling (see docs/meeting-generation-reliability.md).
+            chunk_chars=min(
+                DEFAULT_CHUNK_CHARS,
+                max(64, int(self._config.get("meeting.single_request_char_limit", DEFAULT_CHUNK_CHARS) or DEFAULT_CHUNK_CHARS)),
+            ),
             context_window_tokens=int(self._config.get("meeting.context_window_tokens", 32768)),
             max_output_tokens=int(self._config.get("meeting.max_output_tokens", 4096)),
             meta_lines=self._meeting_meta_lines(record),
@@ -799,7 +857,7 @@ class MeetingController(QObject):
             self._generating_for = ""
             self.generation_preview_text = ""
             self._generator.cancel()
-            self.generation_failed.emit(meeting_id, "已取消")
+            self.generation_cancelled.emit(meeting_id)
 
     @property
     def is_generating(self) -> bool:

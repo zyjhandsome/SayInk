@@ -24,18 +24,17 @@ from sayink.audio_utils import (
     LaneBalancer,
     StreamResampler,
     mix_to_mono,
-    resample_mono,
     rms_volume,
     to_mono,
 )
 from sayink.pawp_capture import decode_pawp_device_index, is_encoded_pawp_device_index
+from sayink.lane_echo import DuplicateLaneSuppressor
 from sayink.runtime_status import SegmentationStatus
 from sayink.vad_segmenter import (
-    MEETING_MAX_SPEECH_SEC,
-    MEETING_SILENCE_HOLD_SEC,
     VAD_ENERGY,
     VAD_SILERO,
     SpeechSegmenter,
+    make_meeting_segmenter,
     make_speech_gate,
 )
 
@@ -110,10 +109,13 @@ class AudioRecorder(QObject):
         self._segmentation_status = SegmentationStatus(VAD_ENERGY, VAD_ENERGY)
         # Per-lane loudness balancing for mixed capture (every profile).
         self._balancer: LaneBalancer | None = LaneBalancer()
+        self._duplicate_suppressor = DuplicateLaneSuppressor()
         # Wall-clock ms at which the block that opened the current utterance
         # arrived; handed out with the segment (history.captured_at).
         self._segment_started_at = 0
         self._block_started_at = 0
+        self._stream_anchor_ms = 0
+        self._segment_captured_at = 0
 
     def configure(
         self,
@@ -141,9 +143,17 @@ class AudioRecorder(QObject):
         # Mixed capture balances the two lanes in every profile: dictation
         # listening to a call has the same quiet-remote-party problem.
         self._balancer = LaneBalancer()
+        self._duplicate_suppressor.reset()
         self._rebuild_segmenter()
 
     def _rebuild_segmenter(self) -> None:
+        if self._is_recording and not self._is_cancelled:
+            # A settings change while listening (source / device / VAD): the
+            # utterance buffered in the old segmenter must come out before the
+            # new one takes over, or those words vanish without a trace.
+            emitted = self._flush_continuous_segments()
+            if emitted:
+                log.info("录音中重建断句器，先送出 %d 段已缓冲语音", emitted)
         if self._vad_kind == "silero" and self._vad_model_path:
             self._segmentation_status = SegmentationStatus(
                 self._vad_kind, "", True, meeting=self._meeting_profile,
@@ -151,16 +161,15 @@ class AudioRecorder(QObject):
             self.segmentation_changed.emit(self._segmentation_status)
         threshold = 0.0006 if self._input_source == INPUT_SOURCE_SYSTEM else 0.002
         if self._meeting_profile:
-            segmenter = SpeechSegmenter(
-                speech_threshold=threshold,
-                silence_hold_sec=MEETING_SILENCE_HOLD_SEC,
-                max_speech_sec=MEETING_MAX_SPEECH_SEC,
+            segmenter = make_meeting_segmenter(
+                speech_threshold=threshold, gate_factory=self._speech_gate,
             )
         else:
             segmenter = SpeechSegmenter(speech_threshold=threshold)
-        gate = self._speech_gate(segmenter)
-        segmenter.set_gate(gate)
+            segmenter.set_gate(self._speech_gate(segmenter))
+        gate = segmenter.gate
         self._segmenter = segmenter
+        self._stream_anchor_ms = 0
         self._segmentation_status = SegmentationStatus(
             self._vad_kind, gate.name, bool(self._vad_model_path),
             gate.fallback_reason, self._meeting_profile,
@@ -202,9 +211,10 @@ class AudioRecorder(QObject):
                 log.debug("音频流状态 [%s]: %s", lane.endpoint.role, status)
             if not self._is_recording or self._is_cancelled:
                 return
+            # The level meter is fed once per tick from the balanced mix
+            # (_on_continuous_tick); emitting the raw per-lane block here as
+            # well made the meter flicker between two scales.
             block = to_mono(indata.copy())
-            vol = rms_volume(block)
-            self.volume_changed.emit(vol)
             with self._lock:
                 lane.chunks.append(block)
                 lane.last_chunk_at = time.monotonic()
@@ -227,8 +237,6 @@ class AudioRecorder(QObject):
 
     def _pawp_read_loop(self, lane: _CaptureLane, stream, channels: int, rate: int):
         """Blocking read loop — stream_callback is unreliable on some Windows drivers."""
-        import time
-
         frame_count = max(1, int(rate * self.CHUNK_DURATION))
         while (
             self._is_recording
@@ -251,11 +259,12 @@ class AudioRecorder(QObject):
             arr = np.frombuffer(data, dtype=np.float32)
             if channels > 1:
                 arr = arr.reshape(-1, channels)
+            # No backend-specific gain here: PyAudioWPatch and the sounddevice
+            # WASAPI path both read the same float32 render mix, and both feed
+            # the same 0.0006 gate, balancer and adaptive floor. A former 2.5×
+            # boost only clipped loud playback and made identical audio
+            # segment differently depending on which backend opened the device.
             block_mono = to_mono(arr.copy())
-            if self._input_source == INPUT_SOURCE_SYSTEM:
-                block_mono = np.clip(block_mono * 2.5, -1.0, 1.0)
-            vol = rms_volume(block_mono)
-            self.volume_changed.emit(vol)
             with self._lock:
                 lane.chunks.append(block_mono)
                 lane.last_chunk_at = time.monotonic()
@@ -316,12 +325,14 @@ class AudioRecorder(QObject):
             channels = min(in_ch, 2)
         channels = max(1, channels)
 
-        sample_rates = (
+        # Deduplicated: the device default is usually 48000 already, and a
+        # repeated rate meant a second identical open attempt in the logs.
+        sample_rates = tuple(dict.fromkeys((
             TARGET_SAMPLE_RATE,
             int(info.get("default_samplerate") or 48000),
             48000,
             44100,
-        )
+        )))
         loopback_attempts = (True, False) if ep.use_wasapi_loopback else (False,)
         last_err: Optional[Exception] = None
 
@@ -334,6 +345,7 @@ class AudioRecorder(QObject):
                     log.debug("此 sounddevice 不支持 WASAPI loopback 参数，改用普通输入流")
                     continue
             for rate in sample_rates:
+                stream = None
                 try:
                     kwargs = dict(
                         samplerate=rate,
@@ -365,12 +377,14 @@ class AudioRecorder(QObject):
                         try_loopback,
                         e,
                     )
-                    if lane.stream is not None:
+                    # A stream that opened but failed to start() is a live
+                    # PortAudio handle; lane.stream is still None here, so
+                    # close the local one (it would otherwise leak until exit).
+                    if stream is not None:
                         try:
-                            lane.stream.close()
+                            stream.close()
                         except Exception:
                             log.debug("关闭半开的音频流失败", exc_info=True)
-                        lane.stream = None
 
         raise RuntimeError(f"无法打开音频设备：{ep.device.name}") from last_err
 
@@ -451,25 +465,42 @@ class AudioRecorder(QObject):
             self._block_system_energy = 0.0
             return None
 
+        lane_tracks = []
+        populated_roles = set()
+        for lane, _raw, _last in drained:
+            track = lane.pending[:take]
+            lane.pending = lane.pending[take:]
+            if track.size:
+                populated_roles.add(lane.endpoint.role)
+            if track.size < take:
+                track = np.pad(track, (0, take - track.size))
+            lane_tracks.append((lane.endpoint.role, track))
+        roles = [role for role, _track in lane_tracks]
+        if sorted(roles) == ["microphone", "system"]:
+            mic_index, system_index = roles.index("microphone"), roles.index("system")
+            cleaned = self._duplicate_suppressor.process(lane_tracks[mic_index][1], lane_tracks[system_index][1])
+            lane_tracks[mic_index] = ("microphone", cleaned)
+        else:
+            self._duplicate_suppressor.reset()
         tracks: list[np.ndarray] = []
         gains: list[float] = []
         mic_energy = 0.0
         system_energy = 0.0
-        for lane, _raw, _last in drained:
-            track = lane.pending[:take]
-            lane.pending = lane.pending[take:]
-            if track.size == 0:
+        for role, track in lane_tracks:
+            if role not in populated_roles:
                 continue
             energy = float(np.dot(track, track))
-            if lane.endpoint.role == "system":
+            if role == "system":
                 system_energy += energy
             else:
                 mic_energy += energy
             tracks.append(track)
             if self._balancer is not None:
-                gains.append(self._balancer.observe(lane.endpoint.role, track))
+                gains.append(self._balancer.observe(role, track))
         self._block_mic_energy = mic_energy
         self._block_system_energy = system_energy
+        if not tracks:
+            return np.zeros(take, dtype=np.float32)
         if len(tracks) == 1:
             track = tracks[0]
             if track.size < take:
@@ -549,6 +580,8 @@ class AudioRecorder(QObject):
             self._reset_continuous_speech_watch()
         self._is_cancelled = False
         self._lanes = []
+        self._duplicate_suppressor.reset()
+        self._stream_anchor_ms = 0
         self._last_start_warning = ""
 
         try:
@@ -637,6 +670,8 @@ class AudioRecorder(QObject):
         segmenter = self._segmenter
         was_in_speech = bool(getattr(segmenter, "in_speech", False))
         now_ms = int(time.time() * 1000)
+        if not self._stream_anchor_ms:
+            self._stream_anchor_ms = now_ms - int(block.size * 1000 / TARGET_SAMPLE_RATE)
         segment = segmenter.feed(
             block,
             mic_energy=self._block_mic_energy,
@@ -657,6 +692,9 @@ class AudioRecorder(QObject):
     def _emit_segment(self, segment: np.ndarray) -> None:
         self._segment_route = self._segmenter.last_route
         self._segment_captured_at = self._block_started_at or int(time.time() * 1000)
+        bounds = getattr(self._segmenter, "last_bounds", None)
+        if self._stream_anchor_ms and bounds is not None and bounds[1] - bounds[0] == segment.size:
+            self._segment_captured_at = self._stream_anchor_ms + int(bounds[0] * 1000 / TARGET_SAMPLE_RATE)
         self.segment_ready.emit(segment)
 
     def consume_segment_route(self) -> str:
@@ -667,7 +705,7 @@ class AudioRecorder(QObject):
 
     def consume_segment_captured_at(self) -> int:
         """Wall-clock ms when the segment just emitted started (0 if unknown)."""
-        stamp = getattr(self, "_segment_captured_at", 0)
+        stamp = self._segment_captured_at
         self._segment_captured_at = 0
         return int(stamp or 0)
 
@@ -722,7 +760,7 @@ class AudioRecorder(QObject):
         if "网易" in msg or "netease" in lower or "虚拟" in msg:
             return (
                 "无法打开该虚拟扬声器采集电脑播放声。"
-                "请在「手动选择音频设备」中将「电脑播放」改为系统默认 Realtek 扬声器，或启用「立体声混音」。"
+                "请在「手动选择音频设备」中将「电脑声音」改为系统默认 Realtek 扬声器，或启用「立体声混音」。"
             )
         return f"音频设备启动失败: {msg}"
 
@@ -749,63 +787,33 @@ class AudioRecorder(QObject):
             lane.stream = None
 
     def stop(self):
+        """End a hold-to-talk recording.
+
+        Hold-to-talk runs through the same segmenter as continuous listening
+        (``start()`` sets ``_segment_live``), so stopping only flushes the
+        utterance tail as one more ``segment_ready``. ``recording_finished``
+        therefore never carries audio any more: an empty array means the gate
+        heard nothing during the whole hold.
+        """
         if self._continuous_mode:
             self.stop_continuous()
             return
-        segment_live = self._segment_live
         self._segment_live = False
         self._continuous_timer.stop()
         if not self._is_recording:
             return
-        if segment_live:
-            cancelled = self._is_cancelled
-            emitted = self._close_lanes_then_flush(flush=not cancelled)
-            self._is_cancelled = False
-            self._is_recording = False
-            self._lanes = []
-            self._terminate_pawp()
-            self._segmenter.reset()
-            if not cancelled and emitted == 0:
-                self.recording_finished.emit(np.array([], dtype=np.float32))
-            return
-
-        self._is_recording = False
-        lanes = self._lanes
-        self._lanes = []
-
-        for lane in lanes:
-            self._close_lane(lane)
-
+        cancelled = self._is_cancelled
+        emitted = self._close_lanes_then_flush(flush=not cancelled)
         with self._lock:
-            is_cancelled = self._is_cancelled
             self._is_cancelled = False
-            lane_chunks = [(lane.endpoint.role, list(lane.chunks), lane.sample_rate) for lane in lanes]
-            for lane in lanes:
+            for lane in self._lanes:
                 lane.chunks = []
-
-        if is_cancelled:
-            self._terminate_pawp()
-            return
-
+        self._is_recording = False
+        self._lanes = []
         self._terminate_pawp()
-
-        tracks = []
-        for _role, chunks, sample_rate in lane_chunks:
-            if not chunks:
-                continue
-            raw = np.concatenate(chunks)
-            tracks.append(resample_mono(raw, sample_rate, TARGET_SAMPLE_RATE))
-
-        if not tracks:
+        self._segmenter.reset()
+        if not cancelled and emitted == 0:
             self.recording_finished.emit(np.array([], dtype=np.float32))
-            return
-
-        if len(tracks) == 1:
-            full_audio = tracks[0]
-        else:
-            full_audio = mix_to_mono(tracks, TARGET_SAMPLE_RATE)
-
-        self.recording_finished.emit(full_audio)
 
     def cancel(self):
         self._is_cancelled = True

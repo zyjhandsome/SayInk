@@ -4,7 +4,7 @@
 
 - 权威状态源：`openspec/changes/remove-media-file-transcription/`
 - 风险/闸门：Standard / `medium`；规格已批准；实现须用户放行后由 `delivery-execute-verify` 执行
-- 禁止范围：改听写热键语义；删历史 DB 行；改无关 settings 视觉 polish；在本阶段 sync/archive 主规格
+- 禁止范围：改转写热键语义；删历史 DB 行；改无关 settings 视觉 polish；在本阶段 sync/archive 主规格
 - 必须执行的最终验证：见文末「最终验证」表
 
 ## 1. 去掉轻翻译并回落配置
@@ -14,7 +14,7 @@
   - 前置依赖：无
   - 目标文件/符号：`sayink/config.py`（`get` 或加载路径规范化 `llm.mode`）；可选默认字典去掉或保留但忽略 `target_language`
   - 允许修改：`sayink/config.py`；`tests/test_config.py`（或新建等价用例）
-  - 禁止修改：`history_store.py`；听写录音模块
+  - 禁止修改：`history_store.py`；转写录音模块
   - 实施步骤：在读取 `llm.mode` 时若值为 `translate`（大小写不敏感）则返回 `polish`；单测写入 translate 后断言读出 polish
   - 失败测试或已批准替代验证：先写/改测试断言 `get("llm.mode")` 对 translate 回落，再改实现
   - 验证命令/动作：`python -m pytest tests/test_config.py -q -k "mode or translate or llm" --tb=short`（若无匹配则跑含新用例的文件全量）
@@ -69,18 +69,18 @@
 
 ## 3. 拆除 App 文件任务与解码模块
 
-- [x] 3.1 从 App 移除文件转写编排并恢复听写路径简洁互斥
-  - 对应需求/场景：无法启动新的文件转写任务；撤回后不破坏实时听写主路径
+- [x] 3.1 从 App 移除文件转写编排并恢复转写路径简洁互斥
+  - 对应需求/场景：无法启动新的文件转写任务；撤回后不破坏实时转写主路径
   - 前置依赖：2.1（避免悬空 connect）；1.2（去掉 translate 分支）
   - 目标文件/符号：`sayink/app.py`（`_FileDecodeWorker`、`start_file_transcription`、`cancel_file_transcription`、`_file_job_*`、`HISTORY_SOURCE_FILE` 写入、`TRIGGER_MODE_FILE_IMPORT`、文件结果跳过粘贴分支、ERROR_HINTS 中 ffmpeg/解码/翻译失败、对 `import_file_requested` 的 connect、后处理中 translate 分支）
-  - 允许修改：`app.py`；删除/改写 `tests/test_app_file_transcription.py` 为「缺席/听写不受文件逻辑影响」类测试
-  - 禁止修改：热键听写成功路径的可观察输出语义；`history_window` 展示映射
-  - 实施步骤：删除文件任务符号与分支；去掉 media_decoder import；保留纯听写 `_begin_transcription`；将原 file 测试改为断言无 `start_file_transcription` 或删除该文件并加最小缺席测试
-  - 失败测试或已批准替代验证：先让旧 `test_app_file_transcription.py` 失败/删除，再以缺席断言+`tests/test_app.py` 回归证明听写仍在
+  - 允许修改：`app.py`；删除/改写 `tests/test_app_file_transcription.py` 为「缺席/转写不受文件逻辑影响」类测试
+  - 禁止修改：热键转写成功路径的可观察输出语义；`history_window` 展示映射
+  - 实施步骤：删除文件任务符号与分支；去掉 media_decoder import；保留纯转写 `_begin_transcription`；将原 file 测试改为断言无 `start_file_transcription` 或删除该文件并加最小缺席测试
+  - 失败测试或已批准替代验证：先让旧 `test_app_file_transcription.py` 失败/删除，再以缺席断言+`tests/test_app.py` 回归证明转写仍在
   - 验证命令/动作：`python -m pytest tests/test_app.py tests/test_app_file_transcription.py -q --tb=short`（若后者删除则只跑 `test_app.py` + 新缺席测试文件）
   - 预期结果：通过；`app.py` 无文件转写 API
   - 迁移/回滚：git revert
-  - 完成定义：无文件任务；听写回归绿
+  - 完成定义：无文件任务；转写回归绿
   - 负责人/冲突说明：**主责 `app.py`**；勿与他人并行改同一文件
 
 - [x] 3.2 删除 `media_decoder` 模块及其测试
@@ -130,7 +130,7 @@
   - 负责人/冲突说明：独享 history 测试；勿改 store schema
 
 - [x] 5.2 最终回归套件
-  - 对应需求/场景：撤回后不破坏实时听写；翻译/文件缺席
+  - 对应需求/场景：撤回后不破坏实时转写；翻译/文件缺席
   - 前置依赖：1–5.1
   - 目标文件/符号：无新功能；跑既有测试集
   - 允许修改：仅修复本变更引起的测试断裂
@@ -155,7 +155,7 @@
 
 | 命令/动作 | 覆盖范围 | 预期结果 |
 |---|---|---|
-| `python -m pytest tests/test_config.py tests/test_text_polisher.py tests/test_app.py tests/test_history_window.py tests/test_build_ffmpeg.py -q --tb=short` | 回落、润色、听写、历史遗产、打包 | 全通过 |
+| `python -m pytest tests/test_config.py tests/test_text_polisher.py tests/test_app.py tests/test_history_window.py tests/test_build_ffmpeg.py -q --tb=short` | 回落、润色、转写、历史遗产、打包 | 全通过 |
 | `python -m pytest tests/ -q --tb=line`（若过长可改为上述+`test_ui_styles`/`test_settings_general`） | 宽回归 | 全通过；无残留 media_decoder 收集错误 |
 | `rg -n "import_file_requested|start_file_transcription|LLM_MODE_TRANSLATE|media_decoder|_copy_ffmpeg_into_dist" sayink build.py`（或等价） | 产品代码残留 | 无匹配（测试/openspec/archive 除外） |
 | 手动（可选）：开托盘菜单 | 无导入项 | 目视确认 |

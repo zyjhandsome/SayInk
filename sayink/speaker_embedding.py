@@ -43,6 +43,13 @@ STICKY_GAP_MS = 3000
 # merge at a lower bar than the online one.
 MODEL_RECLUSTER_THRESHOLD = 0.50
 MEL_RECLUSTER_THRESHOLD = 0.75
+# End-of-session re-assignment clusters every turn (average linkage over the
+# turn embeddings, see speaker_clustering.py) and then folds tiny clusters
+# into substantial ones. Clustering a little finer than the match bar and
+# folding scored best on real far-field meetings (6 and 5 people: 7 and 5
+# numbers); the mel summary keeps its centroid bar.
+MODEL_CLUSTER_THRESHOLD = 0.60
+MEL_CLUSTER_THRESHOLD = MEL_RECLUSTER_THRESHOLD
 # Shorter clips give either backend too little to go on; a zero vector makes
 # SpeakerSession continue the previous speaker instead of guessing.
 MODEL_MIN_SEC = 0.5
@@ -54,9 +61,13 @@ class SpeakerEmbedder:
     name = "embedder"
     model_available = False
     load_error = ""
+    supports_turn_detection = False
+    activity_guard = None
+    activity_guard_error = ""
     threshold = MEL_MATCH_THRESHOLD
     sticky_threshold = MEL_STICKY_THRESHOLD
     recluster_threshold = MEL_RECLUSTER_THRESHOLD
+    cluster_threshold = MEL_CLUSTER_THRESHOLD
 
     def __call__(self, audio: np.ndarray) -> np.ndarray:
         raise NotImplementedError
@@ -69,6 +80,7 @@ class MelEmbedder(SpeakerEmbedder):
     threshold = MEL_MATCH_THRESHOLD
     sticky_threshold = MEL_STICKY_THRESHOLD
     recluster_threshold = MEL_RECLUSTER_THRESHOLD
+    cluster_threshold = MEL_CLUSTER_THRESHOLD
 
     def __call__(self, audio: np.ndarray) -> np.ndarray:
         samples = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -82,9 +94,11 @@ class ModelEmbedder(SpeakerEmbedder):
 
     name = "campplus"
     model_available = True
+    supports_turn_detection = True
     threshold = MODEL_MATCH_THRESHOLD
     sticky_threshold = MODEL_STICKY_THRESHOLD
     recluster_threshold = MODEL_RECLUSTER_THRESHOLD
+    cluster_threshold = MODEL_CLUSTER_THRESHOLD
 
     def __init__(self, model_path: str | Path, *, num_threads: int = 1):
         import sherpa_onnx
@@ -125,13 +139,32 @@ class ModelEmbedder(SpeakerEmbedder):
         return vector / norm
 
 
-def make_embedder(model_path: str | Path | None, *, enabled: bool = True) -> SpeakerEmbedder:
-    """CAM++ when enabled and the model file is there, else the mel summary."""
+def make_embedder(model_path: str | Path | None, *, enabled: bool = True,
+                  activity_enabled: bool = False, activity_model_path: str | Path | None = None) -> SpeakerEmbedder:
+    """CAM++ when enabled and available, otherwise the mel summary.
+
+    Activity checking additionally requires its explicit opt-in and a local
+    model file. Its load failure does not disable a working CAM++ backend.
+    """
     fallback = MelEmbedder()
     fallback.model_available = bool(model_path and Path(model_path).is_file())
     if enabled and fallback.model_available:
         try:
             embedder = ModelEmbedder(model_path)
+            if activity_enabled:
+                # Resolve lazily: the registry imports the turn-analysis module.
+                # Availability is optional and never starts a network download.
+                try:
+                    from sayink.recognition_settings import aux_model_path
+                    from sayink.speech_recognizer import AUX_MODEL_SPEAKER_ACTIVITY
+                    from sayink.speaker_activity import SpeakerActivityGuard
+
+                    activity_path = activity_model_path or aux_model_path(AUX_MODEL_SPEAKER_ACTIVITY)
+                    if activity_path is not None:
+                        embedder.activity_guard = SpeakerActivityGuard(activity_path)
+                except Exception as exc:
+                    embedder.activity_guard_error = str(exc)
+                    log.warning("多人发言检测模型加载失败，本场未启用该增强: %s", exc)
             log.info("会议说话人模型: CAM++ (%s)", model_path)
             return embedder
         except Exception as exc:

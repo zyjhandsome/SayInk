@@ -120,6 +120,20 @@ class TestDrainMixedMono:
             rec._drain_mixed_mono()
         assert lane.chunks == []
 
+    def test_duplicate_playback_is_cleaned_before_route_energy_and_balancing(self):
+        rec = AudioRecorder()
+        mic, system = _make_lane(role="microphone"), _make_lane(role="system")
+        rec._lanes = [mic, system]
+        playback = np.random.default_rng(42).normal(0, 0.05, 32000).astype(np.float32)
+        echo = np.pad(playback, (800, 0))[:len(playback)] * 0.4
+        outputs = []
+        for start in range(0, len(playback), 1600):
+            mic.chunks, system.chunks = [echo[start:start + 1600]], [playback[start:start + 1600]]
+            outputs.append(rec._drain_mixed_mono())
+        assert sum(len(block) for block in outputs) == len(playback)
+        assert rec._block_mic_energy < 1e-8 and rec._block_system_energy > 0
+        assert rec._duplicate_suppressor.suppressed_samples > 16000
+
 
 class _FakeStream:
     def __init__(self, active=True):
@@ -260,6 +274,30 @@ class TestHoldLiveSegments:
         assert segments and segments[0].size >= 16000
         assert rec.is_recording is False
 
+    def test_rebuilding_the_segmenter_mid_recording_flushes_buffered_speech(self):
+        """A device / source / VAD change while listening used to swap the
+        segmenter under the utterance it was holding, losing those words."""
+        rec = AudioRecorder()
+        rec._is_recording = True
+        rec._continuous_mode = True
+        rec._lanes = [_make_lane(chunks=[])]
+        held = np.ones(16000, dtype=np.float32)
+        rec._segmenter = _FakeSegmenter(flush_result=held)
+        segments = []
+        rec.segment_ready.connect(segments.append)
+        rec.configure(input_source="system")
+        assert [s.size for s in segments] == [16000]
+        assert rec._segmenter.speech_threshold == pytest.approx(0.0006)
+        assert rec.is_recording  # the session itself goes on
+
+    def test_rebuilding_the_segmenter_while_idle_flushes_nothing(self):
+        rec = AudioRecorder()
+        rec._segmenter = _FakeSegmenter(flush_result=np.ones(16000, dtype=np.float32))
+        segments = []
+        rec.segment_ready.connect(segments.append)
+        rec.configure(input_source="system")
+        assert segments == []
+
     def test_block_delivered_while_the_stream_closes_is_kept(self):
         """Regression: the flush ran before the streams were stopped, so the
         driver's last block arrived after recording ended and was dropped."""
@@ -287,16 +325,21 @@ class TestHoldLiveSegments:
 
 
 class TestStopOutput:
-    def test_stop_emits_recording_finished_with_audio(self):
+    def test_stop_hands_buffered_speech_to_the_segmenter_not_recording_finished(self):
+        """Hold-to-talk is segmented live; the old "accumulate then emit the
+        whole clip" path is gone, so a stop with speech yields a segment."""
         rec = AudioRecorder()
         rec._is_recording = True
         rec._continuous_mode = False
-        rec._lanes = [_make_lane(chunks=[np.ones(1600, dtype=np.float32)])]
-        results = []
-        rec.recording_finished.connect(results.append)
+        rec._lanes = [_make_lane(chunks=[np.full(16000, 0.5, dtype=np.float32)])]
+        segments, finished = [], []
+        rec.segment_ready.connect(segments.append)
+        rec.recording_finished.connect(finished.append)
         rec.stop()
-        assert results and results[0].size == 1600
+        assert segments and segments[0].size >= 16000
+        assert finished == []
         assert rec.is_recording is False
+        assert rec._lanes == []
 
     def test_stop_emits_empty_when_no_chunks(self):
         rec = AudioRecorder()

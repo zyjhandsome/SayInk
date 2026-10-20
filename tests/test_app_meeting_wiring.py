@@ -99,7 +99,7 @@ def test_hotkeys_are_parked_during_a_meeting() -> None:
         app._on_recording_start()
         h["recorder"].start.assert_not_called()
         h["floating"].show_meeting_paused.assert_not_called()
-        assert "听写快捷键" in h["floating"].show_meeting.call_args.kwargs["detail"]
+        assert "转写快捷键" in h["floating"].show_meeting.call_args.kwargs["detail"]
         app._on_esc_pressed()
         assert app.meeting.is_active
         app._on_recording_cancel()
@@ -287,6 +287,19 @@ def test_start_meeting_takes_over_a_running_continuous_session() -> None:
         h["recorder"].stop_continuous.assert_called()
         assert app._current_session_id == app.meeting.current_id
         assert app._current_seq == 0
+
+
+def test_start_meeting_refused_when_the_history_db_is_unavailable() -> None:
+    """Every transcript row goes through the history DB: with it disabled the
+    meeting would run with a blank transcript and save nothing."""
+    with app_harness() as h:
+        app = h["app"]
+        h["history"].disabled = True
+        with patch("sayink.meeting_session.aux_model_path", return_value=None):
+            assert app.start_meeting(MeetingOptions()) is False
+        assert not app.meeting.is_active
+        assert "历史数据库不可用" in h["floating"].show_error.call_args[0][0]
+        h["recorder"].start_continuous.assert_not_called()
 
 
 def test_start_meeting_refused_while_holding_the_hotkey() -> None:

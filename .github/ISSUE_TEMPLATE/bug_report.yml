@@ -1,5 +1,5 @@
 name: 问题反馈 / Bug report
-description: 听写、粘贴、模型、安装或更新出了问题
+description: 转写、粘贴、模型、安装或更新出了问题
 labels: ["bug"]
 body:
   - type: markdown
@@ -34,11 +34,12 @@ body:
   - type: dropdown
     id: mode
     attributes:
-      label: 当时的触发方式与音频来源
+      label: 当时的模式与音频来源
       multiple: true
       options:
-        - 按住说话
+        - 单次转写
         - 持续转写
+        - 会议
         - 仅麦克风
         - 仅电脑播放
         - 混合

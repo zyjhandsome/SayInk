@@ -55,7 +55,7 @@ def bundle_aux_model_ids() -> list[str]:
     """Meeting helpers shipped in the lite installer as well as the full one."""
     from sayink.speech_recognizer import AUX_MODEL_REGISTRY
 
-    return [m["id"] for m in AUX_MODEL_REGISTRY]
+    return [m["id"] for m in AUX_MODEL_REGISTRY if not m.get("optional")]
 
 
 def bundle_model_ids() -> list[str]:
@@ -252,6 +252,7 @@ def build():
         "--hidden-import=win32timezone",
         "--hidden-import=PyQt6.QtNetwork",
         "--hidden-import=sherpa_onnx",
+        "--hidden-import=onnxruntime",
     ])
 
     PyInstaller.__main__.run(args)

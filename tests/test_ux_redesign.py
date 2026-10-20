@@ -125,9 +125,15 @@ def test_sidebar_status_is_not_a_card_and_nav_has_no_stale_focus_ring(main_windo
     assert not hasattr(win, "_nav_heading")
     assert "border-radius: 8px" not in win._runtime_label.styleSheet()
     win._settings.set_runtime_status("模型载入中…")
-    assert "AMBER" in win._status_tone(win._runtime_label.text())
+    assert win._status_tone() == "AMBER"
     win._settings.set_runtime_status("就绪")
-    assert win._status_tone(win._runtime_label.text()) == "GREEN"
+    assert win._status_tone() == "GREEN"
+    # The dot follows the typed state, not words in the label: 「模型未就绪」 is
+    # red on the engine page and must be red here too.
+    from sayink.runtime_status import RuntimeState
+    win._settings.set_runtime_status(RuntimeState.UNAVAILABLE, "模型未就绪")
+    assert win._status_tone() == "RED"
+    assert win._runtime_label.text() == "模型未就绪"
 
 
 def test_engine_hero_shows_model_load_state(main_window):
@@ -156,7 +162,7 @@ def test_trigger_choice_uses_same_name_as_runtime_mode(main_window):
     assert "持续转写" in titles
     assert "单次转写" in titles
     assert "按住录制" not in titles
-    assert "连续口述" not in titles
+    assert titles.count("持续转写") == 1
     # P-01: hold-to-talk is the default; the sidebar names the mode like the card.
     assert "单次转写" in main_window._mode_label.text()
     main_window._settings._trigger_continuous_rb.setChecked(True)
@@ -306,6 +312,36 @@ def test_history_can_load_older_sessions(_qapp_session):
         win._load_more()
         assert win.session_count() == 55
         assert win._more_btn.isHidden()
+    finally:
+        win.close()
+
+
+def test_history_search_results_are_paged_too(_qapp_session):
+    """A common word must not render thousands of row widgets in one go."""
+    from dataclasses import replace
+    store = FakeHistoryStore()
+    original = store.sessions[0]
+    store.sessions = [replace(original, session_id=f"session-{i}") for i in range(120)]
+    store.segments = {s.session_id: [] for s in store.sessions}
+    store.search_sessions = lambda q, limit=None: store.sessions[:limit]
+    win = HistoryWindow(store)
+    try:
+        win._search_edit.setText("preview")
+        win._perform_search()
+        assert win.session_count() == 50
+        assert "找到 50+ 条" in win._list_summary_text
+        assert not win._more_btn.isHidden()
+        assert win._more_btn.text() == "加载更多结果"
+        win._load_more()
+        assert win.session_count() == 100
+        win._load_more()
+        assert win.session_count() == 120
+        assert "找到 120 条" in win._list_summary_text
+        assert win._more_btn.isHidden()
+        win._search_edit.clear()
+        win._perform_search()
+        assert win.session_count() == 50
+        assert win._more_btn.text() == "加载更早的会话"
     finally:
         win.close()
 

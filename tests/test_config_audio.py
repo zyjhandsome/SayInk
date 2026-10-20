@@ -13,7 +13,7 @@ from sayink.config import (
 
 
 class TestAudioConfigDefaults:
-    """README: 多种音频来源 + 按住快捷键 / 自动持续转写。"""
+    """README: 多种音频来源 + 按住快捷键 / 持续转写。"""
 
     def test_default_input_source_is_microphone(self):
         assert DEFAULT_CONFIG["audio"]["input_source"] == "microphone"

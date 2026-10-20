@@ -106,9 +106,9 @@ class OnboardingController(QObject):
     def welcome_text(self, *, model_missing: bool) -> str:
         hotkey = format_hotkey(self._config.get("hotkey", DEFAULT_HOTKEY))
         if self._is_continuous_mode():
-            stop = "按 Esc 或听写条「结束」停止" if self._config.get("audio.esc_stops_continuous", True) else "点听写条「结束」停止"
+            stop = "按 Esc 或转写条「结束」停止" if self._config.get("audio.esc_stops_continuous", True) else "点转写条「结束」停止"
             mode_tip = (
-                f"当前为「自动持续转写」：按住 {hotkey} 启动，松开后继续录制；{stop}。"
+                f"当前为「持续转写」：按住 {hotkey} 启动，松开后继续录制；{stop}。"
             )
         else:
             mode_tip = f"当前为「单次转写」：按住 {hotkey} 录音，松开后识别；Esc 取消本次录音。"
@@ -116,7 +116,7 @@ class OnboardingController(QObject):
             info = get_model_info(DEFAULT_MODEL_ID) or {}
             model_tip = (
                 f"本机还没有语音模型：请先在设置 → 引擎 中下载 {info.get('name', DEFAULT_MODEL_ID)}"
-                f"（约 {info.get('size_mb', '?')} MB，仅需一次），下载前无法听写。\n\n"
+                f"（约 {info.get('size_mb', '?')} MB，仅需一次），下载前无法转写。\n\n"
             )
         else:
             model_tip = "语音模型已下载，载入完成后即可试用。\n\n"
@@ -164,11 +164,11 @@ class OnboardingController(QObject):
 
     def ask_history_enabled(self) -> bool:
         text = (
-            "SayInk 可以在本机保存语音转写历史，方便稍后搜索、复制或导出。\n\n"
+            "SayInk 可以在本机保存转写历史，方便稍后搜索、复制或导出。\n\n"
             "历史只保存在本地；关闭后只会停止未来写入，不会删除已有数据。\n"
             "随时可以在设置关闭或调整保留策略。"
         )
-        box = message_box(self._dialog_parent(), "开启语音历史？", text, QMessageBox.Icon.Question)
+        box = message_box(self._dialog_parent(), "开启转写历史？", text, QMessageBox.Icon.Question)
         enable_btn = box.addButton("开启", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("暂不开启", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(enable_btn)

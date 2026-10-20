@@ -59,6 +59,17 @@ class TestSpeakerSessionParams:
 
 
 class TestRecluster:
+    def test_a_similar_intermediate_group_cannot_bridge_two_different_people(self):
+        history = [(1, _unit(1, 0)), (2, _unit(0.8, 0.6)), (3, _unit(0.28, 0.96))]
+        mapping = recluster(history, threshold=0.75)
+        assert mapping[1] != mapping[3]
+        assert len(set(mapping.values())) == 2
+
+    def test_bridge_does_not_let_an_unnamed_group_bypass_manual_protection(self):
+        history = [(1, _unit(1, 0)), (2, _unit(0.8, 0.6)), (3, _unit(0.28, 0.96))]
+        mapping = recluster(history, threshold=0.75, protected_ids={1})
+        assert mapping[1] == 1 and mapping[3] != 1
+
     def test_identity_when_nothing_merges(self):
         history = [(1, _unit(1, 0, 0)), (2, _unit(0, 1, 0)), (1, _unit(1, 0.05, 0))]
         assert recluster(history, threshold=0.8) == {1: 1, 2: 2}
@@ -189,6 +200,27 @@ class TestEmbedders:
         bad = tmp_path / "campplus.bin"
         bad.write_bytes(b"x")
         assert isinstance(make_embedder(bad), MelEmbedder)  # validate() fails → fallback
+
+    def test_activity_load_failure_keeps_the_working_campplus_backend(self, fake_sherpa, tmp_path, monkeypatch):
+        model = tmp_path / "campplus.onnx"
+        model.write_bytes(b"x")
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("activity model is incompatible")
+
+        monkeypatch.setattr("sayink.speaker_activity.SpeakerActivityGuard", fail)
+        embedder = make_embedder(model, activity_enabled=True, activity_model_path=tmp_path / "activity.onnx")
+        assert isinstance(embedder, ModelEmbedder)
+        assert embedder.activity_guard is None
+        assert "incompatible" in embedder.activity_guard_error
+
+    def test_disabled_activity_never_loads_the_optional_model(self, fake_sherpa, tmp_path, monkeypatch):
+        model = tmp_path / "campplus.onnx"
+        model.write_bytes(b"x")
+        loaded = []
+        monkeypatch.setattr("sayink.speaker_activity.SpeakerActivityGuard", lambda *_args: loaded.append(True))
+        embedder = make_embedder(model, activity_enabled=False, activity_model_path=tmp_path / "activity.onnx")
+        assert isinstance(embedder, ModelEmbedder) and not loaded
 
 
 class TestContinuityPrior:

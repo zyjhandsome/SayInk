@@ -34,6 +34,17 @@ class RuntimeStatus:
     label: str
 
 
+# One wording per meeting capture state for the tray tooltip, the sidebar and
+# the bar (which only has room for the short form before the clock).
+MEETING_STATE_LABELS = {
+    "live": "会议记录中",
+    "live_short": "会议中",
+    "paused": "会议已暂停",
+    "draining": "正在整理会议",
+    "active": "会议进行中",
+}
+
+
 @dataclass(frozen=True)
 class SegmentationStatus:
     """Actual recorder gate, distinct from a preference or a file on disk."""
@@ -66,10 +77,12 @@ def runtime_status_from_flags(*, is_loading: bool, is_ready: bool) -> RuntimeSta
 
 
 def coerce_runtime_status(
-    state_or_label: RuntimeState | str,
+    state_or_label: RuntimeStatus | RuntimeState | str,
     label: str | None = None,
 ) -> RuntimeStatus:
     """Normalize legacy label-only calls without substring-based state guessing."""
+    if isinstance(state_or_label, RuntimeStatus):
+        return state_or_label if label is None else RuntimeStatus(state_or_label.state, label)
     if isinstance(state_or_label, RuntimeState):
         state = state_or_label
     else:

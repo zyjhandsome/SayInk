@@ -112,19 +112,23 @@ def test_meeting_sidebar_tracks_session_and_restores_dictation(qapp, tmp_path, m
         win._settings.set_runtime_status(RuntimeState.READY, "就绪")
         options = MeetingOptions(input_source="mixed")
         controller.begin(options, resolve_capabilities(win._config, options, dictation_model_id="funasr-nano"))
-        assert win._runtime_label.text() == "会议录制中"
-        assert "电脑" in win._mode_label.text()
+        assert win._runtime_label.text() == "会议记录中"
+        assert win._status_tone() == "GREEN"
+        # Same source name as the dictation hints / source picker.
+        assert win._mode_label.text() == "麦克风 + 电脑声音"
         assert win._output_label.text() == "仅保存会议记录"
         assert "Esc" not in win._shortcut_label.text()
         win.show_page("general")
         controller.pause("手动暂停")
         assert win._runtime_label.text() == "会议已暂停"
+        assert win._status_tone() == "AMBER"
         win._settings.set_runtime_status(RuntimeState.READY, "模型已就绪")
         assert win._runtime_label.text() == "会议已暂停"
         controller.resume()
-        assert win._runtime_label.text() == "会议录制中"
+        assert win._runtime_label.text() == "会议记录中"
         controller.finalize()
         assert win._runtime_label.text() == "模型已就绪"
+        assert win._status_tone() == "GREEN"
         assert "单次转写" in win._mode_label.text()
         assert "粘贴" in win._output_label.text()
     finally:
@@ -528,7 +532,7 @@ def test_history_promote_to_meeting_navigates_to_meeting_page_and_selects_it(qap
             session_id="dictation-1",
             seq=0,
             created_at=1_700_000_000_000,
-            raw_text="一段要整理成会议纪要的听写内容",
+            raw_text="一段要整理成会议纪要的转写内容",
             polished_text="",
             source="mic",
             duration_ms=2000,
@@ -554,7 +558,7 @@ def test_history_promote_to_meeting_navigates_to_meeting_page_and_selects_it(qap
         meeting_id = win.meeting_panel.current_meeting_id
         assert meeting_id != ""
         segs = ctrl.store.get_segments(meeting_id)
-        assert [s.raw_text for s in segs] == ["一段要整理成会议纪要的听写内容"]
+        assert [s.raw_text for s in segs] == ["一段要整理成会议纪要的转写内容"]
         # Dictation history still keeps the original session.
         assert [s.session_id for s in store.list_sessions()] == ["dictation-1"]
     finally:

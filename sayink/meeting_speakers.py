@@ -1,4 +1,4 @@
-"""Conservative, session-only speaker matching for meeting transcripts.
+"""Conservative, session-only speaker matching for meetings and continuous dictation.
 
 Unknown (0) is intentional: a short or ambiguous observation must not teach
 the matcher a wrong voice. No audio or voice profiles are written to disk.
@@ -12,11 +12,13 @@ from dataclasses import dataclass
 import numpy as np
 
 from sayink.audio_utils import TARGET_SAMPLE_RATE
+from sayink.speaker_clustering import TurnObservation
 from sayink.speaker_session import SpeakerSession
 
 MAX_PROFILE_SAMPLES = 12
 MAX_RECENT_OBSERVATIONS = 512
 MATCH_MARGIN = 0.08
+CROSS_ROUTE_MIN_SIMILARITY = 0.80
 
 
 def voice_sample_is_clear(audio: np.ndarray) -> bool:
@@ -87,19 +89,43 @@ class _Profile:
 class MeetingSpeakerSession(SpeakerSession):
     """Match reliable evidence; keep ambiguous and very short turns unknown.
 
-    The base class remains the dictation policy. This policy uses bounded
-    multiple samples per speaker and never learns from continuity guesses.
+    Meetings and continuous dictation share this policy: bounded multiple
+    samples per speaker, with no learning from continuity guesses.
     Manual corrections can relabel recent clear observations by their real
     transcript sequence, including sparse sequences and repeated corrections.
     """
 
-    def __init__(self, *, margin: float = MATCH_MARGIN, **kwargs):
+    def __init__(self, *, margin: float = MATCH_MARGIN, cross_route_matching: bool = True, **kwargs):
         super().__init__(**kwargs)
+        from sayink.speaker_turns import SpeakerTurnContext
+
+        self.turn_context = SpeakerTurnContext()
         self._margin = max(0.0, float(margin))
+        self._cross_route_matching = bool(cross_route_matching)
         self._profiles: dict[int, _Profile] = {}
         self._observations: OrderedDict[int, _Observation] = OrderedDict()
+        self._turns: list[TurnObservation] = []
         self._serial = 0
         self._dimension = 0
+
+    @classmethod
+    def for_embedder(cls, embedder, *, keep_history: bool = True) -> "MeetingSpeakerSession":
+        """The session the app runs for ``embedder``: its thresholds, the
+        shared continuity gap and cross-route matching only for CAM++.
+
+        Meetings, continuous dictation and every benchmark tool build their
+        session here, so a tool cannot quietly score a different policy than
+        the one users get.
+        """
+        from sayink.speaker_embedding import STICKY_GAP_MS
+
+        return cls(
+            threshold=embedder.threshold,
+            keep_history=keep_history,
+            cross_route_matching=embedder.name == "campplus",
+            sticky_threshold=embedder.sticky_threshold,
+            sticky_gap_ms=STICKY_GAP_MS,
+        )
 
     @property
     def speaker_count(self) -> int:
@@ -112,11 +138,24 @@ class MeetingSpeakerSession(SpeakerSession):
             return [(p.speaker_id, vector.copy()) for p in self._profiles.values()
                     for vector in p.samples.values()] if self._keep_history else []
 
+    @property
+    def turns(self) -> list[TurnObservation]:
+        """Every assigned turn with its key, current number, vector and duration.
+
+        Unlike ``history`` this is not limited to profile samples: unknown and
+        non-learnable turns are included so the end-of-session pass can place
+        them. Empty unless ``keep_history`` is on.
+        """
+        with self._lock:
+            return list(self._turns)
+
     def reset(self) -> None:
         with self._lock:
             super().reset()
+            self.turn_context.reset()
             self._profiles.clear()
             self._observations.clear()
+            self._turns.clear()
             self._serial = 0
             self._dimension = 0
 
@@ -138,6 +177,9 @@ class MeetingSpeakerSession(SpeakerSession):
             self._observations[key] = _Observation(speaker_id, vector, route, bool(learnable))
             while len(self._observations) > MAX_RECENT_OBSERVATIONS:
                 self._observations.popitem(last=False)
+            if self._keep_history:
+                duration = int(end_ms - start_ms) if end_ms and end_ms >= start_ms >= 0 else 0
+                self._turns.append(TurnObservation(key, speaker_id, None if vector is None else vector.copy(), duration))
             # Uncertain turns break the continuity chain.
             self._last_id = speaker_id
             self._last_end_ms = int(end_ms or start_ms or 0)
@@ -146,8 +188,11 @@ class MeetingSpeakerSession(SpeakerSession):
     def _choose(self, vector, route, start_ms, learnable) -> tuple[int, bool]:
         if vector is None:
             return 0, False
+        # A capture lane is evidence about the recording, not an identity.
+        # Consider all profiles so switching inputs cannot force an identical
+        # voice into a new group, and conflicting lanes still compete.
         ranked = sorted(((p.score(vector), p) for p in self._profiles.values()
-                         if not (route and p.route and route != p.route)),
+                         if self._cross_route_matching or not self._cross_route(p, route)),
                         key=lambda item: item[0], reverse=True)
         best, profile = ranked[0] if ranked else (-1.0, None)
         confirmed = sorted(((p.confirmed_score(vector), p) for _score, p in ranked),
@@ -155,27 +200,36 @@ class MeetingSpeakerSession(SpeakerSession):
         if confirmed:
             confirmed_best, confirmed_profile = confirmed[0]
             confirmed_next = confirmed[1][0] if len(confirmed) > 1 else -1.0
-            if (confirmed_best >= self._threshold + self._margin
+            required = max(self._threshold + self._margin,
+                           self._route_threshold(confirmed_profile, route))
+            if (confirmed_best >= required
                     and confirmed_best - confirmed_next >= self._margin
                     and confirmed_best >= best - self._margin / 2):
                 # Clear manual evidence takes precedence over a duplicate
                 # automatic group. Conflicting manual samples still abstain.
-                return confirmed_profile.speaker_id, bool(learnable)
+                return confirmed_profile.speaker_id, bool(learnable and not self._cross_route(confirmed_profile, route))
         runner_up = ranked[1][0] if len(ranked) > 1 else -1.0
         margin = best - runner_up
-        required = self._threshold + (0.0 if learnable else self._margin)
+        required = max(self._threshold + (0.0 if learnable else self._margin),
+                       self._route_threshold(profile, route))
         if profile is not None and best >= required:
             if margin < self._margin:
                 return 0, False
-            return profile.speaker_id, bool(learnable and best >= self._threshold + self._margin / 2)
+            # Cross-lane recognition alone does not teach a new recording
+            # condition. A saved manual correction can explicitly link it.
+            return profile.speaker_id, bool(learnable and not self._cross_route(profile, route)
+                                            and best >= self._threshold + self._margin / 2)
         if not learnable:
             return 0, False
         uncertain_floor = self._sticky_threshold if self._sticky_threshold is not None else self._threshold - self._margin
+        if self._cross_route(profile, route) and best >= uncertain_floor:
+            return 0, False
         if runner_up >= uncertain_floor and margin < self._margin:
             return 0, False
-        if profile is not None and best >= self._threshold:
-            return 0, False
+        # Here ``best`` is below the threshold: a same-route match above it
+        # returned earlier, and a cross-route one was caught by the floor.
         if (profile is not None and profile.speaker_id == self._last_id
+                and not self._cross_route(profile, route)
                 and self._sticky_threshold is not None and start_ms and self._last_end_ms
                 and 0 <= start_ms - self._last_end_ms <= self._sticky_gap_ms
                 and best >= self._sticky_threshold and margin >= self._margin
@@ -184,6 +238,15 @@ class MeetingSpeakerSession(SpeakerSession):
         if len(self._profiles) >= self._max_speakers:
             return 0, False
         return self.reserve_speaker_id(), True
+
+    @staticmethod
+    def _cross_route(profile, route) -> bool:
+        return bool(profile is not None and route and profile.route and route != profile.route)
+
+    def _route_threshold(self, profile, route) -> float:
+        if self._cross_route(profile, route):
+            return max(CROSS_ROUTE_MIN_SIMILARITY, self._threshold + 2 * self._margin)
+        return self._threshold
 
     def confirm(self, sample_key: int, speaker_id: int) -> bool:
         """Teach a successfully saved manual correction when evidence permits.
@@ -201,6 +264,8 @@ class MeetingSpeakerSession(SpeakerSession):
                 if not profile.samples:
                     del self._profiles[sid]
             observation.speaker_id = speaker_id
+            self._turns = [TurnObservation(t.key, speaker_id, t.vector, t.duration_ms) if t.key == int(sample_key) else t
+                           for t in self._turns]
             if next(reversed(self._observations)) == int(sample_key):
                 self._last_id = speaker_id
             if not observation.learnable or observation.vector is None:

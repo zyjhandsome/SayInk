@@ -453,12 +453,17 @@ def build_recording_plan(
     return RecordingPlan(source, tuple(endpoints))
 
 
+INPUT_SOURCE_LABELS = {
+    INPUT_SOURCE_MICROPHONE: "麦克风",
+    INPUT_SOURCE_SYSTEM: "电脑声音",
+    INPUT_SOURCE_MIXED: "麦克风 + 电脑声音",
+}
+
+
 def input_source_label(source: str) -> str:
-    return {
-        INPUT_SOURCE_MICROPHONE: "麦克风",
-        INPUT_SOURCE_SYSTEM: "电脑播放",
-        INPUT_SOURCE_MIXED: "麦克风 + 电脑播放",
-    }.get(source, source)
+    """The one user-facing name per source (docs/terminology.md): the source
+    picker, sidebar, history chips and meeting card all read from here."""
+    return INPUT_SOURCE_LABELS.get(source, source)
 
 
 def plan_includes_system_capture(plan: RecordingPlan) -> bool:

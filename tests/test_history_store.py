@@ -130,7 +130,7 @@ class TestLikeSearch:
         store.enqueue(_record(
             record.id, 0, raw_text="只有会议里有的句子", trigger_mode="meeting", created_at=1000,
         ))
-        store.enqueue(_record("dictation", 0, raw_text="听写句子", created_at=2000))
+        store.enqueue(_record("dictation", 0, raw_text="转写句子", created_at=2000))
         store.flush(timeout=2.0)
 
         store.enqueue_delete_sessions([record.id, "dictation"])
@@ -142,7 +142,7 @@ class TestLikeSearch:
 
     def test_count_includes_unloaded_sessions_and_excludes_meetings(self, store):
         for index in range(60):
-            store.enqueue(_record(f"s{index}", 0, raw_text="听写", created_at=index + 1))
+            store.enqueue(_record(f"s{index}", 0, raw_text="转写", created_at=index + 1))
         store.enqueue(_record("s0", 1, raw_text="第二段", created_at=1000))
         store.enqueue(_record("meeting", 0, raw_text="会议", trigger_mode="meeting", created_at=2000))
         store.close(timeout=2.0)
@@ -179,6 +179,18 @@ class TestLikeSearch:
         assert [s.session_id for s in store.search_sessions("100%")] == ["pct"]
         assert [s.session_id for s in store.search_sessions("a_b")] == ["under"]
         assert store.search_sessions("\\") == []
+
+    def test_search_is_pageable_newest_first(self, store):
+        """A common word hitting thousands of sessions is fetched a page at a time."""
+        for i in range(60):
+            store.enqueue(_record(f"s{i}", 0, raw_text=f"第{i}条 共同词", created_at=1000 + i))
+        store.close(timeout=2.0)
+
+        page = store.search_sessions("共同词", limit=51)
+        assert len(page) == 51
+        assert page[0].session_id == "s59"
+        assert len(store.search_sessions("共同词")) == 60
+        assert store.search_sessions("共同词", limit=0) == []
 
     def test_connections_set_a_busy_timeout(self, store):
         from sayink.history_store import BUSY_TIMEOUT_MS

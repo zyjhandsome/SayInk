@@ -1,6 +1,6 @@
 ## Why
 
-设置四表面换肤与字体 polish 已落地，但 `SettingsWindow.reapply_theme` 仍是 225 行角色枚举（cyclo 55 / cognitive 106），`settings_window.py` 与 `settings_components.py` 各约 1600 行。后续任何样式改动都会继续往巡检里加分支。用户选定探索推荐方向：把设置窗换肤收成 ThemeAware 协议，并按页拆分，而不改设置 IA 或听写主路径。
+设置四表面换肤与字体 polish 已落地，但 `SettingsWindow.reapply_theme` 仍是 225 行角色枚举（cyclo 55 / cognitive 106），`settings_window.py` 与 `settings_components.py` 各约 1600 行。后续任何样式改动都会继续往巡检里加分支。用户选定探索推荐方向：把设置窗换肤收成 ThemeAware 协议，并按页拆分，而不改设置 IA 或转写主路径。
 
 ## What Changes
 
@@ -48,7 +48,7 @@
   - 重做浅/暗色 token 或字体阶梯
   - 恢复文件转写或翻译模式
   - 替换 PyQt6；重排设置分页信息架构
-  - 持续听写中间结果、系统主题热更新、API Key 钥匙串、`App` 会话状态抽出
+  - 持续转写中间结果、系统主题热更新、API Key 钥匙串、`App` 会话状态抽出
   - 像素级截图回归基建；顺手改用户可察视觉残留
 - 禁止修改路径：`sayink/speech_recognizer.py`、`sayink/audio_recorder.py`、热键核心逻辑
 

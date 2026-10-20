@@ -135,7 +135,7 @@ class TestWelcome:
     def test_text_follows_trigger_mode(self):
         cfg = _Config(hotkey="alt+x")
         assert "单次转写" in _controller(cfg).welcome_text(model_missing=False)
-        assert "自动持续转写" in _controller(cfg, continuous=True).welcome_text(model_missing=False)
+        assert "持续转写" in _controller(cfg, continuous=True).welcome_text(model_missing=False)
 
     def test_text_follows_source_output_and_escape_preference(self):
         cfg = _Config(hotkey="ctrl+shift+z")
@@ -208,7 +208,7 @@ class TestHistoryOnboarding:
         assert ctl.ask_history_enabled() is True
         assert [t for t, _ in box.last.buttons] == ["开启", "暂不开启"]
         assert box.last.default == box.last.buttons[0]
-        assert box.last.title == "开启语音历史？"
+        assert box.last.title == "开启转写历史？"
         assert "随时可以在设置关闭" in box.last.text
         # U-03: no main window yet, so the box must not open behind other apps.
         assert box.last.parent is None

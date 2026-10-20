@@ -330,15 +330,13 @@ class TestSidebarVisualContracts:
         assert TEXT_SEC.lower() in SECTION_LABEL.lower()
         assert "font-size: 14px" in SECTION_LABEL
 
-    def test_group_and_hero_surfaces_are_bordered_cards(self):
+    def test_group_surface_is_a_bordered_card(self):
         from sayink.ui.design_tokens import BORDER, RADIUS_LG, SURFACE
-        from sayink.ui.settings_components import GROUP_STYLE, HERO_CARD_STYLE
+        from sayink.ui.settings_components import GROUP_STYLE
 
-        for style in (GROUP_STYLE, HERO_CARD_STYLE):
-            assert f"background: {SURFACE}" in style
-            assert f"border-radius: {RADIUS_LG}px" in style
-            assert f"border: 1px solid {BORDER}" in style
-        assert HERO_CARD_STYLE == GROUP_STYLE.replace("settingsGroup", "settingsHeroCard")
+        assert f"background: {SURFACE}" in GROUP_STYLE
+        assert f"border-radius: {RADIUS_LG}px" in GROUP_STYLE
+        assert f"border: 1px solid {BORDER}" in GROUP_STYLE
 
     def test_usage_tip_bar_is_neutral(self):
         from sayink.ui.design_tokens import HAIRLINE, SURFACE_PEARL, TEXT_SEC
@@ -353,44 +351,14 @@ class TestSidebarVisualContracts:
         finally:
             tip.close()
 
-    def test_vertical_choice_selected_uses_single_emphasis(self):
-        from PyQt6.QtWidgets import QRadioButton
+    def test_retired_choice_card_variants_are_gone(self):
+        """Only CompactPickCard is used by the pages; the two older card
+        classes (and their painted icon) were dead weight."""
+        import sayink.ui.settings_components as components
 
-        from sayink.ui import design_tokens as tok
-        from sayink.ui.settings_components import ChoiceCard, VerticalChoiceCard
-
-        tok.activate("light")
-        radio = QRadioButton()
-        radio.setChecked(True)
-        card = VerticalChoiceCard("仅麦克风", "收录你的说话声", "mic", radio)
-        try:
-            sheet = card.styleSheet()
-            assert tok.NAV_SELECTED_BG in sheet
-            assert f"border: 1px solid {tok.HAIRLINE}" in sheet
-            assert "border: 2px solid" not in sheet
-            assert "border-left:" not in sheet or "border-left: 0" in sheet
-            title = next(label for label in card.findChildren(QLabel) if label.text() == "仅麦克风")
-            assert f"color: {tok.TEXT}" in title.styleSheet()
-            assert f"color: {tok.ACCENT}" not in title.styleSheet()
-        finally:
-            card.close()
-            radio.close()
-
-        radio2 = QRadioButton()
-        radio2.setChecked(True)
-        grid = ChoiceCard("仅麦克风", "收录你的说话声", "mic", radio2)
-        try:
-            sheet = grid.styleSheet()
-            assert tok.NAV_SELECTED_BG in sheet
-            assert f"border: 1px solid {tok.HAIRLINE}" in sheet
-            assert "border: 2px solid" not in sheet
-            assert "border-left:" not in sheet or "border-left: 0" in sheet
-            title = next(label for label in grid.findChildren(QLabel) if label.text() == "仅麦克风")
-            assert f"color: {tok.TEXT}" in title.styleSheet()
-            assert f"color: {tok.ACCENT}" not in title.styleSheet()
-        finally:
-            grid.close()
-            radio2.close()
+        for name in ("ChoiceCard", "VerticalChoiceCard", "_SourceIcon", "WideTestButton",
+                     "collapsible_toggle_btn", "hero_card", "kv_row", "LINK_BTN_STYLE"):
+            assert not hasattr(components, name), name
 
     def test_general_page_header_class_removed(self):
         import sayink.ui.settings_components as components

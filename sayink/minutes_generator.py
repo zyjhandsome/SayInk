@@ -145,7 +145,12 @@ class MinutesWorker(QThread):
             raise LLMCancelled()
         key = self._step_key(system_prompt, user_prompt)
         if self._req.save_checkpoint and key not in self._req.checkpoints:
-            self._req.save_checkpoint(key, raw)
+            try:
+                self._req.save_checkpoint(key, raw)
+            except Exception as exc:
+                # The answer is valid; only its resume point is lost. Keep it
+                # in memory and let the run finish instead of failing it.
+                log.warning("分段进度未能保存，本次结果仅保留在内存中: %s", exc)
         self._req.checkpoints[key] = raw
 
     def _reset_preview(self):
@@ -507,13 +512,23 @@ def _preserve_facts(payload, partials):
     return payload
 
 
+# Matched with ``match(text, pos)``: anchored at ``pos`` (a line start).
+_LINE_PREFIX_RE = re.compile(r"\[\d{2,}:\d{2}:\d{2}\][^\n：]*：")
+
+
 def _split_chunk(text):
     cut = len(text) // 2
     newline = text.rfind("\n", 0, cut)
     if newline > len(text) // 4:
         return text[:newline], text[newline + 1:]
-    prefix = re.match(r"^\[\d{2,}:\d{2}:\d{2}\][^\n：]*：", text)
-    return text[:cut], (prefix.group(0) if prefix else "") + text[cut:]
+    # Mid-line cut: the right half keeps the ``[ts] speaker：`` prefix of the
+    # line it came from, never the first line's (that would hand one
+    # speaker's words to another, at the wrong time).
+    line_start = text.rfind("\n", 0, cut) + 1
+    prefix = _LINE_PREFIX_RE.match(text, line_start)
+    if prefix is not None and prefix.end() <= cut:
+        return text[:cut], prefix.group(0) + text[cut:]
+    return text[:cut], text[cut:]
 
 
 def _concat_partials(partials: Sequence[dict[str, Any]]) -> dict[str, Any]:

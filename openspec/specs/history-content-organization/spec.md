@@ -21,8 +21,12 @@ The history window SHALL allow users to edit the text of a single selected dicta
 The history window SHALL allow users to trigger AI polishing (or re-polishing) on a single selected history session using the configured OpenAI-compatible LLM endpoint.
 
 #### Scenario: 单条历史补润色成功
-- **WHEN** 已配置完整的 LLM 服务，用户在单条历史详情点击「润色」（已有润色时为「重新润色」）
-- **THEN** 系统异步调用 `TextPolisher` 对该会话的 `raw_text` 进行润色，完成后写回 `polished_text`，自动切换到「润色」视图并显示完成反馈
+- **WHEN** 已配置完整的 LLM 服务，用户在单条历史详情点击「润色」（已有润色时为「重新润色」；「处理方式」为纠错时按钮为「纠错 / 重新纠错」）
+- **THEN** 系统异步调用 `TextPolisher` 对该会话的 `raw_text` 进行处理，使用与实时输出相同的 `llm.prompt`、`llm.mode` 与术语表，完成后写回 `polished_text`，自动切换到「润色」视图并显示完成反馈
+
+#### Scenario: 结果未通过保真检查
+- **WHEN** 模型返回的文本未通过与实时输出相同的保真检查（数字、否定、英文专名；纠错模式下还包括长度与改动比例）
+- **THEN** 不写回 `polished_text`，底部 Toast 说明原因，原文与已有润色文本保持不变
 
 #### Scenario: LLM 未配置或润色请求失败
 - **WHEN** 用户点击「润色」但 LLM 配置不完整，或请求超时/报错
@@ -46,7 +50,7 @@ The history window SHALL allow users to promote a single selected session or mul
 
 #### Scenario: 单条或多条历史转为会议并跳转
 - **WHEN** 用户在单选态点击「转为会议」或在多选态点击「合并转为会议」
-- **THEN** 系统在 `meetings` 表创建一条 `status = 'ended'` 的新会议记录，将所选历史会话的分段按时间顺序复制写入该 `meeting_id`（`trigger_mode = 'meeting'`），保留原日常听写历史不变
+- **THEN** 系统在 `meetings` 表创建一条 `status = 'ended'` 的新会议记录，将所选历史会话的分段按时间顺序复制写入该 `meeting_id`（`trigger_mode = 'meeting'`），保留原日常转写历史不变
 - **AND** 主窗口自动切换到「会议」页并选中打开该新建会议，用户可直接选模板生成纪要、重命名说话人或编辑导出
 
 ---

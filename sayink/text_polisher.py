@@ -6,6 +6,8 @@ from urllib.parse import urlparse
 
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
+from sayink.asr_correction import CORRECTION_PROMPT, correction_user_prompt
+
 log = logging.getLogger("SayInk")
 
 # Hosts treated as this machine or the LAN. Plain HTTP is allowed for any
@@ -73,6 +75,23 @@ def chat_completions_url(api_url: str) -> str:
 CHAT_RETRY_STATUS = frozenset({502, 503, 504})
 CHAT_RETRY_DELAY_SEC = 0.5
 
+# Official dual-mode DeepSeek models think by default; the reasoning shares
+# the output budget with the edit and can leave ``content`` empty. Other
+# endpoints would reject the field, so it is only sent to the official host.
+_THINKING_TOGGLE_HOST = "api.deepseek.com"
+_THINKING_TOGGLE_MODELS = frozenset({"deepseek-flash", "deepseek-v4-pro"})
+
+
+def thinking_payload_extra(api_url: str, model_name: str, thinking_mode: str | None) -> dict:
+    """Extra request fields that switch a provider's reasoning off, if any."""
+    if (
+        thinking_mode == "disabled"
+        and urlparse((api_url or "").strip()).hostname == _THINKING_TOGGLE_HOST
+        and (model_name or "").strip() in _THINKING_TOGGLE_MODELS
+    ):
+        return {"thinking": {"type": "disabled"}}
+    return {}
+
 
 class LLMCancelled(Exception):
     """The caller cancelled while a request was in flight."""
@@ -100,6 +119,7 @@ def chat_completion(
     retry_delay_sec: float = CHAT_RETRY_DELAY_SEC,
     label: str = "LLM",
     reject_truncated: bool = False,
+    extra_payload: dict | None = None,
 ) -> str:
     """One OpenAI-compatible chat completion, shared by polishing and minutes.
 
@@ -107,7 +127,8 @@ def chat_completion(
     network error or a 502/503/504. Returns the stripped message content.
     Raises :class:`LLMCancelled` when ``is_cancelled()`` turns true,
     :class:`LLMResponseError` for malformed/empty answers, and lets
-    ``httpx`` exceptions (timeout, HTTP status) propagate.
+    ``httpx`` exceptions (timeout, HTTP status) propagate. ``extra_payload``
+    adds provider-specific fields (see :func:`thinking_payload_extra`).
     """
     cancelled = is_cancelled or (lambda: False)
     payload = {
@@ -115,6 +136,7 @@ def chat_completion(
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        **(extra_payload or {}),
     }
     url = chat_completions_url(api_url)
     headers = _request_headers(api_key)
@@ -173,6 +195,33 @@ POLISH_PROMPT = (
 )
 
 LLM_MODE_POLISH = "polish"
+# Correction: fix mis-heard characters and glossary spellings, keep everything
+# else — including filler words — exactly as recognized.
+LLM_MODE_CORRECT = "correct"
+LLM_MODES = (LLM_MODE_POLISH, LLM_MODE_CORRECT)
+
+
+def normalize_llm_mode(value) -> str:
+    """Known mode name or ``polish`` (the historical default) for anything else."""
+    mode = str(value or "").strip().lower()
+    return mode if mode in LLM_MODES else LLM_MODE_POLISH
+
+
+def prompt_config_key(mode: str) -> str:
+    """Config key of the custom prompt for ``mode``.
+
+    Each mode keeps its own prompt: a polish prompt the user tuned must not
+    silently drive the correction mode (and be rejected by its guard) after a
+    mode switch. ``llm.prompt`` stays the polish key for existing configs.
+    """
+    return "llm.prompt_correct" if normalize_llm_mode(mode) == LLM_MODE_CORRECT else "llm.prompt"
+
+
+def custom_prompt_or_empty(prompt: str) -> str:
+    """The prompt as something the user wrote, or "" when it is a built-in copy
+    (the old 恢复默认 button used to paste the built-in text into the editor)."""
+    custom = (prompt or "").strip()
+    return "" if custom in (POLISH_PROMPT, CORRECTION_PROMPT) else custom
 
 
 def build_system_prompt(
@@ -180,9 +229,19 @@ def build_system_prompt(
     *,
     custom_prompt: str = "",
 ) -> str:
-    """Return the system prompt for polish mode."""
-    custom = (custom_prompt or "").strip()
-    return custom or POLISH_PROMPT
+    """System prompt for ``mode``; a custom prompt replaces it in either mode.
+
+    A built-in prompt pasted verbatim (the 恢复默认 button does that) is not a
+    customization, so switching modes afterwards still switches prompts.
+    """
+    custom = custom_prompt_or_empty(custom_prompt)
+    if custom:
+        return custom
+    return CORRECTION_PROMPT if normalize_llm_mode(mode) == LLM_MODE_CORRECT else POLISH_PROMPT
+
+
+def _mode_label(mode: str) -> str:
+    return "纠错" if normalize_llm_mode(mode) == LLM_MODE_CORRECT else "润色"
 
 
 class PolishWorker(QThread):
@@ -201,20 +260,55 @@ class PolishWorker(QThread):
         prompt: str = "",
         *,
         mode: str = LLM_MODE_POLISH,
+        glossary=(),
+        context: str = "",
     ):
         super().__init__()
         self._api_url = api_url.rstrip("/")
         self._api_key = api_key
         self._model_name = model_name
         self._text = text
-        self._mode = (mode or LLM_MODE_POLISH).strip().lower()
-        self._prompt = prompt or POLISH_PROMPT
+        self._mode = normalize_llm_mode(mode)
+        self._prompt = prompt or build_system_prompt(self._mode)
+        self._glossary = tuple(glossary or ())
+        self._context = context or ""
         self._cancelled = False
-        self._action_label = "润色"
+        self._client = None
+        self._action_label = _mode_label(self._mode)
+
+    @property
+    def is_correction(self) -> bool:
+        return self._mode == LLM_MODE_CORRECT
+
+    def user_message(self) -> str:
+        """The user turn: the text itself, or for correction the text with the
+        glossary and the preceding output attached."""
+        if self.is_correction:
+            return correction_user_prompt(self._text, self._glossary, self._context)
+        return self._text
+
+    def request_options(self) -> dict:
+        """Sampling and provider fields. Correction decodes greedily and asks
+        DeepSeek's dual-mode models not to think, so a one-line fix returns in
+        well under a second instead of spending the budget on reasoning."""
+        if self.is_correction:
+            return {
+                "temperature": 0.0,
+                "extra_payload": thinking_payload_extra(self._api_url, self._model_name, "disabled"),
+            }
+        return {"temperature": 0.3, "extra_payload": {}}
 
     def cancel(self):
-        """Set cancellation flag to stop the worker."""
+        """Stop the worker: set the flag and drop the HTTP connection so a
+        request already waiting on the server does not hold the thread (and
+        app exit) for the full 15 s timeout."""
         self._cancelled = True
+        client = self._client
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # best effort from another thread
+                pass
 
     def run(self):
         if self._cancelled:
@@ -231,22 +325,30 @@ class PolishWorker(QThread):
             log.info("正在调用 LLM %s (%s)...", self._action_label, self._model_name)
             log.debug("原文长度: %d 字符", len(self._text))
 
+            options = self.request_options()
             with httpx.Client(timeout=15.0) as client:
-                polished = chat_completion(
-                    client, httpx,
-                    api_url=self._api_url,
-                    api_key=self._api_key,
-                    model_name=self._model_name,
-                    messages=[
-                        {"role": "system", "content": self._prompt},
-                        {"role": "user", "content": self._text},
-                    ],
-                    temperature=0.3,
-                    max_tokens=2048,
-                    is_cancelled=lambda: self._cancelled,
-                    retry_delay_sec=self._RETRY_DELAY_SEC,
-                    label=self._action_label,
-                )
+                self._client = client
+                try:
+                    if self._cancelled:
+                        return
+                    polished = chat_completion(
+                        client, httpx,
+                        api_url=self._api_url,
+                        api_key=self._api_key,
+                        model_name=self._model_name,
+                        messages=[
+                            {"role": "system", "content": self._prompt},
+                            {"role": "user", "content": self.user_message()},
+                        ],
+                        temperature=options["temperature"],
+                        max_tokens=2048,
+                        is_cancelled=lambda: self._cancelled,
+                        retry_delay_sec=self._RETRY_DELAY_SEC,
+                        label=self._action_label,
+                        extra_payload=options["extra_payload"],
+                    )
+                finally:
+                    self._client = None
             if self._cancelled:
                 return
             log.debug("%s结果长度: %d 字符", self._action_label, len(polished))
@@ -286,6 +388,8 @@ class TextPolisher(QObject):
         prompt: str = "",
         *,
         mode: str = LLM_MODE_POLISH,
+        glossary=(),
+        context: str = "",
     ):
         if not text.strip():
             self.polish_complete.emit(text)
@@ -304,6 +408,8 @@ class TextPolisher(QObject):
             text,
             system_prompt,
             mode=mode,
+            glossary=glossary,
+            context=context,
         )
         worker.result_ready.connect(self._on_result)
         worker.error.connect(self._on_error)

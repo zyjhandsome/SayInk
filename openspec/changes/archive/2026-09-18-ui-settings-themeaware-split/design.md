@@ -4,7 +4,7 @@
 
 ## 已批准目标与约束
 - 目标：四表面 ThemeAware 广播；设置按页拆分；删除 Settings 窗级 `viRole` 巡检链。
-- 非目标：token/字体重做、IA 重排、听写/润色业务、像素截图基建。
+- 非目标：token/字体重做、IA 重排、转写/润色业务、像素截图基建。
 - 风险/闸门：Standard / medium；规格已批；G8 与未归档 UI change 重叠，用户已在规格闸门接受 `W-g8-overlap-ui-theme`。
 - 禁止路径：`speech_recognizer.py`、`audio_recorder.py`、热键核心。
 

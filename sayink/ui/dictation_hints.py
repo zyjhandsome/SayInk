@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from sayink.audio_devices import INPUT_SOURCE_LABELS
 from sayink.config import DEFAULT_HOTKEY, TRIGGER_MODE_CONTINUOUS, format_hotkey
 
 
@@ -17,11 +18,7 @@ class DictationHints:
 
 def dictation_hints(config) -> DictationHints:
     source_key = config.get("audio.input_source", "microphone")
-    source = {
-        "microphone": "麦克风",
-        "system": "电脑声音",
-        "mixed": "麦克风 + 电脑声音",
-    }.get(source_key, "麦克风")
+    source = INPUT_SOURCE_LABELS.get(source_key, "麦克风")
     continuous = config.get("audio.trigger_mode") == TRIGGER_MODE_CONTINUOUS
     mode = "持续转写" if continuous else "单次转写"
     history_only = config.history_only_output()
@@ -32,8 +29,8 @@ def dictation_hints(config) -> DictationHints:
     if continuous:
         esc_stops = config.get("audio.esc_stops_continuous", True)
         stop = (
-            "Esc 或听写条「结束」结束录音，已录内容继续识别。"
-            if esc_stops else "点听写条「结束」结束录音，已录内容继续识别。"
+            "Esc 或转写条「结束」结束录音，已录内容继续识别。"
+            if esc_stops else "点转写条「结束」结束录音，已录内容继续识别。"
         )
         output_clause = "；历史已关闭，结果不会保存或粘贴" if warning else f"并{destination}"
         detail = f"按住快捷键启动，松开后继续录制；停顿后识别{output_clause}，不用一直按住。{stop}"

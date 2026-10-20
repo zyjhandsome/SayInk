@@ -263,7 +263,7 @@ class TestRestoreGlossaryCase:
 
     def test_uppercase_model_output_takes_the_glossary_spelling(self):
         glossary = [{"term": "GitHub", "variants": []}, {"term": "SayInk"}]
-        assert restore_glossary_case("代码在GITHUB上，用sayink听写", glossary) == "代码在GitHub上，用SayInk听写"
+        assert restore_glossary_case("代码在GITHUB上，用sayink转写", glossary) == "代码在GitHub上，用SayInk转写"
 
     def test_plain_string_entries_count_as_terms(self):
         assert restore_glossary_case("打开 VSCODE", ["VSCode"]) == "打开 VSCode"
@@ -597,6 +597,28 @@ class TestModelsDirGlobal:
             assert str(d).startswith(str(tmp_path))
         finally:
             sr.set_models_dir(None)
+
+    def test_unusable_models_dir_falls_back_to_the_default_instead_of_crashing(self, tmp_path, monkeypatch):
+        """A configured folder on a removed drive must not take startup down."""
+        from sayink import speech_recognizer as sr
+
+        monkeypatch.setattr(sr, "_get_portable_model_dir", lambda mid: None)
+        blocker = tmp_path / "file-not-a-dir"
+        blocker.write_text("x", encoding="utf-8")
+        try:
+            assert sr.set_models_dir(blocker / "models") is False
+            assert sr._get_models_dir() == sr.default_models_dir()
+            assert sr.set_models_dir(tmp_path / "ok") is True
+            assert sr._get_models_dir() == tmp_path / "ok"
+        finally:
+            sr.set_models_dir(None)
+
+    def test_model_dir_names_cover_both_registries(self):
+        from sayink.speech_recognizer import AUX_MODEL_REGISTRY, MODEL_REGISTRY, model_dir_names
+
+        names = model_dir_names()
+        assert len(names) == len(MODEL_REGISTRY) + len(AUX_MODEL_REGISTRY)
+        assert "silero-vad" in names
 
     def test_get_model_dir_unknown_raises(self):
         from sayink.speech_recognizer import get_model_dir
@@ -1376,6 +1398,26 @@ class TestModelDownloadSources:
         assert errors and "不完整" in errors[0]
         assert not (tmp_path / "tiny" / "a.bin").exists()
         assert not (tmp_path / "tiny" / "a.bin.tmp").exists()
+
+    def test_a_corrupt_leftover_is_replaced_instead_of_kept(self, monkeypatch, tmp_path):
+        """An empty stub / wrong-content file in the models dir used to be
+        skipped as 「已存在」, so every retry failed with zero network calls."""
+        (tmp_path / "tiny").mkdir()
+        (tmp_path / "tiny" / "a.bin").write_bytes(b"garbage from an earlier attempt")
+        responses = [_FakeHttpStream(b"weights")]
+        worker, urls, done, errors = self._worker(monkeypatch, tmp_path, responses, source="huggingface")
+        worker.run()
+        assert len(urls) == 1
+        assert done == ["tiny"] and errors == []
+        assert (tmp_path / "tiny" / "a.bin").read_bytes() == b"weights"
+
+    def test_a_verified_leftover_is_not_downloaded_again(self, monkeypatch, tmp_path):
+        (tmp_path / "tiny").mkdir()
+        (tmp_path / "tiny" / "a.bin").write_bytes(b"weights")
+        worker, urls, done, errors = self._worker(monkeypatch, tmp_path, [], source="huggingface")
+        worker.run()
+        assert urls == []
+        assert done == ["tiny"] and errors == []
 
     def test_download_uses_the_pinned_revision(self, monkeypatch, tmp_path):
         responses = [_FakeHttpStream(b"weights")]

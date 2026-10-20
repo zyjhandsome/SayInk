@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import re
 import time
 from datetime import datetime
@@ -38,6 +39,8 @@ from sayink.ui import design_tokens as tok
 from sayink.ui.clipboard import copy_text
 from sayink.ui.flow_layout import FlowLayout, WrappingToolBar
 from sayink.ui.reading import fit_reading_width
+
+logger = logging.getLogger(__name__)
 
 COPY_FAILED_TEXT = "复制失败，请再试一次"
 
@@ -331,17 +334,19 @@ def _session_model(segments: list[SegmentRecord]) -> str:
 
 
 def history_shows_speakers(segments: list[SegmentRecord]) -> bool:
-    """Labels appear only after a second person shows up in this session."""
+    """Label multiple voices, or uncertainty alongside an identified voice."""
     ids = {int(segment.speaker_id) for segment in segments if int(segment.speaker_id) > 0}
-    return len(ids) >= 2
+    return len(ids) >= 2 or bool(ids) and any(
+        segment.trigger_mode == "continuous" and int(segment.speaker_id) == 0 for segment in segments
+    )
 
 
 def _route_caption(route: str) -> str:
-    return {"mic": "麦克风", "system": "电脑播放"}.get((route or "").strip(), "")
+    return {"mic": "麦克风", "system": "电脑声音"}.get((route or "").strip(), "")
 
 
 def _speaker_heading(segment: SegmentRecord) -> str:
-    heading = f"说话人 {int(segment.speaker_id)}"
+    heading = f"说话人 {int(segment.speaker_id)}" if int(segment.speaker_id) > 0 else "说话人待确认"
     route = _route_caption(segment.speaker_route)
     if route:
         return f"{heading} · {route}"
@@ -352,7 +357,7 @@ def _labeled_text(segment: SegmentRecord, text: str, *, show_speakers: bool) -> 
     body = text.strip()
     if not body:
         return ""
-    if show_speakers and int(segment.speaker_id) > 0:
+    if show_speakers:
         return f"{_speaker_heading(segment)}\n{body}"
     return body
 
@@ -370,7 +375,7 @@ def _session_body(segments: list[SegmentRecord]) -> str:
 _SOURCE_CHIP = {
     "mic": "麦克风",
     "microphone": "麦克风",
-    "system": "电脑播放",
+    "system": "电脑声音",
     "mixed": "混合",
     "file": "文件转写",
 }
@@ -392,7 +397,7 @@ def _friendly_app_name(name: str) -> str:
 
 
 def _source_description(source: str) -> str:
-    return "麦克风 + 电脑播放" if source == "mixed" else _source_chip_text(source)
+    return "麦克风 + 电脑声音" if source == "mixed" else _source_chip_text(source)
 
 
 def _search_excerpt(text: str, query: str) -> str:
@@ -553,7 +558,7 @@ class _ClearHistoryDialog(QDialog):
 
         title = QLabel("清空全部历史")
         title.setObjectName("clearHistoryTitle")
-        scope = f"全部 {session_count} 条听写历史" if session_count is not None else "全部听写历史"
+        scope = f"全部 {session_count} 条转写历史" if session_count is not None else "全部转写历史"
         body = QLabel(f"将永久删除{scope}，包括搜索结果之外和尚未加载的记录。\n\n会议记录不受影响。此操作不可撤销。")
         body.setWordWrap(True)
         body.setObjectName("clearHistoryBody")
@@ -628,9 +633,11 @@ class HistoryWindow(QWidget):
         self._polishing_session_id: str | None = None
         self._editing_session = False
         self._editing_session_id: str | None = None
+        self._editing_original_text = ""
         self._sessions_by_id: dict[str, SessionSummary] = {}
         self._pending_delete: list[SessionSummary] = []
         self._pending_merge: list[SessionSummary] = []
+        self._merge_committed_by_delete = False
         self._open_session_id: str | None = None
         self._search_query = ""
         self._history_enabled = True
@@ -1029,10 +1036,10 @@ class HistoryWindow(QWidget):
         stream_lay.setSpacing(8)
         stream.setMinimumWidth(tok.WORKSPACE_LIST_MIN_WIDTH)
         self._search_edit = QLineEdit(stream)
-        self._search_edit.setPlaceholderText("搜索全部听写历史")
-        self._search_edit.setAccessibleName("搜索全部听写历史")
+        self._search_edit.setPlaceholderText("搜索全部转写历史")
+        self._search_edit.setAccessibleName("搜索全部转写历史")
         self._search_edit.setClearButtonEnabled(True)
-        self._search_edit.setToolTip("搜索全部听写历史的原文与润色文本，不含会议记录 · Ctrl+F")
+        self._search_edit.setToolTip("搜索全部转写历史的原文与润色文本，不含会议记录 · Ctrl+F")
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(200)
@@ -1052,7 +1059,7 @@ class HistoryWindow(QWidget):
         self._manage_btn = QPushButton("更多")
         self._manage_btn.setAccessibleName("历史列表管理")
         self._manage_menu = QMenu(self._manage_btn)
-        self._clear_all_action = self._manage_menu.addAction("清空全部听写历史")
+        self._clear_all_action = self._manage_menu.addAction("清空全部转写历史")
         self._clear_all_action.triggered.connect(self._clear_all_history)
         self._manage_btn.setMenu(self._manage_menu)
         self._summary_row.add(self._manage_btn, role="right")
@@ -1137,7 +1144,7 @@ class HistoryWindow(QWidget):
         self._copy_btn.clicked.connect(self._copy_selected_effective)
         tools.add(self._copy_btn)
         self._polish_btn = QPushButton("润色")
-        self._polish_btn.setToolTip("使用 AI 服务对当前会话进行润色（保留原文）")
+        self._polish_btn.setToolTip("按「AI 服务」中的处理方式（润色或纠错）处理当前会话，原文保留")
         self._polish_btn.clicked.connect(self._polish_selected_session)
         tools.add(self._polish_btn)
         self._edit_btn = QPushButton("编辑")
@@ -1259,14 +1266,15 @@ class HistoryWindow(QWidget):
     # ── data → list ───────────────────────────────────────────────
 
     def refresh(self) -> None:
+        # Both branches page by ``_session_limit``: every row is a widget, so a
+        # common search word matching thousands of sessions must not freeze
+        # the window while it builds them all.
         if self._search_query:
-            sessions = self._store.search_sessions(self._search_query)
-            self._has_more = False
+            sessions = self._store.search_sessions(self._search_query, limit=self._session_limit + 1)
         else:
             sessions = self._store.list_sessions(limit=self._session_limit + 1)
-            self._has_more = len(sessions) > self._session_limit
-            sessions = sessions[:self._session_limit]
-        self._load_sessions(sessions)
+        self._has_more = len(sessions) > self._session_limit
+        self._load_sessions(sessions[:self._session_limit])
 
     def set_history_enabled(self, enabled: bool) -> None:
         self._history_enabled = enabled
@@ -1346,7 +1354,8 @@ class HistoryWindow(QWidget):
             self._history_preferences_btn.setVisible(
                 not sessions and not self._search_query and not self._history_enabled
             )
-            self._more_btn.setVisible(self._has_more and not self._search_query)
+            self._more_btn.setText("加载更多结果" if self._search_query else "加载更早的会话")
+            self._more_btn.setVisible(self._has_more)
             self._sessions_by_id = {s.session_id: s for s in sessions}
             last_day = None
             for session in sessions:
@@ -1401,7 +1410,7 @@ class HistoryWindow(QWidget):
                 bar.setValue(bar.value() - anchor_top)
         elif same_query and list_at_top:
             self._session_list.verticalScrollBar().setValue(0)
-        count = len(sessions)
+        count = f"{len(sessions)}+" if self._has_more and self._search_query else str(len(sessions))
         self._list_summary_text = f"找到 {count} 条" if self._search_query else f"最近 {count} 条"
         self._sync_clear_all_enabled()
         self._restyle_rows()
@@ -1669,7 +1678,7 @@ class HistoryWindow(QWidget):
                 continue
             if many or show_speakers:
                 stamp = datetime.fromtimestamp(segment.created_at / 1000).strftime("%H:%M:%S")
-                if show_speakers and int(segment.speaker_id) > 0:
+                if show_speakers:
                     head = _speaker_heading(segment)
                 else:
                     head = str(index)
@@ -1708,7 +1717,7 @@ class HistoryWindow(QWidget):
         selected = self._selected_session_ids()
         count = len(selected)
         if self._editing_session and (self._selection_mode or count != 1 or selected[0] != self._editing_session_id):
-            self._exit_inline_edit_state()
+            self._leave_inline_edit_on_row_change()
         if count > 1 and not self._selection_mode:
             self._set_selection_mode(True)
             return
@@ -1722,10 +1731,11 @@ class HistoryWindow(QWidget):
         polishing = self._polishing_session_id is not None
         self._polish_btn.setVisible(not self._selection_mode and not self._editing_session)
         self._polish_btn.setEnabled(count == 1 and not polishing)
+        action = self._llm_action_label()
         if polishing and count == 1 and selected[0] == self._polishing_session_id:
-            self._polish_btn.setText("正在润色")
+            self._polish_btn.setText(f"正在{action}")
         else:
-            self._polish_btn.setText("重新润色" if has_polished else "润色")
+            self._polish_btn.setText(f"重新{action}" if has_polished else action)
         self._edit_btn.setVisible(not self._selection_mode)
         self._edit_btn.setEnabled(count == 1 and not polishing)
         self._edit_btn.setText("保存" if self._editing_session else "编辑")
@@ -1836,10 +1846,29 @@ class HistoryWindow(QWidget):
         else:
             self._start_inline_edit()
 
+    def _settle_pending_merge(self) -> bool:
+        """Write a merge still inside its undo window before anything edits,
+        re-polishes, promotes or deletes those rows. While the merge is only
+        previewed, the detail pane shows re-numbered virtual rows that do not
+        exist in the DB; an edit mapped onto them would land on the wrong
+        rows. Returns True when a merge was committed."""
+        if not self._pending_merge:
+            return False
+        self._undo_timer.stop()
+        self._commit_pending_merge_now()
+        flush = getattr(self._store, "flush", None)
+        if callable(flush):
+            flush(timeout=2.0)
+        self._toast.hide()
+        return True
+
     def _start_inline_edit(self) -> None:
         session_id = self._active_session_id()
         if not session_id:
             return
+        if self._settle_pending_merge():
+            self.refresh()
+            session_id = self._active_session_id() or session_id
         segments = _segments_in_order(self._get_session_segments_effective(session_id))
         if not segments:
             return
@@ -1854,17 +1883,29 @@ class HistoryWindow(QWidget):
                 chunks.append(t)
         self._editing_session = True
         self._editing_session_id = session_id
+        self._editing_original_text = "\n\n".join(chunks)
         self._details.setReadOnly(False)
         self._paint_history_styles()
-        self._details.setPlainText("\n\n".join(chunks))
+        self._details.setPlainText(self._editing_original_text)
         self._details.setFocus()
         self._on_selection_changed()
 
     def _exit_inline_edit_state(self) -> None:
         self._editing_session = False
         self._editing_session_id = None
+        self._editing_original_text = ""
         self._details.setReadOnly(True)
         self._paint_history_styles()
+
+    def _leave_inline_edit_on_row_change(self) -> None:
+        """The user clicked another row mid-edit: keep what they typed (like
+        the meeting page's draft autosave) instead of discarding it silently."""
+        changed = self._details.toPlainText().strip() != self._editing_original_text.strip()
+        if changed and self._details.toPlainText().strip():
+            self._save_inline_edit(refresh=False)
+            QTimer.singleShot(0, self.refresh)
+        else:
+            self._exit_inline_edit_state()
 
     def _cancel_inline_edit(self) -> None:
         if not self._editing_session:
@@ -1872,7 +1913,7 @@ class HistoryWindow(QWidget):
         self._exit_inline_edit_state()
         self._on_selection_changed()
 
-    def _save_inline_edit(self) -> None:
+    def _save_inline_edit(self, *, refresh: bool = True) -> None:
         if not self._editing_session or not self._editing_session_id:
             return
         session_id = self._editing_session_id
@@ -1893,7 +1934,8 @@ class HistoryWindow(QWidget):
             self._view_raw_btn.setChecked(False)
             self._view_polished_btn.blockSignals(False)
             self._show_feedback("已保存修改")
-        self.refresh()
+        if refresh:
+            self.refresh()
 
     def _ensure_polisher(self):
         if self._polisher is None:
@@ -1904,28 +1946,73 @@ class HistoryWindow(QWidget):
             self._polisher.polish_error.connect(self._on_polish_error)
         return self._polisher
 
+    def _llm_mode(self) -> str:
+        from sayink.text_polisher import LLM_MODE_POLISH, normalize_llm_mode
+
+        if self._config is None:
+            return LLM_MODE_POLISH
+        return normalize_llm_mode(self._config.get("llm.mode", LLM_MODE_POLISH))
+
+    def _llm_action_label(self) -> str:
+        """The AI action is whatever「AI 服务 → 处理方式」says, same as live dictation."""
+        from sayink.text_polisher import LLM_MODE_CORRECT
+
+        return "纠错" if self._llm_mode() == LLM_MODE_CORRECT else "润色"
+
     def _polish_selected_session(self) -> None:
         session_id = self._active_session_id()
         if not session_id or self._polishing_session_id is not None:
             return
-        from sayink.text_polisher import polish_settings_complete
+        from sayink.text_polisher import polish_settings_complete, prompt_config_key
 
-        api_url = str(self._config.get("llm.api_url", "") or "") if self._config is not None else ""
-        api_key = str(self._config.get("llm.api_key", "") or "") if self._config is not None else ""
-        model_name = str(self._config.get("llm.model_name", "") or "") if self._config is not None else ""
-        prompt = str(self._config.get("llm.custom_prompt", "") or "") if self._config is not None else ""
+        config = self._config
+        api_url = str(config.get("llm.api_url", "") or "") if config is not None else ""
+        api_key = str(config.get("llm.api_key", "") or "") if config is not None else ""
+        model_name = str(config.get("llm.model_name", "") or "") if config is not None else ""
+        # Same prompt key, mode and glossary as the live pipeline, so the stored
+        # text matches what the user would have got at dictation time.
+        mode = self._llm_mode()
+        prompt = str(config.get(prompt_config_key(mode), "") or "") if config is not None else ""
+        glossary = config.get("stt.glossary", []) if config is not None else []
         if not polish_settings_complete(api_url, api_key, model_name):
             self._show_feedback("请先在 AI 服务中配置接口与模型")
             self.ai_settings_requested.emit()
             return
+        if self._settle_pending_merge():
+            self.refresh()
+            session_id = self._active_session_id() or session_id
         segments = _segments_in_order(self._get_session_segments_effective(session_id))
         raw_parts = [s.raw_text.strip() for s in segments if s.raw_text.strip()]
         if not raw_parts:
             return
         self._polishing_session_id = session_id
+        self._polishing_raw = "\n\n".join(raw_parts)
+        self._polishing_mode = mode
+        self._polishing_glossary = list(glossary) if isinstance(glossary, list) else []
         self._on_selection_changed()
         polisher = self._ensure_polisher()
-        polisher.polish("\n\n".join(raw_parts), api_url, api_key, model_name, prompt)
+        polisher.polish(
+            self._polishing_raw, api_url, api_key, model_name, prompt,
+            mode=self._polishing_mode, glossary=self._polishing_glossary,
+        )
+
+    def _polish_rejection(self, polished_text: str) -> str:
+        """Why the reply must not replace the stored text; empty when it may.
+
+        The live pipeline falls back to the raw words when a reply fails the
+        fidelity guard; the history action keeps the same bar instead of
+        saving a rewrite that dropped a number or flipped a negation.
+        """
+        from sayink.asr_correction import correction_rejection_reason
+        from sayink.polish_fidelity import polish_rejection_reason
+        from sayink.text_polisher import LLM_MODE_CORRECT
+
+        raw = getattr(self, "_polishing_raw", "")
+        if not raw:
+            return ""
+        if getattr(self, "_polishing_mode", "") == LLM_MODE_CORRECT:
+            return correction_rejection_reason(raw, polished_text, getattr(self, "_polishing_glossary", ()))
+        return polish_rejection_reason(raw, polished_text)
 
     def _on_polish_complete(self, polished_text: str) -> None:
         session_id = self._polishing_session_id
@@ -1934,6 +2021,13 @@ class HistoryWindow(QWidget):
             self._on_selection_changed()
             return
         cleaned = (polished_text or "").strip()
+        label = "纠错" if getattr(self, "_polishing_mode", "") == "correct" else "润色"
+        reason = self._polish_rejection(cleaned) if cleaned else ""
+        if reason:
+            logger.warning("历史%s结果未通过保真检查（%s），未保存", label, reason)
+            self._show_feedback(f"{label}结果未通过保真检查（{reason}），已保留原文")
+            self.refresh()
+            return
         if cleaned:
             segments = _segments_in_order(self._get_session_segments_effective(session_id))
             mapping = self._map_edited_text_to_segments(segments, cleaned)
@@ -1948,20 +2042,21 @@ class HistoryWindow(QWidget):
             self._view_polished_btn.setChecked(True)
             self._view_raw_btn.setChecked(False)
             self._view_polished_btn.blockSignals(False)
-            self._show_feedback("已完成润色")
+            self._show_feedback(f"已完成{label}")
         self.refresh()
 
     def _on_polish_error(self, error_msg: str) -> None:
         self._polishing_session_id = None
         self._on_selection_changed()
-        self._show_feedback(error_msg or "润色失败，请稍后重试")
+        self._show_feedback(error_msg or f"{self._llm_action_label()}失败，请稍后重试")
 
     def _promote_selected_to_meeting(self) -> None:
         ids = self._selected_session_ids()
         if not ids:
             return
-        if self._pending_merge:
-            self._commit_pending_merge_now()
+        # The promoted meeting reads the rows on another connection: a merge
+        # still in the writer queue would leave the newer sessions out of it.
+        self._settle_pending_merge()
         from sayink.meeting_store import MeetingStore
 
         promoter = getattr(self._store, "create_meeting_from_sessions", None)
@@ -2047,7 +2142,8 @@ class HistoryWindow(QWidget):
         if self._transient_active:
             return
         if self._pending_delete:
-            self._feedback_label.setText(f"已删除 {len(self._pending_delete)} 项 · 8 秒内可撤销")
+            merged = "（之前的合并已生效）" if self._merge_committed_by_delete else ""
+            self._feedback_label.setText(f"已删除 {len(self._pending_delete)} 项{merged} · 8 秒内可撤销删除")
             self._undo_btn.setVisible(True)
             self._toast.show()
             self._toast.reposition()
@@ -2094,8 +2190,9 @@ class HistoryWindow(QWidget):
         if not deletable:
             self._show_feedback("这场正在转写，请先结束再删除")
             return
-        if self._pending_merge:
-            self._commit_pending_merge_now()
+        # Deleting the merged row means the merge itself is final; the toast
+        # says so, since its own undo window is forfeited here.
+        self._merge_committed_by_delete = self._settle_pending_merge()
         # Undo replaces the confirmation dialog: one safety net, not two.
         ids = {s.session_id for s in deletable}
         self._pending_delete.extend(deletable)

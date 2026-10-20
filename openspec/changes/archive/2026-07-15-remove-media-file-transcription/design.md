@@ -2,7 +2,7 @@
 
 ## Context
 
-已批准规格要求撤回本地音/视频文件转写与轻翻译；保留历史中 `source=file` / `trigger_mode=file_import` 的只读展示；打包不再捆绑 ffmpeg；`llm.mode=translate` 读取时静默回落 `polish`。实现已存在于 `App` 文件任务、`media_decoder`、托盘入口、设置翻译模式与 `build.py` 拷贝逻辑。本设计只描述如何拆除，不改变实时热键听写语义。
+已批准规格要求撤回本地音/视频文件转写与轻翻译；保留历史中 `source=file` / `trigger_mode=file_import` 的只读展示；打包不再捆绑 ffmpeg；`llm.mode=translate` 读取时静默回落 `polish`。实现已存在于 `App` 文件任务、`media_decoder`、托盘入口、设置翻译模式与 `build.py` 拷贝逻辑。本设计只描述如何拆除，不改变实时热键转写语义。
 
 ## Goals / Non-Goals
 
@@ -11,12 +11,12 @@
 - 产品面不再能启动文件转写；托盘无导入入口
 - 删除解码模块与打包 ffmpeg 挂钩
 - 去掉翻译模式与相关 prompt/UI；遗留配置回落润色
-- 历史遗产展示保留；热键听写 + 润色回归通过
+- 历史遗产展示保留；热键转写 + 润色回归通过
 
 **Non-Goals:**
 
 - 删除或迁移历史库行；改 SQLite DDL
-- 重做实时听写 / 新增替代文件转写服务
+- 重做实时转写 / 新增替代文件转写服务
 - 在本阶段 sync/archive 主规格（属后续 archive 流程）
 
 ## 已批准目标与约束
@@ -43,9 +43,9 @@
 
 ### 方案 A — 物理拆除（建议）
 
-- 方案形态：删除入口、App 文件任务、`media_decoder`、翻译模式代码与 ffmpeg 打包挂钩；测试改为证明缺席 + 听写回归；历史展示映射保留
+- 方案形态：删除入口、App 文件任务、`media_decoder`、翻译模式代码与 ffmpeg 打包挂钩；测试改为证明缺席 + 转写回归；历史展示映射保留
 - 收益：与已决 1A/3A 一致；无死代码与假入口
-- 成本/风险：`app.py` 改动面较大；须仔细拆互斥分支以免听写回归
+- 成本/风险：`app.py` 改动面较大；须仔细拆互斥分支以免转写回归
 - 可逆性：git revert 可回滚
 - 验证方式：pytest 缺席/回归 + 托盘菜单断言 + build 无拷贝符号
 
@@ -77,7 +77,7 @@
 撤回后控制流：
 
 ```text
-热键听写（保留）
+热键转写（保留）
   AudioRecorder → SpeechRecognizer → [可选 TextPolisher polish] → 粘贴/历史
 
 文件转写（删除）
@@ -92,14 +92,14 @@
 ## 接口与状态模型
 
 - **删除**：`App.start_file_transcription` / `cancel_file_transcription` / `_FileDecodeWorker` / `_file_job_*` / `HISTORY_SOURCE_FILE` 写入路径；托盘 `import_file_requested`；整个 `sayink.media_decoder`；`LLM_MODE_TRANSLATE` 与翻译 prompt；设置页翻译 combo/目标语言行；`build._copy_ffmpeg_into_dist` 等
-- **保留**：`history_window` 对 `file` / `file_import` 的展示映射；润色 `LLM_MODE_POLISH`；实时听写互斥逻辑中仅去掉文件任务相关分支
+- **保留**：`history_window` 对 `file` / `file_import` 的展示映射；润色 `LLM_MODE_POLISH`；实时转写互斥逻辑中仅去掉文件任务相关分支
 - **配置键**：可保留 `llm.target_language` 键于文件中但不暴露 UI、不参与运行时；或读时忽略。`llm.mode` 非法/`translate` → `polish`
 
 ## 失败处理与可观测性
 
 - 配置回落：静默，不弹窗、不阻断启动
 - 删除后不应再出现「ffmpeg/解码/文件转写」类 ERROR_HINTS 用户路径
-- 日志：去掉文件任务 info；听写日志保持
+- 日志：去掉文件任务 info；转写日志保持
 
 ## 兼容、迁移与回滚
 
@@ -130,7 +130,7 @@
 |---|---|---|---|
 | 产品不再提供音视频文件导入转写 / 托盘无导入 | 删托盘信号与菜单 | 2.x | 托盘单测或静态断言菜单文案 |
 | 无法启动新的文件转写任务 | 删 App 文件任务 API | 3.x | `hasattr`/`pytest.raises` 或测试改写为模块无符号 |
-| 撤回后不破坏实时听写 | 保留热键路径；拆互斥 | 3.x + 5.x | `tests/test_app.py` 等回归 |
+| 撤回后不破坏实时转写 | 保留热键路径；拆互斥 | 3.x + 5.x | `tests/test_app.py` 等回归 |
 | 历史中的文件来源记录只读保留 | 不改 history_store；保留 UI 映射 | 5.x | 历史窗单测构造 file 记录 |
 | 发布物不再捆绑解码器 | 删 build 拷贝与 third_party | 4.x | 改写/替换 `test_build_ffmpeg` |
 | 产品不再提供轻翻译模式 | 设置+polisher 去 translate | 1.x | settings/polisher 测试 |
@@ -138,7 +138,7 @@
 
 ## 已知风险与非目标
 
-- [Risk] `app.py` 大块删除误伤听写 → Mitigation：纵向任务 + 听写回归命令必跑
+- [Risk] `app.py` 大块删除误伤转写 → Mitigation：纵向任务 + 转写回归命令必跑
 - [Risk] 删除 `HISTORY_SOURCE_FILE` 常量时误删历史展示映射 → Mitigation：任务 5 显式保护 `history_window` 映射
 - [Risk] `.gitignore` / README third_party 残留误导 → Mitigation：任务 4 清理挂钩与目录说明
 - 非目标见上；不在本 change 内 archive 主规格
@@ -190,7 +190,7 @@
 | 需求/场景 | 技术计划 | 任务 | 验证 | 状态 |
 |---|---|---|---|---|
 | 无导入入口 / 无新文件任务 | 方案 A | 2–3 | pytest | 已规划 |
-| 听写不破坏 | 方案 A | 3、5 | pytest 回归 | 已规划 |
+| 转写不破坏 | 方案 A | 3、5 | pytest 回归 | 已规划 |
 | 历史只读 | 保留映射 | 5 | 历史单测 | 已规划 |
 | 去 ffmpeg 捆绑 | 方案 A | 4 | build 测试改写 | 已规划 |
 | 去翻译 + 回落 | Config/UI/polisher | 1 | config/polisher/settings | 已规划 |

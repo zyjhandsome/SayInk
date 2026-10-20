@@ -147,6 +147,66 @@ class TestExtractJson:
         assert extract_json("") is None
         assert extract_json("{broken") is None
 
+    def test_absurdly_nested_brackets_are_treated_as_not_json(self):
+        # json.loads raises RecursionError (not ValueError) here; a broken
+        # endpoint must not take the minutes worker down.
+        nested = '{"a":' + "[" * 5000 + "]" * 5000 + "}"
+        assert extract_json(nested) is None
+        assert extract_json("前言 " + nested + " 后记") is None
+
+
+class TestValidateMinutes:
+    def test_nulls_where_the_prompt_asked_for_empty_values_are_normalised(self):
+        from sayink.minutes_validation import validate_minutes
+
+        payload = {
+            "title": None,
+            "summary": "结论先行。",
+            "decisions": [{"text": None}, {"text": "采用方案 B", "owner": None}],
+            "action_items": None,
+            "speakers": [{"label": "说话人1", "summary": ""}],
+            "topics": [{"title": None, "points": None}, {"title": "进度", "points": [{"text": None}, {"text": "按期"}]}],
+        }
+        out = validate_minutes(payload)
+        assert out["title"] == ""
+        assert out["decisions"] == [{"text": "采用方案 B", "owner": ""}]
+        assert out["action_items"] == []
+        # A speaker without a summary is still a speaker.
+        assert out["speakers"] == [{"label": "说话人1", "summary": ""}]
+        assert out["topics"] == [{"title": "进度", "points": [{"text": "按期"}]}]
+
+    def test_wrong_types_and_empty_documents_still_reject(self):
+        from sayink.minutes_validation import validate_minutes
+        from sayink.text_polisher import LLMResponseError
+
+        with pytest.raises(LLMResponseError):
+            validate_minutes({"summary": ["列表"]})
+        with pytest.raises(LLMResponseError):
+            validate_minutes({"decisions": "不是列表"})
+        with pytest.raises(LLMResponseError):
+            validate_minutes({"decisions": [{"text": 12}]})
+        with pytest.raises(LLMResponseError, match="为空"):
+            validate_minutes({"title": "x", "decisions": [{"text": None}]})
+
+
+class TestSplitChunk:
+    def test_mid_line_cut_keeps_the_prefix_of_the_line_being_cut(self):
+        from sayink.minutes_generator import _split_chunk
+
+        text = "[00:00:01] 说话人1：短句。\n[00:00:02] 说话人2：" + "甲" * 60 + "乙" * 60
+        left, right = _split_chunk(text)
+        assert left + right.replace("[00:00:02] 说话人2：", "", 1) == text
+        assert right.startswith("[00:00:02] 说话人2：甲")
+        assert "说话人1" not in right
+
+    def test_newline_split_is_preferred(self):
+        from sayink.minutes_generator import _split_chunk
+
+        text = "\n".join(f"[00:00:0{i}] 说话人{i}：内容{i}" for i in range(1, 7))
+        left, right = _split_chunk(text)
+        assert left.endswith("内容2") and right.startswith("[00:00:03] 说话人3")
+        assert left + "\n" + right == text
+
 
 class TestRender:
     def _payload(self):

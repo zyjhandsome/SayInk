@@ -19,7 +19,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from sayink.history_store import MEETING_TRIGGER_MODE, HistoryStore, SegmentRecord, _row_to_segment
+from sayink.history_store import MEETING_TRIGGER_MODE, HistoryStore, SegmentRecord, escape_like, row_to_segment
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +118,7 @@ _MEETING_COLUMNS = (
     "started_at, ended_at, status, deleted_at"
 )
 
-_NOTE_METADATA_COLUMNS = ("template_id", "model", "json_payload", "generated_at", "duration_ms", "chunked")
+_NOTE_METADATA_COLUMNS = ("template_id", "model", "json_payload", "generated_at", "duration_ms", "chunked", "user_edited")
 
 
 def _note_metadata(conn: sqlite3.Connection, meeting_id: str) -> dict[str, Any]:
@@ -241,7 +241,7 @@ class MeetingStore:
         model_id = next((s.model for s in segments if s.model), "")
         stamp_str = time.strftime("%m-%d %H:%M", time.localtime(started_at / 1000))
         if not title.strip():
-            title = f"{stamp_str} 听写整理" if len(ids) == 1 else f"{stamp_str} 等 {len(ids)} 条听写整理"
+            title = f"{stamp_str} 转写整理" if len(ids) == 1 else f"{stamp_str} 等 {len(ids)} 条转写整理"
 
         record = MeetingRecord(
             id=meeting_id or uuid.uuid4().hex,
@@ -441,24 +441,24 @@ class MeetingStore:
         self._write(_save)
 
     def relabel_segments(self, meeting_id: str, mapping: dict[int, int]) -> None:
-        """Recluster automatic meeting assignments; preserve manual corrections."""
-        pairs = [(int(new), meeting_id, int(old), MEETING_TRIGGER_MODE)
-                 for old, new in mapping.items() if old != new]
-        if not pairs:
-            return
+        """Recluster automatic meeting assignments; preserve manual corrections.
 
-        def _relabel(conn: sqlite3.Connection) -> None:
-            conn.executemany(
-                "UPDATE history SET speaker_id = -(? + 1) "
-                "WHERE session_id = ? AND speaker_id = ? AND trigger_mode = ? AND speaker_locked = 0", pairs,
-            )
-            conn.execute(
-                "UPDATE history SET speaker_id = -speaker_id - 1 "
-                "WHERE session_id = ? AND speaker_id < 0 AND trigger_mode = ? AND speaker_locked = 0",
-                (meeting_id, MEETING_TRIGGER_MODE),
-            )
+        Same SQL as continuous dictation (one implementation in the history
+        store), restricted to this meeting's rows and to unlocked segments."""
+        self._history.relabel_session_speakers(
+            meeting_id, mapping, trigger_mode=MEETING_TRIGGER_MODE, respect_locks=True,
+            failure_notice=MEETING_WRITE_FAILED_NOTICE,
+        )
 
-        self._write(_relabel)
+    def set_segment_speakers(self, meeting_id: str, assignments: dict[int, int]) -> None:
+        """Apply an end-of-meeting re-assignment ``{seq: speaker_id}``.
+
+        Automatic numbers only: a segment the user locked keeps its speaker.
+        """
+        self._history.relabel_session_segments(
+            meeting_id, assignments, trigger_mode=MEETING_TRIGGER_MODE,
+            failure_notice=MEETING_WRITE_FAILED_NOTICE,
+        )
 
     def set_segment_speaker(self, meeting_id: str, seq: int, speaker_id: int) -> None:
         """Lock one already-transcribed segment to the user's chosen speaker."""
@@ -592,8 +592,11 @@ class MeetingStore:
     def restore_previous_notes(self, meeting_id: str) -> None:
         """Swap the current and previous markdown, so restoring twice is a no-op.
 
-        The restored text no longer matches ``json_payload``; it is flagged as
-        user-edited so speaker renames patch the text instead of re-rendering.
+        The metadata (template, payload, and whether that version was hand
+        edited) travels with each version, so a restored AI version reads
+        「AI 生成」 again and can be re-rendered on a speaker rename. Rows
+        written before the flag was recorded are treated as edited, which
+        makes renames patch the text instead of re-rendering it.
         """
 
         def _swap(conn: sqlite3.Connection) -> None:
@@ -610,14 +613,15 @@ class MeetingStore:
             if not isinstance(previous, dict):
                 previous = {}
             restored = {key: previous.get(key, current[key]) for key in _NOTE_METADATA_COLUMNS}
+            restored["user_edited"] = 1 if previous.get("user_edited", 1) else 0
             conn.execute(
                 """
                 UPDATE meeting_notes
-                SET markdown = previous_markdown, previous_markdown = markdown, user_edited = 1,
+                SET markdown = previous_markdown, previous_markdown = markdown,
                     transcript_changed = previous_transcript_changed,
                     previous_transcript_changed = transcript_changed,
                     template_id = ?, model = ?, json_payload = ?, generated_at = ?, duration_ms = ?, chunked = ?,
-                    previous_metadata = ?
+                    user_edited = ?, previous_metadata = ?
                 WHERE meeting_id = ? AND previous_markdown != ''
                 """,
                 (*restored.values(), json.dumps(current, ensure_ascii=False), meeting_id),
@@ -665,9 +669,8 @@ class MeetingStore:
         q = q.strip()
         if not q:
             return self.list_meetings()
-        from sayink.history_store import _escape_like
 
-        pattern = f"%{_escape_like(q)}%"
+        pattern = f"%{escape_like(q)}%"
 
         def _q(conn: sqlite3.Connection) -> list[MeetingRecord]:
             rows = conn.execute(
@@ -713,7 +716,7 @@ class MeetingStore:
                 """,
                 (meeting_id, MEETING_TRIGGER_MODE),
             ).fetchall()
-            return [_row_to_segment(r) for r in rows]
+            return [row_to_segment(r) for r in rows]
 
         return self._history.read(_q, default=[]) or []
 
@@ -769,12 +772,3 @@ class MeetingStore:
             )
 
         return self._history.read(_q, default=None)
-
-    def segment_count(self, meeting_id: str) -> int:
-        def _q(conn: sqlite3.Connection) -> int:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM history WHERE session_id = ?", (meeting_id,)
-            ).fetchone()
-            return int(row[0]) if row else 0
-
-        return int(self._history.read(_q, default=0) or 0)

@@ -132,6 +132,14 @@ BUILTIN_TEMPLATES: tuple[MinutesTemplate, ...] = (
 
 def get_template(template_id: str, custom: Iterable[dict[str, Any]] | None = None) -> MinutesTemplate:
     """Built-in or user template by id; unknown ids fall back to 「通用会议」."""
+    template = find_template(template_id, custom)
+    return template if template is not None else BUILTIN_TEMPLATES[0]
+
+
+def find_template(template_id: str, custom: Iterable[dict[str, Any]] | None = None) -> MinutesTemplate | None:
+    """Built-in or user template by id; ``None`` when it no longer exists
+    (a deleted custom template), so callers can avoid re-rendering saved
+    notes through the wrong template."""
     for entry in custom or ():
         if isinstance(entry, dict) and entry.get("id") == template_id:
             output_mode = "refine" if entry.get("output_mode") == "refine" else "minutes"
@@ -147,7 +155,7 @@ def get_template(template_id: str, custom: Iterable[dict[str, Any]] | None = Non
     for template in BUILTIN_TEMPLATES:
         if template.id == template_id:
             return template
-    return BUILTIN_TEMPLATES[0]
+    return None
 
 
 def list_templates(custom: Iterable[dict[str, Any]] | None = None) -> list[MinutesTemplate]:

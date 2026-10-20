@@ -130,9 +130,9 @@ Delete the hidden `SettingsSidebar` instance and its dual-nav sync.
 
 Three groups, same order: 录音 → 音频 → 偏好.
 
-1. **录音**: two choice cards (连续口述 / 按住说话) + hotkey field. Hint is one sentence: hold ~0.30s to start continuous listen; release does not end; Esc or 结束 ends the session.
+1. **录音**: two choice cards (单次转写 / 持续转写) + hotkey field. Hint is one sentence: hold ~0.30s to start continuous listen; release does not end; Esc or 结束 ends the session.
 2. **音频**: three source cards. Amber mixed-mode callout only when mixed is selected. One primary: 测试声音. Device combos stay behind 手动选择; default is auto.
-3. **偏好**: theme segment (跟随系统 / 浅色 / 暗色) + toggles (开机启动、提示音、恢复剪贴板、保存语音历史). Retention days and max sessions visible only when history is on.
+3. **偏好**: theme segment (跟随系统 / 浅色 / 暗色) + toggles (开机启动、提示音、恢复剪贴板、保存转写历史). Retention days and max sessions visible only when history is on.
 
 ### 引擎
 

@@ -103,18 +103,20 @@ DEFAULT_CONFIG = {
         "models_dir": "",
         "download_source": "auto",
         "migration_version": 0,
-        # 识别增强——听写与会议共用（曾是 meeting.* 键，启动时自动迁移）。
+        # 识别增强——转写与会议共用（曾是 meeting.* 键，启动时自动迁移）。
         "glossary": [],            # [{"term": "张鑫", "variants": ["张新"]}] → 热词
         "language": "auto",        # 语种锁定；auto → zh（支持 language 的模型）
         "vad": "silero",           # silero / energy；Silero 未下载时自动退回 energy
         "speaker_model_enabled": True,
+        "speaker_activity_enabled": False,
     },
     "llm": {
         "enabled": False,
         "api_url": "",
         "api_key": "",
         "model_name": "",
-        "prompt": "",
+        "prompt": "",          # custom prompt for 润色 (legacy key)
+        "prompt_correct": "",  # custom prompt for 纠错
         "mode": "polish",
     },
     "history": {
@@ -139,7 +141,9 @@ DEFAULT_CONFIG = {
         "output_language": "auto",
         "aux_prompted": False,     # 首次开会缺辅助模型时问过一次「现在下载？」
         "confirmed_remote_hosts": [],
-        "single_request_char_limit": 20000,
+        # Per-request transcript cap (characters). 8000 is also the hard
+        # ceiling the generator enforces; this can only lower it.
+        "single_request_char_limit": 8000,
         "context_window_tokens": 32768,
         "max_output_tokens": 4096,
         "separate_lanes": False,
@@ -408,6 +412,13 @@ class Config:
                     if isinstance(default_value, (dict, list))
                     else default_value
                 )
+        if _path:
+            # Keys this build does not know inside a known section (written by
+            # a newer release, or hand-added) ride along instead of being
+            # erased on the next save. Top-level extras live in _extra_keys.
+            for key, value in current.items():
+                if key not in defaults:
+                    result[key] = copy.deepcopy(value)
         return result
 
     def _do_save(self):
@@ -450,9 +461,11 @@ class Config:
                 return self._extra_keys[k]
             else:
                 return default
-        # Legacy light-translation mode: treat as polish (silent fallback).
-        if key == "llm.mode" and isinstance(value, str) and value.strip().lower() == "translate":
-            return "polish"
+        # Only the known modes come back: "correct" stays, the retired
+        # light-translation mode and typos fall back to polish silently.
+        if key == "llm.mode":
+            mode = str(value or "").strip().lower()
+            return mode if mode in ("polish", "correct") else "polish"
         return value
 
     def set(self, key: str, value: Any):

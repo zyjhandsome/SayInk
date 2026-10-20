@@ -16,7 +16,7 @@ FONT_STACK = (
     "Segoe UI Variable",
     "Segoe UI",
 )
-_CJK_SAMPLE = "设置听写"
+_CJK_SAMPLE = "设置转写"
 _DEFAULT_UI_FONT = "Microsoft YaHei UI"
 UI_FONT_FAMILY = _DEFAULT_UI_FONT
 FONT = f'"{_DEFAULT_UI_FONT}"'
@@ -182,9 +182,6 @@ TRAY_MENU_RADIUS = 8
 TRAY_MENU_PAD_V = 5
 TRAY_MENU_PAD_H = 22
 TRAY_MENU_FONT = TYPE_FOOTNOTE
-
-TOGGLE_OFF_TRACK = (60, 60, 67, 48)
-TOGGLE_OFF_TRACK_HOVER = (60, 60, 67, 72)
 
 _LIGHT: dict[str, Any] = {
     "ACCENT": "#2563EB",

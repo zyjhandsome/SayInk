@@ -34,7 +34,7 @@
      - 8 秒到期后调用 `self._store.enqueue_merge_sessions(target_id, source_ids)`：在 SQLite 单写线程事务中，读取所有涉及会话的分段，按 `(created_at ASC, seq ASC)` 排序，依次将 `session_id` 设为 `target_id`、`seq` 重排为 `0, 1, ..., Total-1`。
   3. **转为会议（`MeetingStore.create_meeting_from_sessions`）**：
      - 单选点「转为会议」或多选点「合并转为会议」时，读取所选会话的全部 `SegmentRecord`，按 `(created_at ASC, seq ASC)` 排序。
-     - 计算 `started_at = min(s.captured_at or s.created_at)`，`ended_at = max(s.created_at)`，默认标题：单条为 `MM-DD HH:MM 听写整理`，多条为 `MM-DD HH:MM 等 N 条听写整理`。
+     - 计算 `started_at = min(s.captured_at or s.created_at)`，`ended_at = max(s.created_at)`，默认标题：单条为 `MM-DD HH:MM 转写整理`，多条为 `MM-DD HH:MM 等 N 条转写整理`。
      - 在单写线程事务中插入 `meetings` 行（`status = 'ended'`）并将分段复制插入 `history` 表（`session_id = new_meeting_id`, `seq = 0..K-1`, `trigger_mode = 'meeting'`），随后 `flush()` 并发射 `meeting_created.emit(new_meeting_id)`。
      - `MainWindow` 收到 `meeting_created(meeting_id)` 后调用 `self.show_page("meeting")` 和 `self._meeting.show_meeting(meeting_id)`。
 - 收益：零表结构改动，100% 保护 `raw_text`，完美兼容多段会话编辑与原文切换，8 秒撤销无闪烁。

@@ -11,7 +11,9 @@ from sayink.aux_models import (
     describe_aux_models,
     missing_aux_models,
 )
-from sayink.speech_recognizer import AUX_MODEL_REGISTRY, AUX_MODEL_SILERO_VAD, AUX_MODEL_SPEAKER
+from sayink.speech_recognizer import (
+    AUX_MODEL_REGISTRY, AUX_MODEL_SILERO_VAD, AUX_MODEL_SPEAKER, AUX_MODEL_SPEAKER_ACTIVITY,
+)
 
 
 class _FakeWorker(QObject):
@@ -87,6 +89,16 @@ def test_subset_and_nothing_to_do(monkeypatch):
     assert [w.model_id for w in created] == [AUX_MODEL_SILERO_VAD]
     monkeypatch.setattr("sayink.aux_models.is_model_downloaded", lambda mid: True)
     assert AuxModelDownloads(worker_factory=_factory([])).start() is False
+
+
+def test_experimental_activity_model_is_optional_but_explicitly_downloadable(monkeypatch):
+    monkeypatch.setattr("sayink.aux_models.is_model_downloaded", lambda mid: False)
+    assert AUX_MODEL_SPEAKER_ACTIVITY not in {m["id"] for m in missing_aux_models()}
+    assert AUX_MODEL_SPEAKER_ACTIVITY in {m["id"] for m in missing_aux_models(include_optional=True)}
+    created = []
+    batch = AuxModelDownloads(worker_factory=_factory(created))
+    assert batch.start([AUX_MODEL_SPEAKER_ACTIVITY])
+    assert [w.model_id for w in created] == [AUX_MODEL_SPEAKER_ACTIVITY]
 
 
 def test_error_stops_batch_with_model_name(monkeypatch):

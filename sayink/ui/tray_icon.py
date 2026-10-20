@@ -7,6 +7,8 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QSize, QRect, QRectF, QPoint, QPointF
 
+from sayink.runtime_status import MEETING_STATE_LABELS
+
 def _menu_font():
     from PyQt6.QtGui import QFont
 
@@ -456,7 +458,7 @@ class TrayIcon(QSystemTrayIcon):
         empty = self._model_menu.addAction("正在加载")
         empty.setEnabled(False)
 
-        self._auto_start_action = menu.addAction("开机自启")
+        self._auto_start_action = menu.addAction("开机时自动启动")
         self._auto_start_action.setCheckable(True)
         self._auto_start_action.toggled.connect(self.auto_start_toggled.emit)
 
@@ -649,10 +651,11 @@ class TrayIcon(QSystemTrayIcon):
             "recording": "录音中",
             "recognizing": "正在识别",
             "polishing": "润色中",
+            "correcting": "纠错中",
             "listening": "正在听",
             "loading": "模型载入中",
-            "meeting": "会议记录中",
-            "meeting_paused": "会议采集已暂停",
+            "meeting": MEETING_STATE_LABELS["live"],
+            "meeting_paused": MEETING_STATE_LABELS["paused"],
         }
         label = lines.get(state, "")
         if label:

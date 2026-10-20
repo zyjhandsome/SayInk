@@ -64,9 +64,9 @@ class FakeHistoryStore:
     def list_sessions(self, limit: int = 50, offset: int = 0) -> list[SessionSummary]:
         return self.sessions[offset : offset + limit]
 
-    def search_sessions(self, q: str) -> list[SessionSummary]:
+    def search_sessions(self, q: str, limit: int | None = None) -> list[SessionSummary]:
         self.search_terms.append(q)
-        return [self.sessions[1]]
+        return [self.sessions[1]][:limit]
 
     def get_session_segments(self, session_id: str) -> list[SegmentRecord]:
         return self.segments[session_id]
@@ -216,7 +216,7 @@ def test_expand_session_renders_effective_segments(qapp):
     assert "raw second" in detail
     assert "raw first" not in detail
     chips = [c.text() for c in window._detail_chip_labels]
-    assert any("麦克风 + 电脑播放" in t for t in chips)
+    assert any("麦克风 + 电脑声音" in t for t in chips)
     assert "来源：" not in detail
     # Title carries the session identity instead of a static caption.
     assert window._detail_title.text() != "会话详情"
@@ -375,7 +375,7 @@ def test_history_chrome_copy(qapp):
     window = HistoryWindow(FakeHistoryStore())
     try:
         assert window._title_label.text() == "历史"
-        assert window._search_edit.placeholderText() == "搜索全部听写历史"
+        assert window._search_edit.placeholderText() == "搜索全部转写历史"
         assert window._search_edit.parentWidget() is window._stream_host
         from sayink.ui import settings_styles as ss
         from sayink.ui import design_tokens as tok
@@ -395,7 +395,7 @@ def test_detail_collapses_technical_metadata(qapp):
         assert "来源：" not in body
         assert "polished first" in body
         chips = [c.text() for c in window._detail_chip_labels]
-        assert any("麦克风 + 电脑播放" in t for t in chips)
+        assert any("麦克风 + 电脑声音" in t for t in chips)
         assert any("持续" in t or "持续转写" in t for t in chips)
         assert window._detail_chip_bar.isHidden()
         assert "Code" in window._detail_context.toolTip()
@@ -603,7 +603,7 @@ def test_clear_all_confirmation_states_total_and_scope(qapp, monkeypatch):
 
 def test_search_opens_matching_version_and_preserves_manual_choice(qapp):
     store = FakeHistoryStore()
-    store.search_sessions = lambda _query: [store.sessions[0]]
+    store.search_sessions = lambda _query, limit=None: [store.sessions[0]]
     window = HistoryWindow(store)
     try:
         window._search_edit.setText("raw first")
@@ -897,7 +897,7 @@ def test_copy_feedback_is_shown_for_single_selection(qapp):
 def test_clear_all_is_in_the_list_management_menu(qapp):
     window = HistoryWindow(FakeHistoryStore())
     try:
-        assert window._clear_all_action.text() == "清空全部听写历史"
+        assert window._clear_all_action.text() == "清空全部转写历史"
         assert window._clear_all_action in window._manage_menu.actions()
         assert window._summary_row.indexOf(window._manage_btn) >= 0
         assert window._summary_row.indexOf(window._list_summary) >= 0
@@ -1220,6 +1220,133 @@ def test_single_session_inline_edit_saves_to_polished_and_preserves_raw(qapp):
     assert "older raw" in window._details.toPlainText()
 
 
+def test_switching_rows_mid_edit_keeps_the_typed_text(qapp):
+    """Like the meeting page's draft autosave: clicking another row must not
+    silently throw the edit away."""
+    store = FakeHistoryStore()
+    window = HistoryWindow(store)
+    window.show()
+    items = window.session_items()
+    window._session_list.setCurrentItem(items[1])
+    window._edit_btn.click()
+    window._details.setPlainText("改到一半就点了别的行")
+
+    window._session_list.setCurrentItem(items[0])
+
+    assert window._editing_session is False
+    assert store.updated_polished == [("older", {0: "改到一半就点了别的行"})]
+
+    # An untouched editor is simply closed.
+    window._session_list.setCurrentItem(items[1])
+    window._edit_btn.click()
+    window._session_list.setCurrentItem(items[0])
+    assert window._editing_session is False
+    assert len(store.updated_polished) == 1
+
+
+def _merge_both(window):
+    window._selection_mode_btn.click()
+    for item in window.session_items():
+        item.setSelected(True)
+    window._merge_btn.click()
+    assert window.session_count() == 1
+
+
+def test_edit_during_a_pending_merge_writes_to_the_merged_rows(qapp):
+    """The merge preview shows virtual re-numbered rows; an edit must land on
+    the committed merged session, not on rows that do not exist yet."""
+    store = FakeHistoryStore()
+    window = HistoryWindow(store)
+    window.show()
+    _merge_both(window)
+
+    window._edit_btn.click()
+    assert store.merged_sessions == [("older", ["older", "newer"])]
+    assert window._editing_session is True
+    window._details.setPlainText("合并后整段改写")
+    window._edit_btn.click()
+
+    assert len(store.segments["older"]) == 3
+    assert store.updated_polished[-1][0] == "older"
+    assert set(store.updated_polished[-1][1]) == {0, 1, 2}
+    # The merge's undo offer is gone; only the save feedback remains.
+    assert "已合并" not in window._feedback_label.text()
+    assert window._undo_btn.isHidden()
+
+
+def test_polish_during_a_pending_merge_commits_it_first(qapp):
+    from PyQt6.QtCore import QObject, pyqtSignal
+
+    class Config:
+        def get(self, key, default=None):
+            return {"llm.api_url": "http://localhost/v1", "llm.api_key": "k", "llm.model_name": "m"}.get(key, default)
+
+    class Polisher(QObject):
+        polish_complete = pyqtSignal(str)
+        polish_error = pyqtSignal(str)
+
+        def __init__(self):
+            super().__init__()
+            self.texts: list[str] = []
+
+        def polish(self, text, *args, **kwargs):
+            self.texts.append(text)
+
+    store = FakeHistoryStore()
+    polisher = Polisher()
+    window = HistoryWindow(store, config=Config(), polisher=polisher)
+    window.show()
+    _merge_both(window)
+
+    window._polish_btn.click()
+
+    assert store.merged_sessions == [("older", ["older", "newer"])]
+    assert polisher.texts and "older raw" in polisher.texts[-1] and "raw second" in polisher.texts[-1]
+
+
+def test_promote_during_a_pending_merge_flushes_the_merge_first(qapp):
+    from types import SimpleNamespace
+
+    store = FakeHistoryStore()
+    order: list[str] = []
+    store.flush = lambda timeout=None: order.append("flush") or True
+    original_merge = store.enqueue_merge_sessions
+
+    def merge(target, ids):
+        order.append("merge")
+        original_merge(target, ids)
+
+    store.enqueue_merge_sessions = merge
+
+    def promote(ids):
+        order.append(f"promote:{','.join(ids)}")
+        return SimpleNamespace(id="m1")
+
+    store.create_meeting_from_sessions = promote
+    window = HistoryWindow(store)
+    window.show()
+    _merge_both(window)
+
+    window._to_meeting_btn.click()
+
+    assert order == ["merge", "flush", "promote:older"]
+
+
+def test_deleting_the_merged_row_says_the_merge_is_final(qapp):
+    store = FakeHistoryStore()
+    window = HistoryWindow(store)
+    window.show()
+    _merge_both(window)
+    window._selection_mode_btn.click()
+    window.session_items()[0].setSelected(True)
+
+    window._delete_btn.click()
+
+    assert store.merged_sessions == [("older", ["older", "newer"])]
+    assert "合并已生效" in window._feedback_label.text()
+    assert "可撤销删除" in window._feedback_label.text()
+
+
 def test_single_session_inline_edit_cancel_discards_changes(qapp):
     store = FakeHistoryStore()
     window = HistoryWindow(store)
@@ -1247,9 +1374,13 @@ def test_single_session_on_demand_ai_polish_and_error_protection(qapp):
         def __init__(self):
             super().__init__()
             self.calls: list[tuple[str, str, str, str]] = []
+            self.kwargs: list[dict] = []
+            self.prompts: list[str] = []
 
-        def polish(self, text, api_url, api_key, model_name, prompt="", *, mode="polish"):
+        def polish(self, text, api_url, api_key, model_name, prompt="", **kwargs):
             self.calls.append((text, api_url, api_key, model_name))
+            self.prompts.append(prompt)
+            self.kwargs.append(kwargs)
 
         def cancel(self):
             pass
@@ -1265,7 +1396,9 @@ def test_single_session_on_demand_ai_polish_and_error_protection(qapp):
                 "llm.api_url": "https://api.example.com/v1",
                 "llm.api_key": "sk-test",
                 "llm.model_name": "deepseek-chat",
-                "llm.custom_prompt": "",
+                "llm.prompt": "我的自定义提示词",
+                "llm.mode": "polish",
+                "stt.glossary": [{"term": "SayInk", "variants": ["say ink"]}],
             }.get(key, default)
 
     store = FakeHistoryStore()
@@ -1279,6 +1412,11 @@ def test_single_session_on_demand_ai_polish_and_error_protection(qapp):
     window._polish_btn.click()
     assert len(polisher.calls) == 1
     assert polisher.calls[0][0] == "older raw"
+    # The same prompt, mode and glossary as live dictation (llm.prompt, not a
+    # key that does not exist in the config).
+    assert polisher.prompts[0] == "我的自定义提示词"
+    assert polisher.kwargs[0]["mode"] == "polish"
+    assert polisher.kwargs[0]["glossary"] == [{"term": "SayInk", "variants": ["say ink"]}]
 
     # Simulate error first: existing text must remain untouched
     polisher.polish_error.emit("润色超时，请稍后重试")
@@ -1293,6 +1431,63 @@ def test_single_session_on_demand_ai_polish_and_error_protection(qapp):
     assert window._polish_btn.text() == "重新润色"
     assert not window._polish_btn.isHidden()
     assert all(action.text() not in {"AI 润色", "重新润色", "导出 Markdown"} for action in window._detail_menu.actions())
+
+
+def test_history_ai_action_follows_correct_mode_and_fidelity_guard(qapp):
+    """In 纠错 mode the button says so, the worker gets the mode, and a reply
+    that rewrites the text is refused exactly like the live pipeline does."""
+    from PyQt6.QtCore import QObject, pyqtSignal
+
+    class FakePolisher(QObject):
+        polish_complete = pyqtSignal(str)
+        polish_error = pyqtSignal(str)
+
+        def __init__(self):
+            super().__init__()
+            self.kwargs: list[dict] = []
+
+        def polish(self, text, api_url, api_key, model_name, prompt="", **kwargs):
+            self.kwargs.append(kwargs)
+
+        def cancel(self):
+            pass
+
+    class FakeConfig:
+        def get(self, key, default=None):
+            return {
+                "llm.api_url": "https://api.example.com/v1",
+                "llm.api_key": "sk-test",
+                "llm.model_name": "deepseek-chat",
+                "llm.prompt": "",
+                "llm.mode": "correct",
+                "stt.glossary": [{"term": "新盘", "variants": ["训盘"]}],
+            }.get(key, default)
+
+    store = FakeHistoryStore()
+    store.segments["older"] = [
+        SegmentRecord("older", 0, 1_700_000_000_000, "这套房子赠送车位，训盘下周开", "", "mic", 500, "Notepad.exe", "hotkey", "tiny"),
+    ]
+    polisher = FakePolisher()
+    window = HistoryWindow(store, config=FakeConfig(), polisher=polisher)
+    window.show()
+    window._session_list.setCurrentItem(window.session_items()[1])
+    assert window._polish_btn.text() == "纠错"
+
+    window._polish_btn.click()
+    assert polisher.kwargs[0]["mode"] == "correct"
+    assert window._polish_btn.text() == "正在纠错"
+    # A rewrite is not a correction: nothing is saved, the user is told why.
+    polisher.polish_complete.emit("关于这套房子的车位赠送政策以及新盘开盘时间，我们会另行通知。")
+    assert store.updated_polished == []
+    assert "未通过保真检查" in window._feedback_label.text()
+    assert window._polish_btn.text() == "纠错"
+
+    # A faithful correction (the glossary variant plus one character) is saved.
+    window._polish_btn.click()
+    polisher.polish_complete.emit("这套房子赠送车位，新盘下周开。")
+    assert store.updated_polished == [("older", {0: "这套房子赠送车位，新盘下周开。"})]
+    assert "已完成纠错" in window._feedback_label.text()
+    assert window._polish_btn.text() == "重新纠错"
 
 
 def test_batch_merge_sessions_with_8s_undo_and_commit(qapp):

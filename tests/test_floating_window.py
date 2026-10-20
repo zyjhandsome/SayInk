@@ -105,6 +105,8 @@ class TestFloatingWindowStates:
     def test_show_polishing(self, win):
         win.show_polishing("润色文本")
         assert win._status_label.text() == "润色中"
+        win.show_polishing("纠错文本", action="纠错")
+        assert win._status_label.text() == "纠错中"
 
     def test_processing_keeps_continuous_listening_visible(self, win):
         win.show_listening()

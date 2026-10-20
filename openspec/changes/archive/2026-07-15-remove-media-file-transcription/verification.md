@@ -15,7 +15,7 @@
 
 | 时间 | 命令 | 退出码 / 结果 | 覆盖 |
 |---|---|---|---|
-| 2026-07-15 | `py -3.10 -m pytest tests/test_config.py tests/test_text_polisher.py tests/test_app.py tests/test_app_file_transcription.py tests/test_history_window.py tests/test_build_ffmpeg.py tests/test_ui_styles.py tests/test_settings_general.py tests/test_floating_window.py tests/test_readme_features.py -q --tb=short` | 0 / **232 passed** | 回落、润色、听写、缺席入口、历史遗产、打包、设置/UI |
+| 2026-07-15 | `py -3.10 -m pytest tests/test_config.py tests/test_text_polisher.py tests/test_app.py tests/test_app_file_transcription.py tests/test_history_window.py tests/test_build_ffmpeg.py tests/test_ui_styles.py tests/test_settings_general.py tests/test_floating_window.py tests/test_readme_features.py -q --tb=short` | 0 / **232 passed** | 回落、润色、转写、缺席入口、历史遗产、打包、设置/UI |
 | 2026-07-15 | `py -3.10 -c "import importlib; importlib.import_module('sayink.media_decoder')"` | 1 / `ModuleNotFoundError` | 解码模块已删 |
 | 2026-07-15 | `rg … sayink build.py`（`import_file_requested\|start_file_transcription\|LLM_MODE_TRANSLATE\|media_decoder\|_copy_ffmpeg_into_dist`） | 无匹配 | 产品残留清零 |
 | 2026-07-15 | `py -3.10 -m pytest tests/ -q` | 未取得干净收尾（约 40% 后卡住，疑似既有 Windows/Qt harness；与本变更无关） | 接受 tasks.md 批跑替代 |
@@ -30,7 +30,7 @@
 | 无翻译模式 API | `test_translate_mode_constant_removed` | 通过 |
 | 历史遗产展示 | `test_legacy_file_import_history_labels_are_preserved` | 通过 |
 | 无 ffmpeg 打包辅助 | `test_build_has_no_ffmpeg_bundle_helpers` | 通过 |
-| 听写回归 | `tests/test_app.py` 等 | 通过 |
+| 转写回归 | `tests/test_app.py` 等 | 通过 |
 
 ## 独立审查
 

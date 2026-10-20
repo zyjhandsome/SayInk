@@ -50,7 +50,7 @@
   - 前置依赖：任务 1
   - 目标文件/符号：`sayink/ui/theme.py` `apply_theme`；`history_window.py` `HistoryWindow.reapply_theme`；`floating_window.py` `FloatingWindow.reapply_theme`；`tray_icon.py` `TrayIcon.reapply_theme`；`tests/test_floating_window.py`；`tests/test_history_window.py`；`tests/test_tray_icon.py`；`tests/test_theme_resolve.py`
   - 允许修改：上述表面换肤与对应测试
-  - 禁止修改：听写状态机、托盘业务菜单项语义
+  - 禁止修改：转写状态机、托盘业务菜单项语义
   - 实施步骤：
     1. 补/强化四表面随 `apply_theme` 换肤与冷启动断言。
     2. 清 History/Float/Tray 构造期残留（若测试暴露）。

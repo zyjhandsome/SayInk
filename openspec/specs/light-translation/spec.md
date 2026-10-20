@@ -15,7 +15,7 @@
 
 #### Scenario: 运行时不执行翻译语义
 
-- **WHEN** 用户完成实时听写且 LLM 后处理开启
+- **WHEN** 用户完成实时转写且 LLM 后处理开启
 - **THEN** 系统 MUST NOT 按翻译 prompt/目标语言执行翻译；仅可按润色逻辑处理或输出原文
 
 ### Requirement: 遗留 translate 配置静默回落润色

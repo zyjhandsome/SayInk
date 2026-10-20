@@ -38,7 +38,7 @@
 - 工具/审查：`openspec validate` 通过；对照 `specs/main-window-chrome/spec.md`
 - 完整性：一条 Requirement + 基本行为已实现
 - 正确性：选择器用 objectName 限定最外层
-- 一致性：未改 `FLOAT_BORDER` / 听写胶囊 / 系统标题栏
+- 一致性：未改 `FLOAT_BORDER` / 转写胶囊 / 系统标题栏
 
 ## 代码审查
 - 模式：independent（subagent `f7940851-7209-4f2e-b45e-196ad2f13486`）

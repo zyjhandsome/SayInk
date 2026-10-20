@@ -150,7 +150,24 @@ def test_history_copy_includes_speaker_only_for_a_multi_speaker_session():
     body = _session_body(duo)
     assert body.index("说话人 1") < body.index("甲") < body.index("说话人 2") < body.index("乙")
     assert "麦克风" in body
-    assert "电脑播放" in body
+    assert "电脑声音" in body
+
+
+def test_uncertain_continuous_turn_is_labeled_in_history_copy_and_display():
+    from tests.test_history_window import FakeHistoryStore
+
+    store = FakeHistoryStore()
+    store.segments["newer"] = [
+        SegmentRecord("newer", 0, 1_700_000_300_000, "我先说", trigger_mode="continuous", speaker_id=1),
+        SegmentRecord("newer", 1, 1_700_000_301_000, "嗯", trigger_mode="continuous", speaker_id=0),
+    ]
+    body = _session_body(store.segments["newer"])
+    assert "说话人 1\n我先说" in body and "说话人待确认\n嗯" in body
+    window = HistoryWindow(store)
+    window._expand_session(window.session_items()[0])
+    assert "说话人待确认" in window._details.toPlainText()
+    assert "说话人 0" not in window._details.toPlainText()
+    window.close()
 
 
 def test_continuous_paste_has_no_speaker_but_history_does():
@@ -182,9 +199,7 @@ def test_continuous_paste_has_no_speaker_but_history_does():
 
 
 def test_continuous_same_voice_back_to_back_keeps_one_speaker():
-    """The meeting continuity prior applies to dictation too: a close,
-    similar-sounding follow-up (or one too short to judge) does not open
-    「说话人 2」."""
+    """Similar clear turns stay together; an unrelated short voice abstains."""
     with patch("sayink.app.aux_model_path", return_value=None), app_harness(
         {"audio.trigger_mode": "continuous", "llm.enabled": False}
     ) as h:
@@ -200,7 +215,7 @@ def test_continuous_same_voice_back_to_back_keeps_one_speaker():
             app._begin_transcription(audio, context=context)
             app._on_final_result(text)
             h["paster"].paste_async.call_args[0][1]("pasted")
-        assert [r.speaker_id for r in _enqueued_records(h["history"])] == [1, 1, 1]
+        assert [r.speaker_id for r in _enqueued_records(h["history"])] == [1, 1, 0]
 
 
 def test_mixed_continuous_history_keeps_the_capture_route():
@@ -209,8 +224,7 @@ def test_mixed_continuous_history_keeps_the_capture_route():
     ) as h:
         app = h["app"]
         _start_continuous_user_session(app)
-        # Long enough for both CAM++ and the offline mel fallback. Short
-        # clips deliberately keep the previous speaker instead of guessing.
+        # Long enough to establish reliable profiles for either backend.
         tone = _tone(180, 1.2)
         app._begin_transcription(tone, route="mic")
         app._on_final_result("我这边")

@@ -43,7 +43,7 @@ The history window SHALL allow users to promote a single selected session or mul
 
 #### Scenario: 单条或多条历史转为会议并跳转
 - **WHEN** 用户在单选态点击「转为会议」或在多选态点击「合并转为会议」
-- **THEN** 系统在 `meetings` 表创建一条 `status = 'ended'` 的新会议记录，将所选历史会话的分段按时间顺序复制写入该 `meeting_id`（`trigger_mode = 'meeting'`），保留原日常听写历史不变
+- **THEN** 系统在 `meetings` 表创建一条 `status = 'ended'` 的新会议记录，将所选历史会话的分段按时间顺序复制写入该 `meeting_id`（`trigger_mode = 'meeting'`），保留原日常转写历史不变
 - **AND** 主窗口自动切换到「会议」页并选中打开该新建会议，用户可直接选模板生成纪要、重命名说话人或编辑导出
 
 ---
@@ -51,7 +51,7 @@ The history window SHALL allow users to promote a single selected session or mul
 # history-content-organization：需求规格说明（中文对齐附注）
 
 ## 目的
-打通日常听写历史（`HistoryWindow`）与结构化整理之间的断层：高频轻量微调（补润色、改错字、合并断句会话）在历史页原地闭环；深度提炼（结构化纪要、待办提取、说话人改名）一键复制转入「会议」页工作台完成。
+打通日常转写历史（`HistoryWindow`）与结构化整理之间的断层：高频轻量微调（补润色、改错字、合并断句会话）在历史页原地闭环；深度提炼（结构化纪要、待办提取、说话人改名）一键复制转入「会议」页工作台完成。
 
 ## 范围
 ### 本次范围

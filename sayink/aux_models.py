@@ -23,9 +23,10 @@ from sayink.speech_recognizer import (
 log = logging.getLogger("SayInk")
 
 
-def missing_aux_models() -> list[dict]:
+def missing_aux_models(*, include_optional: bool = False) -> list[dict]:
     """Registry entries of helper models not yet on disk, in registry order."""
-    return [m for m in AUX_MODEL_REGISTRY if not is_model_downloaded(m["id"])]
+    return [m for m in AUX_MODEL_REGISTRY if (include_optional or not m.get("optional"))
+            and not is_model_downloaded(m["id"])]
 
 
 def aux_models_size_mb(models: list[dict]) -> int:
@@ -86,7 +87,8 @@ class AuxModelDownloads(QObject):
         if self.running:
             return False
         wanted = set(model_ids) if model_ids is not None else None
-        self._queue = [m for m in missing_aux_models() if wanted is None or m["id"] in wanted]
+        missing = missing_aux_models() if wanted is None else missing_aux_models(include_optional=True)
+        self._queue = [m for m in missing if wanted is None or m["id"] in wanted]
         if not self._queue:
             return False
         self._done = []

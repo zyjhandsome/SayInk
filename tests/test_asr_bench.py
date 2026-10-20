@@ -13,7 +13,9 @@ from tools.asr_bench import (
     recognize,
     segment_meeting,
     transcribe,
+    split_speaker_turns,
 )
+from sayink.speaker_turns import SpeakerTurn
 
 
 class _FakeRecognizer:
@@ -116,3 +118,35 @@ def test_vad_flag_defaults_to_the_meeting_segmenter():
 def test_unknown_vad_is_rejected():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["--data", "bench", "--vad", "webrtc"])
+
+
+def test_turn_detection_flag_defaults_to_available_model_and_can_be_disabled():
+    assert build_parser().parse_args(["--data", "bench"]).speaker_turns == "auto"
+    assert build_parser().parse_args(["--data", "bench", "--speaker-turns", "off"]).speaker_turns == "off"
+
+
+def test_experimental_activity_requires_an_explicit_benchmark_option():
+    assert build_parser().parse_args(["--data", "bench"]).speaker_activity == "off"
+    assert build_parser().parse_args(["--data", "bench", "--speaker-activity", "auto"]).speaker_activity == "auto"
+
+
+def test_asr_benchmark_decodes_each_detected_turn_like_the_app():
+    audio = np.concatenate([_tone(1), _tone(1, 0.3)])
+
+    def split(samples, **kwargs):
+        return [SpeakerTurn(0, 16000, np.array([1, 0]), True),
+                SpeakerTurn(16000, len(samples), np.array([0, 1]), True)]
+
+    text, used, count = transcribe(_FakeRecognizer("独立发言"), audio, 16000, vad="off", turn_analyzer=split)
+    assert count == 2 and used == "off"
+    assert text == "独立发言独立发言"
+
+
+def test_failed_turn_analysis_keeps_every_sample_in_benchmark_too():
+    audio = _tone(2)
+
+    def broken(samples, **kwargs):
+        raise RuntimeError("analysis failed")
+
+    parts = split_speaker_turns([audio], broken)
+    assert len(parts) == 1 and np.array_equal(parts[0], audio)

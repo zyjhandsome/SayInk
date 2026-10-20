@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
+from sayink.recognition_settings import ADVANCED_RECOGNITION_PATH
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles as ss
 
@@ -83,8 +84,10 @@ class ModelCard(QFrame):
         layout.addSpacing(6)
 
         if self._is_aux:
-            scope = "三种转录模式共用" if self._model_id == "silero-vad" else "连续转录与会议共用"
-            self._meta_lbl = QLabel(f"{self._info['languages']} · {scope}；加载状态见「公共识别」")
+            scope = "三种模式共用" if self._model_id == "silero-vad" else "持续转写与会议共用"
+            self._meta_lbl = QLabel(
+                f"{self._info['languages']} · {scope}；加载状态见 {ADVANCED_RECOGNITION_PATH}"
+            )
         else:
             self._meta_lbl = QLabel(
                 f"{self._info['languages']} · "

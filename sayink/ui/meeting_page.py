@@ -69,7 +69,7 @@ from sayink.meeting_session import (
 )
 from sayink.meeting_store import STATUS_ENDED, STATUS_INTERRUPTED, STATUS_LIVE, MeetingRecord
 from sayink.audio_devices import input_source_label
-from sayink.recognition_settings import audio_source
+from sayink.recognition_settings import ADVANCED_RECOGNITION_PATH, audio_source
 from sayink.minutes_prompts import describe_template, format_timestamp, get_template, list_templates, transcript_lines
 from sayink.speech_recognizer import DEFAULT_MODEL_ID, MODEL_REGISTRY, is_model_downloaded
 from sayink.ui.clipboard import copy_text
@@ -84,7 +84,7 @@ PAGE_BROWSE = 0
 PAGE_START = 1
 PAGE_LIVE = 2
 
-_SOURCE_LABELS = (("mixed", "混合音频（麦克风 + 电脑播放）"), ("microphone", "麦克风"), ("system", "电脑播放"))
+_SOURCE_LABELS = (("mixed", "混合音频（麦克风 + 电脑声音）"), ("microphone", "麦克风"), ("system", "电脑声音"))
 _LANGUAGE_LABELS = (("auto", "自动（中文优先）"), ("zh", "中文"), ("en", "English"), ("ja", "日本語"))
 _STATUS_TEXT = {STATUS_LIVE: "进行中", STATUS_INTERRUPTED: "已中断", STATUS_ENDED: "已结束"}
 
@@ -576,6 +576,7 @@ class MeetingPage(QWidget):
         self._ctrl.generation_preview.connect(self._on_generation_preview)
         self._ctrl.generation_finished.connect(self._on_generation_finished)
         self._ctrl.generation_failed.connect(self._on_generation_failed)
+        self._ctrl.generation_cancelled.connect(self._on_generation_cancelled)
         self.reapply_theme()
         self.refresh()
         if self._ctrl.is_active:
@@ -901,7 +902,7 @@ class MeetingPage(QWidget):
         row.setSpacing(10)
         self._opt_source = QComboBox()
         self._opt_source.setAccessibleName("会议音频来源")
-        self._opt_source.addItem("跟随听写设置", "")
+        self._opt_source.addItem("跟随转写设置", "")
         for key, label in _SOURCE_LABELS:
             self._opt_source.addItem(label, key)
         self._opt_model = QComboBox()
@@ -973,7 +974,7 @@ class MeetingPage(QWidget):
         self._live_speaker_hint = QLabel("点击姓名可命名；纠正发言人只影响选中的段落，人工修改会保留。")
         self._live_speaker_hint.setWordWrap(True)
         self._live_speaker_btn = QPushButton("命名说话人")
-        self._live_speaker_btn.setAccessibleName("会议录制中命名说话人")
+        self._live_speaker_btn.setAccessibleName("会议记录中命名说话人")
         self._live_speaker_menu = QMenu(self._live_speaker_btn)
         self._live_speaker_menu.aboutToShow.connect(self._populate_live_speaker_menu)
         self._live_speaker_btn.setMenu(self._live_speaker_menu)
@@ -1594,7 +1595,7 @@ class MeetingPage(QWidget):
             if not progress:
                 progress = "正在整理原文…" if self._is_refinement() else "正在生成纪要…"
             self._notes_state.setText(progress)
-            self._notes_state.setToolTip("整理进行中。完成前仍显示上一版，点「取消」可停下。")
+            self._notes_state.setToolTip("整理进行中。这里显示的是尚未保存的预览；复制/导出仍用上一版，点「取消」可停下。")
             self._status_label.hide()
             self._paint_notes_state()
             return
@@ -1899,6 +1900,11 @@ class MeetingPage(QWidget):
             self._render_detail()
             self._set_status(f"{'原文整理' if self._is_refinement() else '纪要生成'}失败：{message}")
 
+    def _on_generation_cancelled(self, meeting_id: str) -> None:
+        if meeting_id == self._detail_id:
+            self._render_detail()
+            self._set_status(f"已取消{'原文整理' if self._is_refinement() else '纪要生成'}，上一版纪要保持不变。")
+
     def _save_notes_draft(self) -> bool:
         if not self._editing_notes or not self._detail_id:
             return True
@@ -2153,7 +2159,7 @@ class MeetingPage(QWidget):
         self._opt_source.setCurrentIndex(max(0, index))
         self._opt_model.blockSignals(True)
         self._opt_model.clear()
-        self._opt_model.addItem("与听写相同", "")
+        self._opt_model.addItem("与转写相同", "")
         for model in MODEL_REGISTRY:
             if is_model_downloaded(model["id"]):
                 self._opt_model.addItem(model["name"], model["id"])
@@ -2170,7 +2176,7 @@ class MeetingPage(QWidget):
     def _sync_follow_source_label(self) -> None:
         """The follow option names the dictation source; a card choice stays put."""
         self._opt_source.setItemText(
-            0, f"跟随听写（当前：{input_source_label(audio_source(self._config))}）"
+            0, f"跟随转写（当前：{input_source_label(audio_source(self._config))}）"
         )
 
     def _update_card_notes(self) -> None:
@@ -2178,8 +2184,11 @@ class MeetingPage(QWidget):
         dictation = str(self._config.get("stt.model_id", DEFAULT_MODEL_ID) or DEFAULT_MODEL_ID)
         caps = resolve_capabilities(self._config, options, dictation_model_id=dictation)
         notes = list(caps.notes)
+        if self._store.disabled:
+            notes.insert(0, "历史数据库不可用：会议文字稿无法保存，现在无法开始会议。请重启应用或更换历史位置。")
         if not minutes_settings_complete(self._config):
             notes.append("尚未配置纪要模型（设置 → AI 服务）；会议结束后仍可先保存文字稿。")
+        self._card_start.setEnabled(not self._store.disabled)
         self._card_notes.setText("\n".join(f"· {n}" for n in notes))
         self._card_notes.setVisible(bool(notes))
         self._sync_aux_buttons()
@@ -2193,7 +2202,9 @@ class MeetingPage(QWidget):
             return
         label = f"下载辅助模型（约 {aux_models_size_mb(missing)} MB）" if missing else ""
         what = describe_aux_models(missing)
-        self._card_dl_btn.setToolTip(f"{what}：下载后按公共识别设置在开始时加载；实际状态可在公共识别查看")
+        self._card_dl_btn.setToolTip(
+            f"{what}：下载后按共享识别设置在开始时加载；实际状态可在 {ADVANCED_RECOGNITION_PATH} 查看"
+        )
         self._live_dl_btn.setToolTip(f"{what}：本场会议已按当前方式进行，下载后从下一场开始生效")
         for button in (self._card_dl_btn, self._live_dl_btn):
             button.setText(label)
@@ -2228,7 +2239,7 @@ class MeetingPage(QWidget):
             if self._stack.currentIndex() == PAGE_START:
                 self._update_card_notes()
                 self._card_notes.setText(
-                    "· 辅助模型已下载，将按公共识别设置在开始时加载。\n" + self._card_notes.text()
+                    "· 辅助模型已下载，将按共享识别设置在开始时加载。\n" + self._card_notes.text()
                 )
                 self._card_notes.show()
             elif self._stack.currentIndex() == PAGE_LIVE:
@@ -2290,6 +2301,8 @@ class MeetingPage(QWidget):
                 vad_label += "（Silero 未下载）"
             bits = [f"模型 {caps.model_id}", vad_label]
             bits.append("说话人模型" if caps.speaker_model_available else "说话人（粗略）")
+            if caps.speaker_model_available:
+                bits.append("会内换人检测（实验性）；短促插话可能仍需确认")
             if caps.hotwords and caps.hotwords_supported:
                 bits.append("热词已启用")
             self._live_caps.setToolTip(" · ".join(bits))

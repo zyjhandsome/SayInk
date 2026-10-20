@@ -154,13 +154,57 @@ def test_recent_observations_and_profiles_are_bounded_and_reset_for_next_meeting
     assert s.assign(unit(0, 1)) == 1
 
 
-def test_capture_routes_stay_distinct_until_explicitly_linked():
+def test_identical_voice_can_switch_capture_routes_without_a_duplicate_or_learning():
     s = session()
     a = unit(1, 0)
     assert s.assign(a, "mic", sample_key=2) == 1
-    assert s.assign(a, "system", sample_key=7) == 2
+    assert s.assign(a, "system", sample_key=7) == 1
+    assert s.speaker_count == 1 and len(s.history) == 1
+    assert s.assign(a, "mic", sample_key=11) == 1
+
+
+def test_a_weak_cross_route_match_abstains_without_creating_a_duplicate():
+    s = session()
+    assert s.assign(unit(1, 0), "mic") == 1
+    # Cosine 0.9 is sufficient on the original lane, not for a lane change.
+    shifted = unit(0.9, np.sqrt(1 - 0.9 ** 2))
+    assert s.assign(shifted, "system") == 0
+    assert s.speaker_count == 1 and len(s.history) == 1
+    assert s.assign(shifted, "mic") == 1
+
+
+def test_unrelated_people_on_different_routes_still_get_distinct_groups():
+    s = session()
+    assert s.assign(unit(1, 0), "mic") == 1
+    assert s.assign(unit(0, 1), "system") == 2
+    assert s.assign(unit(1, 0), "system") == 1
+    assert s.assign(unit(0, 1), "mic") == 2
+    assert len(s.history) == 2
+
+
+def test_spectral_fallback_can_keep_lanes_separate_without_claiming_cross_route_identity():
+    s = session(cross_route_matching=False)
+    assert s.assign(unit(1, 0), "mic") == 1
+    assert s.assign(unit(1, 0), "system") == 2
+
+
+def test_manual_correction_can_explicitly_link_recording_conditions():
+    s = session()
+    assert s.assign(unit(1, 0), "mic", sample_key=2) == 1
+    assert s.assign(unit(0, 1), "system", sample_key=7) == 2
     assert s.confirm(7, 1)
-    assert s.assign(a, "system", sample_key=11) == 1
+    assert s.assign(unit(0, 1), "system", sample_key=11) == 1
+
+
+def test_conflicting_manual_identities_on_different_routes_stay_ambiguous():
+    s = session()
+    voice = unit(1, 0)
+    s.assign(voice, "mic", sample_key=2)
+    s.assign(voice, "system", sample_key=7)
+    assert s.confirm(2, 1)
+    assert s.confirm(7, 2)
+    assert s.assign(voice, "mic", sample_key=11) == 0
+    assert s.assign(voice, "system", sample_key=15) == 0
 
 
 def test_profile_quality_gate_rejects_short_quiet_nonfinite_and_clipped_audio():

@@ -1,0 +1,419 @@
+{
+  "date": "2026-10-20",
+  "scope": "Reference timeline, known real-waveform controls and unlabeled Chinese ASR replay; not a corpus accuracy claim.",
+  "environment": {
+    "python": "3.10",
+    "numpy": "2.2.6",
+    "sherpa-onnx": "1.13.8",
+    "onnxruntime": "1.23.2"
+  },
+  "reference_assets": [
+    {
+      "name": "sample.wav",
+      "source": "https://github.com/pyannote/pyannote-audio/blob/develop/tutorials/assets/sample.wav",
+      "git_blob": "150d49a69dc2da2310fbb526759ff26638595bdc",
+      "bytes": 960104,
+      "sha256": "c319b4abca767b124e41432d364fd7df006cb26bb79d09326c487d606a134e6e"
+    },
+    {
+      "name": "sample.rttm",
+      "source": "https://github.com/pyannote/pyannote-audio/blob/develop/tutorials/assets/sample.rttm",
+      "git_blob": "7c6b378febff6a4a0bbd4578669b62c2028ad0a2",
+      "bytes": 596,
+      "sha256": "d78fe62c69d8e6dcbb42c26adfce83faccb374c5a1e6d987fe37f85f1c173c87"
+    }
+  ],
+  "video_sources": [
+    "https://www.bilibili.com/video/BV1oy4y1m7yY/",
+    "https://www.bilibili.com/video/BV1aT4y1K7YX/"
+  ],
+  "reference_timeline": {
+    "default_off": {
+      "speaker_backend": "campplus",
+      "activity_backend": "off",
+      "chunk_s": 15.0,
+      "scope": "Fixed chunks, speaker pipeline only; no VAD, ASR, collar or overlap identity score. Not DER.",
+      "files": [
+        {
+          "audio": "build\\diarization-reference\\sample.wav",
+          "audio_ms": 30000.0,
+          "analysis_s": 1.683584799990058,
+          "predicted": [
+            [
+              0.0,
+              15000.0,
+              "1"
+            ],
+            [
+              15000.0,
+              30000.0,
+              "1"
+            ]
+          ],
+          "single_speaker_ms": 20570.0,
+          "overlap_ms": 1890.0,
+          "assigned_single_ms": 20570.0,
+          "correct_single_ms": 10610.0,
+          "wrong_single_ms": 9960.0,
+          "unknown_single_ms": 0.0,
+          "single_coverage": 1.0,
+          "single_correct_rate": 0.5157997083130773,
+          "single_precision": 0.5157997083130773,
+          "overlap_assigned_ms": 1890.0,
+          "overlap_unknown_ms": 0.0,
+          "non_speech_assigned_ms": 7540.0,
+          "short_turns": 3,
+          "short_turns_recovered": 2,
+          "short_turns_missed": 1,
+          "merged_groups": 1,
+          "split_people": 0,
+          "mapping": {
+            "1": "speaker91"
+          }
+        }
+      ]
+    },
+    "before_activity": {
+      "speaker_backend": "campplus",
+      "activity_backend": "pyannote-segmentation-3.0",
+      "chunk_s": 15.0,
+      "scope": "Fixed chunks, speaker pipeline only; no VAD, ASR, collar or overlap identity score. Not DER.",
+      "files": [
+        {
+          "audio": "build\\diarization-reference\\sample.wav",
+          "audio_ms": 30000.0,
+          "analysis_s": 1.4013607000233606,
+          "predicted": [
+            [
+              0.0,
+              15000.0,
+              "1"
+            ],
+            [
+              15000.0,
+              30000.0,
+              "0"
+            ]
+          ],
+          "single_speaker_ms": 20570.0,
+          "overlap_ms": 1890.0,
+          "assigned_single_ms": 7080.0,
+          "correct_single_ms": 5460.0,
+          "wrong_single_ms": 1620.0,
+          "unknown_single_ms": 13490.0,
+          "single_coverage": 0.3441905687894993,
+          "single_correct_rate": 0.2654350996596986,
+          "single_precision": 0.7711864406779662,
+          "overlap_assigned_ms": 800.0,
+          "overlap_unknown_ms": 1090.0,
+          "non_speech_assigned_ms": 7120.0,
+          "short_turns": 3,
+          "short_turns_recovered": 1,
+          "short_turns_missed": 2,
+          "merged_groups": 1,
+          "split_people": 0,
+          "mapping": {
+            "1": "speaker90"
+          }
+        }
+      ]
+    },
+    "after_activity": {
+      "speaker_backend": "campplus",
+      "activity_backend": "pyannote-segmentation-3.0",
+      "chunk_s": 15.0,
+      "scope": "Fixed chunks, speaker pipeline only; no VAD, ASR, collar or overlap identity score. Not DER.",
+      "files": [
+        {
+          "audio": "build\\diarization-reference\\sample.wav",
+          "audio_ms": 30000.0,
+          "analysis_s": 1.438532599946484,
+          "predicted": [
+            [
+              0.0,
+              15000.0,
+              "1"
+            ],
+            [
+              15000.0,
+              30000.0,
+              "0"
+            ]
+          ],
+          "single_speaker_ms": 20570.0,
+          "overlap_ms": 1890.0,
+          "assigned_single_ms": 7080.0,
+          "correct_single_ms": 5460.0,
+          "wrong_single_ms": 1620.0,
+          "unknown_single_ms": 13490.0,
+          "single_coverage": 0.3441905687894993,
+          "single_correct_rate": 0.2654350996596986,
+          "single_precision": 0.7711864406779662,
+          "overlap_assigned_ms": 800.0,
+          "overlap_unknown_ms": 1090.0,
+          "non_speech_assigned_ms": 7120.0,
+          "short_turns": 3,
+          "short_turns_recovered": 1,
+          "short_turns_missed": 2,
+          "merged_groups": 1,
+          "split_people": 0,
+          "mapping": {
+            "1": "speaker90"
+          }
+        }
+      ]
+    }
+  },
+  "real_waveform_and_worker": {
+    "scope": "Known real-waveform operations, no human transcript/CER gold.",
+    "controlled": [
+      {
+        "case": "A4_B0.8_A2",
+        "variant": "before",
+        "predicted": [
+          [
+            0.0,
+            6800.0,
+            "0"
+          ]
+        ],
+        "profiles": 1,
+        "single_speaker_ms": 6800.0,
+        "overlap_ms": 0.0,
+        "assigned_single_ms": 0.0,
+        "correct_single_ms": 0,
+        "wrong_single_ms": 0.0,
+        "unknown_single_ms": 6800.0,
+        "single_coverage": 0.0,
+        "single_correct_rate": 0.0,
+        "single_precision": null,
+        "overlap_assigned_ms": 0.0,
+        "overlap_unknown_ms": 0.0,
+        "non_speech_assigned_ms": 0.0,
+        "short_turns": 1,
+        "short_turns_recovered": 0,
+        "short_turns_missed": 1,
+        "merged_groups": 0,
+        "split_people": 0,
+        "mapping": {}
+      },
+      {
+        "case": "A4_B0.8_A2",
+        "variant": "after",
+        "predicted": [
+          [
+            0.0,
+            3682.5,
+            "1"
+          ],
+          [
+            3682.5,
+            5559.375,
+            "0"
+          ],
+          [
+            5559.375,
+            6800.0,
+            "1"
+          ]
+        ],
+        "profiles": 1,
+        "single_speaker_ms": 6800.0,
+        "overlap_ms": 0.0,
+        "assigned_single_ms": 4923.125,
+        "correct_single_ms": 4923.125,
+        "wrong_single_ms": 0.0,
+        "unknown_single_ms": 1876.875,
+        "single_coverage": 0.7239889705882353,
+        "single_correct_rate": 0.7239889705882353,
+        "single_precision": 1.0,
+        "overlap_assigned_ms": 0.0,
+        "overlap_unknown_ms": 0.0,
+        "non_speech_assigned_ms": 0.0,
+        "short_turns": 1,
+        "short_turns_recovered": 0,
+        "short_turns_missed": 1,
+        "merged_groups": 0,
+        "split_people": 0,
+        "mapping": {
+          "1": "A"
+        }
+      },
+      {
+        "case": "A4_B1.2_A2",
+        "variant": "before",
+        "predicted": [
+          [
+            0.0,
+            7200.0,
+            "0"
+          ]
+        ],
+        "profiles": 1,
+        "single_speaker_ms": 7200.0,
+        "overlap_ms": 0.0,
+        "assigned_single_ms": 0.0,
+        "correct_single_ms": 0,
+        "wrong_single_ms": 0.0,
+        "unknown_single_ms": 7200.0,
+        "single_coverage": 0.0,
+        "single_correct_rate": 0.0,
+        "single_precision": null,
+        "overlap_assigned_ms": 0.0,
+        "overlap_unknown_ms": 0.0,
+        "non_speech_assigned_ms": 0.0,
+        "short_turns": 1,
+        "short_turns_recovered": 0,
+        "short_turns_missed": 1,
+        "merged_groups": 0,
+        "split_people": 0,
+        "mapping": {}
+      },
+      {
+        "case": "A4_B1.2_A2",
+        "variant": "after",
+        "predicted": [
+          [
+            0.0,
+            3682.5,
+            "1"
+          ],
+          [
+            3682.5,
+            5643.75,
+            "0"
+          ],
+          [
+            5643.75,
+            7200.0,
+            "1"
+          ]
+        ],
+        "profiles": 1,
+        "single_speaker_ms": 7200.0,
+        "overlap_ms": 0.0,
+        "assigned_single_ms": 5238.75,
+        "correct_single_ms": 5238.75,
+        "wrong_single_ms": 0.0,
+        "unknown_single_ms": 1961.25,
+        "single_coverage": 0.7276041666666667,
+        "single_correct_rate": 0.7276041666666667,
+        "single_precision": 1.0,
+        "overlap_assigned_ms": 0.0,
+        "overlap_unknown_ms": 0.0,
+        "non_speech_assigned_ms": 0.0,
+        "short_turns": 1,
+        "short_turns_recovered": 0,
+        "short_turns_missed": 1,
+        "merged_groups": 0,
+        "split_people": 0,
+        "mapping": {
+          "1": "A"
+        }
+      }
+    ],
+    "echo": [
+      {
+        "case": "delayed_duplicate",
+        "samples": 64000,
+        "unchanged": false,
+        "suppressed_s": 3.1,
+        "processing_s": 0.07464150001760572,
+        "tail_rms_ratio": 0.13530181348323822,
+        "local_tail_correlation": null,
+        "bypassed_audio_unchanged": true,
+        "applied_local_correlation": null,
+        "applied_local_std_ratio": null
+      },
+      {
+        "case": "double_talk",
+        "samples": 64000,
+        "unchanged": true,
+        "suppressed_s": 0.0,
+        "processing_s": 0.05785019998438656,
+        "tail_rms_ratio": 1.0,
+        "local_tail_correlation": 0.920675203919873,
+        "bypassed_audio_unchanged": true,
+        "applied_local_correlation": null,
+        "applied_local_std_ratio": null
+      },
+      {
+        "case": "weak_double_talk",
+        "samples": 64000,
+        "unchanged": false,
+        "suppressed_s": 3.1,
+        "processing_s": 0.05300910002551973,
+        "tail_rms_ratio": 0.1523417979478836,
+        "local_tail_correlation": 0.4615566195927527,
+        "bypassed_audio_unchanged": true,
+        "applied_local_correlation": 0.9987667166973538,
+        "applied_local_std_ratio": 0.9995481371879578
+      }
+    ],
+    "worker": [
+      {
+        "sample": "source",
+        "variant": "before",
+        "vad": "silero",
+        "turns": 4,
+        "unknown_turns": 3,
+        "assigned_audio_fraction": 0.2385496183206107,
+        "speaker_groups": 1,
+        "characters": 230,
+        "same_text_as_before": true,
+        "text_sha256": "ea01083eff51306195b6b30c1dfa7ab006fee7e354184953ee91137544b39fdf",
+        "processing_s": 19.67306489998009
+      },
+      {
+        "sample": "source",
+        "variant": "after",
+        "vad": "silero",
+        "turns": 10,
+        "unknown_turns": 9,
+        "assigned_audio_fraction": 0.2385496183206107,
+        "speaker_groups": 1,
+        "characters": 229,
+        "same_text_as_before": false,
+        "text_sha256": "787c4e1c14b2ecb33303ff3955efda289c846ea6b23ee4fdec8aa22f5d6a06a2",
+        "processing_s": 20.429002600023523
+      },
+      {
+        "sample": "dialogue",
+        "variant": "before",
+        "vad": "silero",
+        "turns": 7,
+        "unknown_turns": 3,
+        "assigned_audio_fraction": 0.6212927756653992,
+        "speaker_groups": 2,
+        "characters": 228,
+        "same_text_as_before": true,
+        "text_sha256": "efb1f99f9b0af02ccf9da7b429fb2f1c620ea0a861de7ecff90d9be4e48fb262",
+        "processing_s": 19.716348199988715
+      },
+      {
+        "sample": "dialogue",
+        "variant": "after",
+        "vad": "silero",
+        "turns": 8,
+        "unknown_turns": 3,
+        "assigned_audio_fraction": 0.6883911596958175,
+        "speaker_groups": 2,
+        "characters": 239,
+        "same_text_as_before": false,
+        "text_sha256": "81d70e57245f6bb345c820e355e0f5a801cfaad9f601a207300b1ef641ff8488",
+        "processing_s": 20.017049300018698
+      }
+    ]
+  },
+  "checks": {
+    "pytest_passed": 861,
+    "pytest_seconds": 52.52,
+    "ruff": "passed",
+    "pytest_temp_directory": "workspace build/pytest-recognition-round2-final1"
+  },
+  "decisions": [
+    "Activity remains opt-in and off by default.",
+    "Recovered flanks beside overlap only match existing profiles; no new samples.",
+    "Natural reference sample did not improve; no CER improvement established."
+  ]
+}

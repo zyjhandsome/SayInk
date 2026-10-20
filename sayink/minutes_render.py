@@ -39,10 +39,12 @@ def extract_json(text: str) -> dict[str, Any] | None:
     if not text:
         return None
     candidate = _FENCE_RE.sub("", text.strip())
+    # RecursionError: absurdly nested brackets from a broken endpoint must not
+    # take the minutes worker down with them; they are simply "not JSON".
     try:
         data = json.loads(candidate)
         return data if isinstance(data, dict) else None
-    except ValueError:
+    except (ValueError, RecursionError):
         pass
     start = candidate.find("{")
     while start != -1:
@@ -68,7 +70,7 @@ def extract_json(text: str) -> dict[str, Any] | None:
                 if depth == 0:
                     try:
                         data = json.loads(candidate[start:index + 1])
-                    except ValueError:
+                    except (ValueError, RecursionError):
                         break
                     return data if isinstance(data, dict) else None
         start = candidate.find("{", start + 1)
@@ -181,11 +183,14 @@ def render_markdown(
     meta_lines: Sequence[str] = (),
 ) -> str:
     """Render the structured minutes; missing sections become placeholders."""
-    payload = _canonical_speaker_payload(payload or {})
     if template.is_refinement:
         from sayink.transcript_refiner import render_refinement
 
-        return apply_speaker_names(render_refinement(payload), speaker_names)
+        # Refined prose is near-verbatim speech: a name in it is content
+        # (「张强这个月回款才38万」), not a speaker label, so it must not be
+        # rewritten when a speaker who happens to share the name is renamed.
+        return apply_speaker_names(render_refinement(payload or {}), speaker_names)
+    payload = _canonical_speaker_payload(payload or {})
     title = _as_text(payload.get("title")) or title_fallback
     out: list[str] = [f"# {apply_speaker_names(title, speaker_names)}"]
     if meta_lines:

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QSize, QPointF, QRectF, pyqtProperty, pyqtSignal
-from PyQt6.QtGui import QColor, QKeyEvent, QPainter, QPen, QPolygonF
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QSize, QRectF, pyqtProperty, pyqtSignal
+from PyQt6.QtGui import QColor, QKeyEvent, QPainter, QPen
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel,
     QCheckBox, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
@@ -17,7 +17,6 @@ from sayink.ui import design_tokens as tok
 from sayink.ui.design_tokens import (
     PAGE_MARGIN_H,
     PAGE_MARGIN_V,
-    RADIUS_MD,
     SPACE_MD,
     SPACE_SM,
 )
@@ -29,10 +28,8 @@ PAGE_TITLE = ""
 PAGE_SUBTITLE = ""
 FOOTNOTE = ""
 GROUP_STYLE = ""
-HERO_CARD_STYLE = ""
 ROW_RADIO_STYLE = ""
 NAV_BTN_STYLE = ""
-LINK_BTN_STYLE = ""
 
 
 def reload_styles() -> None:
@@ -65,7 +62,6 @@ def reload_styles() -> None:
     }}
 """
     g["GROUP_STYLE"] = group_style
-    g["HERO_CARD_STYLE"] = group_style.replace("settingsGroup", "settingsHeroCard")
     g["ROW_RADIO_STYLE"] = f"""
     QRadioButton {{
         color: {tok.TEXT};
@@ -130,17 +126,6 @@ def reload_styles() -> None:
         padding: 0 14px 0 12px;
     }}
 """
-    g["LINK_BTN_STYLE"] = f"""
-    QPushButton {{
-        color: {tok.TEXT_SEC}; background: transparent; border: none;
-        font-size: {tok.TYPE_FOOTNOTE}px; text-align: left; padding: 4px 0;
-    }}
-    QPushButton:hover {{ color: {tok.TEXT}; }}
-    QPushButton:focus {{
-        outline: none;
-        border-bottom: 1px solid {tok.CONTROL_BORDER_HOVER};
-    }}
-"""
 
 
 reload_styles()
@@ -190,13 +175,6 @@ def elide_middle(text: str, max_len: int = 44) -> str:
     return f"{text[:head]}…{text[-tail:]}"
 
 
-def hero_card() -> QFrame:
-    frame = QFrame()
-    frame.setObjectName("settingsHeroCard")
-    frame.setStyleSheet(HERO_CARD_STYLE)
-    return frame
-
-
 def usage_tip_bar(text: str) -> QFrame:
     """Inline hint strip below hero (shortcut / how-to)."""
     frame = QFrame()
@@ -244,6 +222,8 @@ def polish_preview_content() -> QWidget:
     head.setStyleSheet(SECTION_LABEL)
     lay.addWidget(head)
 
+    rows: list[tuple[QLabel, QLabel]] = []
+
     def _sample(label: str, body: str) -> None:
         row = QWidget()
         row_lay = QHBoxLayout(row)
@@ -265,21 +245,28 @@ def polish_preview_content() -> QWidget:
         )
         row_lay.addWidget(txt, 1)
         lay.addWidget(row)
+        rows.append((tag, txt))
 
-    _sample("原文", "嗯那个就是把会议纪要整理一下吧")
-    _sample("润色", "请整理会议纪要。")
+    for label, body in POLISH_PREVIEW_SAMPLES["polish"]:
+        _sample(label, body)
+
+    def show_mode(mode: str) -> None:
+        """Swap the before/after pair so the example matches the selected
+        processing mode (润色 rewrites, 纠错 only fixes mis-heard words)."""
+        samples = POLISH_PREVIEW_SAMPLES.get(mode) or POLISH_PREVIEW_SAMPLES["polish"]
+        for (tag, txt), (label, body) in zip(rows, samples, strict=True):
+            tag.setText(label)
+            txt.setText(body)
+
+    frame.show_mode = show_mode  # type: ignore[attr-defined]
     return frame
 
 
-def kv_row_elided(key: str, value: str, *, max_len: int = 44) -> QWidget:
-    display = elide_middle(value, max_len)
-    row = kv_row(key, display, mono=True)
-    if display != value:
-        for child in row.findChildren(QLabel):
-            if child.text() == display:
-                child.setToolTip(value)
-                break
-    return row
+# Before/after pairs per llm.mode; the second label names the mode.
+POLISH_PREVIEW_SAMPLES = {
+    "polish": (("原文", "嗯那个就是把会议纪要整理一下吧"), ("润色", "请整理会议纪要。")),
+    "correct": (("原文", "嗯那个这套房子增送车位，训盘下周开"), ("纠错", "嗯那个这套房子赠送车位，新盘下周开")),
+}
 
 
 def _paint_css(widget, css: str) -> None:
@@ -614,274 +601,6 @@ def inline_action_row(widget: QWidget, *, margins: tuple[int, int, int, int] | N
     return row
 
 
-def kv_row(key: str, value: str, *, mono: bool = False) -> QWidget:
-    from sayink.ui.design_tokens import FONT_MONO
-
-    row = QWidget()
-    lay = QHBoxLayout(row)
-    lay.setContentsMargins(SPACE_MD, 11, SPACE_MD, 11)
-    lay.setSpacing(SPACE_MD)
-    k = QLabel(key)
-    k.setProperty("viRole", "kvKey")
-    k.setStyleSheet(
-        f"color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 700; min-width: 80px;"
-    )
-    k.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-    v = QLabel(value)
-    v.setProperty("viRole", "kvValueMono" if mono else "kvValue")
-    v.setWordWrap(True)
-    v.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-    v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-    if mono:
-        v.setStyleSheet(
-            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; font-family: {FONT_MONO};"
-        )
-    else:
-        v.setStyleSheet(f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_BODY_SM}px;")
-    lay.addWidget(k)
-    lay.addWidget(v, 1)
-    return row
-
-
-class _SourceIcon(QWidget):
-    """Simple painted icon for audio source choice cards."""
-
-    def __init__(self, kind: str, active: bool = False, parent=None):
-        super().__init__(parent)
-        self._kind = kind
-        self._active = active
-        self.setFixedSize(32, 32)
-
-    def set_active(self, active: bool) -> None:
-        self._active = active
-        self.update()
-
-    def reapply_styles(self) -> None:
-        self.update()
-
-    def paintEvent(self, event):
-        from sayink.ui import design_tokens as tok
-
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = QColor(tok.TEXT if self._active else tok.TEXT_SEC)
-        pen = QPen(color, 1.8)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-
-        if self._kind == "mic":
-            p.drawRoundedRect(11, 4, 10, 16, 5, 5)
-            p.drawLine(16, 20, 16, 24)
-            p.drawLine(12, 24, 20, 24)
-            p.drawLine(16, 4, 16, 2)
-        elif self._kind == "sys":
-            p.drawRoundedRect(6, 10, 8, 12, 2, 2)
-            p.drawLine(10, 22, 10, 26)
-            p.drawLine(6, 26, 14, 26)
-            p.drawLine(18, 12, 24, 8)
-            p.drawLine(24, 8, 24, 20)
-            p.drawLine(18, 20, 24, 20)
-        elif self._kind == "continuous":
-            p.setBrush(color)
-            for x, h in ((8, 10), (14, 18), (20, 12), (26, 16)):
-                y = 24 - h
-                p.drawRoundedRect(x, y, 4, h, 2, 2)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-        elif self._kind == "hotkey":
-            p.drawRoundedRect(7, 9, 18, 14, 4, 4)
-            p.drawLine(11, 14, 21, 14)
-            p.drawLine(11, 18, 17, 18)
-        else:
-            p.drawRoundedRect(4, 8, 8, 12, 3, 3)
-            p.drawLine(8, 20, 8, 23)
-            p.drawRoundedRect(18, 6, 10, 14, 4, 4)
-            p.drawLine(23, 20, 23, 24)
-            p.drawLine(20, 24, 26, 24)
-        p.end()
-
-
-class ChoiceCard(QFrame):
-    """Clickable option card — vertical icon layout (legacy horizontal picker)."""
-
-    clicked = pyqtSignal()
-
-    def __init__(
-        self,
-        title: str,
-        subtitle: str,
-        icon_kind: str,
-        radio: QRadioButton,
-        parent=None,
-    ):
-        super().__init__(parent)
-        self._radio = radio
-        self._icon_kind = icon_kind
-        self._subtitle = subtitle
-        self.setObjectName("ChoiceCard")
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setAccessibleName(title)
-        if subtitle:
-            self.setAccessibleDescription(subtitle)
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 14, 12, 14)
-        lay.setSpacing(8)
-        lay.setAlignment(Qt.AlignmentFlag.AlignTop)
-
-        self._icon = _SourceIcon(icon_kind)
-        lay.addWidget(self._icon, 0, Qt.AlignmentFlag.AlignHCenter)
-
-        t = QLabel(title)
-        t.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        t.setStyleSheet(
-            f"color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 700; background: transparent;"
-        )
-        lay.addWidget(t)
-
-        s = QLabel(subtitle)
-        s.setWordWrap(True)
-        s.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        s.setStyleSheet(
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_CAPTION}px; line-height: 1.35; background: transparent;"
-        )
-        lay.addWidget(s)
-
-        radio.toggled.connect(self._sync_style)
-        self._sync_style(radio.isChecked())
-
-    def _sync_style(self, checked: bool) -> None:
-        self.setProperty("accessibleChecked", checked)
-        self.setAccessibleDescription(
-            f"{self._subtitle}，{'已选中' if checked else '未选中'}".strip("，")
-        )
-        self._icon.set_active(checked)
-        if checked:
-            self.setStyleSheet(f"""
-                ChoiceCard {{
-                    background: {tok.NAV_SELECTED_BG};
-                    border: 1px solid {tok.HAIRLINE};
-                    border-radius: {tok.RADIUS_MD}px;
-                }}
-            """)
-        else:
-            self.setStyleSheet(f"""
-                ChoiceCard {{
-                    background: {tok.SURFACE};
-                    border: 1px solid {tok.HAIRLINE};
-                    border-radius: {tok.RADIUS_MD}px;
-                }}
-                ChoiceCard:hover {{
-                    border-color: {tok.ACCENT_FOCUS};
-                }}
-            """)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._radio.setChecked(True)
-            self.clicked.emit()
-        super().mousePressEvent(event)
-
-    def keyPressEvent(self, event: QKeyEvent):
-        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self._radio.setChecked(True)
-            self.clicked.emit()
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
-
-class VerticalChoiceCard(QFrame):
-    """Full-width selectable row — used by legacy layouts / style tests."""
-
-    clicked = pyqtSignal()
-
-    def __init__(
-        self,
-        title: str,
-        subtitle: str,
-        icon_kind: str,
-        radio: QRadioButton,
-        parent=None,
-    ):
-        super().__init__(parent)
-        self._radio = radio
-        self._subtitle = subtitle
-        self.setObjectName("VerticalChoiceCard")
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setAccessibleName(title)
-        if subtitle:
-            self.setAccessibleDescription(subtitle)
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(14, 12, 14, 12)
-        lay.setSpacing(12)
-
-        self._icon = _SourceIcon(icon_kind)
-        lay.addWidget(self._icon, 0, Qt.AlignmentFlag.AlignVCenter)
-
-        text_col = QVBoxLayout()
-        text_col.setSpacing(2)
-        t = QLabel(title)
-        t.setStyleSheet(
-            f"color: {tok.TEXT}; font-size: {tok.TYPE_BODY}px; font-weight: 700; background: transparent;"
-        )
-        text_col.addWidget(t)
-        s = QLabel(subtitle)
-        s.setWordWrap(True)
-        s.setStyleSheet(
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.35; background: transparent;"
-        )
-        text_col.addWidget(s)
-        lay.addLayout(text_col, 1)
-
-        radio.setVisible(False)
-        radio.toggled.connect(self._sync_style)
-        self._sync_style(radio.isChecked())
-
-    def _sync_style(self, checked: bool) -> None:
-        self.setProperty("accessibleChecked", checked)
-        self.setAccessibleDescription(
-            f"{self._subtitle}，{'已选中' if checked else '未选中'}".strip("，")
-        )
-        self._icon.set_active(checked)
-        if checked:
-            self.setStyleSheet(f"""
-                VerticalChoiceCard {{
-                    background: {tok.NAV_SELECTED_BG};
-                    border: 1px solid {tok.HAIRLINE};
-                    border-radius: {tok.RADIUS_MD}px;
-                }}
-            """)
-        else:
-            self.setStyleSheet(f"""
-                VerticalChoiceCard {{
-                    background: {tok.SURFACE};
-                    border: 1px solid {tok.HAIRLINE};
-                    border-radius: {tok.RADIUS_MD}px;
-                }}
-                VerticalChoiceCard:hover {{
-                    border-color: {tok.ACCENT_FOCUS};
-                }}
-            """)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._radio.setChecked(True)
-            self.clicked.emit()
-        super().mousePressEvent(event)
-
-    def keyPressEvent(self, event: QKeyEvent):
-        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self._radio.setChecked(True)
-            self.clicked.emit()
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
-
 class CompactPickCard(QFrame):
     """Task choice with visible native radio semantics and a full-row hit target."""
 
@@ -1171,120 +890,6 @@ class ThemeModeSegment(QWidget):
             """)
 
 
-class _PlayCircle(QWidget):
-    """Neutral circular play affordance for audio test row."""
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        d = min(self.width(), self.height())
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(tok.TEXT_SEC))
-        p.drawEllipse(0, 0, d, d)
-        tri = QPolygonF([
-            QPointF(d * 0.38, d * 0.28),
-            QPointF(d * 0.38, d * 0.72),
-            QPointF(d * 0.72, d * 0.50),
-        ])
-        p.setBrush(QColor("#FFFFFF"))
-        p.drawPolygon(tri)
-        p.end()
-
-
-class _WaveformBadge(QWidget):
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        c = QColor(tok.TEXT_DIM)
-        c.setAlpha(120)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(c)
-        w, h = self.width(), self.height()
-        bars = [0.35, 0.7, 0.5, 0.9, 0.45, 0.75, 0.55]
-        gap = 3
-        bar_w = max(2, (w - gap * (len(bars) - 1)) // len(bars))
-        for i, ratio in enumerate(bars):
-            bh = max(4, int(h * ratio))
-            x = i * (bar_w + gap)
-            y = (h - bh) // 2
-            p.drawRoundedRect(x, y, bar_w, bh, 2, 2)
-        p.end()
-
-
-class WideTestButton(QWidget):
-    """Reference-style test row: play · label · waveform."""
-
-    clicked = pyqtSignal()
-
-    def __init__(self, text: str, parent=None):
-        super().__init__(parent)
-        self.setObjectName("WideTestButton")
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(52)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setAccessibleName(text)
-        self._enabled = True
-        self._sync_style()
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(14, 10, 14, 10)
-        lay.setSpacing(12)
-
-        self._play = _PlayCircle()
-        self._play.setFixedSize(32, 32)
-        lay.addWidget(self._play, 0, Qt.AlignmentFlag.AlignVCenter)
-
-        self._label = QLabel(text)
-        self._label.setStyleSheet(
-            f"color: {tok.TEXT}; font-size: {tok.TYPE_BODY}px; font-weight: 400; background: transparent;"
-        )
-        lay.addWidget(self._label, 1, Qt.AlignmentFlag.AlignVCenter)
-
-        wave = _WaveformBadge()
-        wave.setFixedSize(64, 26)
-        lay.addWidget(wave, 0, Qt.AlignmentFlag.AlignVCenter)
-
-    def _sync_style(self) -> None:
-        if self._enabled:
-            self.setStyleSheet(f"""
-                WideTestButton {{
-                    background: {tok.SURFACE};
-                    border: none;
-                    border-radius: {RADIUS_MD}px;
-                }}
-                WideTestButton:hover {{
-                    background: {tok.SURFACE_PEARL};
-                }}
-            """)
-        else:
-            self.setStyleSheet(f"""
-                WideTestButton {{
-                    background: {tok.SURFACE};
-                    border: none;
-                    border-radius: {RADIUS_MD}px;
-                    opacity: 0.55;
-                }}
-            """)
-
-    def setEnabled(self, enabled: bool) -> None:
-        self._enabled = bool(enabled)
-        self._sync_style()
-        super().setEnabled(enabled)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.isEnabled():
-            self.clicked.emit()
-        super().mousePressEvent(event)
-
-    def keyPressEvent(self, event: QKeyEvent):
-        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            if self.isEnabled():
-                self.clicked.emit()
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
-
 def device_selection_link(text: str = "手动选择音频设备") -> QPushButton:
     """Accent text link — toggles advanced device panel (prototype v3)."""
     btn = QPushButton(text)
@@ -1312,33 +917,6 @@ def paint_device_selection_link(btn: QPushButton) -> None:
             border-bottom: 1px solid {tok.ACCENT_FOCUS};
         }}
     """)
-
-
-def collapsible_toggle_btn(text: str) -> QPushButton:
-    btn = QPushButton(f"▸  {text}")
-    btn.setCheckable(True)
-    btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    btn.setStyleSheet(f"""
-        QPushButton {{
-            color: {tok.TEXT_SEC};
-            background: transparent;
-            border: none;
-            font-size: {tok.TYPE_BODY_SM}px;
-            font-weight: 400;
-            text-align: left;
-            padding: 6px 4px;
-        }}
-        QPushButton:hover {{
-            color: {tok.TEXT};
-        }}
-    """)
-
-    def _sync(expanded: bool) -> None:
-        mark = "▾" if expanded else "▸"
-        btn.setText(f"{mark}  {text}")
-
-    btn.toggled.connect(_sync)
-    return btn
 
 
 def _option_text_column(title: str, subtitle: str) -> QWidget:

@@ -32,7 +32,6 @@ class TestAppErrorHints:
             "模型未下载",
             "录音过短",
             "未识别",
-            "润色失败",
             "输出失败",
         ],
     )
@@ -529,6 +528,81 @@ class TestFinalResultFlow:
             h["recorder"].start.assert_not_called()
             h["recorder"].stop.assert_not_called()
             assert "录音过短" in h["floating"].show_error.call_args[0][0]
+
+    def test_long_hold_without_speech_says_nothing_was_heard(self):
+        """Three seconds of silence is not a 'too short' recording: the gate
+        never opened, and the hint must say so."""
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            app._on_recording_start()
+            app._hold_opened_at -= 3.0  # held for three seconds
+            h["recorder"].is_recording = False
+
+            app._on_recording_finished(np.zeros(0, dtype=np.float32))
+
+            msg = h["floating"].show_error.call_args[0][0]
+            assert "未识别到语音内容" in msg
+            assert "录音过短" not in msg
+
+    def test_esc_discards_the_slice_being_recognised(self):
+        """Esc during a hold must not leave 「正在识别上一轮语音」 behind."""
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app, recognizer = h["app"], h["recognizer"]
+            recognizer.cancel_current = lambda: True
+            app._on_recording_start()
+            h["recorder"].is_recording = True
+            app._begin_transcription(np.ones(16000, dtype=np.float32))
+            assert app._is_transcribing
+
+            app._on_recording_cancel()
+
+            assert not app._is_transcribing
+            assert app._pending_record is None
+            h["recorder"].cancel.assert_called_once()
+            h["recorder"].is_recording = False
+            h["floating"].show_error.reset_mock()
+            h["recorder"].start.reset_mock()
+            app._on_recording_start()
+            h["recorder"].start.assert_called_once()
+            h["floating"].show_busy_transcribing.assert_not_called()
+
+    def test_a_failed_slice_inside_a_hold_is_reported_with_the_result(self):
+        """A 15 s slice that failed to recognise is left out of the paste; the
+        result toast must say so instead of hiding the gap."""
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            h["recognizer"].is_loading = False
+            app._on_recording_start()
+            h["recorder"].is_recording = True
+            app._on_final_result("第一段")
+            app._on_recognizer_error("识别失败: boom")
+            h["floating"].show_error.assert_not_called()
+            h["recorder"].is_recording = False
+            app._on_final_result("第三段")
+
+            h["paster"].paste_async.assert_called_once()
+            assert h["paster"].paste_async.call_args[0][0] == "第一段第三段"
+            app._handle_paste_result(PasteResult("sent", target_app="notepad.exe"))
+            hint = h["floating"].show_success.call_args[0][1]
+            assert "有 1 段未识别" in hint
+
+            # The next hold starts clean.
+            h["floating"].show_success.reset_mock()
+            app._on_recording_start()
+            h["recorder"].is_recording = False
+            app._on_final_result("干净的一句")
+            app._handle_paste_result(PasteResult("sent", target_app="notepad.exe"))
+            assert "未识别" not in h["floating"].show_success.call_args[0][1]
+
+    def test_paste_result_keeps_the_tray_on_recording_while_the_next_hold_records(self):
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            h["recorder"].is_recording = True
+            h["tray"].set_activity_tooltip.reset_mock()
+
+            app._handle_paste_result(PasteResult("sent", target_app="notepad.exe"))
+
+            assert h["tray"].set_activity_tooltip.call_args[0][0] == "recording"
 
     def test_esc_before_the_device_opened_cancels_the_hold(self):
         with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:

@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
-from sayink.audio_utils import TARGET_SAMPLE_RATE, rms_volume
+from sayink.audio_utils import MAX_SEGMENT_SEC, TARGET_SAMPLE_RATE, rms_volume
 from sayink.speaker_session import dominant_route
 
 log = logging.getLogger("SayInk")
@@ -38,8 +39,9 @@ TRAILING_SILENCE_KEEP_SEC = 0.5
 HOLD_GATE_RATIO = 0.5
 HOLD_GATE_FLOOR_RATIO = 1.5
 # Stay inside the Fun-ASR-Nano / Qwen3-ASR context window so a long
-# monologue emits a slice while the user is still talking.
-MAX_SPEECH_SEC = 15.0
+# monologue emits a slice while the user is still talking (shared with the
+# speaker detectors, see audio_utils.MAX_SEGMENT_SEC).
+MAX_SPEECH_SEC = MAX_SEGMENT_SEC
 # A fixed RMS gate never sees silence once the room / mic noise floor sits
 # above it, so a steady hiss turns into back-to-back MAX_SPEECH_SEC slices.
 # Track the quietest recent block instead and lift the gate above it.
@@ -70,13 +72,22 @@ VAD_ENERGY = "energy"
 VAD_SILERO = "silero"
 # Silero's exported model takes exactly 512 samples (32 ms) at 16 kHz.
 SILERO_WINDOW = 512
-SILERO_THRESHOLD = 0.5
+# Silero's default 0.5 drops quiet or distant talkers wholesale: on real
+# far-field meetings 9–14 % of labelled speech never left the segmenter,
+# concentrated on the softest speakers. 0.3 halved that; 0.25 halves it
+# again (8.3 % → 5 % / 5.8 % → 3 % of labelled speech on two AISHELL-4
+# meetings) for about half a minute more non-speech per 40 minutes, and the
+# recovered sentences are long enough to embed, so the end-of-meeting DER
+# drops too (32.0 % → 27.4 %, 7.7 % → 5.9 %). 0.2 keeps opening on room noise
+# instead: more false alarms, one extra speaker, no DER gain. The RMS floor
+# still has to agree, so digital silence never opens the gate.
+SILERO_THRESHOLD = 0.25
 # A meeting pause is longer than a dictation pause: speakers think, look at
 # slides, wait for someone else. Holding longer keeps a sentence together.
 MEETING_SILENCE_HOLD_SEC = 1.5
 # A talker who goes on for a long time: cut at a breath, not mid-word, but
 # well inside the ASR context window.
-MEETING_MAX_SPEECH_SEC = 15.0
+MEETING_MAX_SPEECH_SEC = MAX_SEGMENT_SEC
 
 
 class SpeechGate:
@@ -110,9 +121,11 @@ class SileroGate(SpeechGate):
     """Silero VAD (via sherpa-onnx ``VadModel``) with the energy gate as a floor.
 
     Each block is scored in 512-sample windows; any speech window makes the
-    block speech. The RMS gate still has to agree that *something* is there
-    (``rms >= noise floor``), so Silero cannot open on digital silence, and
-    the segmenter's noise-floor tracking keeps working underneath.
+    block speech. A static RMS floor still has to agree that *something* is
+    there (``rms >= min(hold threshold, speech threshold)`` — the fixed
+    0.002 / 0.0006, not the adaptive room floor), so Silero cannot open on
+    digital silence; the segmenter's noise-floor tracking keeps running
+    underneath for the energy fallback.
     """
 
     name = VAD_SILERO
@@ -179,6 +192,34 @@ def make_speech_gate(kind: str, segmenter: "SpeechSegmenter", *, model_path: str
             gate.fallback_reason = str(exc)
             return gate
     return EnergyGate(segmenter)
+
+
+def make_meeting_segmenter(
+    *,
+    speech_threshold: float = SPEECH_RMS_THRESHOLD,
+    vad: str = VAD_ENERGY,
+    model_path: str | Path | None = None,
+    gate_factory: Callable[["SpeechSegmenter"], SpeechGate] | None = None,
+) -> "SpeechSegmenter":
+    """The meeting-profile segmenter exactly as the recorder runs it.
+
+    One constructor for the app, ``tools/asr_bench.py`` and
+    ``tools/meeting_timeline_bench.py``: the pause length, the cut length and
+    the gate choice (with its energy fallback) can no longer drift apart
+    between what users hear and what the benches measure. The recorder passes
+    ``gate_factory`` so its cached Silero session is reused instead of loaded
+    again on the UI thread.
+    """
+    segmenter = SpeechSegmenter(
+        speech_threshold=speech_threshold,
+        silence_hold_sec=MEETING_SILENCE_HOLD_SEC,
+        max_speech_sec=MEETING_MAX_SPEECH_SEC,
+    )
+    if gate_factory is not None:
+        segmenter.set_gate(gate_factory(segmenter))
+    else:
+        segmenter.set_gate(make_speech_gate(vad, segmenter, model_path=model_path))
+    return segmenter
 
 
 class SpeechSegmenter:
@@ -269,6 +310,11 @@ class SpeechSegmenter:
             self._floor_total -= count
 
     def reset(self) -> None:
+        """Start a new input timeline as well as clearing utterance state."""
+        self._input_samples = 0
+        self._reset_buffer()
+
+    def _reset_buffer(self) -> None:
         # The noise-floor window deliberately survives reset(): it describes
         # the room, not the utterance.
         gate = getattr(self, "_gate", None)
@@ -282,6 +328,7 @@ class SpeechSegmenter:
         self._silence_run = 0
         self._in_speech = False
         self._last_route = ""
+        self._last_bounds: tuple[int, int] | None = None
         # Quiet blocks heard before the gate opened, newest last.
         self._pre_roll: list[tuple[np.ndarray, float, float, float]] = []
         self._pre_roll_total = 0
@@ -292,6 +339,15 @@ class SpeechSegmenter:
     def last_route(self) -> str:
         """mic, system, or empty for the segment most recently emitted."""
         return self._last_route
+
+    @property
+    def last_bounds(self) -> tuple[int, int] | None:
+        """Original input sample bounds of the last emitted segment.
+
+        Silence, dropped noise and pre-roll retain their place in this clock.
+        Only an explicit reset starts the input timeline over.
+        """
+        return self._last_bounds
 
     @property
     def in_speech(self) -> bool:
@@ -309,12 +365,16 @@ class SpeechSegmenter:
         if block.size == 0:
             return None
 
+        self._input_samples += int(block.size)
+
         rms = rms_volume(block)
         self._track_noise_floor(int(block.size), float(rms))
         loud = self._gate.is_speech(block, float(rms), in_speech=self._in_speech)
         if loud and not isinstance(self._gate, EnergyGate):
-            # A neural gate still needs *something* above the room's floor;
-            # Silero scoring a hum as speech must not open on silence.
+            # A neural gate still needs *something* above the static RMS
+            # floor (not the adaptive room floor, which would mute quiet
+            # talkers Silero can hear); a hum scored as speech must not open
+            # the gate on digital silence.
             loud = rms >= min(self.hold_threshold, self._speech_threshold)
         if loud:
             if not self._in_speech:
@@ -411,18 +471,20 @@ class SpeechSegmenter:
     def flush(self) -> np.ndarray | None:
         """Emit buffered speech that has not yet reached the silence threshold."""
         if not self._in_speech or self._should_drop():
-            self.reset()
+            self._reset_buffer()
             return None
         if not self._buffer:
-            self.reset()
+            self._reset_buffer()
             return None
+        start = self._input_samples - self._total_samples
         out = np.concatenate(self._buffer).astype(np.float32, copy=False)
         trim = max(0, self._silence_run - self._trailing_keep_samples)
         if trim:
             out = out[: out.size - trim]
         mic, system, _tail = self._split_energy(out.size)
-        self.reset()
+        self._reset_buffer()
         self._last_route = dominant_route(mic, system)
+        self._last_bounds = (start, start + int(out.size))
         return out
 
     def _remember_block(
@@ -467,17 +529,19 @@ class SpeechSegmenter:
         self, limit: int | None = None, *, tail_is_speech: bool = True
     ) -> np.ndarray | None:
         if self._should_drop():
-            self.reset()
+            self._reset_buffer()
             return None
         if not self._buffer:
-            self.reset()
+            self._reset_buffer()
             return None
+        start = self._input_samples - self._total_samples
         audio = np.concatenate(self._buffer).astype(np.float32, copy=False)
         take = audio.size if limit is None else min(int(limit), int(audio.size))
         mic, system, tail_energy = self._split_energy(take)
         tail = audio[take:] if take < audio.size else None
-        self.reset()
+        self._reset_buffer()
         self._last_route = dominant_route(mic, system)
+        self._last_bounds = (start, start + take)
         if tail is not None and tail.size and not tail_is_speech:
             # Trimmed trailing silence: the next utterance's pre-roll.
             self._keep_pre_roll(

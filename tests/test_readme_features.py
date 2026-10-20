@@ -249,7 +249,7 @@ class TestReadmeHoldHotkeyFlow:
 
 
 class TestReadmeHotkeyManagerToApp:
-    """README: 按住说话约 0.18 秒、持续转写约 0.30 秒；短按不进入。"""
+    """README: 单次转写按住约 0.18 秒、持续转写约 0.30 秒；短按不进入。"""
 
     def test_ctrl_space_hold_emits_recording_start(self):
         app = QApplication.instance() or QApplication(sys.argv)
@@ -312,7 +312,7 @@ class TestReadmeAutoStart:
 
 
 class TestReadmeContinuousMode:
-    """README FAQ: 自动持续转写 — 按住快捷键开始，Esc 或听写条「结束」结束。"""
+    """README FAQ: 持续转写 — 按住快捷键开始，Esc 或转写条「结束」结束。"""
 
     def test_stt_ready_does_not_auto_start_continuous(self):
         with app_harness({"audio.trigger_mode": "continuous", "hotkey": "ctrl+space"}) as h:
@@ -325,7 +325,7 @@ class TestReadmeContinuousMode:
                 h["tray"].showMessage.assert_called()
                 msg = h["tray"].showMessage.call_args[0][1]
                 assert "持续转写" in msg or "监听" in msg
-                assert "Esc 或听写条「结束」" in msg
+                assert "Esc 或转写条「结束」" in msg
                 assert "浮窗" not in msg
                 assert "×" not in msg
 
@@ -384,7 +384,50 @@ class TestReadmeContinuousMode:
             app._recorder.is_continuous = True
 
             app._pump_segment_queue()
-            h["recognizer"].transcribe_final.assert_called_once_with(seg)
+            h["recognizer"].transcribe_final.assert_called_once_with(seg, retry_empty=True)
+
+
+def test_readme_single_short_retry_preserves_one_output_and_history_row_after_release():
+    """The shared retry recovers words while a held utterance still outputs once."""
+    from sayink.speech_recognizer import TranscribeWorker
+    from tests.test_app_history_wiring import _enqueued_records
+    from tests.test_asr_short_retry import Recognizer, audio
+
+    with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+        app = h["app"]
+        engine = Recognizer(["", "<asr_text>前半句</asr_text>", "后半句"])
+
+        def transcribe(samples, **options):
+            worker = TranscribeWorker(engine, samples, **options)
+            worker.result_ready.connect(app._on_final_result)
+            worker.error.connect(app._on_recognizer_error)
+            worker.run()
+
+        h["recognizer"].transcribe_final.side_effect = transcribe
+        h["recorder"].is_recording = True
+        with patch("sayink.app.QTimer.singleShot"):
+            app._begin_transcription(audio())
+            assert len(engine.seen) == 2  # the empty first decode was recovered
+            h["paster"].paste_async.assert_not_called()
+            app._begin_transcription(audio())
+            assert len(engine.seen) == 3  # valid text is not decoded again
+            h["paster"].paste_async.assert_not_called()
+            h["history"].enqueue.assert_not_called()
+
+            h["recorder"].is_recording = False
+            app._on_recording_finished(np.zeros(1, dtype=np.float32))
+            assert h["paster"].paste_async.call_count == 1
+            assert h["paster"].paste_async.call_args.args[0] == "前半句后半句"
+            h["paster"].paste_async.call_args.args[1]("pasted")
+            assert not app._emit_hold_output_if_ready()
+
+        records = _enqueued_records(h["history"])
+        assert len(records) == 1
+        assert records[0].raw_text == "前半句后半句"
+        assert records[0].duration_ms == 700 and records[0].trigger_mode == "hotkey"
+        assert records[0].speaker_id == 0
+        assert h["paster"].paste_async.call_count == 1
+        assert h["recognizer"].transcribe_final.call_count == 2
 
 
 class TestReadmeAsrOutputAndPaste:
@@ -415,6 +458,23 @@ class TestReadmeAsrOutputAndPaste:
             h["app"]._on_final_result("测试文本")
             h["polisher"].polish.assert_called_once()
             h["floating"].show_polishing.assert_called_once()
+            assert h["floating"].show_polishing.call_args.kwargs["action"] == "润色"
+            assert h["tray"].set_activity_tooltip.call_args[0][0] == "polishing"
+
+    def test_correct_mode_shows_correcting_not_polishing(self):
+        with app_harness(
+            {
+                "audio.trigger_mode": "hotkey",
+                "llm.enabled": True,
+                "llm.mode": "correct",
+                "llm.api_url": "http://localhost/v1",
+                "llm.api_key": "k",
+                "llm.model_name": "m",
+            }
+        ) as h:
+            h["app"]._on_final_result("测试文本")
+            assert h["floating"].show_polishing.call_args.kwargs["action"] == "纠错"
+            assert h["tray"].set_activity_tooltip.call_args[0][0] == "correcting"
 
     def test_output_text_pastes_without_polish(self):
         with app_harness({"audio.trigger_mode": "hotkey"}) as h:
@@ -514,7 +574,7 @@ class TestReadmeIslandCopy:
 
         text = Path("README.md").read_text(encoding="utf-8")
         assert "打开 SayInk" in text
-        assert "听写条" in text or "薄" in text
+        assert "转写条" in text or "薄" in text
         assert "双击托盘会唤醒空间岛" not in text
 
 
@@ -533,7 +593,7 @@ class TestReadmeReliabilityPromises:
         text = self._readme()
         assert DEFAULT_CONFIG["audio"]["trigger_mode"] == TRIGGER_MODE_HOTKEY
         assert DEFAULT_CONFIG["output"]["mode"] == OUTPUT_MODE_PASTE
-        assert "**按住说话**（默认）" in text
+        assert "**单次转写**（默认）" in text
         assert "持续转写（默认）" not in text
         assert "仅保存到历史" in text
         assert "自动模式下，麦克风默认输入光标" in text
@@ -621,7 +681,7 @@ class TestReadmeSettingsLifecycle:
 
 
 class TestReadmeMeetingNotes:
-    """README「AI 会议记录」promises, backed by tests/test_app_meeting_wiring.py
+    """README「会议」promises, backed by tests/test_app_meeting_wiring.py
     and tests/test_meeting_*.py."""
 
     def _readme(self) -> str:
@@ -631,7 +691,7 @@ class TestReadmeMeetingNotes:
 
     def test_readme_documents_the_meeting_feature(self):
         text = self._readme()
-        assert "### AI 会议记录" in text
+        assert "### 会议" in text
         assert "开始会议" in text and "生成纪要" in text
         assert "不保存音频" in text
         assert "（待核对）" in text
@@ -646,10 +706,10 @@ class TestReadmeMeetingNotes:
         """持续转写 reuses the meeting speaker / VAD / glossary stack
         (tests/test_app_history_wiring.py::TestDictationShares*)."""
         text = self._readme()
-        assert "与会议记录共用同一套方法" in text
-        assert "重新聚类一次并改写编号" in text
-        assert "高级识别设置" in text and "单次转录、连续转录与会议共用" in text
-        assert "跟随听写设置" in text and "仅用于本场" in text
+        assert "持续转写与会议共用谨慎的说话人匹配" in text
+        assert "再用可靠样本重新聚类" in text
+        assert "高级识别设置" in text and "单次转写、持续转写与会议共用" in text
+        assert "跟随转写设置" in text and "仅用于本场" in text
         assert "加载失败并回退" in text and "已保存，待生效" in text
         assert "chat_completion()" in text
         # Settings copy uses the shared names; the old 会议-prefixed ones are gone.
@@ -710,7 +770,7 @@ class TestReadmeMeetingNotes:
                 duration_ms=1000, trigger_mode="meeting", model="m",
             ))
             history.enqueue(SegmentRecord(
-                session_id="dictation", seq=0, created_at=1, raw_text="听写原话", source="mic",
+                session_id="dictation", seq=0, created_at=1, raw_text="转写原话", source="mic",
                 duration_ms=1000, trigger_mode="hotkey", model="m",
             ))
             history.flush(timeout=2.0)

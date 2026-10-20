@@ -417,12 +417,14 @@ class TestGeneration:
         config.set("llm.api_url", "http://127.0.0.1:11434/v1")
         assert controller.remote_host_needing_confirmation() == ""
 
-    def test_cancel_generation_reports_failure(self, controller):
+    def test_cancel_generation_is_not_reported_as_a_failure(self, controller):
         controller._generating_for = "abc"
-        failures = []
+        failures, cancelled = [], []
         controller.generation_failed.connect(lambda mid, msg: failures.append((mid, msg)))
+        controller.generation_cancelled.connect(cancelled.append)
         controller.cancel_generation()
-        assert failures == [("abc", "已取消")]
+        assert failures == []
+        assert cancelled == ["abc"]
         assert controller.generating_for == ""
 
 
@@ -468,18 +470,18 @@ class TestMeetingPage:
     def test_open_start_card_follows_dictation_source_without_replacing_a_choice(self, page, config):
         config.set("audio.input_source", "system")
         page.show_start_card()
-        assert page._opt_source.itemText(0) == "跟随听写（当前：电脑播放）"
+        assert page._opt_source.itemText(0) == "跟随转写（当前：电脑声音）"
         assert page._opt_source.currentData() == ""
 
         config.set("audio.input_source", "mixed")
         page.refresh()
-        assert page._opt_source.itemText(0) == "跟随听写（当前：麦克风 + 电脑播放）"
+        assert page._opt_source.itemText(0) == "跟随转写（当前：麦克风 + 电脑声音）"
         assert page._opt_source.currentData() == ""
 
         page._opt_source.setCurrentIndex(page._opt_source.findData("microphone"))
         config.set("audio.input_source", "system")
         page.refresh()
-        assert page._opt_source.itemText(0) == "跟随听写（当前：电脑播放）"
+        assert page._opt_source.itemText(0) == "跟随转写（当前：电脑声音）"
         assert page._opt_source.currentData() == "microphone"
 
     def test_start_card_emits_options_without_changing_defaults(self, page, config):
@@ -705,10 +707,73 @@ class TestMeetingPage:
         assert page._restore_action.isEnabled()
         page._restore_previous()
         notes = controller.store.get_notes(record.id)
-        assert notes.markdown == "第一版" and notes.previous_markdown == "第二版" and notes.user_edited
+        assert notes.markdown == "第一版" and notes.previous_markdown == "第二版"
+        # Both versions were AI output: restoring one is not a manual edit.
+        assert not notes.user_edited
+        assert "AI 生成" in page._notes_state.text()
         assert "第一版" in page._notes_view.toPlainText()
         page._restore_previous()
         assert controller.store.get_notes(record.id).markdown == "第二版"
+
+    def test_restore_brings_back_the_edited_flag_of_that_version(self, page, controller):
+        record = controller.store.create_meeting(title="评审")
+        controller.store.end_meeting(record.id)
+        controller.store.save_notes(record.id, template_id="general", model="m", json_payload="", markdown="AI 版", duration_ms=1)
+        controller.store.flush()
+        controller.save_user_markdown(record.id, "我改过的版本")
+        controller.store.save_notes(record.id, template_id="general", model="m", json_payload="", markdown="新 AI 版", duration_ms=1)
+        controller.store.flush()
+        page.show_meeting(record.id)
+        page._restore_previous()
+        notes = controller.store.get_notes(record.id)
+        assert notes.markdown == "我改过的版本" and notes.user_edited
+        assert "已手动编辑" in page._notes_state.text()
+        page._restore_previous()
+        notes = controller.store.get_notes(record.id)
+        assert notes.markdown == "新 AI 版" and not notes.user_edited
+
+    def test_rename_after_the_custom_refine_template_was_deleted_keeps_the_prose(self, controller, history, config):
+        """The delete dialog promises the saved text survives; re-rendering a
+        refine payload through 「通用会议」 would replace it with empty sections."""
+        record = controller.store.create_meeting(title="评审")
+        history.enqueue(_row(record.id, 0, "张强这个月回款才38万", speaker_id=1, started_at=record.started_at))
+        controller.store.end_meeting(record.id)
+        payload = {"kind": "refine", "paragraphs": [{"text": "张强这个月回款才38万，说话人1 很不满意。", "sources": [0]}],
+                   "_speaker_names": {"1": "说话人1"}}
+        prose = "张强这个月回款才38万，说话人1 很不满意。\n"
+        controller.store.save_notes(
+            record.id, template_id="custom-refine", model="m",
+            json_payload=json.dumps(payload, ensure_ascii=False), markdown=prose, duration_ms=1,
+        )
+        controller.store.flush()
+        config.set("meeting.custom_templates", [])  # the template is gone
+
+        controller.rename_speaker(record.id, 1, "王五")
+
+        notes = controller.store.get_notes(record.id)
+        assert "本场未识别到" not in notes.markdown
+        assert "王五 很不满意" in notes.markdown
+        # A name inside the prose is content, not the speaker label.
+        assert "张强这个月回款才38万" in notes.markdown
+
+    def test_rename_after_a_custom_minutes_template_was_deleted_patches_the_text(self, controller, history, config):
+        record = controller.store.create_meeting(title="评审")
+        history.enqueue(_row(record.id, 0, "好", speaker_id=1, started_at=record.started_at))
+        controller.store.end_meeting(record.id)
+        payload = {"summary": "说话人1 汇报了进度。", "_speaker_names": {"1": "说话人1"}}
+        controller.store.save_notes(
+            record.id, template_id="custom-x", model="m",
+            json_payload=json.dumps(payload, ensure_ascii=False),
+            markdown="# 评审\n\n## 摘要\n说话人1 汇报了进度。\n\n## 风险\n- 无\n", duration_ms=1,
+        )
+        controller.store.flush()
+
+        controller.rename_speaker(record.id, 1, "王五")
+
+        notes = controller.store.get_notes(record.id)
+        assert "## 风险" in notes.markdown  # the custom section set is kept
+        assert "王五 汇报了进度" in notes.markdown
+        assert notes.json_payload  # still re-renderable once the template is back
 
     def test_speaker_rename_keeps_previous_version(self, controller, history):
         record = controller.store.create_meeting(title="评审")
@@ -769,6 +834,41 @@ class TestSpeakerSessionWiring:
         controller.finalize()
         rows = controller.store.get_segments(record.id)
         assert rows[0].speaker_id == rows[1].speaker_id == 1
+
+    def test_keyed_turns_are_reassigned_one_by_one_around_manual_locks(self, controller, history):
+        """With per-segment keys the finalize pass clusters every turn: a
+        sentence that online matching stuck in the wrong group moves on its
+        own, a one-off spare number folds into the voice it belongs to, and a
+        segment the user corrected (plus its number) stays put."""
+        record = controller.begin(MeetingOptions(), _caps())
+        speakers = controller.speakers
+        a = np.zeros(24, dtype=np.float32)
+        a[0] = 1.0
+        a2 = a.copy()
+        a2[1] = 0.2
+        b = np.zeros(24, dtype=np.float32)
+        b[2] = 1.0
+        b2 = b.copy()
+        b2[3] = 0.2
+        plan = [a, b, a2, b2, a, b, a2, b2, a]
+        ids = []
+        for seq, vector in enumerate(plan):
+            start = record.started_at + seq * 4000
+            ids.append(speakers.assign(vector, "", start_ms=start, end_ms=start + 3500, sample_key=seq))
+        assert ids[0] == 1 and ids[1] == 2
+        rows = [_row(record.id, seq, f"t{seq}", speaker_id=sid, started_at=record.started_at) for seq, sid in enumerate(ids)]
+        # Online matching got seq 4 wrong and invented a spare number for seq 8.
+        rows[4] = SegmentRecord(**{**rows[4].__dict__, "speaker_id": 2})
+        rows[8] = SegmentRecord(**{**rows[8].__dict__, "speaker_id": 3})
+        # The user pinned seq 1 to speaker 2 before the meeting ended.
+        rows[1] = SegmentRecord(**{**rows[1].__dict__, "speaker_locked": True})
+        for row in rows:
+            history.enqueue(row)
+        history.flush(timeout=2.0)
+        controller.finalize()
+        saved = controller.store.get_segments(record.id)
+        assert [s.speaker_id for s in saved] == [1, 2, 1, 2, 1, 2, 1, 2, 1]
+        assert saved[1].speaker_locked and not saved[4].speaker_locked
 
 
 class TestMeetingPageAuxDownload:

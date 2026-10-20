@@ -20,7 +20,7 @@
 # 轻量契约（Quick / Debug-Low）
 
 目标：在已打开的无边框主界面四周画一条可见外边框，让用户能辨认窗口边界。
-非目标：不恢复系统标题栏；不改听写胶囊 / 浮动条；不改独立设置岛或历史岛的 `FLOAT_BORDER`；不改侧栏、导航或页面内容；不加阴影、圆角或窗口尺寸变化。
+非目标：不恢复系统标题栏；不改转写胶囊 / 浮动条；不改独立设置岛或历史岛的 `FLOAT_BORDER`；不改侧栏、导航或页面内容；不加阴影、圆角或窗口尺寸变化。
 影响文件/符号：`sayink/ui/main_window.py` `MainWindow.reapply_theme`；`tests/test_main_window.py`
 可观察行为：浅色与深色主题下，主窗口最外圈出现一条显性 1px 实线外框（类似系统窗口轮廓），颜色使用 `TEXT_DIM`（浅色 `#667085`，深色 `#9CA3AF`）；根布局留 1px 内缩，避免标题栏/侧栏盖住边线；子控件不因此多出边框。
 最小验证：`python -m pytest tests/test_main_window.py -q`，断言外框色为 `TEXT_DIM` 且根布局四边 margin 为 1。

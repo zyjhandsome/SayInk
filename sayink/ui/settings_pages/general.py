@@ -100,7 +100,7 @@ def build_recording_section(win) -> QWidget:
     lay.addWidget(win._esc_stop_divider)
     win._esc_stop_row = ToggleOptionRow(
         "允许 Esc 结束持续转写",
-        "结束后继续识别已录内容；关闭时只能点听写条「结束」",
+        "结束后继续识别已录内容；关闭时只能点转写条「结束」",
     )
     win._esc_stop_row.toggled.connect(win._on_esc_stop_toggled)
     lay.addWidget(win._esc_stop_row)
@@ -229,7 +229,7 @@ def _build_advanced_audio(win, lay: QVBoxLayout) -> tuple[QPushButton, QPushButt
         combo.currentIndexChanged.connect(win._on_audio_device_changed)
     adv_lay.addWidget(labeled_row("麦克风", win._mic_device_combo))
     adv_lay.addWidget(group_divider())
-    adv_lay.addWidget(labeled_row("电脑播放", win._system_device_combo))
+    adv_lay.addWidget(labeled_row("电脑声音", win._system_device_combo))
 
     btn_row = QHBoxLayout()
     btn_row.setContentsMargins(16, 8, 16, 12)
@@ -300,7 +300,7 @@ def _build_toggle_rows(win, lay: QVBoxLayout) -> None:
 
 def _build_history_rows(win, lay: QVBoxLayout) -> None:
     win._history_enabled_row = ToggleOptionRow(
-        "保存转写历史", "仅在本机保存转写文本，不保存音频；关闭后停止新增听写"
+        "保存转写历史", "仅在本机保存转写文本，不保存音频；关闭后停止新增转写"
     )
     win._history_retention_days_spin = QSpinBox()
     win._history_retention_days_spin.setRange(1, 3650)
@@ -319,13 +319,13 @@ def _build_history_rows(win, lay: QVBoxLayout) -> None:
     lay.addWidget(win._history_enabled_row)
     win._history_retention_divider = group_divider()
     lay.addWidget(win._history_retention_divider)
-    win._history_retention_row = labeled_row("保留天数", win._history_retention_days_spin, "超过天数的听写会自动清理")
-    win._history_max_entries_row = labeled_row("最大会话数", win._history_max_entries_spin, "超过上限时先清理最早的听写")
+    win._history_retention_row = labeled_row("保留天数", win._history_retention_days_spin, "超过天数的转写会自动清理")
+    win._history_max_entries_row = labeled_row("最大会话数", win._history_max_entries_spin, "超过上限时先清理最早的转写")
     lay.addWidget(win._history_retention_row)
     win._history_max_entries_divider = group_divider()
     lay.addWidget(win._history_max_entries_divider)
     lay.addWidget(win._history_max_entries_row)
-    win._history_cleanup_hint = footnote("保留规则同样适用于已有听写；保存新听写及启动时自动清理，无法撤销。会议记录不受影响。")
+    win._history_cleanup_hint = footnote("保留规则同样适用于已有转写；保存新转写及启动时自动清理，无法撤销。会议记录不受影响。")
     win._history_cleanup_hint.setProperty("viRole", "importantHint")
     win._history_cleanup_hint_wrap = inline_action_row(win._history_cleanup_hint, margins=(16, 0, 16, 12))
     lay.addWidget(win._history_cleanup_hint_wrap)
@@ -362,12 +362,15 @@ def build_recognition_section(win) -> QWidget:
 
     win._meeting_glossary_edit = QPlainTextEdit()
     win._meeting_glossary_edit.setAccessibleName("自定义词汇")
-    win._meeting_glossary_edit.setPlaceholderText("每行一个词，例如：\nSayInk\n产品名、人名或专业缩写")
+    win._meeting_glossary_edit.setPlaceholderText("每行一个词，例如：\nSayInk\n张鑫=张新、张欣\n产品名、人名或专业缩写")
     win._meeting_glossary_edit.setFixedHeight(96)
     win._meeting_glossary_edit.setTabChangesFocus(True)
     win._paint_meeting_glossary_edit()
     win._meeting_glossary_edit.textChanged.connect(win._on_meeting_glossary_changed)
-    lay.addWidget(stacked_field_row("自定义词汇", win._meeting_glossary_edit, "帮助识别专有名词；最多 50 条，每条不超过 20 字"))
+    lay.addWidget(stacked_field_row(
+        "自定义词汇", win._meeting_glossary_edit,
+        "帮助识别专有名词；最多 50 条，每条不超过 20 字。「词=误写1、误写2」会把常被听错的写法直接改回来",
+    ))
     win._recognition_capability_label = footnote("")
     win._recognition_capability_row = inline_action_row(win._recognition_capability_label, margins=(16, 0, 16, 10))
     lay.addWidget(win._recognition_capability_row)
@@ -409,6 +412,12 @@ def build_recognition_section(win) -> QWidget:
     advanced.addWidget(win._speaker_enabled_row)
     win._speaker_runtime_label = footnote("尚未获取说话人增强运行状态")
     advanced.addWidget(inline_action_row(win._speaker_runtime_label, margins=(16, 0, 16, 12)))
+    advanced.addWidget(group_divider())
+    win._speaker_activity_row = ToggleOptionRow(
+        "多人发言检测（实验性）", "辅助分段，疑似重叠部分待确认；可能增加耗时，需在引擎页下载检测模型并启用 CAM++",
+    )
+    win._speaker_activity_row.toggled.connect(win._on_recognition_setting_changed)
+    advanced.addWidget(win._speaker_activity_row)
     lay.addWidget(win._advanced_recognition_panel)
     section = settings_section("识别", card)
     section.setObjectName("sharedRecognitionSection")
@@ -423,8 +432,8 @@ def build_meeting_section(win) -> QWidget:
     win._meeting_source_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
     win._meeting_source_combo.setMinimumContentsLength(16)
     win._meeting_source_combo.setAccessibleName("会议音频来源")
-    for key, label in (("", "跟随听写设置"), ("mixed", "混合（麦克风 + 电脑播放）"),
-                       ("microphone", "仅麦克风"), ("system", "仅电脑播放")):
+    for key, label in (("", "跟随转写设置"), ("mixed", "混合（麦克风 + 电脑声音）"),
+                       ("microphone", "仅麦克风"), ("system", "仅电脑声音")):
         win._meeting_source_combo.addItem(label, key)
     win._meeting_source_combo.currentIndexChanged.connect(win._on_meeting_setting_changed)
     lay.addWidget(labeled_row("默认音频来源", win._meeting_source_combo, "跟随录音设置，或为会议固定选择一个音源"))
@@ -433,7 +442,7 @@ def build_meeting_section(win) -> QWidget:
     win._meeting_model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
     win._meeting_model_combo.setMinimumContentsLength(16)
     win._meeting_model_combo.setAccessibleName("会议识别模型")
-    win._meeting_model_combo.addItem("与听写相同", "")
+    win._meeting_model_combo.addItem("与转写相同", "")
     for model in MODEL_REGISTRY:
         win._meeting_model_combo.addItem(model["name"], model["id"])
     win._meeting_model_combo.currentIndexChanged.connect(win._on_meeting_setting_changed)
@@ -498,6 +507,7 @@ def build_general_page(win) -> QWidget:
         win._meeting_vad_combo,
         win._vad_download_btn,
         win._speaker_enabled_row,
+        win._speaker_activity_row,
         win._meeting_source_combo,
         win._meeting_model_combo,
         win._meeting_start_card_row,

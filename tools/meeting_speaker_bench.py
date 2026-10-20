@@ -52,7 +52,8 @@ def load_manifest(path: Path) -> list[dict]:
 def run_comparison(clips: list[dict], embedder) -> dict:
     params = dict(threshold=embedder.threshold, keep_history=True,
                   sticky_threshold=embedder.sticky_threshold, sticky_gap_ms=STICKY_GAP_MS)
-    policies = {"legacy": SpeakerSession(**params), "stable": MeetingSpeakerSession(**params)}
+    policies = {"legacy": SpeakerSession(**params),
+                "stable": MeetingSpeakerSession.for_embedder(embedder)}
     rows = {name: [] for name in policies}
     per_clip = []
     embedding_s = audio_s = 0.0

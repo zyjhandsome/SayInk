@@ -127,6 +127,39 @@ class TestHistoryHooks:
         history.flush(timeout=2.0)
         assert [s.speaker_id for s in history.get_session_segments("d1")] == [1, 1, 2]
 
+    def test_relabel_session_segments_moves_single_rows_but_not_locked_ones(self, history):
+        """The end-of-session clustering pass re-assigns individual rows by
+        seq; a row the user corrected keeps its speaker, and other sessions
+        are untouched."""
+        history.enqueue(_seg("d1", 0, "a", created_at=1, meeting=False, speaker_id=1))
+        history.enqueue(_seg("d1", 1, "b", created_at=2, meeting=False, speaker_id=2))
+        locked = _seg("d1", 2, "c", created_at=3, meeting=False, speaker_id=2)
+        history.enqueue(SegmentRecord(**{**locked.__dict__, "speaker_locked": True}))
+        history.enqueue(_seg("d2", 0, "x", created_at=4, meeting=False, speaker_id=2))
+        history.flush(timeout=2.0)
+        history.relabel_session_segments("d1", {0: 1, 1: 1, 2: 1})
+        history.relabel_session_segments("d1", {})
+        history.relabel_session_segments("", {0: 3})
+        history.flush(timeout=2.0)
+        assert [s.speaker_id for s in history.get_session_segments("d1")] == [1, 1, 2]
+        assert [s.speaker_id for s in history.get_session_segments("d2")] == [2]
+
+    def test_set_segment_speakers_respects_locks_and_meeting_rows_only(self, history, meetings):
+        meeting = meetings.create_meeting()
+        for seq, sid in enumerate((1, 2, 1, 2)):
+            history.enqueue(_seg(meeting.id, seq, f"t{seq}", created_at=seq + 1, speaker_id=sid))
+        history.enqueue(_seg(meeting.id, 9, "dictation row with same id", created_at=10, meeting=False, speaker_id=2))
+        assert meetings.flush()
+        meetings.set_segment_speaker(meeting.id, 3, 2)  # user says seq 3 really is speaker 2
+        assert meetings.flush()
+        meetings.set_segment_speakers(meeting.id, {0: 1, 1: 1, 2: 1, 3: 1, 9: 1})
+        meetings.set_segment_speakers(meeting.id, {})
+        assert meetings.flush()
+        rows = meetings.get_segments(meeting.id)
+        assert [s.speaker_id for s in rows] == [1, 1, 1, 2]
+        assert rows[3].speaker_locked
+        assert [s.speaker_id for s in history.get_session_segments(meeting.id) if s.seq == 9] == [2]
+
     def test_old_db_without_captured_at_is_migrated(self, tmp_path):
         db = tmp_path / "history.db"
         conn = sqlite3.connect(db)
@@ -180,17 +213,17 @@ class TestHistoryHooks:
     def test_meeting_rows_hidden_from_dictation_history(self, history, meetings):
         meetings.create_meeting(meeting_id="m1", title="周会")
         history.enqueue(_seg("m1", 0, "会议内容关键词", created_at=1000))
-        history.enqueue(_seg("d1", 0, "听写内容", created_at=2000, meeting=False))
+        history.enqueue(_seg("d1", 0, "转写内容", created_at=2000, meeting=False))
         history.flush(timeout=2.0)
         assert [s.session_id for s in history.list_sessions()] == ["d1"]
         assert history.search_sessions("关键词") == []
-        assert [s.session_id for s in history.search_sessions("听写")] == ["d1"]
+        assert [s.session_id for s in history.search_sessions("转写")] == ["d1"]
 
     def test_cleanup_and_delete_all_exempt_meetings(self, history, meetings):
         meetings.create_meeting(meeting_id="m1", title="周会", started_at=1000)
         history.enqueue(_seg("m1", 0, "会议", created_at=1000))
         for i in range(3):
-            history.enqueue(_seg(f"d{i}", 0, f"听写{i}", created_at=2000 + i, meeting=False))
+            history.enqueue(_seg(f"d{i}", 0, f"转写{i}", created_at=2000 + i, meeting=False))
         history.flush(timeout=2.0)
 
         history.enqueue_cleanup(retention_days=1, max_entries=1, active_session_id=None)
@@ -303,7 +336,9 @@ class TestMeetingStore:
         assert meetings.get_marks("m1") == []
         assert meetings.get_speakers("m1") == []
         assert meetings.get_notes("m1") is None
-        assert meetings.segment_count("m1") == 0
+        rows = history.read(lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM history WHERE session_id = ?", ("m1",)).fetchone()[0])
+        assert rows == 0
 
     def test_interrupted_meetings_marked_on_startup(self, history, meetings):
         meetings.create_meeting(meeting_id="m1", started_at=1000)

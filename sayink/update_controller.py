@@ -203,7 +203,9 @@ class UpdateController(QObject):
     def on_check_failed(self, _message: str) -> None:
         if self._exit_started():
             return
-        self._remember_check()
+        # Not remembered: a start while offline must not push the next real
+        # check out by 24 h, and About's 「上次检查」 only names checks that
+        # actually reached the release feed.
         self.state = UpdateState.ERROR
         if self._interactive or self._check_status_visible:
             self.sync_status()

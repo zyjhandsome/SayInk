@@ -4,8 +4,8 @@
 
 - 权威状态源：`openspec/changes/av-transcribe-and-light-translate/`
 - 风险/闸门：Standard / `medium`；规格已批准；实施须另获明确「开始实施」
-- 禁止范围：真同传；实时听写翻译；历史 DDL 新列；方案 B/C；改热键听写语义；`QThread.terminate` ASR
-- 必须执行的最终验证：`python -m pytest tests/ -q`（或项目惯用等价命令）全绿；手动：短视频/音频导入转写；翻译互斥与降级；热键听写回归
+- 禁止范围：真同传；实时转写翻译；历史 DDL 新列；方案 B/C；改热键转写语义；`QThread.terminate` ASR
+- 必须执行的最终验证：`python -m pytest tests/ -q`（或项目惯用等价命令）全绿；手动：短视频/音频导入转写；翻译互斥与降级；热键转写回归
 
 ## 1. 媒体解码与捆绑
 
@@ -14,7 +14,7 @@
   - 前置依赖：无
   - 目标文件/符号：新建 `sayink/media_decoder.py`（`resolve_ffmpeg_executable`、`decode_media_to_pcm`）；新建 `tests/test_media_decoder.py`
   - 允许修改：上述新文件；必要时极小工具函数
-  - 禁止修改：`speech_recognizer.py` ASR 内核；听写热键逻辑
+  - 禁止修改：`speech_recognizer.py` ASR 内核；转写热键逻辑
   - 实施步骤：列表 argv 调用 ffmpeg；输出 mono float32 16 kHz；分类错误；支持取消（杀子进程）；禁止 `shell=True`
   - 失败测试或已批准替代验证：先写 `tests/test_media_decoder.py`（mock subprocess / 假二进制行为）
   - 验证命令/动作：`python -m pytest tests/test_media_decoder.py -q`
@@ -28,7 +28,7 @@
   - 前置依赖：1.1
   - 目标文件/符号：`build.py`；必要时 `installer/SayInk-Setup.iss`；构建说明中的 ffmpeg 获取步骤；约定放置目录（如 `third_party/ffmpeg/`）
   - 允许修改：构建脚本与安装拷贝规则、简短构建文档
-  - 禁止修改：运行时听写逻辑
+  - 禁止修改：运行时转写逻辑
   - 实施步骤：构建时把 ffmpeg 拷入 `dist/SayInk/`（或 `--add-binary`）；确保冻结态能解析；文档写清来源/许可
   - 失败测试或已批准替代验证：脚本/断言检查产物路径存在（无输入时跳过并明确提示）
   - 验证命令/动作：有 ffmpeg 输入时跑构建或最小产物检查
@@ -48,7 +48,7 @@
   - 实施步骤：硬互斥实时录音/转写；复用 `transcribe_final`；成功写历史；默认不自动粘贴；取消协作式停止
   - 失败测试或已批准替代验证：先写互斥/历史 source/失败提示测试（mock decoder+recognizer）
   - 验证命令/动作：`python -m pytest tests/test_app_file_transcription.py tests/test_app.py -q`
-  - 预期结果：新测与听写相关回归通过
+  - 预期结果：新测与转写相关回归通过
   - 迁移/回滚：去掉入口调用即可
   - 完成定义：无 UI 也可经测试驱动文件任务逻辑
   - 负责人/冲突说明：独占 `app.py` 文件任务段（与 3.x 串行）
@@ -114,12 +114,12 @@
   - 负责人/冲突说明：与 2.2 同文件时串行
 
 - [x] 4.2 最终回归与打包冒烟清单
-  - 对应需求/场景：全规格验收；听写不回归
+  - 对应需求/场景：全规格验收；转写不回归
   - 前置依赖：1.2、2.2、3.2、4.1
   - 目标文件/符号：无功能代码（可补验证笔记，非第二状态源）
   - 允许修改：仅测试/文档笔记
   - 禁止修改：功能范围外重构
-  - 实施步骤：跑全量 pytest；手册：短 mp3/mp4、翻译开关、互斥、热键听写
+  - 实施步骤：跑全量 pytest；手册：短 mp3/mp4、翻译开关、互斥、热键转写
   - 失败测试或已批准替代验证：全量自动测 + 手册项勾选
   - 验证命令/动作：`python -m pytest tests/ -q`
   - 预期结果：全绿；手册项通过或记缺口
@@ -142,5 +142,5 @@
 | `python -m pytest tests/ -q` | 自动回归 + 新测 | 全绿 |
 | 开发态导入短音频/视频 | 解码+ASR+历史 | 成功且 source 可辨 |
 | 开启翻译（文件）/润色互斥 | 轻翻译 | 译文或降级提示 |
-| 热键听写一轮 | 兼容 | 行为与改前一致 |
+| 热键转写一轮 | 兼容 | 行为与改前一致 |
 | （有构建输入时）检查 dist 内 ffmpeg | 捆绑 | 文件存在且冻结路径可解析 |
