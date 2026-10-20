@@ -68,6 +68,35 @@ def test_generation_checkpoints_survive_restart_and_are_invalidated(tmp_path):
         second.close(timeout=2)
 
 
+def test_legacy_transcript_migration_and_corrections_survive_restart(tmp_path):
+    from sayink.history_store import _DDL
+
+    path = tmp_path / "legacy-transcript.db"
+    legacy_ddl = _DDL.replace(",\n  corrected_text TEXT NOT NULL DEFAULT ''", "")
+    with sqlite3.connect(path) as conn:
+        conn.executescript(legacy_ddl)
+        conn.execute("INSERT INTO meetings (id, status, started_at) VALUES ('legacy', 'interrupted', 1000)")
+        conn.execute("INSERT INTO history (session_id, seq, created_at, raw_text, trigger_mode) "
+                     "VALUES ('legacy', 7, 2000, '需要核对的识别原文', 'meeting')")
+    history = HistoryStore(db_path=path)
+    try:
+        store = MeetingStore(history)
+        original = store.get_segments("legacy")[0]
+        assert original.raw_text == "需要核对的识别原文" and original.corrected_text == ""
+        store.set_segment_text("legacy", 7, "人工修正后的文字")
+        assert store.flush()
+    finally:
+        history.close(timeout=2)
+    reopened = HistoryStore(db_path=path)
+    try:
+        segment = MeetingStore(reopened).get_segments("legacy")[0]
+        assert segment.raw_text == original.raw_text and segment.corrected_text == "人工修正后的文字"
+        assert reopened.get_session_segments("legacy")[0] == segment
+        assert reopened.list_sessions() == []
+    finally:
+        reopened.close(timeout=2)
+
+
 class TestHistoryHooks:
     def test_flush_is_a_barrier_for_queued_writes(self, history):
         history.enqueue(_seg("m1", 0, "a", created_at=1000))

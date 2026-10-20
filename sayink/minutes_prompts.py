@@ -220,7 +220,7 @@ def transcript_lines(
 ) -> list[TranscriptLine]:
     lines: list[TranscriptLine] = []
     for seg in segments:
-        text = (seg.polished_text if prefer_polished and seg.polished_text else seg.raw_text).strip()
+        text = (seg.corrected_text or (seg.polished_text if prefer_polished and seg.polished_text else seg.raw_text)).strip()
         if not text:
             continue
         lines.append(

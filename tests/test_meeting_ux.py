@@ -14,7 +14,7 @@ from sayink.ui.flow_layout import PairedToolBar
 from sayink.history_store import HistoryStore, SegmentRecord
 from sayink.meeting_session import MeetingController, MeetingOptions, resolve_capabilities
 from sayink.meeting_store import MeetingStore
-from sayink.ui.meeting_page import MeetingPage, notes_for_display
+from sayink.ui.meeting_page import MeetingPage, _SegmentTextDialog, notes_for_display
 
 
 @pytest.fixture
@@ -554,6 +554,170 @@ def test_correction_is_refused_during_live_recording_or_generation(meeting):
     history.enqueue(SegmentRecord(live.id, 0, live.started_at, raw_text="仍在录制", trigger_mode="meeting", speaker_id=2))
     controller.store.flush()
     assert not controller.correct_segment_speaker(live.id, 0, 1)
+
+
+def test_text_correction_preserves_source_and_only_updates_target_segment(meeting):
+    page, controller, history, record = meeting
+    history.enqueue(SegmentRecord(record.id, 7, record.started_at, raw_text="普通听写", trigger_mode="hotkey"))
+    history.flush()
+    before = controller.store.get_segments(record.id)
+    notes = controller.store.get_notes(record.id)
+    assert controller.save_segment_text(record.id, 7, "  周三开始验证，预算 5000 元。  ")
+    after = controller.store.get_segments(record.id)
+    assert after[0] == before[0] and after[2] == before[2]
+    assert after[1].raw_text == before[1].raw_text
+    assert after[1].speaker_id == before[1].speaker_id and after[1].captured_at == before[1].captured_at
+    assert after[1].corrected_text == "周三开始验证，预算 5000 元。"
+    assert controller.store.get_notes(record.id).markdown == notes.markdown
+    assert controller.store.get_notes(record.id).transcript_changed
+    assert not next(s for s in history.get_session_segments(record.id) if s.trigger_mode == "hotkey").corrected_text
+    page._render_detail()
+    assert "已修改" in page._transcript_view.toPlainText()
+    assert "建议重新生成" in page._notes_state.text()
+    assert controller.store.search_meetings("预算 5000")[0].id == record.id
+    assert not controller.store.search_meetings("下周开始验证")
+
+
+@pytest.mark.parametrize("template_id", ["general", "refine"])
+def test_text_correction_flows_into_generation_copy_and_both_exports(meeting, monkeypatch, template_id):
+    page, controller, _history, record = meeting
+    corrected = "周三开始验证，预算 5000 元。"
+    assert controller.save_segment_text(record.id, 7, corrected)
+    copied = []
+    monkeypatch.setattr("sayink.ui.meeting_page.copy_text", lambda text: copied.append(text) or True)
+    page._copy_transcript()
+    assert corrected in copied[0] and "下周开始验证" not in copied[0]
+    assert corrected in controller.export_transcript_markdown(record.id)
+    assert corrected in controller.export_markdown(record.id)
+    seen = []
+    monkeypatch.setattr(controller._generator, "generate", seen.append)
+    assert controller.generate(record.id, template_id=template_id)
+    assert seen[0].lines[1].text == corrected and seen[0].lines[1].offset_ms == 7000
+
+
+def test_text_restore_preserves_original_and_marks_previous_notes_for_review(meeting):
+    page, controller, _history, record = meeting
+    controller.store.save_notes(record.id, template_id="general", model="m", json_payload="", markdown="新版纪要")
+    controller.store.flush()
+    assert controller.save_segment_text(record.id, 7, "周三验证")
+    assert controller.store.get_notes(record.id).previous_transcript_changed
+    assert controller.save_segment_text(record.id, 7, None)
+    restored = controller.store.get_segments(record.id)[1]
+    assert restored.raw_text == "下周开始验证" and restored.corrected_text == ""
+    assert "下周开始验证" in controller.transcript_text(record.id)
+    controller.restore_previous_notes(record.id)
+    assert controller.store.get_notes(record.id).transcript_changed
+    page._render_detail()
+    assert "已修改" not in page._transcript_view.toPlainText()
+
+
+def test_text_corrections_override_polished_and_raw_sources_until_restored(meeting):
+    from sayink.minutes_prompts import transcript_lines
+
+    _page, controller, history, record = meeting
+    history.enqueue(SegmentRecord(record.id, 20, record.started_at, raw_text="识别原文",
+                                  polished_text="原有润色文字", trigger_mode="meeting"))
+    history.flush()
+    assert controller.save_segment_text(record.id, 20, "人工核对的文字")
+    segments = controller.store.get_segments(record.id)
+    for prefer_polished in (True, False):
+        assert transcript_lines(segments, record.started_at, prefer_polished=prefer_polished)[-1].text == "人工核对的文字"
+    assert controller.save_segment_text(record.id, 20, None)
+    restored = controller.store.get_segments(record.id)
+    assert transcript_lines(restored, record.started_at)[-1].text == "原有润色文字"
+    assert transcript_lines(restored, record.started_at, prefer_polished=False)[-1].text == "识别原文"
+
+
+def test_blank_or_unchanged_text_never_marks_notes_and_failed_write_is_detected(meeting, monkeypatch):
+    _page, controller, _history, record = meeting
+    assert not controller.save_segment_text(record.id, 7, " \n ")
+    assert controller.save_segment_text(record.id, 7, "下周开始验证")
+    assert not controller.store.get_notes(record.id).transcript_changed
+    monkeypatch.setattr(controller.store, "set_segment_text", lambda *_args: None)
+    assert not controller.save_segment_text(record.id, 7, "没有写入")
+    assert not controller.store.get_segments(record.id)[1].corrected_text
+
+
+def test_text_edit_rejected_for_live_generation_missing_or_deleted_segment(meeting):
+    page, controller, history, record = meeting
+    controller._generating_for = record.id
+    page._render_detail()
+    assert "edit-segment:" not in page._transcript_view.toHtml()
+    assert not controller.save_segment_text(record.id, 7, "改动")
+    controller._generating_for = ""
+    assert not controller.save_segment_text(record.id, 999, "改动")
+    assert not controller.save_segment_text("missing", 7, "改动")
+    live = controller.store.create_meeting()
+    history.enqueue(SegmentRecord(live.id, 0, live.started_at, raw_text="进行中", trigger_mode="meeting"))
+    history.flush()
+    assert not controller.save_segment_text(live.id, 0, "改动")
+    controller.store.set_segment_text(live.id, 0, "禁止绕过界面")
+    controller.store.flush()
+    assert not controller.store.get_segments(live.id)[0].corrected_text
+    controller.delete_meeting(record.id)
+    assert not controller.save_segment_text(record.id, 7, "改动")
+
+
+def test_text_link_edits_sparse_sequence_and_keeps_multiline_plain_text(meeting, monkeypatch):
+    page, controller, history, record = meeting
+    history.enqueue(SegmentRecord(record.id, 5, record.started_at, raw_text="", trigger_mode="meeting"))
+    history.flush()
+    page._render_detail()
+    assert "edit-segment:7" in page._transcript_view.toHtml()
+    assert "edit-segment:5" not in page._transcript_view.toHtml()
+
+    def edit(dialog):
+        dialog.editor.setPlainText("预算 <5000> 元\n下周三验证")
+        dialog.save_btn.click()
+        return dialog.result()
+
+    monkeypatch.setattr(_SegmentTextDialog, "exec", edit)
+    page._on_transcript_link(QUrl("edit-segment:7"))
+    assert controller.store.get_segments(record.id)[2].corrected_text == "预算 <5000> 元\n下周三验证"
+    rendered = page._transcript_view.toPlainText()
+    assert "预算 <5000> 元\n下周三验证" in rendered
+    assert "已保存这一段" in page._status_label.text()
+
+
+def test_text_dialog_preserves_failed_draft_then_retries_and_can_restore(meeting):
+    page, controller, _history, record = meeting
+    segment = controller.store.get_segments(record.id)[1]
+    attempts = []
+
+    def save(text):
+        attempts.append(text)
+        return len(attempts) > 1
+
+    dialog = _SegmentTextDialog(segment, position="0:07", speaker="说话人2", save_text=save, parent=page)
+    try:
+        dialog.show()
+        assert not dialog.save_btn.isEnabled() and not dialog.restore_btn.isEnabled()
+        dialog.editor.setPlainText(" \n ")
+        assert not dialog.save_btn.isEnabled()
+        dialog.editor.setPlainText("应当保留的修改")
+        dialog.original_btn.click()
+        assert dialog.original_view.isVisibleTo(dialog)
+        assert dialog.original_view.toPlainText() == segment.raw_text
+        dialog.save_btn.click()
+        assert dialog.isVisible() and dialog.error.isVisibleTo(dialog)
+        assert dialog.editor.toPlainText() == "应当保留的修改"
+        dialog.save_btn.click()
+        assert dialog.result() == QDialog.DialogCode.Accepted
+        assert attempts == ["应当保留的修改", "应当保留的修改"]
+    finally:
+        dialog.deleteLater()
+    assert controller.save_segment_text(record.id, 7, "修改后的文字")
+    segment = controller.store.get_segments(record.id)[1]
+    dialog = _SegmentTextDialog(segment, position="0:07", speaker="说话人2",
+                                save_text=lambda text: controller.save_segment_text(record.id, 7, text), parent=page)
+    try:
+        dialog.restore_btn.click()
+        assert dialog.editor.toPlainText() == segment.raw_text and dialog.corrected_text is None
+        dialog.save_btn.click()
+        assert dialog.result() == QDialog.DialogCode.Accepted
+        assert not controller.store.get_segments(record.id)[1].corrected_text
+    finally:
+        dialog.deleteLater()
 
 
 def test_correction_link_applies_only_the_selected_segment(meeting, monkeypatch):

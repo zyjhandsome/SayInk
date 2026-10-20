@@ -26,7 +26,7 @@ from sayink.config import Config
 from sayink.history_store import HistoryStore, SegmentRecord
 from sayink.meeting_session import MeetingController, MeetingOptions, resolve_capabilities
 from sayink.ui.main_window import MainWindow
-from sayink.ui.meeting_page import _SegmentSpeakerDialog
+from sayink.ui.meeting_page import _SegmentSpeakerDialog, _SegmentTextDialog
 from sayink.ui.theme import apply_theme
 
 NOTES = """# 产品方案评审（示例）
@@ -206,6 +206,26 @@ def main():
             win.resize(880, 580)
             capture(f"narrow-refinement-{theme}.png")
             win.resize(1040, 720)
+            controller.save_segment_text(current.id, 13, "复制按钮应区分纪要和文字稿；导出时可选择范围，周三开始验证。")
+            page._switch_tab(1)
+            page._render_detail()
+            capture(f"edited-transcript-{theme}.png")
+            win.resize(880, 580)
+            capture(f"narrow-edited-transcript-{theme}.png")
+            win.resize(1040, 720)
+            segment = controller.store.get_segments(current.id)[1]
+            dialog = _SegmentTextDialog(
+                segment, position="00:13", speaker="小林", save_text=lambda _text: True, parent=win,
+            )
+            dialog.show()
+            dialog.original_btn.setChecked(True)
+            settle(app)
+            dialog.grab().save(str(args.output / f"text-edit-dialog-{theme}.png"))
+            dialog.resize(360, 440)
+            settle(app)
+            dialog.grab().save(str(args.output / f"narrow-text-edit-dialog-{theme}.png"))
+            dialog.close()
+            controller.save_segment_text(current.id, 13, None)
         win.hide()
         controller.shutdown()
         history.close(timeout=2)

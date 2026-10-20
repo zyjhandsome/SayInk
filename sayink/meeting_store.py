@@ -466,6 +466,29 @@ class MeetingStore:
 
     # -- notes -------------------------------------------------------------
 
+    def set_segment_text(self, meeting_id: str, seq: int, text: str | None) -> None:
+        """Save a manual override, or clear it to restore the original transcript."""
+        if text is not None and not text.strip():
+            raise ValueError("文字稿内容不能为空")
+        corrected = text.strip() if text is not None else ""
+
+        def _update(conn: sqlite3.Connection) -> None:
+            changed = conn.execute(
+                "UPDATE history SET corrected_text = ? "
+                "WHERE session_id = ? AND seq = ? AND trigger_mode = ? AND corrected_text != ? "
+                "AND EXISTS (SELECT 1 FROM meetings WHERE id = ? AND status IN (?, ?))",
+                (corrected, meeting_id, int(seq), MEETING_TRIGGER_MODE, corrected,
+                 meeting_id, STATUS_ENDED, STATUS_INTERRUPTED),
+            )
+            if changed.rowcount:
+                conn.execute(
+                    "UPDATE meeting_notes SET transcript_changed = 1, "
+                    "previous_transcript_changed = CASE WHEN previous_markdown != '' THEN 1 "
+                    "ELSE previous_transcript_changed END WHERE meeting_id = ?", (meeting_id,),
+                )
+
+        self._write(_update)
+
     def generation_checkpoints(self, meeting_id: str, fingerprint: str) -> dict[str, str]:
         def _query(conn):
             return dict(conn.execute(
@@ -639,13 +662,14 @@ class MeetingStore:
                     m.title LIKE ? ESCAPE '\\' OR m.participants LIKE ? ESCAPE '\\' OR m.agenda LIKE ? ESCAPE '\\'
                     OR m.id IN (
                       SELECT session_id FROM history
-                      WHERE raw_text LIKE ? ESCAPE '\\' OR polished_text LIKE ? ESCAPE '\\'
+                      WHERE corrected_text LIKE ? ESCAPE '\\' OR (corrected_text = '' AND
+                            (raw_text LIKE ? ESCAPE '\\' OR polished_text LIKE ? ESCAPE '\\'))
                     )
                     OR m.id IN (SELECT meeting_id FROM meeting_notes WHERE markdown LIKE ? ESCAPE '\\')
                   )
                 ORDER BY m.started_at DESC
                 """,
-                (STATUS_DELETED, pattern, pattern, pattern, pattern, pattern, pattern),
+                (STATUS_DELETED, pattern, pattern, pattern, pattern, pattern, pattern, pattern),
             ).fetchall()
             return [_row_to_meeting(r) for r in rows]
 
@@ -666,7 +690,7 @@ class MeetingStore:
                 """
                 SELECT session_id, seq, created_at, raw_text, polished_text,
                        source, duration_ms, target_app, trigger_mode, model,
-                       speaker_id, speaker_route, captured_at
+                       speaker_id, speaker_route, captured_at, corrected_text
                 FROM history
                 WHERE session_id = ? AND trigger_mode = ?
                 ORDER BY seq ASC

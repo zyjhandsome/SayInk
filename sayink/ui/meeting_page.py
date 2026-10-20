@@ -316,7 +316,7 @@ class _SegmentSpeakerDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 16, 20, 16)
         lay.setSpacing(12)
-        preview = QLabel((segment.polished_text or segment.raw_text)[:220])
+        preview = QLabel((segment.corrected_text or segment.polished_text or segment.raw_text)[:220])
         preview.setTextFormat(Qt.TextFormat.PlainText)
         preview.setWordWrap(True)
         lay.addWidget(preview)
@@ -344,6 +344,105 @@ class _SegmentSpeakerDialog(QDialog):
     @property
     def speaker_id(self) -> int:
         return int(self.speaker_combo.currentData())
+
+
+class _SegmentTextDialog(QDialog):
+    """Keep a segment draft open until its write has been verified."""
+
+    def __init__(self, segment, *, position: str, speaker: str, save_text, parent=None):
+        super().__init__(parent)
+        from sayink.ui import settings_styles as ss
+
+        self._save_text = save_text
+        self._original = (segment.polished_text or segment.raw_text).strip()
+        self._initial = (segment.corrected_text or self._original).strip()
+        self.setWindowTitle("编辑本段文字稿")
+        self.setObjectName("meetingTextCorrection")
+        self.setStyleSheet(ss.WINDOW_CSS + f"""
+            QDialog#meetingTextCorrection {{ background: {tok.SURFACE}; color: {tok.TEXT}; }}
+            QLabel {{ background: transparent; color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; }}
+            QPlainTextEdit {{ background: {tok.SURFACE_PEARL}; color: {tok.TEXT};
+                border: 1px solid {tok.HAIRLINE}; border-radius: {tok.RADIUS_MD}px;
+                padding: 8px; font-size: {tok.READING_FONT_PX}px;
+                selection-background-color: {tok.ACCENT_SOFT}; selection-color: {tok.TEXT}; }}
+        """)
+        self.setMinimumSize(320, 300)
+        available = self.screen().availableGeometry()
+        self.resize(min(600, available.width() - 48), min(500, available.height() - 64))
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(12)
+        context = QLabel(f"[{position}]  {speaker}")
+        context.setTextFormat(Qt.TextFormat.PlainText)
+        context.setWordWrap(True)
+        lay.addWidget(context)
+        hint = QLabel("仅修改这一段。保存后用于纪要、原文精整、复制和导出，时间与发言人保持不变。")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        self.editor = QPlainTextEdit()
+        self.editor.setAccessibleName("本段文字稿内容")
+        self.editor.setPlainText(self._initial)
+        lay.addWidget(self.editor, 1)
+        self.original_view = QPlainTextEdit()
+        self.original_view.setAccessibleName("修改前的原文")
+        self.original_view.setReadOnly(True)
+        self.original_view.setPlainText(self._original)
+        self.original_view.setMaximumHeight(110)
+        self.original_view.hide()
+        lay.addWidget(self.original_view)
+        self.error = QLabel()
+        self.error.setWordWrap(True)
+        self.error.setAccessibleName("文字稿保存状态")
+        self.error.hide()
+        lay.addWidget(self.error)
+        buttons = QHBoxLayout()
+        self.original_btn = QPushButton("查看原文")
+        self.original_btn.setCheckable(True)
+        self.original_btn.setStyleSheet(ss.BTN_GHOST_SM)
+        self.original_btn.toggled.connect(self.original_view.setVisible)
+        self.original_btn.toggled.connect(lambda shown: self.original_btn.setText("收起原文" if shown else "查看原文"))
+        buttons.addWidget(self.original_btn)
+        self.restore_btn = QPushButton("恢复原文")
+        self.restore_btn.setStyleSheet(ss.BTN_GHOST_SM)
+        self.restore_btn.setToolTip("将本段恢复为修改前的文字，点击「保存修改」后生效")
+        self.restore_btn.clicked.connect(lambda: self.editor.setPlainText(self._original))
+        buttons.addWidget(self.restore_btn)
+        buttons.addStretch(1)
+        lay.insertLayout(lay.indexOf(self.original_view), buttons)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.setStyleSheet(ss.BTN_GHOST_SM)
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        self.save_btn = QPushButton("保存修改")
+        self.save_btn.setStyleSheet(ss.BTN_PRIMARY)
+        self.save_btn.clicked.connect(self._save)
+        self.save_btn.setDefault(True)
+        buttons.addWidget(self.save_btn)
+        lay.addLayout(buttons)
+        self.editor.textChanged.connect(self._sync_actions)
+        self._sync_actions()
+        self.editor.setFocus()
+
+    @property
+    def corrected_text(self) -> str | None:
+        text = self.editor.toPlainText().strip()
+        return None if text == self._original else text
+
+    def _sync_actions(self) -> None:
+        text = self.editor.toPlainText().strip()
+        self.save_btn.setEnabled(bool(text) and text != self._initial)
+        self.restore_btn.setEnabled(text != self._original)
+
+    def _save(self) -> None:
+        if not self.save_btn.isEnabled():
+            return
+        if not self._save_text(self.corrected_text):
+            self.error.setText("尚未保存。修改内容仍保留在这里，请重试或复制备份。")
+            self.error.show()
+            return
+        self.accept()
 
 
 class _CurrentPageStack(QStackedWidget):
@@ -432,6 +531,8 @@ class MeetingPage(QWidget):
         self._transcript_offsets: list[int] = []
         self._transcript_highlight = -1
         self._transcript_sequences: list[int] = []
+        self._corrected_sequences: set[int] = set()
+        self._transcript_editable = False
         self._pending_templates: dict[str, str] = {}
         self._citation_return: tuple[str, int] | None = None
         self._correcting_speakers = False
@@ -1372,8 +1473,10 @@ class MeetingPage(QWidget):
         names = self._ctrl.speaker_names(self._detail_id)
         lines = transcript_lines(segments, record.started_at)
         self._transcript_offsets = [line.offset_ms for line in lines]
-        self._transcript_sequences = [s.seq for s in segments if (s.polished_text or s.raw_text).strip()]
-        can_correct = record.status != STATUS_LIVE and not generating and bool(lines)
+        self._transcript_sequences = [s.seq for s in segments if (s.corrected_text or s.polished_text or s.raw_text).strip()]
+        self._corrected_sequences = {s.seq for s in segments if s.corrected_text}
+        can_correct = record.status in (STATUS_ENDED, STATUS_INTERRUPTED) and not generating and bool(lines)
+        self._transcript_editable = can_correct
         self._correct_speaker_btn.setEnabled(can_correct)
         self._correcting_speakers = self._correcting_speakers and can_correct
         self._correct_speaker_btn.blockSignals(True)
@@ -1453,7 +1556,7 @@ class MeetingPage(QWidget):
         else:
             state = "已手动编辑" if notes.user_edited else "AI 生成"
         if notes is not None and notes.transcript_changed:
-            state += f" · 文字稿已更正，{self._result_label()}发言人需核对"
+            state += f" · 文字稿已更正，{self._result_label()}需核对，建议重新生成"
         elif notes is not None and "（待核对）" in notes.markdown:
             state += " · 含待核对内容"
         self._notes_state.setText(state)
@@ -1491,7 +1594,8 @@ class MeetingPage(QWidget):
         self._return_notes_btn.setVisible(transcript and bool(self._citation_return and self._citation_return[0] == self._detail_id))
         if transcript:
             hint = ("点击发言旁的「更正」修改这一段的归属。" if self._correcting_speakers else
-                    "明确自报姓名时自动命名；无法确定时保留编号。点击姓名可手动修改。")
+                    "点击「编辑」修正本段，可恢复原文；姓名无法确定时保留编号，可点击姓名手动命名。"
+                    if self._transcript_editable else "会议结束且生成完成后，可按段编辑文字稿。")
         elif self._editing_notes:
             hint = "复制与导出使用当前草稿。切换会议或离开本页时自动保存。"
         elif self._ctrl.generating_for == self._detail_id:
@@ -1562,10 +1666,17 @@ class MeetingPage(QWidget):
                 head += f" <b style='color:{color}'>{html.escape(label)}</b>"
             background = f" background-color:{tok.HIGHLIGHT_BG};" if index == highlight else ""
             correction = ""
-            if links and self._correcting_speakers and index < len(self._transcript_sequences):
-                correction = (f" <a href='segment:{self._transcript_sequences[index]}' "
-                              f"style='color:{tok.ACCENT_TEXT}'>更正</a>")
-            parts.append(f"<p style='margin:0 0 6px 0;{background}'>{head}&nbsp; {html.escape(line.text)}{correction}</p>")
+            if links and index < len(self._transcript_sequences):
+                seq = self._transcript_sequences[index]
+                if seq in self._corrected_sequences:
+                    head += f" <span style='color:{tok.TEXT_DIM}; font-size:12px'>已修改</span>"
+                if self._correcting_speakers:
+                    correction = f" <a href='segment:{seq}' style='color:{tok.ACCENT_TEXT}'>更正</a>"
+                elif self._transcript_editable:
+                    correction = (f" <a href='edit-segment:{seq}' title='编辑这一段文字稿' "
+                                  f"style='color:{tok.ACCENT_TEXT}; text-decoration:none'>编辑</a>")
+            text = html.escape(line.text).replace("\n", "<br>")
+            parts.append(f"<p style='margin:0 0 6px 0;{background}'>{head}{correction}&nbsp; {text}</p>")
             previous_speaker = line.speaker_id
         return "".join(parts)
 
@@ -1828,6 +1939,33 @@ class MeetingPage(QWidget):
             self._prompt_rename_speaker(int(url.path()))
         elif url.scheme() == "segment" and url.path().isdigit() and self._correcting_speakers:
             self._prompt_segment_speaker(int(url.path()))
+        elif url.scheme() == "edit-segment" and url.path().isdigit():
+            self._prompt_segment_text(int(url.path()))
+
+    def _prompt_segment_text(self, seq: int) -> None:
+        record = self._store.get_meeting(self._detail_id) if self._detail_id else None
+        if record is None or record.status == STATUS_LIVE or self._ctrl.generating_for == record.id:
+            return
+        if not self._save_notes_draft():
+            return
+        segment = next((s for s in self._store.get_segments(record.id) if s.seq == seq), None)
+        if segment is None:
+            return
+        names = self._ctrl.speaker_names(record.id)
+        line = transcript_lines([segment], record.started_at)
+        if not line:
+            return
+        speaker = names.get(line[0].speaker_id) or f"说话人{line[0].speaker_id}"
+        dialog = _SegmentTextDialog(
+            segment, position=_position_label(line[0].offset_ms), speaker=speaker,
+            save_text=lambda text: self._ctrl.save_segment_text(record.id, seq, text), parent=self,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._render_detail()
+            action = "已恢复这一段的原文" if dialog.corrected_text is None else "已保存这一段的修改"
+            notes = self._store.get_notes(record.id)
+            hint = f"；已有{self._result_label()}保留，建议重新生成。" if notes is not None and notes.markdown else "。"
+            self._set_status(action + hint)
 
     def _toggle_speaker_correction(self, enabled: bool) -> None:
         self._correcting_speakers = enabled

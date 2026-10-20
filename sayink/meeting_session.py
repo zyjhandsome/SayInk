@@ -26,6 +26,7 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from sayink.config import Config
 from sayink.history_store import HistoryStore
 from sayink.meeting_store import (
+    STATUS_ENDED,
     STATUS_INTERRUPTED,
     STATUS_LIVE,
     MeetingNotes,
@@ -523,6 +524,30 @@ class MeetingController(QObject):
             return False
         saved = self._store.get_notes(meeting_id) if markdown is not None else None
         if markdown is not None and (saved is None or saved.markdown != markdown):
+            return False
+        self.meeting_changed.emit(meeting_id)
+        return True
+
+    def save_segment_text(self, meeting_id: str, seq: int, text: str | None) -> bool:
+        """Edit only a completed meeting segment; None restores its original text."""
+        record = self._store.get_meeting(meeting_id)
+        if (record is None or record.status not in (STATUS_ENDED, STATUS_INTERRUPTED)
+                or self._generating_for == meeting_id or (text is not None and not text.strip())):
+            return False
+        segment = next((s for s in self._store.get_segments(meeting_id) if s.seq == seq), None)
+        if segment is None:
+            return False
+        original = (segment.polished_text or segment.raw_text).strip()
+        corrected = text.strip() if text is not None else ""
+        if corrected == original:
+            corrected = ""
+        if segment.corrected_text == corrected:
+            return True
+        self._store.set_segment_text(meeting_id, seq, corrected or None)
+        if not self._store.flush():
+            return False
+        saved = next((s for s in self._store.get_segments(meeting_id) if s.seq == seq), None)
+        if saved is None or saved.corrected_text != corrected:
             return False
         self.meeting_changed.emit(meeting_id)
         return True

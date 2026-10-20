@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS history (
   model         TEXT    NOT NULL DEFAULT '',
   speaker_id    INTEGER NOT NULL DEFAULT 0,
   speaker_route TEXT    NOT NULL DEFAULT '',
-  captured_at   INTEGER NOT NULL DEFAULT 0
+  captured_at   INTEGER NOT NULL DEFAULT 0,
+  corrected_text TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_history_session ON history(session_id);
 CREATE INDEX IF NOT EXISTS idx_history_created ON history(created_at);
@@ -105,6 +106,8 @@ def _ensure_speaker_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE history ADD COLUMN speaker_route TEXT NOT NULL DEFAULT ''")
     if "captured_at" not in present:
         conn.execute("ALTER TABLE history ADD COLUMN captured_at INTEGER NOT NULL DEFAULT 0")
+    if "corrected_text" not in present:
+        conn.execute("ALTER TABLE history ADD COLUMN corrected_text TEXT NOT NULL DEFAULT ''")
 
 
 def _ensure_meeting_note_columns(conn: sqlite3.Connection) -> None:
@@ -164,6 +167,8 @@ class SegmentRecord:
     # Wall-clock ms when the segment's speech started (0 for rows written by
     # older versions, which only know when recognition finished).
     captured_at: int = 0
+    # A manual meeting correction; empty means use the untouched ASR text.
+    corrected_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -191,6 +196,7 @@ def _row_to_segment(r: tuple) -> SegmentRecord:
         speaker_id=int(r[10] or 0),
         speaker_route=r[11] or "",
         captured_at=int(r[12] or 0) if len(r) > 12 else 0,
+        corrected_text=(r[13] or "") if len(r) > 13 else "",
     )
 
 
@@ -606,7 +612,7 @@ class HistoryStore:
                     """
                     SELECT session_id, seq, created_at, raw_text, polished_text,
                            source, duration_ms, target_app, trigger_mode, model,
-                           speaker_id, speaker_route, captured_at
+                           speaker_id, speaker_route, captured_at, corrected_text
                     FROM history
                     WHERE session_id = ?
                     ORDER BY seq ASC
@@ -707,8 +713,8 @@ class HistoryStore:
             INSERT INTO history (
               session_id, seq, created_at, raw_text, polished_text,
               source, duration_ms, target_app, trigger_mode, model,
-              speaker_id, speaker_route, captured_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              speaker_id, speaker_route, captured_at, corrected_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.session_id,
@@ -724,6 +730,7 @@ class HistoryStore:
                 int(record.speaker_id),
                 record.speaker_route or "",
                 int(record.captured_at or 0),
+                record.corrected_text,
             ),
         )
         conn.commit()
