@@ -6,6 +6,8 @@ voice is merged into the closest existing one. Nothing is stored on disk.
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 from sayink.audio_utils import TARGET_SAMPLE_RATE
@@ -131,6 +133,8 @@ class SpeakerSession:
         sticky_gap_ms: int = 0,
     ) -> None:
         self._clusters: list[_Cluster] = []
+        self._lock = threading.RLock()
+        self._next_id = 1
         self._last_id = 0
         self._last_end_ms = 0
         self._threshold = float(threshold)
@@ -151,13 +155,23 @@ class SpeakerSession:
     @property
     def history(self) -> list[tuple[int, np.ndarray]]:
         """(speaker_id, embedding) for every assigned segment, in order."""
-        return list(self._history)
+        with self._lock:
+            return list(self._history)
+
+    def reserve_speaker_id(self, minimum: int = 1) -> int:
+        """Reserve a manual identity without teaching it to the voice matcher."""
+        with self._lock:
+            speaker_id = max(self._next_id, int(minimum))
+            self._next_id = speaker_id + 1
+            return speaker_id
 
     def reset(self) -> None:
-        self._clusters.clear()
-        self._last_id = 0
-        self._last_end_ms = 0
-        self._history.clear()
+        with self._lock:
+            self._clusters.clear()
+            self._next_id = 1
+            self._last_id = 0
+            self._last_end_ms = 0
+            self._history.clear()
 
     def assign(
         self,
@@ -169,15 +183,16 @@ class SpeakerSession:
     ) -> int:
         """Speaker number for this segment. ``start_ms``/``end_ms`` (wall clock)
         feed the continuity prior; leave them 0 to disable it for this call."""
-        speaker_id = self._assign(embedding, route, int(start_ms or 0))
-        if end_ms:
-            self._last_end_ms = int(end_ms)
-        elif start_ms:
-            self._last_end_ms = int(start_ms)
-        if self._keep_history:
-            vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
-            self._history.append((speaker_id, vector.copy()))
-        return speaker_id
+        with self._lock:
+            speaker_id = self._assign(embedding, route, int(start_ms or 0))
+            if end_ms:
+                self._last_end_ms = int(end_ms)
+            elif start_ms:
+                self._last_end_ms = int(start_ms)
+            if self._keep_history:
+                vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
+                self._history.append((speaker_id, vector.copy()))
+            return speaker_id
 
     def _assign(self, embedding: np.ndarray, route: str, start_ms: int) -> int:
         route = route if route in ("mic", "system") else ""
@@ -204,7 +219,7 @@ class SpeakerSession:
             self._absorb(fallback[0], vector, route)
             return fallback[0].speaker_id
 
-        speaker_id = len(self._clusters) + 1
+        speaker_id = self.reserve_speaker_id()
         self._clusters.append(_Cluster(speaker_id, route, vector.copy()))
         self._last_id = speaker_id
         return speaker_id
@@ -261,6 +276,7 @@ def recluster(
     *,
     threshold: float,
     max_speakers: int = MAX_SPEAKERS,
+    protected_ids: set[int] | None = None,
 ) -> dict[int, int]:
     """Post-meeting pass over the kept embeddings: agglomerative merge of
     speaker centroids whose cosine similarity exceeds ``threshold``.
@@ -268,8 +284,10 @@ def recluster(
     Online assignment is greedy — the same person can be split in two when
     the first few segments were noisy. Returns ``{old_id: new_id}`` with ids
     renumbered 1..n in order of first appearance; identity mapping when
-    nothing merges.
+    nothing merges. With protected_ids, distinct manual identities never
+    merge and existing numbers remain stable, including reserved manual ids.
     """
+    protected = set(protected_ids or ())
     centroids: dict[int, np.ndarray] = {}
     counts: dict[int, int] = {}
     order: list[int] = []
@@ -310,8 +328,10 @@ def recluster(
             break
         ra, rb = find(a), find(b)
         if ra != rb:
-            # Keep the id that appeared first as the root.
-            if order.index(ra) < order.index(rb):
+            if ra in protected and rb in protected:
+                continue
+            # Manual identities keep their number and cannot swallow each other.
+            if ra in protected or (rb not in protected and order.index(ra) < order.index(rb)):
                 parent[rb] = ra
             else:
                 parent[ra] = rb
@@ -324,11 +344,14 @@ def recluster(
     # More roots than allowed: fold the smallest groups into their nearest root.
     while len(roots_in_order) > max_speakers:
         sizes = {r: sum(counts[s] for s in order if find(s) == r) for r in roots_in_order}
-        smallest = min(roots_in_order, key=lambda r: sizes[r])
+        candidates = [r for r in roots_in_order if r not in protected]
+        if not candidates:
+            break
+        smallest = min(candidates, key=lambda r: sizes[r])
         others = [r for r in roots_in_order if r != smallest]
         nearest = max(others, key=lambda r: float(np.dot(centroids[smallest], centroids[r])))
         parent[smallest] = nearest
         roots_in_order.remove(smallest)
 
-    renumber = {root: index + 1 for index, root in enumerate(roots_in_order)}
+    renumber = {root: root if protected else index + 1 for index, root in enumerate(roots_in_order)}
     return {sid: renumber[find(sid)] for sid in order}

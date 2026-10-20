@@ -194,11 +194,13 @@ def segment_offset_ms(segment: SegmentRecord, meeting_started_at: int) -> int:
 
 
 def speaker_label(speaker_id: int, names: dict[int, str] | None = None) -> str:
+    if int(speaker_id) <= 0:
+        return "说话人待确认"
     if names:
         name = (names.get(int(speaker_id)) or "").strip()
         if name:
             return name
-    return f"说话人{int(speaker_id) or 1}"
+    return f"说话人{int(speaker_id)}"
 
 
 @dataclass
@@ -226,7 +228,7 @@ def transcript_lines(
         lines.append(
             TranscriptLine(
                 offset_ms=segment_offset_ms(seg, meeting_started_at),
-                speaker_id=int(seg.speaker_id or 1),
+                speaker_id=int(seg.speaker_id),
                 text=text,
                 route=seg.speaker_route or "",
             )
@@ -255,6 +257,8 @@ _SYSTEM_RULES = (
     "你是会议纪要撰写助手。只依据给定文字稿与用户笔记写纪要，不编造任何文字稿中没有的事实。\n"
     "- 文字稿每行格式为 [hh:mm:ss] 说话人N：内容；说话人编号来自声音聚类，可能有误，"
     "不要据此推断身份，除非文字稿中有人自报姓名。\n"
+    "- 标为「说话人待确认」的各段可能来自不同的人，不得将它们合成一个人的发言，"
+    "也不得沿用上一位说话人的姓名或推断待办负责人。\n"
     "- 显示姓名也可能由用户手动命名。身份、姓名及系统能力的说法应归因于发言者，"
     "不要把「系统认出我是谁」等发言写成系统已验证真实身份的结论。\n"
     "- 显示姓名也可能来自原文明确自报姓名，仅是本场会议的称呼，不是声纹实名验证。"

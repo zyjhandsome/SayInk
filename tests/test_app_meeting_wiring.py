@@ -67,7 +67,13 @@ def test_start_meeting_switches_pipeline_and_tags_rows() -> None:
         assert row.trigger_mode == "meeting"
         assert row.captured_at == 1_700_000_000_000
         assert row.raw_text == "第一句话"
-        assert row.speaker_id >= 1
+        # This fixture is too short to establish a voice identity. Its words
+        # are kept while attribution stays explicitly unknown.
+        assert row.speaker_id == 0
+        h["recognizer"].transcribe_final.assert_called_once()
+        call = h["recognizer"].transcribe_final.call_args
+        assert call.kwargs == {"retry_empty": True}
+        assert np.array_equal(call.args[0], _audio())
         assert h["floating"].show_success.call_args[0][0] == "已记录"
 
 

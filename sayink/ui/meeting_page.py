@@ -301,8 +301,9 @@ class _ReadingView(QTextBrowser):
 
 
 class _SegmentSpeakerDialog(QDialog):
-    def __init__(self, segment, choices: list[tuple[int, str]], parent=None):
+    def __init__(self, segment, choices: list[tuple[int | None, str]], parent=None, *, save_speaker=None, live=False):
         super().__init__(parent)
+        self._save_speaker = save_speaker
         from sayink.ui import design_tokens as tok
         from sayink.ui import settings_styles as ss
 
@@ -322,28 +323,48 @@ class _SegmentSpeakerDialog(QDialog):
         lay.addWidget(preview)
         self.speaker_combo = QComboBox()
         self.speaker_combo.setAccessibleName("这一段的发言人")
+        self.speaker_combo.setPlaceholderText("请选择这一段的发言人")
         for speaker_id, label in choices:
             self.speaker_combo.addItem(label, speaker_id)
-        self.speaker_combo.setCurrentIndex(max(0, self.speaker_combo.findData(segment.speaker_id)))
+        self.speaker_combo.setCurrentIndex(self.speaker_combo.findData(segment.speaker_id))
         lay.addWidget(self.speaker_combo)
-        hint = QLabel("仅更改这一段的归属。现有纪要中的发言人需要核对，或重新生成纪要。")
+        hint = QLabel(
+            "更正这一段，人工更正会保留。清晰的声音会帮助判断后续发言；其他已有段落保持原归属。" if live else
+            "仅更改这一段的归属。现有纪要中的发言人需要核对，或重新生成纪要。"
+        )
         hint.setWordWrap(True)
         lay.addWidget(hint)
+        self.error = QLabel()
+        self.error.setWordWrap(True)
+        self.error.hide()
+        lay.addWidget(self.error)
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         cancel = QPushButton("取消")
         cancel.setStyleSheet(ss.BTN_GHOST_SM)
         cancel.clicked.connect(self.reject)
-        save = QPushButton("应用更正")
-        save.setStyleSheet(ss.BTN_PRIMARY)
-        save.clicked.connect(self.accept)
+        self.save_btn = QPushButton("应用更正")
+        self.save_btn.setStyleSheet(ss.BTN_PRIMARY)
+        self.save_btn.clicked.connect(self._save)
         buttons.addWidget(cancel)
-        buttons.addWidget(save)
+        buttons.addWidget(self.save_btn)
         lay.addLayout(buttons)
 
     @property
-    def speaker_id(self) -> int:
-        return int(self.speaker_combo.currentData())
+    def speaker_id(self) -> int | None:
+        value = self.speaker_combo.currentData()
+        return int(value) if value is not None else None
+
+    def _save(self) -> None:
+        if self.speaker_combo.currentIndex() < 0:
+            self.error.setText("请先选择这一段的发言人。")
+            self.error.show()
+            return
+        if self._save_speaker is not None and not self._save_speaker(self.speaker_id):
+            self.error.setText("更正尚未保存，选择已保留。请重试；会议已结束或正在整理时，请关闭后重新选择。")
+            self.error.show()
+            return
+        self.accept()
 
 
 class _SegmentTextDialog(QDialog):
@@ -532,10 +553,14 @@ class MeetingPage(QWidget):
         self._transcript_highlight = -1
         self._transcript_sequences: list[int] = []
         self._corrected_sequences: set[int] = set()
+        self._speaker_locked_sequences: set[int] = set()
         self._transcript_editable = False
         self._pending_templates: dict[str, str] = {}
         self._citation_return: tuple[str, int] | None = None
         self._correcting_speakers = False
+        self._live_correcting_speakers = False
+        self._live_transcript_sequences: list[int] = []
+        self._live_locked_sequences: set[int] = set()
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(400)
@@ -944,6 +969,26 @@ class MeetingPage(QWidget):
         self._live_status.hide()
         lay.addWidget(self._live_status)
 
+        speaker_tools = PairedToolBar(spacing=8)
+        self._live_speaker_hint = QLabel("点击姓名可命名；纠正发言人只影响选中的段落，人工修改会保留。")
+        self._live_speaker_hint.setWordWrap(True)
+        self._live_speaker_btn = QPushButton("命名说话人")
+        self._live_speaker_btn.setAccessibleName("会议录制中命名说话人")
+        self._live_speaker_menu = QMenu(self._live_speaker_btn)
+        self._live_speaker_menu.aboutToShow.connect(self._populate_live_speaker_menu)
+        self._live_speaker_btn.setMenu(self._live_speaker_menu)
+        speaker_tools.add_right(self._live_speaker_btn)
+        self._live_correct_speaker_btn = QPushButton("纠正发言人")
+        self._live_correct_speaker_btn.setCheckable(True)
+        self._live_correct_speaker_btn.toggled.connect(self._toggle_live_speaker_correction)
+        speaker_tools.add_right(self._live_correct_speaker_btn)
+        lay.addWidget(speaker_tools)
+        lay.addWidget(self._live_speaker_hint)
+        self._live_speaker_feedback = QLabel()
+        self._live_speaker_feedback.setWordWrap(True)
+        self._live_speaker_feedback.hide()
+        lay.addWidget(self._live_speaker_feedback)
+
         self._live_find_bar = QWidget()
         find_lay = QHBoxLayout(self._live_find_bar)
         find_lay.setContentsMargins(0, 0, 0, 0)
@@ -965,6 +1010,8 @@ class MeetingPage(QWidget):
         self._live_split = QSplitter(Qt.Orientation.Horizontal)
         self._live_split.setChildrenCollapsible(False)
         self._live_transcript = QTextBrowser()
+        self._live_transcript.setOpenLinks(False)
+        self._live_transcript.anchorClicked.connect(self._on_live_transcript_link)
         self._live_transcript.setAccessibleName("实时文字稿")
         self._live_transcript.setPlaceholderText("开始说话后，这里会按说话人逐条出现文字…")
         self._live_split.addWidget(self._live_transcript)
@@ -1064,7 +1111,7 @@ class MeetingPage(QWidget):
         dim = f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
         for label in (self._list_summary, self._detail_meta, self._card_hint, self._live_caps,
                       self._card_notes, self._empty_label, self._template_label, self._content_hint,
-                      self._notes_empty):
+                      self._notes_empty, self._live_speaker_hint, self._live_speaker_feedback):
             label.setStyleSheet(dim)
         for label in (self._marks_title, self._notes_title):
             label.setStyleSheet(
@@ -1102,7 +1149,7 @@ class MeetingPage(QWidget):
         self._template_combo.setMinimumHeight(tok.CONTROL_BTN_SM_HEIGHT)
         from sayink.ui.tray_icon import _menu_font, _menu_stylesheet
 
-        for menu in (self._more_menu, self._speaker_menu, self._export_menu):
+        for menu in (self._more_menu, self._speaker_menu, self._export_menu, self._live_speaker_menu):
             menu.setFont(_menu_font())
             menu.setStyleSheet(_menu_stylesheet())
         text_css = f"""
@@ -1146,7 +1193,7 @@ class MeetingPage(QWidget):
             btn.setStyleSheet(ss.BTN_ACCENT_SM)
         for btn in (self._generate_btn, self._edit_btn, self._copy_btn, self._transcript_copy_btn, self._export_btn, self._card_cancel,
                     self._cancel_btn, self._correct_speaker_btn, self._return_notes_btn, self._clear_search_btn,
-                    self._pause_btn, self._live_find_close_btn, self._manage_templates_btn):
+                    self._pause_btn, self._live_find_close_btn, self._manage_templates_btn, self._live_correct_speaker_btn):
             btn.setStyleSheet(ss.BTN_GHOST_SM)
         # Match 导出's real box (style min-height plus its border) so the tab
         # capsule and the button share one line. Both labels use the same weight.
@@ -1168,6 +1215,7 @@ class MeetingPage(QWidget):
         no_indicator = "QPushButton::menu-indicator { image: none; width: 0px; }"
         self._more_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
         self._speaker_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
+        self._live_speaker_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
         self._end_btn.setStyleSheet(ss.BTN_DANGER_SM)
         for splitter in (self._splitter, self._live_split):
             splitter.setStyleSheet(
@@ -1475,6 +1523,7 @@ class MeetingPage(QWidget):
         self._transcript_offsets = [line.offset_ms for line in lines]
         self._transcript_sequences = [s.seq for s in segments if (s.corrected_text or s.polished_text or s.raw_text).strip()]
         self._corrected_sequences = {s.seq for s in segments if s.corrected_text}
+        self._speaker_locked_sequences = {s.seq for s in segments if s.speaker_locked}
         can_correct = record.status in (STATUS_ENDED, STATUS_INTERRUPTED) and not generating and bool(lines)
         self._transcript_editable = can_correct
         self._correct_speaker_btn.setEnabled(can_correct)
@@ -1639,40 +1688,56 @@ class MeetingPage(QWidget):
         self._export_actions["transcript"].setEnabled(has_transcript)
         self._export_actions["all"].setEnabled(bool(self._detail_id))
 
-    def _transcript_html(self, lines, names: dict[int, str], *, links: bool = False, highlight: int = -1) -> str:
+    def _transcript_html(self, lines, names: dict[int, str], *, links: bool = False, highlight: int = -1, live: bool = False) -> str:
         from sayink.ui import design_tokens as tok
 
         parts = []
+        meeting_id = self._ctrl.current_id if live else self._detail_id
+        sequences = self._live_transcript_sequences if live else self._transcript_sequences
+        locked = self._live_locked_sequences if live else self._speaker_locked_sequences
+        correcting = self._live_correcting_speakers if live else self._correcting_speakers
+        speaker_link = "live-speaker" if live else "speaker"
+        segment_link = "live-segment" if live else "segment"
         auto_names = {
-            s.speaker_id for s in self._store.get_speakers(self._detail_id)
+            s.speaker_id for s in self._store.get_speakers(meeting_id)
             if s.suggested_name and not s.display_name and not s.name_locked
-        } if links and self._detail_id else set()
+        } if links and meeting_id else set()
         previous_speaker = None
         for index, line in enumerate(lines):
-            label = names.get(line.speaker_id) or f"说话人{line.speaker_id}" if line.speaker_id > 0 else ""
+            label = (names.get(line.speaker_id) or f"说话人{line.speaker_id}") if line.speaker_id > 0 else "说话人待确认"
             color = speaker_color(line.speaker_id)
             head = f"<a name='seg{index}'></a><span style='color:{tok.TEXT_DIM}'>[{_position_label(line.offset_ms)}]</span>"
-            if label and links:
+            if line.speaker_id <= 0:
+                head += f" <span style='color:{tok.TEXT_DIM}'>说话人待确认</span>"
+            elif label and links and not live:
                 if line.speaker_id != previous_speaker:
                     suffix = (" · 原文自报姓名" if line.speaker_id in auto_names else
                               " · 手动命名" if line.speaker_id in names else " · 自动区分")
                     parts.append(
-                        f"<p style='margin:10px 0 2px 0'><a href='speaker:{line.speaker_id}' "
+                        f"<p style='margin:10px 0 2px 0'><a href='{speaker_link}:{line.speaker_id}' "
                         f"title='为这一组发言命名' style='color:{color}; text-decoration:none'>"
                         f"<b>{html.escape(label)}</b></a>"
                         f"<span style='color:{tok.TEXT_DIM}; font-size:12px'>{suffix}</span></p>"
                     )
             elif label:
-                head += f" <b style='color:{color}'>{html.escape(label)}</b>"
+                if live and links:
+                    head += (f" <a href='{speaker_link}:{line.speaker_id}' title='为这一组发言命名' "
+                             f"style='color:{color}; text-decoration:none'><b>{html.escape(label)}</b></a>")
+                    if line.speaker_id in names:
+                        head += f" <span style='color:{tok.TEXT_DIM}; font-size:12px'>手动命名</span>"
+                else:
+                    head += f" <b style='color:{color}'>{html.escape(label)}</b>"
             background = f" background-color:{tok.HIGHLIGHT_BG};" if index == highlight else ""
             correction = ""
-            if links and index < len(self._transcript_sequences):
-                seq = self._transcript_sequences[index]
-                if seq in self._corrected_sequences:
+            if links and index < len(sequences):
+                seq = sequences[index]
+                if not live and seq in self._corrected_sequences:
                     head += f" <span style='color:{tok.TEXT_DIM}; font-size:12px'>已修改</span>"
-                if self._correcting_speakers:
-                    correction = f" <a href='segment:{seq}' style='color:{tok.ACCENT_TEXT}'>更正</a>"
-                elif self._transcript_editable:
+                if seq in locked:
+                    head += f" <span style='color:{tok.TEXT_DIM}; font-size:12px'>归属已更正</span>"
+                if correcting:
+                    correction = f" <a href='{segment_link}:{seq}' style='color:{tok.ACCENT_TEXT}'>更正</a>"
+                elif not live and self._transcript_editable:
                     correction = (f" <a href='edit-segment:{seq}' title='编辑这一段文字稿' "
                                   f"style='color:{tok.ACCENT_TEXT}; text-decoration:none'>编辑</a>")
             text = html.escape(line.text).replace("\n", "<br>")
@@ -1955,7 +2020,8 @@ class MeetingPage(QWidget):
         line = transcript_lines([segment], record.started_at)
         if not line:
             return
-        speaker = names.get(line[0].speaker_id) or f"说话人{line[0].speaker_id}"
+        speaker = ((names.get(line[0].speaker_id) or f"说话人{line[0].speaker_id}")
+                   if line[0].speaker_id > 0 else "说话人待确认")
         dialog = _SegmentTextDialog(
             segment, position=_position_label(line[0].offset_ms), speaker=speaker,
             save_text=lambda text: self._ctrl.save_segment_text(record.id, seq, text), parent=self,
@@ -1971,53 +2037,104 @@ class MeetingPage(QWidget):
         self._correcting_speakers = enabled
         self._render_detail()
 
-    def _prompt_segment_speaker(self, seq: int) -> None:
-        record = self._store.get_meeting(self._detail_id) if self._detail_id else None
-        if record is None or record.status == STATUS_LIVE or self._ctrl.generating_for == record.id:
+    def _prompt_segment_speaker(self, seq: int, *, meeting_id: str | None = None) -> None:
+        meeting_id = meeting_id or self._detail_id
+        record = self._store.get_meeting(meeting_id) if meeting_id else None
+        if record is None or self._ctrl.generating_for == record.id:
+            return
+        live = record.status == STATUS_LIVE
+        if live and (self._ctrl.current_id != record.id or self._ctrl.state is MeetingState.DRAINING):
             return
         segments = self._store.get_segments(record.id)
         segment = next((s for s in segments if s.seq == seq), None)
         if segment is None:
             return
         names = self._ctrl.speaker_names(record.id)
-        ids = sorted({int(s.speaker_id or 1) for s in segments})
+        ids = sorted({int(s.speaker_id) for s in segments if s.speaker_id > 0})
         choices = [(sid, f"{names[sid]} · 说话人{sid}" if sid in names else f"说话人{sid}") for sid in ids]
-        new_id = max(ids, default=0) + 1
-        choices.append((new_id, f"新增说话人{new_id}"))
-        dialog = _SegmentSpeakerDialog(segment, choices, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            if self._ctrl.correct_segment_speaker(record.id, seq, dialog.speaker_id):
-                self._render_detail()
-                self._set_status("已更正这一段的发言人；请核对纪要中的相关归属。")
-            else:
-                self._set_status("更正未保存，请重试。")
+        choices.append((None, "新增说话人" if live else "新增说话人（仅本段）"))
 
-    def _prompt_rename_speaker(self, speaker_id: int) -> None:
-        if not self._detail_id:
+        def save(speaker_id):
+            if live and (self._ctrl.current_id != record.id or self._ctrl.state is MeetingState.DRAINING):
+                return False
+            return self._ctrl.correct_segment_speaker(record.id, seq, speaker_id)
+
+        dialog = _SegmentSpeakerDialog(segment, choices, self, save_speaker=save, live=live)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._speaker_edit_status(record.id, "已更正这一段的发言人，人工更正会保留。" if live else
+                                      "已更正这一段的发言人；请核对纪要中的相关归属。")
+
+    def _prompt_rename_speaker(self, speaker_id: int, *, meeting_id: str | None = None) -> None:
+        meeting_id = meeting_id or self._detail_id
+        if not meeting_id:
             return
-        if self._ctrl.generating_for == self._detail_id:
-            self._set_status("纪要生成中，请在完成后为说话人命名。")
+        record = self._store.get_meeting(meeting_id)
+        if record is None:
             return
-        current = self._ctrl.speaker_names(self._detail_id).get(speaker_id, "")
+        live = record.status == STATUS_LIVE
+        if self._ctrl.generating_for == meeting_id:
+            self._speaker_edit_status(meeting_id, "纪要生成中，请在完成后为说话人命名。")
+            return
+        if live and (self._ctrl.current_id != meeting_id or self._ctrl.state is MeetingState.DRAINING):
+            return
+        current = self._ctrl.speaker_names(meeting_id).get(speaker_id, "")
+        scope = ("这组已有发言和后续归入本组的发言都会使用该姓名；留空恢复编号。" if live else
+                 "会更新这一组发言的名称和纪要中的称呼；留空恢复编号。")
         name, ok = QInputDialog.getText(
             self, "为整组说话人命名",
-            f"「说话人{speaker_id}」的显示名称\n会更新这一组发言的名称和纪要中的称呼；留空恢复编号。",
+            f"「说话人{speaker_id}」的显示名称\n{scope}",
             QLineEdit.EchoMode.Normal, current,
         )
         if ok:
-            self._rename_speaker(speaker_id, name)
+            if live and (self._ctrl.current_id != meeting_id or self._ctrl.state is MeetingState.DRAINING):
+                self._speaker_edit_status(meeting_id, "会议已结束或正在整理，姓名尚未保存，请在会后重新命名。")
+                return
+            self._rename_speaker(speaker_id, name, meeting_id=meeting_id)
 
-    def _rename_speaker(self, speaker_id: int, name: str) -> None:
-        if not self._detail_id:
+    def _rename_speaker(self, speaker_id: int, name: str, *, meeting_id: str | None = None) -> None:
+        meeting_id = meeting_id or self._detail_id
+        if not meeting_id:
             return
-        if not self._save_notes_draft():
+        if meeting_id == self._detail_id and not self._save_notes_draft():
             return
         name = name.strip()
-        if self._ctrl.rename_speaker(self._detail_id, speaker_id, name) is None:
-            self._set_status("纪要生成中，请在完成后为说话人命名。")
+        if self._ctrl.rename_speaker(meeting_id, speaker_id, name) is None:
+            self._speaker_edit_status(meeting_id, "姓名尚未保存，请在整理完成后重试。")
             return
-        self._render_detail()
-        self._set_status(f"已将说话人{speaker_id}改为「{name}」" if name else f"已恢复「说话人{speaker_id}」")
+        self._speaker_edit_status(meeting_id, f"已将说话人{speaker_id}改为「{name}」" if name else f"已恢复「说话人{speaker_id}」")
+
+    def _speaker_edit_status(self, meeting_id: str, text: str) -> None:
+        if self._stack.currentIndex() == PAGE_LIVE and self._live_meeting_id == meeting_id:
+            self._render_live()
+            self._live_speaker_feedback.setText(text)
+            self._live_speaker_feedback.show()
+        elif self._detail_id == meeting_id:
+            self._render_detail()
+            self._set_status(text)
+
+    def _populate_live_speaker_menu(self) -> None:
+        meeting_id = self._ctrl.current_id
+        self._live_speaker_menu.clear()
+        if not meeting_id or self._ctrl.state is MeetingState.DRAINING:
+            return
+        names = self._ctrl.speaker_names(meeting_id)
+        for sid in sorted({s.speaker_id for s in self._store.get_segments(meeting_id) if s.speaker_id > 0}):
+            action = self._live_speaker_menu.addAction(names.get(sid) or f"说话人{sid}")
+            action.triggered.connect(lambda _=False, sid=sid, mid=meeting_id:
+                                     self._prompt_rename_speaker(sid, meeting_id=mid))
+
+    def _toggle_live_speaker_correction(self, enabled: bool) -> None:
+        self._live_correcting_speakers = enabled
+        self._render_live()
+
+    def _on_live_transcript_link(self, url) -> None:
+        meeting_id = self._ctrl.current_id
+        if not meeting_id or self._ctrl.state is MeetingState.DRAINING or not url.path().isdigit():
+            return
+        if url.scheme() == "live-speaker":
+            self._prompt_rename_speaker(int(url.path()), meeting_id=meeting_id)
+        elif url.scheme() == "live-segment" and self._live_correcting_speakers:
+            self._prompt_segment_speaker(int(url.path()), meeting_id=meeting_id)
 
     # ── start card ────────────────────────────────────────────────
 
@@ -2158,6 +2275,10 @@ class MeetingPage(QWidget):
             self._live_transcript.clear()
             self._live_find_edit.clear()
             self._live_find_bar.hide()
+            self._live_correcting_speakers = False
+            self._live_speaker_menu.clear()
+            self._live_speaker_feedback.clear()
+            self._live_speaker_feedback.hide()
         self._live_title.setText(record.display_title if record is not None else "会议进行中")
         self._live_clock.setText(self._ctrl.elapsed_text())
         caps = self._ctrl.capabilities
@@ -2210,6 +2331,7 @@ class MeetingPage(QWidget):
             self._enter_live()
         elif state in (MeetingState.PAUSED, MeetingState.DRAINING, MeetingState.LIVE):
             self._sync_live_state()
+            self._render_live()
         elif state is MeetingState.ENDED:
             self.show_meeting(self._ctrl.current_id)
 
@@ -2234,12 +2356,26 @@ class MeetingPage(QWidget):
         started_at = record.started_at if record is not None else 0
         segments = self._store.get_segments(meeting_id)
         names = self._ctrl.speaker_names(meeting_id)
+        self._live_transcript_sequences = [s.seq for s in segments if (s.corrected_text or s.polished_text or s.raw_text).strip()]
+        self._live_locked_sequences = {s.seq for s in segments if s.speaker_locked}
+        editable = bool(self._live_transcript_sequences) and self._ctrl.state in (MeetingState.LIVE, MeetingState.PAUSED)
+        self._live_speaker_btn.setEnabled(editable)
+        self._live_correct_speaker_btn.setEnabled(editable)
+        self._live_correcting_speakers = self._live_correcting_speakers and editable
+        self._live_correct_speaker_btn.blockSignals(True)
+        self._live_correct_speaker_btn.setChecked(self._live_correcting_speakers)
+        self._live_correct_speaker_btn.blockSignals(False)
+        self._live_correct_speaker_btn.setText("完成纠正" if self._live_correcting_speakers else "纠正发言人")
+        self._live_speaker_hint.setText(
+            "点击目标段落旁的「更正」修改归属，人工更正会保留。" if self._live_correcting_speakers else
+            "点击姓名可命名；人工更正会保留，清晰的声音可帮助判断后续发言。"
+        )
         bar = self._live_transcript.verticalScrollBar()
         cursor = self._live_transcript.textCursor()
         position, anchor = cursor.position(), cursor.anchor()
         scroll = bar.value()
         at_end = bar.value() >= bar.maximum() - 24
-        rendered = self._transcript_html(transcript_lines(segments, started_at), names)
+        rendered = self._transcript_html(transcript_lines(segments, started_at), names, links=True, live=True)
         if rendered != self._live_html:
             previous = self._live_html
             self._live_html = rendered

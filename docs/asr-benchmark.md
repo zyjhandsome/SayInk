@@ -25,11 +25,18 @@
    py -3.10 tools/asr_bench.py --data D:\bench --language zh
    py -3.10 tools/asr_bench.py --data D:\bench --models funasr-nano --vad energy --hotwords "SayInk,CAM++"
    py -3.10 tools/asr_bench.py --data D:\bench --out D:\bench\results.json
+   py -3.10 tools/asr_bench.py --data D:\bench --no-short-retry --out D:\bench\without-retry.json
    ```
 
    `--vad` 默认 `silero`：先按**会议**停顿切段（静音 1.5 秒、最长 15 秒，与开会相同），再逐段解码。`energy` 用能量门限，用来对照 Silero 有没有收益。`off` 整段一次解码，测的不是线上链路，**不要写入下表**。Silero 模型没下载时会退回能量门限，输出里会写明实际用的门。
 
    wav 可以不是 16 kHz，脚本会重采样到 16 kHz。RTF 只计解码时间，不计切段。
+
+   2026-10-20 起默认共用会议的短句空结果重试：首次没有文字且音频不超过 8 秒时，
+   有至少约 100 ms 非静音才保留语音边界并补静音重试一次。有效的首次文字不改写，
+   不对纯静音或很轻的底噪重试；重试失败保留首次空结果。重试耗时计入 RTF。
+   使用 `--no-short-retry` 跑同一组录音作对照，JSON 同时记录开关、空片段数和空片段率。
+   空片段率下降仍须结合 CER 检查，不能把噪音幻觉当作收益。
 
 3. 把输出的 Markdown 表格贴到下面的「结果」小节，注明日期、机器、音频来源，以及 `--vad` 实际用的门（`silero` 或回退后的 `energy`）。合成语音、`--vad off` 的结果不贴进这张表。
 

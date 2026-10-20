@@ -129,9 +129,32 @@ def main():
             live = controller.begin(options, replace(caps, speaker_model_available=False))
             history.enqueue(SegmentRecord(live.id, 0, live.started_at,
                 raw_text="这里是本场会议的实时文字稿，可核对、复制，或暂停采集。", trigger_mode="meeting", speaker_id=1))
+            history.enqueue(SegmentRecord(live.id, 4, live.started_at + 4000,
+                raw_text="这句话的发言人可以在录制中更正，不需要暂停会议。", trigger_mode="meeting", speaker_id=2))
+            history.enqueue(SegmentRecord(live.id, 9, live.started_at + 9000,
+                raw_text="好的，稍后再确认。", trigger_mode="meeting", speaker_id=0,
+                captured_at=live.started_at + 9000))
             history.flush()
             page._render_live()
             capture(f"live-{theme}.png")
+            controller.rename_speaker(live.id, 1, "小林")
+            page._render_live()
+            capture(f"live-named-{theme}.png")
+            page._live_correct_speaker_btn.setChecked(True)
+            capture(f"live-speaker-correction-{theme}.png")
+            controller.correct_segment_speaker(live.id, 4, 1)
+            page._render_live()
+            capture(f"live-speaker-corrected-{theme}.png")
+            win.resize(880, 580)
+            capture(f"narrow-live-speaker-corrected-{theme}.png")
+            win.resize(1040, 720)
+            live_segment = controller.store.get_segments(live.id)[1]
+            dialog = _SegmentSpeakerDialog(live_segment, [(1, "小林 · 说话人1"), (2, "说话人2")], win, live=True)
+            dialog.show()
+            settle(app)
+            dialog.grab().save(str(args.output / f"live-speaker-dialog-{theme}.png"))
+            dialog.close()
+            page._live_correct_speaker_btn.setChecked(False)
             page.focus_search()
             page._live_find_edit.setText("核对")
             capture(f"live-find-{theme}.png")

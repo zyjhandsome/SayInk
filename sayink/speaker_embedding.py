@@ -98,7 +98,6 @@ class ModelEmbedder(SpeakerEmbedder):
         if hasattr(config, "validate") and not config.validate():
             raise RuntimeError(f"说话人模型配置无效: {model_path}")
         self._extractor = sherpa_onnx.SpeakerEmbeddingExtractor(config)
-        self._fallback = MelEmbedder()
         self.dim = int(getattr(self._extractor, "dim", 0) or 0)
 
     def __call__(self, audio: np.ndarray) -> np.ndarray:
@@ -116,7 +115,7 @@ class ModelEmbedder(SpeakerEmbedder):
                 return np.zeros(self.dim or 1, dtype=np.float32)
             vector = np.asarray(self._extractor.compute(stream), dtype=np.float32).reshape(-1)
         except Exception as exc:
-            log.warning("说话人嵌入计算失败，本段使用频谱摘要: %s", exc)
+            log.warning("说话人嵌入计算失败，本段无法判断说话人: %s", exc)
             return np.zeros(self.dim or 1, dtype=np.float32)
         norm = float(np.linalg.norm(vector))
         if norm < 1e-6:

@@ -51,7 +51,7 @@ from sayink.speech_recognizer import (
     is_model_downloaded,
     language_argument,
     model_supports,
-    normalize_asr_output,
+    decode_asr_slice,
     restore_glossary_case,
 )
 from sayink.vad_segmenter import (
@@ -140,11 +140,10 @@ def hotword_hits(terms: list[str], reference: str, hypothesis: str, *, exact_cas
     return hits, expected
 
 
-def recognize(recognizer, audio: np.ndarray, rate: int, *, terms: list[str] = ()) -> str:
-    stream = recognizer.create_stream()
-    stream.accept_waveform(rate, audio)
-    recognizer.decode_stream(stream)
-    return restore_glossary_case(normalize_asr_output(stream.result.text), terms)
+def recognize(recognizer, audio: np.ndarray, rate: int, *, terms: list[str] = (),
+              retry_empty: bool = True) -> str:
+    text = decode_asr_slice(recognizer, audio, sample_rate=rate, retry_empty=retry_empty)
+    return restore_glossary_case(text, terms)
 
 
 def segment_meeting(audio: np.ndarray, rate: int, *, vad: str) -> tuple[list[np.ndarray], str]:
@@ -180,19 +179,19 @@ def segment_meeting(audio: np.ndarray, rate: int, *, vad: str) -> tuple[list[np.
 
 
 def transcribe(recognizer, audio: np.ndarray, rate: int, *, vad: str,
-               terms: list[str] | tuple[str, ...] = ()) -> tuple[str, str, int]:
+               terms: list[str] | tuple[str, ...] = (), retry_empty: bool = True) -> tuple[str, str, int]:
     """Decode each meeting slice and join the text. Returns (text, vad_used, n)."""
     segments, used = segment_meeting(audio, rate, vad=vad)
     term_list = list(terms)
     parts = [
-        recognize(recognizer, seg, TARGET_SAMPLE_RATE, terms=term_list)
+        recognize(recognizer, seg, TARGET_SAMPLE_RATE, terms=term_list, retry_empty=retry_empty)
         for seg in segments
     ]
     return "".join(parts), used, len(segments)
 
 
 def run_model(model_id: str, items: list[tuple[Path, str]], *, terms: list[str], language: str,
-              num_threads: int, vad: str = VAD_SILERO) -> dict:
+              num_threads: int, vad: str = VAD_SILERO, retry_empty: bool = True) -> dict:
     hotwords = format_hotwords([{"term": t} for t in terms]) if model_supports(model_id, SUPPORTS_HOTWORDS) else ""
     t0 = time.perf_counter()
     recognizer = _create_recognizer(model_id, num_threads, hotwords=hotwords,
@@ -202,20 +201,23 @@ def run_model(model_id: str, items: list[tuple[Path, str]], *, terms: list[str],
     cers: list[float] = []
     hits = spelled = expected = 0
     segment_count = 0
+    empty_count = 0
     vad_used = vad
     per_file = []
     for wav_path, reference in items:
         audio, rate = load_wav(wav_path)
         segments, vad_used = segment_meeting(audio, rate, vad=vad)
         t1 = time.perf_counter()
-        hypothesis = "".join(
-            recognize(recognizer, seg, TARGET_SAMPLE_RATE, terms=terms) for seg in segments
-        )
+        outputs = [
+            recognize(recognizer, seg, TARGET_SAMPLE_RATE, terms=terms, retry_empty=retry_empty) for seg in segments
+        ]
+        hypothesis = "".join(outputs)
         decode_s = time.perf_counter() - t1
         audio_s = len(audio) / rate
         total_audio += audio_s
         total_decode += decode_s
         segment_count += len(segments)
+        empty_count += sum(not text for text in outputs)
         c = cer(reference, hypothesis)
         cers.append(c)
         h, e = hotword_hits(terms, reference, hypothesis)
@@ -227,10 +229,12 @@ def run_model(model_id: str, items: list[tuple[Path, str]], *, terms: list[str],
             "cer": round(c, 4),
             "rtf": round(decode_s / max(audio_s, 1e-6), 3),
             "segments": len(segments),
+            "empty_segments": sum(not text for text in outputs),
             "hypothesis": hypothesis,
         })
     return {
         "model": model_id,
+        "retry_empty": retry_empty,
         "vad_requested": vad,
         "vad_used": vad_used,
         "load_s": round(load_s, 1),
@@ -240,6 +244,8 @@ def run_model(model_id: str, items: list[tuple[Path, str]], *, terms: list[str],
         "rtf": round(total_decode / max(total_audio, 1e-6), 3),
         "audio_s": round(total_audio, 1),
         "segments": segment_count,
+        "empty_segments": empty_count,
+        "empty_segment_rate": empty_count / segment_count if segment_count else None,
         "files": per_file,
     }
 
@@ -258,6 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="silero (default, meeting pauses) | energy | off (whole file; not a baseline)",
     )
     parser.add_argument("--out", type=Path, default=None, help="write full JSON results here")
+    parser.add_argument("--no-short-retry", action="store_true", help="compare without the meeting short-utterance retry")
     return parser
 
 
@@ -287,7 +294,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     results = [
-        run_model(m, items, terms=terms, language=args.language, num_threads=args.threads, vad=args.vad)
+        run_model(m, items, terms=terms, language=args.language, num_threads=args.threads,
+                  vad=args.vad, retry_empty=not args.no_short_retry)
         for m in model_ids
     ]
     used = results[0]["vad_used"]

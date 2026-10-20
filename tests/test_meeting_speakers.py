@@ -88,6 +88,32 @@ class TestRecluster:
         assert mapping[1] == 1 and mapping[2] == 2
         assert mapping[3] == 1  # nearest to speaker 1
 
+    def test_manual_identity_keeps_its_number_and_absorbs_only_unnamed_groups(self):
+        history = [(1, _unit(1, 0, 0)), (2, _unit(1, 0.1, 0)), (3, _unit(0, 1, 0))]
+        assert recluster(history, threshold=0.9, protected_ids={2}) == {1: 2, 2: 2, 3: 3}
+
+    def test_manual_groups_are_protected_even_when_the_voice_limit_is_exceeded(self):
+        history = [(1, _unit(1, 0, 0)), (2, _unit(1, 0.1, 0)), (3, _unit(1, 0, 0.1))]
+        assert recluster(history, threshold=0.8, max_speakers=2, protected_ids={1, 2, 3}) == {1: 1, 2: 2, 3: 3}
+
+    def test_manual_id_without_embedding_prevents_automatic_renumbering_collision(self):
+        history = [(2, _unit(1, 0, 0)), (4, _unit(0, 1, 0))]
+        assert recluster(history, threshold=0.8, protected_ids={1}) == {2: 2, 4: 4}
+
+
+def test_manual_id_reservation_and_worker_assignments_cannot_collide():
+    from concurrent.futures import ThreadPoolExecutor
+
+    session = SpeakerSession(max_speakers=32, keep_history=True)
+    vectors = np.eye(24, dtype=np.float32)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reserved = pool.submit(lambda: [session.reserve_speaker_id() for _ in range(24)])
+        assigned = pool.submit(lambda: [session.assign(vector) for vector in vectors])
+    assert not set(reserved.result()) & set(assigned.result())
+    assert len(set(reserved.result() + assigned.result())) == 48
+    session.reset()
+    assert session.assign(vectors[0]) == 1
+
 
 @pytest.fixture
 def fake_sherpa(monkeypatch):

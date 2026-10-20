@@ -1183,6 +1183,53 @@ class ModelLoadWorker(QThread):
             self.error.emit(f"模型加载失败: {e}")
 
 
+def short_retry_audio(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray | None:
+    """Prepare one bounded retry for an empty short utterance.
+
+    Remove long quiet edges while retaining 120 ms of context and add quiet
+    padding for tiny clips. Never amplify noise, retry silence or loop retries.
+    """
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    frame = max(1, int(sample_rate * 0.02))
+    if not frame <= samples.size <= sample_rate * 8 or not np.all(np.isfinite(samples)):
+        return None
+    blocks = samples[:samples.size // frame * frame].reshape(-1, frame)
+    levels = np.sqrt(np.mean(blocks * blocks, axis=1))
+    threshold = max(0.005, min(0.015, float(levels.max()) * 0.1))
+    voiced = np.flatnonzero(levels >= threshold)
+    if voiced.size < 5:
+        return None
+    margin = int(sample_rate * 0.12)
+    start = max(0, int(voiced[0]) * frame - margin)
+    stop = min(samples.size, (int(voiced[-1]) + 1) * frame + margin)
+    clip = samples[start:stop]
+    padding = max(int(sample_rate * 0.2), (sample_rate - clip.size + 1) // 2)
+    return np.pad(clip, (padding, padding))
+
+
+def decode_asr_slice(recognizer, audio: np.ndarray, *, sample_rate: int = SAMPLE_RATE,
+                     retry_empty: bool = False, cancelled=None) -> str:
+    """The same normalized, bounded decode policy for the app and benchmark."""
+    def decode(piece):
+        stream = recognizer.create_stream()
+        stream.accept_waveform(sample_rate, piece)
+        recognizer.decode_stream(stream)
+        return normalize_asr_output(stream.result.text)
+
+    text = decode(audio)
+    if text or not retry_empty or (cancelled is not None and cancelled()):
+        return text
+    retry = short_retry_audio(audio, sample_rate)
+    if retry is None:
+        return text
+    try:
+        log.info("短句识别为空，使用保留上下文的音频重试一次")
+        return decode(retry)
+    except Exception as exc:
+        log.warning("短句重试失败，保留首次识别结果: %s", exc)
+        return text
+
+
 class TranscribeWorker(QThread):
     """Runs transcription in a background thread."""
     result_ready = pyqtSignal(str)
@@ -1196,6 +1243,7 @@ class TranscribeWorker(QThread):
         *,
         max_slice_sec: float | None = None,
         overlap_sec: float = CONTEXT_SLICE_OVERLAP_SEC,
+        retry_empty: bool = False,
     ):
         super().__init__()
         self._recognizer = recognizer
@@ -1203,16 +1251,15 @@ class TranscribeWorker(QThread):
         self._cancelled = False
         self._max_slice_sec = max_slice_sec
         self._overlap_sec = overlap_sec
+        self._retry_empty = retry_empty
 
     def cancel(self):
         """Set cancellation flag."""
         self._cancelled = True
 
     def _decode_slice(self, audio: np.ndarray) -> str:
-        stream = self._recognizer.create_stream()
-        stream.accept_waveform(SAMPLE_RATE, audio)
-        self._recognizer.decode_stream(stream)
-        return normalize_asr_output(stream.result.text)
+        return decode_asr_slice(self._recognizer, audio, retry_empty=self._retry_empty,
+                                cancelled=lambda: self._cancelled)
 
     def run(self):
         if self._cancelled:
@@ -1388,7 +1435,7 @@ class SpeechRecognizer(QObject):
         if is_model_downloaded(self._model_id):
             self._load_model()
 
-    def transcribe_final(self, full_audio: np.ndarray):
+    def transcribe_final(self, full_audio: np.ndarray, *, retry_empty: bool = False):
         if not self._is_ready or self._recognizer is None:
             self.error.emit("语音模型未就绪，请等待模型加载完成")
             return
@@ -1409,7 +1456,7 @@ class SpeechRecognizer(QObject):
         loader = info.get("loader", "") if info else ""
         window = slice_window_for_loader(loader)
         if window is None:
-            worker = TranscribeWorker(self._recognizer, full_audio)
+            worker = TranscribeWorker(self._recognizer, full_audio, retry_empty=retry_empty)
         else:
             slice_sec, overlap_sec = window
             worker = TranscribeWorker(
@@ -1417,6 +1464,7 @@ class SpeechRecognizer(QObject):
                 full_audio,
                 max_slice_sec=slice_sec,
                 overlap_sec=overlap_sec,
+                retry_empty=retry_empty,
             )
         worker.result_ready.connect(
             lambda text, s=seq: self._on_final_result(text, s)

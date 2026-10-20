@@ -23,6 +23,7 @@ _HEADER_CELLS = frozenset({
     "gold", "pred", "speaker", "id",
     "真人", "预测", "说话人", "编号", "序号", "segment", "index",
 })
+_UNKNOWN_LABELS = frozenset({"0", "unknown", "待确认", "说话人待确认"})
 
 
 def score_speakers(rows: list[tuple[str, str]]) -> dict:
@@ -30,18 +31,27 @@ def score_speakers(rows: list[tuple[str, str]]) -> dict:
     by_gold: dict[str, set[str]] = defaultdict(set)
     by_pred: dict[str, set[str]] = defaultdict(set)
     kept = 0
+    unknown = 0
+    people: set[str] = set()
     for gold, pred in rows:
         person, label = str(gold).strip(), str(pred).strip()
         if not person or not label:
             continue
         kept += 1
+        people.add(person)
+        if label.lower() in _UNKNOWN_LABELS:
+            unknown += 1
+            continue
         by_gold[person].add(label)
         by_pred[label].add(person)
     split_names = sorted(person for person, labels in by_gold.items() if len(labels) > 1)
     merged_ids = sorted(label for label, people in by_pred.items() if len(people) > 1)
-    n_gold, n_pred = len(by_gold), len(by_pred)
+    n_gold, n_pred = len(people), len(by_pred)
     return {
         "segments": kept,
+        "unknown_segments": unknown,
+        "unknown_rate": unknown / kept if kept else None,
+        "coverage": (kept - unknown) / kept if kept else None,
         "gold_speakers": n_gold,
         "pred_ids": n_pred,
         "split_speakers": len(split_names),
@@ -92,7 +102,8 @@ def format_report(scored: dict) -> str:
         f"片段 {scored['segments']} · 真人 {scored['gold_speakers']} · "
         f"预测编号 {scored['pred_ids']} · "
         f"拆人 {_pct(scored['split_rate'], scored['split_speakers'], scored['gold_speakers'])} · "
-        f"并人 {_pct(scored['merge_rate'], scored['merge_ids'], scored['pred_ids'])}"
+        f"并人 {_pct(scored['merge_rate'], scored['merge_ids'], scored['pred_ids'])} · "
+        f"待确认 {_pct(scored['unknown_rate'], scored['unknown_segments'], scored['segments'])}"
     )
 
 

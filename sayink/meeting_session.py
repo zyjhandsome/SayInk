@@ -47,6 +47,7 @@ from sayink.minutes_prompts import (
 from sayink.minutes_render import apply_speaker_names, render_markdown, replace_names_in_markdown
 from sayink.recognition_settings import RecognitionSettings, audio_source, aux_model_path
 from sayink.speaker_embedding import STICKY_GAP_MS, SpeakerEmbedder, make_embedder
+from sayink.meeting_speakers import MeetingSpeakerSession
 from sayink.speaker_session import SpeakerSession, recluster
 from sayink.speaker_naming import infer_speaker_names
 from sayink.speech_recognizer import (
@@ -290,7 +291,7 @@ class MeetingController(QObject):
             speaker_model_available=self._embedder.name == "campplus",
             speaker_load_failed=capabilities.speaker_model_available and self._embedder.name != "campplus",
         )
-        self._speakers = SpeakerSession(
+        self._speakers = MeetingSpeakerSession(
             threshold=self._embedder.threshold,
             keep_history=True,
             sticky_threshold=self._embedder.sticky_threshold,
@@ -388,17 +389,13 @@ class MeetingController(QObject):
             return
         embedder = self._embedder
         threshold = embedder.recluster_threshold if embedder is not None else speakers.threshold
-        mapping = recluster(speakers.history, threshold=threshold)
+        protected = {s.speaker_id for s in self._store.get_speakers(meeting_id) if s.name_locked or s.display_name}
+        protected.update(s.speaker_id for s in self._store.get_segments(meeting_id) if s.speaker_locked)
+        mapping = recluster(speakers.history, threshold=threshold, protected_ids=protected)
         if mapping and any(old != new for old, new in mapping.items()):
             log.info("会议 %s 说话人重聚类: %s", meeting_id[:8], mapping)
             self._store.relabel_segments(meeting_id, mapping)
             self._store.flush()
-            # Speaker rows were written under the old ids; move display names.
-            existing = {s.speaker_id: s for s in self._store.get_speakers(meeting_id)}
-            for old, new in mapping.items():
-                row = existing.get(old)
-                if row is not None and old != new and row.display_name:
-                    self._store.set_speaker(meeting_id, new, display_name=row.display_name)
 
     def abandon_on_exit(self) -> None:
         """App is quitting mid-meeting: close the record without waiting."""
@@ -446,17 +443,29 @@ class MeetingController(QObject):
         user-edited notes. Returns the number of replacements made in
         edited notes (0 when re-rendered).
 
-        ``None`` when a minutes job is still writing this meeting: the naming
-        dialog can stay open across that job, and a late rename would lose
-        to the worker's save.
+        ``None`` when the meeting is draining/generating, the identity no
+        longer exists, or the name write cannot be verified. Dialogs can stay
+        open while capture continues, so their targets must be rechecked.
         """
         if self._generating_for == meeting_id:
+            return None
+        record = self._store.get_meeting(meeting_id)
+        if (record is None or record.status not in (STATUS_LIVE, STATUS_ENDED, STATUS_INTERRUPTED)
+                or speaker_id <= 0):
+            return None
+        if record.status == STATUS_LIVE and (self.current_id != meeting_id or self._state is MeetingState.DRAINING):
+            return None
+        if speaker_id not in {s.speaker_id for s in self._store.get_segments(meeting_id)}:
             return None
         name = (name or "").strip()
         existing = {s.speaker_id: s for s in self._store.get_speakers(meeting_id)}
         old_label = existing[speaker_id].label if speaker_id in existing else speaker_label(speaker_id)
         self._store.set_speaker(meeting_id, speaker_id, display_name=name)
-        self._store.flush()
+        if not self._store.flush():
+            return None
+        saved = next((s for s in self._store.get_speakers(meeting_id) if s.speaker_id == speaker_id), None)
+        if saved is None or saved.display_name != name or not saved.name_locked:
+            return None
         replaced = 0
         notes = self._store.get_notes(meeting_id)
         if notes is not None and notes.markdown:
@@ -552,19 +561,33 @@ class MeetingController(QObject):
         self.meeting_changed.emit(meeting_id)
         return True
 
-    def correct_segment_speaker(self, meeting_id: str, seq: int, speaker_id: int) -> bool:
+    def correct_segment_speaker(self, meeting_id: str, seq: int, speaker_id: int | None) -> bool:
+        """Lock a persisted segment's speaker; None allocates a new manual identity."""
         record = self._store.get_meeting(meeting_id)
-        if record is None or record.status == STATUS_LIVE or self._generating_for == meeting_id or speaker_id <= 0:
+        if (record is None or record.status not in (STATUS_LIVE, STATUS_ENDED, STATUS_INTERRUPTED)
+                or self._generating_for == meeting_id or (speaker_id is not None and speaker_id <= 0)):
             return False
-        segment = next((s for s in self._store.get_segments(meeting_id) if s.seq == seq), None)
+        live = record.status == STATUS_LIVE
+        if live and (self.current_id != meeting_id or self._state is MeetingState.DRAINING):
+            return False
+        segments = self._store.get_segments(meeting_id)
+        segment = next((s for s in segments if s.seq == seq), None)
         if segment is None:
+            return False
+        used_ids = {s.speaker_id for s in segments} | {s.speaker_id for s in self._store.get_speakers(meeting_id)}
+        if speaker_id is None:
+            minimum = max(used_ids, default=0) + 1
+            speaker_id = self._speakers.reserve_speaker_id(minimum) if live and self._speakers else minimum
+        elif live and speaker_id not in used_ids:
             return False
         self._store.set_segment_speaker(meeting_id, seq, speaker_id)
         if not self._store.flush():
             return False
         saved = next((s for s in self._store.get_segments(meeting_id) if s.seq == seq), None)
-        if saved is None or saved.speaker_id != speaker_id:
+        if saved is None or saved.speaker_id != speaker_id or not saved.speaker_locked:
             return False
+        if live and isinstance(self._speakers, MeetingSpeakerSession):
+            self._speakers.confirm(seq, speaker_id)
         self.auto_name_speakers(meeting_id)
         self.meeting_changed.emit(meeting_id)
         return True

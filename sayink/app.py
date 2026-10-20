@@ -34,6 +34,7 @@ from sayink.audio_recorder import AudioRecorder
 from sayink.audio_utils import TARGET_SAMPLE_RATE
 from sayink.speaker_embedding import STICKY_GAP_MS, SpeakerEmbedder, make_embedder
 from sayink.speaker_session import SpeakerSession, recluster, voice_embedding
+from sayink.meeting_speakers import MeetingSpeakerSession, voice_sample_is_clear
 from sayink.speech_recognizer import (
     AUX_MODEL_SILERO_VAD,
     AUX_MODEL_SPEAKER,
@@ -1367,7 +1368,10 @@ class App(QObject):
             self._floating.show_continuous_stopped("正在处理剩余内容 · 正在识别")
         else:
             self._floating.show_recognizing()
-        self._recognizer.transcribe_final(audio)
+        if context is not None and context.trigger_mode == TRIGGER_MODE_MEETING:
+            self._recognizer.transcribe_final(audio, retry_empty=True)
+        else:
+            self._recognizer.transcribe_final(audio)
 
     def _history_source(self) -> str:
         return {
@@ -1808,12 +1812,20 @@ class App(QObject):
         try:
             embedding = embed(audio)
         except Exception as e:  # a broken speaker model must not drop the words
-            log.warning("说话人特征提取失败，退回频谱特征: %s", e)
-            embedding = voice_embedding(audio)
+            log.warning("说话人特征提取失败，本段说话人待确认: %s", e)
+            # Mixing model and spectral feature spaces can corrupt matching or
+            # fail on incompatible dimensions. Words can still be recognized.
+            embedding = np.zeros(1, dtype=np.float32)
         # Wall-clock bounds let the meeting session apply its continuity prior.
         start_ms = int(context.captured_at or 0)
         end_ms = start_ms + int(audio.size * 1000 / TARGET_SAMPLE_RATE) if start_ms else 0
-        speaker_id = context.speakers.assign(embedding, stored_route, start_ms=start_ms, end_ms=end_ms)
+        if isinstance(context.speakers, MeetingSpeakerSession):
+            speaker_id = context.speakers.assign(
+                embedding, stored_route, start_ms=start_ms, end_ms=end_ms,
+                sample_key=context.seq, learnable=voice_sample_is_clear(audio),
+            )
+        else:
+            speaker_id = context.speakers.assign(embedding, stored_route, start_ms=start_ms, end_ms=end_ms)
         return speaker_id, stored_route
 
     def _show_post_output_floating(

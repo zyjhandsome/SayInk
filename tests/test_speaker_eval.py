@@ -40,3 +40,17 @@ def test_empty_labels_have_no_rate():
     assert scored["segments"] == 0
     assert scored["split_rate"] is None
     assert scored["merge_rate"] is None
+
+
+def test_unknown_is_measured_as_abstention_and_not_a_shared_person():
+    scored = score_speakers([("甲", "1"), ("甲", "0"), ("乙", "0"), ("乙", "2")])
+    assert scored["unknown_segments"] == 2
+    assert scored["unknown_rate"] == scored["coverage"] == 0.5
+    assert scored["split_rate"] == scored["merge_rate"] == 0
+    assert scored["pred_ids"] == 2
+
+
+def test_all_unknown_is_zero_coverage_with_no_assigned_groups():
+    scored = score_speakers([("甲", "待确认"), ("乙", "unknown")])
+    assert scored["gold_speakers"] == 2
+    assert scored["coverage"] == 0 and scored["merge_rate"] is None

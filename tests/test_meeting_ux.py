@@ -179,7 +179,7 @@ def test_find_live_transcript_keeps_meeting_recording(meeting):
     options = MeetingOptions(title="实时查找")
     record = controller.begin(options, resolve_capabilities(page._config, options, dictation_model_id="funasr-nano"))
     history.enqueue(SegmentRecord(record.id, 0, record.started_at,
-        raw_text="确认发布范围，然后确认测试结果。", trigger_mode="meeting"))
+        raw_text="确认发布范围，然后确认测试结果。", trigger_mode="meeting", speaker_id=1))
     history.flush()
     page.show()
     page._render_live()
@@ -725,7 +725,8 @@ def test_correction_link_applies_only_the_selected_segment(meeting, monkeypatch)
 
     def choose(dialog):
         dialog.speaker_combo.setCurrentIndex(dialog.speaker_combo.findData(1))
-        return QDialog.DialogCode.Accepted
+        dialog.save_btn.click()
+        return dialog.result()
 
     monkeypatch.setattr("sayink.ui.meeting_page._SegmentSpeakerDialog.exec", choose)
     page._tab_transcript.click()

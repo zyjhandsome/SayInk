@@ -441,26 +441,42 @@ class MeetingStore:
         self._write(_save)
 
     def relabel_segments(self, meeting_id: str, mapping: dict[int, int]) -> None:
-        """Apply a post-meeting re-clustering (old speaker_id → new speaker_id).
+        """Recluster automatic meeting assignments; preserve manual corrections."""
+        pairs = [(int(new), meeting_id, int(old), MEETING_TRIGGER_MODE)
+                 for old, new in mapping.items() if old != new]
+        if not pairs:
+            return
 
-        Transcript rows live in ``history``; the relabel itself is shared with
-        dictation sessions (:meth:`HistoryStore.relabel_session_speakers`)."""
-        self._history.relabel_session_speakers(
-            meeting_id, mapping, failure_notice=MEETING_WRITE_FAILED_NOTICE
-        )
+        def _relabel(conn: sqlite3.Connection) -> None:
+            conn.executemany(
+                "UPDATE history SET speaker_id = -(? + 1) "
+                "WHERE session_id = ? AND speaker_id = ? AND trigger_mode = ? AND speaker_locked = 0", pairs,
+            )
+            conn.execute(
+                "UPDATE history SET speaker_id = -speaker_id - 1 "
+                "WHERE session_id = ? AND speaker_id < 0 AND trigger_mode = ? AND speaker_locked = 0",
+                (meeting_id, MEETING_TRIGGER_MODE),
+            )
+
+        self._write(_relabel)
 
     def set_segment_speaker(self, meeting_id: str, seq: int, speaker_id: int) -> None:
-        """Correct one completed meeting segment, and mark its notes for review."""
+        """Lock one already-transcribed segment to the user's chosen speaker."""
         def _update(conn: sqlite3.Connection) -> None:
             changed = conn.execute(
-                "UPDATE history SET speaker_id = ? "
-                "WHERE session_id = ? AND seq = ? AND trigger_mode = ? AND speaker_id != ? "
-                "AND EXISTS (SELECT 1 FROM meetings WHERE id = ? AND status IN (?, ?))",
+                "UPDATE history SET speaker_id = ?, speaker_locked = 1 "
+                "WHERE session_id = ? AND seq = ? AND trigger_mode = ? "
+                "AND (speaker_id != ? OR speaker_locked = 0) "
+                "AND EXISTS (SELECT 1 FROM meetings WHERE id = ? AND status IN (?, ?, ?))",
                 (int(speaker_id), meeting_id, int(seq), MEETING_TRIGGER_MODE, int(speaker_id),
-                 meeting_id, STATUS_ENDED, STATUS_INTERRUPTED),
+                 meeting_id, STATUS_LIVE, STATUS_ENDED, STATUS_INTERRUPTED),
             )
             if changed.rowcount:
-                conn.execute("UPDATE meeting_notes SET transcript_changed = 1 WHERE meeting_id = ?", (meeting_id,))
+                conn.execute(
+                    "UPDATE meeting_notes SET transcript_changed = 1, "
+                    "previous_transcript_changed = CASE WHEN previous_markdown != '' THEN 1 "
+                    "ELSE previous_transcript_changed END WHERE meeting_id = ?", (meeting_id,),
+                )
 
         self._write(_update)
 
@@ -690,7 +706,7 @@ class MeetingStore:
                 """
                 SELECT session_id, seq, created_at, raw_text, polished_text,
                        source, duration_ms, target_app, trigger_mode, model,
-                       speaker_id, speaker_route, captured_at, corrected_text
+                       speaker_id, speaker_route, captured_at, corrected_text, speaker_locked
                 FROM history
                 WHERE session_id = ? AND trigger_mode = ?
                 ORDER BY seq ASC
