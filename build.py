@@ -252,7 +252,27 @@ def build():
         "--hidden-import=win32timezone",
         "--hidden-import=PyQt6.QtNetwork",
         "--hidden-import=sherpa_onnx",
+        # The speaker-activity guard runs one small ONNX graph through
+        # onnxruntime's inference API. onnxruntime/__init__.py also mentions
+        # its transformers/training helpers, and PyInstaller follows those
+        # into torch, scipy, pandas, sklearn and matplotlib (+200 MB that
+        # the app never imports). Keep the installer at its lite size.
         "--hidden-import=onnxruntime",
+        "--exclude-module=onnxruntime.transformers",
+        "--exclude-module=onnxruntime.training",
+        "--exclude-module=onnxruntime.quantization",
+        "--exclude-module=onnxruntime.tools",
+        "--exclude-module=onnxruntime.datasets",
+        "--exclude-module=torch",
+        "--exclude-module=torchvision",
+        "--exclude-module=torchaudio",
+        "--exclude-module=scipy",
+        "--exclude-module=sklearn",
+        "--exclude-module=pandas",
+        "--exclude-module=matplotlib",
+        "--exclude-module=sympy",
+        "--exclude-module=tensorboard",
+        "--exclude-module=IPython",
     ])
 
     PyInstaller.__main__.run(args)
