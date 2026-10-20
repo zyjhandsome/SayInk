@@ -192,8 +192,8 @@ pip install -r requirements.txt   # PyQt6、sherpa-onnx、sounddevice、pynput �
 
 | 安装包 | 大小 | 适合 |
 |--------|------|------|
-| **`SayInk-Setup-2.2.14.exe`**（轻量包，默认） | 约 72 MB | 首次安装、日常更新。已带说话人嵌入 CAM++ 和 Silero VAD。不含 Fun-ASR-Nano，首次启动的欢迎框会带你到 **设置 → 引擎** 下载（约 950 MB，只需一次） |
-| `SayInk-Setup-2.2.14-full.exe`（完整包） | 约 740 MB | 安装后要立刻离线使用：Fun-ASR-Nano、说话人嵌入 CAM++、Silero VAD 随安装包装好 |
+| **`SayInk-Setup-2.2.14.exe`**（轻量包，默认） | 约 80 MB | 首次安装、日常更新。已带说话人嵌入 CAM++、Silero VAD 和说话人活动检测所需的 onnxruntime。不含 Fun-ASR-Nano，首次启动的欢迎框会带你到 **设置 → 引擎** 下载（约 950 MB，只需一次） |
+| `SayInk-Setup-2.2.14-full.exe`（完整包） | 约 746 MB | 安装后要立刻离线使用：Fun-ASR-Nano、说话人嵌入 CAM++、Silero VAD 随安装包装好 |
 
 两种包装出来的程序完全相同；**应用内自动更新一律下载轻量包**。已安装的模型（无论是完整包带的 `安装目录\models`，还是自己下载到 `~/.sayink/models/` 的）在升级时都会保留，不必重新下载。无安装包见 [从源码打包](#从源码打包)。
 
