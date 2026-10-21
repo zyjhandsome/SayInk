@@ -158,6 +158,70 @@ DEFAULT_CONFIG = {
 
 
 SECRET_KEY = "llm.api_key"
+
+_BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
+_BOOL_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def _parse_bool(value):
+    """``True`` / ``False``, ``0`` / ``1``, or the words true/false/yes/no/on/off."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in _BOOL_TRUE:
+            return True
+        if word in _BOOL_FALSE:
+            return False
+    return None
+
+
+def _parse_int(value):
+    """An integer, an integral float, or a base-10 string. Booleans are not numbers."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer() and abs(value) <= 2**53:
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text and text.lstrip("+-").isdigit():
+            try:
+                return int(text)
+            except ValueError:
+                return None
+    return None
+
+
+def _coerce_known_value(default_value, value):
+    """Fit one saved scalar to the type of its default.
+
+    Returns ``(stored, repaired)``. A value that cannot be read becomes the
+    default. Callers must not log ``value``: a misplaced secret could land
+    in a string field.
+    """
+    if isinstance(default_value, bool):
+        parsed = _parse_bool(value)
+        if parsed is None:
+            return default_value, True
+        return parsed, parsed is not value
+    if isinstance(default_value, int):
+        parsed = _parse_int(value)
+        if parsed is None:
+            return default_value, True
+        return parsed, type(parsed) is not type(value) or parsed != value
+    if isinstance(default_value, str):
+        if isinstance(value, str):
+            return value, False
+        return default_value, True
+    if isinstance(default_value, list):
+        if isinstance(value, list):
+            return value, False
+        return copy.deepcopy(default_value), True
+    return value, False
 # Keys that moved from the meeting section to stt (shared by dictation).
 SHARED_RECOGNITION_KEYS = ("glossary", "language", "vad", "speaker_model_enabled")
 # Run-key value name written by VoiceInk ≤ 2.1.0; removed once on first start.
@@ -215,13 +279,14 @@ class Config:
                 raw = {}
         self._extra_keys = {k: v for k, v in raw.items() if k not in DEFAULT_CONFIG}
         moved = self._migrate_recognition_settings(raw)
+        self._type_repairs = False
         self._config = self._merge_defaults(DEFAULT_CONFIG, raw)
         # True = 不写欢迎弹窗（升级用户或未配置时用默认 True）；首次本无配置文件时单独打开欢迎。
         # 必须先于下面的迁移落盘，否则新文件会把欢迎写成已看过。
         if not config_existed:
             self._config["first_run_welcome_seen"] = False
         output_migrated = self._migrate_output_by_mode()
-        if self._strip_test_pollution() or moved or output_migrated:
+        if self._strip_test_pollution() or moved or output_migrated or self._type_repairs:
             self.save_immediate()
         self._migrate_stt_model()
         self._load_secret()
@@ -408,8 +473,31 @@ class Config:
                             dotted, type(current[key]).__name__,
                         )
                         result[key] = copy.deepcopy(default_value)
+                        self._type_repairs = True
                 else:
-                    result[key] = current[key]
+                    value = current[key]
+                    # ``None`` is a real sentinel (output.follow_input_source), not
+                    # "missing". Only a boolean may replace it.
+                    if default_value is None:
+                        if value is None or isinstance(value, bool):
+                            result[key] = value
+                        else:
+                            parsed = _parse_bool(value)
+                            log.warning(
+                                "配置项 %s 应为布尔或空，实际为 %s，已改为可用的值",
+                                dotted, type(value).__name__,
+                            )
+                            result[key] = parsed
+                            self._type_repairs = True
+                    else:
+                        coerced, repaired = _coerce_known_value(default_value, value)
+                        if repaired:
+                            log.warning(
+                                "配置项 %s 的类型与默认值不符（实际为 %s），已改为可用的值",
+                                dotted, type(value).__name__,
+                            )
+                            self._type_repairs = True
+                        result[key] = coerced
             else:
                 result[key] = (
                     copy.deepcopy(default_value)

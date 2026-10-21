@@ -293,6 +293,53 @@ def test_scalar_in_place_of_section_falls_back_to_section_defaults(config_home):
     assert not list(config_home.glob("config.corrupt-*.json"))
 
 
+def test_mistyped_scalars_do_not_crash_startup_and_false_stays_false(config_home, monkeypatch):
+    """A hand-edited config may store ``"false"`` or ``"auto"`` where a bool or
+    int belongs. ``"false"`` must not read as on, and ``int()`` at startup must
+    not raise."""
+    import json
+
+    from sayink.config import Config
+
+    monkeypatch.setattr(Config, "_sync_registry_auto_start", lambda self: None)
+    (config_home / "config.json").write_text(json.dumps({
+        "auto_start": "false",
+        "audio": {"mic_device_index": "auto", "system_device_index": None, "esc_stops_continuous": "no"},
+        "history": {"enabled": "false", "retention_days": "ninety", "max_entries": 1.5},
+        "stt": {"num_threads": "8", "glossary": "SayInk"},
+        "meeting": {"auto_generate": 1, "single_request_char_limit": "lots", "context_window_tokens": None},
+        "update": {"auto_check": "false", "last_check_at": "yesterday"},
+        "output": {"follow_input_source": "false", "mode": "paste"},
+    }), encoding="utf-8")
+    cfg = Config(config_dir=config_home)
+    assert cfg.get("auto_start") is False
+    assert cfg.get("history.enabled") is False
+    assert cfg.get("update.auto_check") is False
+    assert cfg.get("audio.esc_stops_continuous") is False
+    assert cfg.get("meeting.auto_generate") is True
+    assert cfg.get("stt.num_threads") == 8
+    assert cfg.get("stt.glossary") == []
+    assert cfg.get("audio.mic_device_index") == -1
+    assert cfg.get("audio.system_device_index") == -1
+    assert cfg.get("history.retention_days") == 90
+    assert cfg.get("history.max_entries") == 5000
+    assert cfg.get("meeting.single_request_char_limit") == 8000
+    assert cfg.get("meeting.context_window_tokens") == 32768
+    assert cfg.get("update.last_check_at") == 0
+    assert cfg.get("output.follow_input_source") is False
+    for key, default in (
+        ("audio.mic_device_index", -1),
+        ("stt.num_threads", 4),
+        ("history.retention_days", 90),
+        ("meeting.context_window_tokens", 32768),
+    ):
+        int(cfg.get(key, default))
+    saved = json.loads((config_home / "config.json").read_text(encoding="utf-8"))
+    assert saved["history"]["enabled"] is False
+    assert saved["stt"]["num_threads"] == 8
+    assert saved["audio"]["mic_device_index"] == -1
+
+
 def test_unknown_nested_keys_survive_a_save_by_an_older_build(config_home):
     """A newer release's ``stt.foo`` (or a hand-added key) must not be erased
     the first time this build saves; only top-level extras were kept before."""
