@@ -2112,7 +2112,7 @@ class App(QObject):
         elif status == "recorded":
             saved = error_detail != "history_disabled"
             title = ("已记录" if saved else "未保存 · 历史已关闭") + ("（原文）" if degraded_from_polish else "")
-            hint = "" if saved else "当前为「只记录到历史」，但历史已关闭；请在设置中打开历史或改回粘贴"
+            hint = "" if saved else "当前为「仅保存到历史」，但历史已关闭；请在设置中打开历史或改为输入当前光标"
             self._show_post_output_floating(
                 title,
                 hint,

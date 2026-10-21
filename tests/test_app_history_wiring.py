@@ -943,7 +943,7 @@ def test_history_only_output_warns_when_history_is_disabled() -> None:
         h["history"].enqueue.assert_not_called()
         title, hint = h["floating"].show_info.call_args[0][:2]
         assert "历史已关闭" in title
-        assert "改回粘贴" in hint
+        assert "输入当前光标" in hint
 
 
 def test_default_output_mode_still_pastes() -> None:

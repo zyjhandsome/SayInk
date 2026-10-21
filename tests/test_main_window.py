@@ -130,7 +130,7 @@ def test_meeting_sidebar_tracks_session_and_restores_dictation(qapp, tmp_path, m
         assert win._runtime_label.text() == "模型已就绪"
         assert win._status_tone() == "GREEN"
         assert "单次转写" in win._mode_label.text()
-        assert "粘贴" in win._output_label.text()
+        assert win._output_label.text() == "输入当前光标"
     finally:
         win.hide()
         controller.shutdown()

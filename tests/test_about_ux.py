@@ -39,18 +39,18 @@ def test_hold_hint_names_the_actual_audio_source_and_output(config, source):
     assert hint.mode == "单次转写"
     if source != "microphone":
         assert "电脑声音" in hint.source
-        assert "记录到历史" in hint.detail
+        assert "保存到历史" in hint.detail
         assert "粘贴" not in hint.detail
     else:
-        assert "粘贴到光标处" in hint.detail
+        assert "输入当前光标" in hint.detail
 
 
 def test_output_hint_respects_a_manual_paste_override_for_system_audio(config):
     config.set("audio.input_source", "system")
     config.set_output_mode(OUTPUT_MODE_PASTE)
     hint = dictation_hints(config)
-    assert hint.output == "粘贴到光标"
-    assert "粘贴到光标处" in hint.detail
+    assert hint.output == "输入当前光标"
+    assert "输入当前光标" in hint.detail
     assert not hint.output_warning
 
 
@@ -62,7 +62,7 @@ def test_disabled_history_is_never_presented_as_saved_output(config, continuous)
     hint = dictation_hints(config)
     assert hint.output_warning
     assert "未保存" in hint.output
-    assert "不会保存或粘贴" in hint.detail
+    assert "不会保存或输入" in hint.detail
 
 
 def test_continuous_hint_respects_the_esc_preference(config):
@@ -101,8 +101,8 @@ def test_sidebar_and_summary_refresh_without_reconfiguring_audio(about_window):
     assert "未保存" in win._output_label.text()
     assert "未保存" in settings._about_summary_rows["输出去向"].value_label.text()
     settings._history_enabled_row.setChecked(True)
-    assert win._output_label.text() == "仅记录历史"
-    assert "记录到历史" in settings._hotkey_hint.text()
+    assert win._output_label.text() == "仅保存到历史"
+    assert "保存到历史" in settings._hotkey_hint.text()
     settings._esc_stop_row.setChecked(False)
     assert audio_changes == []
 
@@ -117,7 +117,7 @@ def test_reloading_preferences_updates_sidebar_and_about(about_window, config):
     win.settings_panel.reload_settings()
     assert "电脑声音" in win._mode_label.text()
     assert "Esc" not in win._shortcut_label.text()
-    assert win.settings_panel._about_summary_rows["输出去向"].value_label.text() == "仅记录历史"
+    assert win.settings_panel._about_summary_rows["输出去向"].value_label.text() == "仅保存到历史"
 
 
 def test_file_locations_toggle_works_from_the_keyboard_and_survives_theme_changes(about_window, _qapp_session):
