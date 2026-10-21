@@ -1036,10 +1036,11 @@ class TestMeetingModelKnobs:
             {"term": "SayInk"},
             "Fun-ASR",
             {"term": "a,b"},
+            {"term": "甲\n乙"},
             {"term": ""},
             {"term": "x" * 30},
         ]
-        assert sr.format_hotwords(glossary) == "SayInk,张鑫,Fun-ASR,a b"
+        assert sr.format_hotwords(glossary) == "SayInk,张鑫,Fun-ASR,a b,甲 乙"
         assert sr.format_hotwords([]) == ""
         assert sr.format_hotwords(None) == ""
 

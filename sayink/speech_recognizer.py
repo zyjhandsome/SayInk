@@ -739,7 +739,10 @@ def format_hotwords(glossary) -> str:
     seen: list[str] = []
     for entry in glossary or ():
         term = entry.get("term", "") if isinstance(entry, dict) else entry
-        term = str(term or "").strip().replace(",", " ").replace("，", " ")
+        # Commas separate hotwords; any other whitespace, including a newline
+        # pasted into the file, would split one term across decoder lines.
+        term = str(term or "").replace(",", " ").replace("，", " ")
+        term = " ".join(term.split())
         if not term or len(term) > MAX_HOTWORD_CHARS or term in seen:
             continue
         seen.append(term)
