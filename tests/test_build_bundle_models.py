@@ -1,4 +1,4 @@
-"""Full installer bundles the ASR model and the two meeting helpers."""
+"""Full installer bundles the ASR model and the meeting helpers."""
 
 from __future__ import annotations
 
@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 
 import build as build_mod
-from sayink.speech_recognizer import AUX_MODEL_SILERO_VAD, AUX_MODEL_SPEAKER, get_model_info
+from sayink.speech_recognizer import (
+    AUX_MODEL_SILERO_VAD,
+    AUX_MODEL_SPEAKER,
+    AUX_MODEL_SPEAKER_ACTIVITY,
+    get_model_info,
+)
 
 
 def _plant(root: Path, info: dict) -> None:
@@ -20,23 +25,28 @@ def _plant(root: Path, info: dict) -> None:
 
 
 def test_bundle_ids_are_asr_then_meeting_helpers():
-    assert build_mod.bundle_aux_model_ids() == [AUX_MODEL_SPEAKER, AUX_MODEL_SILERO_VAD]
+    assert build_mod.bundle_aux_model_ids() == [
+        AUX_MODEL_SPEAKER,
+        AUX_MODEL_SILERO_VAD,
+        AUX_MODEL_SPEAKER_ACTIVITY,
+    ]
     assert build_mod.bundle_model_ids() == [
         "funasr-nano",
         AUX_MODEL_SPEAKER,
         AUX_MODEL_SILERO_VAD,
+        AUX_MODEL_SPEAKER_ACTIVITY,
     ]
 
 
 def test_lite_bundle_copies_helpers_and_leaves_the_asr_model(tmp_path: Path):
     root = tmp_path / "models"
-    for model_id in ("funasr-nano", AUX_MODEL_SPEAKER, AUX_MODEL_SILERO_VAD):
+    for model_id in ("funasr-nano", AUX_MODEL_SPEAKER, AUX_MODEL_SILERO_VAD, AUX_MODEL_SPEAKER_ACTIVITY):
         _plant(root, get_model_info(model_id))
 
     found = build_mod._find_model_sources([root], build_mod.bundle_aux_model_ids())
     names = {name for name, _ in found}
 
-    assert names == {"3dspeaker-campplus-zh-en", "silero-vad"}
+    assert names == {"3dspeaker-campplus-zh-en", "silero-vad", "pyannote-segmentation-3-0"}
     build_mod._require_bundle_model(found, build_mod.bundle_aux_model_ids())
 
 
@@ -58,6 +68,7 @@ def test_find_model_sources_picks_each_required_model(tmp_path: Path):
         ("funasr-nano", asr_dir),
         (AUX_MODEL_SPEAKER, helper_dir),
         (AUX_MODEL_SILERO_VAD, helper_dir),
+        (AUX_MODEL_SPEAKER_ACTIVITY, helper_dir),
     ):
         _plant(dest, get_model_info(model_id))
 
@@ -67,6 +78,7 @@ def test_find_model_sources_picks_each_required_model(tmp_path: Path):
         "sherpa-onnx-funasr-nano-int8-2025-12-30",
         "3dspeaker-campplus-zh-en",
         "silero-vad",
+        "pyannote-segmentation-3-0",
     }
     assert found["sherpa-onnx-funasr-nano-int8-2025-12-30"].parent == asr_dir
     assert found["silero-vad"].parent == helper_dir

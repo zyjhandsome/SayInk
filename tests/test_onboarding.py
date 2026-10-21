@@ -241,3 +241,97 @@ class TestAppWiring:
             connected = [c.args[0] for c in h["recognizer"].ready.connect.call_args_list]
             assert h["app"]._onboarding.show_welcome_once in connected
             assert h["app"]._onboarding.show_history_onboarding_once not in connected
+
+
+def test_missing_model_schedules_setup_without_the_long_fallback(monkeypatch):
+    cfg = _Config(first_run_welcome_seen=False)
+    ctl = _controller(cfg, model_installed=False)
+    ready = MagicMock()
+    shots = []
+    monkeypatch.setattr(onboarding_module.QTimer, "singleShot", lambda ms, fn: shots.append((ms, fn)))
+    ctl.schedule(ready)
+    assert onboarding_module.WELCOME_FALLBACK_MS not in [ms for ms, _fn in shots]
+    assert onboarding_module.WELCOME_DELAY_MS in [ms for ms, _fn in shots]
+    ready.connect.assert_not_called()
+
+
+def test_setup_trial_joins_every_captured_segment():
+    import numpy as np
+
+    ctl = _controller(_Config())
+    ctl._setup_mode = "trial"
+    first = np.array([0.1, 0.2], dtype=np.float32)
+    ctl._on_setup_segment(first)
+    first[:] = 0
+    ctl._on_setup_segment(np.array([0.3], dtype=np.float32))
+    assert np.allclose(ctl._trial_audio, [0.1, 0.2, 0.3])
+
+
+def test_setup_trial_stays_on_the_page_and_close_marks_welcome_seen(monkeypatch):
+    from PyQt6.QtWidgets import QDialog, QLabel, QLineEdit, QPushButton
+
+    pasted = []
+    monkeypatch.setattr(
+        "sayink.text_paster.TextPaster.paste_async",
+        lambda *args, **kwargs: pasted.append(args),
+    )
+    cfg = _Config(first_run_welcome_seen=False)
+    cfg.set("history.onboarded", True)
+    ctl = _controller(cfg, model_installed=False)
+    seen = {}
+
+    def exec_(dialog):
+        buttons = dialog.findChildren(QPushButton)
+        seen["buttons"] = [button.text() for button in buttons]
+        seen["names"] = [button.accessibleName() for button in buttons]
+        seen["fields"] = dialog.findChildren(QLineEdit)
+        ctl.note_mic_level(0)
+        seen["mic"] = dialog.findChild(QLabel, "setupMicStatus").text()
+        ctl.submit_trial("准备页试说")
+        seen["trial"] = dialog.findChild(QLabel, "setupTrial").text()
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(QDialog, "exec", exec_)
+    ctl.show_setup()
+    assert "下载模型" in seen["buttons"]
+    assert "下载模型" in seen["names"]
+    assert seen["fields"] == []
+    assert "没有听到" in seen["mic"]
+    assert "准备页试说" in seen["trial"]
+    assert pasted == []
+    assert cfg.get("first_run_welcome_seen") is True
+
+
+def test_setup_download_opens_the_engine_page_without_marking_welcome(monkeypatch):
+    from PyQt6.QtWidgets import QDialog, QPushButton
+
+    cfg = _Config(first_run_welcome_seen=False)
+    cfg.set("history.onboarded", True)
+    ctl = _controller(cfg, model_installed=False)
+
+    def exec_(dialog):
+        button = next(item for item in dialog.findChildren(QPushButton) if item.text() == "下载模型")
+        button.click()
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(QDialog, "exec", exec_)
+    monkeypatch.setattr(QDialog, "show", lambda dialog: None)
+    ctl.show_setup()
+    from PyQt6.QtWidgets import QApplication
+    QApplication.processEvents()
+    assert ctl.opened == ["engine"]
+    assert cfg.get("first_run_welcome_seen") is False
+    assert ctl._setup_dialog.download_btn.isDefault()
+
+
+def test_closing_setup_schedules_the_history_question(monkeypatch):
+    from PyQt6.QtWidgets import QDialog
+
+    cfg = _Config(first_run_welcome_seen=False)
+    ctl = _controller(cfg, model_installed=False)
+    shots = []
+    monkeypatch.setattr(onboarding_module.QTimer, "singleShot", lambda ms, fn: shots.append((ms, fn)))
+    monkeypatch.setattr(QDialog, "exec", lambda dialog: QDialog.DialogCode.Rejected)
+    ctl.show_setup()
+    assert (onboarding_module.HISTORY_AFTER_WELCOME_MS, ctl.show_history_onboarding) in shots
+    assert cfg.get("first_run_welcome_seen") is True

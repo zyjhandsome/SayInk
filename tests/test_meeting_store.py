@@ -68,6 +68,77 @@ def test_generation_checkpoints_survive_restart_and_are_invalidated(tmp_path):
         second.close(timeout=2)
 
 
+def _ended(store: MeetingStore, meeting_id: str) -> None:
+    store.create_meeting(meeting_id=meeting_id, started_at=1_000)
+    store.end_meeting(meeting_id, ended_at=61_000)
+
+
+def test_generation_queue_survives_restart_and_orders_user_requests_first(tmp_path):
+    from sayink.meeting_store import QUEUE_FAILED, QUEUE_PENDING, QUEUE_PRIORITY_AUTO, QUEUE_PRIORITY_USER
+
+    path = tmp_path / "queue.db"
+    first = HistoryStore(db_path=path)
+    store = MeetingStore(first)
+    for meeting_id in ("auto1", "auto2", "user1", "failed"):
+        _ended(store, meeting_id)
+    store.enqueue_generation("auto1", "general", priority=QUEUE_PRIORITY_AUTO, enqueued_at=10)
+    store.enqueue_generation("auto2", "standup", priority=QUEUE_PRIORITY_AUTO, enqueued_at=20)
+    store.enqueue_generation("user1", "general", priority=QUEUE_PRIORITY_USER, enqueued_at=30)
+    store.enqueue_generation("failed", "general", priority=QUEUE_PRIORITY_AUTO, enqueued_at=5)
+    store.fail_generation("failed", "HTTP 401；请检查接口密钥")
+    store.reschedule_generation("auto2", attempts=1, not_before=99_000, last_error="超时")
+    assert store.flush()
+    first.close(timeout=2)
+
+    second = HistoryStore(db_path=path)
+    try:
+        store = MeetingStore(second)
+        queue = store.generation_queue()
+        assert [job.meeting_id for job in queue] == ["user1", "failed", "auto1", "auto2"]
+        assert queue[0].priority == QUEUE_PRIORITY_USER and not queue[0].automatic
+        auto2 = store.queued_generation("auto2")
+        assert auto2 is not None and auto2.template_id == "standup"
+        assert (auto2.attempts, auto2.not_before, auto2.last_error, auto2.state) == (1, 99_000, "超时", QUEUE_PENDING)
+        failed = store.queued_generation("failed")
+        assert failed is not None and failed.state == QUEUE_FAILED and "401" in failed.last_error
+        store.dequeue_generation("auto1")
+        store.delete_meeting("auto2")
+        assert store.flush()
+        assert [job.meeting_id for job in store.generation_queue()] == ["user1", "failed"]
+    finally:
+        second.close(timeout=2)
+
+
+def test_user_request_upgrades_an_automatic_job_but_not_the_reverse(meetings):
+    from sayink.meeting_store import QUEUE_PENDING, QUEUE_PRIORITY_AUTO, QUEUE_PRIORITY_USER
+
+    _ended(meetings, "m")
+    meetings.enqueue_generation("m", "general", priority=QUEUE_PRIORITY_AUTO, enqueued_at=10)
+    meetings.fail_generation("m", "余额不足")
+    meetings.enqueue_generation("m", "review", priority=QUEUE_PRIORITY_USER, enqueued_at=20)
+    assert meetings.flush()
+    job = meetings.queued_generation("m")
+    assert job is not None
+    assert (job.priority, job.template_id, job.state, job.attempts, job.last_error) == (
+        QUEUE_PRIORITY_USER, "review", QUEUE_PENDING, 0, "")
+    meetings.enqueue_generation("m", "general", priority=QUEUE_PRIORITY_AUTO, enqueued_at=30)
+    assert meetings.flush()
+    job = meetings.queued_generation("m")
+    assert job is not None and job.priority == QUEUE_PRIORITY_USER and job.template_id == "review"
+
+
+def test_queue_ignores_live_and_deleted_meetings(meetings):
+    from sayink.meeting_store import QUEUE_PRIORITY_AUTO
+
+    meetings.create_meeting(meeting_id="live")
+    _ended(meetings, "gone")
+    meetings.delete_meeting("gone")
+    meetings.enqueue_generation("live", "general", priority=QUEUE_PRIORITY_AUTO)
+    meetings.enqueue_generation("gone", "general", priority=QUEUE_PRIORITY_AUTO)
+    assert meetings.flush()
+    assert meetings.generation_queue() == []
+
+
 def test_legacy_transcript_migration_and_corrections_survive_restart(tmp_path):
     from sayink.history_store import _DDL
 

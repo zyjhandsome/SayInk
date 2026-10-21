@@ -29,8 +29,8 @@ class TestReadmeSharedRecognition:
     def test_meeting_follows_dictation_audio_and_shared_parameters(self):
         from sayink.meeting_session import MeetingOptions
 
-        with app_harness({"audio.input_source": "system", "stt.language": "en",
-                          "stt.glossary": [{"term": "SayInk"}]}) as h:
+        with app_harness({"audio.input_source": "system", "meeting.input_source": "",
+                          "stt.language": "en", "stt.glossary": [{"term": "SayInk"}]}) as h:
             options = MeetingOptions.from_config(h["config"])
             assert options.input_source == "system"
             h["recorder"].start_continuous.side_effect = lambda: setattr(h["recorder"], "is_continuous", True)
@@ -657,7 +657,8 @@ class TestReadmeReliabilityPromises:
         assert "应用内自动更新一律下载轻量包" in text
         assert "升级会不会重新下载模型" in text
         assert "build_release.py --with-model" in text
-        assert "Fun-ASR-Nano、说话人嵌入 CAM++、Silero VAD 随安装包装好" in text
+        assert "Fun-ASR-Nano、说话人嵌入 CAM++、Silero VAD、多人发言检测（实验性）随安装包装好" in text
+        assert "轻量包和完整包都带上这个模型" in text
         assert "轻量包和完整包都带上 CAM++ 和 Silero VAD" in text
         assert "不含 Fun-ASR-Nano" in text
 
@@ -709,7 +710,7 @@ class TestReadmeMeetingNotes:
         assert "持续转写与会议共用谨慎的说话人匹配" in text
         assert "再用可靠样本重新聚类" in text
         assert "高级识别设置" in text and "单次转写、持续转写与会议共用" in text
-        assert "跟随转写设置" in text and "仅用于本场" in text
+        assert "麦克风 + 电脑声音" in text and "跟随转写设置" in text and "仅用于本场" in text
         assert "加载失败并回退" in text and "已保存，待生效" in text
         assert "chat_completion()" in text
         # Settings copy uses the shared names; the old 会议-prefixed ones are gone.

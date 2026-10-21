@@ -22,7 +22,7 @@ def dictation_hints(config) -> DictationHints:
     continuous = config.get("audio.trigger_mode") == TRIGGER_MODE_CONTINUOUS
     mode = "持续转写" if continuous else "单次转写"
     history_only = config.history_only_output()
-    warning = history_only and not config.get("history.enabled", False)
+    warning = history_only and not config.get("history.enabled", True)
     output = "未保存 · 历史已关闭" if warning else "仅记录历史" if history_only else "粘贴到光标"
     destination = "记录到历史" if history_only else "粘贴到光标处"
     hotkey = format_hotkey(config.get("hotkey", DEFAULT_HOTKEY))

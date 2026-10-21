@@ -4,15 +4,16 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
-from PyQt6.QtCore import QPoint, Qt, QUrl
-from PyQt6.QtTest import QTest
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QTimer, Qt, QUrl
+from PyQt6.QtGui import QMouseEvent, QTextCursor
+from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication, QDialog, QFileDialog, QPushButton
 
 from sayink.ui.design_tokens import SECONDARY_CONTAINER
 from sayink.ui.flow_layout import PairedToolBar
 
 from sayink.history_store import HistoryStore, SegmentRecord
-from sayink.meeting_session import MeetingController, MeetingOptions, resolve_capabilities
+from sayink.meeting_session import MeetingController, MeetingOptions, MeetingState, resolve_capabilities
 from sayink.meeting_store import MeetingStore
 from sayink.ui.meeting_page import MeetingPage, _SegmentTextDialog, notes_for_display
 
@@ -478,18 +479,131 @@ def test_generation_locks_edit_template_and_restore_then_unlocks_on_failure(meet
     assert page._restore_action.isEnabled() and page._generate_btn.isEnabled()
 
 
-def test_generate_stays_disabled_while_another_meeting_is_generating(meeting):
+def _row_text(page, meeting_id):
+    item = next(page._list.item(i) for i in range(page._list.count())
+                if page._list.item(i).data(Qt.ItemDataRole.UserRole) == meeting_id)
+    return item.data(Qt.ItemDataRole.AccessibleTextRole)
+
+
+def _ended_without_notes(controller, history, title):
+    other = controller.store.create_meeting(title=title)
+    history.enqueue(SegmentRecord(other.id, 1, other.started_at + 1000, raw_text="先确认排期",
+                                  speaker_id=1, trigger_mode="meeting", captured_at=other.started_at + 1000))
+    controller.store.end_meeting(other.id, ended_at=other.started_at + 60_000)
+    controller.store.flush()
+    return other
+
+
+def test_copying_a_transcript_paragraph_omits_hidden_actions(meeting):
+    page, _controller, _history, _record = meeting
+    page._switch_tab(1)
+    page._render_detail()
+    view = page._transcript_view
+    assert "采用方案 A" in view.toPlainText()
+    assert "编辑" in view.toPlainText()
+    cursor = view.textCursor()
+    cursor.select(QTextCursor.SelectionType.Document)
+    view.setTextCursor(cursor)
+    copied = view.createMimeDataFromSelection().text()
+    assert "采用方案 A" in copied
+    assert "编辑" not in copied
+
+
+def test_generate_queues_behind_another_meeting_and_can_leave_the_queue(meeting, monkeypatch):
     page, controller, _history, record = meeting
     other = controller.store.create_meeting(title="另一场")
     controller.store.end_meeting(other.id)
     controller.store.flush()
     controller._generating_for = other.id
-    page._render_detail()
+    page.refresh()
     assert page.current_meeting_id == record.id
-    assert not page._generate_btn.isEnabled()
-    assert "另一场" in page._generate_btn.toolTip()
+    assert page._generate_btn.isEnabled() and page._cancel_btn.isHidden()
+    assert "纪要生成中" in _row_text(page, other.id)
+    monkeypatch.setattr(page, "_confirm_regenerate", lambda: True)
+    page._generate()
+    job = controller.store.queued_generation(record.id)
+    assert job is not None and not job.automatic
+    assert not page._generate_btn.isEnabled() and page._generate_btn.text() == "排队中…"
+    assert "排队中" in page._notes_state.text() and "第 1 位" in page._notes_state.text()
+    assert not page._cancel_btn.isHidden() and page._cancel_btn.text() == "取消排队"
+    assert not page._template_combo.isEnabled()
     assert page._edit_btn.isEnabled()
-    assert not page._cancel_btn.isVisible()
+    assert "纪要排队中" in _row_text(page, record.id)
+    page._cancel_btn.click()
+    assert controller.store.queued_generation(record.id) is None
+    assert controller.generating_for == other.id
+    assert page._generate_btn.isEnabled() and page._cancel_btn.isHidden()
+    assert "纪要排队中" not in _row_text(page, record.id)
+    controller._generating_for = ""
+
+
+def test_cancel_button_still_stops_the_running_job(meeting, monkeypatch):
+    page, controller, _history, record = meeting
+    monkeypatch.setattr(controller._generator, "generate", lambda _request: None)
+    monkeypatch.setattr(page, "_confirm_regenerate", lambda: True)
+    page._generate()
+    assert controller.generating_for == record.id
+    assert page._cancel_btn.text() == "取消"
+    page._cancel_btn.click()
+    assert controller.generating_for == ""
+    assert controller.store.queued_generation(record.id) is None
+
+
+def test_queued_job_starting_updates_the_list(meeting, monkeypatch):
+    page, controller, history, record = meeting
+    waiting = _ended_without_notes(controller, history, "排在后面")
+    seen = []
+    monkeypatch.setattr(controller._generator, "generate", seen.append)
+    monkeypatch.setattr(page, "_confirm_regenerate", lambda: True)
+    page._generate()
+    assert controller.generate(waiting.id)
+    assert "纪要排队中" in _row_text(page, waiting.id)
+    controller._on_generation_error("HTTP 401")
+    assert controller.generating_for == waiting.id
+    assert "纪要生成中" in _row_text(page, waiting.id)
+    assert "纪要" not in _row_text(page, record.id).splitlines()[1]
+
+
+def test_failed_automatic_job_shows_the_reason_and_generate_retries_it(meeting, config, monkeypatch):
+    from sayink.meeting_store import QUEUE_PRIORITY_AUTO
+
+    page, controller, history, _record = meeting
+    config.set("meeting.auto_generate", True)
+    failed = _ended_without_notes(controller, history, "自动失败")
+    controller.store.enqueue_generation(failed.id, "general", priority=QUEUE_PRIORITY_AUTO)
+    controller.store.fail_generation(failed.id, "HTTP 401：密钥无效")
+    controller.store.flush()
+    page.show_meeting(failed.id)
+    assert "自动生成失败" in page._notes_state.text() and "密钥无效" in page._notes_state.text()
+    assert "纪要生成失败" in _row_text(page, failed.id)
+    assert page._generate_btn.isEnabled() and page._generate_btn.text() == "生成纪要"
+    assert page._cancel_btn.isHidden()
+    seen = []
+    monkeypatch.setattr(controller._generator, "generate", seen.append)
+    page._generate()
+    assert len(seen) == 1 and controller.generating_for == failed.id
+    job = controller.store.queued_generation(failed.id)
+    assert job is not None and not job.automatic and not job.failed
+
+
+def test_automatic_retry_wait_says_why_and_offers_to_retry_now(meeting, config, monkeypatch):
+    from sayink.meeting_store import QUEUE_PRIORITY_AUTO, now_ms
+
+    page, controller, history, _record = meeting
+    config.set("meeting.auto_generate", True)
+    waiting = _ended_without_notes(controller, history, "稍后重试")
+    controller.store.enqueue_generation(waiting.id, "general", priority=QUEUE_PRIORITY_AUTO)
+    controller.store.reschedule_generation(waiting.id, attempts=1, not_before=now_ms() + 60_000,
+                                           last_error="连接超时")
+    controller.store.flush()
+    page.show_meeting(waiting.id)
+    assert "连接超时" in page._notes_state.text() and "自动重试" in page._notes_state.text()
+    assert page._generate_btn.isEnabled() and page._generate_btn.text() == "立即重试"
+    assert not page._cancel_btn.isHidden()
+    seen = []
+    monkeypatch.setattr(controller._generator, "generate", seen.append)
+    page._generate()
+    assert len(seen) == 1 and controller.generating_for == waiting.id
 
 
 def test_switching_meeting_saves_draft_to_its_original_record(meeting):
@@ -572,10 +686,141 @@ def test_text_correction_preserves_source_and_only_updates_target_segment(meetin
     assert controller.store.get_notes(record.id).transcript_changed
     assert not next(s for s in history.get_session_segments(record.id) if s.trigger_mode == "hotkey").corrected_text
     page._render_detail()
-    assert "已修改" in page._transcript_view.toPlainText()
+    assert "已编辑" in page._transcript_view.toPlainText()
     assert "建议重新生成" in page._notes_state.text()
     assert controller.store.search_meetings("预算 5000")[0].id == record.id
     assert not controller.store.search_meetings("下周开始验证")
+
+
+def _transcript_link(view, href):
+    from PyQt6.QtGui import QTextCursor
+
+    block = view.document().begin()
+    while block.isValid():
+        it = block.begin()
+        while not it.atEnd():
+            fragment = it.fragment()
+            if fragment.charFormat().anchorHref() == href:
+                cursor = QTextCursor(view.document())
+                cursor.setPosition(fragment.position())
+                cursor.setPosition(fragment.position() + fragment.length(), QTextCursor.MoveMode.KeepAnchor)
+                return cursor
+            it += 1
+        block = block.next()
+    raise AssertionError(f"Missing transcript link: {href}")
+
+
+def test_paragraph_actions_reveal_on_hover_without_moving_text_or_selection(meeting):
+    page, _controller, _history, _record = meeting
+    page.resize(1040, 720)
+    page.show()
+    page._switch_tab(1)
+    QApplication.processEvents()
+    view = page._transcript_view
+    action = _transcript_link(view, "edit-segment:7")
+    assert action.charFormat().foreground().color().alpha() == 0
+    selection = view.document().find("下周开始验证")
+    view.setTextCursor(selection)
+    before = view.cursorRect(selection)
+    scroll = view.verticalScrollBar().value()
+    # Deliver through the viewport: the offscreen plugin may ignore OS cursor moves.
+    QApplication.sendEvent(view.viewport(), QMouseEvent(
+        QEvent.Type.MouseMove, QPointF(before.center()), Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+    ))
+    assert _transcript_link(view, "edit-segment:7").charFormat().foreground().color().alpha() == 255
+    assert _transcript_link(view, "edit-segment:2").charFormat().foreground().color().alpha() == 0
+    assert view.textCursor().selectedText() == "下周开始验证"
+    assert view.cursorRect(selection) == before and view.verticalScrollBar().value() == scroll
+    QApplication.sendEvent(view, QEvent(QEvent.Type.Leave))
+    assert _transcript_link(view, "edit-segment:7").charFormat().foreground().color().alpha() == 0
+    page._correct_speaker_btn.click()
+    assert _transcript_link(view, "segment:7").charFormat().foreground().color().alpha() == 255
+
+
+def test_keyboard_can_reveal_and_activate_paragraph_edit(meeting, monkeypatch):
+    page, _controller, _history, _record = meeting
+    page.show()
+    page._switch_tab(1)
+    QApplication.processEvents()
+    view = page._transcript_view
+    opened = []
+    monkeypatch.setattr(page, "_prompt_segment_text", opened.append)
+    view.setFocus(Qt.FocusReason.TabFocusReason)
+    for _ in range(10):
+        QTest.keyClick(view, Qt.Key.Key_Tab)
+        if view.textCursor().charFormat().anchorHref() == "edit-segment:7":
+            break
+    assert view.textCursor().charFormat().anchorHref() == "edit-segment:7"
+    assert _transcript_link(view, "edit-segment:7").charFormat().foreground().color().alpha() == 255
+    QTest.keyClick(view, Qt.Key.Key_Return)
+    assert opened == [7]
+
+
+def test_combined_modifications_have_one_badge_and_details_can_restore_original(meeting, monkeypatch):
+    page, controller, _history, record = meeting
+    page._rename_speaker(1, "小林")
+    assert controller.correct_segment_speaker(record.id, 7, 1)
+    assert controller.save_segment_text(record.id, 7, "周三验证")
+    page._render_detail()
+    plain = page._transcript_view.toPlainText()
+    assert plain.count("已编辑") == 1
+    assert "手动命名" not in plain and "归属已更正" not in plain
+    assert "details-segment:7" not in page._transcript_view.toHtml()
+
+    def restore(dialog):
+        assert dialog.windowTitle() == "修改详情"
+        assert "此姓名由你设置" in dialog.details_label.text()
+        assert "已手动更正，仅作用于本段" in dialog.details_label.text()
+        assert dialog.original_btn.isChecked()
+        assert dialog.original_view.toPlainText() == "下周开始验证"
+        dialog.restore_btn.click()
+        dialog.save_btn.click()
+        return dialog.result()
+
+    monkeypatch.setattr(_SegmentTextDialog, "exec", restore)
+    page._on_transcript_link(QUrl("edited-segment:7"))
+    restored = controller.store.get_segments(record.id)[1]
+    assert restored.corrected_text == "" and restored.speaker_id == 1 and restored.speaker_locked
+    assert "已编辑" not in page._transcript_view.toPlainText()
+    assert "details-segment:7" in page._transcript_view.toHtml()
+
+
+def test_modification_details_remain_read_only_during_generation(meeting, monkeypatch):
+    page, controller, _history, record = meeting
+    assert controller.save_segment_text(record.id, 7, "周三验证")
+    controller._generating_for = record.id
+    page._render_detail()
+    shown = []
+
+    def inspect(dialog):
+        shown.append(dialog.windowTitle())
+        assert dialog.editor.isReadOnly()
+        assert dialog.restore_btn.isHidden() and dialog.save_btn.isHidden()
+        assert not dialog.save_btn.isEnabled()
+        assert dialog.original_btn.isChecked()
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(_SegmentTextDialog, "exec", inspect)
+    page._on_transcript_link(QUrl("edited-segment:7"))
+    assert shown == ["修改详情"]
+    controller._generating_for = ""
+
+
+def test_success_feedback_expires_but_cannot_hide_a_later_error(meeting):
+    page, _controller, _history, _record = meeting
+    page.show()
+    page._rename_speaker(1, "小林")
+    assert page._status_timer.isActive()
+    expired = QSignalSpy(page._status_timer.timeout)
+    page._status_timer.start(1)
+    assert expired.wait(1000)
+    assert page._status_label.isHidden()
+    page._rename_speaker(1, "小周")
+    page._set_status("尚未保存，请重试")
+    assert not page._status_timer.isActive()
+    assert not page._status_label.isHidden()
+    assert "尚未保存" in page._status_label.text()
 
 
 @pytest.mark.parametrize("template_id", ["general", "refine"])
@@ -608,7 +853,7 @@ def test_text_restore_preserves_original_and_marks_previous_notes_for_review(mee
     controller.restore_previous_notes(record.id)
     assert controller.store.get_notes(record.id).transcript_changed
     page._render_detail()
-    assert "已修改" not in page._transcript_view.toPlainText()
+    assert "已编辑" not in page._transcript_view.toPlainText()
 
 
 def test_text_corrections_override_polished_and_raw_sources_until_restored(meeting):
@@ -651,9 +896,8 @@ def test_text_edit_rejected_for_live_generation_missing_or_deleted_segment(meeti
     history.enqueue(SegmentRecord(live.id, 0, live.started_at, raw_text="进行中", trigger_mode="meeting"))
     history.flush()
     assert not controller.save_segment_text(live.id, 0, "改动")
-    controller.store.set_segment_text(live.id, 0, "禁止绕过界面")
-    controller.store.flush()
-    assert not controller.store.get_segments(live.id)[0].corrected_text
+    assert controller.store.get_segments(live.id)[0].corrected_text == ""
+    assert controller.store.get_segments(live.id)[0].raw_text == "进行中"
     controller.delete_meeting(record.id)
     assert not controller.save_segment_text(record.id, 7, "改动")
 
@@ -975,4 +1219,139 @@ def test_only_empty_decision_sections_are_compacted_for_display():
     assert "## 决策" not in shown and "## 待办" not in shown
     assert "决策 / 待办：暂未提取到明确内容" in shown
     assert "需要评审。" in shown
+
+
+def _begin_live(page, controller):
+    options = MeetingOptions(title="进行中改字")
+    return controller.begin(
+        options, resolve_capabilities(page._config, options, dictation_model_id="funasr-nano"),
+    )
+
+
+def _link_characters(view, href: str):
+    link = _transcript_link(view, href)
+    start, end = link.selectionStart(), link.selectionEnd()
+    chars = []
+    for offset in range(end - start):
+        probe = QTextCursor(view.document())
+        probe.setPosition(start + offset)
+        probe.setPosition(start + offset + 1, QTextCursor.MoveMode.KeepAnchor)
+        color = probe.charFormat().foreground().color()
+        chars.append((probe.selectedText(), probe.charFormat().anchorHref(), color.alpha()))
+    return chars
+
+
+def test_live_edit_link_stays_hidden_after_the_transcript_is_redrawn(meeting):
+    page, controller, history, _record = meeting
+    live = _begin_live(page, controller)
+    history.enqueue(SegmentRecord(
+        live.id, 3, live.started_at, raw_text="我想会啊啊。去", trigger_mode="meeting", speaker_id=0,
+    ))
+    history.flush()
+    page.resize(1040, 720)
+    page.show()
+    page._render_live()
+    QApplication.processEvents()
+    view = page._live_transcript
+    link = _transcript_link(view, "live-edit:3")
+    caret = view.textCursor()
+    caret.setPosition(link.selectionStart() + 1)
+    view.setTextCursor(caret)
+    view.setFocus(Qt.FocusReason.MouseFocusReason)
+
+    def finish_dialog():
+        dialog = page.findChild(_SegmentTextDialog)
+        if dialog is None:
+            QTimer.singleShot(0, finish_dialog)
+            return
+        dialog.editor.setPlainText("我想会啊啊。去改")
+        dialog.save_btn.click()
+
+    QTimer.singleShot(0, finish_dialog)
+    page._on_live_transcript_link(QUrl("live-edit:3"))
+    QApplication.processEvents()
+    QApplication.sendEvent(view, QEvent(QEvent.Type.Leave))
+    QApplication.processEvents()
+    hidden = _link_characters(view, "live-edit:3")
+    assert "去改" in view.toPlainText()
+    assert hidden and all(alpha == 0 for _text, _href, alpha in hidden), hidden
+    assert not view.textCursor().charFormat().anchorHref().startswith("live-edit")
+
+
+def test_live_and_paused_meetings_save_stored_segment_text(meeting):
+    page, controller, history, _record = meeting
+    live = _begin_live(page, controller)
+    captured = live.started_at + 3000
+    history.enqueue(SegmentRecord(
+        live.id, 3, captured, raw_text="原文还在", trigger_mode="meeting",
+        speaker_id=2, captured_at=captured,
+    ))
+    history.flush()
+    page.show()
+    page._render_live()
+    assert controller.save_segment_text(live.id, 3, "改成这句")
+    saved = controller.store.get_segments(live.id)[0]
+    assert saved.corrected_text == "改成这句"
+    assert saved.raw_text == "原文还在"
+    assert saved.speaker_id == 2
+    assert saved.captured_at == captured
+    page._render_live()
+    html = page._live_transcript.toHtml()
+    assert "live-edit:3" in html
+    assert "live-edit:" not in html.replace("live-edit:3", "")
+    assert "live-edit:" in page._live_transcript._CONTEXT_LINKS
+    history.enqueue(SegmentRecord(
+        live.id, 4, captured + 1000, raw_text="后到的新段落", trigger_mode="meeting", speaker_id=1,
+    ))
+    history.flush()
+    kept = next(segment for segment in controller.store.get_segments(live.id) if segment.seq == 3)
+    assert kept.corrected_text == "改成这句"
+    assert kept.raw_text == "原文还在"
+    controller.pause("你已暂停采集")
+    assert controller.save_segment_text(live.id, 3, "暂停时再改")
+    assert controller.state is MeetingState.PAUSED
+    assert controller.paused_detail == "你已暂停采集"
+    paused = next(segment for segment in controller.store.get_segments(live.id) if segment.seq == 3)
+    assert paused.corrected_text == "暂停时再改"
+    assert paused.raw_text == "原文还在"
+    assert paused.speaker_id == 2
+    assert paused.captured_at == captured
+
+
+def test_draining_or_generation_does_not_change_segment_text(meeting):
+    page, controller, history, _record = meeting
+    live = _begin_live(page, controller)
+    history.enqueue(SegmentRecord(
+        live.id, 3, live.started_at, raw_text="保持原文", trigger_mode="meeting", speaker_id=1,
+    ))
+    history.flush()
+    controller._generating_for = live.id
+    assert not controller.save_segment_text(live.id, 3, "生成中")
+    assert controller.store.get_segments(live.id)[0].corrected_text == ""
+    assert controller.store.get_segments(live.id)[0].raw_text == "保持原文"
+    controller._generating_for = ""
+    controller._pending_segments = lambda: 1
+    controller.request_end()
+    assert controller.state is MeetingState.DRAINING
+    assert not controller.save_segment_text(live.id, 3, "收尾中")
+    assert controller.store.get_segments(live.id)[0].corrected_text == ""
+    assert controller.store.get_segments(live.id)[0].raw_text == "保持原文"
+
+
+def test_ended_meeting_without_notes_can_be_edited_without_waiting_for_generation(meeting):
+    page, controller, history, _record = meeting
+    bare = controller.store.create_meeting(title="还没有纪要")
+    controller.store.end_meeting(bare.id, ended_at=bare.started_at + 4000)
+    history.enqueue(SegmentRecord(
+        bare.id, 1, bare.started_at, raw_text="先改字", trigger_mode="meeting", speaker_id=1,
+    ))
+    history.flush()
+    page.show_meeting(bare.id)
+    page._tab_transcript.click()
+    hint = page._content_hint.text()
+    assert "生成完成" not in hint
+    assert "编辑" in hint
+    assert controller.save_segment_text(bare.id, 1, "已经改过")
+    assert controller.store.get_segments(bare.id)[0].corrected_text == "已经改过"
+    assert controller.store.get_segments(bare.id)[0].raw_text == "先改字"
     assert "通过方案" in notes_for_display("## 决策\n通过方案。\n", "会议")

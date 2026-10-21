@@ -254,7 +254,9 @@ def test_context_error_is_returned_for_adaptive_splitting_without_retry():
 
 
 def test_total_deadline_includes_server_requested_retry_delay():
-    with pytest.raises(LLMResponseError, match="超时"):
+    from sayink.llm_transport import LLMDeadlineError
+
+    with pytest.raises(LLMDeadlineError, match="超时"):
         run(lambda request: httpx.Response(503, headers={"retry-after": "3600"}, json={"error": {}}),
             total_timeout_sec=0.02)
 

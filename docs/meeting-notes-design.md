@@ -16,7 +16,7 @@
 |---|---|---|
 | D1 | 会议内容来源 | 只针对 SayInk 实时听到的会议（麦克风 / 电脑播放 / 混合），**不**重新引入文件导入（与 2026-07-15 移除文件转写与 ffmpeg 的决策保持一致） |
 | D2 | 生成纪要的大模型 | 复用现有 OpenAI 兼容 API 配置（DeepSeek / 通义 / Ollama 等），纪要可单独选模型 |
-| D3 | 生成时机 | 会议结束后一键生成；会中不做滚动纪要 |
+| D3 | 生成时机 | 会议结束后一键生成；会中不做滚动纪要。2026-10-21 增补：可选「会议结束后自动生成纪要」（默认关），按默认模板在后台逐场排队生成，手动请求排在自动任务前面且不打断当前任务，见 [排队与自动生成](meeting-generation-reliability.md#排队与自动生成) |
 | D4 | 纪要内容 | 整体摘要、分议题要点、决策、待办（负责人 / 截止）、遗留问题、带时间戳的章节、按说话人的发言摘要；模板 / 提示词可自定义 |
 | D5 | 说话人识别 | 升级为 sherpa-onnx 说话人嵌入模型（可选 pyannote 分段），取代现有频谱粗分 |
 | D6 | 音频 | **坚持不保存音频**，只存文字稿与纪要 |
@@ -326,6 +326,7 @@
 
 - 音频不落盘；嵌入向量不落盘；文字稿与纪要只在 `~/.sayink/history.db`。
 - 纪要生成是用户显式动作；首次向**非本机 / 非局域网**端点发送时弹确认（显示主机名与字数），可勾选「不再提示」（`meeting.confirmed_remote_hosts`）。本机 / 局域网端点（Ollama 等）不提示。
+- 会后自动生成（`meeting.auto_generate`）默认关闭，打开开关即视为同意会后发送：远程端点在打开时确认一次。自动任务本身从不弹窗，启动前再检查一次地址；接口改成未确认的主机时不发送，记为失败，由用户在会议页确认后手动生成。
 - 复用 `is_secure_or_local_url`、`api_key_required`、凭据管理器；不新增任何明文 Key。
 - 设置页「会议」区写明：「文字稿会发送到你配置的大模型服务；SayInk 不经手任何服务器」。
 - 导出的 .md 默认不含参会人以外的个人信息字段；文件名用标题，特殊字符替换。
@@ -347,7 +348,8 @@
 | `meeting.show_start_card` | `true` | 是否显示开始卡片 |
 | `meeting.polish_segments` | `false` | 会中是否逐句润色 |
 | `meeting.model_name` | `""` | 纪要模型；空则用 `llm.model_name` |
-| `meeting.template_id` | `general` | 默认模板 |
+| `meeting.template_id` | `general` | 默认模板；会后自动生成也用它 |
+| `meeting.auto_generate` | `false` | 会议结束后按默认模板在后台排队生成纪要（AI 服务 → 会议纪要） |
 | `meeting.output_language` | `auto` | `auto / zh / en` |
 | `meeting.confirmed_remote_hosts` | `[]` | 已确认可发送文字稿的远程主机 |
 | `meeting.single_request_char_limit` | `8000` | 单次请求的文字稿上限，超过走分块；8000 同时是生成器的硬上限，此项只能调低 |

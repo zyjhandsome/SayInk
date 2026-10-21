@@ -31,6 +31,13 @@ STATUS_DELETED = "deleted"
 # A meeting still marked live after a restart: the app crashed mid-meeting.
 STATUS_INTERRUPTED = "interrupted"
 
+# Minutes queue: user requests run before automatic end-of-meeting jobs.
+QUEUE_PRIORITY_AUTO = 0
+QUEUE_PRIORITY_USER = 1
+QUEUE_PENDING = "pending"
+# Needs the user (key, quota, unconfirmed host…); never retried on its own.
+QUEUE_FAILED = "failed"
+
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -111,6 +118,36 @@ class MeetingNotes:
         except ValueError:
             return {}
         return data if isinstance(data, dict) else {}
+
+
+@dataclass(frozen=True)
+class QueuedGeneration:
+    meeting_id: str
+    template_id: str = ""
+    priority: int = QUEUE_PRIORITY_AUTO
+    enqueued_at: int = 0
+    attempts: int = 0
+    not_before: int = 0
+    state: str = QUEUE_PENDING
+    last_error: str = ""
+
+    @property
+    def automatic(self) -> bool:
+        return self.priority == QUEUE_PRIORITY_AUTO
+
+    @property
+    def failed(self) -> bool:
+        return self.state == QUEUE_FAILED
+
+
+_QUEUE_COLUMNS = "meeting_id, template_id, priority, enqueued_at, attempts, not_before, state, last_error"
+
+
+def _row_to_queued(r: tuple) -> QueuedGeneration:
+    return QueuedGeneration(
+        meeting_id=r[0], template_id=r[1] or "", priority=int(r[2] or 0), enqueued_at=int(r[3] or 0),
+        attempts=int(r[4] or 0), not_before=int(r[5] or 0), state=r[6] or QUEUE_PENDING, last_error=r[7] or "",
+    )
 
 
 _MEETING_COLUMNS = (
@@ -373,6 +410,7 @@ class MeetingStore:
             conn.execute("DELETE FROM meeting_speakers WHERE meeting_id = ?", (meeting_id,))
             conn.execute("DELETE FROM meeting_notes WHERE meeting_id = ?", (meeting_id,))
             conn.execute("DELETE FROM meeting_generation_cache WHERE meeting_id = ?", (meeting_id,))
+            conn.execute("DELETE FROM meeting_generation_queue WHERE meeting_id = ?", (meeting_id,))
             conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
 
         self._write(_delete)
@@ -492,9 +530,9 @@ class MeetingStore:
             changed = conn.execute(
                 "UPDATE history SET corrected_text = ? "
                 "WHERE session_id = ? AND seq = ? AND trigger_mode = ? AND corrected_text != ? "
-                "AND EXISTS (SELECT 1 FROM meetings WHERE id = ? AND status IN (?, ?))",
+                "AND EXISTS (SELECT 1 FROM meetings WHERE id = ? AND status IN (?, ?, ?))",
                 (corrected, meeting_id, int(seq), MEETING_TRIGGER_MODE, corrected,
-                 meeting_id, STATUS_ENDED, STATUS_INTERRUPTED),
+                 meeting_id, STATUS_LIVE, STATUS_ENDED, STATUS_INTERRUPTED),
             )
             if changed.rowcount:
                 conn.execute(
@@ -534,6 +572,68 @@ class MeetingStore:
 
     def clear_generation_checkpoints(self, meeting_id: str) -> None:
         self._write(lambda conn: conn.execute("DELETE FROM meeting_generation_cache WHERE meeting_id = ?", (meeting_id,)))
+
+    # -- minutes queue -----------------------------------------------------
+
+    def enqueue_generation(self, meeting_id: str, template_id: str, *, priority: int,
+                           enqueued_at: int | None = None) -> None:
+        """Queue an ended meeting. A user request replaces any earlier job for
+        the meeting (failed ones included); an automatic job never displaces
+        an existing one."""
+        stamp = now_ms() if enqueued_at is None else int(enqueued_at)
+        user = priority != QUEUE_PRIORITY_AUTO
+
+        def _enqueue(conn: sqlite3.Connection) -> None:
+            row = conn.execute("SELECT status FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+            if row is None or row[0] not in (STATUS_ENDED, STATUS_INTERRUPTED):
+                return
+            conn.execute(
+                f"INSERT INTO meeting_generation_queue ({_QUEUE_COLUMNS}) VALUES (?, ?, ?, ?, 0, 0, ?, '') "
+                + ("ON CONFLICT(meeting_id) DO UPDATE SET template_id = excluded.template_id, "
+                   "priority = excluded.priority, enqueued_at = excluded.enqueued_at, attempts = 0, "
+                   "not_before = 0, state = excluded.state, last_error = ''" if user else
+                   "ON CONFLICT(meeting_id) DO NOTHING"),
+                (meeting_id, template_id, int(priority), stamp, QUEUE_PENDING),
+            )
+
+        self._write(_enqueue)
+
+    def reschedule_generation(self, meeting_id: str, *, attempts: int, not_before: int, last_error: str) -> None:
+        self._write(lambda conn: conn.execute(
+            "UPDATE meeting_generation_queue SET attempts = ?, not_before = ?, last_error = ?, state = ? "
+            "WHERE meeting_id = ?", (int(attempts), int(not_before), last_error, QUEUE_PENDING, meeting_id),
+        ))
+
+    def fail_generation(self, meeting_id: str, last_error: str) -> None:
+        self._write(lambda conn: conn.execute(
+            "UPDATE meeting_generation_queue SET state = ?, last_error = ? WHERE meeting_id = ?",
+            (QUEUE_FAILED, last_error, meeting_id),
+        ))
+
+    def dequeue_generation(self, meeting_id: str) -> None:
+        self._write(lambda conn: conn.execute(
+            "DELETE FROM meeting_generation_queue WHERE meeting_id = ?", (meeting_id,)
+        ))
+
+    def generation_queue(self) -> list[QueuedGeneration]:
+        """Every queued job, in the order they should run (failed rows included)."""
+        def _q(conn: sqlite3.Connection) -> list[QueuedGeneration]:
+            rows = conn.execute(
+                f"SELECT {_QUEUE_COLUMNS} FROM meeting_generation_queue "
+                "ORDER BY priority DESC, enqueued_at ASC, meeting_id ASC"
+            ).fetchall()
+            return [_row_to_queued(r) for r in rows]
+
+        return self._history.read(_q, default=[]) or []
+
+    def queued_generation(self, meeting_id: str) -> QueuedGeneration | None:
+        def _q(conn: sqlite3.Connection) -> QueuedGeneration | None:
+            row = conn.execute(
+                f"SELECT {_QUEUE_COLUMNS} FROM meeting_generation_queue WHERE meeting_id = ?", (meeting_id,)
+            ).fetchone()
+            return _row_to_queued(row) if row else None
+
+        return self._history.read(_q, default=None)
 
     def save_notes(
         self,

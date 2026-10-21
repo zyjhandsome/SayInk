@@ -519,6 +519,13 @@ class TestChatCompletionHelper:
 
         assert chat_completions_url("https://x/v1/chat/completions") == "https://x/v1/chat/completions"
         assert chat_completions_url("https://x/v1/") == "https://x/v1/chat/completions"
+        assert chat_completions_url("  https://x/v1/  ") == "https://x/v1/chat/completions"
+        assert chat_completions_url("https://x/v1?x=1") == "https://x/v1/chat/completions?x=1"
+        assert chat_completions_url("https://x/v1#frag") == "https://x/v1/chat/completions"
+        assert (
+            chat_completions_url("https://user:secret@x/v1/chat/completions?x=1")
+            == "https://x/v1/chat/completions?x=1"
+        )
 
     def test_malformed_and_empty_answers_raise_response_error(self):
         from sayink.text_polisher import LLMResponseError
@@ -597,16 +604,53 @@ class TestPolishSettingsComplete:
         assert polish_settings_complete("http://localhost:11434/v1", "", "") is False
 
     def test_keyless_connection_test_omits_authorization(self):
-        fake, client = _fake_httpx_module(_make_response({}))
+        fake, client = _fake_httpx_module(_make_response(_CHAT_OK))
         with patch.dict(sys.modules, {"httpx": fake}):
             ok, _ = TextPolisher.test_connection("http://localhost:11434/v1", "", "m")
         assert ok is True
         assert "Authorization" not in client.post.call_args.kwargs["headers"]
 
 
+_CHAT_OK = {"choices": [{"message": {"content": "hi"}}]}
+
+
+class TestApiInputNormalization:
+    def test_spaced_host_is_rejected(self):
+        assert is_secure_or_local_url("https://api.deepseek.com /v1") is False
+
+    def test_fullwidth_scheme_explains_the_character(self):
+        from sayink.text_polisher import FULLWIDTH_URL_ERROR, api_url_error
+
+        assert api_url_error("https：//api.deepseek.com") == FULLWIDTH_URL_ERROR
+
+    def test_userinfo_is_removed_but_the_path_stays(self):
+        from sayink.text_polisher import redact_url_userinfo
+
+        cleaned, removed = redact_url_userinfo("https://user:sk-secret@api.deepseek.com/v1")
+        assert removed is True
+        assert cleaned == "https://api.deepseek.com/v1"
+        assert redact_url_userinfo("https://api.deepseek.com/v1") == ("https://api.deepseek.com/v1", False)
+
+    def test_key_drops_bearer_quotes_and_internal_whitespace(self):
+        from sayink.text_polisher import normalize_api_key
+
+        assert normalize_api_key('  "Bearer sk-abc" \n') == "sk-abc"
+        assert normalize_api_key("sk-ab\u200bcd") == "sk-abcd"
+
+    def test_known_model_names_are_canonicalized(self):
+        from sayink.text_polisher import normalize_model_name, thinking_payload_extra
+
+        assert normalize_model_name(" DeepSeek－Flash ") == "deepseek-flash"
+        assert normalize_model_name("deepseek flash") == "deepseek-flash"
+        assert normalize_model_name("Qwen2.5") == "Qwen2.5"
+        assert thinking_payload_extra(
+            "https://api.deepseek.com/v1", "DeepSeek-Flash", "disabled"
+        ) == {"thinking": {"type": "disabled"}}
+
+
 class TestTestConnectionRun:
     def test_local_http_accepted(self):
-        fake, client = _fake_httpx_module(_make_response({}))
+        fake, client = _fake_httpx_module(_make_response(_CHAT_OK))
         with patch.dict(sys.modules, {"httpx": fake}):
             ok, msg = TextPolisher.test_connection(
                 "http://localhost:11434/v1", "k", "m"
@@ -615,7 +659,7 @@ class TestTestConnectionRun:
         assert "成功" in msg
 
     def test_remote_http_is_requested(self):
-        fake, client = _fake_httpx_module(_make_response({}))
+        fake, client = _fake_httpx_module(_make_response(_CHAT_OK))
         with patch.dict(sys.modules, {"httpx": fake}):
             ok, msg = TextPolisher.test_connection(
                 "http://api.example.com/v1", "k", "m"
@@ -625,12 +669,50 @@ class TestTestConnectionRun:
         client.post.assert_called_once()
 
     def test_https_success(self):
-        fake, _ = _fake_httpx_module(_make_response({}))
+        fake, _ = _fake_httpx_module(_make_response(_CHAT_OK))
         with patch.dict(sys.modules, {"httpx": fake}):
             ok, msg = TextPolisher.test_connection(
                 "https://api.example.com/v1", "k", "m"
             )
         assert ok is True
+
+    def test_empty_json_is_not_a_successful_connection(self):
+        fake, _ = _fake_httpx_module(_make_response({}))
+        with patch.dict(sys.modules, {"httpx": fake}):
+            ok, msg = TextPolisher.test_connection("https://api.example.com/v1", "k", "m")
+        assert ok is False
+        assert "格式异常" in msg
+
+    def test_blank_content_is_not_a_successful_connection(self):
+        fake, _ = _fake_httpx_module(_make_response({"choices": [{"message": {"content": "  "}}]}))
+        with patch.dict(sys.modules, {"httpx": fake}):
+            ok, msg = TextPolisher.test_connection("https://api.example.com/v1", "k", "m")
+        assert ok is False
+        assert "空内容" in msg
+
+    def test_deepseek_flash_test_disables_thinking(self):
+        fake, client = _fake_httpx_module(_make_response(_CHAT_OK))
+        with patch.dict(sys.modules, {"httpx": fake}):
+            ok, _ = TextPolisher.test_connection(
+                "https://api.deepseek.com", "Bearer sk-x", "deepseek-flash"
+            )
+        assert ok is True
+        payload = client.post.call_args.kwargs["json"]
+        assert payload["model"] == "deepseek-flash"
+        assert payload["max_tokens"] == 16
+        assert payload["thinking"] == {"type": "disabled"}
+        assert client.post.call_args.kwargs["headers"]["Authorization"] == "Bearer sk-x"
+        assert client.post.call_args[0][0] == "https://api.deepseek.com/chat/completions"
+
+    def test_http_401_names_the_key(self):
+        resp = _make_response({})
+        resp.status_code = 401
+        fake, _ = _fake_httpx_module(resp)
+        resp.raise_for_status.side_effect = fake.HTTPStatusError(resp)
+        with patch.dict(sys.modules, {"httpx": fake}):
+            ok, msg = TextPolisher.test_connection("https://api.example.com/v1", "k", "m")
+        assert ok is False
+        assert "密钥" in msg and "401" in msg
 
 
 class TestPolishWorkerLifecycle:

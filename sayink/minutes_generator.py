@@ -30,8 +30,10 @@ from sayink.minutes_prompts import (
     render_transcript,
 )
 from sayink.minutes_render import apply_speaker_names, extract_json, render_markdown
-from sayink.text_polisher import INSECURE_URL_ERROR, LLMCancelled, LLMResponseError, LLMTruncatedError, is_secure_or_local_url
-from sayink.llm_transport import Cancellation, LLMContextError, completion
+from sayink.text_polisher import LLMCancelled, LLMResponseError, LLMTruncatedError, api_url_error
+from sayink.llm_transport import (
+    Cancellation, LLMBrokenStream, LLMContextError, LLMDeadlineError, completion, is_billing_error,
+)
 from sayink.minutes_validation import validate_markdown, validate_minutes
 from sayink.transcript_refiner import (
     REFINE_SYSTEM_PROMPT,
@@ -91,6 +93,22 @@ def request_fingerprint(request: MinutesRequest) -> str:
     return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def is_transient_failure(exc: BaseException) -> bool:
+    """Network, timeout, overload and rate-limit failures: the same request
+    may succeed later. Credentials, quota, budget and validation do not."""
+    import httpx
+
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError,
+                        LLMBrokenStream, LLMDeadlineError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 429:
+            return not is_billing_error(exc.response)
+        return status in (408, 500, 502, 503, 504)
+    return False
+
+
 def estimate_prompt_tokens(system: str, user: str) -> int:
     # Unknown compatible models need a conservative, tokenizer-independent
     # budget. UTF-8 bytes bound byte-token counts; reserve message overhead too.
@@ -124,6 +142,8 @@ class MinutesWorker(QThread):
         self._split_occurred = False
         self._preview_markdown = False
         self._capabilities = {}
+        # Set before ``error`` is emitted: whether retrying later can help.
+        self.transient_failure = False
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -395,8 +415,9 @@ class MinutesWorker(QThread):
         try:
             import httpx
 
-            if not is_secure_or_local_url(req.api_url):
-                self.error.emit(INSECURE_URL_ERROR)
+            problem = api_url_error(req.api_url)
+            if problem:
+                self.error.emit(problem)
                 return
             if not req.lines:
                 self.error.emit("文字稿为空，无法生成纪要")
@@ -410,6 +431,7 @@ class MinutesWorker(QThread):
         except Exception as exc:
             if self._cancelled:
                 return
+            self.transient_failure = is_transient_failure(exc)
             try:
                 import httpx
                 if isinstance(exc, httpx.TimeoutException):
@@ -575,6 +597,8 @@ class MinutesGenerator(QObject):
         super().__init__(parent)
         self._worker: MinutesWorker | None = None
         self._workers: list[MinutesWorker] = []
+        # Of the last ``error``: whether the same request may succeed later.
+        self.last_error_transient = False
 
     @property
     def is_running(self) -> bool:
@@ -630,6 +654,7 @@ class MinutesGenerator(QObject):
     def _on_error(self, message: str) -> None:
         if self._worker is None or self.sender() is not self._worker:
             return
+        self.last_error_transient = bool(self._worker.transient_failure)
         self._worker = None
         self.error.emit(message)
 

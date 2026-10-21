@@ -61,6 +61,7 @@ class AudioRecorder(QObject):
     volume_changed = pyqtSignal(float)
     recording_finished = pyqtSignal(np.ndarray)
     segment_ready = pyqtSignal(np.ndarray)
+    utterance_opened = pyqtSignal(int, str)
     error = pyqtSignal(str)
     warning = pyqtSignal(str)
     no_speech_warning = pyqtSignal()
@@ -116,6 +117,8 @@ class AudioRecorder(QObject):
         self._block_started_at = 0
         self._stream_anchor_ms = 0
         self._segment_captured_at = 0
+        self._open_target = (0, "")
+        self._segment_target = (0, "")
 
     def configure(
         self,
@@ -681,13 +684,36 @@ class AudioRecorder(QObject):
         if not was_in_speech and (segment is not None or in_speech):
             # The gate opened inside this block; the utterance started about
             # one block (plus pre-roll) before the block arrived.
+            self._remember_open_target()
             self._segment_started_at = now_ms - int(self.CHUNK_DURATION * 1000)
         if segment is not None:
             self._block_started_at = self._segment_started_at
+            self._segment_target = self._open_target
             if in_speech:
                 # A carried tail already belongs to the next utterance.
+                self._remember_open_target()
                 self._segment_started_at = now_ms
         return segment
+
+    def _remember_open_target(self) -> None:
+        """Record the foreground window on the UI thread when speech opens."""
+        from sayink.text_paster import (
+            TextPaster,
+            get_foreground_process_name,
+            get_foreground_window_info,
+            target_rejects_synthetic_input,
+        )
+
+        info = get_foreground_window_info()
+        hwnd = int(info[0] or 0)
+        name = get_foreground_process_name() if hwnd else ""
+        if hwnd and (
+            TextPaster._is_own_window(TextPaster, info)
+            or target_rejects_synthetic_input(info)
+        ):
+            hwnd = 0
+        self._open_target = (hwnd, name)
+        self.utterance_opened.emit(hwnd, name)
 
     def _emit_segment(self, segment: np.ndarray) -> None:
         self._segment_route = self._segmenter.last_route
@@ -708,6 +734,14 @@ class AudioRecorder(QObject):
         stamp = self._segment_captured_at
         self._segment_captured_at = 0
         return int(stamp or 0)
+
+    def consume_segment_target(self) -> tuple[int, str]:
+        """Foreground window captured when this segment's speech opened."""
+        target = self._segment_target
+        self._segment_target = (0, "")
+        if not isinstance(target, tuple) or len(target) != 2:
+            return 0, ""
+        return int(target[0] or 0), str(target[1] or "")
 
     def stop_continuous(self):
         if not self._continuous_mode and not self._is_recording:

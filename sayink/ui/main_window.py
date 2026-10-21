@@ -353,7 +353,7 @@ class MainWindow(QWidget):
         self._history.meeting_created.connect(self._open_promoted_meeting)
         self._history.ai_settings_requested.connect(self._open_ai_connection)
         self._settings._history_enabled_row.toggled.connect(self._history.set_history_enabled)
-        self._history.set_history_enabled(bool(self._config.get("history.enabled", False)))
+        self._history.set_history_enabled(bool(self._config.get("history.enabled", True)))
         if self._meeting_controller is not None:
             self._meeting_controller.state_changed.connect(self._refresh_usage_summary)
             self._meeting_controller.meeting_changed.connect(self._refresh_usage_summary)

@@ -335,19 +335,44 @@ class TextPaster:
             return "pasted"
         return "clipboard"
 
-    def paste_async(self, text: str, callback: Callable[[PasteResult], None]) -> None:
+    def paste_async(
+        self,
+        text: str,
+        callback: Callable[[PasteResult], None],
+        *,
+        target_hwnd: int | None = None,
+        target_app: str | None = None,
+    ) -> None:
         """
         Copy text and attempt paste after a short delay, then verify focus
         stayed on the target window. Invokes callback with result status.
+
+        ``target_hwnd is None`` keeps the legacy behaviour of reading the
+        foreground window now. A remembered handle is the window from the
+        start of the utterance: keys are sent only if that same window is
+        still in front and can accept them.
         """
         if not text:
             callback(PasteResult("error", detail="空文本"))
             return
 
         info = get_foreground_window_info()
-        hwnd = info[0]
-        has_target = hwnd != 0 and not self._is_own_window(info)
-        target_app = _process_name_from_window_info(info) if has_target else ""
+        skip_detail = ""
+        if target_hwnd is None:
+            hwnd = info[0]
+            has_target = hwnd != 0 and not self._is_own_window(info)
+            target_app = _process_name_from_window_info(info) if has_target else ""
+        else:
+            hwnd = int(target_hwnd)
+            target_app = target_app or ""
+            if hwnd == 0 or info[0] != hwnd:
+                has_target = False
+                skip_detail = "focus_changed" if hwnd and info[0] != hwnd else ""
+            elif self._is_own_window(info) or target_rejects_synthetic_input(info):
+                has_target = False
+                skip_detail = "elevated" if target_rejects_synthetic_input(info) else ""
+            else:
+                has_target = True
 
         self._paste_seq += 1
         seq = self._paste_seq
@@ -379,7 +404,7 @@ class TextPaster:
             return
 
         if not has_target:
-            callback(PasteResult("clipboard"))
+            callback(PasteResult("clipboard", target_app=target_app or "", detail=skip_detail))
             return
 
         if target_rejects_synthetic_input(info):

@@ -122,6 +122,8 @@ class SettingsWindow(QWidget):
         self._test_workers: list[QThread] = []
         self._llm_test_worker: QThread | None = None
         self._minutes_test_worker: QThread | None = None
+        # (url, key, model, ok, message) for the last finished 接口配置 test.
+        self._llm_test_stamp: tuple | None = None
         self._mic_test_recorder = AudioRecorder(self)
         self._mic_probe_active = False
         self._mic_probe_max = 0.0
@@ -798,7 +800,7 @@ class SettingsWindow(QWidget):
                 "idle",
             )
         else:
-            self._set_llm_status(self._llm_test_status, "配置已填写，尚未测试连接。", "idle")
+            self._show_completed_llm_status()
 
     def _scroll_page_of(self, widget: QWidget) -> SettingsPage | None:
         w = widget
@@ -1886,6 +1888,7 @@ class SettingsWindow(QWidget):
 
         populate_template_combo(self._minutes_template_combo, self._config)
         self._set_combo_by_data(self._minutes_language_combo, self._config.get("meeting.output_language", "auto"))
+        self._minutes_auto_row.setChecked(bool(self._config.get("meeting.auto_generate", False)))
         self._refresh_recognition_feedback()
 
     def _flush_minutes_fields(self, *_args):
@@ -1894,6 +1897,30 @@ class SettingsWindow(QWidget):
         self._config.set("meeting.model_name", self._minutes_model_edit.text().strip())
         self._config.set("meeting.template_id", str(self._minutes_template_combo.currentData() or "general"))
         self._config.set("meeting.output_language", str(self._minutes_language_combo.currentData() or "auto"))
+
+    def _on_minutes_auto_toggled(self, enabled: bool) -> None:
+        if self._loading:
+            return
+        if enabled:
+            from sayink.meeting_session import confirm_remote_host, remote_host_needing_confirmation
+
+            # Automatic runs never ask, so a remote endpoint is confirmed here once.
+            host = remote_host_needing_confirmation(self._config)
+            if host:
+                if not self._confirm(
+                    "会后自动生成纪要",
+                    f"每场会议结束后，完整文字稿会自动发送到 {host} 生成纪要（不发送音频）。"
+                    "确认后本机记住该地址，之后不再询问。",
+                    accept="确认并开启",
+                ):
+                    self._loading = True
+                    try:
+                        self._minutes_auto_row.setChecked(False)
+                    finally:
+                        self._loading = False
+                    return
+                confirm_remote_host(self._config, host)
+        self._config.set("meeting.auto_generate", enabled)
 
     def _apply_hotkey_setting(self, hotkey: str):
         if self._loading or not hotkey:
@@ -1959,34 +1986,80 @@ class SettingsWindow(QWidget):
             return
         self._persist_runtime_settings()
 
+    def _llm_connection_identity(self, model: str) -> tuple[str, str, str]:
+        from sayink.text_polisher import (
+            api_url_error,
+            normalize_api_key,
+            normalize_model_name,
+            redact_url_userinfo,
+        )
+
+        url = self._llm_url_edit.text().strip()
+        if url and api_url_error(url) is None:
+            url, _removed = redact_url_userinfo(url)
+        return url, normalize_api_key(self._llm_key_edit.text()), normalize_model_name(model)
+
+    def _show_completed_llm_status(self) -> None:
+        from sayink.text_polisher import public_cleartext_note
+
+        current = self._llm_connection_identity(self._llm_model_edit.text())
+        note = public_cleartext_note(current[0])
+        stamp = self._llm_test_stamp
+        if stamp is not None and stamp[:3] == current:
+            ok, message = stamp[3], stamp[4]
+            if ok and note and note not in message:
+                message = f"{message}{note}"
+            self._set_llm_status(self._llm_test_status, message, "ok" if ok else "error")
+            return
+        text = "配置已填写，尚未测试连接。"
+        if note:
+            text += note
+        self._set_llm_status(self._llm_test_status, text, "idle")
+
+    def _replace_llm_edit(self, edit, text: str) -> None:
+        if edit.text() == text:
+            return
+        self._loading = True
+        try:
+            edit.setText(text)
+        finally:
+            self._loading = False
+
     def _flush_llm_fields(self):
         if self._loading:
             return
-        from sayink.text_polisher import is_secure_or_local_url
-
-        from sayink.text_polisher import prompt_config_key
+        from sayink.text_polisher import (
+            URL_USERINFO_ERROR,
+            api_url_error,
+            normalize_api_key,
+            normalize_model_name,
+            prompt_config_key,
+            redact_url_userinfo,
+        )
 
         llm_enabled = self._llm_enable_row.isChecked()
         self._config.set("llm.enabled", llm_enabled)
         llm_url = self._llm_url_edit.text().strip()
         # Checked with polish off too: meeting minutes send to the same endpoint.
-        if llm_url and not is_secure_or_local_url(llm_url):
-            QMessageBox.warning(
-                self,
-                "提示",
-                "接口地址须以 http:// 或 https:// 开头。",
-            )
+        problem = api_url_error(llm_url) if llm_url else None
+        if problem:
+            QMessageBox.warning(self, "提示", problem)
             # Only the address is reverted; the other fields on this page were
             # edited on purpose and still get saved below.
-            self._loading = True
-            try:
-                self._llm_url_edit.setText(self._config.get("llm.api_url", ""))
-            finally:
-                self._loading = False
+            self._replace_llm_edit(self._llm_url_edit, self._config.get("llm.api_url", ""))
         else:
+            if llm_url:
+                llm_url, removed = redact_url_userinfo(llm_url)
+                if removed:
+                    QMessageBox.warning(self, "提示", URL_USERINFO_ERROR)
+                    self._replace_llm_edit(self._llm_url_edit, llm_url)
             self._config.set("llm.api_url", llm_url)
-        self._config.set("llm.api_key", self._llm_key_edit.text().strip())
-        self._config.set("llm.model_name", self._llm_model_edit.text().strip())
+        key = normalize_api_key(self._llm_key_edit.text())
+        model = normalize_model_name(self._llm_model_edit.text())
+        self._replace_llm_edit(self._llm_key_edit, key)
+        self._replace_llm_edit(self._llm_model_edit, model)
+        self._config.set("llm.api_key", key)
+        self._config.set("llm.model_name", model)
         mode = self._selected_llm_mode()
         self._config.set(prompt_config_key(mode), self._llm_prompt_edit.toPlainText().strip())
         self._llm_prompt_mode = mode
@@ -2013,8 +2086,7 @@ class SettingsWindow(QWidget):
         )
 
     def _start_llm_test(self, model: str, btn: QPushButton, status: QLabel, *, ok_text: str = "连接正常，可以使用。"):
-        url = self._llm_url_edit.text().strip()
-        key = self._llm_key_edit.text().strip()
+        url, key, model = self._llm_connection_identity(model)
         from sayink.text_polisher import polish_settings_complete
 
         if not polish_settings_complete(url, key, model):
@@ -2047,6 +2119,10 @@ class SettingsWindow(QWidget):
             pass
         btn.setEnabled(True)
         btn.setText("测试连接")
+        if status is self._llm_test_status:
+            self._llm_test_stamp = (w.u, w.k, w.m, w.ok, ok_text if w.ok else w.msg)
+            self._update_llm_configuration_status()
+            return
         if w.ok:
             self._set_llm_status(status, ok_text, "ok")
         else:

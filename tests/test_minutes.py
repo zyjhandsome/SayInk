@@ -353,6 +353,33 @@ def _run(worker):
 
 
 class TestMinutesWorker:
+    @pytest.mark.parametrize("script, transient", [
+        ([(503, "busy"), (503, "busy")], True),
+        ([(429, "rate limited"), (429, "rate limited")], True),
+        ([httpx.ConnectError("down"), httpx.ConnectError("down")], True),
+        ([(429, "insufficient balance")], False),
+        ([(401, "invalid api key")], False),
+        (["not JSON", "please retry later"], False),
+    ])
+    def test_failure_says_whether_a_later_retry_can_help(self, fake_httpx, script, transient):
+        fake_httpx.script.extend(script)
+        worker = MinutesWorker(_request())
+        results, errors, _ = _run(worker)
+        assert not results and errors
+        assert worker.transient_failure is transient
+
+    def test_total_deadline_is_a_transient_failure(self, fake_httpx, monkeypatch):
+        from sayink.llm_transport import LLMDeadlineError
+
+        async def deadline(*_args, **_kwargs):
+            raise LLMDeadlineError("模型响应超时，已完成的分段可在重试时继续使用")
+
+        monkeypatch.setattr("sayink.minutes_generator.completion", deadline)
+        worker = MinutesWorker(_request())
+        results, errors, _ = _run(worker)
+        assert not results and "超时" in errors[0]
+        assert worker.transient_failure is True
+
     def test_known_names_are_recorded_as_owned_metadata(self, fake_httpx):
         fake_httpx.script.append(json.dumps({"summary": "张三负责发布。", "_speaker_names": {"9": "猜测姓名"}}))
         results, errors, _ = _run(MinutesWorker(_request(speaker_names={1: "张三"})))
@@ -800,6 +827,31 @@ def test_queued_result_from_cancelled_worker_cannot_complete_new_job(monkeypatch
     for worker in list(generator._workers):
         assert worker.wait(2000)
     QCoreApplication.processEvents()
+    generator.shutdown()
+
+
+@pytest.mark.parametrize("transient", [True, False])
+def test_generator_reports_whether_the_failure_was_transient(monkeypatch, transient):
+    from PyQt6.QtCore import QCoreApplication
+
+    from sayink.minutes_generator import MinutesGenerator
+
+    def work(self):
+        self.transient_failure = transient
+        self.error.emit("纪要生成失败")
+
+    monkeypatch.setattr(MinutesWorker, "run", work)
+    generator = MinutesGenerator()
+    seen = []
+    generator.error.connect(lambda message: seen.append((message, generator.last_error_transient)))
+    import time
+
+    generator.generate(_request())
+    deadline = time.monotonic() + 2
+    while not seen and time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.005)
+    assert seen == [("纪要生成失败", transient)]
     generator.shutdown()
 
 

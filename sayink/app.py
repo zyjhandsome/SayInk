@@ -11,6 +11,7 @@ from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMessageBox
 
 from sayink.config import (
+    OUTPUT_MODE_PASTE,
     Config,
     DEFAULT_HOTKEY,
     format_hotkey,
@@ -47,7 +48,7 @@ from sayink.speech_recognizer import (
     restore_glossary_case,
 )
 from sayink.recognition_settings import RecognitionSettings, aux_model_path
-from sayink.vad_segmenter import VAD_SILERO
+from sayink.vad_segmenter import SILENCE_HOLD_SEC, VAD_SILERO
 from sayink.history_store import HistoryStore, SegmentRecord
 from sayink.meeting_session import (
     MeetingController,
@@ -147,6 +148,8 @@ class _PendingHistoryRecord:
     speaker_id: int = 0
     speaker_route: str = ""
     captured_at: int = 0
+    target_hwnd: int = 0
+    target_app: str = ""
 
 
 @dataclass
@@ -161,6 +164,8 @@ class _SegmentContext:
     model: str = ""
     # Wall-clock ms when the utterance started (0 = unknown).
     captured_at: int = 0
+    target_hwnd: int = 0
+    target_app: str = ""
     # Speaker embedding function; None = dictation's log-mel summary.
     embed: object = None
     recognized_text: str | None = None
@@ -216,6 +221,7 @@ class App(QObject):
         self._live_committed = ""
         self._live_inflight = ""
         self._hold_paste_sent = False
+        self._hold_target = (0, "")
         self._hold_duration_ms = 0
         # Slices of the current hold whose recognition failed (left out of
         # the pasted text) and the count carried to the paste result hint.
@@ -416,6 +422,9 @@ class App(QObject):
         self._recorder.volume_changed.connect(self._floating.update_volume)
         self._recorder.recording_finished.connect(self._on_recording_finished)
         self._recorder.segment_ready.connect(self._on_segment_ready)
+        opened = getattr(self._recorder, "utterance_opened", None)
+        if opened is not None and hasattr(opened, "connect"):
+            opened.connect(self._on_utterance_opened)
         self._recorder.segmentation_changed.connect(self._on_segmentation_changed)
         self._recorder.error.connect(self._on_recorder_error)
         self._recorder.warning.connect(self._on_recorder_warning)
@@ -745,7 +754,10 @@ class App(QObject):
             self._floating.show_busy_transcribing()
             return
 
+        if not self._ensure_history_output_ready():
+            return
         log.info("开始录音（来源: %s）...", self._recorder.input_source_display)
+        self._hold_target = self._read_paste_target()
         self._current_transcription = ""
         self._hold_paste_sent = False
         self._hold_duration_ms = 0
@@ -980,6 +992,8 @@ class App(QObject):
             return
         if self._recorder.is_continuous:
             return
+        if not self._ensure_history_output_ready():
+            return
         log.info("开启持续转写（来源: %s）", self._recorder.input_source_display)
         self._sound.play_start()
 
@@ -996,7 +1010,7 @@ class App(QObject):
                 self._floating.show_error("无法开启持续监听\n请检查音频设备设置")
                 return
             self._tray.set_activity_tooltip("listening")
-            self._floating.show_listening()
+            self._floating.show_listening("")
             if (
                 self._config.get("audio.input_source") == "system"
                 and self._recorder.is_continuous
@@ -1130,9 +1144,102 @@ class App(QObject):
         else:
             context.embed = self._speaker_embedder()
             context.model = self._dictation_model_id()
+        context.target_hwnd, context.target_app = self._segment_target_from_recorder()
         self._current_seq += 1
         self._publish_open_history_session()
         return context
+
+    def _history_output_blocked(self) -> bool:
+        if self._meeting_active():
+            return False
+        return bool(self._config.history_only_output()) and not bool(self._config.get("history.enabled", True))
+
+    def _ensure_history_output_ready(self) -> bool:
+        """Block a new recording until history-only with history off is resolved."""
+        if not self._history_output_blocked():
+            return True
+        choice = self._ask_history_output_conflict()
+        if choice == "history":
+            self._config.set("history.enabled", True)
+            return True
+        if choice == "paste":
+            self._config.set_output_mode(OUTPUT_MODE_PASTE)
+            return True
+        return False
+
+    def _ask_history_output_conflict(self) -> str:
+        from PyQt6.QtWidgets import QWidget
+
+        parent = self._main if isinstance(getattr(self, "_main", None), QWidget) else None
+        box = QMessageBox(parent)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("结果没有去处")
+        box.setText("历史已关闭，当前结果只会进历史，所以不会开始录音。")
+        box.setInformativeText("可以开启历史，或只把当前模式改为输入光标。")
+        enable = box.addButton("开启历史", QMessageBox.ButtonRole.AcceptRole)
+        paste = box.addButton("改为输入光标", QMessageBox.ButtonRole.ActionRole)
+        cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        enable.setAccessibleName("开启历史")
+        paste.setAccessibleName("改为输入光标")
+        cancel.setAccessibleName("取消")
+        box.setDefaultButton(enable)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is enable:
+            return "history"
+        if clicked is paste:
+            return "paste"
+        return "cancel"
+
+    def _read_paste_target(self) -> tuple[int, str]:
+        """Foreground window at the moment a single-shot hold is accepted."""
+        from sayink.text_paster import (
+            TextPaster,
+            get_foreground_process_name,
+            get_foreground_window_info,
+            target_rejects_synthetic_input,
+        )
+
+        info = get_foreground_window_info()
+        hwnd = int(info[0] or 0)
+        name = get_foreground_process_name() if hwnd else ""
+        if hwnd and (
+            TextPaster._is_own_window(TextPaster, info)
+            or target_rejects_synthetic_input(info)
+        ):
+            hwnd = 0
+        return hwnd, name
+
+    def _segment_target_from_recorder(self) -> tuple[int, str]:
+        consume = getattr(self._recorder, "consume_segment_target", None)
+        if not callable(consume):
+            return 0, ""
+        value = consume()
+        if isinstance(value, tuple) and len(value) == 2:
+            return int(value[0] or 0), str(value[1] or "")
+        return 0, ""
+
+    def _paste_target_for_output(self) -> tuple[int, str]:
+        """Window remembered for the utterance still waiting to go out.
+
+        An explicit empty target (SayInk itself, or no foreground window)
+        must not fall through to an older hold: that would type into the
+        wrong application.
+        """
+        pending = self._pending_record
+        if pending is not None:
+            return int(getattr(pending, "target_hwnd", 0) or 0), str(getattr(pending, "target_app", "") or "")
+        held = getattr(self, "_hold_target", (0, ""))
+        if isinstance(held, tuple) and len(held) == 2:
+            return int(held[0] or 0), str(held[1] or "")
+        return 0, ""
+
+    def _on_utterance_opened(self, hwnd: int, name: str) -> None:
+        if self._meeting_active() or not self._is_continuous_mode():
+            return
+        show = getattr(self._floating, "show_listening", None)
+        if callable(show):
+            show(target_app=str(name or ""))
 
     # ── Speaker numbering (shared with meetings) ──────
 
@@ -1370,6 +1477,13 @@ class App(QObject):
             session_id, seq, source = uuid4().hex, 0, self._history_source()
 
         model = (context.model if context is not None else "") or self._dictation_model_id()
+        if context is not None:
+            target_hwnd = int(context.target_hwnd or 0)
+            target_app = context.target_app or ""
+        elif not self._is_continuous_mode():
+            target_hwnd, target_app = self._hold_target
+        else:
+            target_hwnd, target_app = 0, ""
         return _PendingHistoryRecord(
             session_id=session_id,
             seq=seq,
@@ -1380,6 +1494,8 @@ class App(QObject):
             trigger_mode=trigger_mode,
             model=model,
             captured_at=captured_at,
+            target_hwnd=int(target_hwnd or 0),
+            target_app=str(target_app or ""),
         )
 
     def _clear_live_transcript(self) -> None:
@@ -1683,7 +1799,7 @@ class App(QObject):
                 else "用转写条「结束」停止整场。"
             )
             tray_msg = (
-                f"持续转写已就绪。按住 {hotkey} 开始监听，说话停顿约 1 秒后自动输入，不用点结束；"
+                f"持续转写已就绪。按住 {hotkey} 开始监听，说话停顿约 {SILENCE_HOLD_SEC:g} 秒后自动输入，不用点结束；"
                 + stop
             )
         else:
@@ -1754,6 +1870,9 @@ class App(QObject):
             self._finish_empty_recognition()
             return
 
+        # Freeze drops the pending row, and that row is the only place a
+        # continuous utterance keeps the window from when speech started.
+        paste_hwnd, paste_app = self._paste_target_for_output()
         record = self._freeze_pending_history_record(text, degraded_from_polish)
         is_meeting_row = record is not None and record.trigger_mode == TRIGGER_MODE_MEETING
         if not is_meeting_row:
@@ -1761,6 +1880,29 @@ class App(QObject):
             # go out, never a meeting row the user is not typing anywhere.
             self._last_output_text = text
             self._last_output_at = time.monotonic()
+        if (
+            not is_meeting_row
+            and self._history_output_blocked()
+            and getattr(self._recorder, "is_continuous", False) is True
+        ):
+            choice = self._ask_history_output_conflict()
+            if choice == "history":
+                self._config.set("history.enabled", True)
+            elif choice == "paste":
+                self._config.set_output_mode(OUTPUT_MODE_PASTE)
+            else:
+                import pyperclip
+                try:
+                    pyperclip.copy(text)
+                except Exception:
+                    log.debug("冲突取消时写入剪贴板失败", exc_info=True)
+                self._stop_continuous_user_session()
+                self._handle_paste_result(
+                    PasteResult("clipboard", detail="history_conflict"),
+                    degraded_from_polish=degraded_from_polish,
+                    record=record,
+                )
+                return
         if is_meeting_row or self._config.history_only_output():
             # Meeting / playback capture: the words go to history, never to
             # whatever window happens to be in front.
@@ -1777,11 +1919,16 @@ class App(QObject):
         # Kept outside the paste callback so the watchdog can still save the
         # row when the paster never answers.
         self._output_stage_record = record
-        self._paster.paste_async(text, lambda result, record=record: self._handle_paste_result(
-            result,
-            degraded_from_polish=degraded_from_polish,
-            record=record,
-        ))
+        self._paster.paste_async(
+            text,
+            lambda result, record=record: self._handle_paste_result(
+                result,
+                degraded_from_polish=degraded_from_polish,
+                record=record,
+            ),
+            target_hwnd=paste_hwnd,
+            target_app=paste_app,
+        )
 
     def _freeze_pending_history_record(
         self,
@@ -1941,6 +2088,16 @@ class App(QObject):
                 "已发送 · 未确认",
                 unverified_hint,
                 stopped_text=f"剩余内容：已发送 · 未确认 · {unverified_hint}",
+                use_info=True,
+                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
+            )
+        elif status == "clipboard" and error_detail == "focus_changed":
+            log.info("开口后的目标窗口已变化，未发送粘贴键")
+            title = f"未输入到 {target_app}" if target_app else "未输入到原来的窗口"
+            self._show_post_output_floating(
+                title,
+                paste_hint,
+                stopped_text=f"剩余内容：{title} · {paste_hint}",
                 use_info=True,
                 refresh_ms=RESULT_TOAST_WITH_HINT_MS,
             )
@@ -2346,8 +2503,10 @@ class App(QObject):
         if main is not None and main.isVisible():
             main.meeting_panel.show_meeting(meeting_id)
         else:
+            queued = self._meeting.queued_generation(meeting_id) is not None
             self._tray.showMessage(
-                "SayInk", "会议已结束，可到「会议」页生成纪要。",
+                "SayInk",
+                "会议已结束，纪要正在后台生成，完成后会通知你。" if queued else "会议已结束，可到「会议」页生成纪要。",
                 QSystemTrayIcon.MessageIcon.Information, 5000,
             )
 
@@ -2372,9 +2531,10 @@ class App(QObject):
         log.warning("纪要生成失败: %s", message)
         main = self._main
         if main is None or not main.isVisible():
-            self._tray.showMessage(
-                "SayInk", f"会议内容处理失败：{message}", QSystemTrayIcon.MessageIcon.Warning, 8000
-            )
+            job = self._meeting.queued_generation(meeting_id)
+            text = (f"纪要自动生成失败：{message.rstrip('。')}。可到「会议」页重试。" if job is not None and job.automatic
+                    else f"会议内容处理失败：{message}")
+            self._tray.showMessage("SayInk", text, QSystemTrayIcon.MessageIcon.Warning, 8000)
 
     # ── Settings ──────────────────────────────────────
 
@@ -2830,6 +2990,7 @@ class App(QObject):
         self._hotkey_mgr.start()
         self._show_history_startup_notice()
         self._meeting.mark_interrupted()
+        self._meeting.resume_generation_queue()
         self._enqueue_history_cleanup()
         QTimer.singleShot(UPDATE_CHECK_STARTUP_DELAY_MS, self._updates.maybe_auto_check)
         self._onboarding.schedule(self._recognizer.ready)

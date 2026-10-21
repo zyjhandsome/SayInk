@@ -3,8 +3,8 @@ One-shot Windows release build: PyInstaller → Inno Setup → remove staging.
 
 Final artifact (for distribution):
   dist/SayInk-Setup-<version>.exe       lite installer (default; bundles
-                                        CAM++ and Silero VAD, and the app
-                                        downloads Fun-ASR-Nano on first start)
+                                        CAM++, Silero VAD and speaker-activity;
+                                        the app downloads Fun-ASR-Nano on first start)
   dist/SayInk-Setup-<version>-full.exe  with --with-model: also bundles
                                         Fun-ASR-Nano
 
@@ -65,9 +65,9 @@ def main(argv: list[str] | None = None) -> None:
     env = dict(os.environ)
     env["SAYINK_BUNDLE_MODEL"] = "1" if args.with_model else "0"
     flavor = (
-        "full (Fun-ASR-Nano, CAM++ and Silero VAD)"
+        "full (Fun-ASR-Nano, CAM++, Silero VAD and speaker-activity)"
         if args.with_model
-        else "lite (CAM++ and Silero VAD; Fun-ASR-Nano downloaded on first start)"
+        else "lite (CAM++, Silero VAD and speaker-activity; Fun-ASR-Nano downloaded on first start)"
     )
 
     print(f"Step 1/2: PyInstaller (dist/SayInk/), {flavor} …")

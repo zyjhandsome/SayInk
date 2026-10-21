@@ -6,13 +6,15 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
-from PyQt6.QtCore import QUrl
-from PyQt6.QtWidgets import QDialog
+from PyQt6.QtCore import QEvent, QPointF, Qt, QUrl
+from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtTest import QSignalSpy
+from PyQt6.QtWidgets import QApplication, QDialog
 
 from sayink.history_store import HistoryStore, SegmentRecord, _DDL
 from sayink.meeting_session import MeetingController, MeetingOptions, MeetingState, resolve_capabilities
 from sayink.meeting_store import MeetingStore
-from sayink.ui.meeting_page import MeetingPage, _SegmentSpeakerDialog
+from sayink.ui.meeting_page import MeetingPage, _SegmentSpeakerDialog, _SegmentTextDialog
 
 
 def _unit(*values):
@@ -75,6 +77,60 @@ def test_distinct_manual_names_cannot_be_merged_or_overwritten_on_finalize(live_
     assert [s.speaker_id for s in controller.store.get_segments(record.id)] == [1, 2, 3]
 
 
+def test_live_details_explain_hidden_metadata_without_allowing_text_edits(live_meeting, monkeypatch):
+    page, controller, _history, record = live_meeting
+    page.show()
+    page._rename_speaker(1, "小林", meeting_id=record.id)
+    assert "手动命名" not in page._live_transcript.toPlainText()
+    assert "此姓名由你设置" in page._live_transcript.document().find("小林").charFormat().toolTip()
+    assert controller.correct_segment_speaker(record.id, 7, 1)
+    page._render_live()
+    shown = []
+
+    def inspect(dialog):
+        shown.append(dialog.windowTitle())
+        assert "此姓名由你设置" in dialog.details_label.text()
+        assert "已手动更正" in dialog.details_label.text()
+        assert dialog.editor.isReadOnly() and not dialog.save_btn.isEnabled()
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(_SegmentTextDialog, "exec", inspect)
+    page._on_live_transcript_link(QUrl("live-details:7"))
+    assert shown == ["修改详情"]
+    assert controller.state is MeetingState.LIVE
+    expired = QSignalSpy(page._live_feedback_timer.timeout)
+    page._live_feedback_timer.start(1)
+    assert expired.wait(1000)
+    assert page._live_speaker_feedback.isHidden()
+    page._speaker_edit_status(record.id, "姓名尚未保存，请重试")
+    assert not page._live_feedback_timer.isActive()
+    assert not page._live_speaker_feedback.isHidden()
+
+
+def test_live_append_preserves_hovered_action_and_selection(live_meeting):
+    page, controller, history, record = live_meeting
+    assert controller.correct_segment_speaker(record.id, 7, 1)
+    page._render_live()
+    page.resize(1040, 720)
+    page.show()
+    QApplication.processEvents()
+    view = page._live_transcript
+    selection = view.document().find("周三验证")
+    view.setTextCursor(selection)
+    QApplication.sendEvent(view.viewport(), QMouseEvent(
+        QEvent.Type.MouseMove, QPointF(view.cursorRect(selection).center()), Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+    ))
+    assert view.document().find("修改详情").charFormat().foreground().color().alpha() == 255
+    history.enqueue(SegmentRecord(record.id, 17, record.started_at + 17_000, raw_text="继续讨论",
+                                  speaker_id=1, trigger_mode="meeting"))
+    assert history.flush()
+    page._render_live()
+    assert view.textCursor().selectedText() == "周三验证"
+    assert "继续讨论" in view.toPlainText()
+    assert view.document().find("修改详情").charFormat().foreground().color().alpha() == 255
+
+
 def test_live_correction_locks_only_the_selected_segment_through_finalize(live_meeting, monkeypatch):
     page, controller, history, record = live_meeting
     history.enqueue(SegmentRecord(record.id, 5, record.started_at, raw_text="", speaker_id=1, trigger_mode="meeting"))
@@ -91,7 +147,8 @@ def test_live_correction_locks_only_the_selected_segment_through_finalize(live_m
     assert "live-segment:11" in page._live_transcript.toHtml()
     assert "live-segment:5" not in page._live_transcript.toHtml()
     page._on_live_transcript_link(QUrl("live-segment:11"))
-    assert "归属已更正" in page._live_transcript.toPlainText()
+    assert "归属已更正" not in page._live_transcript.toPlainText()
+    assert "live-details:11" in page._live_transcript.toHtml()
     assert controller.state is MeetingState.LIVE
     sid = controller.speakers.assign(_unit(1, 0.6, 0))
     history.enqueue(SegmentRecord(record.id, 15, record.started_at, raw_text="后续仍自动分组",

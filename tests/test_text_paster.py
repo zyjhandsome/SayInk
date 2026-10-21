@@ -507,3 +507,36 @@ class TestWin32PasteShortcut:
         assert fake_user32.events[0] == (self.RALT, self.UP | self.EXT)
         assert (self.RALT, self.EXT) in fake_user32.events
         assert all(vk != self.ALT for vk, _ in fake_user32.events)
+
+
+class TestRememberedPasteTarget:
+    def test_window_change_after_speech_start_does_not_send_keys(self, paste_env):
+        paste_env["set_foreground"]([(222, "Chat", 2)])
+        results = []
+        TextPaster().paste_async(
+            "句子", results.append, target_hwnd=111, target_app="notepad.exe",
+        )
+        assert paste_env["shortcut_calls"] == 0
+        assert [(r.status, r.detail, r.target_app) for r in results] == [
+            ("clipboard", "focus_changed", "notepad.exe"),
+        ]
+        assert paste_env["clipboard"] == "句子"
+
+    def test_missing_start_window_does_not_paste_into_a_later_one(self, paste_env):
+        paste_env["set_foreground"]([(222, "Chat", 2)])
+        results = []
+        TextPaster().paste_async("句子", results.append, target_hwnd=0, target_app="")
+        assert paste_env["shortcut_calls"] == 0
+        assert results[0].status == "clipboard"
+        assert paste_env["clipboard"] == "句子"
+
+    def test_own_window_from_the_start_is_not_pasted_into_a_later_external_window(self, paste_env):
+        import os
+        paste_env["set_foreground"]([(222, "Chat", 2)])
+        results = []
+        TextPaster().paste_async(
+            "句子", results.append, target_hwnd=os.getpid(), target_app="python.exe",
+        )
+        # The remembered hwnd is not the later chat window, so no keys go there.
+        assert paste_env["shortcut_calls"] == 0
+        assert results[0].status == "clipboard"

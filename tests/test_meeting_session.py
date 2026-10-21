@@ -72,6 +72,17 @@ def _row(meeting_id: str, seq: int, text: str, *, speaker_id: int, started_at: i
     )
 
 
+def _result(title: str, template_id: str = "general"):
+    from sayink.minutes_generator import MinutesResult
+
+    return MinutesResult(json_payload='{"summary": "ok"}', markdown=f"# {title}\n\nok", chunked=False,
+                         duration_ms=1000, model="m", template_id=template_id)
+
+
+LAN_URL = "http://192.168.1.10:8000/v1"
+LONG_TEXT = "这一段是足够长的会议内容，用来触发会后自动生成纪要。" * 12
+
+
 class TestCapabilities:
     def test_energy_fallback_when_silero_missing(self, config, monkeypatch):
         monkeypatch.setattr("sayink.meeting_session.aux_model_path", lambda _mid: None)
@@ -366,7 +377,7 @@ class TestGeneration:
         assert notes is not None and notes.markdown.startswith("# 站会") and notes.template_id == "standup"
         assert controller.generating_for == ""
 
-    def test_generate_refuses_a_second_meeting_without_cancelling_the_first(
+    def test_second_meeting_queues_behind_the_first_and_runs_next(
         self, controller, config, history, monkeypatch,
     ):
         config.set("llm.api_url", "http://localhost:1234/v1")
@@ -381,15 +392,20 @@ class TestGeneration:
         controller.store.flush()
         calls = []
         monkeypatch.setattr(controller._generator, "generate", calls.append)
-        failures = []
+        failures, queued = [], []
         controller.generation_failed.connect(lambda mid, msg: failures.append((mid, msg)))
+        controller.generation_queued.connect(queued.append)
 
         assert controller.generate(first.id) is True
-        assert controller.generate(second.id) is False
-        assert calls and len(calls) == 1
-        assert controller.generating_for == first.id
-        assert failures and failures[0][0] == second.id
-        assert "另一场" in failures[0][1]
+        assert controller.generate(second.id) is True
+        assert len(calls) == 1 and controller.generating_for == first.id
+        assert failures == [] and queued == [second.id]
+        assert controller.queue_position(second.id) == 1
+
+        controller._on_generation_done(_result("第一场"))
+        assert len(calls) == 2 and [line.text for line in calls[1].lines] == ["第二场内容"]
+        assert controller.generating_for == second.id
+        assert controller.store.queued_generation(first.id) is None
 
     def test_generate_refuses_a_live_meeting(self, controller, config, history, monkeypatch):
         config.set("llm.api_url", "http://localhost:1234/v1")
@@ -428,6 +444,277 @@ class TestGeneration:
         assert controller.generating_for == ""
 
 
+class TestGenerationQueue:
+    """Automatic end-of-meeting minutes and the one-at-a-time queue."""
+
+    @pytest.fixture
+    def calls(self, controller, monkeypatch):
+        calls = []
+        monkeypatch.setattr(controller._generator, "generate", calls.append)
+        return calls
+
+    @staticmethod
+    def _configure(config, *, url=LAN_URL, auto=True, template="general"):
+        config.set("llm.api_url", url)
+        config.set("llm.api_key", "k")
+        config.set("llm.model_name", "m")
+        config.set("meeting.auto_generate", auto)
+        config.set("meeting.template_id", template)
+
+    @staticmethod
+    def _ended(controller, history, title, text=LONG_TEXT):
+        record = controller.store.create_meeting(title=title)
+        history.enqueue(_row(record.id, 0, text, speaker_id=1, started_at=record.started_at))
+        controller.store.end_meeting(record.id, ended_at=record.started_at + 120_000)
+        controller.store.flush()
+        return record
+
+    @staticmethod
+    def _live_meeting_ends(controller, history, text=LONG_TEXT):
+        record = controller.begin(MeetingOptions(), _caps())
+        history.enqueue(_row(record.id, 0, text, speaker_id=1, started_at=record.started_at))
+        history.flush(timeout=2.0)
+        controller.finalize()
+        return record
+
+    @staticmethod
+    def _enqueue_auto(controller, record, template="general"):
+        from sayink.meeting_store import QUEUE_PRIORITY_AUTO
+
+        controller.store.enqueue_generation(record.id, template, priority=QUEUE_PRIORITY_AUTO)
+        controller.store.flush()
+
+    def test_meeting_end_queues_default_template_and_starts_it(self, controller, config, history, calls):
+        self._configure(config, template="standup")
+        queued = []
+        controller.generation_queued.connect(queued.append)
+        record = self._live_meeting_ends(controller, history)
+        assert queued == [record.id]
+        assert len(calls) == 1 and calls[0].template.id == "standup"
+        assert controller.generating_for == record.id
+        job = controller.store.queued_generation(record.id)
+        assert job is not None and job.automatic
+        controller._on_generation_done(_result("会议", "standup"))
+        assert controller.store.queued_generation(record.id) is None
+        assert controller.store.get_notes(record.id).template_id == "standup"
+
+    @pytest.mark.parametrize("auto, model, text", [
+        (False, "m", LONG_TEXT),       # switch off (the default)
+        (True, "", LONG_TEXT),         # AI service not configured
+        (True, "m", "就一句话。"),      # too short to be worth a request
+    ])
+    def test_meeting_end_does_not_queue_without_switch_service_or_content(
+        self, controller, config, history, calls, auto, model, text,
+    ):
+        self._configure(config, auto=auto)
+        config.set("llm.model_name", model)
+        record = self._live_meeting_ends(controller, history, text=text)
+        assert calls == [] and controller.store.queued_generation(record.id) is None
+
+    def test_auto_generation_is_off_by_default(self, config):
+        assert config.get("meeting.auto_generate") is False
+
+    def test_back_to_back_meetings_are_generated_in_order(self, controller, config, history, calls):
+        self._configure(config)
+        first = self._live_meeting_ends(controller, history)
+        second = self._live_meeting_ends(controller, history)
+        assert len(calls) == 1 and controller.generating_for == first.id
+        assert controller.queue_position(second.id) == 1
+        controller._on_generation_done(_result("第一场"))
+        assert len(calls) == 2 and controller.generating_for == second.id
+        controller._on_generation_done(_result("第二场"))
+        assert controller.generating_for == "" and controller.store.generation_queue() == []
+        assert controller.store.get_notes(first.id) is not None and controller.store.get_notes(second.id) is not None
+
+    def test_user_request_runs_before_waiting_automatic_jobs(self, controller, config, history, calls):
+        self._configure(config)
+        running = self._ended(controller, history, "进行中的")
+        auto = self._ended(controller, history, "自动排队")
+        user = self._ended(controller, history, "手动请求")
+        assert controller.generate(running.id) is True
+        self._enqueue_auto(controller, auto)
+        assert controller.generate(user.id) is True
+        assert controller.queue_position(user.id) == 1 and controller.queue_position(auto.id) == 2
+        controller._on_generation_done(_result("进行中的"))
+        assert controller.generating_for == user.id
+        controller._on_generation_done(_result("手动请求"))
+        assert controller.generating_for == auto.id
+
+    def test_transient_failure_is_retried_later_then_left_for_the_user(self, controller, config, history, calls):
+        from sayink.meeting_session import AUTO_RETRY_DELAYS_MS
+
+        self._configure(config)
+        failures, queued = [], []
+        controller.generation_failed.connect(lambda mid, msg: failures.append((mid, msg)))
+        controller.generation_queued.connect(queued.append)
+        record = self._live_meeting_ends(controller, history)
+        for attempt, delay in enumerate(AUTO_RETRY_DELAYS_MS, start=1):
+            before = int(time.time() * 1000)
+            controller._generator.last_error_transient = True
+            controller._on_generation_error("纪要生成超时，已完成的分段可在重试时继续使用")
+            job = controller.store.queued_generation(record.id)
+            assert job is not None and not job.failed and job.attempts == attempt
+            assert job.not_before >= before + delay and "超时" in job.last_error
+            assert failures == [] and queued[-1] == record.id
+            assert controller.generating_for == "" and controller._retry_timer.isActive()
+            controller.store.reschedule_generation(record.id, attempts=attempt, not_before=0, last_error=job.last_error)
+            controller.store.flush()
+            controller._pump_queue()
+            assert controller.generating_for == record.id
+        controller._generator.last_error_transient = True
+        controller._on_generation_error("纪要生成超时，已完成的分段可在重试时继续使用")
+        job = controller.store.queued_generation(record.id)
+        assert job is not None and job.failed
+        assert failures == [(record.id, "纪要生成超时，已完成的分段可在重试时继续使用")]
+        assert len(calls) == 1 + len(AUTO_RETRY_DELAYS_MS)
+
+    def test_permanent_failure_is_kept_and_the_queue_moves_on(self, controller, config, history, calls):
+        self._configure(config)
+        failures = []
+        controller.generation_failed.connect(lambda mid, msg: failures.append((mid, msg)))
+        first = self._live_meeting_ends(controller, history)
+        second = self._live_meeting_ends(controller, history)
+        controller._generator.last_error_transient = False
+        controller._on_generation_error("纪要生成失败: HTTP 401；请检查接口密钥")
+        job = controller.store.queued_generation(first.id)
+        assert job is not None and job.failed and "401" in job.last_error
+        assert failures == [(first.id, "纪要生成失败: HTTP 401；请检查接口密钥")]
+        assert controller.generating_for == second.id
+        assert controller.queue_position(first.id) == 0
+
+    def test_failed_user_request_is_reported_and_not_kept(self, controller, config, history, calls):
+        self._configure(config)
+        record = self._ended(controller, history, "手动")
+        assert controller.generate(record.id) is True
+        controller._generator.last_error_transient = True
+        controller._on_generation_error("纪要生成超时")
+        assert controller.store.queued_generation(record.id) is None
+        assert not controller._retry_timer.isActive()
+
+    def test_unconfirmed_remote_host_is_never_sent_automatically(self, controller, config, history, calls):
+        self._configure(config, url="https://api.example.com/v1")
+        failures = []
+        controller.generation_failed.connect(lambda mid, msg: failures.append((mid, msg)))
+        record = self._live_meeting_ends(controller, history)
+        assert calls == []
+        job = controller.store.queued_generation(record.id)
+        assert job is not None and job.failed
+        assert failures and failures[0][0] == record.id and "api.example.com" in failures[0][1]
+        controller.confirm_remote_host("api.example.com")
+        assert controller.generate(record.id) is True and len(calls) == 1
+
+    def test_local_model_waits_until_the_next_meeting_ends(self, controller, config, history, calls):
+        self._configure(config, url="http://127.0.0.1:11434/v1")
+        waiting = self._ended(controller, history, "上一场")
+        self._enqueue_auto(controller, waiting)
+        controller.begin(MeetingOptions(), _caps())
+        controller._pump_queue()
+        assert calls == []
+        record = controller.current
+        history.enqueue(_row(record.id, 0, LONG_TEXT, speaker_id=1, started_at=record.started_at))
+        history.flush(timeout=2.0)
+        controller.finalize()
+        assert controller.generating_for == waiting.id
+        assert controller.queue_position(record.id) == 1
+
+    def test_new_meeting_pauses_a_local_automatic_job(self, controller, config, history, calls, monkeypatch):
+        self._configure(config, url="http://localhost:11434/v1")
+        cancelled, queued = [], []
+        monkeypatch.setattr(controller._generator, "cancel", lambda: cancelled.append(True))
+        controller.generation_cancelled.connect(lambda mid: cancelled.append(mid))
+        controller.generation_queued.connect(queued.append)
+        first = self._live_meeting_ends(controller, history)
+        assert controller.generating_for == first.id
+        controller.begin(MeetingOptions(), _caps())
+        assert controller.generating_for == "" and cancelled == [True]
+        assert queued[-1] == first.id
+        job = controller.store.queued_generation(first.id)
+        assert job is not None and not job.failed and job.attempts == 0
+
+    def test_remote_automatic_job_keeps_running_during_a_new_meeting(self, controller, config, history, calls):
+        self._configure(config)
+        first = self._live_meeting_ends(controller, history)
+        controller.begin(MeetingOptions(), _caps())
+        assert controller.generating_for == first.id
+
+    def test_cancelling_removes_the_job_and_starts_the_next(self, controller, config, history, calls):
+        self._configure(config)
+        cancelled = []
+        controller.generation_cancelled.connect(cancelled.append)
+        first = self._live_meeting_ends(controller, history)
+        second = self._live_meeting_ends(controller, history)
+        third = self._live_meeting_ends(controller, history)
+        controller.remove_from_queue(third.id)
+        assert controller.store.queued_generation(third.id) is None and cancelled == [third.id]
+        controller.remove_from_queue(first.id)
+        assert cancelled == [third.id, first.id]
+        assert controller.store.queued_generation(first.id) is None
+        assert controller.generating_for == second.id
+
+    def test_deleting_the_running_meeting_starts_the_next(self, controller, config, history, calls):
+        self._configure(config)
+        first = self._live_meeting_ends(controller, history)
+        second = self._live_meeting_ends(controller, history)
+        controller.delete_meeting(first.id)
+        assert controller.generating_for == second.id
+
+    def test_turning_the_switch_off_drops_waiting_automatic_jobs(self, controller, config, history, calls):
+        self._configure(config)
+        running = self._ended(controller, history, "手动")
+        assert controller.generate(running.id) is True
+        waiting = self._live_meeting_ends(controller, history)
+        config.set("meeting.auto_generate", False)
+        controller._on_generation_done(_result("手动"))
+        assert controller.generating_for == "" and controller.store.queued_generation(waiting.id) is None
+
+    def test_automatic_job_never_replaces_existing_notes(self, controller, config, history, calls):
+        self._configure(config)
+        record = self._ended(controller, history, "已有纪要")
+        controller.store.save_user_markdown(record.id, "我自己写的要点")
+        self._enqueue_auto(controller, record)
+        controller._pump_queue()
+        assert calls == [] and controller.store.queued_generation(record.id) is None
+        assert controller.store.get_notes(record.id).markdown == "我自己写的要点"
+
+    def test_notes_written_by_hand_settle_a_waiting_or_failed_automatic_job(self, controller, config, history, calls):
+        self._configure(config)
+        failed = self._ended(controller, history, "失败后手写")
+        waiting = self._ended(controller, history, "排队时手写")
+        for record in (failed, waiting):
+            self._enqueue_auto(controller, record)
+        controller.store.fail_generation(failed.id, "HTTP 401")
+        controller.store.flush()
+        for record in (failed, waiting):
+            assert controller.save_user_markdown(record.id, "手写要点")
+            assert controller.store.queued_generation(record.id) is None
+        assert calls == []
+
+    def test_switching_off_clears_failed_automatic_jobs(self, controller, config, history, calls):
+        self._configure(config)
+        record = self._ended(controller, history, "失败")
+        self._enqueue_auto(controller, record)
+        controller.store.fail_generation(record.id, "HTTP 401")
+        controller.store.flush()
+        config.set("meeting.auto_generate", False)
+        controller._pump_queue()
+        assert controller.store.queued_generation(record.id) is None
+
+    def test_queue_resumes_after_restart(self, config, history):
+        self._configure(config)
+        first = MeetingController(config, history, pending_segments=lambda: 0)
+        record = self._ended(first, history, "上次没生成完")
+        self._enqueue_auto(first, record)
+        first.shutdown()
+        second = MeetingController(config, history, pending_segments=lambda: 0)
+        started = []
+        second._generator.generate = started.append
+        try:
+            second.resume_generation_queue()
+            assert second.generating_for == record.id and len(started) == 1
+        finally:
+            second.shutdown()
+
+
 class TestMeetingPage:
     @pytest.fixture
     def page(self, config, controller):
@@ -463,11 +750,12 @@ class TestMeetingPage:
         assert page._stack.currentIndex() == PAGE_BROWSE
         page.show_start_card()
         assert page._stack.currentIndex() == PAGE_START
-        assert page._opt_source.currentData() == ""
+        assert page._opt_source.currentData() == "mixed"
         page._leave_start_card()
         assert page._stack.currentIndex() == PAGE_BROWSE
 
     def test_open_start_card_follows_dictation_source_without_replacing_a_choice(self, page, config):
+        config.set("meeting.input_source", "")
         config.set("audio.input_source", "system")
         page.show_start_card()
         assert page._opt_source.itemText(0) == "跟随转写（当前：电脑声音）"
@@ -497,7 +785,7 @@ class TestMeetingPage:
         assert isinstance(options, MeetingOptions)
         assert options.title == "设计评审" and options.participants == "甲, 乙"
         assert options.input_source == "microphone"
-        assert config.get("meeting.input_source") == ""
+        assert config.get("meeting.input_source") == "mixed"
 
     def test_start_card_model_and_language_are_session_overrides(self, page, config):
         config.set("stt.language", "zh")

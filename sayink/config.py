@@ -130,13 +130,15 @@ DEFAULT_CONFIG = {
     },
     # 会议记录 / 会议纪要（docs/meeting-notes-design.md §4.8）。
     "meeting": {
-        "input_source": "",        # 空 = 跟随 audio.input_source；保留已有独立选择
+        "input_source": "mixed",   # 新会议默认麦克风 + 电脑声音；空 = 跟随转写音源
         "model_id": "",            # 空 = 沿用 stt.model_id
         "hotkey": "",              # 空 = 未设置
         "show_start_card": True,
         "polish_segments": False,
         "model_name": "",          # 纪要模型；空 = 沿用 llm.model_name
         "template_id": "general",
+        # 会议结束后按默认模板在后台排队生成纪要；会把文字稿发给 AI 服务，故默认关闭。
+        "auto_generate": False,
         "custom_templates": [],
         "output_language": "auto",
         "aux_prompted": False,     # 首次开会缺辅助模型时问过一次「现在下载？」
@@ -214,11 +216,13 @@ class Config:
         self._extra_keys = {k: v for k, v in raw.items() if k not in DEFAULT_CONFIG}
         moved = self._migrate_recognition_settings(raw)
         self._config = self._merge_defaults(DEFAULT_CONFIG, raw)
-        if self._strip_test_pollution() or moved:
-            self.save_immediate()
-        # True = 不写欢迎弹窗（升级用户或未配置时用默认 True）；首次本无配置文件时单独打开欢迎
+        # True = 不写欢迎弹窗（升级用户或未配置时用默认 True）；首次本无配置文件时单独打开欢迎。
+        # 必须先于下面的迁移落盘，否则新文件会把欢迎写成已看过。
         if not config_existed:
             self._config["first_run_welcome_seen"] = False
+        output_migrated = self._migrate_output_by_mode()
+        if self._strip_test_pollution() or moved or output_migrated:
+            self.save_immediate()
         self._migrate_stt_model()
         self._load_secret()
 
@@ -497,6 +501,10 @@ class Config:
                 config[k] = {}
             config = config[k]
         config[keys[-1]] = value
+        if key == "audio.trigger_mode":
+            self._realign_active_output()
+        elif key in ("output.mode", "output.follow_input_source"):
+            self._sync_active_output_slot(key, value)
         # 延迟保存：500ms 后写入，多次 set 只触发一次写入
         self._save_timer.start(500)
 
@@ -505,41 +513,180 @@ class Config:
 
     # ── Output mode ───────────────────────────────────
 
+    def _active_output_trigger(self) -> str:
+        mode = self.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY)
+        if mode not in (TRIGGER_MODE_HOTKEY, TRIGGER_MODE_CONTINUOUS):
+            return TRIGGER_MODE_HOTKEY
+        return mode
+
+    def _output_section(self) -> dict:
+        output = self._config.get("output")
+        if not isinstance(output, dict):
+            output = {}
+            self._config["output"] = output
+        return output
+
+    def _output_by_mode(self) -> dict:
+        output = self._output_section()
+        by_mode = output.get("by_mode")
+        if not isinstance(by_mode, dict):
+            by_mode = {}
+            output["by_mode"] = by_mode
+        return by_mode
+
+    def _output_slot(self, trigger: str | None = None) -> dict:
+        trigger = trigger or self._active_output_trigger()
+        slot = self._output_by_mode().get(trigger)
+        if not isinstance(slot, dict):
+            slot = {"mode": OUTPUT_MODE_PASTE, "follow_input_source": True}
+            self._output_by_mode()[trigger] = slot
+        return slot
+
+    @staticmethod
+    def _legacy_output_follows(output: dict) -> bool:
+        follow = output.get("follow_input_source", None)
+        if isinstance(follow, bool):
+            return follow
+        mode = output.get("mode", OUTPUT_MODE_PASTE)
+        return mode == OUTPUT_MODE_PASTE or bool(output.get("mode_auto", False))
+
+    def _automatic_output_mode(self, source: str) -> str:
+        if source in HISTORY_ONLY_INPUT_SOURCES:
+            return OUTPUT_MODE_HISTORY
+        return OUTPUT_MODE_PASTE
+
+    def _active_slot_view(self) -> dict | None:
+        """Read the active slot through ``get`` so test doubles keep working."""
+        by_mode = self.get("output.by_mode")
+        if not isinstance(by_mode, dict):
+            return None
+        slot = by_mode.get(self._active_output_trigger())
+        return slot if isinstance(slot, dict) else None
+
+    def _store_active_slot(self, mode: str, follow) -> None:
+        if mode not in OUTPUT_MODES:
+            mode = OUTPUT_MODE_PASTE
+        trigger = Config._active_output_trigger(self)
+        current = self.get("output.by_mode")
+        by_mode: dict = {}
+        if isinstance(current, dict):
+            for key, value in current.items():
+                by_mode[key] = dict(value) if isinstance(value, dict) else value
+        by_mode[trigger] = {"mode": mode, "follow_input_source": follow}
+        self.set("output.by_mode", by_mode)
+        self.set("output.mode", mode)
+        self.set("output.follow_input_source", follow)
+
+    def _mirror_active_output(self) -> None:
+        slot = self._output_slot()
+        output = self._output_section()
+        output["mode"] = slot.get("mode", OUTPUT_MODE_PASTE)
+        output["follow_input_source"] = slot.get("follow_input_source", None)
+
+    def _migrate_output_by_mode(self) -> bool:
+        """Copy a shared destination into per-mode slots once.
+
+        Returns True when the file should be rewritten. A later launch that
+        already has both slots must not run this again.
+        """
+        output = self._config.get("output")
+        if not isinstance(output, dict):
+            return False
+        by_mode = output.get("by_mode")
+        if (
+            isinstance(by_mode, dict)
+            and TRIGGER_MODE_HOTKEY in by_mode
+            and TRIGGER_MODE_CONTINUOUS in by_mode
+        ):
+            before = (output.get("mode"), output.get("follow_input_source", None))
+            self._mirror_active_output()
+            after = (output.get("mode"), output.get("follow_input_source", None))
+            return before != after
+        follows = self._legacy_output_follows(output)
+        mode = output.get("mode", OUTPUT_MODE_PASTE)
+        if mode not in OUTPUT_MODES:
+            mode = OUTPUT_MODE_PASTE
+        source = self.get("audio.input_source", "microphone")
+        automatic = {
+            "mode": self._automatic_output_mode(source),
+            "follow_input_source": True,
+        }
+        if follows:
+            slots = {
+                TRIGGER_MODE_HOTKEY: dict(automatic),
+                TRIGGER_MODE_CONTINUOUS: dict(automatic),
+            }
+        else:
+            explicit = {"mode": mode, "follow_input_source": False}
+            trigger = self.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY)
+            if trigger not in (TRIGGER_MODE_HOTKEY, TRIGGER_MODE_CONTINUOUS):
+                trigger = TRIGGER_MODE_HOTKEY
+            slots = {
+                TRIGGER_MODE_HOTKEY: dict(explicit if trigger == TRIGGER_MODE_HOTKEY else automatic),
+                TRIGGER_MODE_CONTINUOUS: dict(explicit if trigger == TRIGGER_MODE_CONTINUOUS else automatic),
+            }
+        output["by_mode"] = slots
+        self._mirror_active_output()
+        return True
+
+    def _realign_active_output(self) -> None:
+        """When the active mode still follows the source, apply that source now."""
+        if not Config.output_follows_input_source(self):
+            self._mirror_active_output()
+            return
+        Config.follow_input_source_for_output(self, self.get("audio.input_source", "microphone"))
+
+    def _sync_active_output_slot(self, key: str, value) -> None:
+        """Keep direct writes of the legacy mirror on the active mode only."""
+        trigger = self._active_output_trigger()
+        slot = dict(self._output_slot(trigger))
+        if key == "output.mode":
+            slot["mode"] = value if value in OUTPUT_MODES else OUTPUT_MODE_PASTE
+        else:
+            slot["follow_input_source"] = value
+        self._output_by_mode()[trigger] = slot
+
     def output_mode(self) -> str:
-        mode = self.get("output.mode", OUTPUT_MODE_PASTE)
+        slot = Config._active_slot_view(self)
+        mode = slot.get("mode") if slot else self.get("output.mode", OUTPUT_MODE_PASTE)
         return mode if mode in OUTPUT_MODES else OUTPUT_MODE_PASTE
 
     def history_only_output(self) -> bool:
-        return self.output_mode() == OUTPUT_MODE_HISTORY
+        return Config.output_mode(self) == OUTPUT_MODE_HISTORY
 
     def set_output_mode(self, mode: str, *, auto: bool = False) -> None:
         """Pick where results go. ``auto`` marks a choice made by the app."""
         if mode not in OUTPUT_MODES:
             mode = OUTPUT_MODE_PASTE
-        self.set("output.mode", mode)
+        Config._store_active_slot(self, mode, bool(auto))
         self.set("output.mode_auto", bool(auto))
-        self.set("output.follow_input_source", bool(auto))
 
     def output_follows_input_source(self) -> bool:
-        follow = self.get("output.follow_input_source")
+        slot = Config._active_slot_view(self)
+        if slot is None:
+            follow = self.get("output.follow_input_source", None)
+            mode = self.get("output.mode", OUTPUT_MODE_PASTE)
+        else:
+            follow = slot.get("follow_input_source", None)
+            mode = slot.get("mode", OUTPUT_MODE_PASTE)
         if isinstance(follow, bool):
             return follow
-        return self.output_mode() == OUTPUT_MODE_PASTE or bool(self.get("output.mode_auto", False))
+        return mode == OUTPUT_MODE_PASTE or bool(self.get("output.mode_auto", False))
 
     def follow_input_source_for_output(self, source: str) -> str | None:
-        """Keep output mode in step with the audio source.
+        """Keep the active mode in step with the audio source.
 
         In automatic mode, system / mixed capture goes to history and the
         microphone goes to the cursor. Either explicit destination sticks
-        across later source changes. Legacy manual history is preserved.
+        across later source changes, and the other trigger mode is left alone.
         Returns the new effective mode only when it changed.
         """
-        if not self.output_follows_input_source():
+        if not Config.output_follows_input_source(self):
             return None
-        mode = OUTPUT_MODE_HISTORY if source in HISTORY_ONLY_INPUT_SOURCES else OUTPUT_MODE_PASTE
-        changed = mode != self.output_mode()
-        self.set_output_mode(mode, auto=mode == OUTPUT_MODE_HISTORY)
-        self.set("output.follow_input_source", True)
+        mode = Config._automatic_output_mode(self, source)
+        changed = mode != Config.output_mode(self)
+        Config._store_active_slot(self, mode, True)
+        self.set("output.mode_auto", mode == OUTPUT_MODE_HISTORY)
         return mode if changed else None
 
     @property

@@ -782,3 +782,86 @@ def test_main_window_build_failure_is_reported_and_retried(monkeypatch):
     _title, message, icon, _ms = app._tray.showMessage.call_args[0]
     assert "主窗口" in message and "sayink.log" in message
     assert icon == QSystemTrayIcon.MessageIcon.Warning
+
+
+def test_hold_output_uses_the_window_from_recording_start(monkeypatch):
+    with app_harness() as h:
+        current = {"info": (111, "Notepad", 50)}
+        monkeypatch.setattr(
+            "sayink.text_paster.get_foreground_window_info", lambda: current["info"],
+        )
+        monkeypatch.setattr(
+            "sayink.text_paster.get_foreground_process_name", lambda: "notepad.exe",
+        )
+        h["app"]._on_recording_start()
+        current["info"] = (222, "Chat", 60)
+        h["app"]._output_text("你好")
+        kwargs = h["paster"].paste_async.call_args.kwargs
+        assert kwargs.get("target_hwnd") == 111
+        assert kwargs.get("target_app") == "notepad.exe"
+
+
+def test_changed_target_notice_names_the_process_and_does_not_ask(monkeypatch):
+    with app_harness() as h:
+        dialogs = []
+        monkeypatch.setattr(
+            "PyQt6.QtWidgets.QMessageBox.exec",
+            lambda *args, **kwargs: dialogs.append(args),
+        )
+        h["app"]._handle_paste_result(
+            PasteResult("clipboard", target_app="notepad.exe", detail="focus_changed"),
+        )
+        notices = []
+        for name in ("show_info", "show_success"):
+            mock = getattr(h["floating"], name)
+            if mock.called:
+                notices.extend(" ".join(str(part) for part in call.args) for call in mock.call_args_list)
+        text = " ".join(notices)
+        assert "notepad.exe" in text
+        assert dialogs == []
+
+
+def test_listening_bar_shows_process_name_not_a_window_title():
+    from sayink.ui.floating_window import FloatingWindow
+
+    win = FloatingWindow()
+    try:
+        win.show_listening(target_app="notepad.exe")
+        label = win._status_label.text()
+        assert "notepad.exe" in label
+        assert "记事本" not in label
+        # Refreshing the listening state must not drop the utterance still open.
+        win.show_listening()
+        assert "notepad.exe" in win._status_label.text()
+        win.show_listening("")
+        assert "notepad.exe" not in win._status_label.text()
+    finally:
+        win.close()
+
+
+def test_continuous_ready_notice_uses_the_real_pause():
+    from sayink.vad_segmenter import SILENCE_HOLD_SEC
+
+    with app_harness({"audio.trigger_mode": "continuous"}) as h:
+        h["recognizer"].is_ready = True
+        h["app"]._on_stt_ready()
+        text = " ".join(
+            str(part) for call in h["tray"].showMessage.call_args_list for part in call.args
+        )
+        assert f"{SILENCE_HOLD_SEC:g} 秒" in text
+
+
+def test_new_continuous_session_clears_a_previous_paste_target(monkeypatch):
+    with app_harness({"audio.trigger_mode": "continuous"}) as h:
+        app = h["app"]
+        h["recognizer"].is_ready = True
+        h["recognizer"].is_loading = False
+
+        def start_continuous():
+            h["recorder"].is_continuous = True
+
+        h["recorder"].start_continuous.side_effect = start_continuous
+        h["recorder"].is_continuous = False
+        monkeypatch.setattr("sayink.app.QTimer.singleShot", lambda _ms, fn: fn())
+        app._start_continuous_listening()
+        h["floating"].show_listening.assert_called_with("")

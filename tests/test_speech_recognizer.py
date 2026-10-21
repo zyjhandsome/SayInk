@@ -356,6 +356,35 @@ class TestModelRegistryContent:
         assert "Qwen3-0.6B/vocab.json" in model["files"]
         assert DEFAULT_MODEL_ID == "funasr-nano"
 
+    def test_catalog_lists_default_first_and_reserves_top_accuracy(self):
+        order = [
+            "funasr-nano",
+            "sensevoice",
+            "qwen3-asr-0.6b",
+            "fireredasr2-ctc",
+            "fireredasr2-aed",
+            "paraformer-zh",
+            "paraformer-trilingual",
+            "zipformer-ctc-zh",
+            "qwen3-asr-1.7b",
+        ]
+        assert [model["id"] for model in MODEL_REGISTRY] == order
+        by_id = {model["id"]: model for model in MODEL_REGISTRY}
+        assert by_id["funasr-nano"]["description"].startswith("默认")
+        assert "热词" in by_id["funasr-nano"]["description"]
+        assert "识别语言" in by_id["funasr-nano"]["description"]
+        assert by_id["sensevoice"]["description"].startswith("更快")
+        assert "热词" in by_id["qwen3-asr-0.6b"]["description"]
+        assert "CTC" in by_id["fireredasr2-ctc"]["description"]
+        assert "较慢" in by_id["fireredasr2-aed"]["description"]
+        assert "中英" in by_id["paraformer-zh"]["description"]
+        assert "粤语" in by_id["paraformer-trilingual"]["description"]
+        assert "纯中文" in by_id["zipformer-ctc-zh"]["description"]
+        assert "第三方" in by_id["qwen3-asr-1.7b"]["description"]
+        assert [model["id"] for model in MODEL_REGISTRY if model["accuracy"] >= 5] == ["funasr-nano"]
+        for model in MODEL_REGISTRY:
+            assert "最高" not in model["description"]
+
     def test_unknown_model(self):
         model = get_model_info("nonexistent_model")
         assert model is None
@@ -479,23 +508,30 @@ class TestGetModelDir:
 
 
 class TestModelAccuracySpeed:
-    def test_qwen3_high_accuracy(self):
-        model = get_model_info("qwen3-asr-0.6b")
-        assert model["accuracy"] == 5
+    def test_only_the_default_model_is_rated_top_accuracy(self):
+        from sayink.speech_recognizer import DEFAULT_MODEL_ID, MODEL_REGISTRY
+
+        default = get_model_info(DEFAULT_MODEL_ID)
+        assert default["accuracy"] == 5
+        others = [model for model in MODEL_REGISTRY if model["id"] != DEFAULT_MODEL_ID]
+        assert others
+        assert all(model["accuracy"] < default["accuracy"] for model in others)
 
     def test_qwen3_1_7b_slowest_speed(self):
         model = get_model_info("qwen3-asr-1.7b")
-        assert model["accuracy"] == 5
+        assert model["accuracy"] == 4
         assert model["speed"] == 1
 
     def test_sensevoice_fast_speed(self):
         model = get_model_info("sensevoice")
         assert model["speed"] == 5
 
-    def test_fireredasr2_aed_highest_accuracy(self):
-        model = get_model_info("fireredasr2-aed")
-        assert model["accuracy"] == 5
-        assert model["speed"] == 2
+    def test_fireredasr2_aed_is_a_slower_candidate(self):
+        aed = get_model_info("fireredasr2-aed")
+        fast = get_model_info("sensevoice")
+        assert aed["accuracy"] == 4
+        assert aed["speed"] == 2
+        assert aed["speed"] < fast["speed"]
 
 
 class TestModelLanguages:

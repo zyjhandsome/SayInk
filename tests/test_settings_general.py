@@ -563,6 +563,19 @@ class TestOutputMode:
         combo.setCurrentIndex(combo.findData("paste"))
         assert settings_window._restore_clipboard_row.isEnabled()
 
+    def test_switching_trigger_mode_shows_that_modes_destination(
+        self, settings_window, config, monkeypatch,
+    ):
+        monkeypatch.setattr(settings_window, "_confirm_discard_pending", lambda: True)
+        combo = settings_window._output_mode_combo
+        combo.setCurrentIndex(combo.findData("history"))
+        settings_window._trigger_continuous_rb.setChecked(True)
+        assert settings_window._output_mode_combo.currentData() == "auto"
+        assert config.output_follows_input_source()
+        settings_window._trigger_hotkey_rb.setChecked(True)
+        assert settings_window._output_mode_combo.currentData() == "history"
+        assert config.history_only_output()
+
 
 class TestInputSource:
     def test_source_selection_persists(self, settings_window, config, monkeypatch):
@@ -890,9 +903,55 @@ class TestPolishConfigurationStatus:
         monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warnings.append(a)))
         settings_window._llm_enable_row.setChecked(False)
         settings_window._llm_url_edit.setText("http://api.example.com/v1")
+        settings_window._llm_key_edit.setText("sk-x")
+        settings_window._llm_model_edit.setText("m")
         settings_window._flush_llm_fields()
         assert warnings == []
         assert config.get("llm.api_url", "") == "http://api.example.com/v1"
+        assert "明文" in settings_window._llm_test_status.text()
+
+    def test_model_placeholder_names_deepseek_flash(self, settings_window):
+        assert settings_window._llm_model_edit.placeholderText() == "例如：deepseek-flash"
+
+    def test_userinfo_and_pasted_key_are_normalized_on_save(self, settings_window, config, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warnings.append(a)))
+        settings_window._llm_url_edit.setText("https://user:sk-secret@api.deepseek.com/v1")
+        settings_window._llm_key_edit.setText(' "Bearer sk-field" ')
+        settings_window._llm_model_edit.setText("DeepSeek－Flash")
+        settings_window._flush_llm_fields()
+        assert config.get("llm.api_url") == "https://api.deepseek.com/v1"
+        assert "sk-secret" not in settings_window._llm_url_edit.text()
+        assert config.get("llm.api_key") == "sk-field"
+        assert config.get("llm.model_name") == "deepseek-flash"
+        assert warnings and "API 密钥" in warnings[0][2]
+
+    def test_fullwidth_url_is_rejected_with_a_specific_warning(self, settings_window, config, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warnings.append(a)))
+        settings_window._llm_url_edit.setText("https：//api.deepseek.com")
+        settings_window._flush_llm_fields()
+        assert warnings and "全角" in warnings[0][2]
+        assert config.get("llm.api_url", "") != "https：//api.deepseek.com"
+
+    def test_prompt_edit_keeps_a_successful_connection_result(self, settings_window, qapp, monkeypatch):
+        monkeypatch.setattr(
+            "sayink.text_polisher.TextPolisher.test_connection",
+            lambda *_args, **_kwargs: (True, "ok"),
+        )
+        settings_window._llm_url_edit.setText("https://api.example.com/v1")
+        settings_window._llm_key_edit.setText("sk-test")
+        settings_window._llm_model_edit.setText("demo-model")
+        settings_window._test_llm()
+        assert settings_window._llm_test_worker.wait(3000)
+        qapp.processEvents()
+        assert settings_window._llm_test_status.text() == "连接正常，可以使用。"
+        settings_window._llm_prompt_edit.setPlainText("一段提示词")
+        settings_window._flush_llm_fields()
+        assert settings_window._llm_test_status.text() == "连接正常，可以使用。"
+        settings_window._llm_model_edit.setText("other-model")
+        settings_window._flush_llm_fields()
+        assert settings_window._llm_test_status.text().startswith("配置已填写，尚未测试连接")
 
     def test_minutes_model_test_uses_shared_endpoint(self, settings_window, monkeypatch):
         calls = []
@@ -1076,7 +1135,7 @@ class TestMeetingSettings:
     """
 
     def test_meeting_defaults_load(self, settings_window, config):
-        assert settings_window._meeting_source_combo.currentData() == ""
+        assert settings_window._meeting_source_combo.currentData() == "mixed"
         assert settings_window._meeting_model_combo.currentData() == ""
         assert settings_window._meeting_vad_combo.currentData() == "silero"
         assert settings_window._meeting_language_combo.currentData() == "auto"
@@ -1253,6 +1312,35 @@ class TestMeetingSettings:
         assert config.get("meeting.model_name") == "big-model"
         assert config.get("meeting.template_id") == "standup"
         assert config.get("meeting.output_language") == "zh"
+
+    def test_auto_minutes_switch_is_off_by_default_and_persists(self, settings_window, config, monkeypatch):
+        win = settings_window
+        assert not win._minutes_auto_row.isChecked()
+        config.set("llm.api_url", "http://localhost:11434/v1")
+        monkeypatch.setattr(win, "_confirm", lambda *a, **k: pytest.fail("local model needs no confirmation"))
+        win._minutes_auto_row.setChecked(True)
+        assert config.get("meeting.auto_generate") is True
+        win._minutes_auto_row.setChecked(False)
+        assert config.get("meeting.auto_generate") is False
+
+    def test_auto_minutes_to_a_remote_host_asks_first(self, settings_window, config, monkeypatch):
+        win = settings_window
+        config.set("llm.api_url", "https://api.example.com/v1")
+        asked = []
+        monkeypatch.setattr(win, "_confirm", lambda title, text, **kw: asked.append(text) or False)
+        win._minutes_auto_row.setChecked(True)
+        assert asked and "api.example.com" in asked[0]
+        assert not win._minutes_auto_row.isChecked()
+        assert config.get("meeting.auto_generate") is False
+        assert "api.example.com" not in (config.get("meeting.confirmed_remote_hosts", []) or [])
+        monkeypatch.setattr(win, "_confirm", lambda *a, **k: True)
+        win._minutes_auto_row.setChecked(True)
+        assert config.get("meeting.auto_generate") is True
+        assert "api.example.com" in config.get("meeting.confirmed_remote_hosts")
+        win._minutes_auto_row.setChecked(False)
+        monkeypatch.setattr(win, "_confirm", lambda *a, **k: pytest.fail("host already confirmed"))
+        win._minutes_auto_row.setChecked(True)
+        assert config.get("meeting.auto_generate") is True
 
     def test_aux_model_download_message_does_not_touch_dictation_model(self, settings_window, config, monkeypatch):
         shown = []

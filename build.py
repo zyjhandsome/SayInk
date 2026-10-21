@@ -4,7 +4,7 @@ Build script for packaging SayInk as a standalone Windows application.
 Output: dist/SayInk/ — SayInk.exe, _internal/, and models/.
 
 The default **lite** package copies the meeting helpers (CAM++ speaker
-embedding and Silero VAD). Fun-ASR-Nano is not included; the app downloads it
+embedding, Silero VAD, and the experimental speaker-activity model). Fun-ASR-Nano is not included; the app downloads it
 on first start (设置 → 引擎). ``--with-model`` (or ``SAYINK_BUNDLE_MODEL=1``)
 also copies Fun-ASR-Nano. Both flavors fail when a model they must ship is
 missing. Fetch the files with
@@ -12,7 +12,7 @@ missing. Fetch the files with
 
 Distribution:
 - **Installer (recommended):** run `python build_release.py` — produces
-  `dist/SayInk-Setup-<version>.exe` (lite: CAM++ + Silero); add `--with-model`
+  `dist/SayInk-Setup-<version>.exe` (lite: CAM++ + Silero + speaker-activity); add `--with-model`
   for `dist/SayInk-Setup-<version>-full.exe` (~740 MB, also Fun-ASR-Nano).
   Version from `sayink/version.py`; staging folder removed after Inno Setup.
 - **Portable folder:** run this script only, then zip `dist/SayInk/` for
@@ -37,7 +37,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 # Fun-ASR-Nano is copied only by a --with-model build. Meeting helpers
-# (CAM++, Silero) ship in both the lite and the full installer.
+# (CAM++, Silero, speaker-activity) ship in both the lite and the full installer.
 from sayink.speech_recognizer import DEFAULT_MODEL_ID
 
 BUNDLE_REQUIRE_MODEL_ID = DEFAULT_MODEL_ID
@@ -52,10 +52,15 @@ def bundle_model_requested(argv: list[str] | None = None) -> bool:
 
 
 def bundle_aux_model_ids() -> list[str]:
-    """Meeting helpers shipped in the lite installer as well as the full one."""
+    """Meeting helpers shipped in the lite installer as well as the full one.
+
+    ``optional`` models are left out of the in-app required download, unless
+    ``bundle`` is set. The experimental speaker-activity model is bundled that
+    way: both installers carry the file, and the switch stays off by default.
+    """
     from sayink.speech_recognizer import AUX_MODEL_REGISTRY
 
-    return [m["id"] for m in AUX_MODEL_REGISTRY if not m.get("optional")]
+    return [m["id"] for m in AUX_MODEL_REGISTRY if m.get("bundle") or not m.get("optional")]
 
 
 def bundle_model_ids() -> list[str]:

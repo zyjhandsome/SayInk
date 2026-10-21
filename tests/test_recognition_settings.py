@@ -14,8 +14,14 @@ from sayink.vad_segmenter import EnergyGate
 from tests.helpers.app_harness import app_harness
 
 
+def test_a_new_meeting_defaults_to_the_microphone_and_system_audio(config):
+    assert config.get("meeting.input_source") == "mixed"
+    assert MeetingOptions.from_config(config).input_source == "mixed"
+
+
 @pytest.mark.parametrize("source", ["microphone", "system", "mixed"])
 def test_meeting_follows_shared_audio_until_explicitly_overridden(config, source):
+    config.set("meeting.input_source", "")
     config.set("audio.input_source", source)
     assert audio_source(config, meeting=True) == source
     assert MeetingOptions.from_config(config).input_source == source

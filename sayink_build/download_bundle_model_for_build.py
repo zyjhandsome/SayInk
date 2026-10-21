@@ -1,7 +1,9 @@
 """
 Download the models a full installer bundles into <project>/models/.
 
-That is Fun-ASR-Nano plus the meeting helpers (CAM++ and Silero VAD).
+That is Fun-ASR-Nano plus the meeting helpers (CAM++, Silero VAD, and the
+experimental speaker-activity model). Lite and full installers both copy the
+helpers; only the full installer also copies Fun-ASR-Nano.
 Same HuggingFace layout as the in-app downloader. Run from repo root:
 
   python sayink_build/download_bundle_model_for_build.py

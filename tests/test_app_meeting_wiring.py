@@ -419,6 +419,91 @@ def test_download_then_start_waits_for_the_batch() -> None:
             assert app.meeting.current.title == "等模型"
 
 
+AUTO_MINUTES = {
+    "llm.api_url": "http://192.168.1.10:8000/v1", "llm.api_key": "k", "llm.model_name": "m",
+    "meeting.auto_generate": True, "audio.trigger_mode": "hotkey",
+}
+# Varied on purpose: repeated phrases are dropped as ASR hallucinations.
+LONG_TEXT = (
+    "今天先过一下第三季度的预算执行情况，市场部超支了大约百分之八。"
+    "主要原因是线下活动比计划多了两场，下个月会压缩差旅。"
+    "研发这边的新版本推迟一周上线，测试发现支付回调在弱网下偶尔丢失。"
+    "客服反馈退款流程太长，希望把人工审核改成金额阈值以下自动通过。"
+    "法务提醒隐私协议需要在十一月前更新，涉及第三方统计组件的说明。"
+    "运维提出机房迁移窗口定在月底周六凌晨，各业务方需要提前确认回滚方案。"
+    "最后确认下周三下午做一次跨部门复盘，每个团队准备十分钟的汇报材料。"
+)
+
+
+def _end_and_wait(app, h, meeting_id) -> None:
+    ended = []
+    app.meeting.meeting_ended.connect(ended.append)
+    app._end_meeting()
+    h["recorder"].is_continuous = False
+    deadline = time.monotonic() + 2.0
+    while not ended and time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.01)
+    assert ended == [meeting_id]
+
+
+def test_meeting_end_with_auto_minutes_says_they_run_in_the_background() -> None:
+    with app_harness(AUTO_MINUTES, real_history=True) as h:
+        app = h["app"]
+        requests = []
+        with patch.object(app._meeting._generator, "generate", requests.append):
+            meeting_id = _start(app, h)
+            app._on_segment_ready(_audio())
+            app._on_final_result(LONG_TEXT)
+            _end_and_wait(app, h, meeting_id)
+        assert len(requests) == 1
+        assert "后台" in h["tray"].showMessage.call_args[0][1]
+
+
+def test_meeting_end_without_auto_minutes_points_to_the_meeting_page() -> None:
+    with app_harness({**AUTO_MINUTES, "meeting.auto_generate": False}, real_history=True) as h:
+        app = h["app"]
+        meeting_id = _start(app, h)
+        app._on_segment_ready(_audio())
+        app._on_final_result(LONG_TEXT)
+        _end_and_wait(app, h, meeting_id)
+        assert "可到「会议」页生成纪要" in h["tray"].showMessage.call_args[0][1]
+
+
+def test_failed_automatic_minutes_tell_the_user_where_to_retry() -> None:
+    with app_harness(AUTO_MINUTES, real_history=True) as h:
+        app = h["app"]
+        with patch.object(app._meeting._generator, "generate", lambda _request: None):
+            meeting_id = _start(app, h)
+            app._on_segment_ready(_audio())
+            app._on_final_result(LONG_TEXT)
+            _end_and_wait(app, h, meeting_id)
+            app._meeting._generator.last_error_transient = False
+            app._meeting._on_generation_error("HTTP 401：密钥无效")
+        text = h["tray"].showMessage.call_args[0][1]
+        assert "自动生成" in text and "密钥无效" in text and "会议" in text
+
+
+def test_start_resumes_minutes_queued_before_the_last_quit() -> None:
+    from sayink.meeting_store import QUEUE_PRIORITY_AUTO
+
+    with app_harness({**AUTO_MINUTES, "meeting.auto_generate": False}, real_history=True) as h:
+        app = h["app"]
+        meeting_id = _start(app, h)
+        app._on_segment_ready(_audio())
+        app._on_final_result(LONG_TEXT)
+        _end_and_wait(app, h, meeting_id)
+        # Left in the queue by the previous run.
+        h["config"].set("meeting.auto_generate", True)
+        app.meeting.store.enqueue_generation(meeting_id, "general", priority=QUEUE_PRIORITY_AUTO)
+        app.meeting.store.flush()
+        requests = []
+        with patch.object(app._meeting._generator, "generate", requests.append):
+            app.start()
+        assert len(requests) == 1
+        assert app.meeting.generating_for == meeting_id
+
+
 def _tone(freq: float, seconds: float = 1.2) -> np.ndarray:
     t = np.arange(int(TARGET_SAMPLE_RATE * seconds), dtype=np.float32) / TARGET_SAMPLE_RATE
     return (0.25 * np.sin(2.0 * np.pi * freq * t)).astype(np.float32)

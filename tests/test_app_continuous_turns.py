@@ -32,6 +32,63 @@ def acknowledge(h):
     h["paster"].paste_async.call_args.args[1]("pasted")
 
 
+def test_dismissing_a_mid_session_history_conflict_keeps_the_words_and_stops(monkeypatch):
+    copied = []
+    monkeypatch.setattr("pyperclip.copy", copied.append)
+    with app_harness({"audio.trigger_mode": "continuous", "history.enabled": True}) as h:
+        app = start(h)
+        h["recorder"].is_continuous = True
+        app._config.set("history.enabled", False)
+        app._config.set("output.mode", "history")
+        monkeypatch.setattr(app, "_ask_history_output_conflict", lambda: "cancel", raising=False)
+        with patch("sayink.app.QTimer.singleShot"):
+            begin(app)
+            app._on_speaker_turn_result(batch()[:1])
+        h["paster"].paste_async.assert_not_called()
+        assert copied == ["甲说方案可行"]
+        h["recorder"].stop_continuous.assert_called()
+        assert app._config.get("history.enabled") is False
+        assert app._config.history_only_output()
+
+
+def test_continuous_segments_keep_the_process_captured_when_speech_started():
+    with app_harness({"audio.trigger_mode": "continuous"}) as h:
+        app = h["app"]
+        targets = [(11, "alpha.exe"), (22, "beta.exe")]
+        app._recorder.consume_segment_target.side_effect = lambda: targets.pop(0)
+        first = app._capture_segment_context()
+        second = app._capture_segment_context()
+        assert (getattr(first, "target_hwnd", None), getattr(first, "target_app", None)) == (11, "alpha.exe")
+        assert (getattr(second, "target_hwnd", None), getattr(second, "target_app", None)) == (22, "beta.exe")
+
+
+def test_continuous_output_pastes_into_the_window_open_at_speech_start():
+    """A previous hold must not steal the window captured for this utterance."""
+    with app_harness({"audio.trigger_mode": "continuous", "llm.enabled": False}) as h:
+        app = start(h)
+        app._hold_target = (999, "stale.exe")
+        app._recorder.consume_segment_target.return_value = (11, "alpha.exe")
+        begin(app)
+        with patch("sayink.app.QTimer.singleShot"):
+            app._on_speaker_turn_result(batch()[:1])
+        kwargs = h["paster"].paste_async.call_args.kwargs
+        assert kwargs.get("target_hwnd") == 11
+        assert kwargs.get("target_app") == "alpha.exe"
+
+
+def test_continuous_without_an_external_window_does_not_reuse_the_last_hold():
+    with app_harness({"audio.trigger_mode": "continuous", "llm.enabled": False}) as h:
+        app = start(h)
+        app._hold_target = (999, "stale.exe")
+        app._recorder.consume_segment_target.return_value = (0, "")
+        begin(app)
+        with patch("sayink.app.QTimer.singleShot"):
+            app._on_speaker_turn_result(batch()[:1])
+        kwargs = h["paster"].paste_async.call_args.kwargs
+        assert kwargs.get("target_hwnd") == 0
+        assert kwargs.get("target_app") in (None, "")
+
+
 @pytest.mark.parametrize("mode", ["continuous", "hotkey"])
 def test_single_and_continuous_modes_share_retry_without_turn_analysis_on_spectral_fallback(mode):
     with app_harness({"audio.trigger_mode": mode}) as h:
@@ -137,9 +194,12 @@ def test_empty_final_turn_releases_queue_and_finishes_stopped_session():
 
 
 @pytest.mark.parametrize("history_enabled", [True, False])
-def test_history_only_output_still_obeys_continuous_history_preference(history_enabled):
+def test_history_only_output_still_obeys_continuous_history_preference(history_enabled, monkeypatch):
     with app_harness({"audio.trigger_mode": "continuous", "output.mode": OUTPUT_MODE_HISTORY, "history.enabled": history_enabled}) as h:
         app = start(h)
+        if not history_enabled:
+            # The session was already open; refusing the conflict must not paste.
+            monkeypatch.setattr(app, "_ask_history_output_conflict", lambda: "cancel")
         begin(app)
         with patch("sayink.app.QTimer.singleShot"):
             app._on_speaker_turn_result(batch())

@@ -74,7 +74,7 @@ def _build_connection_section(win) -> QWidget:
     model_row.setSpacing(8)
     win._llm_model_edit = QLineEdit()
     win._llm_model_edit.setAccessibleName("模型名称")
-    win._llm_model_edit.setPlaceholderText("例如：deepseek-chat")
+    win._llm_model_edit.setPlaceholderText("例如：deepseek-flash")
     win._llm_model_edit.setMinimumHeight(36)
     win._llm_test_btn = QPushButton("测试连接")
     win._style_llm_action_btn(win._llm_test_btn)
@@ -225,6 +225,13 @@ def _build_minutes_section(win) -> QWidget:
         win._minutes_language_combo.addItem(label, key)
     win._minutes_language_combo.currentIndexChanged.connect(win._flush_minutes_fields)
     lay.addWidget(labeled_row("纪要语言", win._minutes_language_combo))
+    lay.addWidget(group_divider())
+    win._minutes_auto_row = ToggleOptionRow(
+        "会议结束后自动生成纪要",
+        "用默认模板在后台生成，连续多场按顺序排队；文字稿会发送到上方配置的服务",
+    )
+    win._minutes_auto_row.toggled.connect(win._on_minutes_auto_toggled)
+    lay.addWidget(win._minutes_auto_row)
     return settings_section("会议纪要", group)
 
 

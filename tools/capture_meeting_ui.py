@@ -18,9 +18,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from PyQt6.QtCore import QCoreApplication, QEvent, QRect
+from PyQt6.QtCore import QCoreApplication, QEvent, QPoint, QRect, QUrl
 from PyQt6.QtGui import QFontDatabase
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QApplication, QDialog
 
 from sayink.config import Config
 from sayink.history_store import HistoryStore, SegmentRecord
@@ -120,6 +121,16 @@ def main():
             settle(app)
             win.grab().save(str(args.output / name))
 
+        def capture_details(dialog):
+            dialog.show()
+            settle(app)
+            dialog.grab().save(str(args.output / f"modification-details-{theme}.png"))
+            dialog.resize(360, 540)
+            settle(app)
+            dialog.grab().save(str(args.output / f"narrow-modification-details-{theme}.png"))
+            dialog.close()
+            return QDialog.DialogCode.Rejected
+
         for theme in ("dark", "light"):
             apply_theme(app, mode=theme, surfaces=[win, win._settings, win._history, page])
             page.show_start_card()
@@ -155,6 +166,7 @@ def main():
             dialog.grab().save(str(args.output / f"live-speaker-dialog-{theme}.png"))
             dialog.close()
             page._live_correct_speaker_btn.setChecked(False)
+            capture(f"live-quiet-{theme}.png")
             page.focus_search()
             page._live_find_edit.setText("核对")
             capture(f"live-find-{theme}.png")
@@ -230,12 +242,20 @@ def main():
             capture(f"narrow-refinement-{theme}.png")
             win.resize(1040, 720)
             controller.save_segment_text(current.id, 13, "复制按钮应区分纪要和文字稿；导出时可选择范围，周三开始验证。")
+            controller.correct_segment_speaker(current.id, 13, 1)
             page._switch_tab(1)
             page._render_detail()
             capture(f"edited-transcript-{theme}.png")
             win.resize(880, 580)
             capture(f"narrow-edited-transcript-{theme}.png")
             win.resize(1040, 720)
+            with patch.object(_SegmentTextDialog, "exec", capture_details):
+                page._on_transcript_link(QUrl("edited-segment:13"))
+            settle(app)
+            paragraph = page._transcript_view.document().find("复制按钮应区分")
+            QTest.mouseMove(page._transcript_view.viewport(), page._transcript_view.cursorRect(paragraph).center())
+            capture(f"hover-transcript-{theme}.png")
+            QTest.mouseMove(page._detail_title, QPoint(4, 4))
             segment = controller.store.get_segments(current.id)[1]
             dialog = _SegmentTextDialog(
                 segment, position="00:13", speaker="小林", save_text=lambda _text: True, parent=win,

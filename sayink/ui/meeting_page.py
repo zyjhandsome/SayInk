@@ -67,7 +67,7 @@ from sayink.meeting_session import (
     resolve_capabilities,
     safe_filename,
 )
-from sayink.meeting_store import STATUS_ENDED, STATUS_INTERRUPTED, STATUS_LIVE, MeetingRecord
+from sayink.meeting_store import STATUS_ENDED, STATUS_INTERRUPTED, STATUS_LIVE, MeetingRecord, QueuedGeneration, now_ms
 from sayink.audio_devices import input_source_label
 from sayink.recognition_settings import ADVANCED_RECOGNITION_PATH, audio_source
 from sayink.minutes_prompts import describe_template, format_timestamp, get_template, list_templates, transcript_lines
@@ -107,7 +107,7 @@ def _format_dt(ms: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ms / 1000))
 
 
-def _meeting_row_meta(record: MeetingRecord) -> str:
+def _meeting_row_meta(record: MeetingRecord, minutes: str = "") -> str:
     status = _STATUS_TEXT.get(record.status, "")
     duration = _duration_label(record.duration_ms) if record.ended_at else ""
     stamp = time.localtime(record.started_at / 1000)
@@ -122,11 +122,13 @@ def _meeting_row_meta(record: MeetingRecord) -> str:
     bits = [status, when] if status else [when]
     if duration:
         bits.append(duration)
+    if minutes:
+        bits.append(minutes)
     return " · ".join(bits)
 
 
-def _meeting_row_text(record: MeetingRecord) -> str:
-    return f"{record.display_title}\n{_meeting_row_meta(record)}"
+def _meeting_row_text(record: MeetingRecord, minutes: str = "") -> str:
+    return f"{record.display_title}\n{_meeting_row_meta(record, minutes)}"
 
 
 _HEADER_META_PREFIXES = ("- 时间：", "- 时长：")
@@ -300,6 +302,158 @@ class _ReadingView(QTextBrowser):
         self._fit_text_width()
 
 
+class _TranscriptView(_ReadingView):
+    """Reveal paragraph actions without replacing the document or moving text."""
+
+    _CONTEXT_LINKS = ("edit-segment:", "live-edit:", "details-segment:", "live-details:")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._action_block = None
+        self._keyboard_actions = False
+        self.setMouseTracking(True)
+        self.cursorPositionChanged.connect(self._reveal_cursor_actions)
+
+    def reset_actions(self) -> None:
+        self._activate_actions()
+        if self.hasFocus() and self._keyboard_actions:
+            self._activate_actions(self.textCursor().block())
+
+    def setHtml(self, text: str) -> None:
+        # Drop the old block before the document is replaced, then hide every
+        # action. A full rebuild used to return early (both blocks were None)
+        # and left the first character of「编辑」in the body color.
+        self._action_block = None
+        super().setHtml(text)
+        self._hide_all_actions()
+        self.reset_actions()
+
+    def _hide_all_actions(self) -> None:
+        block = self.document().begin()
+        while block.isValid():
+            self._paint_actions(block, False)
+            block = block.next()
+        self._action_block = None
+
+    def position_before_action(self, position: int) -> int:
+        """Pull a caret out of a hover action so that word cannot stay on screen."""
+        last = max(0, self.document().characterCount() - 1)
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(min(max(0, position), last))
+        while cursor.position() > 0 and cursor.charFormat().anchorHref().startswith(self._CONTEXT_LINKS):
+            cursor.setPosition(cursor.position() - 1)
+        return cursor.position()
+
+    def _paint_actions(self, block, visible: bool) -> None:
+        if block is None or not block.isValid():
+            return
+        ranges = []
+        it = block.begin()
+        while not it.atEnd():
+            fragment = it.fragment()
+            if fragment.isValid() and fragment.charFormat().anchorHref().startswith(self._CONTEXT_LINKS):
+                ranges.append((fragment.position(), fragment.length()))
+            it += 1
+        for start, length in ranges:
+            cursor = QTextCursor(self.document())
+            cursor.setPosition(start)
+            cursor.setPosition(start + length, QTextCursor.MoveMode.KeepAnchor)
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(tok.ACCENT_TEXT) if visible else QColor(Qt.GlobalColor.transparent))
+            cursor.mergeCharFormat(fmt)
+
+    def _activate_actions(self, block=None) -> None:
+        if self._action_block == block:
+            return
+        previous, self._action_block = self._action_block, block
+        self._paint_actions(previous, False)
+        self._paint_actions(block, True)
+
+    def _reveal_cursor_actions(self) -> None:
+        if self.hasFocus() and self._keyboard_actions:
+            self._activate_actions(self.textCursor().block())
+
+    def mouseMoveEvent(self, event) -> None:
+        self._keyboard_actions = False
+        self._activate_actions(self.cursorForPosition(event.pos()).block())
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if not (self.hasFocus() and self._keyboard_actions):
+            self._activate_actions()
+        super().leaveEvent(event)
+
+    def focusInEvent(self, event) -> None:
+        # A dialog closing hands focus back with ActiveWindow/Popup, not Tab.
+        # Treating that as keyboard navigation painted「编辑」onto the paragraph
+        # the caret had been restored into.
+        self._keyboard_actions = event.reason() in (
+            Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason,
+        )
+        super().focusInEvent(event)
+        self._reveal_cursor_actions()
+
+    def focusOutEvent(self, event) -> None:
+        self._activate_actions()
+        super().focusOutEvent(event)
+
+    def focusNextPrevChild(self, next: bool) -> bool:
+        self._keyboard_actions = True
+        handled = super().focusNextPrevChild(next)
+        self._reveal_cursor_actions()
+        return handled
+
+    def keyPressEvent(self, event) -> None:
+        self._keyboard_actions = True
+        super().keyPressEvent(event)
+        self._reveal_cursor_actions()
+
+    def createMimeDataFromSelection(self):
+        """Copy the spoken text. Hover actions stay clickable but out of the clipboard."""
+        from PyQt6.QtCore import QMimeData
+
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            return super().createMimeDataFromSelection()
+        start = min(cursor.selectionStart(), cursor.selectionEnd())
+        end = max(cursor.selectionStart(), cursor.selectionEnd())
+        skip = self._CONTEXT_LINKS + ("edited-segment:", "segment:", "live-segment:")
+        lines: list[str] = []
+        block = self.document().begin()
+        while block.isValid() and block.position() < end:
+            if block.position() + block.length() <= start:
+                block = block.next()
+                continue
+            pieces: list[str] = []
+            it = block.begin()
+            while not it.atEnd():
+                fragment = it.fragment()
+                if fragment.isValid():
+                    frag_start = fragment.position()
+                    left = max(start, frag_start)
+                    right = min(end, frag_start + fragment.length())
+                    if left < right:
+                        href = fragment.charFormat().anchorHref()
+                        if not href.startswith(skip):
+                            pieces.append(fragment.text()[left - frag_start:right - frag_start])
+                it += 1
+            lines.append("".join(pieces))
+            block = block.next()
+        mime = QMimeData()
+        mime.setText("\n".join(lines).strip("\n"))
+        return mime
+
+
+def _speaker_source(speaker_id: int, names: dict[int, str], auto_names: set[int]) -> str:
+    if speaker_id <= 0:
+        return "说话人待确认"
+    if speaker_id in auto_names:
+        return "姓名来自原文自报，仅作本场称呼"
+    if speaker_id in names:
+        return "此姓名由你设置"
+    return "按声音自动区分，尚未命名"
+
+
 class _SegmentSpeakerDialog(QDialog):
     def __init__(self, segment, choices: list[tuple[int | None, str]], parent=None, *, save_speaker=None, live=False):
         super().__init__(parent)
@@ -370,14 +524,16 @@ class _SegmentSpeakerDialog(QDialog):
 class _SegmentTextDialog(QDialog):
     """Keep a segment draft open until its write has been verified."""
 
-    def __init__(self, segment, *, position: str, speaker: str, save_text, parent=None):
+    def __init__(self, segment, *, position: str, speaker: str, save_text, parent=None,
+                 details: str = "", read_only: bool = False):
         super().__init__(parent)
         from sayink.ui import settings_styles as ss
 
         self._save_text = save_text
         self._original = (segment.polished_text or segment.raw_text).strip()
         self._initial = (segment.corrected_text or self._original).strip()
-        self.setWindowTitle("编辑本段文字稿")
+        self._read_only = read_only
+        self.setWindowTitle("修改详情" if details else "编辑本段文字稿")
         self.setObjectName("meetingTextCorrection")
         self.setStyleSheet(ss.WINDOW_CSS + f"""
             QDialog#meetingTextCorrection {{ background: {tok.SURFACE}; color: {tok.TEXT}; }}
@@ -397,12 +553,19 @@ class _SegmentTextDialog(QDialog):
         context.setTextFormat(Qt.TextFormat.PlainText)
         context.setWordWrap(True)
         lay.addWidget(context)
-        hint = QLabel("仅修改这一段。保存后用于纪要、原文精整、复制和导出，时间与发言人保持不变。")
+        if details:
+            self.details_label = QLabel(details)
+            self.details_label.setTextFormat(Qt.TextFormat.PlainText)
+            self.details_label.setWordWrap(True)
+            lay.addWidget(self.details_label)
+        hint = QLabel("当前只能查看。生成或收尾结束后可以再改这一段。" if read_only else
+                      "仅修改这一段。保存后用于纪要、原文精整、复制和导出，时间与发言人保持不变。")
         hint.setWordWrap(True)
         lay.addWidget(hint)
         self.editor = QPlainTextEdit()
         self.editor.setAccessibleName("本段文字稿内容")
         self.editor.setPlainText(self._initial)
+        self.editor.setReadOnly(read_only)
         lay.addWidget(self.editor, 1)
         self.original_view = QPlainTextEdit()
         self.original_view.setAccessibleName("修改前的原文")
@@ -433,6 +596,8 @@ class _SegmentTextDialog(QDialog):
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         cancel = QPushButton("取消")
+        if read_only:
+            cancel.setText("关闭")
         cancel.setStyleSheet(ss.BTN_GHOST_SM)
         cancel.clicked.connect(self.reject)
         buttons.addWidget(cancel)
@@ -444,6 +609,10 @@ class _SegmentTextDialog(QDialog):
         lay.addLayout(buttons)
         self.editor.textChanged.connect(self._sync_actions)
         self._sync_actions()
+        self.restore_btn.setVisible(not read_only)
+        self.save_btn.setVisible(not read_only)
+        if details and segment.corrected_text:
+            self.original_btn.setChecked(True)
         self.editor.setFocus()
 
     @property
@@ -453,7 +622,7 @@ class _SegmentTextDialog(QDialog):
 
     def _sync_actions(self) -> None:
         text = self.editor.toPlainText().strip()
-        self.save_btn.setEnabled(bool(text) and text != self._initial)
+        self.save_btn.setEnabled(not self._read_only and bool(text) and text != self._initial)
         self.restore_btn.setEnabled(text != self._original)
 
     def _save(self) -> None:
@@ -566,9 +735,16 @@ class MeetingPage(QWidget):
         self._refresh_timer.setInterval(400)
         self._refresh_timer.timeout.connect(self._refresh_now)
         self._pending_refresh_id = ""
+        self._listed_generating = ""
         self._live_html = ""
         self._live_meeting_id = ""
         self._setup_ui()
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(self._status_label.hide)
+        self._live_feedback_timer = QTimer(self)
+        self._live_feedback_timer.setSingleShot(True)
+        self._live_feedback_timer.timeout.connect(self._live_speaker_feedback.hide)
         self._ctrl.state_changed.connect(self._on_state_changed)
         self._ctrl.meeting_changed.connect(self._on_meeting_changed)
         self._ctrl.clock_tick.connect(self._live_clock.setText)
@@ -577,6 +753,7 @@ class MeetingPage(QWidget):
         self._ctrl.generation_finished.connect(self._on_generation_finished)
         self._ctrl.generation_failed.connect(self._on_generation_failed)
         self._ctrl.generation_cancelled.connect(self._on_generation_cancelled)
+        self._ctrl.generation_queued.connect(self._on_generation_queued)
         self.reapply_theme()
         self.refresh()
         if self._ctrl.is_active:
@@ -710,7 +887,7 @@ class MeetingPage(QWidget):
         state_lay.setSpacing(8)
         state_lay.addWidget(self._notes_state, 1)
         self._cancel_btn = QPushButton("取消")
-        self._cancel_btn.clicked.connect(self._ctrl.cancel_generation)
+        self._cancel_btn.clicked.connect(self._cancel_job)
         self._cancel_btn.hide()
         state_lay.addWidget(self._cancel_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         right_lay.addWidget(self._detail_meta)
@@ -843,7 +1020,7 @@ class MeetingPage(QWidget):
         self._notes_empty.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self._notes_stack.addWidget(self._notes_empty)
         self._content_stack.addWidget(self._notes_stack)
-        self._transcript_view = _ReadingView()
+        self._transcript_view = _TranscriptView()
         self._transcript_view.setAccessibleName("会议文字稿")
         self._transcript_view.setPlaceholderText("文字稿为空")
         self._transcript_view.setOpenLinks(False)
@@ -1010,7 +1187,7 @@ class MeetingPage(QWidget):
 
         self._live_split = QSplitter(Qt.Orientation.Horizontal)
         self._live_split.setChildrenCollapsible(False)
-        self._live_transcript = QTextBrowser()
+        self._live_transcript = _TranscriptView()
         self._live_transcript.setOpenLinks(False)
         self._live_transcript.anchorClicked.connect(self._on_live_transcript_link)
         self._live_transcript.setAccessibleName("实时文字稿")
@@ -1256,7 +1433,8 @@ class MeetingPage(QWidget):
         records = self._store.search_meetings(self._search_query) if self._search_query else self._store.list_meetings()
         self._records = {r.id: r for r in records}
         keep = self._detail_id
-        rows_key = (tuple(records), tuple(_meeting_row_text(record) for record in records),
+        minutes = self._minutes_markers()
+        rows_key = (tuple(records), tuple(_meeting_row_text(record, minutes.get(record.id, "")) for record in records),
                     tok.FONT, tok.TEXT, tok.TEXT_SEC, tok.TEXT_DIM)
         self._list.blockSignals(True)
         try:
@@ -1265,9 +1443,9 @@ class MeetingPage(QWidget):
                 for record in records:
                     item = QListWidgetItem()
                     item.setData(Qt.ItemDataRole.UserRole, record.id)
-                    item.setData(Qt.ItemDataRole.AccessibleTextRole, _meeting_row_text(record))
+                    item.setData(Qt.ItemDataRole.AccessibleTextRole, _meeting_row_text(record, minutes.get(record.id, "")))
                     item.setToolTip(record.display_title)
-                    row = self._build_list_row(record)
+                    row = self._build_list_row(record, minutes.get(record.id, ""))
                     self._list.addItem(item)
                     self._list.setItemWidget(item, row)
                     row.ensurePolished()
@@ -1306,7 +1484,16 @@ class MeetingPage(QWidget):
             self._clear_detail()
         self._detail_pane.setVisible(bool(records) or self._editing_notes)
 
-    def _build_list_row(self, record: MeetingRecord) -> QWidget:
+    def _minutes_markers(self) -> dict[str, str]:
+        """Meeting id → minutes job state shown in its list row."""
+        markers = {job.meeting_id: "纪要生成失败" if job.failed else "纪要排队中"
+                   for job in self._store.generation_queue()}
+        self._listed_generating = self._ctrl.generating_for
+        if self._listed_generating:
+            markers[self._listed_generating] = "纪要生成中"
+        return markers
+
+    def _build_list_row(self, record: MeetingRecord, minutes: str = "") -> QWidget:
         row = QWidget()
         row.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         lay = QVBoxLayout(row)
@@ -1315,7 +1502,7 @@ class MeetingPage(QWidget):
         title = _ElidedLabel(record.display_title)
         title.setObjectName("meetingRowTitle")
         lay.addWidget(title)
-        meta = _ElidedLabel(_meeting_row_meta(record))
+        meta = _ElidedLabel(_meeting_row_meta(record, minutes))
         meta.setObjectName("meetingRowMeta")
         lay.addWidget(meta)
         return row
@@ -1446,7 +1633,10 @@ class MeetingPage(QWidget):
 
         notes = self._store.get_notes(self._detail_id)
         generating = self._ctrl.generating_for == self._detail_id
-        another_generating = bool(self._ctrl.generating_for) and not generating
+        job = None if generating else self._ctrl.queued_generation(self._detail_id)
+        waiting = job is not None and not job.failed
+        retry_now = waiting and job.not_before > now_ms()
+        blocked = generating or (waiting and not retry_now)
         from sayink.ui import settings_styles as ss
 
         has_notes = notes is not None and bool(notes.markdown)
@@ -1460,14 +1650,14 @@ class MeetingPage(QWidget):
             self._generate_btn.setText("重新生成" if has_notes else "生成纪要")
             self._generate_btn.setAccessibleName(self._generate_btn.text())
             self._generate_btn.setToolTip(
-                "另一场会议正在生成，请等它结束或先取消" if another_generating else ""
+                "另一场会议正在生成；点击后排队，它完成后自动开始"
+                if self._ctrl.generating_for and not generating and not waiting else ""
             )
         self._generate_btn.setStyleSheet(ss.BTN_GHOST_SM if has_notes and configured else ss.BTN_ACCENT_SM)
-        self._generate_btn.setEnabled(
-            not generating and not another_generating and record.status != STATUS_LIVE
-        )
+        self._generate_btn.setEnabled(not blocked and record.status != STATUS_LIVE)
         self._restore_action.setEnabled(not generating and notes is not None and bool(notes.previous_markdown))
-        self._cancel_btn.setVisible(generating)
+        self._cancel_btn.setVisible(generating or waiting)
+        self._cancel_btn.setText("取消" if generating else "取消排队")
         default_template = notes.template_id if notes is not None and notes.template_id else self._config.get("meeting.template_id", "general")
         template_id = self._pending_templates.get(self._detail_id, default_template)
         index = self._template_combo.findData(template_id)
@@ -1475,11 +1665,14 @@ class MeetingPage(QWidget):
         if index >= 0:
             self._template_combo.setCurrentIndex(index)
         self._template_combo.blockSignals(False)
-        self._template_combo.setEnabled(not generating)
+        self._template_combo.setEnabled(not blocked)
         self._manage_templates_btn.setEnabled(not self._ctrl.generating_for)
         self._sync_result_actions(notes)
-        if generating and configured:
-            busy = "整理中…" if self._is_refinement() else "生成中…"
+        if (generating or waiting) and configured:
+            if generating:
+                busy = "整理中…" if self._is_refinement() else "生成中…"
+            else:
+                busy = "立即重试" if retry_now else "排队中…"
             self._generate_btn.setText(busy)
             self._generate_btn.setAccessibleName(busy)
         markdown = notes.markdown if notes is not None else ""
@@ -1609,13 +1802,34 @@ class MeetingPage(QWidget):
             state += f" · 文字稿已更正，{self._result_label()}需核对，建议重新生成"
         elif notes is not None and "（待核对）" in notes.markdown:
             state += " · 含待核对内容"
+        job = self._ctrl.queued_generation(self._detail_id) if self._detail_id else None
+        if job is not None:
+            state += " · " + self._queue_state(job)
         self._notes_state.setText(state)
-        self._notes_state.setToolTip(
-            "保留细节与语气的 AI 整理稿，可切换到文字稿核对；手动编辑不等于内容已经核实。"
-            if self._result_label() == "精整正文" else
-            "纪要根据文字稿生成；点击引用可核对来源。手动编辑不等于内容已经核实。"
-        )
+        if job is not None:
+            self._notes_state.setToolTip(
+                "自动生成没有成功，不会再自动重试；修正问题后可手动生成。" if job.failed else
+                "多场会议逐场生成，手动点的排在会后自动生成的前面；点「取消排队」可移出队列。"
+            )
+        else:
+            self._notes_state.setToolTip(
+                "保留细节与语气的 AI 整理稿，可切换到文字稿核对；手动编辑不等于内容已经核实。"
+                if self._result_label() == "精整正文" else
+                "纪要根据文字稿生成；点击引用可核对来源。手动编辑不等于内容已经核实。"
+            )
         self._paint_notes_state()
+
+    def _queue_state(self, job: QueuedGeneration) -> str:
+        reason = job.last_error.rstrip("。")
+        if job.failed:
+            return f"自动生成失败：{reason}"
+        if job.not_before > now_ms():
+            at = time.strftime("%H:%M", time.localtime(job.not_before / 1000))
+            return f"自动生成暂时失败（{reason}），{at} 自动重试"
+        if job.automatic and self._ctrl.defers_automatic_jobs():
+            return "会议进行中，本机模型空闲后自动生成"
+        position = self._ctrl.queue_position(job.meeting_id)
+        return f"排队中 · 第 {position} 位，前面的完成后自动开始" if position else "排队中"
 
     def _paint_notes_state(self) -> None:
         from sayink.ui import design_tokens as tok
@@ -1644,8 +1858,10 @@ class MeetingPage(QWidget):
         self._return_notes_btn.setVisible(transcript and bool(self._citation_return and self._citation_return[0] == self._detail_id))
         if transcript:
             hint = ("点击发言旁的「更正」修改这一段的归属。" if self._correcting_speakers else
-                    "点击「编辑」修正本段，可恢复原文；姓名无法确定时保留编号，可点击姓名手动命名。"
-                    if self._transcript_editable else "会议结束且生成完成后，可按段编辑文字稿。")
+                    "移到段落上或用 Tab 聚焦可编辑、查看详情；点击姓名可命名。"
+                    if self._transcript_editable else
+                    "正在生成，完成前不能修改文字稿。" if self._ctrl.generating_for == self._detail_id else
+                    "有可编辑的段落后，可以把鼠标移到段落上修改。")
         elif self._editing_notes:
             hint = "复制与导出使用当前草稿。切换会议或离开本页时自动保存。"
         elif self._ctrl.generating_for == self._detail_id:
@@ -1707,25 +1923,22 @@ class MeetingPage(QWidget):
         for index, line in enumerate(lines):
             label = (names.get(line.speaker_id) or f"说话人{line.speaker_id}") if line.speaker_id > 0 else "说话人待确认"
             color = speaker_color(line.speaker_id)
+            source = _speaker_source(line.speaker_id, names, auto_names)
+            speaker_tip = html.escape(source + "；点击为这一组发言命名", quote=True)
             head = f"<a name='seg{index}'></a><span style='color:{tok.TEXT_DIM}'>[{_position_label(line.offset_ms)}]</span>"
             if line.speaker_id <= 0:
                 head += f" <span style='color:{tok.TEXT_DIM}'>说话人待确认</span>"
             elif label and links and not live:
                 if line.speaker_id != previous_speaker:
-                    suffix = (" · 原文自报姓名" if line.speaker_id in auto_names else
-                              " · 手动命名" if line.speaker_id in names else " · 自动区分")
                     parts.append(
                         f"<p style='margin:10px 0 2px 0'><a href='{speaker_link}:{line.speaker_id}' "
-                        f"title='为这一组发言命名' style='color:{color}; text-decoration:none'>"
-                        f"<b>{html.escape(label)}</b></a>"
-                        f"<span style='color:{tok.TEXT_DIM}; font-size:12px'>{suffix}</span></p>"
+                        f"title='{speaker_tip}' style='color:{color}; text-decoration:none'>"
+                        f"<b>{html.escape(label)}</b></a></p>"
                     )
             elif label:
                 if live and links:
-                    head += (f" <a href='{speaker_link}:{line.speaker_id}' title='为这一组发言命名' "
+                    head += (f" <a href='{speaker_link}:{line.speaker_id}' title='{speaker_tip}' "
                              f"style='color:{color}; text-decoration:none'><b>{html.escape(label)}</b></a>")
-                    if line.speaker_id in names:
-                        head += f" <span style='color:{tok.TEXT_DIM}; font-size:12px'>手动命名</span>"
                 else:
                     head += f" <b style='color:{color}'>{html.escape(label)}</b>"
             background = f" background-color:{tok.HIGHLIGHT_BG};" if index == highlight else ""
@@ -1733,16 +1946,22 @@ class MeetingPage(QWidget):
             if links and index < len(sequences):
                 seq = sequences[index]
                 if not live and seq in self._corrected_sequences:
-                    head += f" <span style='color:{tok.TEXT_DIM}; font-size:12px'>已修改</span>"
-                if seq in locked:
-                    head += f" <span style='color:{tok.TEXT_DIM}; font-size:12px'>归属已更正</span>"
+                    head += (f" <a href='edited-segment:{seq}' title='查看修改详情与原文，可恢复原文' "
+                             f"style='color:{tok.TEXT_DIM}; font-size:12px; text-decoration:none'>已编辑</a>")
                 if correcting:
                     correction = f" <a href='{segment_link}:{seq}' style='color:{tok.ACCENT_TEXT}'>更正</a>"
                 elif not live and self._transcript_editable:
                     correction = (f" <a href='edit-segment:{seq}' title='编辑这一段文字稿' "
-                                  f"style='color:{tok.ACCENT_TEXT}; text-decoration:none'>编辑</a>")
+                                  "style='color:transparent; text-decoration:none'>编辑</a>")
+                elif live and self._ctrl.state in (MeetingState.LIVE, MeetingState.PAUSED):
+                    correction = (f" <a href='live-edit:{seq}' title='编辑这一段文字稿' "
+                                  "style='color:transparent; text-decoration:none'>编辑</a>")
+                if seq in locked and (live or seq not in self._corrected_sequences):
+                    detail_link = "live-details" if live else "details-segment"
+                    correction += (f" <a href='{detail_link}:{seq}' title='查看姓名来源与归属更正' "
+                                   "style='color:transparent; text-decoration:none'>修改详情</a>")
             text = html.escape(line.text).replace("\n", "<br>")
-            parts.append(f"<p style='margin:0 0 6px 0;{background}'>{head}{correction}&nbsp; {text}</p>")
+            parts.append(f"<p style='margin:0 0 6px 0;{background}'>{head}&nbsp; {text}{correction}</p>")
             previous_speaker = line.speaker_id
         return "".join(parts)
 
@@ -1772,9 +1991,12 @@ class MeetingPage(QWidget):
         self._switch_tab(0)
         self._notes_view.restore_reading_position(value)
 
-    def _set_status(self, text: str) -> None:
+    def _set_status(self, text: str, *, transient: bool = False) -> None:
+        self._status_timer.stop()
         self._status_label.setText(text)
         self._status_label.setVisible(bool(text))
+        if text and transient:
+            self._status_timer.start(4000)
 
     # ── detail actions ────────────────────────────────────────────
 
@@ -1789,12 +2011,10 @@ class MeetingPage(QWidget):
         self.refresh()
 
     def _generate(self) -> None:
-        if not self._detail_id:
+        if not self._detail_id or self._ctrl.generating_for == self._detail_id:
             return
-        if self._ctrl.generating_for and self._ctrl.generating_for != self._detail_id:
-            self._set_status("另一场会议正在生成，请等它结束或先取消")
-            return
-        if self._ctrl.generating_for == self._detail_id:
+        job = self._ctrl.queued_generation(self._detail_id)
+        if job is not None and not job.failed and job.not_before <= now_ms():
             return
         if not minutes_settings_complete(self._config):
             self.configure_requested.emit()
@@ -1865,9 +2085,17 @@ class MeetingPage(QWidget):
         self._sync_copy_action()
         self._sync_content_hint()
 
+    def _cancel_job(self) -> None:
+        if self._detail_id:
+            self._ctrl.remove_from_queue(self._detail_id)
+
     def _on_generation_progress(self, meeting_id: str, text: str) -> None:
         if meeting_id == self._detail_id:
             self._set_status(text)
+        if meeting_id != self._listed_generating:
+            # A queued job just started: its list row changes too.
+            self.refresh()
+        elif meeting_id == self._detail_id:
             self._render_detail()
 
     def _on_generation_preview(self, meeting_id: str, text: str) -> None:
@@ -1896,14 +2124,17 @@ class MeetingPage(QWidget):
         self.refresh()
 
     def _on_generation_failed(self, meeting_id: str, message: str) -> None:
+        self.refresh()
         if meeting_id == self._detail_id:
-            self._render_detail()
             self._set_status(f"{'原文整理' if self._is_refinement() else '纪要生成'}失败：{message}")
 
     def _on_generation_cancelled(self, meeting_id: str) -> None:
+        self.refresh()
         if meeting_id == self._detail_id:
-            self._render_detail()
             self._set_status(f"已取消{'原文整理' if self._is_refinement() else '纪要生成'}，上一版纪要保持不变。")
+
+    def _on_generation_queued(self, meeting_id: str) -> None:
+        self.refresh()
 
     def _save_notes_draft(self) -> bool:
         if not self._editing_notes or not self._detail_id:
@@ -2012,12 +2243,22 @@ class MeetingPage(QWidget):
             self._prompt_segment_speaker(int(url.path()))
         elif url.scheme() == "edit-segment" and url.path().isdigit():
             self._prompt_segment_text(int(url.path()))
+        elif url.scheme() in ("edited-segment", "details-segment") and url.path().isdigit():
+            self._prompt_segment_text(int(url.path()), details=True)
 
-    def _prompt_segment_text(self, seq: int) -> None:
-        record = self._store.get_meeting(self._detail_id) if self._detail_id else None
-        if record is None or record.status == STATUS_LIVE or self._ctrl.generating_for == record.id:
+    def _prompt_segment_text(self, seq: int, *, details: bool = False, meeting_id: str | None = None) -> None:
+        meeting_id = meeting_id or self._detail_id
+        record = self._store.get_meeting(meeting_id) if meeting_id else None
+        if record is None:
             return
-        if not self._save_notes_draft():
+        generating = self._ctrl.generating_for == record.id
+        live_session = record.status == STATUS_LIVE and self._ctrl.current_id == record.id
+        draining = live_session and self._ctrl.state is MeetingState.DRAINING
+        live_editable = live_session and self._ctrl.state in (MeetingState.LIVE, MeetingState.PAUSED) and not generating
+        read_only = generating or draining or (record.status == STATUS_LIVE and (details or not live_editable))
+        if read_only and not details:
+            return
+        if not read_only and not self._save_notes_draft():
             return
         segment = next((s for s in self._store.get_segments(record.id) if s.seq == seq), None)
         if segment is None:
@@ -2028,16 +2269,33 @@ class MeetingPage(QWidget):
             return
         speaker = ((names.get(line[0].speaker_id) or f"说话人{line[0].speaker_id}")
                    if line[0].speaker_id > 0 else "说话人待确认")
+        detail_text = ""
+        if details:
+            auto_names = {s.speaker_id for s in self._store.get_speakers(record.id)
+                          if s.suggested_name and not s.display_name and not s.name_locked}
+            detail_text = "姓名来源：" + _speaker_source(segment.speaker_id, names, auto_names)
+            if segment.speaker_locked:
+                detail_text += "\n发言归属：已手动更正，仅作用于本段。"
+            if segment.corrected_text:
+                detail_text += "\n正文：已编辑，修改前的原文保留如下。"
         dialog = _SegmentTextDialog(
             segment, position=_position_label(line[0].offset_ms), speaker=speaker,
             save_text=lambda text: self._ctrl.save_segment_text(record.id, seq, text), parent=self,
+            details=detail_text, read_only=read_only,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self._render_detail()
             action = "已恢复这一段的原文" if dialog.corrected_text is None else "已保存这一段的修改"
+            if self._stack.currentIndex() == PAGE_LIVE and self._ctrl.current_id == record.id:
+                self._render_live()
+                self._live_feedback_timer.stop()
+                self._live_speaker_feedback.setText(action + "。")
+                self._live_speaker_feedback.show()
+                self._live_feedback_timer.start(4000)
+                return
+            self._render_detail()
             notes = self._store.get_notes(record.id)
             hint = f"；已有{self._result_label()}保留，建议重新生成。" if notes is not None and notes.markdown else "。"
-            self._set_status(action + hint)
+            self._set_status(action + hint, transient=True)
 
     def _toggle_speaker_correction(self, enabled: bool) -> None:
         self._correcting_speakers = enabled
@@ -2068,7 +2326,7 @@ class MeetingPage(QWidget):
         dialog = _SegmentSpeakerDialog(segment, choices, self, save_speaker=save, live=live)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._speaker_edit_status(record.id, "已更正这一段的发言人，人工更正会保留。" if live else
-                                      "已更正这一段的发言人；请核对纪要中的相关归属。")
+                                      "已更正这一段的发言人；请核对纪要中的相关归属。", transient=True)
 
     def _prompt_rename_speaker(self, speaker_id: int, *, meeting_id: str | None = None) -> None:
         meeting_id = meeting_id or self._detail_id
@@ -2107,16 +2365,20 @@ class MeetingPage(QWidget):
         if self._ctrl.rename_speaker(meeting_id, speaker_id, name) is None:
             self._speaker_edit_status(meeting_id, "姓名尚未保存，请在整理完成后重试。")
             return
-        self._speaker_edit_status(meeting_id, f"已将说话人{speaker_id}改为「{name}」" if name else f"已恢复「说话人{speaker_id}」")
+        self._speaker_edit_status(meeting_id, f"已将说话人{speaker_id}改为「{name}」" if name else
+                                  f"已恢复「说话人{speaker_id}」", transient=True)
 
-    def _speaker_edit_status(self, meeting_id: str, text: str) -> None:
+    def _speaker_edit_status(self, meeting_id: str, text: str, *, transient: bool = False) -> None:
         if self._stack.currentIndex() == PAGE_LIVE and self._live_meeting_id == meeting_id:
+            self._live_feedback_timer.stop()
             self._render_live()
             self._live_speaker_feedback.setText(text)
             self._live_speaker_feedback.show()
+            if transient:
+                self._live_feedback_timer.start(4000)
         elif self._detail_id == meeting_id:
             self._render_detail()
-            self._set_status(text)
+            self._set_status(text, transient=transient)
 
     def _populate_live_speaker_menu(self) -> None:
         meeting_id = self._ctrl.current_id
@@ -2141,6 +2403,10 @@ class MeetingPage(QWidget):
             self._prompt_rename_speaker(int(url.path()), meeting_id=meeting_id)
         elif url.scheme() == "live-segment" and self._live_correcting_speakers:
             self._prompt_segment_speaker(int(url.path()), meeting_id=meeting_id)
+        elif url.scheme() == "live-edit":
+            self._prompt_segment_text(int(url.path()), meeting_id=meeting_id)
+        elif url.scheme() == "live-details":
+            self._prompt_segment_text(int(url.path()), details=True, meeting_id=meeting_id)
 
     # ── start card ────────────────────────────────────────────────
 
@@ -2290,6 +2556,7 @@ class MeetingPage(QWidget):
             self._live_speaker_menu.clear()
             self._live_speaker_feedback.clear()
             self._live_speaker_feedback.hide()
+            self._live_feedback_timer.stop()
         self._live_title.setText(record.display_title if record is not None else "会议进行中")
         self._live_clock.setText(self._ctrl.elapsed_text())
         caps = self._ctrl.capabilities
@@ -2381,7 +2648,7 @@ class MeetingPage(QWidget):
         self._live_correct_speaker_btn.setText("完成纠正" if self._live_correcting_speakers else "纠正发言人")
         self._live_speaker_hint.setText(
             "点击目标段落旁的「更正」修改归属，人工更正会保留。" if self._live_correcting_speakers else
-            "点击姓名可命名；人工更正会保留，清晰的声音可帮助判断后续发言。"
+            "移到已出现的段落上可改文字；点击姓名可命名。还在识别的这一句要等落段后才能改。"
         )
         bar = self._live_transcript.verticalScrollBar()
         cursor = self._live_transcript.textCursor()
@@ -2404,8 +2671,10 @@ class MeetingPage(QWidget):
                 self._live_transcript.setHtml(rendered)
             cursor = self._live_transcript.textCursor()
             last = self._live_transcript.document().characterCount() - 1
-            cursor.setPosition(min(anchor, last))
-            cursor.setPosition(min(position, last), QTextCursor.MoveMode.KeepAnchor)
+            anchor = self._live_transcript.position_before_action(min(anchor, last))
+            position = self._live_transcript.position_before_action(min(position, last))
+            cursor.setPosition(anchor)
+            cursor.setPosition(position, QTextCursor.MoveMode.KeepAnchor)
             self._live_transcript.setTextCursor(cursor)
             bar.setValue(bar.maximum() if at_end and position == anchor else scroll)
         marks = self._store.get_marks(meeting_id)

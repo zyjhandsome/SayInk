@@ -38,6 +38,89 @@ def test_one_person_without_pauses_stays_one_turn():
     assert result[0].start == 0 and result[0].stop == len(audio)
 
 
+def _bursty(seconds=4.8):
+    """Speech shorter than a 1.2 s window can prove, with enough of it overall.
+
+    Each burst is 0.35 s and the gap is 0.95 s, so no analysis window contains
+    the 1.0 s of loud frames ``voice_sample_is_clear`` requires. The whole clip
+    still does.
+    """
+    speech = int(0.35 * RATE)
+    gap = int(0.95 * RATE)
+    total = int(seconds * RATE)
+    cycle = np.concatenate((
+        np.full(speech, 0.1, dtype=np.float32),
+        np.zeros(gap, dtype=np.float32),
+    ))
+    repeats = int(np.ceil(total / len(cycle)))
+    return np.tile(cycle, repeats)[:total]
+
+
+def test_a_clear_opening_without_a_stable_window_can_seed_a_speaker():
+    """The first utterance is often longer than 2.8 s and full of short pauses.
+
+    Missing window anchors must not force the whole clear clip to stay unknown,
+    or the meeting cannot open speaker 1.
+    """
+    from sayink.meeting_speakers import MeetingSpeakerSession, voice_sample_is_clear
+    from sayink.speaker_turns import HOP_SEC, WINDOW_SEC
+
+    audio = _bursty()
+    window = int(WINDOW_SEC * RATE)
+    hop = int(HOP_SEC * RATE)
+    assert audio.size >= 2 * window + hop
+    assert voice_sample_is_clear(audio)
+    assert not any(
+        voice_sample_is_clear(audio[start:start + window])
+        for start in range(0, audio.size - window + 1, hop)
+    )
+    result = SpeakerTurnDetector(Embedder())(audio)
+    assert len(result) == 1 and result[0].learnable
+    assert result[0].start == 0 and result[0].stop == len(audio)
+    assert np.any(result[0].embedding)
+
+    session = MeetingSpeakerSession(threshold=0.55, margin=0.08, keep_history=True)
+    assert session.assign(result[0].embedding, sample_key=1, learnable=result[0].learnable) == 1
+
+
+def test_overlap_still_blocks_seeding_when_no_window_is_stable():
+    class Guard:
+        def analyze(self, audio, **kwargs):
+            return ActivityEvidence(overlaps=((0, len(audio)),))
+
+    model = Embedder()
+    model.activity_guard = Guard()
+    result = SpeakerTurnDetector(model)(_bursty())
+    assert len(result) == 1 and not result[0].learnable
+    assert not np.any(result[0].embedding)
+
+
+def test_a_safe_activity_check_can_seed_a_clear_clip_with_no_stable_window():
+    class Guard:
+        def analyze(self, audio, **kwargs):
+            return ActivityEvidence()
+
+    model = Embedder()
+    model.activity_guard = Guard()
+    result = SpeakerTurnDetector(model)(_bursty())
+    assert len(result) == 1 and result[0].learnable
+    assert np.any(result[0].embedding)
+
+
+def test_activity_cuts_do_not_split_a_clip_that_never_formed_an_anchor():
+    class Guard:
+        def analyze(self, audio, **kwargs):
+            return ActivityEvidence(cuts=(2 * RATE,))
+
+    model = Embedder()
+    model.activity_guard = Guard()
+    audio = _bursty()
+    result = SpeakerTurnDetector(model)(audio)
+    assert [(t.start, t.stop) for t in result] == [(0, len(audio))]
+    assert not result[0].learnable
+    assert np.any(result[0].embedding)
+
+
 def test_two_people_with_no_silence_are_split_without_audio_loss():
     audio = np.concatenate([voice(1), voice(2)])
     result = SpeakerTurnDetector(Embedder())(audio)

@@ -299,12 +299,14 @@ def test_ui_labels_source_of_name_and_copy_uses_it(naming, config):
     try:
         page.show_meeting(record.id)
         plain = page._transcript_view.toPlainText()
-        assert "张三" in plain and "原文自报姓名" in plain and "说话人2" in plain
+        assert "张三" in plain and "原文自报姓名" not in plain and "说话人2" in plain
+        assert "姓名来自原文自报" in page._transcript_view.document().find("张三").charFormat().toolTip()
         assert "张三负责" in page._notes_view.toPlainText()
         page._tab_transcript.click()
-        assert "无法确定时保留编号" in page._content_hint.text()
+        assert "点击姓名可命名" in page._content_hint.text()
         page._rename_speaker(1, "主持人")
-        assert "主持人" in page._transcript_view.toPlainText() and "手动命名" in page._transcript_view.toPlainText()
+        assert "主持人" in page._transcript_view.toPlainText() and "手动命名" not in page._transcript_view.toPlainText()
+        assert "此姓名由你设置" in page._transcript_view.document().find("主持人").charFormat().toolTip()
     finally:
         page.deleteLater()
 

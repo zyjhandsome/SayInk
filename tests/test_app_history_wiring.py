@@ -964,3 +964,73 @@ def test_model_load_hint_uses_last_measured_duration() -> None:
 
         app._on_model_load_progress(ModelLoadPhase.LOADING, "正在加载 SenseVoice…")
         assert "上次用时约 12 秒" in h["floating"].show_model_loading.call_args[0][0]
+
+
+def test_history_conflict_cancel_does_not_start_or_change_settings(monkeypatch):
+    from PyQt6.QtWidgets import QMessageBox
+
+    shown = {}
+
+    def exec_(box):
+        shown["default"] = box.defaultButton().text()
+        cancel = next(button for button in box.buttons() if button.text() == "取消")
+        shown["cancel_name"] = cancel.accessibleName()
+        shown["labels"] = [button.text() for button in box.buttons()]
+
+    monkeypatch.setattr(QMessageBox, "exec", exec_)
+    with app_harness({"audio.trigger_mode": "hotkey", "output.mode": "history", "history.enabled": False}) as h:
+        h["app"]._on_recording_start()
+        assert h["floating"].call_when_painted.call_count == 0
+        assert h["app"]._config.get("history.enabled") is False
+        assert h["app"]._config.history_only_output()
+        assert shown["default"] == "开启历史"
+        assert shown["cancel_name"] == "取消"
+        assert set(shown["labels"]) == {"开启历史", "改为输入光标", "取消"}
+
+
+def test_enabling_history_lets_the_hold_start(monkeypatch):
+    with app_harness({"audio.trigger_mode": "hotkey", "output.mode": "history", "history.enabled": False}) as h:
+        monkeypatch.setattr(h["app"], "_ask_history_output_conflict", lambda: "history", raising=False)
+        h["app"]._on_recording_start()
+        assert h["app"]._config.get("history.enabled") is True
+        assert h["app"]._config.history_only_output()
+        assert h["floating"].call_when_painted.call_count == 1
+        slots = h["app"]._config.get("output.by_mode") or {}
+        assert "continuous" not in slots
+
+
+def test_paste_choice_changes_only_the_active_mode_and_then_starts(monkeypatch):
+    with app_harness({"audio.trigger_mode": "hotkey", "output.mode": "history", "history.enabled": False}) as h:
+        monkeypatch.setattr(h["app"], "_ask_history_output_conflict", lambda: "paste", raising=False)
+        h["app"]._on_recording_start()
+        assert h["app"]._config.output_mode() == "paste"
+        assert h["app"]._config.get("history.enabled") is False
+        assert h["floating"].call_when_painted.call_count == 1
+        slots = h["app"]._config.get("output.by_mode") or {}
+        assert "continuous" not in slots
+
+
+def test_continuous_conflict_cancel_does_not_open_the_microphone(monkeypatch):
+    from PyQt6.QtCore import QTimer
+
+    scheduled = []
+    monkeypatch.setattr(QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+    with app_harness({"audio.trigger_mode": "continuous", "output.mode": "history", "history.enabled": False}) as h:
+        monkeypatch.setattr(h["app"], "_ask_history_output_conflict", lambda: "cancel", raising=False)
+        h["app"]._start_continuous_listening()
+        assert scheduled == []
+        h["recorder"].start_continuous.assert_not_called()
+
+
+def test_meeting_start_does_not_ask_about_the_dictation_history_conflict(monkeypatch):
+    from sayink.meeting_session import MeetingOptions
+
+    with app_harness({"output.mode": "history", "history.enabled": False}) as h:
+        asked = []
+        monkeypatch.setattr(
+            h["app"], "_ask_history_output_conflict", lambda: asked.append("ask") or "cancel", raising=False,
+        )
+        monkeypatch.setattr(h["app"], "_meeting_refusal", lambda _options: "测试中不真正开会")
+        started = h["app"].start_meeting(MeetingOptions())
+        assert started is False
+        assert asked == []

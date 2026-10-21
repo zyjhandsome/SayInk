@@ -8,10 +8,15 @@ the seams (``begin`` / ``request_end`` / ``finalize``).
 State machine (docs/meeting-notes-design.md §5.3)::
 
     IDLE → LIVE ⇄ PAUSED → DRAINING → ENDED → (GENERATING) → ENDED
+
+Minutes run one meeting at a time from a persistent queue: user requests
+first, then automatic end-of-meeting jobs in order
+(docs/meeting-generation-reliability.md「排队与自动生成」).
 """
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import json
 import re
@@ -26,12 +31,16 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from sayink.config import Config
 from sayink.history_store import HistoryStore
 from sayink.meeting_store import (
+    QUEUE_PRIORITY_AUTO,
+    QUEUE_PRIORITY_USER,
     STATUS_ENDED,
     STATUS_INTERRUPTED,
     STATUS_LIVE,
     MeetingNotes,
     MeetingRecord,
     MeetingStore,
+    QueuedGeneration,
+    now_ms,
 )
 from sayink.minutes_generator import MinutesGenerator, MinutesRequest, MinutesResult, request_fingerprint
 from sayink.minutes_prompts import (
@@ -66,6 +75,12 @@ from sayink.text_polisher import is_local_endpoint, polish_settings_complete
 from sayink.vad_segmenter import VAD_ENERGY, VAD_SILERO
 
 log = logging.getLogger("SayInk")
+
+# Shorter transcripts are not worth an automatic request (and make hollow minutes).
+AUTO_MIN_TRANSCRIPT_CHARS = 200
+# Waits before re-running an automatic job after a transient failure; after
+# the last one the job is left for the user.
+AUTO_RETRY_DELAYS_MS = (60_000, 300_000)
 
 
 class MeetingState(Enum):
@@ -182,6 +197,34 @@ def minutes_settings_complete(config: Config) -> bool:
     return polish_settings_complete(*minutes_settings(config))
 
 
+def remote_host_needing_confirmation(config: Config) -> str:
+    """Hostname when the minutes endpoint is remote and not yet confirmed."""
+    api_url, _key, _model = minutes_settings(config)
+    if not api_url or is_local_endpoint(api_url):
+        return ""
+    host = (urlparse(api_url).hostname or "").lower()
+    confirmed = {str(h).lower() for h in (config.get("meeting.confirmed_remote_hosts", []) or [])}
+    return "" if not host or host in confirmed else host
+
+
+def confirm_remote_host(config: Config, host: str) -> None:
+    hosts = list(config.get("meeting.confirmed_remote_hosts", []) or [])
+    if host and host not in hosts:
+        hosts.append(host)
+        config.set("meeting.confirmed_remote_hosts", hosts)
+
+
+def runs_on_this_machine(url: str) -> bool:
+    """A loopback model shares the CPU / GPU with live speech recognition."""
+    host = (urlparse((url or "").strip()).hostname or "").strip("[]").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 class MeetingController(QObject):
     state_changed = pyqtSignal(object)          # MeetingState
     meeting_started = pyqtSignal(str)           # meeting_id
@@ -193,6 +236,7 @@ class MeetingController(QObject):
     generation_finished = pyqtSignal(str)       # meeting_id
     generation_failed = pyqtSignal(str, str)    # meeting_id, message
     generation_cancelled = pyqtSignal(str)      # meeting_id (user cancelled; not a failure)
+    generation_queued = pyqtSignal(str)         # meeting_id waits in the queue (new, deferred or retrying)
     notice = pyqtSignal(str, str)               # title, detail (for bar / tray)
 
     def __init__(
@@ -229,6 +273,9 @@ class MeetingController(QObject):
         self._generator.error.connect(self._on_generation_error)
         self._generating_for = ""
         self.generation_preview_text = ""
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.timeout.connect(self._pump_queue)
         self._history.add_committed_callback(self._on_history_committed_threadsafe)
 
     # -- accessors -----------------------------------------------------------
@@ -323,9 +370,26 @@ class MeetingController(QObject):
         self._paused_detail = ""
         self._set_state(MeetingState.LIVE)
         self._clock.start()
+        self._yield_local_model()
         self.meeting_started.emit(record.id)
         self.meeting_changed.emit(record.id)
         return record
+
+    def _yield_local_model(self) -> None:
+        """A model on this machine would slow live recognition into a backlog
+        pause. An automatic job steps aside (finished parts stay checkpointed)
+        and resumes when the meeting ends; a user request keeps running."""
+        meeting_id = self._generating_for
+        if not meeting_id or not runs_on_this_machine(minutes_settings(self._config)[0]):
+            return
+        job = self._store.queued_generation(meeting_id)
+        if job is None or not job.automatic:
+            return
+        log.info("会议开始，本机纪要模型让出资源，会议 %s 的纪要稍后继续", meeting_id[:8])
+        self._generating_for = ""
+        self.generation_preview_text = ""
+        self._generator.cancel()
+        self.generation_queued.emit(meeting_id)
 
     def pause(self, detail: str = "") -> None:
         if self._state is MeetingState.PAUSED:
@@ -382,6 +446,7 @@ class MeetingController(QObject):
         self._apply_recluster(meeting_id)
         self._store.flush()
         self.auto_name_speakers(meeting_id)
+        self._enqueue_automatic(meeting_id)
         self._speakers = None
         self._embedder = None
         self._current = self._store.get_meeting(meeting_id) or MeetingRecord(
@@ -396,6 +461,7 @@ class MeetingController(QObject):
         self._capabilities = None
         self._started_wall_ms = 0
         self._set_state(MeetingState.IDLE)
+        self._pump_queue()
 
     def _apply_recluster(self, meeting_id: str) -> None:
         """End-of-meeting pass: cluster every turn and re-assign each segment.
@@ -573,10 +639,14 @@ class MeetingController(QObject):
         return True
 
     def save_segment_text(self, meeting_id: str, seq: int, text: str | None) -> bool:
-        """Edit only a completed meeting segment; None restores its original text."""
+        """Edit one stored segment. Live and paused meetings can edit segments already written."""
         record = self._store.get_meeting(meeting_id)
-        if (record is None or record.status not in (STATUS_ENDED, STATUS_INTERRUPTED)
-                or self._generating_for == meeting_id or (text is not None and not text.strip())):
+        if record is None or self._generating_for == meeting_id or (text is not None and not text.strip()):
+            return False
+        if record.status == STATUS_LIVE:
+            if self.current_id != meeting_id or self._state not in (MeetingState.LIVE, MeetingState.PAUSED):
+                return False
+        elif record.status not in (STATUS_ENDED, STATUS_INTERRUPTED):
             return False
         segment = next((s for s in self._store.get_segments(meeting_id) if s.seq == seq), None)
         if segment is None:
@@ -697,6 +767,11 @@ class MeetingController(QObject):
         saved = self._store.get_notes(meeting_id)
         if saved is None or saved.markdown != markdown:
             return False
+        job = self._store.queued_generation(meeting_id)
+        if job is not None and job.automatic and meeting_id != self._generating_for:
+            # Hand-written notes are never replaced by an automatic run.
+            self._store.dequeue_generation(meeting_id)
+            self._store.flush()
         self.meeting_changed.emit(meeting_id)
         return True
 
@@ -721,9 +796,11 @@ class MeetingController(QObject):
         if self._generating_for == meeting_id:
             self._generator.cancel()
             self._generating_for = ""
+            self.generation_preview_text = ""
         self._store.delete_meeting(meeting_id)
         self._store.flush()
         self.meeting_changed.emit(meeting_id)
+        self._pump_queue()
 
     # -- export ----------------------------------------------------------------
 
@@ -753,19 +830,10 @@ class MeetingController(QObject):
         return [t for t in custom if isinstance(t, dict)]
 
     def remote_host_needing_confirmation(self) -> str:
-        """Hostname when the minutes endpoint is remote and not yet confirmed."""
-        api_url, _key, _model = minutes_settings(self._config)
-        if not api_url or is_local_endpoint(api_url):
-            return ""
-        host = (urlparse(api_url).hostname or "").lower()
-        confirmed = {str(h).lower() for h in (self._config.get("meeting.confirmed_remote_hosts", []) or [])}
-        return "" if not host or host in confirmed else host
+        return remote_host_needing_confirmation(self._config)
 
     def confirm_remote_host(self, host: str) -> None:
-        hosts = list(self._config.get("meeting.confirmed_remote_hosts", []) or [])
-        if host and host not in hosts:
-            hosts.append(host)
-            self._config.set("meeting.confirmed_remote_hosts", hosts)
+        confirm_remote_host(self._config, host)
 
     def transcript_char_count(self, meeting_id: str) -> int:
         record = self._store.get_meeting(meeting_id)
@@ -774,42 +842,134 @@ class MeetingController(QObject):
         lines = transcript_lines(self._store.get_segments(meeting_id), record.started_at)
         return sum(len(line.text) for line in lines)
 
+    def auto_generate_enabled(self) -> bool:
+        return bool(self._config.get("meeting.auto_generate", False))
+
+    def queued_generation(self, meeting_id: str) -> QueuedGeneration | None:
+        return self._store.queued_generation(meeting_id)
+
+    def defers_automatic_jobs(self) -> bool:
+        """Automatic jobs on a model on this machine wait for the live meeting to end."""
+        return self.is_active and runs_on_this_machine(minutes_settings(self._config)[0])
+
+    def queue_position(self, meeting_id: str) -> int:
+        """1-based place among jobs waiting to run; 0 when not waiting."""
+        waiting = [job.meeting_id for job in self._store.generation_queue()
+                   if not job.failed and job.meeting_id != self._generating_for]
+        return waiting.index(meeting_id) + 1 if meeting_id in waiting else 0
+
     def generate(self, meeting_id: str, *, template_id: str | None = None, model_name: str | None = None) -> bool:
-        """Start minutes generation; False (with ``generation_failed``) when
+        """User request: start now, or queue ahead of automatic jobs while
+        another meeting generates. False (with ``generation_failed``) when
         the configuration or the transcript makes it impossible."""
+        if self._generating_for == meeting_id:
+            return False
+        template_id = template_id or record_template_id(self._config, self._store.get_notes(meeting_id))
         if self._generating_for:
-            # One worker, and its result is stored against this id. Starting
-            # another meeting here would cancel the first and can file the
-            # finished text under the wrong meeting.
-            if self._generating_for != meeting_id:
-                self.generation_failed.emit(
-                    meeting_id, "另一场会议正在生成，请等它结束或先取消",
-                )
+            # One worker, and its result is stored against the running id.
+            problem = self._generation_problem(self._store.get_meeting(meeting_id), template_id, model_name)
+        else:
+            problem = self._start(meeting_id, template_id, model_name)
+        if problem:
+            self.generation_failed.emit(meeting_id, problem)
             return False
-        record = self._store.get_meeting(meeting_id)
+        self._store.enqueue_generation(meeting_id, template_id, priority=QUEUE_PRIORITY_USER)
+        self._store.flush()
+        if self._generating_for != meeting_id:
+            self.generation_queued.emit(meeting_id)
+        return True
+
+    def resume_generation_queue(self) -> None:
+        """Startup: continue jobs a quit or crash interrupted."""
+        self._pump_queue()
+
+    def _enqueue_automatic(self, meeting_id: str) -> None:
+        if not self.auto_generate_enabled() or not minutes_settings_complete(self._config):
+            return
+        if self.transcript_char_count(meeting_id) < AUTO_MIN_TRANSCRIPT_CHARS:
+            log.info("会议 %s 内容过短，不自动生成纪要", meeting_id[:8])
+            return
+        template_id = str(self._config.get("meeting.template_id", GENERAL_TEMPLATE_ID) or GENERAL_TEMPLATE_ID)
+        self._store.enqueue_generation(meeting_id, template_id, priority=QUEUE_PRIORITY_AUTO)
+        self._store.flush()
+        self.generation_queued.emit(meeting_id)
+
+    def _pump_queue(self) -> None:
+        """Start the next runnable job: one at a time, user requests first."""
+        self._retry_timer.stop()
+        if self._generating_for or self._store.disabled:
+            return
+        now = now_ms()
+        wake = 0
+        for job in self._store.generation_queue():
+            if job.automatic:
+                notes = self._store.get_notes(job.meeting_id)
+                if not self.auto_generate_enabled() or (notes is not None and notes.markdown.strip()):
+                    # Switched off since, or the user already has notes: never overwrite them.
+                    self._store.dequeue_generation(job.meeting_id)
+                    continue
+            if job.failed or (job.automatic and self.defers_automatic_jobs()):
+                continue
+            if job.not_before > now:
+                wake = min(wake or job.not_before, job.not_before)
+                continue
+            host = self.remote_host_needing_confirmation()
+            problem = (f"文字稿未发送：{host} 尚未确认。可在会议页点「生成纪要」确认后发送" if host
+                       else self._start(job.meeting_id, job.template_id))
+            if not problem:
+                return
+            self._record_failure(job.meeting_id, problem, transient=False)
+        self._store.flush()
+        if wake:
+            self._retry_timer.start(max(1000, wake - now))
+
+    def _record_failure(self, meeting_id: str, message: str, *, transient: bool) -> None:
+        """Automatic jobs retry transient failures after a wait, then stay
+        queued as failed for the user; user requests are reported and dropped."""
+        job = self._store.queued_generation(meeting_id)
+        automatic = job is not None and job.automatic
+        if automatic and transient and job.attempts < len(AUTO_RETRY_DELAYS_MS):
+            delay = AUTO_RETRY_DELAYS_MS[job.attempts]
+            self._store.reschedule_generation(meeting_id, attempts=job.attempts + 1,
+                                              not_before=now_ms() + delay, last_error=message)
+            self._store.flush()
+            log.info("会议 %s 纪要自动生成暂时失败，%d 秒后重试: %s", meeting_id[:8], delay // 1000, message)
+            self.generation_queued.emit(meeting_id)
+            return
+        if automatic:
+            self._store.fail_generation(meeting_id, message)
+        else:
+            self._store.dequeue_generation(meeting_id)
+        self._store.flush()
+        self.generation_failed.emit(meeting_id, message)
+
+    def _generation_problem(self, record: MeetingRecord | None, template_id: str, model_name: str | None) -> str:
         if record is None:
-            self.generation_failed.emit(meeting_id, "会议不存在")
-            return False
+            return "会议不存在"
         if record.status == STATUS_LIVE:
-            self.generation_failed.emit(meeting_id, "会议仍在进行，请先结束后再生成")
-            return False
+            return "会议仍在进行，请先结束后再生成"
+        api_url, api_key, default_model = minutes_settings(self._config)
+        if not polish_settings_complete(api_url, api_key, (model_name or "").strip() or default_model):
+            return "未配置纪要模型：请在 设置 → AI 服务 填写接口地址、密钥与模型"
+        template = get_template(template_id, self._custom_templates())
+        if not transcript_lines(self._store.get_segments(record.id), record.started_at,
+                                prefer_polished=not template.is_refinement):
+            return "文字稿为空，无法整理原文" if template.is_refinement else "文字稿为空，无法生成纪要"
+        return ""
+
+    def _start(self, meeting_id: str, template_id: str, model_name: str | None = None) -> str:
+        """Dispatch one job to the worker; the reason when it cannot start."""
+        record = self._store.get_meeting(meeting_id)
+        problem = self._generation_problem(record, template_id, model_name)
+        if problem:
+            return problem
         api_url, api_key, default_model = minutes_settings(self._config)
         model = (model_name or "").strip() or default_model
-        if not polish_settings_complete(api_url, api_key, model):
-            self.generation_failed.emit(meeting_id, "未配置纪要模型：请在 设置 → AI 服务 填写接口地址、密钥与模型")
-            return False
-        template = get_template(
-            template_id or record_template_id(self._config, self._store.get_notes(meeting_id)),
-            self._custom_templates(),
-        )
+        template = get_template(template_id, self._custom_templates())
         segments = self._store.get_segments(meeting_id)
         lines: list[TranscriptLine] = transcript_lines(segments, record.started_at, prefer_polished=not template.is_refinement)
-        if not lines:
-            self.generation_failed.emit(meeting_id, "文字稿为空，无法整理原文" if template.is_refinement else "文字稿为空，无法生成纪要")
-            return False
         if not self.auto_name_speakers(meeting_id):
-            self.generation_failed.emit(meeting_id, "说话人名称保存失败，请重试")
-            return False
+            return "说话人名称保存失败，请重试"
         names = self.speaker_names(meeting_id)
         marks = [(m.offset_ms, m.note) for m in self._store.get_marks(meeting_id)]
         context = MeetingContext(
@@ -849,7 +1009,7 @@ class MeetingController(QObject):
         self.generation_preview_text = ""
         self.generation_progress.emit(meeting_id, "正在整理原文…" if template.is_refinement else "正在生成纪要…")
         self._generator.generate(request)
-        return True
+        return ""
 
     def cancel_generation(self) -> None:
         if self._generating_for:
@@ -857,7 +1017,21 @@ class MeetingController(QObject):
             self._generating_for = ""
             self.generation_preview_text = ""
             self._generator.cancel()
+            self._store.dequeue_generation(meeting_id)
+            self._store.flush()
             self.generation_cancelled.emit(meeting_id)
+            self._pump_queue()
+
+    def remove_from_queue(self, meeting_id: str) -> None:
+        """Cancel this meeting's job, running or waiting."""
+        if meeting_id and meeting_id == self._generating_for:
+            self.cancel_generation()
+            return
+        if self._store.queued_generation(meeting_id) is None:
+            return
+        self._store.dequeue_generation(meeting_id)
+        self._store.flush()
+        self.generation_cancelled.emit(meeting_id)
 
     @property
     def is_generating(self) -> bool:
@@ -890,28 +1064,34 @@ class MeetingController(QObject):
         flushed = self._store.flush()
         saved = self._store.get_notes(meeting_id)
         if not flushed or saved is None or saved.markdown != result.markdown or saved.json_payload != result.json_payload:
-            self.generation_failed.emit(meeting_id, "纪要保存失败，已完成的分段会保留，请重试")
+            self._record_failure(meeting_id, "纪要保存失败，已完成的分段会保留，请重试", transient=True)
+            self._pump_queue()
             return
         self._store.clear_generation_checkpoints(meeting_id)
+        self._store.dequeue_generation(meeting_id)
         self._store.flush()
         self.generation_finished.emit(meeting_id)
         self.meeting_changed.emit(meeting_id)
+        self._pump_queue()
 
     def _on_generation_error(self, message: str) -> None:
         meeting_id = self._generating_for
         self._generating_for = ""
         self.generation_preview_text = ""
         if meeting_id:
-            self.generation_failed.emit(meeting_id, message)
+            self._record_failure(meeting_id, message, transient=self._generator.last_error_transient)
+        self._pump_queue()
 
     @property
     def running_workers(self):
         return self._generator.running_workers
 
     def shutdown(self, *, wait_ms: int = 2000) -> None:
+        """Queued and interrupted jobs stay in the database for the next start."""
         self.abandon_on_exit()
         self._clock.stop()
         self._drain_timer.stop()
+        self._retry_timer.stop()
         self._generator.shutdown(wait_ms=wait_ms)
 
 

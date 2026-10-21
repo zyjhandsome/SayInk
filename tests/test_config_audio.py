@@ -130,3 +130,86 @@ class TestAudioConfigPersistence:
         assert merged["hotkey"] == "alt+space"
         assert merged["audio"]["input_source"] == "microphone"
         assert merged["audio"]["trigger_mode"] == TRIGGER_MODE_CONTINUOUS
+
+
+def test_manual_destination_stays_inside_the_mode_that_set_it(config):
+    config.set("audio.trigger_mode", TRIGGER_MODE_CONTINUOUS)
+    config.set_output_mode("history")
+    config.follow_input_source_for_output("microphone")
+    assert config.history_only_output()
+    assert not config.output_follows_input_source()
+
+    config.set("audio.trigger_mode", TRIGGER_MODE_HOTKEY)
+    assert config.output_follows_input_source()
+    config.follow_input_source_for_output("system")
+    assert config.history_only_output()
+    assert config.output_follows_input_source()
+
+    config.set("audio.trigger_mode", TRIGGER_MODE_CONTINUOUS)
+    assert config.output_mode() == "history"
+    assert not config.output_follows_input_source()
+
+
+def test_legacy_explicit_history_migrates_once(tmp_path):
+    home = tmp_path / ".sayink"
+    home.mkdir()
+    (home / "config.json").write_text(
+        json.dumps({
+            "audio": {"trigger_mode": "continuous", "input_source": "microphone"},
+            "output": {"mode": "history", "mode_auto": False, "follow_input_source": None},
+        }),
+        encoding="utf-8",
+    )
+    config = Config(config_dir=home)
+    assert config.history_only_output()
+    assert not config.output_follows_input_source()
+    config.set("audio.trigger_mode", TRIGGER_MODE_HOTKEY)
+    assert config.output_follows_input_source()
+    config.set_output_mode("paste")
+    config.save_immediate()
+
+    reloaded = Config(config_dir=home)
+    assert reloaded.output_mode() == "paste"
+    assert not reloaded.output_follows_input_source()
+    reloaded.set("audio.trigger_mode", TRIGGER_MODE_CONTINUOUS)
+    assert reloaded.history_only_output()
+    assert not reloaded.output_follows_input_source()
+
+
+def test_legacy_automatic_output_migrates_both_modes_without_resetting_later_choice(tmp_path):
+    home = tmp_path / ".sayink"
+    home.mkdir()
+    (home / "config.json").write_text(
+        json.dumps({
+            "audio": {"trigger_mode": "hotkey", "input_source": "microphone"},
+            "output": {"mode": "paste", "follow_input_source": None, "mode_auto": False},
+        }),
+        encoding="utf-8",
+    )
+    config = Config(config_dir=home)
+    assert config.output_follows_input_source()
+    config.set("audio.trigger_mode", TRIGGER_MODE_CONTINUOUS)
+    assert config.output_follows_input_source()
+    config.set_output_mode("history")
+    config.save_immediate()
+
+    reloaded = Config(config_dir=home)
+    assert reloaded.history_only_output()
+    assert not reloaded.output_follows_input_source()
+    reloaded.set("audio.trigger_mode", TRIGGER_MODE_HOTKEY)
+    assert reloaded.output_follows_input_source()
+
+
+def test_missing_trigger_mode_keeps_explicit_paste_on_single_shot_only(tmp_path):
+    home = tmp_path / ".sayink"
+    home.mkdir()
+    (home / "config.json").write_text(
+        json.dumps({"output": {"mode": "paste", "follow_input_source": False}}),
+        encoding="utf-8",
+    )
+    config = Config(config_dir=home)
+    assert config.get("audio.trigger_mode") == TRIGGER_MODE_HOTKEY
+    assert config.output_mode() == "paste"
+    assert not config.output_follows_input_source()
+    config.set("audio.trigger_mode", TRIGGER_MODE_CONTINUOUS)
+    assert config.output_follows_input_source()

@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from sayink.text_polisher import (
     LLMCancelled, LLMResponseError, LLMTruncatedError, _request_headers, chat_completions_url,
-    thinking_payload_extra,
+    normalize_api_key, normalize_model_name, thinking_payload_extra,
 )
 
 log = logging.getLogger("SayInk")
@@ -22,6 +22,13 @@ class LLMContextError(LLMResponseError):
 
 class LLMBrokenStream(LLMResponseError):
     """The stream ended without a successful model finish event."""
+
+
+class LLMDeadlineError(LLMResponseError):
+    """The whole call, retries included, ran past its total deadline."""
+
+
+_BILLING_TERMS = ("quota", "credit", "balance", "billing", "spend_limit", "usage_limit", "余额", "额度不足")
 
 
 class Cancellation:
@@ -64,6 +71,12 @@ def _error_detail(response):
         return str(error.get("message", "")).lower(), str(error.get("code", "")).lower()
     except (ValueError, AttributeError):
         return "", ""
+
+
+def is_billing_error(response) -> bool:
+    """Quota / balance problems: waiting will not fix them."""
+    message, code = _error_detail(response)
+    return any(term in code + " " + message for term in _BILLING_TERMS)
 
 
 def _retry_after(response, fallback):
@@ -203,6 +216,8 @@ async def completion(client, httpx, *, api_url, api_key, model_name, messages,
     Status changes replace retry notices as soon as the next attempt starts.
     """
     capabilities = capabilities if capabilities is not None else {}
+    model_name = normalize_model_name(model_name)
+    api_key = normalize_api_key(api_key)
     payload = dict(model=model_name, messages=messages, stream=capabilities.get("stream", True))
     payload[capabilities.get("token_parameter", "max_tokens")] = max_tokens
     if capabilities.get("temperature", True):
@@ -258,9 +273,7 @@ async def completion(client, httpx, *, api_url, api_key, model_name, messages,
                             capabilities["temperature"] = False
                             attempts -= 1
                             continue
-                        billing = any(term in code + " " + message for term in (
-                            "quota", "credit", "balance", "billing", "spend_limit", "usage_limit", "余额", "额度不足",
-                        ))
+                        billing = any(term in code + " " + message for term in _BILLING_TERMS)
                         retryable = response.status_code in (500, 502, 503, 504) or (response.status_code == 429 and not billing)
                         if not retryable or attempts >= 2:
                             response.raise_for_status()
@@ -317,4 +330,4 @@ async def completion(client, httpx, *, api_url, api_key, model_name, messages,
     try:
         return await asyncio.wait_for(perform(), total_timeout_sec)
     except asyncio.TimeoutError as exc:
-        raise LLMResponseError("模型响应超时，已完成的分段可在重试时继续使用") from exc
+        raise LLMDeadlineError("模型响应超时，已完成的分段可在重试时继续使用") from exc

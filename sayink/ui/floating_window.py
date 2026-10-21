@@ -174,6 +174,7 @@ class FloatingWindow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._listening_active = False
+        self._listen_target = ""
         self._esc_stops_continuous = True
         self._meeting_active = False
         self._meeting_elapsed = "00:00:00"
@@ -536,7 +537,12 @@ class FloatingWindow(QWidget):
         self._text_label.hide()
         self._set_mode("compact")
 
-    def show_listening(self):
+    def show_listening(self, target_app: str | None = None):
+        """Show the listening bar.
+
+        ``None`` keeps the process name of the utterance already open.
+        ``""`` clears it, which a new session does before any speech starts.
+        """
         if self._meeting_active:
             if self._meeting_paused_detail:
                 self.show_meeting_paused(self._meeting_paused_detail)
@@ -549,7 +555,11 @@ class FloatingWindow(QWidget):
         self._capture_released = False
         self.set_esc_stops_continuous(self._esc_stops_continuous)
         self._status_label.setToolTip(self._end_btn.toolTip())
+        if target_app is not None:
+            self._listen_target = target_app
         label = "正在听" if self._live_text else "正在听 · 停顿后出字"
+        if self._listen_target:
+            label = f"{label} · {self._listen_target}"
         self._set_state(label, "STATE_LISTEN", pulse=False)
         self.unsetCursor()
         self._waveform.set_compact(bool(self._live_text))
@@ -568,7 +578,10 @@ class FloatingWindow(QWidget):
             return
         self._live_text = cleaned
         if self._listening_active:
-            self._set_state("正在听", "STATE_LISTEN", pulse=False)
+            label = "正在听"
+            if self._listen_target:
+                label = f"{label} · {self._listen_target}"
+            self._set_state(label, "STATE_LISTEN", pulse=False)
         elif self._capture_active and not self._capture_released:
             self._set_state("录音中", "STATE_RECORD", pulse=False)
         else:

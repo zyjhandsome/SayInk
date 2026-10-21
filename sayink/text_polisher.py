@@ -2,7 +2,7 @@ import ipaddress
 import logging
 import time
 from typing import Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
@@ -16,6 +16,18 @@ log = logging.getLogger("SayInk")
 _LOCAL_HOSTNAMES = {"localhost", "127.0.0.1", "::1"}
 
 INSECURE_URL_ERROR = "接口地址须以 http:// 或 https:// 开头，并包含主机名"
+FULLWIDTH_URL_ERROR = "接口地址含有全角冒号或斜杠，请改用半角的 http:// 或 https://，并包含主机名"
+HOST_GARBLED_ERROR = "接口地址的主机名含有空格或不可见字符。"
+URL_USERINFO_ERROR = "接口地址里的账号或密钥已去掉，请把密钥填在「API 密钥」。"
+PUBLIC_HTTP_NOTE = "该地址是公网 HTTP，密钥和转写内容会明文传输。"
+
+_INVISIBLE_CHARS = "\u200b\u200c\u200d\ufeff\u2060\u00ad"
+_INVISIBLE_TRANS = dict.fromkeys(map(ord, _INVISIBLE_CHARS), None)
+_DASH_CHARS = ("－", "—", "–", "‑", "−")
+_CANONICAL_MODELS = {
+    "deepseek-flash": "deepseek-flash",
+    "deepseek-v4-pro": "deepseek-v4-pro",
+}
 
 
 def is_local_endpoint(url: str) -> bool:
@@ -32,16 +44,84 @@ def is_local_endpoint(url: str) -> bool:
     return ip.is_loopback or ip.is_private or ip.is_link_local
 
 
+def _host_is_clean(host: str) -> bool:
+    return bool(host) and not any(ch.isspace() or ch in _INVISIBLE_CHARS for ch in host)
+
+
+def _request_netloc(parsed) -> str:
+    host = parsed.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    if parsed.port:
+        return f"{host}:{parsed.port}"
+    return host
+
+
 def is_secure_or_local_url(url: str) -> bool:
     """Allow any ``http`` or ``https`` URL that has a host.
 
     The scheme is the only gate. Public HTTP is permitted because the user
     types the address; the key and transcript then travel in cleartext.
-    Other schemes are rejected. Whether the host is local is a separate
-    question (:func:`is_local_endpoint`).
+    Other schemes are rejected. A host that itself contains spaces or
+    invisible characters is rejected. Whether the host is local is a
+    separate question (:func:`is_local_endpoint`).
     """
     parsed = urlparse((url or "").strip())
-    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+    return parsed.scheme in {"http", "https"} and _host_is_clean(parsed.hostname or "")
+
+
+def api_url_error(url: str) -> str | None:
+    """User-facing reason the address cannot be used, or ``None`` when it can."""
+    text = (url or "").strip()
+    if is_secure_or_local_url(text):
+        return None
+    parsed = urlparse(text)
+    host = parsed.hostname or ""
+    if parsed.scheme in {"http", "https"} and host and not _host_is_clean(host):
+        return HOST_GARBLED_ERROR
+    if "：" in text or "／" in text:
+        return FULLWIDTH_URL_ERROR
+    return INSECURE_URL_ERROR
+
+
+def redact_url_userinfo(url: str) -> tuple[str, bool]:
+    """Drop ``user:password@`` so a secret is not stored in the address."""
+    raw = (url or "").strip()
+    parsed = urlparse(raw)
+    if not parsed.hostname or (parsed.username is None and parsed.password is None):
+        return raw, False
+    cleaned = urlunparse((parsed.scheme, _request_netloc(parsed), parsed.path, "", parsed.query, parsed.fragment))
+    return cleaned, True
+
+
+def public_cleartext_note(url: str) -> str:
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme == "http" and not is_local_endpoint(url):
+        return PUBLIC_HTTP_NOTE
+    return ""
+
+
+def normalize_api_key(api_key: str) -> str:
+    """Strip a pasted ``Bearer`` prefix, quotes, and whitespace inside the key."""
+    key = (api_key or "").strip().translate(_INVISIBLE_TRANS)
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in "\"'“”‘’":
+        key = key[1:-1].strip()
+    if key[:7].lower() == "bearer ":
+        key = key[7:].strip()
+    return "".join(ch for ch in key if not ch.isspace() and ch not in _INVISIBLE_CHARS)
+
+
+def normalize_model_name(model_name: str) -> str:
+    """Drop invisible characters. Known DeepSeek ids are also canonicalized.
+
+    Other names keep their spelling: a local model id can be case-sensitive.
+    """
+    text = (model_name or "").replace("\u3000", " ").translate(_INVISIBLE_TRANS)
+    for dash in _DASH_CHARS:
+        text = text.replace(dash, "-")
+    text = " ".join(text.split())
+    key = "-".join(text.casefold().replace("_", " ").replace("-", " ").split())
+    return _CANONICAL_MODELS.get(key, text)
 
 
 def api_key_required(url: str) -> bool:
@@ -57,16 +137,26 @@ def polish_settings_complete(api_url: str, api_key: str, model_name: str) -> boo
 
 def _request_headers(api_key: str) -> dict:
     headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    key = normalize_api_key(api_key)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     return headers
 
 
 def chat_completions_url(api_url: str) -> str:
-    url = (api_url or "").rstrip("/")
-    if not url.endswith("/chat/completions"):
-        url = url + "/chat/completions"
-    return url
+    """OpenAI-compatible chat URL. Query strings stay; userinfo and fragments do not."""
+    raw = (api_url or "").strip()
+    parsed = urlparse(raw)
+    host = parsed.hostname or ""
+    if parsed.scheme not in {"http", "https"} or not _host_is_clean(host):
+        url = raw.rstrip("/")
+        if not url.endswith("/chat/completions"):
+            url += "/chat/completions"
+        return url
+    path = (parsed.path or "").rstrip("/")
+    if not path.endswith("/chat/completions"):
+        path = f"{path}/chat/completions" if path else "/chat/completions"
+    return urlunparse((parsed.scheme, _request_netloc(parsed), path, "", parsed.query, ""))
 
 
 # One extra attempt for connection-level failures and gateway errors.
@@ -87,7 +177,7 @@ def thinking_payload_extra(api_url: str, model_name: str, thinking_mode: str | N
     if (
         thinking_mode == "disabled"
         and urlparse((api_url or "").strip()).hostname == _THINKING_TOGGLE_HOST
-        and (model_name or "").strip() in _THINKING_TOGGLE_MODELS
+        and normalize_model_name(model_name) in _THINKING_TOGGLE_MODELS
     ):
         return {"thinking": {"type": "disabled"}}
     return {}
@@ -131,6 +221,8 @@ def chat_completion(
     adds provider-specific fields (see :func:`thinking_payload_extra`).
     """
     cancelled = is_cancelled or (lambda: False)
+    model_name = normalize_model_name(model_name)
+    api_key = normalize_api_key(api_key)
     payload = {
         "model": model_name,
         "messages": messages,
@@ -163,7 +255,11 @@ def chat_completion(
     if cancelled():
         raise LLMCancelled()
     response.raise_for_status()
-    data = response.json()
+    return chat_message_text(response.json(), reject_truncated=reject_truncated)
+
+
+def chat_message_text(data, *, reject_truncated: bool = False) -> str:
+    """Message text from a chat-completion body, or a response error."""
     choices = data.get("choices") if isinstance(data, dict) else None
     if not choices or not isinstance(choices, list):
         raise LLMResponseError("API 响应格式异常")
@@ -177,6 +273,20 @@ def chat_completion(
     if not text:
         raise LLMResponseError("API 返回空内容")
     return text
+
+
+def http_status_message(code: int | None) -> str:
+    if code in (401, 403):
+        return f"密钥被拒绝（HTTP {code}）。请检查 API 密钥。"
+    if code == 404:
+        return "接口路径不存在（HTTP 404）。请检查接口地址是否为 OpenAI 兼容的基址。"
+    if code == 400:
+        return "请求被拒绝（HTTP 400）。请检查模型名称是否与该接口匹配。"
+    if code == 429:
+        return "请求过于频繁（HTTP 429），请稍后重试。"
+    if code is None:
+        return "HTTP 错误"
+    return f"HTTP 错误: {code}"
 
 POLISH_PROMPT = (
     "你是一个纯文本润色工具，不是对话助手。\n"
@@ -317,9 +427,10 @@ class PolishWorker(QThread):
         try:
             import httpx
 
-            if not is_secure_or_local_url(self._api_url):
+            problem = api_url_error(self._api_url)
+            if problem:
                 log.warning("API URL 不是 http 或 https 地址")
-                self.error.emit(INSECURE_URL_ERROR)
+                self.error.emit(problem)
                 return
 
             log.info("正在调用 LLM %s (%s)...", self._action_label, self._model_name)
@@ -458,31 +569,37 @@ class TextPolisher(QObject):
 
     @staticmethod
     def test_connection(api_url: str, api_key: str, model_name: str) -> tuple[bool, str]:
-        if not is_secure_or_local_url(api_url):
-            return False, INSECURE_URL_ERROR
+        problem = api_url_error(api_url)
+        if problem:
+            return False, problem
 
         try:
             import httpx
 
-            url = chat_completions_url(api_url)
-            headers = _request_headers(api_key)
-
+            model = normalize_model_name(model_name)
+            key = normalize_api_key(api_key)
             payload = {
-                "model": model_name,
-                "messages": [
-                    {"role": "user", "content": "Hello"}
-                ],
-                "max_tokens": 5
+                "model": model,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 16,
+                **thinking_payload_extra(api_url, model, "disabled"),
             }
 
             with httpx.Client(timeout=10.0) as client:
-                response = client.post(url, headers=headers, json=payload)
+                response = client.post(
+                    chat_completions_url(api_url),
+                    headers=_request_headers(key),
+                    json=payload,
+                )
                 response.raise_for_status()
+                chat_message_text(response.json())
 
             return True, "连接成功"
         except httpx.TimeoutException:
             return False, "连接超时"
-        except httpx.HTTPStatusError as e:
-            return False, f"HTTP 错误: {e.response.status_code}"
-        except Exception as e:
-            return False, f"连接失败: {str(e)}"
+        except httpx.HTTPStatusError as exc:
+            return False, http_status_message(getattr(getattr(exc, "response", None), "status_code", None))
+        except LLMResponseError as exc:
+            return False, str(exc)
+        except Exception as exc:
+            return False, f"连接失败: {str(exc)}"

@@ -180,12 +180,12 @@ class SpeakerTurnDetector:
         return [SpeakerTurn(0, len(audio), vector if vector is not None else np.zeros(1, dtype=np.float32),
                             vector is not None and not uncertain and voice_sample_is_clear(audio))]
 
-    def _single(self, audio, *, uncertain=False, cancelled=None):
+    def _single(self, audio, *, uncertain=False, cancelled=None, allow_activity_splits=True):
         analyze = getattr(self._activity_guard, "analyze", None)
         if callable(analyze):
             try:
                 evidence = analyze(audio, cancelled=cancelled)
-                if evidence.unsafe and not uncertain:
+                if evidence.unsafe and not uncertain and allow_activity_splits:
                     return self._activity_turns(audio, evidence, cancelled=cancelled)
                 return self._plain_single(audio, uncertain=uncertain or evidence.unsafe,
                                           mixed=bool(evidence.overlaps))
@@ -386,7 +386,13 @@ class SpeakerTurnDetector:
                 if len(anchors) < MAX_TURNS:
                     anchors.append(vector)
         if not anchors:
-            return self._single(samples, uncertain=True)
+            # No 1.2 s window held a full second of clear speech, so nothing
+            # proposed a speaker change. Clips under that analysis length
+            # already seed a profile when the whole utterance is clear; forcing
+            # uncertain here left the opening of a meeting unnamed. A configured
+            # activity check can still abstain, but it must not invent splits
+            # the windows never supported.
+            return self._single(samples, cancelled=cancelled, allow_activity_splits=False)
         # A new voice may first appear in a window straddling the change.
         # Replace that mixed anchor with a repeated, better-separated state.
         # Otherwise the mixed anchor can hide a real A→B boundary.

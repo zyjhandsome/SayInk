@@ -90,6 +90,18 @@ CREATE TABLE IF NOT EXISTS meeting_generation_cache (
   payload TEXT NOT NULL,
   PRIMARY KEY (meeting_id, fingerprint, step_key)
 );
+-- Minutes jobs waiting, running or failed; a row outlives a restart so the
+-- job resumes (docs/meeting-generation-reliability.md「排队与自动生成」).
+CREATE TABLE IF NOT EXISTS meeting_generation_queue (
+  meeting_id  TEXT PRIMARY KEY,
+  template_id TEXT    NOT NULL DEFAULT '',
+  priority    INTEGER NOT NULL DEFAULT 0,
+  enqueued_at INTEGER NOT NULL DEFAULT 0,
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  not_before  INTEGER NOT NULL DEFAULT 0,
+  state       TEXT    NOT NULL DEFAULT 'pending',
+  last_error  TEXT    NOT NULL DEFAULT ''
+);
 """
 
 # Sessions that belong to a meeting are kept out of the dictation history

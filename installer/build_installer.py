@@ -111,7 +111,8 @@ def check_prerequisites(*, with_model: bool = False):
 
     print(f"[OK] Icon file found: {icon_file}")
 
-    # Check models. Lite ships the meeting helpers; full also ships Fun-ASR-Nano.
+    # Check models. Lite ships the meeting helpers, including speaker-activity;
+    # full also ships Fun-ASR-Nano.
     from build import BUNDLE_REQUIRE_MODEL_ID, bundle_aux_model_ids, bundle_model_ids
     from sayink.speech_recognizer import get_model_info
 
@@ -143,9 +144,9 @@ def build_installer(*, keep_staging: bool = False, with_model: bool = False):
     print(
         "  Flavor  "
         + (
-            "full (Fun-ASR-Nano, CAM++ and Silero VAD)"
+            "full (Fun-ASR-Nano, CAM++, Silero VAD and speaker-activity)"
             if with_model
-            else "lite (CAM++ and Silero VAD)"
+            else "lite (CAM++, Silero VAD and speaker-activity)"
         )
     )
     print("=" * 60)
