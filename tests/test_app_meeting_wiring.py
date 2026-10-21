@@ -460,6 +460,27 @@ def test_meeting_end_with_auto_minutes_says_they_run_in_the_background() -> None
         assert "后台" in h["tray"].showMessage.call_args[0][1]
 
 
+def test_unconfirmed_remote_minutes_do_not_claim_they_already_started() -> None:
+    overrides = {
+        **AUTO_MINUTES,
+        "llm.api_url": "https://api.example.com/v1",
+        "meeting.confirmed_remote_hosts": [],
+    }
+    with app_harness(overrides, real_history=True) as h:
+        app = h["app"]
+        requests = []
+        with patch.object(app._meeting._generator, "generate", requests.append):
+            meeting_id = _start(app, h)
+            app._on_segment_ready(_audio())
+            app._on_final_result(LONG_TEXT)
+            _end_and_wait(app, h, meeting_id)
+        texts = [call.args[1] for call in h["tray"].showMessage.call_args_list]
+        assert requests == []
+        assert texts
+        assert all("正在后台生成" not in text for text in texts)
+        assert any("尚未确认" in text for text in texts)
+
+
 def test_meeting_end_without_auto_minutes_points_to_the_meeting_page() -> None:
     with app_harness({**AUTO_MINUTES, "meeting.auto_generate": False}, real_history=True) as h:
         app = h["app"]

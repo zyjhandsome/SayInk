@@ -768,8 +768,9 @@ class MeetingController(QObject):
         if saved is None or saved.markdown != markdown:
             return False
         job = self._store.queued_generation(meeting_id)
-        if job is not None and job.automatic and meeting_id != self._generating_for:
-            # Hand-written notes are never replaced by an automatic run.
+        if job is not None and meeting_id != self._generating_for:
+            # Hand-written notes are the version the user wants. A job that
+            # has not started, automatic or requested, must not replace them.
             self._store.dequeue_generation(meeting_id)
             self._store.flush()
         self.meeting_changed.emit(meeting_id)
@@ -870,6 +871,8 @@ class MeetingController(QObject):
             problem = self._generation_problem(self._store.get_meeting(meeting_id), template_id, model_name)
         else:
             problem = self._start(meeting_id, template_id, model_name)
+        if problem is None:
+            return False
         if problem:
             self.generation_failed.emit(meeting_id, problem)
             return False
@@ -916,7 +919,7 @@ class MeetingController(QObject):
             host = self.remote_host_needing_confirmation()
             problem = (f"文字稿未发送：{host} 尚未确认。可在会议页点「生成纪要」确认后发送" if host
                        else self._start(job.meeting_id, job.template_id))
-            if not problem:
+            if problem is None or not problem:
                 return
             self._record_failure(job.meeting_id, problem, transient=False)
         self._store.flush()
@@ -957,7 +960,7 @@ class MeetingController(QObject):
             return "文字稿为空，无法整理原文" if template.is_refinement else "文字稿为空，无法生成纪要"
         return ""
 
-    def _start(self, meeting_id: str, template_id: str, model_name: str | None = None) -> str:
+    def _start(self, meeting_id: str, template_id: str, model_name: str | None = None) -> str | None:
         """Dispatch one job to the worker; the reason when it cannot start."""
         record = self._store.get_meeting(meeting_id)
         problem = self._generation_problem(record, template_id, model_name)
@@ -1008,6 +1011,10 @@ class MeetingController(QObject):
         self._generating_for = meeting_id
         self.generation_preview_text = ""
         self.generation_progress.emit(meeting_id, "正在整理原文…" if template.is_refinement else "正在生成纪要…")
+        # An open notes draft can cancel this run from the progress signal
+        # before the worker is asked to start.
+        if self._generating_for != meeting_id:
+            return None
         self._generator.generate(request)
         return ""
 

@@ -40,7 +40,7 @@ def test_dismissing_a_mid_session_history_conflict_keeps_the_words_and_stops(mon
         h["recorder"].is_continuous = True
         app._config.set("history.enabled", False)
         app._config.set("output.mode", "history")
-        monkeypatch.setattr(app, "_ask_history_output_conflict", lambda: "cancel", raising=False)
+        monkeypatch.setattr(app, "_ask_history_output_conflict", lambda **_kwargs: "cancel", raising=False)
         with patch("sayink.app.QTimer.singleShot"):
             begin(app)
             app._on_speaker_turn_result(batch()[:1])
@@ -49,6 +49,64 @@ def test_dismissing_a_mid_session_history_conflict_keeps_the_words_and_stops(mon
         h["recorder"].stop_continuous.assert_called()
         assert app._config.get("history.enabled") is False
         assert app._config.history_only_output()
+
+
+def test_words_that_finish_after_the_conflict_cancel_are_copied_too(monkeypatch):
+    copied = []
+    monkeypatch.setattr("pyperclip.copy", copied.append)
+    with app_harness({"audio.trigger_mode": "continuous", "history.enabled": True}) as h:
+        app = start(h)
+        marker = object()
+
+        def stop():
+            h["recorder"].is_continuous = False
+            app._segment_queue.append(marker)
+
+        h["recorder"].stop_continuous.side_effect = stop
+        app._config.set("history.enabled", False)
+        app._config.set("output.mode", "history")
+        monkeypatch.setattr(app, "_ask_history_output_conflict", lambda **_kwargs: "cancel", raising=False)
+        with patch("sayink.app.QTimer.singleShot"):
+            begin(app)
+            app._on_speaker_turn_result(batch()[:1])
+        app._segment_queue.remove(marker)
+        app._output_text("后面这句还在识别")
+        assert copied == ["甲说方案可行", "后面这句还在识别"]
+        h["paster"].paste_async.assert_not_called()
+
+
+def test_history_conflict_cancel_does_not_claim_a_copy_that_failed(monkeypatch):
+    def deny(_text):
+        raise OSError("clipboard denied")
+
+    monkeypatch.setattr("pyperclip.copy", deny)
+    with app_harness({"audio.trigger_mode": "continuous", "history.enabled": True}) as h:
+        app = start(h)
+        app._config.set("history.enabled", False)
+        app._config.set("output.mode", "history")
+        monkeypatch.setattr(app, "_ask_history_output_conflict", lambda **_kwargs: "cancel", raising=False)
+        with patch("sayink.app.QTimer.singleShot"):
+            begin(app)
+            app._on_speaker_turn_result(batch()[:1])
+        h["floating"].show_success.assert_not_called()
+        assert h["floating"].show_error.called
+
+
+def test_mid_session_history_conflict_does_not_say_recording_has_not_started(monkeypatch):
+    from PyQt6.QtWidgets import QMessageBox
+
+    captured = {}
+
+    def exec_(box):
+        captured["text"] = box.text()
+        captured["info"] = box.informativeText()
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", exec_)
+    with app_harness({"audio.trigger_mode": "continuous", "history.enabled": False}) as h:
+        assert h["app"]._ask_history_output_conflict(listening=True) == "cancel"
+    assert "不会开始录音" not in captured["text"]
+    assert "复制" in captured["info"]
 
 
 def test_continuous_segments_keep_the_process_captured_when_speech_started():
@@ -199,7 +257,7 @@ def test_history_only_output_still_obeys_continuous_history_preference(history_e
         app = start(h)
         if not history_enabled:
             # The session was already open; refusing the conflict must not paste.
-            monkeypatch.setattr(app, "_ask_history_output_conflict", lambda: "cancel")
+            monkeypatch.setattr(app, "_ask_history_output_conflict", lambda **_kwargs: "cancel")
         begin(app)
         with patch("sayink.app.QTimer.singleShot"):
             app._on_speaker_turn_result(batch())

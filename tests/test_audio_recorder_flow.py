@@ -205,6 +205,27 @@ class TestContinuousFlush:
         assert len(emitted) == 1
         assert emitted[0].size == 2000
 
+    def test_flush_keeps_the_window_open_when_speech_started(self):
+        rec = AudioRecorder()
+        rec._open_target = (42, "notepad.exe")
+        rec._segment_target = (0, "")
+        rec._segmenter = _FakeSegmenter(feed_result=None, flush_result=np.ones(2000, dtype=np.float32))
+        rec._lanes = [_make_lane(chunks=[np.ones(1600, dtype=np.float32)])]
+        rec._flush_continuous_segments()
+        assert rec.consume_segment_target() == (42, "notepad.exe")
+
+    def test_start_forgets_a_window_from_the_previous_hold(self, monkeypatch):
+        rec = AudioRecorder()
+        rec._open_target = (7, "old.exe")
+        rec._segment_target = (7, "old.exe")
+        monkeypatch.setattr(
+            "sayink.audio_recorder.build_recording_plan",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("no device")),
+        )
+        rec.start(continuous=True)
+        assert rec._open_target == (0, "")
+        assert rec.consume_segment_target() == (0, "")
+
     def test_stop_continuous_flushes_then_resets(self):
         rec = AudioRecorder()
         seg = np.ones(1800, dtype=np.float32)

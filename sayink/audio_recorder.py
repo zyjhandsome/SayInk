@@ -576,6 +576,9 @@ class AudioRecorder(QObject):
         if self._is_recording:
             return
 
+        # A hold can leave a window here, and hold-to-talk never consumes it.
+        self._open_target = (0, "")
+        self._segment_target = (0, "")
         self._continuous_mode = continuous
         self._segment_live = not continuous
         if continuous or self._segment_live:
@@ -665,6 +668,9 @@ class AudioRecorder(QObject):
         if flushed is not None and flushed.size > 0:
             log.debug("持续监听 flush 片段: %d 采样点", flushed.size)
             self._block_started_at = self._segment_started_at
+            # flush() never passes through _feed_segmenter, so the window
+            # captured when this utterance opened would otherwise be lost.
+            self._segment_target = self._open_target
             self._emit_segment(flushed)
             emitted += 1
         return emitted

@@ -689,6 +689,18 @@ class TestGenerationQueue:
             assert controller.store.queued_generation(record.id) is None
         assert calls == []
 
+    def test_a_hand_written_save_drops_a_waiting_user_job(self, controller, config, history, calls):
+        self._configure(config)
+        running = self._ended(controller, history, "正在生成")
+        assert controller.generate(running.id) is True
+        waiting = self._ended(controller, history, "排队的手动纪要")
+        assert controller.generate(waiting.id) is True
+        assert controller.save_user_markdown(waiting.id, "我改好的纪要")
+        assert controller.store.queued_generation(waiting.id) is None
+        controller._on_generation_done(_result("正在生成"))
+        assert controller.generating_for != waiting.id
+        assert controller.store.get_notes(waiting.id).markdown == "我改好的纪要"
+
     def test_switching_off_clears_failed_automatic_jobs(self, controller, config, history, calls):
         self._configure(config)
         record = self._ended(controller, history, "失败")

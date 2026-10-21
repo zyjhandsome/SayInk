@@ -164,7 +164,8 @@ def test_legacy_explicit_history_migrates_once(tmp_path):
     assert config.history_only_output()
     assert not config.output_follows_input_source()
     config.set("audio.trigger_mode", TRIGGER_MODE_HOTKEY)
-    assert config.output_follows_input_source()
+    assert config.history_only_output()
+    assert not config.output_follows_input_source()
     config.set_output_mode("paste")
     config.save_immediate()
 
@@ -200,7 +201,7 @@ def test_legacy_automatic_output_migrates_both_modes_without_resetting_later_cho
     assert reloaded.output_follows_input_source()
 
 
-def test_missing_trigger_mode_keeps_explicit_paste_on_single_shot_only(tmp_path):
+def test_missing_trigger_mode_keeps_an_explicit_paste_for_both_modes(tmp_path):
     home = tmp_path / ".sayink"
     home.mkdir()
     (home / "config.json").write_text(
@@ -212,4 +213,5 @@ def test_missing_trigger_mode_keeps_explicit_paste_on_single_shot_only(tmp_path)
     assert config.output_mode() == "paste"
     assert not config.output_follows_input_source()
     config.set("audio.trigger_mode", TRIGGER_MODE_CONTINUOUS)
-    assert config.output_follows_input_source()
+    assert config.output_mode() == "paste"
+    assert not config.output_follows_input_source()

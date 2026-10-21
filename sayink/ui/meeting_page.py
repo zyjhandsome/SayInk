@@ -2089,7 +2089,19 @@ class MeetingPage(QWidget):
         if self._detail_id:
             self._ctrl.remove_from_queue(self._detail_id)
 
+    def _keep_open_draft(self, meeting_id: str) -> None:
+        """A draft the user is still typing must not be replaced by the model."""
+        text = self._notes_edit.toPlainText()
+        notes = self._store.get_notes(meeting_id)
+        if notes is not None and text == notes.markdown:
+            self._editing_notes = False
+            return
+        self._save_notes_draft()
+        self._ctrl.remove_from_queue(meeting_id)
+
     def _on_generation_progress(self, meeting_id: str, text: str) -> None:
+        if meeting_id == self._detail_id and self._editing_notes:
+            self._keep_open_draft(meeting_id)
         if meeting_id == self._detail_id:
             self._set_status(text)
         if meeting_id != self._listed_generating:
@@ -2114,6 +2126,9 @@ class MeetingPage(QWidget):
     def _on_generation_finished(self, meeting_id: str) -> None:
         self._pending_templates.pop(meeting_id, None)
         if meeting_id == self._detail_id:
+            if self._editing_notes and not self._save_notes_draft():
+                self.refresh()
+                return
             self._editing_notes = False
             self._switch_tab(0)
             self._render_detail()

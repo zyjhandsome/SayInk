@@ -990,7 +990,7 @@ def test_history_conflict_cancel_does_not_start_or_change_settings(monkeypatch):
 
 def test_enabling_history_lets_the_hold_start(monkeypatch):
     with app_harness({"audio.trigger_mode": "hotkey", "output.mode": "history", "history.enabled": False}) as h:
-        monkeypatch.setattr(h["app"], "_ask_history_output_conflict", lambda: "history", raising=False)
+        monkeypatch.setattr(h["app"], "_ask_history_output_conflict", lambda **_kwargs: "history", raising=False)
         h["app"]._on_recording_start()
         assert h["app"]._config.get("history.enabled") is True
         assert h["app"]._config.history_only_output()
@@ -1001,7 +1001,7 @@ def test_enabling_history_lets_the_hold_start(monkeypatch):
 
 def test_paste_choice_changes_only_the_active_mode_and_then_starts(monkeypatch):
     with app_harness({"audio.trigger_mode": "hotkey", "output.mode": "history", "history.enabled": False}) as h:
-        monkeypatch.setattr(h["app"], "_ask_history_output_conflict", lambda: "paste", raising=False)
+        monkeypatch.setattr(h["app"], "_ask_history_output_conflict", lambda **_kwargs: "paste", raising=False)
         h["app"]._on_recording_start()
         assert h["app"]._config.output_mode() == "paste"
         assert h["app"]._config.get("history.enabled") is False
@@ -1016,7 +1016,7 @@ def test_continuous_conflict_cancel_does_not_open_the_microphone(monkeypatch):
     scheduled = []
     monkeypatch.setattr(QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
     with app_harness({"audio.trigger_mode": "continuous", "output.mode": "history", "history.enabled": False}) as h:
-        monkeypatch.setattr(h["app"], "_ask_history_output_conflict", lambda: "cancel", raising=False)
+        monkeypatch.setattr(h["app"], "_ask_history_output_conflict", lambda **_kwargs: "cancel", raising=False)
         h["app"]._start_continuous_listening()
         assert scheduled == []
         h["recorder"].start_continuous.assert_not_called()
@@ -1028,7 +1028,7 @@ def test_meeting_start_does_not_ask_about_the_dictation_history_conflict(monkeyp
     with app_harness({"output.mode": "history", "history.enabled": False}) as h:
         asked = []
         monkeypatch.setattr(
-            h["app"], "_ask_history_output_conflict", lambda: asked.append("ask") or "cancel", raising=False,
+            h["app"], "_ask_history_output_conflict", lambda **_kwargs: asked.append("ask") or "cancel", raising=False,
         )
         monkeypatch.setattr(h["app"], "_meeting_refusal", lambda _options: "测试中不真正开会")
         started = h["app"].start_meeting(MeetingOptions())

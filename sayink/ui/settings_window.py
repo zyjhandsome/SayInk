@@ -1734,7 +1734,9 @@ class SettingsWindow(QWidget):
         history_only = self._config.history_only_output()
         destination = "仅保存到历史，不输入其他应用" if history_only else "输入当前光标"
         rule = "自动模式随音源切换" if automatic else "固定选择，切换音源后保持不变"
-        text = f"当前：{destination}。{rule}。"
+        mode_name = "持续转写" if self._selected_trigger_mode() == TRIGGER_MODE_CONTINUOUS else "单次转写"
+        other_name = "单次转写" if mode_name == "持续转写" else "持续转写"
+        text = f"当前是{mode_name}：{destination}。{rule}。{other_name}沿用自己的选择。"
         color = _tok.TEXT_SEC
         if hints.output_warning:
             text = "历史已关闭：结果不会保存或输入其他应用。请开启转写历史，或改为输入当前光标。"

@@ -497,6 +497,8 @@ class TestOutputMode:
         assert config.history_only_output() is False
         assert settings_window._output_mode_combo.currentData() == "auto"
         assert "输入当前光标" in settings_window._output_mode_hint.text()
+        assert "单次转写" in settings_window._output_mode_hint.text()
+        assert "持续转写" in settings_window._output_mode_hint.text()
 
     def test_system_or_mixed_source_switches_to_history_only(self, settings_window, config, monkeypatch):
         monkeypatch.setattr(settings_window, "_confirm_discard_pending", lambda: True)

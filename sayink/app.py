@@ -268,6 +268,7 @@ class App(QObject):
         self._speakers = self._new_speaker_session()
         self._reclustered_session_id: str | None = None
         self._continuous_user_stopped = False
+        self._keep_unsaved_continuous_text = False
         self._current_session_id: str | None = None
         self._current_seq = 0
         self._pending_record: _PendingHistoryRecord | None = None
@@ -877,6 +878,7 @@ class App(QObject):
             return
         log.info("快捷键触发：开始持续转写")
         self._continuous_user_stopped = False
+        self._keep_unsaved_continuous_text = False
         self._current_session_id = None
         self._current_seq = 0
         # Segments still queued from the previous session keep its speaker numbering.
@@ -1167,15 +1169,39 @@ class App(QObject):
             return True
         return False
 
-    def _ask_history_output_conflict(self) -> str:
+    def _copy_clipboard(self, text: str) -> bool:
+        import pyperclip
+
+        try:
+            pyperclip.copy(text)
+        except Exception:
+            log.warning("写入剪贴板失败", exc_info=True)
+            return False
+        return True
+
+    def _release_unsaved_hold(self) -> None:
+        """Drop the cancel-and-copy hold once the stopped session has no tail left."""
+        if not self._keep_unsaved_continuous_text:
+            return
+        if getattr(self._recorder, "is_continuous", False):
+            return
+        if self._segment_queue:
+            return
+        self._keep_unsaved_continuous_text = False
+
+    def _ask_history_output_conflict(self, *, listening: bool = False) -> str:
         from PyQt6.QtWidgets import QWidget
 
         parent = self._main if isinstance(getattr(self, "_main", None), QWidget) else None
         box = QMessageBox(parent)
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle("结果没有去处")
-        box.setText("历史已关闭，当前结果只会进历史，所以不会开始录音。")
-        box.setInformativeText("可以开启历史，或只把当前模式改为输入光标。")
+        if listening:
+            box.setText("正在录音，但历史已关闭，这句话只会进历史，所以现在没有去处。")
+            box.setInformativeText("可以开启历史，或只把当前模式改为输入光标。取消会把已经识别出的文字复制出来并停止。")
+        else:
+            box.setText("历史已关闭，当前结果只会进历史，所以不会开始录音。")
+            box.setInformativeText("可以开启历史，或只把当前模式改为输入光标。")
         enable = box.addButton("开启历史", QMessageBox.ButtonRole.AcceptRole)
         paste = box.addButton("改为输入光标", QMessageBox.ButtonRole.ActionRole)
         cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
@@ -1880,28 +1906,34 @@ class App(QObject):
             # go out, never a meeting row the user is not typing anywhere.
             self._last_output_text = text
             self._last_output_at = time.monotonic()
-        if (
-            not is_meeting_row
-            and self._history_output_blocked()
-            and getattr(self._recorder, "is_continuous", False) is True
+        preserve_tail = self._keep_unsaved_continuous_text and not getattr(self._recorder, "is_continuous", False)
+        if not is_meeting_row and self._history_output_blocked() and (
+            getattr(self._recorder, "is_continuous", False) is True or preserve_tail
         ):
-            choice = self._ask_history_output_conflict()
+            if preserve_tail:
+                copied = self._copy_clipboard(text)
+                self._handle_paste_result(
+                    PasteResult("clipboard" if copied else "failed", detail="history_conflict" if copied else "clipboard_failed"),
+                    degraded_from_polish=degraded_from_polish,
+                    record=record,
+                )
+                self._release_unsaved_hold()
+                return
+            choice = self._ask_history_output_conflict(listening=True)
             if choice == "history":
                 self._config.set("history.enabled", True)
             elif choice == "paste":
                 self._config.set_output_mode(OUTPUT_MODE_PASTE)
             else:
-                import pyperclip
-                try:
-                    pyperclip.copy(text)
-                except Exception:
-                    log.debug("冲突取消时写入剪贴板失败", exc_info=True)
+                self._keep_unsaved_continuous_text = True
+                copied = self._copy_clipboard(text)
                 self._stop_continuous_user_session()
                 self._handle_paste_result(
-                    PasteResult("clipboard", detail="history_conflict"),
+                    PasteResult("clipboard" if copied else "failed", detail="history_conflict" if copied else "clipboard_failed"),
                     degraded_from_polish=degraded_from_polish,
                     record=record,
                 )
+                self._release_unsaved_hold()
                 return
         if is_meeting_row or self._config.history_only_output():
             # Meeting / playback capture: the words go to history, never to
@@ -2388,6 +2420,7 @@ class App(QObject):
         self._current_seq = 0
         self._speakers = self._meeting.speakers or SpeakerSession()
         self._continuous_user_stopped = False
+        self._keep_unsaved_continuous_text = False
         self._meeting_capture_pending = False
         self._clear_live_transcript()
 
@@ -2503,12 +2536,18 @@ class App(QObject):
         if main is not None and main.isVisible():
             main.meeting_panel.show_meeting(meeting_id)
         else:
-            queued = self._meeting.queued_generation(meeting_id) is not None
-            self._tray.showMessage(
-                "SayInk",
-                "会议已结束，纪要正在后台生成，完成后会通知你。" if queued else "会议已结束，可到「会议」页生成纪要。",
-                QSystemTrayIcon.MessageIcon.Information, 5000,
-            )
+            job = self._meeting.queued_generation(meeting_id)
+            host = self._meeting.remote_host_needing_confirmation() if job is not None and job.automatic else ""
+            if not host:
+                # An unconfirmed host is refused as soon as the queue runs,
+                # and that failure already tells the user. Don't claim the
+                # minutes have started.
+                queued = job is not None and not job.failed
+                self._tray.showMessage(
+                    "SayInk",
+                    "会议已结束，纪要正在后台生成，完成后会通知你。" if queued else "会议已结束，可到「会议」页生成纪要。",
+                    QSystemTrayIcon.MessageIcon.Information, 5000,
+                )
 
     def _on_meeting_notice(self, title: str, detail: str) -> None:
         if not self._meeting_active():
@@ -2818,6 +2857,7 @@ class App(QObject):
             self._stop_continuous_listening()
 
         self._continuous_user_stopped = False
+        self._keep_unsaved_continuous_text = False
         self._sound.enabled = self._config.get("sound_enabled", True)
         self._tray.set_auto_start(self._config.get("auto_start", False))
         # A trigger-mode click used to re-open the recognizer, rescan every

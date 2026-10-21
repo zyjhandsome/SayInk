@@ -225,8 +225,11 @@ class OnboardingController(QObject):
         self._setup_watch.timeout.connect(self._refresh_setup_steps)
         self._setup_watch.start()
         dialog.finished.connect(self._on_setup_finished)
-        dialog.exec()
+        code = dialog.exec()
         if self._setup_reopened or self._setup_closed:
+            return
+        if code == int(QDialog.DialogCode.Rejected) and not self._model_installed():
+            self._defer_setup()
             return
         self._finish_setup()
 
@@ -251,23 +254,38 @@ class OnboardingController(QObject):
         cleaned = (text or "").strip()
         dialog.trial_result.setText(cleaned or "没有识别到文字。可以再试说一句。")
 
-    def _on_setup_finished(self, _code: int) -> None:
+    def _on_setup_finished(self, code: int) -> None:
         if self._setup_open_engine:
             self._setup_open_engine = False
             self._setup_reopened = True
             self._show_main_window("engine")
             QTimer.singleShot(0, self._reopen_setup_nonmodal)
             return
+        if code == int(QDialog.DialogCode.Rejected) and not self._model_installed():
+            self._defer_setup()
+            return
         self._finish_setup()
+
+    def _defer_setup(self) -> None:
+        """「稍后继续」leaves the page for the next launch, until a model exists."""
+        self._setup_closed = True
+        self._stop_setup_audio()
+        if self._setup_watch is not None:
+            self._setup_watch.stop()
+            self._setup_watch = None
+        dialog = self._setup_dialog
+        self._setup_dialog = None
+        if dialog is not None:
+            dialog.hide()
+        self._welcome_scheduled = False
 
     def _reopen_setup_nonmodal(self) -> None:
         dialog = self._setup_dialog
         if dialog is None:
             return
+        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
         dialog.setWindowModality(Qt.WindowModality.NonModal)
         dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
 
     def _open_engine_from_setup(self) -> None:
         if self._setup_dialog is None:

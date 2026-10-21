@@ -617,13 +617,12 @@ class Config:
                 TRIGGER_MODE_CONTINUOUS: dict(automatic),
             }
         else:
+            # One destination used to cover every mode. Keep that choice on
+            # both, so the mode that was not selected does not start pasting.
             explicit = {"mode": mode, "follow_input_source": False}
-            trigger = self.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY)
-            if trigger not in (TRIGGER_MODE_HOTKEY, TRIGGER_MODE_CONTINUOUS):
-                trigger = TRIGGER_MODE_HOTKEY
             slots = {
-                TRIGGER_MODE_HOTKEY: dict(explicit if trigger == TRIGGER_MODE_HOTKEY else automatic),
-                TRIGGER_MODE_CONTINUOUS: dict(explicit if trigger == TRIGGER_MODE_CONTINUOUS else automatic),
+                TRIGGER_MODE_HOTKEY: dict(explicit),
+                TRIGGER_MODE_CONTINUOUS: dict(explicit),
             }
         output["by_mode"] = slots
         self._mirror_active_output()

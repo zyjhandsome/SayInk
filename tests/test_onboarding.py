@@ -299,7 +299,12 @@ def test_setup_trial_stays_on_the_page_and_close_marks_welcome_seen(monkeypatch)
     assert "没有听到" in seen["mic"]
     assert "准备页试说" in seen["trial"]
     assert pasted == []
-    assert cfg.get("first_run_welcome_seen") is True
+    assert cfg.get("first_run_welcome_seen") is False
+    again = _controller(cfg, model_installed=False)
+    shown = []
+    monkeypatch.setattr(again, "show_setup", lambda: shown.append("setup"))
+    again.show_setup_once()
+    assert shown == ["setup"]
 
 
 def test_setup_download_opens_the_engine_page_without_marking_welcome(monkeypatch):
@@ -315,13 +320,19 @@ def test_setup_download_opens_the_engine_page_without_marking_welcome(monkeypatc
         return QDialog.DialogCode.Accepted
 
     monkeypatch.setattr(QDialog, "exec", exec_)
+    activated = []
     monkeypatch.setattr(QDialog, "show", lambda dialog: None)
+    monkeypatch.setattr(QDialog, "raise_", lambda dialog: activated.append("raise"))
+    monkeypatch.setattr(QDialog, "activateWindow", lambda dialog: activated.append("activate"))
     ctl.show_setup()
+    from PyQt6.QtCore import Qt
     from PyQt6.QtWidgets import QApplication
     QApplication.processEvents()
     assert ctl.opened == ["engine"]
     assert cfg.get("first_run_welcome_seen") is False
     assert ctl._setup_dialog.download_btn.isDefault()
+    assert not ctl._setup_dialog.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+    assert activated == []
 
 
 def test_closing_setup_schedules_the_history_question(monkeypatch):
@@ -333,5 +344,5 @@ def test_closing_setup_schedules_the_history_question(monkeypatch):
     monkeypatch.setattr(onboarding_module.QTimer, "singleShot", lambda ms, fn: shots.append((ms, fn)))
     monkeypatch.setattr(QDialog, "exec", lambda dialog: QDialog.DialogCode.Rejected)
     ctl.show_setup()
-    assert (onboarding_module.HISTORY_AFTER_WELCOME_MS, ctl.show_history_onboarding) in shots
-    assert cfg.get("first_run_welcome_seen") is True
+    assert shots == []
+    assert cfg.get("first_run_welcome_seen") is False

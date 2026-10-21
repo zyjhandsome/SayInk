@@ -537,6 +537,37 @@ def test_generate_queues_behind_another_meeting_and_can_leave_the_queue(meeting,
     controller._generating_for = ""
 
 
+def test_an_open_draft_stops_generation_before_it_replaces_the_notes(meeting):
+    page, controller, _history, record = meeting
+    page._toggle_edit()
+    page._notes_edit.setPlainText("还没点保存的草稿")
+    started = []
+    controller._generator.generate = started.append
+    assert controller._start(record.id, "general") is None
+    assert started == []
+    assert controller.generating_for == ""
+    assert controller.store.get_notes(record.id).markdown == "还没点保存的草稿"
+
+
+def test_an_unchanged_editor_still_lets_generation_start(meeting):
+    page, controller, _history, record = meeting
+    page._toggle_edit()
+    started = []
+    controller._generator.generate = started.append
+    assert controller._start(record.id, "general") == ""
+    assert len(started) == 1
+    assert controller.generating_for == record.id
+
+
+def test_finishing_generation_keeps_text_still_in_the_editor(meeting):
+    page, controller, _history, record = meeting
+    page._toggle_edit()
+    page._notes_edit.setPlainText("生成结束前的草稿")
+    page._on_generation_finished(record.id)
+    assert controller.store.get_notes(record.id).markdown == "生成结束前的草稿"
+    assert page._editing_notes is False
+
+
 def test_cancel_button_still_stops_the_running_job(meeting, monkeypatch):
     page, controller, _history, record = meeting
     monkeypatch.setattr(controller._generator, "generate", lambda _request: None)
