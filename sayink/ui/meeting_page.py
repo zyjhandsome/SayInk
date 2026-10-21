@@ -1788,7 +1788,10 @@ class MeetingPage(QWidget):
             if not progress:
                 progress = "正在整理原文…" if self._is_refinement() else "正在生成纪要…"
             self._notes_state.setText(progress)
-            self._notes_state.setToolTip("整理进行中。这里显示的是尚未保存的预览；复制/导出仍用上一版，点「取消」可停下。")
+            running = "整理" if self._is_refinement() else "生成"
+            self._notes_state.setToolTip(
+                f"{running}进行中。这里显示的是尚未保存的预览；复制和导出仍用上一版，点「取消」可停下。"
+            )
             self._status_label.hide()
             self._paint_notes_state()
             return
@@ -2096,12 +2099,24 @@ class MeetingPage(QWidget):
         if notes is not None and text == notes.markdown:
             self._editing_notes = False
             return
-        self._save_notes_draft()
+        saved = self._save_notes_draft()
         self._ctrl.remove_from_queue(meeting_id)
+        if meeting_id != self._detail_id:
+            return
+        # Cancellation announces itself first. Say what actually happened to
+        # this draft, or the status bar keeps claiming generation is running.
+        if saved:
+            self._set_status(f"已保留正在编辑的{self._result_label()}，未用生成结果覆盖。")
+        else:
+            self._set_status("修改尚未保存，请重试；可先复制草稿保留内容。")
 
     def _on_generation_progress(self, meeting_id: str, text: str) -> None:
         if meeting_id == self._detail_id and self._editing_notes:
             self._keep_open_draft(meeting_id)
+        if self._ctrl.generating_for != meeting_id:
+            if meeting_id != self._listed_generating:
+                self.refresh()
+            return
         if meeting_id == self._detail_id:
             self._set_status(text)
         if meeting_id != self._listed_generating:
@@ -2146,7 +2161,9 @@ class MeetingPage(QWidget):
     def _on_generation_cancelled(self, meeting_id: str) -> None:
         self.refresh()
         if meeting_id == self._detail_id:
-            self._set_status(f"已取消{'原文整理' if self._is_refinement() else '纪要生成'}，上一版纪要保持不变。")
+            label = self._result_label()
+            action = "原文整理" if label == "精整正文" else "纪要生成"
+            self._set_status(f"已取消{action}，上一版{label}保持不变。")
 
     def _on_generation_queued(self, meeting_id: str) -> None:
         self.refresh()

@@ -469,6 +469,7 @@ def test_generation_locks_edit_template_and_restore_then_unlocks_on_failure(meet
     assert page._generate_btn.text() == "整理中…"
     assert not page._cancel_btn.isHidden()
     assert page._notes_state.text() == "正在整理原文… 第 1/2 段"
+    assert page._notes_state.toolTip().startswith("整理进行中")
     assert not page._status_label.isVisible()
     assert "取消" in page._content_hint.text()
     assert "font-weight: 700" in page._notes_state.styleSheet()
@@ -547,6 +548,34 @@ def test_an_open_draft_stops_generation_before_it_replaces_the_notes(meeting):
     assert started == []
     assert controller.generating_for == ""
     assert controller.store.get_notes(record.id).markdown == "还没点保存的草稿"
+    assert page._status_label.text() == "已保留正在编辑的纪要，未用生成结果覆盖。"
+    assert "正在生成" not in page._status_label.text()
+    assert page._notes_state.text().startswith("已手动编辑")
+
+
+def test_a_draft_that_cannot_be_saved_is_not_reported_as_still_generating(meeting, monkeypatch):
+    page, controller, _history, record = meeting
+    page._toggle_edit()
+    page._notes_edit.setPlainText("写了一半的纪要")
+    monkeypatch.setattr(controller, "save_user_markdown", lambda *_: False)
+    controller._generator.generate = lambda _request: None
+    assert controller._start(record.id, "general") is None
+    assert controller.generating_for == ""
+    assert page._status_label.text() == "修改尚未保存，请重试；可先复制草稿保留内容。"
+    assert "正在生成" not in page._status_label.text()
+    assert page._editing_notes
+
+
+def test_cancelling_a_refinement_names_the_refinement(meeting, monkeypatch):
+    page, controller, _history, record = meeting
+    controller.store.save_notes(record.id, template_id="refine", model="m", json_payload="", markdown="精整正文。")
+    controller.store.flush()
+    page.show_meeting(record.id)
+    monkeypatch.setattr(controller._generator, "generate", lambda _request: None)
+    monkeypatch.setattr(page, "_confirm_regenerate", lambda: True)
+    page._generate()
+    page._cancel_btn.click()
+    assert page._status_label.text() == "已取消原文整理，上一版精整正文保持不变。"
 
 
 def test_an_unchanged_editor_still_lets_generation_start(meeting):
@@ -557,6 +586,7 @@ def test_an_unchanged_editor_still_lets_generation_start(meeting):
     assert controller._start(record.id, "general") == ""
     assert len(started) == 1
     assert controller.generating_for == record.id
+    assert page._notes_state.toolTip().startswith("生成进行中")
 
 
 def test_finishing_generation_keeps_text_still_in_the_editor(meeting):
