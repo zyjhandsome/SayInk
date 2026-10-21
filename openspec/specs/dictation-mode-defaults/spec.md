@@ -27,13 +27,13 @@ The system MUST store the result destination of single-shot dictation and contin
 
 ### Requirement: Existing shared output choice migrates once
 
-When per-mode destinations are absent and a legacy shared output choice exists, the system MUST migrate that choice once. If the legacy choice is automatic, both modes MUST become automatic. If it is an explicit paste or history-only choice, the saved trigger mode MUST keep that explicit choice and the other mode MUST become automatic. A missing trigger mode MUST be treated as single-shot. After per-mode values exist, later launches MUST NOT migrate again.
+When per-mode destinations are absent and a legacy shared output choice exists, the system MUST migrate that choice once. If the legacy choice is automatic, both modes MUST become automatic. If it is an explicit paste or history-only choice, both modes MUST keep that explicit choice, so the mode that was not selected does not start or stop pasting on its own. A missing trigger mode MUST be treated as single-shot when choosing which slot is active. After per-mode values exist, later launches MUST NOT migrate again.
 
-#### Scenario: 持续转写里手选的只记历史不带走单次
+#### Scenario: 升级前选定的固定去向同时用于两种模式
 
 - **WHEN** 旧配置的录制方式是持续转写，结果去向是明确的「仅保存历史」，且还没有分模式字段
-- **THEN** 首次加载后持续转写保持「仅保存历史」
-- **AND** 单次转写变为自动
+- **THEN** 首次加载后持续转写和单次转写都保持「仅保存历史」
+- **AND** 之后只改单次转写的结果去向时，持续转写仍是「仅保存历史」
 
 #### Scenario: 已经是自动的旧配置两种都保持自动
 
