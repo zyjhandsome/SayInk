@@ -179,7 +179,8 @@ class MeetingSpeakerSession(SpeakerSession):
                 self._observations.popitem(last=False)
             if self._keep_history:
                 duration = int(end_ms - start_ms) if end_ms and end_ms >= start_ms >= 0 else 0
-                self._turns.append(TurnObservation(key, speaker_id, None if vector is None else vector.copy(), duration))
+                self._turns.append(TurnObservation(key, speaker_id, None if vector is None else vector.copy(),
+                                                   duration, bool(learnable)))
             # Uncertain turns break the continuity chain.
             self._last_id = speaker_id
             self._last_end_ms = int(end_ms or start_ms or 0)
@@ -264,7 +265,7 @@ class MeetingSpeakerSession(SpeakerSession):
                 if not profile.samples:
                     del self._profiles[sid]
             observation.speaker_id = speaker_id
-            self._turns = [TurnObservation(t.key, speaker_id, t.vector, t.duration_ms) if t.key == int(sample_key) else t
+            self._turns = [TurnObservation(t.key, speaker_id, t.vector, t.duration_ms, t.learnable) if t.key == int(sample_key) else t
                            for t in self._turns]
             if next(reversed(self._observations)) == int(sample_key):
                 self._last_id = speaker_id

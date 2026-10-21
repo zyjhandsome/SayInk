@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sayink.audio_utils import TARGET_SAMPLE_RATE, resample_mono
 from sayink.meeting_speakers import MeetingSpeakerSession
 from sayink.recognition_settings import aux_model_path
-from sayink.speaker_clustering import reassign_turns
+from sayink.speaker_clustering import final_assignments
 from sayink.speaker_embedding import make_embedder
 from sayink.speaker_turns import MAX_ANALYSIS_SEC, SpeakerTurnDetector, analyze_turns
 from sayink.speech_recognizer import AUX_MODEL_SILERO_VAD, AUX_MODEL_SPEAKER
@@ -303,11 +303,8 @@ def evaluate_recordings(manifest: Path, embedder, *, contextual=True, segmenter=
                  "der": score_der(reference, predicted, duration_ms=duration)}
         if finalize:
             # What the app does when the meeting ends (meeting_session
-            # _apply_recluster): with two or more speakers, cluster every turn
-            # and re-assign; a turn the clustering abstains on, and every turn
-            # of a one-speaker recording, keeps its live label.
-            turns = [t for t in session.turns if t.key >= 0] if session.speaker_count >= 2 else []
-            assignments = reassign_turns(turns, threshold=embedder.cluster_threshold) if turns else {}
+            # _apply_recluster). Missing vectors keep live labels.
+            assignments = final_assignments(session, embedder.cluster_threshold)
             final = [(start, stop, str(assignments.get(seq, live))) for seq, (start, stop, live) in enumerate(predicted)]
             # ``relabelled`` counts every number that changed, renumbering included.
             entry["finalized"] = {"predicted": final,

@@ -24,7 +24,7 @@ def test_context_can_recover_a_leading_short_turn_without_repeating_old_audio():
     assert not any(t.learnable for t in result)
 
 
-def test_tiny_leading_suffix_preserves_asr_bounds_and_abstains_only_for_first_turn(monkeypatch):
+def test_tiny_leading_suffix_keeps_asr_bounds_and_labels_first_turn_by_its_dominant_voice(monkeypatch):
     context, model = SpeakerTurnContext(), Embedder()
     run(context, model, voice(1, 3.2), 1000)
     current = voice(2, 6)
@@ -39,10 +39,32 @@ def test_tiny_leading_suffix_preserves_asr_bounds_and_abstains_only_for_first_tu
 
     monkeypatch.setattr(detector, "_analyze", analyze)
     result = detector(current)
-    assert detector.context_action == "abstain"
+    assert detector.context_action == "dominant"
     assert [(t.start, t.stop) for t in result] == [(0, 3 * RATE), (3 * RATE, 6 * RATE)]
-    assert not np.any(result[0].embedding) and not result[0].learnable
+    assert int(np.argmax(result[0].embedding)) == 1 and not result[0].learnable
     assert result[1].learnable
+
+
+def test_tiny_leading_suffix_still_labels_the_turn_when_a_live_session_has_its_voice(monkeypatch):
+    context, model = SpeakerTurnContext(), Embedder()
+    session = MeetingSpeakerSession(threshold=0.55)
+    for turn in run(context, model, voice(1, 3.2), 1000):
+        session.assign(turn.embedding, learnable=turn.learnable)
+    later = SpeakerTurnDetector(model)(voice(2, 4))[0]
+    assert session.assign(later.embedding, learnable=later.learnable) == 2
+    current = voice(2, 6)
+    detector = SpeakerTurnDetector(model, context=context, start_ms=4200, route="system")
+    a, b = np.eye(3, dtype=np.float32)[:2]
+
+    def analyze(samples, **kwargs):
+        if len(samples) == len(current):
+            return [SpeakerTurn(0, 3 * RATE, b, True), SpeakerTurn(3 * RATE, len(current), b, True)]
+        cut = int(2.2 * RATE)
+        return [SpeakerTurn(0, cut, a, True), SpeakerTurn(cut, len(samples), b, True)]
+
+    monkeypatch.setattr(detector, "_analyze", analyze)
+    first = detector(current)[0]
+    assert session.assign(first.embedding, learnable=first.learnable) == 2
 
 
 @pytest.mark.parametrize("start_ms,route,reset", [(5500, "system", False), (4200, "mic", False), (4200, "system", True)])

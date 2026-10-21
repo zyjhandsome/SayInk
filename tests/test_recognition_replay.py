@@ -29,10 +29,12 @@ def test_replay_keeps_real_input_gaps_and_never_emits_accuracy(monkeypatch):
 
     monkeypatch.setattr(replay, "TranscribeWorker", Worker)
     model = Embedder()
-    model.name, model.sticky_threshold = "campplus", 0.45
+    model.name, model.sticky_threshold, model.cluster_threshold = "campplus", 0.45, 0.6
     report = replay.replay(audio, 16000, object(), model, mode="speaker")
     assert report["segments"][1]["start_sample"] == 67200
     assert report["speaker_groups"] == 1 and report["turns"] == 2
+    assert report["final_speaker_groups"] == 1 and report["final_unknown_turns"] == 0
+    assert [row["final_speaker"] for row in report["segments"]] == [1, 1]
     assert "accuracy" not in report and "cer" not in report
     json.dumps(report)  # Activity-model boundaries may be numpy integers.
 

@@ -64,7 +64,7 @@ from sayink.recognition_settings import (
 )
 from sayink.speaker_embedding import SpeakerEmbedder, make_embedder
 from sayink.meeting_speakers import MeetingSpeakerSession
-from sayink.speaker_clustering import reassign_turns
+from sayink.speaker_clustering import final_assignments
 from sayink.speaker_session import SpeakerSession, recluster
 from sayink.speaker_naming import infer_speaker_names
 from sayink.speech_recognizer import (
@@ -471,23 +471,24 @@ class MeetingController(QObject):
         session cannot provide per-turn evidence.
         """
         speakers = self._speakers
-        if speakers is None or speakers.speaker_count < 2:
+        if speakers is None:
             return
         embedder = self._embedder
         protected = {s.speaker_id for s in self._store.get_speakers(meeting_id) if s.name_locked or s.display_name}
         segments = self._store.get_segments(meeting_id)
         locked = {s.seq for s in segments if s.speaker_locked}
         protected.update(s.speaker_id for s in segments if s.speaker_locked)
-        turns = [t for t in speakers.turns if t.key >= 0] if isinstance(speakers, MeetingSpeakerSession) else []
-        if turns:
+        if isinstance(speakers, MeetingSpeakerSession) and any(t.key >= 0 for t in speakers.turns):
             threshold = embedder.cluster_threshold if embedder is not None else speakers.threshold
-            assignments = reassign_turns(turns, threshold=threshold, protected_ids=protected, locked_keys=locked)
+            assignments = final_assignments(speakers, threshold, protected_ids=protected, locked_keys=locked)
             current = {s.seq: s.speaker_id for s in segments}
             changed = {seq: sid for seq, sid in assignments.items() if seq >= 0 and current.get(seq) not in (None, sid)}
             if changed:
                 log.info("会议 %s 说话人重新归属 %d 段", meeting_id[:8], len(changed))
                 self._store.set_segment_speakers(meeting_id, changed)
                 self._store.flush()
+            return
+        if speakers.speaker_count < 2:
             return
         threshold = embedder.recluster_threshold if embedder is not None else speakers.threshold
         mapping = recluster(speakers.history, threshold=threshold, protected_ids=protected)

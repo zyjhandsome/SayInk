@@ -32,7 +32,7 @@ from sayink.audio_devices import (
 from sayink.audio_recorder import AudioRecorder
 from sayink.audio_utils import TARGET_SAMPLE_RATE
 from sayink.speaker_embedding import SpeakerEmbedder, make_embedder
-from sayink.speaker_clustering import reassign_turns
+from sayink.speaker_clustering import final_assignments
 from sayink.speaker_session import SpeakerSession, recluster, voice_embedding
 from sayink.meeting_speakers import MeetingSpeakerSession, voice_sample_is_clear
 from sayink.speaker_turns import SpeakerTurnDetector
@@ -134,6 +134,15 @@ def auto_start_command() -> str:
         return f'"{exe}"'
     run_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "run.py")
     return f'"{exe}" "{run_py}"'
+
+
+def _activity_state(embedder, requested: bool) -> str:
+    """Multi-speaker detection as it actually runs this session, for the log."""
+    if getattr(embedder, "activity_guard", None) is not None:
+        return "已加载"
+    if getattr(embedder, "activity_guard_error", ""):
+        return "加载失败"
+    return "未加载" if requested else "关"
 
 @dataclass
 class _PendingHistoryRecord:
@@ -1295,15 +1304,15 @@ class App(QObject):
         if self._meeting_active() and self._meeting.current_id == session_id:
             return
         self._reclustered_session_id = session_id
-        if speakers.speaker_count < 2:
-            return
         turns = [t for t in (getattr(speakers, "turns", None) or []) if getattr(t, "key", -1) >= 0]
         if turns:
-            assignments = reassign_turns(turns, threshold=self._speaker_embedder().cluster_threshold)
+            assignments = final_assignments(speakers, self._speaker_embedder().cluster_threshold)
             changed = {seq: sid for seq, sid in assignments.items() if seq >= 0}
             if changed:
                 log.info("持续转写 %s 说话人重新归属 %d 段", session_id[:8], len(changed))
                 self._history.relabel_session_segments(session_id, changed)
+            return
+        if speakers.speaker_count < 2:
             return
         mapping = recluster(speakers.history, threshold=self._speaker_embedder().recluster_threshold)
         if mapping and any(old != new for old, new in mapping.items()):
@@ -2411,9 +2420,10 @@ class App(QObject):
         record = self._meeting.begin(options, caps)
         caps = self._meeting.capabilities or caps
         log.info(
-            "开始会议 %s（来源 %s，模型 %s，VAD %s，热词 %d 字，说话人模型 %s）",
+            "开始会议 %s（来源 %s，模型 %s，VAD %s，热词 %d 字，说话人模型 %s，多人发言检测 %s）",
             record.id[:8], options.input_source, caps.model_id, caps.vad,
             len(caps.hotwords), "是" if caps.speaker_model_available else "否",
+            _activity_state(self._meeting.embedder, caps.speaker_activity_enabled),
         )
         # Session identity for every segment captured from here on.
         self._current_session_id = record.id

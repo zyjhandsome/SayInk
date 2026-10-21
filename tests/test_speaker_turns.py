@@ -271,6 +271,55 @@ def test_unresolved_single_voice_offers_its_embedding_but_cannot_train():
     assert np.argmax(result[0].embedding) == 0 and np.any(result[0].embedding)
 
 
+@pytest.mark.parametrize("unresolved,cuts", [(True, ()), (False, (RATE,))])
+def test_unresolved_or_rejected_change_keeps_overlap_local_and_out_of_clustering(unresolved, cuts):
+    from sayink.meeting_speakers import MeetingSpeakerSession
+    from sayink.speaker_clustering import reassign_turns
+
+    class Guard:
+        def analyze(self, audio, **kwargs):
+            return ActivityEvidence(overlaps=((2 * RATE, 3 * RATE),), cuts=cuts, unresolved=unresolved)
+
+    model = Embedder()
+    model.activity_guard = Guard()
+    audio = voice(1, 5)
+    turns = SpeakerTurnDetector(model)(audio)
+    assert [(t.start, t.stop) for t in turns] == [(0, 2 * RATE), (2 * RATE, 3 * RATE), (3 * RATE, 5 * RATE)]
+    assert np.array_equal(np.concatenate([audio[t.start:t.stop] for t in turns]), audio)
+    assert not any(t.learnable for t in turns)
+    assert not np.any(turns[1].embedding)
+    session = MeetingSpeakerSession(threshold=0.55, keep_history=True)
+    for key, turn in enumerate(turns):
+        assert session.assign(turn.embedding, sample_key=key, learnable=turn.learnable) == 0
+    session.assign(model(voice(1)), sample_key=3)
+    final = reassign_turns(session.turns, threshold=0.6)
+    assert final == {0: 1, 2: 1, 3: 1}  # Overlap has no vector to reassign.
+
+
+def test_an_already_uncertain_turn_still_preserves_clear_sides_of_overlap():
+    class Guard:
+        def analyze(self, audio, **kwargs):
+            return ActivityEvidence(overlaps=((2 * RATE, 3 * RATE),), cuts=(RATE,))
+
+    model = Embedder()
+    model.activity_guard = Guard()
+    turns = SpeakerTurnDetector(model)._single(voice(1, 5), uncertain=True)
+    assert [(t.start, t.stop) for t in turns] == [(0, 2 * RATE), (2 * RATE, 3 * RATE), (3 * RATE, 5 * RATE)]
+    assert [bool(np.any(t.embedding)) for t in turns] == [True, False, True]
+    assert not any(t.learnable for t in turns)
+
+
+def test_too_many_overlap_regions_cannot_fall_back_to_a_mixed_embedding():
+    from sayink.speaker_turns import MAX_TURNS
+
+    detector = SpeakerTurnDetector(Embedder())
+    audio = voice(1, 15)
+    overlaps = tuple((i * RATE + RATE // 2, (i + 1) * RATE) for i in range(MAX_TURNS))
+    turns = detector._activity_turns(audio, ActivityEvidence(overlaps=overlaps, unresolved=True))
+    assert len(turns) == 1 and turns[0].stop == len(audio)
+    assert not np.any(turns[0].embedding) and not turns[0].learnable
+
+
 def test_fallback_embedding_labels_only_a_strong_known_match_and_never_opens_a_speaker():
     from sayink.meeting_speakers import MeetingSpeakerSession
 

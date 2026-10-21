@@ -25,10 +25,8 @@ from sayink.speaker_session import MATCH_THRESHOLD, voice_embedding
 
 log = logging.getLogger("SayInk")
 
-# CAM++ cosine similarity between two clips of the same speaker typically sits
-# above 0.6; different speakers below 0.4. 0.55 leans toward "same person"
-# because a split speaker is corrected by the post-meeting recluster, while
-# two people merged into one cannot be told apart afterwards.
+# Online matching balances coverage and voice separation; the end-of-session
+# pass can revise individual assignments when more evidence is available.
 MODEL_MATCH_THRESHOLD = 0.55
 MEL_MATCH_THRESHOLD = MATCH_THRESHOLD
 # Continuity prior (SpeakerSession.sticky_threshold): a segment that follows
@@ -38,20 +36,19 @@ MEL_MATCH_THRESHOLD = MATCH_THRESHOLD
 MODEL_STICKY_THRESHOLD = 0.45
 MEL_STICKY_THRESHOLD = 0.70
 STICKY_GAP_MS = 3000
-# Post-meeting recluster compares per-speaker centroids. Averaging over many
+# Centroid merge for sessions without per-turn evidence. Averaging over many
 # segments cancels most of the content variance, so splits of the same person
 # merge at a lower bar than the online one.
 MODEL_RECLUSTER_THRESHOLD = 0.50
 MEL_RECLUSTER_THRESHOLD = 0.75
 # End-of-session re-assignment clusters every turn (average linkage over the
-# turn embeddings, see speaker_clustering.py) and then folds tiny clusters
-# into substantial ones. Clustering a little finer than the match bar and
-# folding scored best on real far-field meetings (6 and 5 people: 7 and 5
-# numbers); the mel summary keeps its centroid bar.
+# turn embeddings) and then resolves small clusters, see speaker_clustering.py.
+# Clustering a little finer than the match bar scored best on real far-field
+# meetings (6 and 5 people: 6 and 5 numbers); the mel summary keeps its bar.
 MODEL_CLUSTER_THRESHOLD = 0.60
 MEL_CLUSTER_THRESHOLD = MEL_RECLUSTER_THRESHOLD
-# Shorter clips give either backend too little to go on; a zero vector makes
-# SpeakerSession continue the previous speaker instead of guessing.
+# Shorter clips give either backend too little to go on; a zero vector leaves
+# the turn unknown instead of carrying the preceding speaker forward.
 MODEL_MIN_SEC = 0.5
 MEL_MIN_SEC = 1.0
 _QUIET_RMS = 0.005

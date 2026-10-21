@@ -1170,6 +1170,21 @@ class TestSpeakerSessionWiring:
         assert [s.speaker_id for s in saved] == [1, 2, 1, 2, 1, 2, 1, 2, 1]
         assert saved[1].speaker_locked and not saved[4].speaker_locked
 
+    def test_finalize_recovers_unknown_turn_with_only_one_established_voice(self, controller, history):
+        record = controller.begin(MeetingOptions(), _caps())
+        speakers = controller.speakers
+        a, b = np.eye(24, dtype=np.float32)[:2]
+        plan = [(a, False), (a, True), (b, False)]
+        for seq, (vector, learnable) in enumerate(plan):
+            start = record.started_at + seq * 4000
+            sid = speakers.assign(vector, start_ms=start, end_ms=start + 3500, sample_key=seq, learnable=learnable)
+            history.enqueue(_row(record.id, seq, f"t{seq}", speaker_id=sid, started_at=record.started_at))
+        assert speakers.speaker_count == 1
+        history.flush(timeout=2.0)
+        assert [s.speaker_id for s in controller.store.get_segments(record.id)] == [0, 1, 0]
+        controller.finalize()
+        assert [s.speaker_id for s in controller.store.get_segments(record.id)] == [1, 1, 0]
+
 
 class TestMeetingPageAuxDownload:
     @pytest.fixture

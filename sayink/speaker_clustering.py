@@ -19,13 +19,13 @@ import numpy as np
 
 from sayink.speaker_session import MAX_SPEAKERS
 
-# Clustering slightly finer than the match bar and then folding every tiny
-# cluster (fewer turns *or* less speech than this) into the nearest substantial
-# one gave the right speaker count on real meetings; leaving tiny clusters
-# alone only produced spare numbers that the cap then folded blindly. A voice
-# that spoke for three turns or eight seconds keeps a number of its own.
+# Repeated long turns make a reference voice for resolving small groups.
 MIN_CLUSTER_TURNS = 3
 MIN_CLUSTER_SECONDS = 8.0
+# Centroid similarity below which a group is plainly not the nearest voice.
+# CAM++ groups of one person score far above it and different people mostly
+# below; the mel fallback rarely scores this low, so it keeps folding.
+DISTINCT_VOICE_SIMILARITY = 0.30
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,7 @@ class TurnObservation:
     speaker_id: int
     vector: np.ndarray | None
     duration_ms: int = 0
+    learnable: bool = True
 
 
 def average_linkage_labels(vectors: np.ndarray, max_distance: float) -> np.ndarray:
@@ -100,9 +101,16 @@ def reassign_turns(
 ) -> dict[int, int]:
     """Cluster every turn embedding and return ``{turn_key: speaker_id}``.
 
-    ``threshold`` is the cosine similarity at which turns still count as one
-    voice. Turns without a usable vector are left out (they stay unknown).
-    ``protected_ids`` (named or manually corrected speakers) keep their
+    ``turns`` are in time order. ``threshold`` is the cosine similarity at
+    which turns still count as one voice. Groups with at least ``min_turns``
+    turns and ``min_seconds`` of speech are reference voices. A smaller group
+    that is plainly different from all of them (``DISTINCT_VOICE_SIMILARITY``)
+    keeps a number of its own when it recurs or talks long; any other small
+    group joins the nearest voice, or the speaker on both sides of it when it
+    resembles no one. Turns without a usable vector are left out, and evidence
+    made only of non-learnable turns may join a similar voice but never founds one.
+    ``max_speakers`` folds the smallest groups into a similar voice, or leaves
+    them unknown. ``protected_ids`` (named or manually corrected speakers) keep their
     numbers and their turns stay put; the cluster holding most of such a
     speaker's time lends that number to the automatic turns in it.
     ``locked_keys`` are never moved and anchor their speaker.
@@ -112,6 +120,8 @@ def reassign_turns(
     """
     protected = {int(x) for x in (protected_ids or ()) if int(x) > 0}
     locked = {int(k) for k in (locked_keys or ())}
+    manual = {int(t.key): int(t.speaker_id) for t in turns
+              if t.key in locked or t.speaker_id in protected}
     usable: list[TurnObservation] = []
     for turn in turns:
         if turn.vector is None:
@@ -122,49 +132,82 @@ def reassign_turns(
         norm = float(np.linalg.norm(vec))
         if norm < 1e-6:
             continue
-        usable.append(TurnObservation(int(turn.key), int(turn.speaker_id), vec / norm, max(0, int(turn.duration_ms))))
+        normalized = TurnObservation(int(turn.key), int(turn.speaker_id), vec / norm,
+                                     max(0, int(turn.duration_ms)), bool(turn.learnable))
+        usable.append(normalized)
     if not usable:
-        return {}
+        return manual
     dims = {t.vector.size for t in usable}
     if len(dims) != 1:
-        return {}
+        return manual
     vectors = np.stack([t.vector for t in usable])
     labels = average_linkage_labels(vectors, max(0.0, 1.0 - float(threshold)))
     durations = np.array([t.duration_ms / 1000.0 for t in usable], dtype=np.float64)
 
-    def centroid(mask: np.ndarray) -> np.ndarray:
-        total = vectors[mask].sum(axis=0)
+    def centroid(label: int) -> np.ndarray:
+        total = vectors[labels == label].sum(axis=0)
         norm = float(np.linalg.norm(total))
         return total / norm if norm >= 1e-6 else total
 
-    # Fold tiny clusters into the nearest substantial one.
+    def nearest(vector: np.ndarray, references: dict[int, np.ndarray]) -> tuple[float, int]:
+        return max((float(vector @ reference), label) for label, reference in references.items())
+
+    manual_rows = [t.key in locked or t.speaker_id in protected for t in usable]
+
+    def established() -> set[int]:
+        # A manual correction vouches for its voice even on uncertain audio.
+        return {int(labels[i]) for i, t in enumerate(usable) if t.learnable or manual_rows[i]}
+
     counts = {int(l): int(np.sum(labels == l)) for l in np.unique(labels)}
     seconds = {l: float(durations[labels == l].sum()) for l in counts}
-    anchored = {int(labels[i]) for i, t in enumerate(usable) if t.key in locked or t.speaker_id in protected}
-    big = [l for l in counts if (counts[l] >= min_turns and seconds[l] >= min_seconds) or l in anchored]
+    anchored = {int(labels[i]) for i in range(len(usable)) if manual_rows[i]}
+    founded = established()
+    big = [l for l in counts if l in anchored
+           or (l in founded and counts[l] >= min_turns and seconds[l] >= min_seconds)]
     if big:
-        centroids = {l: centroid(labels == l) for l in big}
-        for l in sorted(set(counts) - set(big)):
-            mask = labels == l
-            c = centroid(mask)
-            labels[mask] = max(big, key=lambda b: float(c @ centroids[b]))
+        references = {l: centroid(l) for l in big}
+        small = sorted(set(counts) - set(big))
+        # A recurring or long voice unlike every reference is someone else
+        # (an interviewer's few long questions), not a fragment to fold away.
+        kept = [l for l in small if l in founded and (counts[l] >= min_turns or seconds[l] >= min_seconds)
+                and nearest(centroid(l), references)[0] < DISTINCT_VOICE_SIMILARITY]
+        references.update({l: centroid(l) for l in kept})
+        unlike: list[tuple[int, int]] = []
+        for l in small:
+            if l in kept:
+                continue
+            similarity, target = nearest(centroid(l), references)
+            if similarity >= DISTINCT_VOICE_SIMILARITY:
+                labels[labels == l] = target
+            elif l in founded:
+                unlike.append((l, target))
+        # A short clear group unlike every voice (laughter, a cough) says little
+        # about who made it; between turns of one speaker it stays with them.
+        for l, target in unlike:
+            rows = set(np.flatnonzero(labels == l).tolist())
+            around = {int(labels[n]) for r in rows for n in (r - 1, r + 1)
+                      if 0 <= n < len(usable) and n not in rows}
+            labels[labels == l] = around.pop() if len(around) == 1 and around <= set(references) else target
 
-    # Cap the number of automatic speakers: fold the smallest unanchored
-    # clusters into their nearest neighbour.
+    # Uncertain observations may reinforce a similar voice, but an uncertain
+    # group unlike every voice (even a long one) is not a new identity.
+    for label in set(labels.tolist()) - established():
+        labels[labels == label] = -1
+
+    # The cap is not evidence of identity. An excess group unlike every other
+    # stays unknown; manual identities are never removed.
     def remaining() -> list[int]:
-        return [int(l) for l in np.unique(labels)]
+        return [int(l) for l in np.unique(labels) if l >= 0]
 
     while len(remaining()) > max(1, int(max_speakers)):
         current = remaining()
-        anchored = {int(labels[i]) for i, t in enumerate(usable) if t.key in locked or t.speaker_id in protected}
+        anchored = {int(labels[i]) for i in range(len(usable)) if manual_rows[i]}
         candidates = [l for l in current if l not in anchored]
         if not candidates or len(current) < 2:
             break
         smallest = min(candidates, key=lambda l: (float(durations[labels == l].sum()), int(np.sum(labels == l))))
-        others = [l for l in current if l != smallest]
-        c = centroid(labels == smallest)
-        nearest = max(others, key=lambda o: float(c @ centroid(labels == o)))
-        labels[labels == smallest] = nearest
+        similarity, target = nearest(centroid(smallest), {o: centroid(o) for o in current if o != smallest})
+        labels[labels == smallest] = target if similarity >= DISTINCT_VOICE_SIMILARITY else -1
 
     # Number the clusters. Protected speakers claim the cluster holding most
     # of their time; locked turns keep their own number regardless.
@@ -181,9 +224,9 @@ def reassign_turns(
                 if label not in claim:
                     claim[label] = sid
                     break
-    taken = set(protected) | set(claim.values()) | {t.speaker_id for t in usable if t.key in locked and t.speaker_id > 0}
+    taken = set(protected) | set(claim.values()) | {sid for sid in manual.values() if sid > 0}
     next_id = 1
-    assignment: dict[int, int] = {}
+    assignment: dict[int, int] = dict(manual)
     numbered: dict[int, int] = {}
     for i, t in enumerate(usable):
         label = int(labels[i])
@@ -191,6 +234,9 @@ def reassign_turns(
             # Manual evidence stays where the user put it; two named people
             # never collapse into one even when their voices cluster together.
             assignment[t.key] = t.speaker_id
+            continue
+        if label < 0:
+            assignment[t.key] = 0
             continue
         if label not in numbered:
             if label in claim:
@@ -202,3 +248,24 @@ def reassign_turns(
                 taken.add(next_id)
         assignment[t.key] = numbered[label]
     return assignment
+
+
+def final_assignments(
+    session,
+    threshold: float,
+    *,
+    protected_ids: set[int] | None = None,
+    locked_keys: set[int] | None = None,
+) -> dict[int, int]:
+    """End-of-session ``reassign_turns`` over a speaker session's keyed turns.
+
+    Meetings, continuous dictation and the benchmark tools all finish here. A
+    session that only ever learned one voice may place its unknown turns with
+    that voice, but the end pass cannot discover new people in it.
+    """
+    turns = [t for t in (getattr(session, "turns", None) or []) if t.key >= 0]
+    if not turns:
+        return {}
+    limit = MAX_SPEAKERS if int(getattr(session, "speaker_count", 0)) >= 2 else 1
+    return reassign_turns(turns, threshold=threshold, max_speakers=limit,
+                          protected_ids=protected_ids, locked_keys=locked_keys)

@@ -412,6 +412,26 @@ class TestDictationSharesMeetingSpeakerStack:
                 callback("pasted")
             h["history"].relabel_session_speakers.assert_called_once_with(session_id, {1: 1, 2: 1})
 
+    def test_single_voice_can_recover_an_earlier_unknown_but_not_an_unrelated_weak_voice(self) -> None:
+        from sayink.meeting_speakers import MeetingSpeakerSession
+
+        with app_harness({"audio.trigger_mode": "continuous"}) as h:
+            app, recorder = h["app"], h["recorder"]
+            _start_continuous_user_session(app)
+            recorder.is_continuous = True
+            recorder.stop_continuous.side_effect = lambda: setattr(recorder, "is_continuous", False)
+            _drive_segment(app, h["paster"], "第一句")
+            session_id = app._current_session_id
+            speakers = MeetingSpeakerSession.for_embedder(app._speaker_embedder())
+            a, b = np.eye(3, dtype=np.float32)[:2]
+            assert speakers.assign(a, sample_key=0, learnable=False) == 0
+            assert speakers.assign(a, sample_key=1) == 1
+            assert speakers.assign(b, sample_key=2, learnable=False) == 0
+            app._speakers = speakers
+            app._stop_continuous_user_session()
+            h["history"].relabel_session_segments.assert_called_once_with(session_id, {0: 1, 1: 1, 2: 0})
+            h["history"].relabel_session_speakers.assert_not_called()
+
     def test_single_speaker_or_identity_mapping_skips_relabel(self) -> None:
         from unittest.mock import MagicMock
 

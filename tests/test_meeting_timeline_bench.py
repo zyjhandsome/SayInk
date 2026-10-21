@@ -185,3 +185,24 @@ def test_silero_segmenter_keeps_file_offsets_and_finalize_rescores_the_timeline(
     assert entry["non_speech_assigned_ms"] < 3 * 1000
     starts = sorted(start for start, _stop, _label in entry["predicted"])
     assert len(starts) == 3 and all(abs(start - gold) <= 500 for start, gold in zip(starts, (2000, 7200, 12400), strict=True))
+
+
+def test_finalize_recovers_a_single_known_voice_like_the_app(tmp_path, monkeypatch):
+    from sayink.speaker_turns import SpeakerTurn
+    from tests.test_speaker_turns import Embedder, RATE, voice
+
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"recordings": [{"audio": "x.wav", "rttm": "gold.rttm"}]}))
+    (tmp_path / "gold.rttm").write_text("SPEAKER x 1 0.000 6.000 <NA> <NA> A <NA> <NA>\n"
+                                      "SPEAKER x 1 6.000 3.000 <NA> <NA> B <NA> <NA>\n")
+    monkeypatch.setattr(bench, "load_wav", lambda path: (voice(1, 9), RATE))
+    a, b = np.eye(3, dtype=np.float32)[:2]
+    monkeypatch.setattr(bench, "analyze_turns", lambda clip, detector: [
+        SpeakerTurn(0, 3 * RATE, a, False), SpeakerTurn(3 * RATE, 6 * RATE, a, True),
+        SpeakerTurn(6 * RATE, 9 * RATE, b, False),
+    ])
+    model = Embedder()
+    model.name, model.sticky_threshold, model.cluster_threshold, model.recluster_threshold = "campplus", 0.45, 0.6, 0.5
+    entry = bench.evaluate_recordings(manifest, model)["files"][0]
+    assert [sid for _, _, sid in entry["predicted"]] == ["0", "1", "0"]
+    assert [sid for _, _, sid in entry["finalized"]["predicted"]] == ["1", "1", "0"]

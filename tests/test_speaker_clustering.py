@@ -1,11 +1,13 @@
 """End-of-session re-assignment: every turn clustered, numbers stable for manual identities."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from sayink.meeting_speakers import MeetingSpeakerSession
-from sayink.speaker_clustering import TurnObservation, average_linkage_labels, reassign_turns
+from sayink.speaker_clustering import TurnObservation, average_linkage_labels, final_assignments, reassign_turns
 
 
 def _unit(*values):
@@ -77,12 +79,68 @@ class TestReassignTurns:
         assert reassign_turns([_turn(0, 1, A), _turn(1, 2, _unit(1, 0))], threshold=0.6) == {}
         assert reassign_turns([], threshold=0.6) == {}
 
-    def test_a_single_short_remark_is_folded_into_the_nearest_voice(self):
-        # Fewer than three turns and under eight seconds cannot hold a number of
-        # their own: on real meetings such clusters were noise or mixed chunks.
+    def test_a_lone_short_remark_joins_a_voice_instead_of_inventing_a_participant(self):
         turns = [_turn(k, 1, A) for k in range(4)] + [_turn(k, 2, B) for k in range(4, 8)] + [_turn(8, 3, C, 2.0)]
         result = reassign_turns(turns, threshold=0.6)
-        assert result[8] in (1, 2) and len(set(result.values())) == 2
+        assert result[8] in (result[0], result[4]) and len(set(result.values())) == 2
+
+    def test_a_sound_unlike_every_voice_stays_with_the_speaker_around_it(self):
+        # Laughter inside B's answer: barely like B, a little more like A.
+        laugh = _unit(0.3, 0.1, 0, 1)
+        turns = ([_turn(k, 1, A) for k in range(4)] + [_turn(4, 2, B), _turn(5, 3, laugh, 2.5)]
+                 + [_turn(k, 2, B2) for k in range(6, 9)])
+        result = reassign_turns(turns, threshold=0.6)
+        assert result[5] == result[4] == result[6] != result[0]
+        # Between two different people it falls back to the nearer voice.
+        turns = [_turn(k, 1, A) for k in range(4)] + [_turn(4, 3, laugh, 2.5)] + [_turn(k, 2, B) for k in range(5, 9)]
+        assert reassign_turns(turns, threshold=0.6)[4] == 1
+
+    def test_a_long_distinct_voice_keeps_its_number_and_collects_its_short_remarks(self):
+        remark = _unit(0.7, 0.2, 1, 0)  # its own cluster, but closer to A than to B
+        turns = ([_turn(0, 1, A, 14.2), _turn(1, 1, A2, 11.1)] + [_turn(k, 2, B) for k in range(2, 9)]
+                 + [_turn(9, 3, remark, 1.5)])
+        result = reassign_turns(turns, threshold=0.6)
+        assert result[9] == result[0] == result[1] != result[2]
+        assert len(set(result.values())) == 2
+
+    def test_two_long_interview_turns_are_not_merged_for_having_too_few_slices(self):
+        turns = [_turn(0, 1, A, 14.2), _turn(1, 1, A2, 11.12)] + [_turn(k, 2, B) for k in range(2, 9)]
+        result = reassign_turns(turns, threshold=0.6)
+        assert result[0] == result[1] != result[2]
+        assert len(set(result.values())) == 2
+
+    def test_enough_short_turns_are_independent_of_total_duration(self):
+        turns = [_turn(k, 1, A) for k in range(3)] + [_turn(k, 2, B, 1.2) for k in range(3, 6)]
+        result = reassign_turns(turns, threshold=0.6)
+        assert {result[k] for k in range(3)} == {1}
+        assert {result[k] for k in range(3, 6)} == {2}
+
+    def test_uncertain_evidence_joins_a_similar_voice_and_stays_unknown_when_unlike_all(self):
+        odd = _unit(0.7, 0, 1, 0)  # its own cluster, cos ≈ 0.57 to A
+        other = _unit(0, 0, 0, 1)
+        turns = ([_turn(k, 1, A) for k in range(4)] + [_turn(k, 2, B) for k in range(4, 8)]
+                 + [TurnObservation(8, 0, odd, 2000, False), TurnObservation(9, 0, other, 5000, False),
+                    TurnObservation(10, 0, other, 5000, False)])
+        result = reassign_turns(turns, threshold=0.6)
+        assert result[8] == result[0]
+        assert result[9] == result[10] == 0
+
+    def test_uncertain_turns_can_match_a_later_single_voice_but_cannot_seed_people(self):
+        turns = [TurnObservation(0, 0, A2, 1500, False), _turn(1, 1, A),
+                 TurnObservation(2, 0, B, 12000, False)]
+        assert reassign_turns(turns, threshold=0.6) == {0: 1, 1: 1, 2: 0}
+        assert reassign_turns([turns[0], turns[2]], threshold=0.6) == {0: 0, 2: 0}
+
+    def test_repeated_uncertain_evidence_alone_cannot_form_a_substantial_identity(self):
+        turns = [_turn(0, 1, A)] + [TurnObservation(k, 0, B, 4000, False) for k in range(1, 6)]
+        assert reassign_turns(turns, threshold=0.6) == {0: 1, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+
+    def test_a_manual_correction_on_uncertain_audio_lends_its_number_to_that_voice(self):
+        turns = ([_turn(k, 1, A) for k in range(3)] + [TurnObservation(3, 7, B, 4000, False),
+                                                        TurnObservation(4, 0, B2, 4000, False)])
+        result = reassign_turns(turns, threshold=0.6, protected_ids={7}, locked_keys={3})
+        assert result[3] == result[4] == 7
+        assert {result[k] for k in range(3)} == {1}
 
     def test_protected_speaker_keeps_its_number_and_lends_it_to_its_cluster(self):
         # Number 3 was named by the user while 1 is an earlier automatic split of the same voice.
@@ -110,7 +168,7 @@ class TestReassignTurns:
         assert {result[k] for k in (1, 3, 5)} == {1}
         assert {result[k] for k in (0, 2, 4)} == {2}
 
-    def test_speaker_cap_folds_the_smallest_automatic_groups(self):
+    def test_speaker_cap_does_not_merge_acoustically_unrelated_groups(self):
         basis = np.eye(6, dtype=np.float32)
         turns = []
         key = 0
@@ -120,10 +178,50 @@ class TestReassignTurns:
                 key += 1
         assert len(set(reassign_turns(turns, threshold=0.6).values())) == 6
         result = reassign_turns(turns, threshold=0.6, max_speakers=3)
-        assert len(set(result.values())) == 3
+        assert len(set(result.values()) - {0}) == 3
+        assert len([sid for sid in result.values() if sid == 0]) == 9
+        for voice in range(6):
+            assert len({result[k] for k in range(3 * voice, 3 * voice + 3)}) == 1
+
+    def test_speaker_cap_folds_a_similar_voice_into_its_neighbour(self):
+        near = _unit(1, 1.6, 0, 0)  # cos(A, near) ≈ 0.53: separate clusters, plausibly one person
+        turns = [_turn(k, 1, A) for k in range(3)] + [_turn(k, 2, near, 3.0) for k in range(3, 6)]
+        assert len(set(reassign_turns(turns, threshold=0.6).values())) == 2
+        assert set(reassign_turns(turns, threshold=0.6, max_speakers=1).values()) == {1}
+
+    def test_cap_cannot_remove_protected_identities(self):
+        turns = [_turn(0, 5, A), _turn(1, 7, B), _turn(2, 8, C)]
+        assert reassign_turns(turns, threshold=0.6, max_speakers=1, protected_ids={5, 7, 8}) == {0: 5, 1: 7, 2: 8}
+
+
+class TestFinalAssignments:
+    def _session(self, speaker_count):
+        turns = ([_turn(k, 1, A) for k in range(3)] + [_turn(k, 1, C, 3.0) for k in range(3, 6)]
+                 + [TurnObservation(6, 0, A2, 2000, False), TurnObservation(-7, 1, A, 4000)])
+        return SimpleNamespace(turns=turns, speaker_count=speaker_count)
+
+    def test_a_single_voice_session_fills_unknowns_but_gains_no_new_people(self):
+        result = final_assignments(self._session(1), 0.6)
+        assert result == {0: 1, 1: 1, 2: 1, 3: 0, 4: 0, 5: 0, 6: 1}
+
+    def test_sessions_with_several_voices_can_separate_them(self):
+        result = final_assignments(self._session(2), 0.6)
+        assert {result[k] for k in (0, 1, 2, 6)} == {1} and {result[k] for k in (3, 4, 5)} == {2}
+
+    def test_nothing_keyed_means_nothing_to_do(self):
+        assert final_assignments(SimpleNamespace(turns=[TurnObservation(-1, 1, A)], speaker_count=1), 0.6) == {}
+        assert final_assignments(SimpleNamespace(speaker_count=2), 0.6) == {}
 
 
 class TestSessionTurns:
+    def test_manual_correction_preserves_original_acoustic_quality(self):
+        session = MeetingSpeakerSession(threshold=0.55, keep_history=True)
+        session.assign(A, sample_key=0, learnable=False)
+        session.assign(A, sample_key=1)
+        assert not session.turns[0].learnable and session.turns[1].learnable
+        assert not session.confirm(0, 1)
+        assert session.turns[0].speaker_id == 1 and not session.turns[0].learnable
+
     def test_session_records_every_keyed_turn_with_duration_and_manual_updates(self):
         session = MeetingSpeakerSession(threshold=0.55, keep_history=True)
         assert session.assign(A, "", start_ms=1000, end_ms=4000, sample_key=0) == 1

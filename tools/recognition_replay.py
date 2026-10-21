@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sayink.audio_utils import TARGET_SAMPLE_RATE
 from sayink.meeting_speakers import MeetingSpeakerSession
 from sayink.recognition_settings import aux_model_path
+from sayink.speaker_clustering import final_assignments
 from sayink.speaker_embedding import make_embedder
 from sayink.speaker_turns import SpeakerTurn, SpeakerTurnDetector
 from sayink.speech_recognizer import AUX_MODEL_SPEAKER, TranscribeWorker, _create_recognizer, language_argument
@@ -72,6 +73,10 @@ def replay(audio, rate, recognizer, embedder, *, mode, vad="silero", contextual=
             rows.append({"start_sample": start, "stop_sample": stop, "start_s": start / TARGET_SAMPLE_RATE,
                          "stop_s": stop / TARGET_SAMPLE_RATE, "speaker": speaker,
                          "learnable": bool(turn.learnable), "text": turn.text})
+    # The end-of-session pass the app applies before the transcript is final.
+    final = final_assignments(session, embedder.cluster_threshold)
+    for index, row in enumerate(rows):
+        row["final_speaker"] = final.get(index, row["speaker"])
     text = "".join(row["text"] for row in rows)
     total = sum(len(chunk.audio) for chunk in chunks)
     return {"mode": mode, "vad_used": used, "speaker_backend": embedder.name,
@@ -79,6 +84,8 @@ def replay(audio, rate, recognizer, embedder, *, mode, vad="silero", contextual=
             "contextual": contextual and mode != "pause_only", "context_actions": dict(actions),
             "speaker_groups": session.speaker_count, "profile_samples": len(session.history),
             "vad_chunks": len(chunks), "turns": len(rows), "unknown_turns": sum(row["speaker"] == 0 for row in rows),
+            "final_speaker_groups": len({row["final_speaker"] for row in rows} - {0}),
+            "final_unknown_turns": sum(row["final_speaker"] == 0 for row in rows),
             "assigned_audio_fraction": (sum(row["stop_sample"] - row["start_sample"] for row in rows if row["speaker"]) / total
                                         if total and mode != "pause_only" else None),
             "characters": len(text), "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
@@ -112,10 +119,10 @@ const labels={pause_only:'仅按停顿转写',speaker:'说话人分析',activity
 report.runs.forEach((r,i)=>{let o=document.createElement('option');o.value=i;o.textContent=r.label||labels[r.mode]||r.mode;mode.append(o)});
 mode.value=Math.max(0,report.runs.findIndex(r=>r.mode==='speaker'));
 function render(){const r=report.runs[mode.value],body=document.getElementById('rows');body.replaceChildren();
-document.getElementById('summary').textContent=`${r.turns} 段 · ${r.speaker_groups} 个模型人物组 · ${r.unknown_turns} 段待确认 · 仅供排查，不代表准确率`;
+document.getElementById('summary').textContent=`${r.turns} 段 · 结束后 ${r.final_speaker_groups??r.speaker_groups} 个模型人物组 · ${r.final_unknown_turns??r.unknown_turns} 段待确认（实时 ${r.unknown_turns} 段） · 仅供排查，不代表准确率`;
 r.segments.forEach((s,i)=>{let row=document.createElement('tr'),time=document.createElement('td'),b=document.createElement('button');
 b.textContent=`${s.start_s.toFixed(2)}–${s.stop_s.toFixed(2)} 秒`;b.onclick=()=>{player.currentTime=s.start_s;stopAt=s.stop_s;player.play().catch(()=>{})};time.append(b);row.append(time);
-let who=document.createElement('td');who.textContent=r.mode==='pause_only'?'未启用':s.speaker?`说话人 ${s.speaker}`:'待确认';row.append(who);
+let who=document.createElement('td'),sid=s.final_speaker??s.speaker;who.textContent=r.mode==='pause_only'?'未启用':sid?`说话人 ${sid}`:'待确认';row.append(who);
 let text=document.createElement('td');text.textContent=s.text;row.append(text);let cell=document.createElement('td'),input=document.createElement('textarea'),key=`${mode.value}:${i}`;
 input.placeholder='记录错字、接话或人物归属问题';input.value=notes[key]||'';input.oninput=()=>notes[key]=input.value;cell.append(input);row.append(cell);body.append(row)})}
 player.addEventListener('timeupdate',()=>{if(stopAt!==null&&player.currentTime>=stopAt){player.pause();stopAt=null}});mode.onchange=render;

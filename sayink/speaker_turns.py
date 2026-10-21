@@ -185,8 +185,9 @@ class SpeakerTurnDetector:
         if callable(analyze):
             try:
                 evidence = analyze(audio, cancelled=cancelled)
-                if evidence.unsafe and not uncertain and allow_activity_splits:
-                    return self._activity_turns(audio, evidence, cancelled=cancelled)
+                allow_cuts = not uncertain and allow_activity_splits
+                if evidence.overlaps or (evidence.unsafe and allow_cuts):
+                    return self._activity_turns(audio, evidence, cancelled=cancelled, allow_cuts=allow_cuts)
                 return self._plain_single(audio, uncertain=uncertain or evidence.unsafe,
                                           mixed=bool(evidence.overlaps))
             except Exception as exc:
@@ -198,20 +199,27 @@ class SpeakerTurnDetector:
             return self._plain_single(audio, uncertain=True, mixed=True)
         return self._plain_single(audio, uncertain=uncertain)
 
-    def _activity_turns(self, audio, evidence, *, cancelled=None):
-        if evidence.unresolved:
+    def _activity_turns(self, audio, evidence, *, cancelled=None, allow_cuts=True):
+        uncertain = evidence.unresolved or not allow_cuts
+        if uncertain and not evidence.overlaps:
             return self._plain_single(audio, uncertain=True)
         minimum = int(MIN_ACTIVITY_VERIFY_SEC * TARGET_SAMPLE_RATE)
         proposed = [0, *evidence.cuts, len(audio)]
-        for index, cut in enumerate(evidence.cuts, 1):
+        cuts = list(evidence.cuts) if not uncertain else []
+        for index, cut in enumerate(cuts, 1):
             if cancelled is not None and cancelled():
                 return []
             similarity = self._change_similarity(audio, cut, proposed[index - 1], proposed[index + 1],
                                                  minimum_sec=MIN_ACTIVITY_VERIFY_SEC)
             if similarity is None or similarity > CHANGE_SIMILARITY:
-                # Local model labels alone cannot create a new speaker turn.
-                return self._plain_single(audio, uncertain=True)
-        bounds = sorted({0, len(audio), *evidence.cuts,
+                # A rejected sequential boundary must not discard the overlap
+                # mask. Keep clear flanks available for strong matches only.
+                cuts = []
+                uncertain = True
+                break
+        if uncertain and not evidence.overlaps:
+            return self._plain_single(audio, uncertain=True)
+        bounds = sorted({0, len(audio), *cuts,
                          *(at for interval in evidence.overlaps for at in interval)})
         # Do not create tiny ASR slices around uncertain edges. Removing a
         # boundary expands the unknown region instead of deleting any audio.
@@ -222,13 +230,13 @@ class SpeakerTurnDetector:
                 break
             del bounds[1 if tiny == 0 else tiny]
         if len(bounds) - 1 > MAX_TURNS:
-            return self._plain_single(audio, uncertain=True)
+            return self._plain_single(audio, uncertain=True, mixed=bool(evidence.overlaps))
         turns = []
         for start, stop in zip(bounds, bounds[1:], strict=False):
             if cancelled is not None and cancelled():
                 return []
             unsafe = any(start < end and stop > begin for begin, end in evidence.overlaps)
-            turn = self._plain_single(audio[start:stop], uncertain=unsafe, mixed=unsafe)[0]
+            turn = self._plain_single(audio[start:stop], uncertain=unsafe or uncertain, mixed=unsafe)[0]
             # A clear flank beside suspected overlap may match an established
             # voice, but must not seed or change a profile from this evidence.
             turns.append(SpeakerTurn(start, stop, turn.embedding, turn.learnable and not evidence.overlaps))
@@ -256,13 +264,18 @@ class SpeakerTurnDetector:
                     or a.size != b.size or float(a @ b) > CHANGE_SIMILARITY):
                 continue
             # A tiny suffix cannot be decoded reliably by itself. Preserve
-            # its words in the original ASR slice and abstain for this mixed
-            # leading turn, without contaminating either speaker profile.
+            # its words in the original ASR slice and describe the turn by the
+            # voice filling the rest of it: a strong match may label it, but
+            # this mixed evidence must not teach either speaker profile.
             if cut < minimum:
                 if len(turns) < 2 or first.stop > int(CONTEXT_HEAD_SEC * TARGET_SAMPLE_RATE):
                     return turns  # A tiny suffix must not reject a whole long utterance.
-                self.context_action = "abstain"
-                return [SpeakerTurn(0, first.stop, np.zeros(1, dtype=np.float32), False), *turns[1:]]
+                if cancelled is not None and cancelled():
+                    return []
+                dominant = self._embed_or_none(samples[cut:first.stop])
+                self.context_action = "dominant"
+                vector = dominant if dominant is not None else np.zeros(1, dtype=np.float32)
+                return [SpeakerTurn(0, first.stop, vector, False), *turns[1:]]
             pieces = []
             for start, stop in ((0, cut), (cut, first.stop)):
                 if cancelled is not None and cancelled():
@@ -468,7 +481,7 @@ class SpeakerTurnDetector:
                                  cancelled=cancelled)
             turns.extend(SpeakerTurn(start + t.start, start + t.stop, t.embedding, t.learnable) for t in local)
         if len(turns) > MAX_TURNS:
-            return self._plain_single(samples, uncertain=True)
+            return self._plain_single(samples, uncertain=True, mixed=True)
         return turns
 
     def _verify_change(self, samples, cut, lower, upper):
