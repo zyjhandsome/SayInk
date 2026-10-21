@@ -1,0 +1,102 @@
+{
+  "schema_version": "delivery-handoff/v1",
+  "family_version": "delivery-family/1.6",
+  "type": "delivery-handoff",
+  "handoff_id": "dictation-mode-defaults-frame-spec-20261021T044940",
+  "previous_handoff_id": null,
+  "generated_at": "2026-10-21T04:49:40Z",
+  "stage": "delivery-frame-spec",
+  "source_revision": {
+    "repo_head": "737e792614474e6081b2070d7a2f7d2199ff9c73",
+    "artifact_revision": "sha256:9212320eb7519fb6a347bce12e4c8e69fb84b87d101be0770dcc53a6861b8119",
+    "state_observed_at": "2026-10-21T04:49:40Z"
+  },
+  "state_source": {
+    "kind": "openspec_change",
+    "label": "change #dictation-mode-defaults",
+    "anchor": "openspec/changes/dictation-mode-defaults"
+  },
+  "capability_snapshot": {
+    "memory": "ok",
+    "openspec": "initialized",
+    "superpowers": "loaded"
+  },
+  "capability_bindings": {
+    "openspec": {
+      "version": "1.6.0",
+      "schema": "spec-driven",
+      "operations": {
+        "create_change": "openspec new change",
+        "inspect_change": "openspec status",
+        "continue_artifacts": "openspec instructions",
+        "validate_structure": "openspec validate --strict"
+      }
+    },
+    "memory": {
+      "server": "user-codebase-memory-mcp",
+      "resolved_tools": ["list_projects", "search_graph", "search_code", "get_code_snippet", "index_status"]
+    },
+    "superpowers": { "source": "loaded", "resolved_methods": ["brainstorming"] },
+    "subagents": {
+      "max_concurrency": null,
+      "worktree_support": "unknown",
+      "independent_review": "available"
+    }
+  },
+  "presentation_capability": {
+    "mode": "markdown",
+    "source": "unknown"
+  },
+  "gate_status": {
+    "status": "pass",
+    "summary": "用户批准范围：分模式结果去向、一次迁移、开口窗口粘贴、缺模型准备页、历史冲突开录前选择、会中修改已落段文字。无接受警告。",
+    "evidence": [
+      "openspec validate dictation-mode-defaults --strict 通过",
+      "proposal.md 状态源与工件位置"
+    ],
+    "approved_by": "用户",
+    "approved_at": "2026-10-21T04:49:40Z",
+    "binds_to_revision": "sha256:9212320eb7519fb6a347bce12e4c8e69fb84b87d101be0770dcc53a6861b8119",
+    "accepted_warning_ids": []
+  },
+  "evidence_mode": "full",
+  "next_skill": "delivery-plan-tasks",
+  "next_action": null,
+  "required_inputs": [],
+  "stop_condition": "",
+  "stage_payload": {
+    "route": "High",
+    "risk": "high",
+    "confirmed_artifacts": [
+      "openspec/changes/dictation-mode-defaults/proposal.md",
+      "openspec/changes/dictation-mode-defaults/specs/dictation-mode-defaults/spec.md"
+    ],
+    "forbidden_scope": [
+      "不把 Fun-ASR-Nano 打进轻量包",
+      "不把会议文字粘贴到其他应用",
+      "不改会议开始、暂停、结束和 Esc",
+      "不改默认音源、默认快捷键、默认关闭润色",
+      "不在准备页配置 AI",
+      "不改动凭据管理器中的 API Key"
+    ],
+    "open_questions": [],
+    "quality_profiles": {
+      "functional": "required",
+      "visual": "required",
+      "accessibility": "required",
+      "performance": "not_required",
+      "compatibility": "required"
+    },
+    "external_artifacts": []
+  },
+  "presentation": {
+    "schema": "delivery-presentation/v1",
+    "from_task": "定框·规格闸门通过",
+    "to_task": "技术设计与任务拆解",
+    "summary": "规格已批准，进入设计；会中可改已落段文字。",
+    "evidence": [
+      "openspec validate dictation-mode-defaults --strict 通过"
+    ],
+    "continue_prompt": "请使用 delivery-plan-tasks"
+  }
+}

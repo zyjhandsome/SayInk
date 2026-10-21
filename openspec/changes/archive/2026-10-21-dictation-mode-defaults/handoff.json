@@ -1,0 +1,112 @@
+{
+  "schema_version": "delivery-handoff/v1",
+  "family_version": "delivery-family/1.6",
+  "type": "delivery-handoff",
+  "handoff_id": "dictation-mode-defaults-plan-tasks-20261021T045441",
+  "previous_handoff_id": "dictation-mode-defaults-frame-spec-20261021T044940",
+  "generated_at": "2026-10-21T04:59:50Z",
+  "stage": "delivery-plan-tasks",
+  "source_revision": {
+    "repo_head": "737e792614474e6081b2070d7a2f7d2199ff9c73",
+    "artifact_revision": "sha256:47e381cd484f9ca821e5f5aebc7a87e169f7dbbe1feb4eba5fbe29f78e33ff9a",
+    "state_observed_at": "2026-10-21T04:59:50Z"
+  },
+  "state_source": {
+    "kind": "openspec_change",
+    "label": "change #dictation-mode-defaults",
+    "anchor": "openspec/changes/dictation-mode-defaults"
+  },
+  "capability_snapshot": {
+    "memory": "ok",
+    "openspec": "initialized",
+    "superpowers": "loaded"
+  },
+  "capability_bindings": {
+    "openspec": {
+      "version": "1.6.0",
+      "schema": "spec-driven",
+      "operations": {
+        "inspect_change": "openspec status",
+        "validate_structure": "openspec validate --strict"
+      }
+    },
+    "memory": {
+      "server": "user-codebase-memory-mcp",
+      "resolved_tools": ["search_graph", "search_code"]
+    },
+    "superpowers": { "source": "loaded", "resolved_methods": [] },
+    "subagents": {
+      "max_concurrency": null,
+      "worktree_support": "unknown",
+      "independent_review": "available"
+    }
+  },
+  "presentation_capability": {
+    "mode": "markdown",
+    "source": "unknown"
+  },
+  "gate_status": {
+    "status": "pass",
+    "summary": "用户选择「开始实施」。实现闸门通过，绑定 sha256:47e381cd484f9ca821e5f5aebc7a87e169f7dbbe1feb4eba5fbe29f78e33ff9a。无警告项。规格闸门仍绑定 sha256:9212320eb7519fb6a347bce12e4c8e69fb84b87d101be0770dcc53a6861b8119。openspec list 仅有本 change，允许路径无并行冲突。",
+    "evidence": [
+      "openspec validate dictation-mode-defaults --strict 通过",
+      "validate_delivery_change.mjs 通过",
+      "openspec list 仅有 dictation-mode-defaults（0/7）",
+      "用户在实现闸门选择 start"
+    ],
+    "approved_by": "用户",
+    "approved_at": "2026-10-21T04:59:50Z",
+    "binds_to_revision": "sha256:47e381cd484f9ca821e5f5aebc7a87e169f7dbbe1feb4eba5fbe29f78e33ff9a",
+    "accepted_warning_ids": []
+  },
+  "evidence_mode": "full",
+  "next_skill": "delivery-execute-verify",
+  "next_action": null,
+  "required_inputs": [],
+  "stop_condition": "",
+  "stage_payload": {
+    "plan_tasks": [
+      "任务 1 复制会议文字稿对照图",
+      "任务 2 分模式结果去向与一次迁移",
+      "任务 3 开口窗口粘贴与浮条",
+      "任务 4 开录前历史冲突选择",
+      "任务 5 缺模型准备页",
+      "任务 6 会中修改已落段文字",
+      "任务 7 界面截图"
+    ],
+    "plan_decisions": {
+      "agent_decided": ["output.by_mode 加旧字段镜像", "UI 线程记录开口窗口", "准备页只替换缺模型", "会中保存复用收尾门闩"],
+      "user_decided": ["当前模式保留明确去向", "每段开口窗口", "浮条提示", "会中可改已落段文字"],
+      "returned_to_frame": [],
+      "remaining_blockers": []
+    },
+    "traceability": ["design.md 需求追溯"],
+    "readiness_result": {
+      "blockers": [],
+      "warnings": [],
+      "suggestions": ["实施时不要把窗口标题写进日志"]
+    },
+    "validation_plan": ["tasks.md 最终验证表"],
+    "quality_profiles": {
+      "functional": "required",
+      "visual": "required",
+      "accessibility": "required",
+      "performance": "not_required",
+      "compatibility": "required"
+    },
+    "visual_validation_plan": ["V1 准备页待下载", "V2 麦克风未听到", "V3 浮条目标", "V4 开录前选择", "V5 会中悬停编辑", "V6 会后无纪要提示"],
+    "risk_gates": ["High：配置迁移、粘贴主路径、会中正文并发"],
+    "parallel_ownership": ["任务 5 与任务 6 可并行", "任务 3 然后任务 4 串行修改 sayink/app.py"]
+  },
+  "presentation": {
+    "schema": "delivery-presentation/v1",
+    "from_task": "计划·实现闸门已批准",
+    "to_task": "实施·按 tasks.md 执行（任务勾选属 Execute 阶段）",
+    "summary": "实现闸门已通过，任务待实施",
+    "evidence": [
+      "用户选择开始实施",
+      "binds_to_revision sha256:47e381cd484f9ca821e5f5aebc7a87e169f7dbbe1feb4eba5fbe29f78e33ff9a"
+    ],
+    "continue_prompt": "请使用 delivery-execute-verify"
+  }
+}

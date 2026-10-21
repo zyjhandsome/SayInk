@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-10-21
+goal: Make fresh-install defaults and mode switching match how people actually
+  dictate, record, and meet.
