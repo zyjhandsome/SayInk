@@ -522,6 +522,8 @@ class TestRefinement:
         assert "生成章节" not in describe_template(template)
         assert build_system_prompt(template, output_language="en") == REFINE_SYSTEM_PROMPT
         assert "不额外翻译" in REFINE_SYSTEM_PROMPT
+        assert "高度保留风格与原意" in REFINE_SYSTEM_PROMPT
+        assert "防总结机制" in REFINE_SYSTEM_PROMPT
         assert '"action_items"' not in REFINE_SYSTEM_PROMPT
 
     def test_single_request_renders_only_prose(self, fake_httpx):
