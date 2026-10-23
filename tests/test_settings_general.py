@@ -217,6 +217,34 @@ class TestGeneralPageLayout:
         assert settings_window._auto_start_row.isVisible()
         assert settings_window._history_enabled_row.isVisible()
 
+    def test_general_section_jumps_scroll_each_group_into_view(self, settings_window, qapp):
+        from PyQt6.QtCore import QPoint
+        from PyQt6.QtWidgets import QLabel
+
+        settings_window.resize(900, 640)
+        settings_window.show()
+        qapp.processEvents()
+        page = settings_window._pages.widget(0)
+        assert page.verticalScrollBar().maximum() > 200
+        titles = {
+            label.text(): label
+            for label in settings_window.findChildren(QLabel)
+            if label.objectName() == "settingsGroupTitle"
+        }
+        names = {
+            "录音与输入": "录音与输入",
+            "识别": "识别",
+            "会议默认": "会议默认设置",
+            "应用与历史": "应用与历史",
+        }
+        assert [button.text() for button in settings_window._general_section_jumps] == list(names)
+        for button in settings_window._general_section_jumps:
+            button.click()
+            qapp.processEvents()
+            label = titles[names[button.text()]]
+            y = label.mapTo(page.viewport(), QPoint(0, 8)).y()
+            assert 0 <= y < page.viewport().height(), (button.text(), y)
+
     def test_general_section_groups_use_bordered_cards(self, settings_window):
         from PyQt6.QtWidgets import QFrame
 

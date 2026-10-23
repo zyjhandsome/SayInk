@@ -32,6 +32,19 @@ def _ui_font(family, pixels, weight=QFont.Weight.Normal):
     return font
 
 
+def _error_headline(first_line: str) -> tuple[str, str]:
+    """Split an error title at the first sentence mark, not at a fixed width."""
+    best = None
+    for mark in ("：", "。", "；", "，", "！", "？"):
+        index = first_line.find(mark)
+        if index > 0 and (best is None or index < best[0]):
+            best = (index, mark)
+    if best is None:
+        return first_line.strip(), ""
+    index, mark = best
+    return first_line[:index].strip(), first_line[index + len(mark):].strip()
+
+
 class _DotIndicator(QWidget):
     """Listening ring that pulses while a session is active."""
 
@@ -469,9 +482,12 @@ class FloatingWindow(QWidget):
         self._state_token = color
         color = getattr(tok, color, color)
         self._current_accent = color
+        # AMBER on white is about 3.2:1. Warning text uses the darker text
+        # token; the dot keeps the brighter amber so it still reads as a warning.
+        label_color = tok.AMBER_TEXT if self._state_token == "STATE_WARN" else color
         self._status_label.setText(text)
         self._status_label.setStyleSheet(
-            f"color: {color}; background: transparent;"
+            f"color: {label_color}; background: transparent;"
             f" font-family: {tok.FONT_DISPLAY};"
         )
         self._dot.set_color(color)
@@ -823,11 +839,7 @@ class FloatingWindow(QWidget):
         self._waveform.stop()
         self._waveform.hide()
         first_line, _, body_after_newline = message.partition("\n")
-        if "：" in first_line:
-            status, colon_remainder = first_line.split("：", 1)
-        else:
-            status = first_line[:12]
-            colon_remainder = first_line[12:]
+        status, colon_remainder = _error_headline(first_line)
         parts = [p for p in (colon_remainder, body_after_newline) if p]
         remainder = "\n".join(parts)
         self._set_state(status, "STATE_ERROR")

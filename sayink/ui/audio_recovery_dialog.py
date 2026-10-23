@@ -6,7 +6,7 @@ import time
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor, QPalette
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
-                            QPushButton, QPlainTextEdit, QFileDialog, QMessageBox, QComboBox)
+                            QPushButton, QPlainTextEdit, QFileDialog, QComboBox)
 
 from sayink.audio_recovery import recordings, delete_recording
 from sayink.audio_utils import TARGET_SAMPLE_RATE
@@ -14,6 +14,7 @@ from sayink.speech_recognizer import decode_asr_slice
 from sayink.vad_segmenter import SpeechSegmenter, make_speech_gate
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles
+from sayink.ui.prompts import confirm
 
 
 class RecoveryWorker(QThread):
@@ -186,9 +187,10 @@ class AudioRecoveryDialog(QDialog):
                                        vad_path=self.vad_path, quiet=self.quiet))
 
     def _delete(self):
-        if (item := self._selected()) and QMessageBox.question(
-                self, "删除录音", "永久删除所选录音缓存？已导出的文件和识别文字会保留。"
-        ) == QMessageBox.StandardButton.Yes:
+        if (item := self._selected()) and confirm(
+                self, "删除录音", "永久删除所选录音缓存？已导出的文件和识别文字会保留。",
+                accept="删除", destructive=True,
+        ):
             try:
                 delete_recording(self.root, item)
                 self._refresh()

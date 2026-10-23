@@ -170,6 +170,9 @@ class SettingsWindow(QWidget):
                 f"color: {tok.TEXT_SEC}; font-size: {_tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
                 f" background: transparent; padding: 0 16px 12px 16px;"
             )
+        if hasattr(self, "_general_section_jumps"):
+            for button in self._general_section_jumps:
+                button.setStyleSheet(_settings_styles.BTN_GHOST_SM)
         if hasattr(self, "_advanced_audio_btn"):
             paint_device_selection_link(self._advanced_audio_btn)
             paint_device_selection_link(self._advanced_recognition_btn)

@@ -212,6 +212,25 @@ class TestModelLoadingGuard:
         assert win.height() <= COMPACT_HEIGHT + 40
         assert msg in win.toolTip()
 
+
+def test_error_breaks_at_punctuation_instead_of_twelve_characters(win):
+    msg = "识别失败，模型推理时发生内部错误"
+    win.show_error(msg)
+    assert win._status_label.text() == "识别失败"
+    assert "模型推理时发生内部错误" in win._text_label.text()
+    assert msg in win.toolTip()
+
+
+def test_warning_text_uses_the_readable_amber(win):
+    from sayink.ui.design_tokens import AMBER, AMBER_TEXT
+
+    win.show_warning("会议已暂停")
+    css = win._status_label.styleSheet()
+    assert AMBER_TEXT.lower() in css.lower()
+    assert AMBER.lower() not in css.lower()
+    win.show_meeting_paused()
+    assert AMBER_TEXT.lower() in win._status_label.styleSheet().lower()
+
     def test_success_clears_loading_flag(self, win):
         win.show_model_loading()
         win.show_success("已就绪")

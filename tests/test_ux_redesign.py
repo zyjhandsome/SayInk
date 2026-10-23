@@ -53,9 +53,10 @@ def test_tab_walks_the_general_page_top_to_bottom_then_back_to_the_current_nav(m
     win.setFocus()
     _qapp_session.processEvents()
 
-    stops = _tab_stops(win, _qapp_session, 25)
+    stops = _tab_stops(win, _qapp_session, 29)
     assert stops == [
-        "通用", "单次转写", "录音快捷键", "仅麦克风", "识别结果去向",
+        "通用", "录音与输入", "识别", "会议默认", "应用与历史",
+        "单次转写", "录音快捷键", "仅麦克风", "识别结果去向",
         "测试声音（约 2 秒）", "设备恢复自动选择", "手动选择音频设备",
         "混合音源分别识别（实验性）",
         "识别语言", "自定义词汇", "展开高级识别设置",
@@ -72,9 +73,10 @@ def test_tab_enters_radio_groups_on_the_checked_option(main_window, _qapp_sessio
     win._settings.reload_settings()
     win.setFocus()
     _qapp_session.processEvents()
-    stops = _tab_stops(win, _qapp_session, 5)
-    assert stops[1] == "持续转写"
-    assert stops[4] == "混合音源"
+    stops = _tab_stops(win, _qapp_session, 9)
+    assert stops[:5] == ["通用", "录音与输入", "识别", "会议默认", "应用与历史"]
+    assert stops[5] == "持续转写"
+    assert stops[8] == "混合音源"
 
 
 def test_theme_segment_uses_arrows_and_keeps_only_current_option_tabbable(main_window, _qapp_session):

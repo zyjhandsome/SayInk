@@ -386,7 +386,30 @@ def build_btn_accent_sm() -> str:
     QPushButton:focus {{
         border: 2px solid {t.ACCENT_FOCUS}; padding: 0px {focus_pad_h}px;
     }}
-    QPushButton:disabled {{ color: {t.TEXT_DIM}; background: {t.BAR_OFF}; border-color: {t.BAR_OFF}; }}
+    QPushButton:disabled {{ color: {t.TEXT_DIM}; background: {t.BAR_OFF}; border-color: {t.BAR_OFF}; font-weight: 400; }}
+"""
+
+
+def build_btn_danger_solid_sm() -> str:
+    """Filled end-meeting control. Same outer box as the other small buttons.
+
+    The light theme's red is dark, so the label uses the page background
+    (white). The dark theme's red is light, so that same background token
+    is the dark ink.
+    """
+    h, pad_h, focus_pad_h, font_px = _btn_sm_metrics()
+    return f"""
+    QPushButton {{
+        background: {t.RED}; color: {t.BG};
+        border: 1px solid {t.RED};
+        border-radius: {t.RADIUS_SM}px; padding: 0px {pad_h}px; font-size: {font_px}px;
+        font-weight: 700; min-height: {h}px; max-height: {h}px;
+    }}
+    QPushButton:hover {{ background: {t.RED_BG}; color: {t.RED}; border-color: {t.RED}; }}
+    QPushButton:focus {{
+        border: 2px solid {t.ACCENT_FOCUS}; padding: 0px {focus_pad_h}px;
+    }}
+    QPushButton:disabled {{ color: {t.TEXT_DIM}; background: {t.BAR_OFF}; border-color: {t.BAR_OFF}; font-weight: 400; }}
 """
 
 
@@ -399,6 +422,7 @@ def reload_styles() -> None:
     g["BTN_GHOST"] = build_btn_ghost()
     g["BTN_GHOST_SM"] = build_btn_ghost_sm()
     g["BTN_DANGER_SM"] = build_btn_danger_sm()
+    g["BTN_DANGER_SOLID_SM"] = build_btn_danger_solid_sm()
     g["BTN_GREEN_SM"] = build_btn_green_sm()
     g["BTN_ACCENT_SM"] = build_btn_accent_sm()
 
@@ -408,6 +432,7 @@ BTN_PRIMARY = ""
 BTN_GHOST = ""
 BTN_GHOST_SM = ""
 BTN_DANGER_SM = ""
+BTN_DANGER_SOLID_SM = ""
 BTN_GREEN_SM = ""
 BTN_ACCENT_SM = ""
 

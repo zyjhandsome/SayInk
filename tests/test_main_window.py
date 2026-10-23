@@ -579,3 +579,100 @@ def test_hiding_main_window_cleans_up_settings_panel_transient_state(qapp, tmp_p
         assert calls == ["mic", "hotkey", "llm"]
     finally:
         store.close()
+
+
+def test_failed_minutes_save_keeps_the_meeting_page(qapp, tmp_path, monkeypatch):
+    win, store = _make_main_window(tmp_path, monkeypatch, with_meeting=True)
+    controller = win._meeting_controller
+    try:
+        record = controller.store.create_meeting(title="评审")
+        controller.store.save_notes(
+            record.id, template_id="general", model="m", json_payload="", markdown="原纪要",
+        )
+        controller.store.flush()
+        win.show()
+        win.show_page("meeting")
+        page = win.meeting_panel
+        page.show_meeting(record.id)
+        page._toggle_edit()
+        page._notes_edit.setPlainText("不能丢的草稿")
+        real_save = controller.save_user_markdown
+        monkeypatch.setattr(controller, "save_user_markdown", lambda *_args, **_kwargs: False)
+        win._nav_buttons[2].click()
+        qapp.processEvents()
+        assert win.current_page() == "meeting"
+        assert win._nav_buttons[1].isChecked()
+        assert page.isVisible()
+        assert page._editing_notes
+        assert page._notes_edit.toPlainText() == "不能丢的草稿"
+        assert page._status_label.isVisible()
+        assert "尚未保存" in page._status_label.text()
+        monkeypatch.setattr(controller, "save_user_markdown", real_save)
+        win.show_page("general")
+        assert win.current_page() == "general"
+    finally:
+        win.close()
+        controller.shutdown()
+        store.close()
+
+
+def test_caption_hit_enables_system_drag_and_snap_button(qapp, tmp_path, monkeypatch):
+    from PyQt6.QtCore import QPoint
+
+    from sayink.ui.main_window import _HTCAPTION, _HTMAXBUTTON
+
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        win.show()
+        qapp.processEvents()
+        title = win._title.mapTo(win, QPoint(2, 2))
+        assert win._hit_test(title.x(), title.y()) == _HTCAPTION
+        maximize = win._max_btn.mapTo(win, QPoint(4, 4))
+        assert win._hit_test(maximize.x(), maximize.y()) == _HTMAXBUTTON
+        close = win._close_btn.mapTo(win, QPoint(4, 4))
+        assert win._hit_test(close.x(), close.y()) is None
+        edge = win._hit_test(2, win.height() // 2)
+        assert edge not in (None, _HTCAPTION, _HTMAXBUTTON)
+        monkeypatch.setattr(win, "isMaximized", lambda: True)
+        assert win._hit_test(title.x(), title.y()) == _HTCAPTION
+        assert win._hit_test(2, win.height() // 2) is None
+    finally:
+        win.close()
+        store.close()
+
+
+def test_post_meeting_tools_stay_on_one_row_at_minimum_window(qapp, tmp_path, monkeypatch):
+    from PyQt6.QtCore import QPoint
+
+    win, store = _make_main_window(tmp_path, monkeypatch, with_meeting=True)
+    controller = win._meeting_controller
+    try:
+        record = controller.store.create_meeting(title="评审")
+        controller.store.end_meeting(record.id, ended_at=record.started_at + 1000)
+        controller.store.save_notes(
+            record.id, template_id="general", model="m", json_payload="", markdown="纪要正文",
+        )
+        controller.store.flush()
+        win.show()
+        win.resize(880, 580)
+        win.show_page("meeting")
+        page = win.meeting_panel
+        page.show_meeting(record.id)
+        qapp.processEvents()
+        action_y = page._generate_btn.mapTo(page, QPoint(0, 0)).y()
+        menu_y = page._template_menu_btn.mapTo(page, QPoint(0, 0)).y()
+        assert page._template_menu_btn.isVisible()
+        assert not page._template_label.isVisible()
+        assert abs(menu_y - action_y) <= 4
+        assert page._notes_bar.height() <= page._generate_btn.height() + 8
+        assert "管理模板" in [action.text() for action in page._template_menu.actions()]
+        assert page._copy_btn.isEnabled()
+        from sayink.ui import settings_styles as ss
+        disabled = ss.BTN_ACCENT_SM.split("QPushButton:disabled", 1)[1]
+        ghost_disabled = ss.BTN_GHOST_SM.split("QPushButton:disabled", 1)[1]
+        assert "font-weight: 400" in disabled
+        assert "font-weight: 400" in ghost_disabled or "font-weight: 700" not in ghost_disabled
+    finally:
+        win.close()
+        controller.shutdown()
+        store.close()

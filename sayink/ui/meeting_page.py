@@ -35,7 +35,6 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -212,6 +211,19 @@ class _ReadingView(QTextBrowser):
         key = (markdown, plain, text, tok.ACCENT_TEXT, tok.TEXT_SEC)
         if self._reading_key == key:
             return
+        previous = self._reading_key
+        if (
+            not plain and not markdown and previous
+            and previous[0] is False and previous[1] is False
+            and previous[3] == tok.ACCENT_TEXT and previous[4] == tok.TEXT_SEC
+            and self.retarget_speaker_labels(previous[2], text)
+        ):
+            # A rename rewrites the same paragraphs. Replacing the anchor
+            # text keeps the document; parsing a long transcript again
+            # stalls the UI thread.
+            self._reading_key = key
+            self._fit_text_width()
+            return
         value = self.verticalScrollBar().value()
         self._reading_key = key
         if plain:
@@ -229,6 +241,54 @@ class _ReadingView(QTextBrowser):
 
     def set_reading_html(self, text: str) -> None:
         self._set_reading(text, markdown=False)
+
+    def retarget_speaker_labels(self, old_html: str, new_html: str) -> bool:
+        """Replace speaker-link text in place when the paragraphs did not change.
+
+        Returns False when the caller should rebuild the document.
+        """
+        if not old_html or _speaker_anchor_skeleton(old_html) != _speaker_anchor_skeleton(new_html):
+            return False
+        old_map = _speaker_anchor_map(old_html)
+        new_map = _speaker_anchor_map(new_html)
+        if not old_map or set(old_map) != set(new_map):
+            return False
+        changed = {href: new_map[href] for href in old_map if old_map[href] != new_map[href]}
+        if not changed:
+            return False
+        edits = []
+        seen: set[str] = set()
+        block = self.document().begin()
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                href = fragment.charFormat().anchorHref()
+                if href in changed:
+                    old_label = old_map[href][0]
+                    if fragment.text() == old_label:
+                        edits.append((fragment.position(), fragment.position() + fragment.length(), href))
+                        seen.add(href)
+                    elif fragment.text() != changed[href][0]:
+                        return False
+                iterator += 1
+            block = block.next()
+        label_changes = {href for href, (label, _title) in changed.items() if label != old_map[href][0]}
+        if not label_changes.issubset(seen):
+            return False
+        cursor = QTextCursor(self.document())
+        cursor.beginEditBlock()
+        for start, end, href in reversed(edits):
+            label, title = changed[href]
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            fmt = cursor.charFormat()
+            fmt.setAnchor(True)
+            fmt.setAnchorHref(href)
+            fmt.setToolTip(title)
+            cursor.insertText(label, fmt)
+        cursor.endEditBlock()
+        return True
 
     def set_reading_plain(self, text: str) -> None:
         self._set_reading(text, markdown=False, plain=True)
@@ -554,6 +614,25 @@ class _TranscriptView(_ReadingView):
         mime = QMimeData()
         mime.setText("\n".join(lines).strip("\n"))
         return mime
+
+
+_SPEAKER_ANCHOR_RE = re.compile(
+    r"<a href='((?:live-)?speaker:\d+)' title='([^']*)' style='[^']*'><b>([^<]*)</b></a>"
+)
+
+
+def _speaker_anchor_skeleton(source: str) -> str:
+    return _SPEAKER_ANCHOR_RE.sub(r"<a href='\1'><b></b></a>", source)
+
+
+def _speaker_anchor_map(source: str) -> dict[str, tuple[str, str]]:
+    found: dict[str, tuple[str, str]] = {}
+    for href, title, label in _SPEAKER_ANCHOR_RE.findall(source):
+        item = (html.unescape(label), html.unescape(title))
+        if href in found and found[href] != item:
+            return {}
+        found[href] = item
+    return found
 
 
 def _speaker_source(speaker_id: int, names: dict[int, str], auto_names: set[int]) -> str:
@@ -988,7 +1067,6 @@ class MeetingPage(QWidget):
         self._detail_title.editingFinished.connect(self._save_title)
         title_row.addWidget(self._detail_title, 1)
         self._copy_btn = QPushButton("复制")
-        self._copy_btn.setMinimumWidth(108)
         self._copy_btn.setToolTip("复制纪要 Markdown")
         self._copy_btn.clicked.connect(self._copy_current)
         self._export_btn = QPushButton("导出")
@@ -1118,13 +1196,20 @@ class MeetingPage(QWidget):
                 self._template_combo.count() - 1, describe_template(template), Qt.ItemDataRole.ToolTipRole
             )
         self._template_combo.currentIndexChanged.connect(self._on_template_changed)
-        self._template_combo.setMinimumWidth(120)
-        self._template_combo.setMaximumWidth(240)
+        self._template_combo.setMinimumWidth(96)
+        self._template_combo.setMaximumWidth(168)
         self._template_combo.setToolTip(str(self._template_combo.itemData(0, Qt.ItemDataRole.ToolTipRole) or ""))
         self._template_label.setBuddy(self._template_combo)
         self._manage_templates_btn = QPushButton("管理模板")
         self._manage_templates_btn.setToolTip("新建自定义模板，或复制内置模板后修改")
         self._manage_templates_btn.clicked.connect(self._manage_templates)
+        self._template_menu_btn = QPushButton("模板")
+        self._template_menu_btn.setAccessibleName("选择会议模板")
+        self._template_menu_btn.setToolTip("选择纪要模板")
+        self._template_menu = QMenu(self._template_menu_btn)
+        self._template_menu_btn.setMenu(self._template_menu)
+        self._template_menu_btn.hide()
+        self._fitting_templates = False
         self._generate_btn = QPushButton("生成纪要")
         self._generate_btn.setAccessibleName("生成纪要")
         self._generate_btn.clicked.connect(self._generate)
@@ -1135,6 +1220,8 @@ class MeetingPage(QWidget):
         self._notes_bar.add_left(self._template_label)
         self._notes_bar.add_left(self._template_combo)
         self._notes_bar.add_left(self._manage_templates_btn)
+        self._notes_bar.add_left(self._template_menu_btn)
+        self._notes_bar.installEventFilter(self)
         self._notes_bar.add_right(self._generate_btn)
         self._notes_bar.add_right(self._edit_btn)
         self._notes_bar.add_right(self._copy_btn)
@@ -1166,7 +1253,6 @@ class MeetingPage(QWidget):
         self._return_notes_btn.hide()
         self._transcript_bar.add_right(self._return_notes_btn)
         self._transcript_copy_btn = QPushButton("复制文字稿")
-        self._transcript_copy_btn.setMinimumWidth(108)
         self._transcript_copy_btn.setAccessibleName("复制文字稿")
         self._transcript_copy_btn.setToolTip("复制完整文字稿（含时间与说话人名称） · Ctrl+C")
         self._transcript_copy_btn.clicked.connect(self._copy_transcript)
@@ -1318,10 +1404,31 @@ class MeetingPage(QWidget):
         head = QHBoxLayout()
         head.setSpacing(12)
         self._live_title = QLabel("会议进行中")
+        self._live_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         head.addWidget(self._live_title, 1)
+        self._live_rec_dot = QLabel()
+        self._live_rec_dot.setFixedSize(8, 8)
+        self._live_rec_dot.setAccessibleName("正在记录")
+        head.addWidget(self._live_rec_dot, 0, Qt.AlignmentFlag.AlignVCenter)
         self._live_clock = QLabel("00:00:00")
         self._live_clock.setObjectName("meetingLiveClock")
+        self._live_clock.setAccessibleName("会议已进行时间")
         head.addWidget(self._live_clock, 0)
+        self._pause_btn = QPushButton("暂停采集")
+        self._pause_btn.setAccessibleName("暂停会议采集")
+        self._pause_btn.setToolTip("暂停期间不采集新音频；已录内容继续识别，会议记录保留。")
+        self._pause_btn.clicked.connect(self.pause_requested.emit)
+        head.addWidget(self._pause_btn, 0)
+        self._resume_btn = QPushButton("继续采集")
+        self._resume_btn.setAccessibleName("继续会议采集")
+        self._resume_btn.setToolTip("继续采集新的会议音频。")
+        self._resume_btn.clicked.connect(self.resume_requested.emit)
+        self._resume_btn.hide()
+        head.addWidget(self._resume_btn, 0)
+        self._end_btn = QPushButton("结束会议")
+        self._end_btn.setAccessibleName("结束会议")
+        self._end_btn.clicked.connect(self._confirm_end)
+        head.addWidget(self._end_btn, 0)
         lay.addLayout(head)
         self._live_status = QLabel("")
         self._live_status.setWordWrap(True)
@@ -1428,21 +1535,6 @@ class MeetingPage(QWidget):
         self._live_dl_btn.clicked.connect(self._download_aux_models)
         self._live_dl_btn.hide()
         actions.addWidget(self._live_dl_btn)
-        self._pause_btn = QPushButton("暂停采集")
-        self._pause_btn.setAccessibleName("暂停会议采集")
-        self._pause_btn.setToolTip("暂停期间不采集新音频；已录内容继续识别，会议记录保留。")
-        self._pause_btn.clicked.connect(self.pause_requested.emit)
-        actions.addWidget(self._pause_btn)
-        self._resume_btn = QPushButton("继续采集")
-        self._resume_btn.setAccessibleName("继续会议采集")
-        self._resume_btn.setToolTip("继续采集新的会议音频。")
-        self._resume_btn.clicked.connect(self.resume_requested.emit)
-        self._resume_btn.hide()
-        actions.addWidget(self._resume_btn)
-        self._end_btn = QPushButton("结束会议")
-        self._end_btn.setAccessibleName("结束会议")
-        self._end_btn.clicked.connect(self._confirm_end)
-        actions.addWidget(self._end_btn)
         lay.addLayout(actions)
         return page
 
@@ -1464,9 +1556,7 @@ class MeetingPage(QWidget):
         self._live_title.setStyleSheet(
             f"font-size: {tok.TYPE_TITLE}px; font-weight: 700; color: {tok.TEXT}; background: transparent;"
         )
-        self._live_clock.setStyleSheet(
-            f"font-size: {tok.TYPE_TITLE_LG}px; font-weight: 700; color: {tok.ACCENT}; background: transparent;"
-        )
+        self._paint_live_clock()
         dim = f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
         for label in (self._list_summary, self._detail_meta, self._card_hint, self._live_caps,
                       self._card_notes, self._empty_label, self._template_label, self._content_hint,
@@ -1549,11 +1639,11 @@ class MeetingPage(QWidget):
             combo.setStyleSheet("")  # Inherit the shared form and popup styles.
         # Match the small action buttons so 纪要 and 文字稿 share one tool-row height.
         self._template_combo.setStyleSheet(ss.build_toolbar_combo_css())
-        for btn in (self._start_btn, self._card_start, self._mark_btn, self._resume_btn):
+        for btn in (self._start_btn, self._card_start, self._pause_btn, self._resume_btn):
             btn.setStyleSheet(ss.BTN_ACCENT_SM)
         for btn in (self._generate_btn, self._edit_btn, self._copy_btn, self._transcript_copy_btn, self._export_btn, self._card_cancel,
                     self._cancel_btn, self._correct_speaker_btn, self._return_notes_btn, self._clear_search_btn,
-                    self._pause_btn, self._live_find_close_btn, self._manage_templates_btn, self._live_correct_speaker_btn,
+                    self._mark_btn, self._live_find_close_btn, self._manage_templates_btn, self._live_correct_speaker_btn,
                     self._card_dl_btn, self._live_dl_btn, self._load_more_btn, self._materials_toggle):
             btn.setStyleSheet(ss.BTN_GHOST_SM)
         # Match 导出's real box (style min-height plus its border) so the tab
@@ -1575,9 +1665,10 @@ class MeetingPage(QWidget):
         self._tab_bar.setFixedHeight(tab_h)
         no_indicator = "QPushButton::menu-indicator { image: none; width: 0px; }"
         self._more_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
+        self._template_menu_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
         self._speaker_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
         self._live_speaker_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
-        self._end_btn.setStyleSheet(ss.BTN_DANGER_SM)
+        self._end_btn.setStyleSheet(ss.BTN_DANGER_SOLID_SM)
         for splitter in (self._splitter, self._live_split):
             splitter.setStyleSheet(
                 "QSplitter::handle { background: transparent; }"
@@ -1596,6 +1687,73 @@ class MeetingPage(QWidget):
         from sayink.ui.minutes_templates import populate_template_combo
 
         populate_template_combo(self._template_combo, self._config, self._template_combo.currentData())
+        self._rebuild_template_menu()
+
+    def _rebuild_template_menu(self) -> None:
+        menu = self._template_menu
+        menu.clear()
+        current = self._template_combo.currentData()
+        for index in range(self._template_combo.count()):
+            action = menu.addAction(self._template_combo.itemText(index))
+            action.setCheckable(True)
+            action.setChecked(self._template_combo.itemData(index) == current)
+            tip = self._template_combo.itemData(index, Qt.ItemDataRole.ToolTipRole)
+            if tip:
+                action.setToolTip(str(tip))
+            action.triggered.connect(lambda _checked=False, idx=index: self._select_template(idx))
+        menu.addSeparator()
+        manage = menu.addAction("管理模板")
+        manage.triggered.connect(self._manage_templates)
+        self._sync_template_menu_tip()
+
+    def _sync_template_menu(self) -> None:
+        if not hasattr(self, "_template_menu"):
+            return
+        names = [self._template_combo.itemText(i) for i in range(self._template_combo.count())]
+        actions = [action for action in self._template_menu.actions() if not action.isSeparator() and action.text() != "管理模板"]
+        if [action.text() for action in actions] != names:
+            self._rebuild_template_menu()
+            return
+        current = self._template_combo.currentData()
+        for index, action in enumerate(actions):
+            action.setChecked(self._template_combo.itemData(index) == current)
+        self._sync_template_menu_tip()
+
+    def _sync_template_menu_tip(self) -> None:
+        text = self._template_combo.currentText()
+        self._template_menu_btn.setToolTip(f"当前模板：{text}" if text else "选择纪要模板")
+
+    def _select_template(self, index: int) -> None:
+        if self._template_combo.currentIndex() != index:
+            self._template_combo.setCurrentIndex(index)
+        else:
+            self._sync_template_menu()
+
+    def _fit_template_cluster(self) -> None:
+        """Keep post-meeting actions on one row when the window is narrow.
+
+        The label, combo and 管理模板 stay inline when they fit. Otherwise they
+        collapse into the 模板 menu so the notes body does not lose a row.
+        """
+        if self._fitting_templates or not hasattr(self, "_notes_bar"):
+            return
+        bar = self._notes_bar
+        width = bar.width()
+        if width <= 0:
+            return
+        full = (self._template_label, self._template_combo, self._manage_templates_btn)
+        actions = [widget for widget in (self._generate_btn, self._edit_btn, self._copy_btn) if not widget.isHidden()]
+        gap = bar._spacing if actions else 0
+        compact = bar._span(list(full)) + gap + bar._span(actions) > width
+        if compact == self._template_menu_btn.isVisible() and all(widget.isVisible() != compact for widget in full):
+            return
+        self._fitting_templates = True
+        try:
+            for widget in full:
+                widget.setVisible(not compact)
+            self._template_menu_btn.setVisible(compact)
+        finally:
+            self._fitting_templates = False
 
     def _manage_templates(self) -> None:
         from sayink.ui.minutes_templates import MinutesTemplatesDialog
@@ -1985,6 +2143,7 @@ class MeetingPage(QWidget):
         if self._detail_id:
             self._pending_templates[self._detail_id] = str(self._template_combo.currentData() or "general")
             self._render_detail()
+        self._sync_template_menu()
 
     def _is_refinement(self, template_id: str | None = None) -> bool:
         return get_template(template_id or str(self._template_combo.currentData() or "general"), self._custom_templates()).is_refinement
@@ -2142,6 +2301,7 @@ class MeetingPage(QWidget):
         # taller than the shared small-button box and made the two toolbars disagree.
         self._copy_btn.setStyleSheet(ss.BTN_ACCENT_SM)
         self._transcript_copy_btn.setStyleSheet(ss.BTN_ACCENT_SM)
+        self._fit_template_cluster()
         self._export_actions["notes"].setEnabled(has_notes)
         self._export_actions["transcript"].setEnabled(has_transcript)
         self._export_actions["all"].setEnabled(bool(self._detail_id))
@@ -2427,6 +2587,18 @@ class MeetingPage(QWidget):
         self._editing_notes = False
         return True
 
+    def try_leave(self) -> bool:
+        """Save open drafts before another page covers this one.
+
+        False keeps the editor, the draft and the visible hint on this page.
+        """
+        if not hasattr(self, "_notes_edit"):
+            return True
+        self.flush_pending_user_notes()
+        if not self._save_record_notes():
+            return False
+        return self._save_notes_draft()
+
     def hideEvent(self, event) -> None:
         if hasattr(self, "_notes_edit"):
             editing = self._editing_notes
@@ -2436,6 +2608,8 @@ class MeetingPage(QWidget):
         super().hideEvent(event)
 
     def eventFilter(self, obj, event) -> bool:
+        if obj is getattr(self, "_notes_bar", None) and event.type() == QEvent.Type.Resize:
+            self._fit_template_cluster()
         if obj is getattr(self, "_notes_edit", None) and event.type() == QEvent.Type.KeyPress:
             if event.matches(QKeySequence.StandardKey.Save):
                 self._save_open_minutes()
@@ -2710,12 +2884,14 @@ class MeetingPage(QWidget):
         current = self._ctrl.speaker_names(meeting_id).get(speaker_id, "")
         scope = ("这组已有发言和后续归入本组的发言都会使用该姓名；留空恢复编号。" if live else
                  "会更新这一组发言的名称和纪要中的称呼；留空恢复编号。")
-        name, ok = QInputDialog.getText(
+        from sayink.ui.prompts import prompt_text
+
+        name = prompt_text(
             self, "为整组说话人命名",
             f"「说话人{speaker_id}」的显示名称\n{scope}",
-            QLineEdit.EchoMode.Normal, current,
+            current,
         )
-        if ok:
+        if name is not None:
             if live and (self._ctrl.current_id != meeting_id or self._ctrl.state is MeetingState.DRAINING):
                 self._speaker_edit_status(meeting_id, "会议已结束或正在整理，姓名尚未保存，请在会后重新命名。")
                 return
@@ -2959,6 +3135,7 @@ class MeetingPage(QWidget):
             self._resume_btn.show()
             self._pause_btn.hide()
             self._end_btn.setEnabled(True)
+            self._paint_live_clock()
         elif state is MeetingState.DRAINING:
             self._live_status.setText("正在整理文字稿，请稍候…")
             self._live_status.show()
@@ -2966,12 +3143,27 @@ class MeetingPage(QWidget):
             self._pause_btn.hide()
             self._end_btn.setEnabled(False)
             self._mark_btn.setEnabled(False)
+            self._paint_live_clock()
         else:
             self._live_status.hide()
             self._resume_btn.hide()
             self._pause_btn.show()
             self._end_btn.setEnabled(True)
             self._mark_btn.setEnabled(True)
+            self._paint_live_clock()
+
+    def _paint_live_clock(self) -> None:
+        from sayink.ui import design_tokens as tok
+
+        paused = self._ctrl.state is MeetingState.PAUSED
+        color = tok.TEXT_DIM if paused else tok.STATE_RECORD
+        self._live_clock.setStyleSheet(
+            f"font-size: {tok.TYPE_TITLE_LG}px; font-weight: 700; color: {color}; background: transparent;"
+        )
+        self._live_rec_dot.setStyleSheet(
+            f"background: {color}; border-radius: 4px;"
+        )
+        self._live_rec_dot.setAccessibleName("采集已暂停" if paused else "正在记录")
 
     def _on_state_changed(self, state: MeetingState) -> None:
         if state in (MeetingState.DRAINING, MeetingState.ENDED):
@@ -3029,8 +3221,10 @@ class MeetingPage(QWidget):
         rendered = self._transcript_html(transcript_lines(segments, started_at), names, links=True, live=True)
         if rendered != self._live_html:
             previous = self._live_html
-            self._live_html = rendered
-            if previous and rendered.startswith(previous):
+            if previous and self._live_transcript.retarget_speaker_labels(previous, rendered):
+                self._live_html = rendered
+            elif previous and rendered.startswith(previous):
+                self._live_html = rendered
                 # Normal live transcription only adds paragraphs. Keep the
                 # existing document instead of parsing and laying it out again.
                 tail = QTextCursor(self._live_transcript.document())
@@ -3046,8 +3240,9 @@ class MeetingPage(QWidget):
                 self._live_transcript.setTextCursor(cursor)
                 bar.setValue(bar.maximum() if at_end and position == anchor else scroll)
             else:
-                # Corrections and renames rebuild the document. setHtml puts the
-                # selection back by paragraph, not by the old absolute offset.
+                # Corrections that change the paragraphs still rebuild.
+                # A pure rename is handled above and does not parse the document again.
+                self._live_html = rendered
                 self._live_transcript.setHtml(rendered)
                 if at_end and position == anchor:
                     end = self._live_transcript.textCursor()

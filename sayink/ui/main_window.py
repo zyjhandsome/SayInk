@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 
-from PyQt6.QtCore import QEvent, QLineF, QRectF, Qt
+from PyQt6.QtCore import QEvent, QLineF, QPoint, QRect, QRectF, Qt
 from PyQt6.QtGui import (
     QColor,
     QCursor,
@@ -71,6 +71,12 @@ _WVR_VALIDRECTS = 0x0400
 _MONITOR_DEFAULTTONEAREST = 2
 _HTLEFT, _HTRIGHT, _HTTOP, _HTTOPLEFT, _HTTOPRIGHT = 10, 11, 12, 13, 14
 _HTBOTTOM, _HTBOTTOMLEFT, _HTBOTTOMRIGHT = 15, 16, 17
+_HTCAPTION = 2
+_HTMAXBUTTON = 9
+_WM_NCLBUTTONDBLCLK = 0x00A3
+# WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
+_WS_SNAP_STYLE = 0x00C00000 | 0x00040000 | 0x00080000 | 0x00020000 | 0x00010000
+_SWP_FRAMECHANGED = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020
 # Hide without moving, resizing, or activating another window first.
 _SWP_HIDE_ONLY = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0080
 
@@ -500,6 +506,7 @@ class MainWindow(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        self._enable_native_snap()
         self._fit_to_available_screen()
         self._sync_frame_margin()
         self._position_frame_edges()
@@ -667,6 +674,9 @@ class MainWindow(QWidget):
     def show_page(self, key: str) -> None:
         if key not in PAGE_KEYS:
             return
+        if key != self._page and self._page == "meeting" and not self._meeting_can_leave():
+            self._check_nav(self._page)
+            return
         self._page = key
         settings_index = {
             "general": 0,
@@ -685,8 +695,16 @@ class MainWindow(QWidget):
         else:
             self._stack.setCurrentIndex(_STACK_SETTINGS)
             self._settings.show_page(settings_index[key])
-        nav_index = PAGE_KEYS.index(key)
-        btn = self._nav_buttons[nav_index]
+        self._check_nav(key)
+
+    def _meeting_can_leave(self) -> bool:
+        leave = getattr(self._meeting, "try_leave", None)
+        if not callable(leave):
+            return True
+        return bool(leave())
+
+    def _check_nav(self, key: str) -> None:
+        btn = self._nav_buttons[PAGE_KEYS.index(key)]
         btn.blockSignals(True)
         btn.setChecked(True)
         btn.blockSignals(False)
@@ -832,6 +850,59 @@ class MainWindow(QWidget):
             return _HTBOTTOM
         return None
 
+    def _widget_rect(self, widget) -> QRect:
+        return QRect(widget.mapTo(self, QPoint(0, 0)), widget.size())
+
+    def _hit_test(self, x: int, y: int) -> int | None:
+        """Edge resize, or the caption behaviors a frameless window otherwise loses.
+
+        The max button reports HTMAXBUTTON so Windows 11 can offer snap
+        layouts. Empty caption reports HTCAPTION so a drag snaps to the
+        screen edge and a drag from the maximized state restores. Min and
+        close stay client widgets.
+        """
+        edge = self._hit_test_edge(x, y)
+        if edge is not None:
+            return edge
+        if not hasattr(self, "_caption"):
+            return None
+        point = QPoint(x, y)
+        if self._widget_rect(self._min_btn).contains(point) or self._widget_rect(self._close_btn).contains(point):
+            return None
+        if self._widget_rect(self._max_btn).contains(point):
+            return _HTMAXBUTTON
+        if self._widget_rect(self._caption).contains(point):
+            return _HTCAPTION
+        return None
+
+    def _enable_native_snap(self) -> None:
+        """Give the frameless window back Aero Snap, the system menu and snap layouts.
+
+        The style bits are what Windows uses for those gestures. WM_NCCALCSIZE
+        then keeps the native caption from painting over the custom one.
+        """
+        if sys.platform != "win32" or getattr(self, "_native_snap_ready", False):
+            return
+        try:
+            import ctypes
+            from ctypes import windll
+
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+            get_long = windll.user32.GetWindowLongPtrW
+            set_long = windll.user32.SetWindowLongPtrW
+            get_long.restype = ctypes.c_ssize_t
+            set_long.restype = ctypes.c_ssize_t
+            get_long.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            set_long.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+            style = get_long(hwnd, -16)
+            set_long(hwnd, -16, style | _WS_SNAP_STYLE)
+            windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, _SWP_FRAMECHANGED)
+            self._native_snap_ready = True
+        except Exception:
+            return
+
     def _fill_min_max_info(self, msg) -> bool:
         """Report the minimum track size and the maximized work-area rect to Windows.
 
@@ -953,12 +1024,18 @@ class MainWindow(QWidget):
                 if msg.message == _WM_GETMINMAXINFO:
                     if self._fill_min_max_info(msg):
                         return True, 0
+                if msg.message == _WM_NCLBUTTONDBLCLK and int(msg.wParam) == _HTCAPTION:
+                    self._toggle_maximized()
+                    return True, 0
                 if msg.message == _WM_NCCALCSIZE and msg.wParam:
                     # The 1px valid-rect result is only for a live edge drag.
                     # Maximize also changes size; applying it there discards the
                     # old frame, then the window waits and the new size pops in.
                     if self._live_resizing and self._skip_stale_client_copy(msg):
                         return True, _WVR_VALIDRECTS
+                    # WS_CAPTION is set so snap and Alt+Space work. Keep the
+                    # client area equal to the window so that caption does not draw.
+                    return True, 0
                 if msg.message == _WM_ENTERSIZEMOVE:
                     self._live_resizing = True
                     self._clear_round_mask()
@@ -969,7 +1046,7 @@ class MainWindow(QWidget):
                     # QCursor.pos() is already in logical coordinates, which
                     # keeps the hit test correct on mixed-DPI monitor setups.
                     local = self.mapFromGlobal(QCursor.pos())
-                    hit = self._hit_test_edge(local.x(), local.y())
+                    hit = self._hit_test(local.x(), local.y())
                     if hit is not None:
                         return True, hit
             except Exception:

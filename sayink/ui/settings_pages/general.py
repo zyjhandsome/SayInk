@@ -5,7 +5,7 @@ fixes the keyboard order. The builders attach the controls to ``win`` because
 SettingsWindow reads/writes them when settings load or change.
 """
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QComboBox,
@@ -491,15 +491,64 @@ def build_meeting_section(win) -> QWidget:
 
 # ── Page ───────────────────────────────────────────────
 
+def _reveal_section(page: SettingsPage, target: QWidget) -> None:
+    """Put the group title at the top of the viewport.
+
+    ``ensureWidgetVisible`` on a group taller than the viewport scrolls toward
+    the group's bottom, which clips the title.
+    """
+    content = page.widget()
+    if content is None:
+        return
+    top = target.mapTo(content, QPoint(0, 0)).y()
+    bar = page.verticalScrollBar()
+    bar.setValue(max(bar.minimum(), min(top - 8, bar.maximum())))
+
+
+def _section_jumps(page: SettingsPage, sections: list[tuple[str, QWidget]]) -> QWidget:
+    """One click reaches any group on the long general page."""
+    bar = QWidget()
+    bar.setObjectName("generalSectionNav")
+    row = QHBoxLayout(bar)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(8)
+    buttons = []
+    for title, section in sections:
+        button = QPushButton(title)
+        button.setAccessibleName(title)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setStyleSheet(settings_styles.BTN_GHOST_SM)
+        button.clicked.connect(
+            lambda _checked=False, target=section, scroller=page: _reveal_section(scroller, target)
+        )
+        row.addWidget(button, 0)
+        buttons.append(button)
+    row.addStretch(1)
+    bar._jump_buttons = buttons
+    return bar
+
+
 def build_general_page(win) -> QWidget:
     """Keep common decisions visible and low-frequency controls expandable."""
     page = SettingsPage()
     page.add(page_header("通用", "设置录音、识别和历史记录。更改自动保存，生效时间在对应设置旁显示。"))
-    page.add(build_recording_section(win))
+    recording = build_recording_section(win)
     refresh_btn, reset_btn = win._audio_device_buttons
-    page.add(build_recognition_section(win))
-    page.add(build_meeting_section(win))
-    page.add(build_preferences_section(win))
+    recognition = build_recognition_section(win)
+    meeting = build_meeting_section(win)
+    preferences = build_preferences_section(win)
+    jumps = _section_jumps(page, [
+        ("录音与输入", recording),
+        ("识别", recognition),
+        ("会议默认", meeting),
+        ("应用与历史", preferences),
+    ])
+    win._general_section_jumps = jumps._jump_buttons
+    page.add(jumps)
+    page.add(recording)
+    page.add(recognition)
+    page.add(meeting)
+    page.add(preferences)
 
     win._general_footer_note = footnote(
         "快捷键与输入法冲突时，可尝试其他组合；修改录音快捷键后自动保存。"
@@ -512,6 +561,7 @@ def build_general_page(win) -> QWidget:
     # of how the widgets above were constructed. Radio groups count as one
     # stop (only the checked one keeps TabFocus, see sync_group_tab_stop).
     win._general_tab_chain = [
+        *win._general_section_jumps,
         # The pick cards (focus proxy → their radio), not the bare radios.
         win._trigger_hotkey_rb.parentWidget(),
         win._trigger_continuous_rb.parentWidget(),

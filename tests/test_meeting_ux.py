@@ -1416,3 +1416,60 @@ def test_ended_meeting_without_notes_can_be_edited_without_waiting_for_generatio
     assert controller.store.get_segments(bare.id)[0].corrected_text == "已经改过"
     assert controller.store.get_segments(bare.id)[0].raw_text == "先改字"
     assert "通过方案" in notes_for_display("## 决策\n通过方案。\n", "会议")
+
+
+def test_live_controls_put_pause_and_end_ahead_of_marking(meeting):
+    from sayink.ui import design_tokens as tok
+    from sayink.ui import settings_styles as ss
+
+    page, controller, _history, _record = meeting
+    options = MeetingOptions()
+    caps = resolve_capabilities(page._config, options, dictation_model_id="funasr-nano")
+    controller.begin(options, caps)
+    page.resize(910, 472)
+    page.show()
+    QApplication.processEvents()
+    assert page._pause_btn.styleSheet() == ss.BTN_ACCENT_SM
+    assert page._mark_btn.styleSheet() == ss.BTN_GHOST_SM
+    assert page._end_btn.styleSheet() == ss.BTN_DANGER_SOLID_SM
+    assert tok.STATE_RECORD in page._live_clock.styleSheet()
+    assert page._pause_btn.mapTo(page, QPoint(0, 0)).y() < page._mark_btn.mapTo(page, QPoint(0, 0)).y()
+    assert page._end_btn.mapTo(page, page._end_btn.rect().bottomRight()).y() < page.height()
+    controller.pause("先停一下")
+    assert tok.TEXT_DIM in page._live_clock.styleSheet()
+    assert page._resume_btn.isVisible()
+    assert page._resume_btn.styleSheet() == ss.BTN_ACCENT_SM
+
+
+def test_renaming_a_long_transcript_does_not_rebuild_the_document(meeting, monkeypatch):
+    import time
+
+    page, controller, history, record = meeting
+    for index in range(1000):
+        history.enqueue(SegmentRecord(
+            record.id, 100 + index, record.started_at + index * 1000,
+            raw_text=f"第{index}段，这里是一句用于计时的示例发言内容。",
+            speaker_id=1 + index % 3, trigger_mode="meeting",
+            captured_at=record.started_at + index * 1000,
+        ))
+    assert history.flush()
+    page.resize(1100, 720)
+    page.show()
+    page.show_meeting(record.id)
+    page._switch_tab(1)
+    page._render_detail()
+    QApplication.processEvents()
+    calls = []
+    original = page._transcript_view.setHtml
+
+    def track(text):
+        calls.append(text)
+        return original(text)
+
+    monkeypatch.setattr(page._transcript_view, "setHtml", track)
+    started = time.perf_counter()
+    page._rename_speaker(1, "小林")
+    elapsed = time.perf_counter() - started
+    assert calls == []
+    assert elapsed < 1.0, elapsed
+    assert "小林" in page._transcript_view.toPlainText()

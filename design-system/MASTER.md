@@ -157,7 +157,7 @@ shadow tokens to `design_tokens.py` unless a surface actually paints one.
 ### Buttons
 
 - Primary: ink fill (`PRIMARY_CONTAINER` / `PRIMARY_ON`), radius MD, visible `:focus` ring 2px accent
-- Ghost / danger: semantic colors; danger uses destructive red
+- Ghost / danger: semantic colors; danger uses destructive red. Disabled accent and ghost share weight 400, so a disabled primary action does not stay bold. The live meeting's 结束会议 uses a filled red button (`BTN_DANGER_SOLID_SM`) the same height as the other small buttons.
 - Hover: darken/lighten within theme; no large translate on tray-adjacent chrome
 
 ### Cards / settings groups
@@ -166,7 +166,7 @@ shadow tokens to `design_tokens.py` unless a surface actually paints one.
 - Main navigation: ink wash (`NAV_SELECTED_BG`), semibold label, 40px row height, 2px keyboard focus ring. Focus ring appears only for keyboard navigation (TabFocus) — never as a second "selected" state on open.
 - Sidebar runtime status: hairline + 8px semantic dot (`GREEN` ready / `AMBER` loading / `RED` failure) + text. Not a filled card, so it cannot read as a sixth nav item.
 - Task choices: native radio indicator, title and task-specific explanation; full card is clickable. Selected compact cards use `ACCENT_SOFT` and a 2px `ACCENT` outline; unchecked cards keep a 2px neutral outline so selection does not move content. Keyboard focus remains visible on the native radio.
-- General settings use four groups: 录音与输入 / 识别 / 会议默认设置 / 应用与历史. Result destination sits beside audio source, with an explicit automatic policy and two persistent fixed destinations. Low-frequency recognition algorithms and model diagnostics live in a keyboard-accessible disclosure; pending changes and failures remain visible while collapsed.
+- General settings use four groups: 录音与输入 / 识别 / 会议默认设置 / 应用与历史. A row of jumps under the page title scrolls to each group in one click. Result destination sits beside audio source, with an explicit automatic policy and two persistent fixed destinations. Low-frequency recognition algorithms and model diagnostics live in a keyboard-accessible disclosure; pending changes and failures remain visible while collapsed.
 - Theme segments have one Tab stop on the selected option and retain arrow-key navigation. Section titles use `TEXT_SEC` / `TYPE_BODY_SM`; behavior-critical explanations use `TEXT_SEC`. Audio testing is a secondary action, with a temporary input meter and actual opened device labels.
 - Settings pages: 20px page title, purpose sentence, grouped 14px section labels.
 - Engine hero card shows the *load* state (「已载入 · 可用」/「模型载入中…」) beside the「当前」badge; downloaded ≠ usable.
@@ -180,7 +180,7 @@ shadow tokens to `design_tokens.py` unless a surface actually paints one.
 - Meeting review: use a narrower list (default split 240 / 560), stable content tabs, and one primary copy action beside the active tab. Copy labels distinguish notes, transcript and the current draft; transcript copying works before notes exist. Export explicitly offers notes / transcript / complete meeting. New-meeting entry stays available as a secondary action while reviewing a selected record.
 - Meeting notes show generation / manual-edit provenance and the saved template. Template changes affect the next generation and survive refresh; a hint explains a pending change. Editing uses「保存修改」and draft-aware copy/export, saves on navigation, and preserves the draft on failure.
 - Meeting transcript groups consecutive turns from the same speaker while retaining every segment and timestamp. Names are marked as manually assigned; automatic grouping does not imply identity verification.「命名说话人」affects a group;「纠正发言人」reveals per-segment correction, including a new speaker ID. Corrections are restricted to completed / interrupted meetings outside generation, persist locally, and mark earlier notes for review.
-- Meeting citations navigate to a highlighted transcript segment and provide「返回纪要」to restore the previous reading position. Repainting unchanged content and refreshing the list preserve document position. Empty decision / action headings compact only in the reading view; stored Markdown and exported text remain complete.
+- At the 880px window the meeting template label, combo and 管理模板 collapse into one 模板 menu on the action row, so the notes keep that row's height. Wider windows show the three controls inline. Meeting citations navigate to a highlighted transcript segment and provide「返回纪要」to restore the previous reading position. Repainting unchanged content and refreshing the list preserve document position. Empty decision / action headings compact only in the reading view; stored Markdown and exported text remain complete.
 
 ### Inputs
 

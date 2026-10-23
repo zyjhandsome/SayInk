@@ -49,7 +49,7 @@ def live_meeting(config, tmp_path):
 def test_live_naming_updates_existing_and_future_lines_without_stopping_capture(live_meeting, monkeypatch):
     page, controller, history, record = live_meeting
     page.show()
-    monkeypatch.setattr("sayink.ui.meeting_page.QInputDialog.getText", lambda *_args: ("小林", True))
+    monkeypatch.setattr("sayink.ui.prompts.prompt_text", lambda *_args, **_kwargs: "小林")
     page._populate_live_speaker_menu()
     page._live_speaker_menu.actions()[0].trigger()
     assert controller.speaker_names(record.id) == {1: "小林"}
@@ -256,7 +256,7 @@ def test_new_speaker_is_allocated_after_incoming_voice_arrives_during_dialog(liv
 def test_speaker_edits_work_while_paused_and_preserve_pause_reason(live_meeting, monkeypatch):
     page, controller, _history, record = live_meeting
     controller.pause("设备断开，等待继续")
-    monkeypatch.setattr("sayink.ui.meeting_page.QInputDialog.getText", lambda *_args: ("主持人", True))
+    monkeypatch.setattr("sayink.ui.prompts.prompt_text", lambda *_args, **_kwargs: "主持人")
     page._on_live_transcript_link(QUrl("live-speaker:1"))
     assert controller.correct_segment_speaker(record.id, 11, 2)
     assert controller.state is MeetingState.PAUSED

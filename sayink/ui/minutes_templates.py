@@ -8,7 +8,7 @@ from PyQt6.QtCore import QSignalBlocker, Qt
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QGridLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QPlainTextEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
 from sayink.minutes_prompts import (
@@ -17,6 +17,7 @@ from sayink.minutes_prompts import (
 )
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles as ss
+from sayink.ui.prompts import confirm
 
 
 def populate_template_combo(combo, config, selected_id=None) -> None:
@@ -248,9 +249,10 @@ class MinutesTemplatesDialog(QDialog):
         template = self._selected()
         if template.builtin:
             return
-        if QMessageBox.question(self, "删除模板", f"删除「{template.name}」？已保存的纪要正文会保留。",
-                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+        if not confirm(
+            self, "删除模板", f"删除「{template.name}」？已保存的纪要正文会保留。",
+            accept="删除", destructive=True,
+        ):
             return
         self._custom = [t for t in self._custom if t.get("id") != template.id]
         self._reload(GENERAL_TEMPLATE_ID)

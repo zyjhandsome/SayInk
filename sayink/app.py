@@ -10,6 +10,8 @@ import pyperclip
 from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMessageBox
 
+from sayink.ui.prompts import confirm
+
 from sayink.config import (
     OUTPUT_MODE_PASTE,
     Config,
@@ -2504,13 +2506,11 @@ class App(QObject):
             if message == "已取消":
                 self._tray.showMessage("SayInk", "已取消下载，会议未开始。", QSystemTrayIcon.MessageIcon.Information, 4000)
                 return
-            answer = QMessageBox.question(
+            if confirm(
                 self._main, "下载失败",
                 f"{message}\n\n仍以粗略的说话人区分开始会议吗？（可稍后在 引擎 页重试下载）",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes,
-            )
-            if answer == QMessageBox.StandardButton.Yes:
+                accept="仍然开始", cancel="返回", default_accept=True,
+            ):
                 self._start_meeting_or_show_browse(options)
 
         downloads.finished.connect(finished)

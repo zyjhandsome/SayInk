@@ -1,6 +1,6 @@
 """Custom template editing, persistence and selection across UI entry points."""
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QComboBox, QDialog, QMessageBox
+from PyQt6.QtWidgets import QComboBox, QDialog
 
 from sayink.config import Config
 from sayink.minutes_prompts import get_template, list_templates
@@ -78,7 +78,7 @@ def test_delete_custom_default_falls_back_and_builtin_cannot_be_deleted(config, 
     config.set("meeting.custom_templates", [entry])
     config.set("meeting.template_id", "custom-a")
     manager = MinutesTemplatesDialog(config, "custom-a")
-    monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr("sayink.ui.minutes_templates.confirm", lambda *_args, **_kwargs: True)
     manager._delete_btn.click()
     manager.accept()
     assert config.get("meeting.custom_templates") == []
