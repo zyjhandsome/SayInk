@@ -375,10 +375,14 @@ class TestMeetingStore:
         meetings.create_meeting(meeting_id="m3", title="其它")
         history.enqueue(_seg("m2", 0, "今天讨论上线窗口", created_at=1000))
         meetings.save_notes("m3", template_id="g", model="m", json_payload="{}", markdown="决定延期")
+        meetings.update_meeting("m1", notes_user="记得带报价单")
+        meetings.add_mark("m2", 1000, "卡点在灰度")
         meetings.flush()
         assert [m.id for m in meetings.search_meetings("预算")] == ["m1"]
         assert [m.id for m in meetings.search_meetings("上线")] == ["m2"]
         assert [m.id for m in meetings.search_meetings("延期")] == ["m3"]
+        assert [m.id for m in meetings.search_meetings("报价单")] == ["m1"]
+        assert [m.id for m in meetings.search_meetings("灰度")] == ["m2"]
         assert len(meetings.search_meetings("")) == 3
         assert meetings.search_meetings("%") == []
         assert meetings.search_meetings("_") == []

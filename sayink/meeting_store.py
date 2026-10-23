@@ -765,6 +765,18 @@ class MeetingStore:
 
         return self._history.read(_q, default=[]) or []
 
+    def count_meetings(self) -> int:
+        """Meetings the default list can show, excluding deleted rows."""
+
+        def _q(conn: sqlite3.Connection) -> int:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM meetings WHERE status != ?",
+                (STATUS_DELETED,),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+        return int(self._history.read(_q, default=0) or 0)
+
     def search_meetings(self, q: str) -> list[MeetingRecord]:
         q = q.strip()
         if not q:
@@ -779,16 +791,18 @@ class MeetingStore:
                 WHERE m.status != ?
                   AND (
                     m.title LIKE ? ESCAPE '\\' OR m.participants LIKE ? ESCAPE '\\' OR m.agenda LIKE ? ESCAPE '\\'
+                    OR m.notes_user LIKE ? ESCAPE '\\'
                     OR m.id IN (
                       SELECT session_id FROM history
                       WHERE corrected_text LIKE ? ESCAPE '\\' OR (corrected_text = '' AND
                             (raw_text LIKE ? ESCAPE '\\' OR polished_text LIKE ? ESCAPE '\\'))
                     )
                     OR m.id IN (SELECT meeting_id FROM meeting_notes WHERE markdown LIKE ? ESCAPE '\\')
+                    OR m.id IN (SELECT meeting_id FROM meeting_marks WHERE note LIKE ? ESCAPE '\\')
                   )
                 ORDER BY m.started_at DESC
                 """,
-                (STATUS_DELETED, pattern, pattern, pattern, pattern, pattern, pattern, pattern),
+                (STATUS_DELETED, pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern),
             ).fetchall()
             return [_row_to_meeting(r) for r in rows]
 

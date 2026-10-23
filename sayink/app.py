@@ -3140,10 +3140,37 @@ class App(QObject):
             return
         self._finish_quit()
 
+    def _unsaved_meeting_draft(self) -> str | None:
+        panel = getattr(self._main, "meeting_panel", None) if self._main is not None else None
+        report = getattr(panel, "unsaved_exit_draft", None)
+        if not callable(report):
+            return None
+        draft = report()
+        # Only a real leftover string blocks exit. A missing panel must not.
+        return draft if isinstance(draft, str) and draft else None
+
     def _confirm_exit(self, *, install_update: bool = False) -> bool:
         """Never silently discard captured or in-flight speech on exit."""
         if self._exit_dialog_open:
             return False
+        draft = self._unsaved_meeting_draft()
+        if draft:
+            self._exit_dialog_open = True
+            try:
+                box = QMessageBox(self._main)
+                box.setWindowTitle("退出 SayInk")
+                box.setIcon(QMessageBox.Icon.Warning)
+                box.setText("有修改尚未保存")
+                box.setInformativeText("纪要或会中笔记没能写入。可以返回继续编辑，或放弃这次修改并退出。")
+                back = box.addButton("返回编辑", QMessageBox.ButtonRole.RejectRole)
+                discard = box.addButton("放弃修改并退出", QMessageBox.ButtonRole.DestructiveRole)
+                box.setDefaultButton(back)
+                box.setEscapeButton(back)
+                box.exec()
+                if box.clickedButton() != discard:
+                    return False
+            finally:
+                self._exit_dialog_open = False
         meeting_live = self._meeting_active()
         pending = (
             meeting_live
@@ -3195,6 +3222,10 @@ class App(QObject):
         for timer in self.findChildren(QTimer):
             timer.stop()
         self._stop_continuous_listening()
+        panel = getattr(self._main, "meeting_panel", None) if self._main is not None else None
+        flush_notes = getattr(panel, "flush_pending_user_notes", None)
+        if callable(flush_notes):
+            flush_notes()
         self._meeting.shutdown(wait_ms=0)
         self._hotkey_mgr.stop()
         self._hold_open_pending = False

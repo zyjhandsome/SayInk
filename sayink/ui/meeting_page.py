@@ -306,6 +306,10 @@ class _TranscriptView(_ReadingView):
     """Reveal paragraph actions without replacing the document or moving text."""
 
     _CONTEXT_LINKS = ("edit-segment:", "live-edit:", "details-segment:", "live-details:")
+    _SEGMENT_LINKS = (
+        "live-edit:", "edit-segment:", "live-details:", "details-segment:",
+        "live-segment:", "segment:", "edited-segment:",
+    )
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -323,10 +327,113 @@ class _TranscriptView(_ReadingView):
         # Drop the old block before the document is replaced, then hide every
         # action. A full rebuild used to return early (both blocks were None)
         # and left the first character of「编辑」in the body color.
+        saved = self._capture_body_selection()
         self._action_block = None
         super().setHtml(text)
         self._hide_all_actions()
         self.reset_actions()
+        self._restore_body_selection(saved)
+
+    def _seq_in_block(self, block) -> int | None:
+        it = block.begin()
+        while not it.atEnd():
+            href = it.fragment().charFormat().anchorHref()
+            for prefix in self._SEGMENT_LINKS:
+                if href.startswith(prefix) and href[len(prefix):].isdigit():
+                    return int(href[len(prefix):])
+            it += 1
+        return None
+
+    def _plain_offset(self, block, position: int) -> int:
+        """UTF-16 units of non-link text before ``position``.
+
+        Speaker names and hover actions are links, so a longer name does not
+        move this offset. The timestamp and the spoken text are not links.
+        """
+        count = 0
+        it = block.begin()
+        while not it.atEnd():
+            fragment = it.fragment()
+            if not fragment.isValid() or fragment.charFormat().anchorHref():
+                it += 1
+                continue
+            start = fragment.position()
+            end = start + fragment.length()
+            if position <= start:
+                break
+            count += min(position, end) - start
+            if position <= end:
+                break
+            it += 1
+        return count
+
+    def _position_at_plain_offset(self, block, offset: int) -> int:
+        last = block.position()
+        it = block.begin()
+        while not it.atEnd():
+            fragment = it.fragment()
+            if not fragment.isValid() or fragment.charFormat().anchorHref():
+                it += 1
+                continue
+            last = fragment.position() + fragment.length()
+            if offset <= fragment.length():
+                return fragment.position() + max(0, offset)
+            offset -= fragment.length()
+            it += 1
+        return max(block.position(), last - 1 if last else block.position())
+
+    def _body_point(self, position: int) -> tuple[int, int] | None:
+        last = max(0, self.document().characterCount() - 1)
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(min(max(0, position), last))
+        seq = self._seq_in_block(cursor.block())
+        if seq is None:
+            return None
+        return seq, self._plain_offset(cursor.block(), cursor.position())
+
+    def _body_position(self, seq: int, offset: int) -> int | None:
+        block = self.document().begin()
+        while block.isValid():
+            if self._seq_in_block(block) == seq:
+                return self._position_at_plain_offset(block, offset)
+            block = block.next()
+        return None
+
+    def _capture_body_selection(self):
+        cursor = self.textCursor()
+        if not cursor.hasSelection() and cursor.position() == 0:
+            return None
+        start = self._body_point(min(cursor.selectionStart(), cursor.selectionEnd()))
+        end = self._body_point(max(cursor.selectionStart(), cursor.selectionEnd()))
+        if start is None and end is None:
+            return None
+        return start, end
+
+    def _restore_body_selection(self, saved) -> None:
+        if not saved:
+            return
+        start, end = saved
+        start_pos = self._body_position(*start) if start else None
+        end_pos = self._body_position(*end) if end else None
+        if start_pos is None and end_pos is None:
+            return
+        if start_pos is None:
+            start_pos = end_pos
+        if end_pos is None:
+            end_pos = start_pos
+        cursor = self.textCursor()
+        cursor.setPosition(start_pos)
+        cursor.setPosition(end_pos, QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(cursor)
+
+    def place_cursor_at_segment(self, seq: int) -> None:
+        position = self._body_position(seq, 0)
+        if position is None:
+            return
+        cursor = self.textCursor()
+        cursor.setPosition(position)
+        self.setTextCursor(cursor)
+        self.ensureCursorVisible()
 
     def _hide_all_actions(self) -> None:
         block = self.document().begin()
@@ -435,7 +542,12 @@ class _TranscriptView(_ReadingView):
                     if left < right:
                         href = fragment.charFormat().anchorHref()
                         if not href.startswith(skip):
-                            pieces.append(fragment.text()[left - frag_start:right - frag_start])
+                            # Qt positions count UTF-16 units; slice the fragment
+                            # with a cursor so an emoji does not shift the text.
+                            piece = QTextCursor(self.document())
+                            piece.setPosition(left)
+                            piece.setPosition(right, QTextCursor.MoveMode.KeepAnchor)
+                            pieces.append(piece.selectedText().replace("\u2029", "\n").replace("\u2028", "\n"))
                 it += 1
             lines.append("".join(pieces))
             block = block.next()
@@ -589,7 +701,7 @@ class _SegmentTextDialog(QDialog):
         self.restore_btn = QPushButton("恢复原文")
         self.restore_btn.setStyleSheet(ss.BTN_GHOST_SM)
         self.restore_btn.setToolTip("将本段恢复为修改前的文字，点击「保存修改」后生效")
-        self.restore_btn.clicked.connect(lambda: self.editor.setPlainText(self._original))
+        self.restore_btn.clicked.connect(self._restore_original)
         buttons.addWidget(self.restore_btn)
         buttons.addStretch(1)
         lay.insertLayout(lay.indexOf(self.original_view), buttons)
@@ -614,6 +726,24 @@ class _SegmentTextDialog(QDialog):
         if details and segment.corrected_text:
             self.original_btn.setChecked(True)
         self.editor.setFocus()
+        self.editor.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.editor and event.type() == QEvent.Type.KeyPress:
+            if (event.modifiers() == Qt.KeyboardModifier.ControlModifier
+                    and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)):
+                self._save()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _restore_original(self) -> None:
+        """One undoable edit, so Ctrl+Z brings back what was just replaced."""
+        cursor = self.editor.textCursor()
+        cursor.beginEditBlock()
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.insertText(self._original)
+        cursor.endEditBlock()
+        self.editor.setTextCursor(cursor)
 
     @property
     def corrected_text(self) -> str | None:
@@ -737,7 +867,12 @@ class MeetingPage(QWidget):
         self._pending_refresh_id = ""
         self._listed_generating = ""
         self._live_html = ""
+        self._marks_html = None
         self._live_meeting_id = ""
+        self._list_limit = 100
+        self._pending_title: tuple[str, str] | None = None
+        self._record_notes_meeting_id = ""
+        self._record_marks_html = None
         self._setup_ui()
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
@@ -821,6 +956,11 @@ class MeetingPage(QWidget):
         self._list.setWordWrap(True)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
         left_lay.addWidget(self._list, 1)
+        self._load_more_btn = QPushButton("加载更早的会议")
+        self._load_more_btn.setAccessibleName("加载更早的会议")
+        self._load_more_btn.clicked.connect(self._load_more)
+        self._load_more_btn.hide()
+        left_lay.addWidget(self._load_more_btn, 0, Qt.AlignmentFlag.AlignHCenter)
         self._empty_label = QLabel("还没有会议记录。\n点击右上角「开始会议」，或从托盘菜单开始。")
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_label.setWordWrap(True)
@@ -892,6 +1032,46 @@ class MeetingPage(QWidget):
         state_lay.addWidget(self._cancel_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         right_lay.addWidget(self._detail_meta)
         right_lay.addWidget(self._state_row)
+        self._materials = QWidget()
+        materials_lay = QVBoxLayout(self._materials)
+        materials_lay.setContentsMargins(0, 0, 0, 0)
+        materials_lay.setSpacing(6)
+        self._materials_toggle = QPushButton("会议资料")
+        self._materials_toggle.setCheckable(True)
+        self._materials_toggle.setChecked(True)
+        self._materials_toggle.setAccessibleName("会议资料")
+        self._materials_toggle.setToolTip("议程、随手笔记和标记。笔记在离开时自动保存。")
+        materials_lay.addWidget(self._materials_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+        self._materials_body = QWidget()
+        body_lay = QVBoxLayout(self._materials_body)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(6)
+        self._materials_agenda = QLabel()
+        self._materials_agenda.setWordWrap(True)
+        self._materials_agenda.setTextFormat(Qt.TextFormat.PlainText)
+        body_lay.addWidget(self._materials_agenda)
+        self._materials_notes_label = QLabel("我的笔记")
+        body_lay.addWidget(self._materials_notes_label)
+        self._record_notes = QPlainTextEdit()
+        self._record_notes.setAccessibleName("我的笔记")
+        self._record_notes.setPlaceholderText("会中记下的内容；离开时自动保存。")
+        self._record_notes.setFixedHeight(96)
+        self._record_notes_timer = QTimer(self)
+        self._record_notes_timer.setSingleShot(True)
+        self._record_notes_timer.setInterval(800)
+        self._record_notes_timer.timeout.connect(self._save_record_notes)
+        self._record_notes.textChanged.connect(lambda: self._record_notes_timer.start())
+        body_lay.addWidget(self._record_notes)
+        self._materials_marks_label = QLabel("标记")
+        body_lay.addWidget(self._materials_marks_label)
+        self._record_marks = QTextBrowser()
+        self._record_marks.setAccessibleName("标记")
+        self._record_marks.setMaximumHeight(120)
+        body_lay.addWidget(self._record_marks)
+        self._materials_toggle.toggled.connect(self._materials_body.setVisible)
+        materials_lay.addWidget(self._materials_body)
+        self._materials.hide()
+        right_lay.addWidget(self._materials)
 
         self._status_label = QLabel("")
         self._status_label.setWordWrap(True)
@@ -1010,6 +1190,7 @@ class MeetingPage(QWidget):
         self._notes_edit = QPlainTextEdit()
         self._notes_edit.setAccessibleName("编辑会议纪要")
         self._notes_edit.textChanged.connect(self._sync_copy_action)
+        self._notes_edit.installEventFilter(self)
         self._notes_stack.addWidget(self._notes_view)
         self._notes_stack.addWidget(self._notes_edit)
         # QTextEdit placeholders are drawn on one line by Qt. Use a real label
@@ -1213,7 +1394,7 @@ class MeetingPage(QWidget):
         side_lay.addLayout(mark_row)
         self._marks_view = QTextBrowser()
         self._marks_view.setAccessibleName("标记列表")
-        self._marks_view.setPlaceholderText("重要时刻按一下「标记此刻」，纪要会优先覆盖这些点。")
+        self._marks_view.setPlaceholderText("")
         self._marks_view.setMaximumHeight(160)
         side_lay.addWidget(self._marks_view)
         self._notes_title = QLabel("我的笔记")
@@ -1289,9 +1470,10 @@ class MeetingPage(QWidget):
         dim = f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
         for label in (self._list_summary, self._detail_meta, self._card_hint, self._live_caps,
                       self._card_notes, self._empty_label, self._template_label, self._content_hint,
-                      self._notes_empty, self._live_speaker_hint, self._live_speaker_feedback):
+                      self._notes_empty, self._live_speaker_hint, self._live_speaker_feedback,
+                      self._materials_agenda):
             label.setStyleSheet(dim)
-        for label in (self._marks_title, self._notes_title):
+        for label in (self._marks_title, self._notes_title, self._materials_notes_label, self._materials_marks_label):
             label.setStyleSheet(
                 f"color: {tok.TEXT}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700; background: transparent;"
             )
@@ -1340,7 +1522,7 @@ class MeetingPage(QWidget):
             QPlainTextEdit:focus {{ border: 2px solid {tok.ACCENT}; }}
         """
         for view in (self._notes_edit, self._live_transcript, self._marks_view, self._user_notes,
-                     self._opt_agenda):
+                     self._opt_agenda, self._record_notes, self._record_marks):
             view.setStyleSheet(text_css)
         self._notes_edit.setStyleSheet(text_css + f"QPlainTextEdit {{ font-size: {tok.READING_FONT_PX}px; }}")
         # Reading a saved meeting matches 历史: text sits on the page, and only
@@ -1371,7 +1553,8 @@ class MeetingPage(QWidget):
             btn.setStyleSheet(ss.BTN_ACCENT_SM)
         for btn in (self._generate_btn, self._edit_btn, self._copy_btn, self._transcript_copy_btn, self._export_btn, self._card_cancel,
                     self._cancel_btn, self._correct_speaker_btn, self._return_notes_btn, self._clear_search_btn,
-                    self._pause_btn, self._live_find_close_btn, self._manage_templates_btn, self._live_correct_speaker_btn):
+                    self._pause_btn, self._live_find_close_btn, self._manage_templates_btn, self._live_correct_speaker_btn,
+                    self._card_dl_btn, self._live_dl_btn, self._load_more_btn, self._materials_toggle):
             btn.setStyleSheet(ss.BTN_GHOST_SM)
         # Match 导出's real box (style min-height plus its border) so the tab
         # capsule and the button share one line. Both labels use the same weight.
@@ -1430,9 +1613,18 @@ class MeetingPage(QWidget):
         if self._store.disabled:
             self._list_summary.setText("历史数据库不可用，会议记录无法保存")
             return
-        records = self._store.search_meetings(self._search_query) if self._search_query else self._store.list_meetings()
-        self._records = {r.id: r for r in records}
         keep = self._detail_id
+        records = (self._store.search_meetings(self._search_query) if self._search_query
+                   else self._store.list_meetings(limit=self._list_limit))
+        if (keep and not self._search_query and records
+                and all(record.id != keep for record in records)
+                and self._store.get_meeting(keep) is not None):
+            # A meeting opened past the first page stays selected when newer ones arrive.
+            total = self._store.count_meetings()
+            if total > self._list_limit:
+                self._list_limit = total
+                records = self._store.list_meetings(limit=self._list_limit)
+        self._records = {r.id: r for r in records}
         minutes = self._minutes_markers()
         rows_key = (tuple(records), tuple(_meeting_row_text(record, minutes.get(record.id, "")) for record in records),
                     tok.FONT, tok.TEXT, tok.TEXT_SEC, tok.TEXT_DIM)
@@ -1465,7 +1657,16 @@ class MeetingPage(QWidget):
         finally:
             self._list.blockSignals(False)
         count = len(records)
-        self._list_summary.setText(f"找到 {count} 场会议" if self._search_query else f"共 {count} 场会议")
+        if self._search_query:
+            self._list_summary.setText(f"找到 {count} 场会议")
+            self._load_more_btn.hide()
+        else:
+            total = self._store.count_meetings()
+            if count < total:
+                self._list_summary.setText(f"最近 {count} 场，共 {total} 场会议")
+            else:
+                self._list_summary.setText(f"共 {total} 场会议")
+            self._load_more_btn.setVisible(count < total and count > 0)
         self._empty_label.setText(
             "未找到匹配的会议。\n试试其他关键词，或清除搜索查看全部会议。" if self._search_query else
             "还没有会议记录。\n点击右上角「开始会议」，或从托盘菜单开始。"
@@ -1478,7 +1679,7 @@ class MeetingPage(QWidget):
         elif records:
             self._list.setCurrentRow(0)
         elif not records:
-            if not self._save_notes_draft():
+            if not self._save_notes_draft() or not self._save_record_notes():
                 return
             self._detail_id = ""
             self._clear_detail()
@@ -1564,6 +1765,15 @@ class MeetingPage(QWidget):
                         break
                 self._list.blockSignals(False)
                 return
+            if not self._save_record_notes():
+                self._list.blockSignals(True)
+                for index in range(self._list.count()):
+                    item = self._list.item(index)
+                    if item.data(Qt.ItemDataRole.UserRole) == self._detail_id:
+                        self._list.setCurrentItem(item)
+                        break
+                self._list.blockSignals(False)
+                return
             self._transcript_highlight = -1
             self._citation_return = None
             self._correcting_speakers = False
@@ -1573,10 +1783,23 @@ class MeetingPage(QWidget):
             self._transcript_view.restore_reading_position(0)
             self._render_detail()
 
+    def _load_more(self) -> None:
+        self._list_limit += 100
+        self.refresh()
+
     def show_meeting(self, meeting_id: str) -> None:
         """Open a meeting in the browse view (after it ended, or from a notice)."""
-        if not self._save_notes_draft():
+        if not self._save_notes_draft() or not self._save_record_notes():
             return
+        self._search_timer.stop()
+        self._search_query = ""
+        self._search_edit.blockSignals(True)
+        self._search_edit.clear()
+        self._search_edit.blockSignals(False)
+        if meeting_id and self._store.get_meeting(meeting_id) is not None:
+            visible = self._store.list_meetings(limit=self._list_limit)
+            if all(item.id != meeting_id for item in visible):
+                self._list_limit = max(self._list_limit, self._store.count_meetings())
         self._transcript_highlight = -1
         self._citation_return = None
         self._correcting_speakers = False
@@ -1593,7 +1816,15 @@ class MeetingPage(QWidget):
         return self._detail_id
 
     def _clear_detail(self) -> None:
-        self._save_notes_draft()
+        if not self._save_notes_draft() or not self._save_record_notes():
+            return
+        self._materials.hide()
+        self._record_notes.blockSignals(True)
+        self._record_notes.clear()
+        self._record_notes.blockSignals(False)
+        self._record_marks.clear()
+        self._record_marks_html = None
+        self._record_notes_meeting_id = ""
         self._detail_title.clear()
         self._detail_title.setPlaceholderText("会议标题")
         self._detail_meta.clear()
@@ -1621,15 +1852,22 @@ class MeetingPage(QWidget):
         for widget in (self._generate_btn, self._edit_btn, self._copy_btn, self._transcript_copy_btn, self._export_btn,
                        self._more_btn, self._speaker_btn, self._template_combo, self._detail_title):
             widget.setEnabled(True)
-        if not self._detail_title.hasFocus():
+        pending = self._pending_title
+        if pending and pending[0] == self._detail_id and pending[1] != record.title:
+            if self._detail_title.text() != pending[1]:
+                self._detail_title.setText(pending[1])
+        elif not self._detail_title.hasFocus():
             self._detail_title.setText(record.title)
-            self._detail_title.setPlaceholderText(record.display_title)
+            if pending and pending[0] == self._detail_id:
+                self._pending_title = None
+        self._detail_title.setPlaceholderText(record.display_title)
         meta = [_format_dt(record.started_at)]
         if record.ended_at:
             meta.append(_duration_label(record.duration_ms))
         if record.status in _STATUS_TEXT:
             meta.append(_STATUS_TEXT[record.status])
         self._detail_meta.setText(" · ".join(meta))
+        self._show_materials(record)
 
         notes = self._store.get_notes(self._detail_id)
         generating = self._ctrl.generating_for == self._detail_id
@@ -2010,7 +2248,13 @@ class MeetingPage(QWidget):
         title = self._detail_title.text().strip()
         if record is None or title == record.title:
             return
+        self._pending_title = (self._detail_id, title)
         self._ctrl.update_meeting(self._detail_id, title=title)
+        if not self._store.flush() or (saved := self._store.get_meeting(self._detail_id)) is None or saved.title != title:
+            self._render_detail()
+            self._set_status("标题尚未保存，输入已保留。")
+            return
+        self._pending_title = None
         self.refresh()
 
     def _generate(self) -> None:
@@ -2076,9 +2320,12 @@ class MeetingPage(QWidget):
             if self._editing_notes:
                 return
         self._pending_templates.pop(self._detail_id, None)
-        self._ctrl.restore_previous_notes(self._detail_id)
+        restored = self._ctrl.restore_previous_notes(self._detail_id)
         self._switch_tab(0)
         self._render_detail()
+        if not restored:
+            self._set_status("尚未恢复上一版，当前内容保持不变。")
+            return
         self._set_status(f"已恢复上一版{self._result_label()}；再次恢复可切回刚才的版本。")
 
     def _switch_tab(self, index: int) -> None:
@@ -2183,9 +2430,88 @@ class MeetingPage(QWidget):
     def hideEvent(self, event) -> None:
         if hasattr(self, "_notes_edit"):
             editing = self._editing_notes
+            self._save_record_notes()
             if self._save_notes_draft() and editing:
                 self._render_detail()
         super().hideEvent(event)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is getattr(self, "_notes_edit", None) and event.type() == QEvent.Type.KeyPress:
+            if event.matches(QKeySequence.StandardKey.Save):
+                self._save_open_minutes()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _save_open_minutes(self) -> None:
+        if not self._editing_notes:
+            return
+        if not self._save_notes_draft():
+            return
+        self._set_status("修改已保存")
+        self._render_detail()
+
+    def unsaved_exit_draft(self) -> str | None:
+        """Save what we can. Return text that did not land, so exit can ask first."""
+        self.flush_pending_user_notes()
+        if not self._save_record_notes():
+            return self._record_notes.toPlainText() or " "
+        if not self._editing_notes or not self._detail_id:
+            return None
+        text = self._notes_edit.toPlainText()
+        if self._save_notes_draft():
+            return None
+        return text
+
+    def _show_materials(self, record) -> None:
+        marks = self._store.get_marks(record.id)
+        agenda = (record.agenda or "").strip()
+        has = bool(agenda or (record.notes_user or "").strip() or marks)
+        self._materials.setVisible(has)
+        self._materials_agenda.setVisible(bool(agenda))
+        self._materials_agenda.setText(("议程：" + agenda) if agenda else "")
+        # A refresh must not copy one meeting's notes into the next, or wipe
+        # keystrokes that have not reached the database yet.
+        same_meeting = self._record_notes_meeting_id == record.id
+        pending = same_meeting and self._record_notes_timer.isActive()
+        if not pending and (not same_meeting or not self._record_notes.hasFocus()):
+            self._record_notes.blockSignals(True)
+            self._record_notes.setPlainText(record.notes_user or "")
+            self._record_notes.blockSignals(False)
+        self._record_notes_meeting_id = record.id
+        marks_html = "".join(
+            f"<p style='margin:0 0 4px 0'>[{format_timestamp(mark.offset_ms)}] {html.escape(mark.note) or '标记'}</p>"
+            for mark in marks
+        )
+        self._materials_marks_label.setVisible(bool(marks))
+        self._record_marks.setVisible(bool(marks))
+        if marks_html != self._record_marks_html:
+            self._record_marks_html = marks_html
+            self._record_marks.setHtml(marks_html)
+
+    def _save_record_notes(self) -> bool:
+        """Write the post-meeting notes. False leaves the typed text in place."""
+        timer = getattr(self, "_record_notes_timer", None)
+        if timer is not None:
+            timer.stop()
+        meeting_id = self._record_notes_meeting_id
+        if not meeting_id or not hasattr(self, "_record_notes"):
+            return True
+        text = self._record_notes.toPlainText()
+        record = self._store.get_meeting(meeting_id)
+        if record is None or record.notes_user == text:
+            return True
+        # Keep the debounce running across the write. A refresh that sneaks in
+        # while the writer is behind must not replace these keystrokes.
+        if timer is not None:
+            timer.start()
+        self._ctrl.update_meeting(meeting_id, notes_user=text)
+        saved = self._store.get_meeting(meeting_id) if self._store.flush() else None
+        if saved is None or saved.notes_user != text:
+            self._set_status("笔记尚未保存，输入已保留。")
+            return False
+        if timer is not None:
+            timer.stop()
+        return True
 
     def _toggle_edit(self) -> None:
         if not self._detail_id:
@@ -2223,6 +2549,8 @@ class MeetingPage(QWidget):
                 self._set_status("已复制文字稿" if copy_text(text) else "复制失败，请重试")
 
     def _export(self, scope: str = "all") -> None:
+        if not self._save_record_notes():
+            return
         record = self._store.get_meeting(self._detail_id) if self._detail_id else None
         if record is None:
             return
@@ -2237,7 +2565,11 @@ class MeetingPage(QWidget):
             elif scope == "notes":
                 text = self._current_notes_text()
             elif self._editing_notes:
-                text = self._current_notes_text().rstrip() + "\n\n## 文字稿\n\n" + self._ctrl.transcript_text(record.id) + "\n"
+                supplement = self._ctrl.supplements_markdown(record.id)
+                text = self._current_notes_text().rstrip()
+                if supplement:
+                    text += "\n\n" + supplement
+                text += "\n\n## 文字稿\n\n" + self._ctrl.transcript_text(record.id) + "\n"
             else:
                 text = self._ctrl.export_markdown(record.id)
             Path(path).write_text(text, encoding="utf-8")
@@ -2257,7 +2589,7 @@ class MeetingPage(QWidget):
         box.setWindowTitle("删除会议")
         box.setIcon(QMessageBox.Icon.Warning)
         box.setText(f"删除「{record.display_title}」？")
-        box.setInformativeText("文字稿、标记与纪要会一起删除，无法撤销。")
+        box.setInformativeText("文字稿、笔记、标记与纪要会一起删除，无法撤销。")
         delete = box.addButton("删除", QMessageBox.ButtonRole.DestructiveRole)
         back = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(back)
@@ -2319,12 +2651,14 @@ class MeetingPage(QWidget):
             action = "已恢复这一段的原文" if dialog.corrected_text is None else "已保存这一段的修改"
             if self._stack.currentIndex() == PAGE_LIVE and self._ctrl.current_id == record.id:
                 self._render_live()
+                self._live_transcript.place_cursor_at_segment(seq)
                 self._live_feedback_timer.stop()
                 self._live_speaker_feedback.setText(action + "。")
                 self._live_speaker_feedback.show()
                 self._live_feedback_timer.start(4000)
                 return
             self._render_detail()
+            self._transcript_view.place_cursor_at_segment(seq)
             notes = self._store.get_notes(record.id)
             hint = f"；已有{self._result_label()}保留，建议重新生成。" if notes is not None and notes.markdown else "。"
             self._set_status(action + hint, transient=True)
@@ -2581,6 +2915,7 @@ class MeetingPage(QWidget):
         if meeting_id != self._live_meeting_id:
             self._live_meeting_id = meeting_id
             self._live_html = ""
+            self._marks_html = None
             self._live_transcript.clear()
             self._live_find_edit.clear()
             self._live_find_bar.hide()
@@ -2639,6 +2974,10 @@ class MeetingPage(QWidget):
             self._mark_btn.setEnabled(True)
 
     def _on_state_changed(self, state: MeetingState) -> None:
+        if state in (MeetingState.DRAINING, MeetingState.ENDED):
+            # current_id is still this meeting. The debounce timer must not
+            # fire later, after the controller has cleared it.
+            self.flush_pending_user_notes()
         if state is MeetingState.LIVE and self._stack.currentIndex() != PAGE_LIVE:
             self._enter_live()
         elif state in (MeetingState.PAUSED, MeetingState.DRAINING, MeetingState.LIVE):
@@ -2698,30 +3037,55 @@ class MeetingPage(QWidget):
                 tail.movePosition(QTextCursor.MoveOperation.End)
                 tail.insertBlock()
                 tail.insertHtml(rendered[len(previous):])
+                cursor = self._live_transcript.textCursor()
+                last = self._live_transcript.document().characterCount() - 1
+                anchor = self._live_transcript.position_before_action(min(anchor, last))
+                position = self._live_transcript.position_before_action(min(position, last))
+                cursor.setPosition(anchor)
+                cursor.setPosition(position, QTextCursor.MoveMode.KeepAnchor)
+                self._live_transcript.setTextCursor(cursor)
+                bar.setValue(bar.maximum() if at_end and position == anchor else scroll)
             else:
-                # Corrections, speaker renames and theme changes need a rebuild.
+                # Corrections and renames rebuild the document. setHtml puts the
+                # selection back by paragraph, not by the old absolute offset.
                 self._live_transcript.setHtml(rendered)
-            cursor = self._live_transcript.textCursor()
-            last = self._live_transcript.document().characterCount() - 1
-            anchor = self._live_transcript.position_before_action(min(anchor, last))
-            position = self._live_transcript.position_before_action(min(position, last))
-            cursor.setPosition(anchor)
-            cursor.setPosition(position, QTextCursor.MoveMode.KeepAnchor)
-            self._live_transcript.setTextCursor(cursor)
-            bar.setValue(bar.maximum() if at_end and position == anchor else scroll)
+                if at_end and position == anchor:
+                    end = self._live_transcript.textCursor()
+                    end.movePosition(QTextCursor.MoveOperation.End)
+                    self._live_transcript.setTextCursor(end)
+                    bar.setValue(bar.maximum())
+                else:
+                    bar.setValue(scroll)
         marks = self._store.get_marks(meeting_id)
-        self._marks_view.setHtml(
-            "".join(
+        if marks:
+            marks_html = "".join(
                 f"<p style='margin:0 0 4px 0'>[{format_timestamp(m.offset_ms)}] {html.escape(m.note) or '标记'}</p>"
                 for m in marks
             )
-        )
+        else:
+            marks_html = (
+                "<p style='margin:0 0 6px 0'>重要时刻按一下「标记此刻」。</p>"
+                "<p style='margin:0'>纪要会优先覆盖这些点。</p>"
+            )
+        if marks_html != self._marks_html:
+            self._marks_html = marks_html
+            self._marks_view.setHtml(marks_html)
 
     def _add_mark(self) -> None:
         offset = self._ctrl.add_mark(self._mark_note.text())
         if offset is not None:
             self._mark_note.clear()
             self._render_live()
+
+    def flush_pending_user_notes(self) -> None:
+        if hasattr(self, "_user_notes_timer"):
+            self._user_notes_timer.stop()
+        self._save_user_notes()
+        # Browse opens on ENDED and reads the database. The queued note has to
+        # be visible before that, not only eventually.
+        store = getattr(self, "_store", None)
+        if store is not None:
+            store.flush()
 
     def _save_user_notes(self) -> None:
         meeting_id = self._ctrl.current_id

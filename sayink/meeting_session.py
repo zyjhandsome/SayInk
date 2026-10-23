@@ -777,22 +777,53 @@ class MeetingController(QObject):
         self.meeting_changed.emit(meeting_id)
         return True
 
-    def restore_previous_notes(self, meeting_id: str) -> None:
+    def restore_previous_notes(self, meeting_id: str) -> bool:
+        """Swap in the previous minutes. False when the saved text did not change."""
+        before = self._store.get_notes(meeting_id)
+        if before is None or not before.previous_markdown:
+            return False
+        expected = before.previous_markdown
         self._store.restore_previous_notes(meeting_id)
-        self._store.flush()
+        if not self._store.flush():
+            return False
         notes = self._store.get_notes(meeting_id)
-        if notes is not None and notes.markdown:
-            # Speakers may have been named since that version was written.
-            # Patch the labels; whether it counts as hand-edited is the
-            # restored version's own flag, not a side effect of restoring.
-            markdown = apply_speaker_names(notes.markdown, self.speaker_names(meeting_id))
-            if markdown != notes.markdown:
-                if notes.user_edited:
-                    self._store.save_user_markdown(meeting_id, markdown)
-                else:
-                    self._save_rendered_notes(meeting_id, notes, markdown, json_payload=notes.json_payload)
-                self._store.flush()
+        if notes is None or not notes.markdown:
+            return False
+        names = self.speaker_names(meeting_id)
+        # Speakers may have been named since that version was written.
+        # Patch the labels; whether it counts as hand-edited is the
+        # restored version's own flag, not a side effect of restoring.
+        markdown = apply_speaker_names(notes.markdown, names)
+        if markdown != notes.markdown:
+            if notes.user_edited:
+                self._store.save_user_markdown(meeting_id, markdown)
+            else:
+                self._save_rendered_notes(meeting_id, notes, markdown, json_payload=notes.json_payload)
+            if not self._store.flush():
+                return False
+            notes = self._store.get_notes(meeting_id)
+            if notes is None or not notes.markdown:
+                return False
+        if notes.markdown not in {expected, apply_speaker_names(expected, names)}:
+            return False
         self.meeting_changed.emit(meeting_id)
+        return True
+
+    def supplements_markdown(self, meeting_id: str) -> str:
+        """Agenda, the user's own notes and marks. Empty when the meeting has none."""
+        record = self._store.get_meeting(meeting_id)
+        if record is None:
+            return ""
+        parts: list[str] = []
+        if record.agenda.strip():
+            parts.append("## 议程\n\n" + record.agenda.strip())
+        if record.notes_user.strip():
+            parts.append("## 我的笔记\n\n" + record.notes_user.strip())
+        marks = self._store.get_marks(meeting_id)
+        if marks:
+            lines = [f"- [{format_timestamp(mark.offset_ms)}] {mark.note.strip() or '标记'}" for mark in marks]
+            parts.append("## 标记\n\n" + "\n".join(lines))
+        return "\n\n".join(parts)
 
     def delete_meeting(self, meeting_id: str) -> None:
         if self._generating_for == meeting_id:
@@ -818,6 +849,9 @@ class MeetingController(QObject):
         else:
             parts.append(f"# {record.display_title}")
             parts.extend(f"- {line}" for line in self._meeting_meta_lines(record))
+        supplement = self.supplements_markdown(meeting_id)
+        if supplement:
+            parts.append(supplement)
         if include_transcript:
             lines = transcript_lines(self._store.get_segments(meeting_id), record.started_at)
             if lines:
