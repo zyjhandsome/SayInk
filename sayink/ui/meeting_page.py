@@ -1056,7 +1056,7 @@ class MeetingPage(QWidget):
         lay.addWidget(self._card_title)
         self._card_hint = QLabel(
             "填写的信息会写进纪要并帮助模型理解上下文；全部可留空。"
-            "本卡片的音源、模型和语言仅用于本场。不保存音频，只保存文字。"
+            "本卡片的音源、模型和语言仅用于本场。默认不保存音频；开启「录音恢复」时会在本机缓存原声。"
         )
         self._card_hint.setWordWrap(True)
         lay.addWidget(self._card_hint)

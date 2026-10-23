@@ -26,6 +26,40 @@ def test_recording_bar_receives_the_saved_esc_preference_on_startup():
 
 
 class TestReadmeSharedRecognition:
+    def test_audio_recovery_requires_explicit_opt_in(self):
+        with app_harness() as h:
+            h["recorder"].set_recovery_directory.assert_called_once_with(None)
+            h["recorder"].set_separate_lanes.assert_called_once_with(False)
+        with app_harness({"audio.recovery_enabled": True}) as h:
+            h["recorder"].set_recovery_directory.assert_called_once_with(h["config"].config_dir / "audio-recovery")
+
+    def test_boundary_context_requires_user_choice_and_a_timestamp_model(self):
+        for enabled in (False, True):
+            with app_harness({"stt.boundary_context_enabled": enabled}) as h:
+                app = h["app"]
+                app._set_boundary_context_for_model("funasr-nano")
+                h["recorder"].set_boundary_context.assert_called_with(False)
+                app._set_boundary_context_for_model("fireredasr2-ctc")
+                h["recorder"].set_boundary_context.assert_called_with(enabled)
+
+    def test_repeated_speech_and_mixed_languages_reach_output_intact(self):
+        spoken = "请注意。" * 8 + "こんにちは。继续中文。"
+        with app_harness() as h:
+            h["app"]._on_recording_finished(np.ones(3200, dtype=np.float32))
+            h["app"]._on_final_result("<asr_text>" + spoken + "</asr_text>")
+            assert h["paster"].paste_async.call_args.args[0] == spoken
+            h["paster"].paste_async.call_args.args[1]("sent")
+            assert h["history"].enqueue.call_args.args[0].raw_text == spoken
+
+    def test_glossary_output_still_keeps_the_asr_original_in_history(self):
+        with app_harness({"stt.glossary": [{"term": "五证", "variants": ["五中"]}]}) as h:
+            h["app"]._on_recording_finished(np.ones(3200, dtype=np.float32))
+            h["app"]._on_final_result("五中资料")
+            assert h["paster"].paste_async.call_args.args[0] == "五证资料"
+            h["paster"].paste_async.call_args.args[1]("sent")
+            record = h["history"].enqueue.call_args.args[0]
+            assert record.raw_text == "五中资料" and record.polished_text == "五证资料"
+
     def test_meeting_follows_dictation_audio_and_shared_parameters(self):
         from sayink.meeting_session import MeetingOptions
 

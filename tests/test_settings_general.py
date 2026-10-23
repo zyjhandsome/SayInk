@@ -145,7 +145,8 @@ class TestGeneralPageLayout:
         assert "转写留在剪贴板" in clipboard_text
         history_text = " ".join(lb.text() for lb in settings_window._history_enabled_row.findChildren(QLabel))
         assert "保存转写历史" in history_text
-        assert "不保存音频" in history_text
+        assert "仅保存转写文本" in history_text
+        assert "录音恢复有独立开关" in history_text
 
         footnotes = [
             lb.text()

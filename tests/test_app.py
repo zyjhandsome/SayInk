@@ -331,11 +331,12 @@ class TestSettingsChangedQueue:
 
 
 class TestSegmentReadyQueueing:
-    def test_short_segment_ignored(self):
+    def test_empty_segment_ignored(self):
         with app_harness() as h:
             app = h["app"]
-            app._on_segment_ready(np.zeros(10, dtype=np.float32))
+            app._on_segment_ready(np.zeros(0, dtype=np.float32))
             assert app._segment_queue == []
+            h["recognizer"].transcribe_final.assert_not_called()
 
     def test_segment_queued_when_transcribing(self):
         with app_harness() as h:

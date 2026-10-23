@@ -64,6 +64,8 @@ class RecognitionSettings:
     vad: str = VAD_SILERO
     speaker_model_enabled: bool = True
     speaker_activity_enabled: bool = False
+    quiet_speech_enabled: bool = False
+    boundary_context_enabled: bool = False
 
     @classmethod
     def from_config(cls, config) -> "RecognitionSettings":
@@ -76,6 +78,8 @@ class RecognitionSettings:
             vad=vad if vad in (VAD_SILERO, VAD_ENERGY) else VAD_SILERO,
             speaker_model_enabled=bool(config.get("stt.speaker_model_enabled", True)),
             speaker_activity_enabled=bool(config.get("stt.speaker_activity_enabled", False)),
+            quiet_speech_enabled=bool(config.get("stt.quiet_speech_enabled", False)),
+            boundary_context_enabled=bool(config.get("stt.boundary_context_enabled", False)),
         )
 
     @property
@@ -97,6 +101,11 @@ class RecognitionSettings:
     @property
     def notes(self) -> list[str]:
         notes = []
+        if (self.boundary_context_enabled
+                and (get_model_info(self.model_id) or {}).get("loader") not in {"fire_red_asr_ctc", "zipformer_ctc"}):
+            notes.append("当前模型没有可用的词元时间戳，跨段上下文不生效；仍识别完整原片段。")
+        if self.quiet_speech_enabled and self.vad != VAD_SILERO:
+            notes.append("轻声增强需要实际加载 Silero；能量断句不启用此增强。")
         if self.hotwords and not self.hotwords_supported:
             notes.append("当前模型不支持识别期热词；术语仍可用于会议纪要。")
         if not self.language_supported:

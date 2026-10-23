@@ -96,6 +96,8 @@ DEFAULT_CONFIG = {
         "mic_device_index": -1,
         "system_device_index": -1,
         "esc_stops_continuous": True,
+        "recovery_enabled": False,
+        "separate_lanes": False,
     },
     "stt": {
         "model_id": DEFAULT_MODEL_ID,
@@ -109,6 +111,8 @@ DEFAULT_CONFIG = {
         "vad": "silero",           # silero / energy；Silero 未下载时自动退回 energy
         "speaker_model_enabled": True,
         "speaker_activity_enabled": False,
+        "quiet_speech_enabled": False,
+        "boundary_context_enabled": False,
     },
     "llm": {
         "enabled": False,

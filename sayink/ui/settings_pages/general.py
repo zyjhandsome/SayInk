@@ -113,6 +113,13 @@ def build_recording_section(win) -> QWidget:
     lay.addWidget(group_divider())
     lay.addWidget(_build_mic_test_row(win))
     win._audio_device_buttons = _build_advanced_audio(win, lay)
+    lay.addWidget(group_divider())
+    win._separate_lanes_row = ToggleOptionRow(
+        "混合音源分别识别（实验性）",
+        "分别识别麦克风和电脑声音，减少同时说话时的互相遮盖；可能增加处理耗时。下次录音生效。",
+    )
+    win._separate_lanes_row.toggled.connect(win._on_separate_lanes_toggled)
+    lay.addWidget(win._separate_lanes_row)
     section = settings_section("录音与输入", card)
     section.setObjectName("recordingInputSection")
     return section
@@ -300,7 +307,7 @@ def _build_toggle_rows(win, lay: QVBoxLayout) -> None:
 
 def _build_history_rows(win, lay: QVBoxLayout) -> None:
     win._history_enabled_row = ToggleOptionRow(
-        "保存转写历史", "仅在本机保存转写文本，不保存音频；关闭后停止新增转写"
+        "保存转写历史", "历史仅保存转写文本；关闭后停止新增转写，录音恢复有独立开关"
     )
     win._history_retention_days_spin = QSpinBox()
     win._history_retention_days_spin.setRange(1, 3650)
@@ -337,6 +344,15 @@ def build_preferences_section(win) -> QWidget:
     lay.addWidget(group_divider())
     _build_toggle_rows(win, lay)
     _build_history_rows(win, lay)
+    lay.addWidget(group_divider())
+    win._recovery_row = ToggleOptionRow(
+        "录音恢复（本机缓存）",
+        "默认关闭；开启后保存完整录音，正常结束保留 7 天，总量上限 2 GB。下次录音生效。",
+    )
+    win._recovery_row.toggled.connect(win._on_recovery_toggled)
+    lay.addWidget(win._recovery_row)
+    win._recovery_btn = _ghost_button("查看 / 恢复录音", win.audio_recovery_requested.emit)
+    lay.addWidget(inline_action_row(win._recovery_btn))
     bottom = QWidget()
     bottom.setFixedHeight(4)
     lay.addWidget(bottom)
@@ -404,6 +420,18 @@ def build_recognition_section(win) -> QWidget:
     win._vad_download_row = inline_action_row(win._vad_download_btn, margins=(16, 0, 16, 12))
     win._vad_download_row.layout().setAlignment(win._vad_download_btn, Qt.AlignmentFlag.AlignLeft)
     advanced.addWidget(win._vad_download_row)
+    win._quiet_speech_row = ToggleOptionRow(
+        "轻声增强（安静环境）",
+        "默认关闭；用语音模型判断更轻的声音，原始录音不变。需要 Silero；嘈杂环境可能增加误触发。",
+    )
+    win._quiet_speech_row.toggled.connect(win._on_recognition_setting_changed)
+    advanced.addWidget(win._quiet_speech_row)
+    win._boundary_context_row = ToggleOptionRow(
+        "跨段音频上下文（实验性）",
+        "默认关闭；仅支持带时间戳的 CTC 模型，强制分段最多多等 0.3 秒。尚未验证稳定精度收益。",
+    )
+    win._boundary_context_row.toggled.connect(win._on_recognition_setting_changed)
+    advanced.addWidget(win._boundary_context_row)
     advanced.addWidget(group_divider())
     win._speaker_enabled_row = ToggleOptionRow(
         "增强说话人区分", "使用 CAM++ 帮助区分不同声音；用于持续转写与会议，不验证人物身份",
@@ -501,11 +529,14 @@ def build_general_page(win) -> QWidget:
         win._system_device_combo,
         refresh_btn,
         reset_btn,
+        win._separate_lanes_row,
         win._meeting_language_combo,
         win._meeting_glossary_edit,
         win._advanced_recognition_btn,
         win._meeting_vad_combo,
         win._vad_download_btn,
+        win._quiet_speech_row,
+        win._boundary_context_row,
         win._speaker_enabled_row,
         win._speaker_activity_row,
         win._meeting_source_combo,
@@ -518,6 +549,8 @@ def build_general_page(win) -> QWidget:
         win._history_enabled_row,
         win._history_retention_days_spin,
         win._history_max_entries_spin,
+        win._recovery_row,
+        win._recovery_btn,
     ]
     chain_tab_order(win._general_tab_chain)
     return page

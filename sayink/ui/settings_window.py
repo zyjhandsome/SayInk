@@ -95,6 +95,8 @@ def _int_or(value, default: int) -> int:
 class SettingsWindow(QWidget):
     hotkey_updated = pyqtSignal(str)
     settings_changed = pyqtSignal()
+    audio_options_changed = pyqtSignal()
+    audio_recovery_requested = pyqtSignal()
     auto_start_changed = pyqtSignal(bool)
     sound_enabled_changed = pyqtSignal(bool)
     restore_clipboard_changed = pyqtSignal(bool)
@@ -866,7 +868,10 @@ class SettingsWindow(QWidget):
                 layout.activate()
             QApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)
             new_y = anchor.mapTo(host, anchor.rect().topLeft()).y()
-            bar.setValue(max(0, scroll_before + (new_y - anchor_y)))
+            # At the top, keep the whole document anchored there. Expanding a
+            # long wrapped section may change preferred heights above the
+            # control; scrolling to compensate would move the entire column.
+            bar.setValue(0 if scroll_before == 0 else max(0, scroll_before + (new_y - anchor_y)))
             page._sync_scroll_gutter(bar.minimum(), bar.maximum())
 
     def _without_scroll_jump(self, anchor: QWidget, change) -> None:
@@ -1244,6 +1249,8 @@ class SettingsWindow(QWidget):
             self._config.get("stt.download_source", "auto"),
         )
         self._history_enabled_row.setChecked(self._config.get("history.enabled", True))
+        self._recovery_row.setChecked(bool(self._config.get("audio.recovery_enabled", False)))
+        self._separate_lanes_row.setChecked(bool(self._config.get("audio.separate_lanes", False)))
         if hasattr(self, "_about_auto_update_row"):
             self._about_auto_update_row.setChecked(
                 bool(self._config.get("update.auto_check", True))
@@ -1797,6 +1804,16 @@ class SettingsWindow(QWidget):
 
         self._without_scroll_jump(self._history_enabled_row, change)
 
+    def _on_recovery_toggled(self, checked: bool):
+        if not self._loading:
+            self._config.set("audio.recovery_enabled", bool(checked))
+            self.audio_options_changed.emit()
+
+    def _on_separate_lanes_toggled(self, checked: bool):
+        if not self._loading:
+            self._config.set("audio.separate_lanes", bool(checked))
+            self.audio_options_changed.emit()
+
     def _on_history_limits_changed(self, _value: int):
         if self._loading:
             return
@@ -1820,16 +1837,22 @@ class SettingsWindow(QWidget):
         language = str(self._meeting_language_combo.currentData() or "auto")
         speaker = self._speaker_enabled_row.isChecked()
         activity = self._speaker_activity_row.isChecked()
+        quiet = self._quiet_speech_row.isChecked()
+        boundary = self._boundary_context_row.isChecked()
         changed = (
             vad != self._config.get("stt.vad", "silero")
             or language != self._config.get("stt.language", "auto")
             or speaker != self._config.get("stt.speaker_model_enabled", True)
             or activity != self._config.get("stt.speaker_activity_enabled", False)
+            or quiet != self._config.get("stt.quiet_speech_enabled", False)
+            or boundary != self._config.get("stt.boundary_context_enabled", False)
         )
         self._config.set("stt.vad", vad)
         self._config.set("stt.language", language)
         self._config.set("stt.speaker_model_enabled", speaker)
         self._config.set("stt.speaker_activity_enabled", activity)
+        self._config.set("stt.quiet_speech_enabled", quiet)
+        self._config.set("stt.boundary_context_enabled", boundary)
         if changed:
             self.recognition_changed.emit()
         self._refresh_recognition_feedback()
@@ -1876,6 +1899,8 @@ class SettingsWindow(QWidget):
         self._meeting_start_card_row.setChecked(bool(self._config.get("meeting.show_start_card", True)))
         self._speaker_enabled_row.setChecked(bool(self._config.get("stt.speaker_model_enabled", True)))
         self._speaker_activity_row.setChecked(bool(self._config.get("stt.speaker_activity_enabled", False)))
+        self._quiet_speech_row.setChecked(bool(self._config.get("stt.quiet_speech_enabled", False)))
+        self._boundary_context_row.setChecked(bool(self._config.get("stt.boundary_context_enabled", False)))
         from sayink.asr_correction import format_glossary_line
 
         glossary = self._config.get("stt.glossary", []) or []

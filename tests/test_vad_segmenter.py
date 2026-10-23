@@ -71,6 +71,9 @@ class TestSpeechSegmenterBasics:
         emitted = [e for e in emitted if e is not None]
         assert len(emitted) == 1
         assert emitted[0].size == int(16000 * 15)
+        tail = seg.flush()
+        assert tail is not None
+        assert sum(part.size for part in emitted) + tail.size == 160 * block
 
     def test_max_length_forces_cut(self):
         seg = SpeechSegmenter(

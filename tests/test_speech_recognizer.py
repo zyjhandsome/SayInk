@@ -174,29 +174,6 @@ class TestNormalizeAsrOutput:
         spoken = "说前面啊往前挪啊。往前挪啊。没问题没问题。嗯。嗯。嗯。嗯。嗯。"
         assert normalize_asr_output(spoken) == spoken
 
-    @pytest.mark.parametrize(
-        ("text", "expected"),
-        [
-            ("哈" * 16, "哈哈哈"),
-            ("对" * 16 + "，就是这样。", "对对对，就是这样。"),
-            ("太好笑了" + "哈" * 20 + "真的", "太好笑了哈哈哈真的"),
-        ],
-    )
-    def test_long_single_character_runs_are_shortened_not_deleted(self, text, expected):
-        assert normalize_asr_output(text) == expected
-
-    @pytest.mark.parametrize(
-        ("text", "expected"),
-        [
-            ("叮" * 8, "叮叮叮"),
-            ("嗯" * 11 + "，好的。", "嗯嗯嗯，好的。"),
-            ("好的。" + "他走了，" * 7 + "他走了。", "好的。"),
-            ("他走了，" * 8 + "我们继续。", "我们继续。"),
-            ("对，" * 10 + "就这样。", "对对对，就这样。"),
-        ],
-    )
-    def test_loops_are_found_across_punctuation(self, text, expected):
-        assert normalize_asr_output(text) == expected
 
     @pytest.mark.parametrize(
         "text",
@@ -225,37 +202,6 @@ class TestNormalizeAsrOutput:
     def test_keeps_chinese_english_mix(self):
         text = "这个 API 怎么调用"
         assert normalize_asr_output(text) == text
-
-    def test_drops_stuck_token_loop(self):
-        text = "あ、いやいやいや、一人で。なんか、天の、" + "神の" * 30
-        assert normalize_asr_output(text) == ""
-
-    def test_keeps_chinese_when_a_loop_is_appended(self):
-        text = "我们出发吧" + "神の" * 20
-        assert normalize_asr_output(text) == "我们出发吧"
-
-    def test_drops_repeated_clause_longer_than_a_token(self):
-        clause = "然后你这个月又有点长了，"
-        text = (
-            "就是你这个月没有完成那个100多的这个任务，"
-            "然后你这个月的这个任务有点长了，"
-            "然后你这个月又迟了，"
-            + clause * 12
-        )
-        assert normalize_asr_output(text) == (
-            "就是你这个月没有完成那个100多的这个任务，"
-            "然后你这个月的这个任务有点长了，"
-            "然后你这个月又迟了，"
-        )
-
-    def test_drops_unrelated_japanese_sentence_and_keeps_chinese(self):
-        text = (
-            "我觉得你有点矛盾。"
-            "これ、睡眠の描写が入るしかない。そう、夜は。"
-            "是不是下雨了呢？"
-        )
-        result = normalize_asr_output(text)
-        assert result == "我觉得你有点矛盾。是不是下雨了呢？"
 
 
 class TestRestoreGlossaryCase:

@@ -153,9 +153,12 @@ class SileroGate(SpeechGate):
         self._window = int(window or SILERO_WINDOW)
         self._carry = np.zeros(0, dtype=np.float32)
         self._last_verdict = False
+        self.input_gain = 1.0
 
     def is_speech(self, block: np.ndarray, rms: float, *, in_speech: bool) -> bool:
-        samples = np.concatenate([self._carry, np.asarray(block, dtype=np.float32).reshape(-1)])
+        source = np.asarray(block, dtype=np.float32).reshape(-1)
+        gain = min(self.input_gain, max(1.0, 0.9 / max(float(np.max(np.abs(source), initial=0)), 1e-8)))
+        samples = np.concatenate([self._carry, source * gain])
         verdict = False
         offset = 0
         scored = False
@@ -243,6 +246,7 @@ class SpeechSegmenter:
     ):
         self._rate = sample_rate
         self._gate: SpeechGate = gate if gate is not None else EnergyGate(self)
+        self.quiet_speech = False
         self._speech_threshold = speech_threshold
         self._silence_hold_samples = int(sample_rate * silence_hold_sec)
         self._pre_roll_samples = int(sample_rate * max(0.0, pre_roll_sec))
@@ -327,8 +331,11 @@ class SpeechSegmenter:
         self._loud_samples = 0
         self._silence_run = 0
         self._in_speech = False
+        self._continuation = False
+        self._continuation_wait = 0
         self._last_route = ""
         self._last_bounds: tuple[int, int] | None = None
+        self.last_forced = False
         # Quiet blocks heard before the gate opened, newest last.
         self._pre_roll: list[tuple[np.ndarray, float, float, float]] = []
         self._pre_roll_total = 0
@@ -354,6 +361,11 @@ class SpeechSegmenter:
         """True while an utterance is being buffered (gate has opened)."""
         return self._in_speech
 
+    @property
+    def pending_start(self) -> int:
+        """Earliest input sample that can still belong to a future segment."""
+        return self._input_samples - (self._total_samples if self._in_speech else self._pre_roll_total)
+
     def feed(
         self,
         mono_block: np.ndarray,
@@ -375,7 +387,8 @@ class SpeechSegmenter:
             # floor (not the adaptive room floor, which would mute quiet
             # talkers Silero can hear); a hum scored as speech must not open
             # the gate on digital silence.
-            loud = rms >= min(self.hold_threshold, self._speech_threshold)
+            floor = min(self.hold_threshold, self._speech_threshold)
+            loud = rms >= (floor * 0.1 if self.quiet_speech else floor)
         if loud:
             if not self._in_speech:
                 self._in_speech = True
@@ -389,6 +402,9 @@ class SpeechSegmenter:
 
         if not self._in_speech:
             self._keep_pre_roll(block, mic_energy, system_energy, float(rms))
+            self._continuation_wait += int(block.size)
+            if self._continuation_wait >= self._silence_hold_samples:
+                self._continuation = False
             return None
 
         self._remember_block(block, mic_energy, system_energy, float(rms))
@@ -456,13 +472,17 @@ class SpeechSegmenter:
     def _should_drop(self) -> bool:
         spoken = self._total_samples - self._lead_samples
         if spoken < self._min_samples or self._loud_samples < self._min_loud_samples:
-            return True
+            # This is the tail of speech we already accepted, not an isolated
+            # click. Do not discard it merely because the time limit split it.
+            return not (self._continuation and self._loud_samples > 0)
         return self._noise_only()
 
     def _noise_only(self) -> bool:
         # A segment opened by loud noise before the floor was trusted: once it
         # is, nothing in it rises above the room, and the ASR would only
         # hallucinate words into it.
+        if (self.quiet_speech and not isinstance(self._gate, EnergyGate)):
+            return False  # Neural speech evidence is required in quiet mode.
         if not self._adaptive or self._floor_total < self._floor_trust_samples:
             return False
         peak = max((rms for _count, _mic, _system, rms in self._energy), default=0.0)
@@ -470,6 +490,17 @@ class SpeechSegmenter:
 
     def flush(self) -> np.ndarray | None:
         """Emit buffered speech that has not yet reached the silence threshold."""
+        # A neural gate may need more than the final few milliseconds to open
+        # again after a forced cut. Recover only the immediate audible tail,
+        # never a later independent click or an arbitrary silent pre-roll.
+        if (not self._in_speech and self._continuation and self._pre_roll
+                and self._continuation_wait <= self._pre_roll_samples
+                and any(rms >= self._speech_threshold * (0.05 if self.quiet_speech else 1)
+                        for _b, _m, _s, rms in self._pre_roll)):
+            self._take_pre_roll()
+            self._lead_samples = 0
+            self._loud_samples = self._total_samples
+            self._in_speech = True
         if not self._in_speech or self._should_drop():
             self._reset_buffer()
             return None
@@ -540,8 +571,10 @@ class SpeechSegmenter:
         mic, system, tail_energy = self._split_energy(take)
         tail = audio[take:] if take < audio.size else None
         self._reset_buffer()
+        self._continuation = tail_is_speech
         self._last_route = dominant_route(mic, system)
         self._last_bounds = (start, start + take)
+        self.last_forced = tail_is_speech
         if tail is not None and tail.size and not tail_is_speech:
             # Trimmed trailing silence: the next utterance's pre-roll.
             self._keep_pre_roll(

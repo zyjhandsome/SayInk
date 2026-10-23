@@ -2,6 +2,7 @@ import hashlib
 import logging
 import re
 import shutil
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -94,117 +95,11 @@ _ASR_SIL_FRAGMENT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_./\\:-])/sil(?![A-Za-z0-9_./\\:-])(?:[ \t]*>)?",
     re.IGNORECASE,
 )
-_SENTENCE_PATTERN = re.compile(r"[^。！？!?]+[。！？!?]?")
-# A short token or clause repeated this many times is a decoder loop, not speech.
-# The upper bound covers a clause like "然后你这个月又有点长了，" (12 chars).
-_LOOP_MIN_REPEATS = 8
-_LOOP_MIN_UNIT = 2
-_LOOP_MAX_UNIT = 24
-# How many characters survive when a loop is one character repeated (哈 × 16).
-_SINGLE_CHAR_RUN_KEEP = 3
-
-
-def _script_counts(text: str) -> tuple[int, int, int]:
-    kana = hangul = cjk = 0
-    for ch in text:
-        code = ord(ch)
-        if 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF or 0xFF66 <= code <= 0xFF9D:
-            kana += 1
-        elif 0xAC00 <= code <= 0xD7AF:
-            hangul += 1
-        elif 0x4E00 <= code <= 0x9FFF:
-            cjk += 1
-    return kana, hangul, cjk
 
 
 def _is_speech_char(ch: str) -> bool:
-    code = ord(ch)
-    if ch.isascii() and ch.isalnum():
-        return True
-    return (
-        0x3040 <= code <= 0x30FF
-        or 0x31F0 <= code <= 0x31FF
-        or 0xFF66 <= code <= 0xFF9D
-        or 0xAC00 <= code <= 0xD7AF
-        or 0x4E00 <= code <= 0x9FFF
-    )
-
-
-def _find_loop(core: str, start: int) -> tuple[int, int] | None:
-    """(unit length, repeats) of a loop beginning at core[start], if any."""
-    length = len(core)
-    for unit_len in range(1, _LOOP_MAX_UNIT + 1):
-        if start + unit_len * _LOOP_MIN_REPEATS > length:
-            return None
-        unit = core[start:start + unit_len]
-        # 100000000 / 8888 8888 are numbers, and "aaaa" is not an ASR loop.
-        if unit.isascii() and (unit_len < _LOOP_MIN_UNIT or unit.isdigit()):
-            continue
-        repeats = 1
-        cursor = start + unit_len
-        while core.startswith(unit, cursor):
-            repeats += 1
-            cursor += unit_len
-        if repeats >= _LOOP_MIN_REPEATS:
-            return unit_len, repeats
-    return None
-
-
-def _excise_repetition_loops(text: str) -> str:
-    """Drop a short token or clause that the decoder emitted over and over.
-
-    Repeats are compared on speech characters only, so a loop whose last
-    copy ends in 。 instead of ， (他走了，× 7 + 他走了。) is still one loop.
-    """
-    positions = [i for i, ch in enumerate(text) if _is_speech_char(ch)]
-    if len(positions) < _LOOP_MIN_REPEATS:
-        return text
-    core = "".join(text[i] for i in positions)
-    pieces: list[str] = []
-    copied = 0
-    k = 0
-    while k < len(core):
-        found = _find_loop(core, k)
-        if found is None:
-            k += 1
-            continue
-        unit_len, repeats = found
-        unit = core[k:k + unit_len]
-        loop_end = k + unit_len * repeats
-        start = positions[k]
-        end = positions[loop_end - 1] + 1
-        pieces.append(text[copied:start])
-        if len(set(unit)) == 1:
-            # 哈哈哈…… / 对对对…… is laughter or emphasis, not a decoder
-            # loop; keep a natural-sounding run instead of deleting it.
-            pieces.append(unit[0] * _SINGLE_CHAR_RUN_KEEP)
-        else:
-            next_speech = positions[loop_end] if loop_end < len(positions) else len(text)
-            while end < next_speech and not text[end].isspace():
-                end += 1
-        copied = end
-        k = loop_end
-    pieces.append(text[copied:])
-    return "".join(pieces)
-
-
-def _is_unrelated_foreign_sentence(sentence: str) -> bool:
-    """A whole sentence that switched into Japanese or Korean."""
-    kana, hangul, cjk = _script_counts(sentence)
-    if hangul >= 4 and hangul >= cjk:
-        return True
-    return kana >= 3 and kana > cjk
-
-
-def _drop_unrelated_foreign_sentences(text: str, *, decoder_glitch: bool = False) -> str:
-    sentences = [s for s in _SENTENCE_PATTERN.findall(text) if s.strip()]
-    kept = [s for s in sentences if not _is_unrelated_foreign_sentence(s)]
-    if len(kept) == len(sentences):
-        return text
-    if not decoder_glitch and not any(_script_counts(s)[2] for s in kept):
-        # Nothing Chinese to drift away from: the user spoke Japanese / Korean.
-        return text
-    return "".join(kept)
+    # Multilingual models also emit Arabic, Cyrillic, Indic scripts, etc.
+    return ch.isalnum()
 
 
 def normalize_asr_output(text: str) -> str:
@@ -225,12 +120,9 @@ def normalize_asr_output(text: str) -> str:
     if _ASR_SIL_FRAGMENT_PATTERN.search(cleaned):
         stripped_tags = True
         cleaned = _ASR_SIL_FRAGMENT_PATTERN.sub("", cleaned)
-    deloop = _excise_repetition_loops(cleaned)
-    # A decoder loop means the model derailed, so stray Japanese / Korean
-    # around it is noise. Otherwise only drop a foreign sentence when the
-    # utterance is otherwise Chinese (language drift), never a whole Japanese
-    # utterance: Fun-ASR-Nano is a 中/英/日 model.
-    cleaned = _drop_unrelated_foreign_sentences(deloop, decoder_glitch=deloop != cleaned)
+    # Text alone cannot distinguish decoder hallucinations from deliberate
+    # repetition or code-switching. Preserve spoken content; remove only the
+    # known engine markers above. This also keeps normalization idempotent.
     cleaned = cleaned.strip()
     if stripped_tags:
         log.debug("已剥离 ASR 标签，清洗后长度: %d", len(cleaned))
@@ -1265,19 +1157,76 @@ def short_retry_audio(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.n
     return np.pad(clip, (padding, padding))
 
 
+_REPEATED_ASR_UNIT = re.compile(r"(.{1,24}?)\1{7,}")
+
+
+def _repetition_overflow(text: str, samples: int, sample_rate: int) -> bool:
+    """A retry signal, never permission to delete repetitions from a transcript.
+
+    Ordinary emphasis and repeated instructions fit comfortably under this
+    generous speech-character budget. A long loop alone is not enough.
+    """
+    core = "".join(ch for ch in text if ch.isalnum())
+    if len(core) <= 15 * samples / sample_rate + 20:
+        return False
+    return any(not match.group(1).isdigit() for match in _REPEATED_ASR_UNIT.finditer(core))
+
+
+def prepare_quiet_asr_audio(audio: np.ndarray, sample_rate: int = SAMPLE_RATE, *, assume_speech=False) -> np.ndarray:
+    """Raise clearly modulated, quiet speech without another native decode.
+
+    This only affects ASR input; raw recording and speaker embeddings stay
+    unchanged. Near silence, steady hum and normal-volume clips are untouched.
+    """
+    samples = np.asarray(audio, dtype=np.float32)
+    frame = max(1, sample_rate // 50)
+    if samples.size < frame * 10 or not np.all(np.isfinite(samples)):
+        return samples
+    levels = np.sqrt(np.mean(samples[:samples.size // frame * frame].reshape(-1, frame)**2, axis=1))
+    low, high = np.percentile(levels, [20, 90])
+    if not (0.00005 if assume_speech else 0.0005) <= high < 0.008:
+        return samples
+    if not assume_speech and high < max(low * 4, 0.0005):
+        return samples
+    gain = min(32.0 if assume_speech else 8.0, 0.02 / high,
+               0.9 / max(float(np.max(np.abs(samples))), 1e-8))
+    return samples * np.float32(gain) if gain > 1.2 else samples
+
+
 def decode_asr_slice(recognizer, audio: np.ndarray, *, sample_rate: int = SAMPLE_RATE,
-                     retry_empty: bool = False, cancelled=None) -> str:
+                     retry_empty: bool = False, cancelled=None, quiet_speech=False) -> str:
     """The same normalized, bounded decode policy for the app and benchmark."""
     def decode(piece):
         stream = recognizer.create_stream()
-        stream.accept_waveform(sample_rate, piece)
+        stream.accept_waveform(sample_rate, prepare_quiet_asr_audio(piece, sample_rate, assume_speech=quiet_speech))
         recognizer.decode_stream(stream)
         return normalize_asr_output(stream.result.text)
 
     text = decode(audio)
+    if _repetition_overflow(text, len(audio), sample_rate) and not (cancelled and cancelled()):
+        # Ask the acoustics again, with bounded shorter context, instead of
+        # assuming a repeated phrase was not actually spoken. Both halves
+        # cover the entire original clip, sharing only a small seam.
+        middle = len(audio) // 2
+        margin = min(int(sample_rate * 0.2), middle // 2)
+        pieces = [audio[:middle + margin], audio[middle - margin:]]
+        try:
+            parts = []
+            for piece in pieces:
+                if cancelled and cancelled():
+                    return text
+                parts.append(decode(piece))
+            candidate = merge_slice_texts(parts)
+            size = sum(ch.isalnum() for ch in candidate)
+            if candidate and size <= 15 * len(audio) / sample_rate + 20:
+                text = candidate
+                log.info("异常重复片段已用完整音频分两片重新识别")
+        except Exception as exc:
+            log.warning("异常重复重识别失败，保留首次文字: %s", exc)
     if text or not retry_empty or (cancelled is not None and cancelled()):
         return text
-    retry = short_retry_audio(audio, sample_rate)
+    retry_source = prepare_quiet_asr_audio(audio, sample_rate, assume_speech=True) if quiet_speech else audio
+    retry = short_retry_audio(retry_source, sample_rate)
     if retry is None:
         return text
     try:
@@ -1313,21 +1262,49 @@ class TranscribeWorker(QThread):
         self._overlap_sec = overlap_sec
         self._retry_empty = retry_empty
         self._turn_analyzer = turn_analyzer
+        self.native_lock = None
+        self.quiet_speech = False
 
     def cancel(self):
         """Set cancellation flag."""
         self._cancelled = True
 
     def _decode_slice(self, audio: np.ndarray) -> str:
+        from sayink.asr_context import decode_owned_context
+        if not self._cancelled and (len(getattr(audio, "prefix", ())) or len(getattr(audio, "suffix", ()))):
+            try:
+                text = decode_owned_context(self._recognizer, audio, normalize_asr_output,
+                                             prepare=lambda window: prepare_quiet_asr_audio(window, assume_speech=self.quiet_speech))
+                if text:
+                    return text
+            except Exception as exc:
+                log.warning("跨段时间对齐不可用，识别原始片段: %s", exc)
+        if self._cancelled:
+            return ""
+        options = {"quiet_speech": True} if self.quiet_speech else {}
         return decode_asr_slice(self._recognizer, audio, retry_empty=self._retry_empty,
-                                cancelled=lambda: self._cancelled)
+                                cancelled=lambda: self._cancelled, **options)
 
     def run(self):
+        if self.native_lock is None:
+            self._run_locked()
+            return
+        while not self._cancelled:
+            if self.native_lock.acquire(timeout=0.1):
+                try:
+                    self._run_locked()
+                finally:
+                    self.native_lock.release()
+                return
+
+    def _run_locked(self):
         if self._cancelled:
             return
 
         try:
-            audio = self._audio_data.astype(np.float32)
+            from sayink.asr_context import with_context
+            audio = with_context(self._audio_data, getattr(self._audio_data, "prefix", None),
+                                 getattr(self._audio_data, "suffix", None))
             if audio.ndim > 1:
                 audio = audio[:, 0]
 
@@ -1383,6 +1360,9 @@ class TranscribeWorker(QThread):
             if self._cancelled:
                 return
             part = audio[turn.start:turn.stop]
+            from sayink.asr_context import with_context
+            part = with_context(part, audio.prefix if turn.start == 0 else None,
+                                 audio.suffix if turn.stop == len(audio) else None)
             pieces = (plan_audio_slices(part, SAMPLE_RATE, self._max_slice_sec, self._overlap_sec)
                       if self._max_slice_sec and len(part) > int(self._max_slice_sec * SAMPLE_RATE) else [part])
             texts = []
@@ -1403,6 +1383,7 @@ class TranscribeWorker(QThread):
 
 class SpeechRecognizer(QObject):
     """Offline speech recognizer supporting multiple sherpa-onnx models."""
+    supports_prefetch = True
     final_result = pyqtSignal(str)
     meeting_result = pyqtSignal(object)
     partial_result = pyqtSignal(str)
@@ -1428,6 +1409,8 @@ class SpeechRecognizer(QObject):
         self._request_seq = 0
         self._active_seq = 0
         self._workers: list[TranscribeWorker] = []
+        self._decode_lock = threading.Lock()
+        self.quiet_speech = False
 
     def _target(self) -> LoadTarget:
         return (self._model_id, self._num_threads, self._hotwords, self._language)
@@ -1524,9 +1507,23 @@ class SpeechRecognizer(QObject):
         if is_model_downloaded(self._model_id):
             self._load_model()
 
-    def transcribe_final(self, full_audio: np.ndarray, *, retry_empty: bool = False, turn_analyzer=None):
+    def prefetch_final(self, audio: np.ndarray, *, on_text, on_turns, on_error, turn_analyzer=None):
+        """Decode the next queued segment without publishing it as current output.
+
+        Uses the same single worker slot and cancellation sequence as normal
+        recognition; no second native decoder runs concurrently.
+        """
+        self.transcribe_final(audio, retry_empty=True, turn_analyzer=turn_analyzer,
+                              _callbacks=(on_text, on_turns, on_error))
+
+    def transcribe_final(self, full_audio: np.ndarray, *, retry_empty: bool = False,
+                         turn_analyzer=None, _callbacks=None):
         if not self._is_ready or self._recognizer is None:
-            self.error.emit("语音模型未就绪，请等待模型加载完成")
+            message = "语音模型未就绪，请等待模型加载完成"
+            if _callbacks is None:
+                self.error.emit(message)
+            else:
+                _callbacks[2](message)
             return
 
         # Supersede any in-flight worker without force-terminating it: mark it
@@ -1556,14 +1553,18 @@ class SpeechRecognizer(QObject):
                 retry_empty=retry_empty,
                 turn_analyzer=turn_analyzer,
             )
-        worker.result_ready.connect(
-            lambda text, s=seq: self._on_final_result(text, s)
-        )
-        worker.partial_ready.connect(
-            lambda text, s=seq: self._on_partial_result(text, s)
-        )
-        worker.meeting_ready.connect(lambda turns, s=seq: self._on_meeting_result(turns, s))
-        worker.error.connect(lambda e, s=seq: self._on_worker_error(e, s))
+        worker.native_lock = self._decode_lock
+        worker.quiet_speech = self.quiet_speech
+        if _callbacks is None:
+            worker.result_ready.connect(lambda text, s=seq: self._on_final_result(text, s))
+            worker.partial_ready.connect(lambda text, s=seq: self._on_partial_result(text, s))
+            worker.meeting_ready.connect(lambda turns, s=seq: self._on_meeting_result(turns, s))
+            worker.error.connect(lambda e, s=seq: self._on_worker_error(e, s))
+        else:
+            on_text, on_turns, on_error = _callbacks
+            worker.result_ready.connect(lambda text, s=seq: on_text(text) if s == self._active_seq else None)
+            worker.meeting_ready.connect(lambda turns, s=seq: on_turns(turns) if s == self._active_seq else None)
+            worker.error.connect(lambda e, s=seq: on_error(e) if s == self._active_seq else None)
         worker.finished.connect(lambda w=worker: self._reap_worker(w))
         self._current_worker = worker
         self._workers.append(worker)

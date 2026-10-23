@@ -236,4 +236,5 @@ def test_meeting_rows_follow_the_meetings_own_glossary():
         app._on_segment_ready(np.ones(6400, dtype=np.float32))
         app._on_final_result("提交到GITHUB")
         rows = [call.args[0] for call in h["history"].enqueue.call_args_list]
-        assert rows[-1].raw_text == "提交到GitHub"
+        assert rows[-1].raw_text == "提交到GITHUB"
+        assert rows[-1].polished_text == "提交到GitHub"
