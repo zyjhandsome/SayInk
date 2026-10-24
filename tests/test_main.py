@@ -162,6 +162,30 @@ class TestLogging:
                 main._crash_file.close()
                 main._crash_file = None
 
+    def test_setup_logging_honors_sayink_log_level(self, tmp_path, monkeypatch):
+        root = logging.getLogger()
+        saved = root.handlers[:]
+        saved_level = root.level
+        try:
+            monkeypatch.setenv("SAYINK_LOG_LEVEL", "DEBUG")
+            main.setup_logging(str(tmp_path))
+            assert root.level == logging.DEBUG
+            monkeypatch.setenv("SAYINK_LOG_LEVEL", "NOT-A-LEVEL")
+            main.setup_logging(str(tmp_path / "again"))
+            assert root.level == logging.INFO
+        finally:
+            import faulthandler
+
+            faulthandler.disable()
+            for handler in root.handlers:
+                if handler not in saved:
+                    handler.close()
+            root.handlers[:] = saved
+            root.setLevel(saved_level)
+            if main._crash_file is not None:
+                main._crash_file.close()
+                main._crash_file = None
+
     def test_setup_logging_without_console_stream(self, tmp_path, monkeypatch):
         monkeypatch.setattr(main.sys, "stderr", None)
         root = logging.getLogger()

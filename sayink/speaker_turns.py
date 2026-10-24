@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import threading
+import time
 
 import numpy as np
 
@@ -146,6 +147,7 @@ class SpeakerTurnDetector:
         self._activity_guard = getattr(embedder, "activity_guard", None)
         self._context, self._start_ms, self._route = context, int(start_ms or 0), route
         self.context_action = "none"
+        self._embed_warned_at = 0.0
 
     @property
     def activity_backend(self) -> str:
@@ -154,7 +156,11 @@ class SpeakerTurnDetector:
     def _embed_or_none(self, audio):
         try:
             return _vector(self._embed(audio))
-        except Exception:
+        except Exception as exc:
+            now = time.monotonic()
+            if now - self._embed_warned_at >= 30:
+                self._embed_warned_at = now
+                log.warning("说话人声纹计算失败，本段暂不判断说话人: %s", exc)
             return None
 
     def _activity_unsafe(self, audio, *, cancelled=None):

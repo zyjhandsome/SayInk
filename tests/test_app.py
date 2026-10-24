@@ -104,6 +104,18 @@ class TestAppFriendlyError:
         result = App._friendly_error("模型加载失败，模型未就绪")
         assert "模型未就绪" in result
 
+    def test_system_audio_error_is_not_called_a_microphone_problem(self):
+        result = App._friendly_error("无法采集系统声音：麦克风设备被占用")
+        assert "系统声音" in result
+        assert "立体声混音" in result
+
+    def test_disconnected_audio_device_keeps_the_disconnect_hint(self):
+        result = App._friendly_error("音频设备已断开")
+        assert result.startswith("音频设备已断开")
+
+    def test_hint_order_covers_every_hint(self):
+        assert set(App._ERROR_HINT_ORDER) == set(App.ERROR_HINTS)
+
 
 class TestAppInit:
     def test_init_creates_modules(self):
@@ -872,6 +884,17 @@ def test_continuous_ready_notice_uses_the_real_pause():
             str(part) for call in h["tray"].showMessage.call_args_list for part in call.args
         )
         assert f"{SILENCE_HOLD_SEC:g} 秒" in text
+
+
+def test_sync_models_dir_uses_only_an_explicit_folder(tmp_path, monkeypatch):
+    with app_harness() as h:
+        calls = []
+        monkeypatch.setattr("sayink.app.set_models_dir", lambda path: calls.append(path) or True)
+        h["config"].set("stt.models_dir", "")
+        assert h["app"]._sync_models_dir() is True
+        h["config"].set("stt.models_dir", str(tmp_path))
+        assert h["app"]._sync_models_dir() is True
+        assert calls == [None, str(tmp_path)]
 
 
 def test_new_continuous_session_clears_a_previous_paste_target(monkeypatch):

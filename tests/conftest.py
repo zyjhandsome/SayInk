@@ -33,10 +33,9 @@ def _restore_light_design_tokens():
     yield
     try:
         from sayink.ui import design_tokens as dt
-        from sayink.ui import settings_styles as ss
 
-        dt.activate("light")
-        ss.reload_styles()
+        if dt._active_axis != "light":
+            dt.activate("light")
     except Exception:
         pass
 
@@ -73,6 +72,14 @@ def _point_home_at(mp: pytest.MonkeyPatch, home) -> None:
     mp.setenv("APPDATA", str(home / "AppData" / "Roaming"))
     mp.setattr("sayink.user_data._resolved", {})
     mp.setattr("sayink.speech_recognizer._custom_models_dir", None)
+    # The project tree's ./models must not count as an installed model. A
+    # developer checkout (or a git-lfs pointer) would otherwise make downloads
+    # look finished and hide an empty custom directory.
+    mp.setattr("sayink.speech_recognizer._portable_model_roots", _no_portable_models)
+
+
+def _no_portable_models() -> list:
+    return []
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -667,23 +667,27 @@ def restore_glossary_case(text: str, glossary) -> str:
 _custom_models_dir: Path | None = None
 
 
-def set_models_dir(path: Path | None) -> bool:
+def set_models_dir(path: Path | str | None) -> bool:
     """Use ``path`` for models; ``None`` restores the default location.
 
     A configured folder that cannot be created (removed drive, revoked
     permission) must not take the whole app down at startup: the default
     directory is used instead and False is returned so the caller can tell
-    the user.
+    the user. A plain string is accepted because settings store the folder
+    as text.
     """
     global _custom_models_dir
-    if path:
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            log.warning("模型目录 %s 不可用，改用默认目录: %s", path, exc)
-            _custom_models_dir = None
-            return False
-    _custom_models_dir = path
+    if not path:
+        _custom_models_dir = None
+        return True
+    folder = Path(path)
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning("模型目录 %s 不可用，改用默认目录: %s", folder, exc)
+        _custom_models_dir = None
+        return False
+    _custom_models_dir = folder
     return True
 
 
@@ -732,31 +736,44 @@ def _get_models_dir() -> Path:
     return default_models_dir()
 
 
-def _get_portable_model_dir(model_id: str) -> Path | None:
-    """Look for models in portable locations: next to exe or project root."""
+def _portable_model_roots() -> list[Path]:
+    """Directories that may hold a model shipped beside the program."""
     import sys
+
+    roots = []
+    if hasattr(sys, "_MEIPASS"):
+        roots.append(Path(sys._MEIPASS).parent / "models")
+    roots.append(Path(__file__).resolve().parent.parent / "models")
+    return roots
+
+
+def _get_portable_model_dir(model_id: str) -> Path | None:
+    """Look for a usable model next to the exe or the project root.
+
+    ``exists()`` is not enough: a git-lfs pointer is a tiny text file with
+    the right name, and treating it as downloaded skips the real download.
+    """
     info = get_model_info(model_id)
     if not info:
         return None
 
-    candidates = []
-    if hasattr(sys, '_MEIPASS'):
-        candidates.append(Path(sys._MEIPASS).parent / "models" / info["dir_name"])
-    candidates.append(Path(__file__).parent.parent / "models" / info["dir_name"])
-
-    for d in candidates:
-        if d.exists() and all((d / f).exists() for f in info["files"]):
-            return d
+    for root in _portable_model_roots():
+        folder = root / info["dir_name"]
+        if folder.is_dir() and all(_is_usable_model_file(folder / name) for name in info["files"]):
+            return folder
     return None
 
 
 def get_model_dir(model_id: str) -> Path:
-    portable = _get_portable_model_dir(model_id)
-    if portable:
-        return portable
     info = get_model_info(model_id)
     if not info:
         raise ValueError(f"未知模型: {model_id}")
+    # A folder the user chose is the only place to look, even when it is
+    # empty. The copy beside the program is a fallback for the default location.
+    if not _custom_models_dir:
+        portable = _get_portable_model_dir(model_id)
+        if portable:
+            return portable
     return _get_models_dir() / info["dir_name"]
 
 
@@ -808,11 +825,11 @@ def _is_usable_model_file(path: Path) -> bool:
 
 
 def is_model_downloaded(model_id: str) -> bool:
-    if _get_portable_model_dir(model_id):
-        return True
     info = get_model_info(model_id)
     if not info:
         return False
+    if not _custom_models_dir and _get_portable_model_dir(model_id):
+        return True
     d = _get_models_dir() / info["dir_name"]
     return all(_is_usable_model_file(d / f) for f in info["files"])
 
@@ -851,7 +868,9 @@ def resolve_startup_model_id(configured_id: str | None) -> str:
 
 
 def delete_model(model_id: str) -> bool:
-    if _get_portable_model_dir(model_id):
+    # The bundled copy is not the user's download. An explicit models folder
+    # is, so a portable copy elsewhere must not block deleting that folder.
+    if not _custom_models_dir and _get_portable_model_dir(model_id):
         return False
     info = get_model_info(model_id)
     if not info:

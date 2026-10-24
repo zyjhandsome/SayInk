@@ -344,8 +344,15 @@ def _notify_derived_styles() -> None:
         sc.reload_styles()
 
 
+_active_axis: str | None = None
+
+
 def activate(effective: str) -> None:
     """Publish the effective theme onto module-level color aliases."""
+    global _active_axis
+    axis = "dark" if effective == "dark" else "light"
+    if axis == _active_axis:
+        return
     vals = tokens_for(effective)
     g = globals()
     for key in _COLOR_KEYS:
@@ -360,6 +367,7 @@ def activate(effective: str) -> None:
     g["STATE_WARN"] = vals["AMBER"]
     g["STATE_MUTED"] = vals["FLOAT_TEXT_SEC"]
     g["STATE_ERROR"] = vals["STATE_RECORD"]
+    _active_axis = axis
     _notify_derived_styles()
 
 

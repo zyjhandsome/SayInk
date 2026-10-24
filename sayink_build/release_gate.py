@@ -89,6 +89,25 @@ def _ci_not_green(run: Runner, head: str) -> str | None:
     return None
 
 
+def _ruff_problem(run: Runner) -> str | None:
+    """Lint the tree that CI would ship. The workflow file cannot run ruff itself."""
+    import sys
+
+    cmd = [
+        sys.executable, "-m", "ruff", "check",
+        "sayink", "sayink_build", "tests", "build.py", "build_release.py", "run.py",
+    ]
+    try:
+        result = run(cmd)
+    except OSError as exc:
+        return f"Could not run ruff: {exc}"
+    if result.returncode != 0:
+        detail = (result.stdout or result.stderr or "").strip().splitlines()
+        tail = "; ".join(detail[:4])
+        return f"ruff check failed: {tail}"
+    return None
+
+
 def release_problems(version: str, run: Runner = _run) -> list[str]:
     """Everything that stops ``version`` from being released; empty when ready."""
     problems = []
@@ -102,6 +121,7 @@ def release_problems(version: str, run: Runner = _run) -> list[str]:
             problems.append(problem)
 
     check(_uncommitted)
+    check(_ruff_problem)
     try:
         head = _output(run, ["git", "rev-parse", "HEAD"]).strip()
     except _CommandFailed as exc:

@@ -252,8 +252,17 @@ def setup_logging(directory: str | None = None) -> str | None:
         console = logging.StreamHandler(sys.stderr)
         console.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
         handlers.append(console)
-    logging.basicConfig(level=logging.INFO, handlers=handlers, force=True)
+    logging.basicConfig(level=_configured_log_level(), handlers=handlers, force=True)
     return log_path
+
+
+def _configured_log_level() -> int:
+    """``SAYINK_LOG_LEVEL=DEBUG`` makes device and clipboard diagnostics visible."""
+    name = os.environ.get("SAYINK_LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, name, None)
+    if not isinstance(level, int):
+        return logging.INFO
+    return level
 
 
 def main():

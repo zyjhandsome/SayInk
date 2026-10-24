@@ -784,11 +784,41 @@ def test_runtime_switch_leaves_no_widget_with_old_theme_colors(
 
 def test_watch_system_color_scheme_connects_to_style_hints():
     from PyQt6.QtGui import QGuiApplication
-    from sayink.ui.theme import watch_system_color_scheme
+    from sayink.ui.theme import unwatch_system_color_scheme, watch_system_color_scheme
 
     assert hasattr(QGuiApplication.styleHints(), "colorSchemeChanged")
-    calls = []
-    assert watch_system_color_scheme(lambda: calls.append(1)) is True
+    first, second = [], []
+    assert watch_system_color_scheme(lambda: first.append(1)) is True
+    assert watch_system_color_scheme(lambda: second.append(1)) is True
+    QGuiApplication.styleHints().colorSchemeChanged.emit(
+        QGuiApplication.styleHints().colorScheme()
+    )
+    assert first == []
+    assert second == [1]
+    unwatch_system_color_scheme()
+    QGuiApplication.styleHints().colorSchemeChanged.emit(
+        QGuiApplication.styleHints().colorScheme()
+    )
+    assert second == [1]
+
+
+def test_harness_releases_the_app_after_exit():
+    import gc
+
+    from PyQt6 import sip
+
+    from sayink.app import App
+    from sayink.ui import theme
+    from tests.helpers.app_harness import app_harness
+
+    for _ in range(3):
+        with app_harness() as h:
+            h["app"]._meeting_idle_timer.start()
+            assert h["app"]._meeting_idle_timer.isActive()
+        assert theme._scheme_callback is None
+    gc.collect()
+    live = [obj for obj in gc.get_objects() if isinstance(obj, App) and not sip.isdeleted(obj)]
+    assert live == []
 
 
 def test_system_scheme_change_reapplies_only_in_system_mode():

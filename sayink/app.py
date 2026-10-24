@@ -8,6 +8,10 @@ from uuid import uuid4
 import numpy as np
 import pyperclip
 from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
+
+# Tests replace ``QTimer.singleShot`` to run or swallow delayed work. The
+# child-timer path below must keep honoring that replacement.
+_QT_SINGLE_SHOT = QTimer.singleShot
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMessageBox
 
 from sayink.ui.prompts import confirm
@@ -223,12 +227,26 @@ class App(QObject):
         "输出失败": "输出失败\n请确保目标窗口可接收文本输入",
     }
 
+    # 先匹配更具体的来源。``ERROR_HINTS`` 里「麦克风」写在「音频设备」和
+    # 「系统声音」前面，按字典顺序会把混音失败说成麦克风问题。
+    _ERROR_HINT_ORDER: ClassVar[tuple[str, ...]] = (
+        "系统声音",
+        "已断开",
+        "音频设备",
+        "麦克风",
+        "模型未就绪",
+        "模型未下载",
+        "录音过短",
+        "未识别",
+        "输出失败",
+    )
+
     @classmethod
     def _friendly_error(cls, original_msg: str) -> str:
         """将技术性错误信息转换为友好提示"""
-        for keyword, hint in cls.ERROR_HINTS.items():
+        for keyword in cls._ERROR_HINT_ORDER:
             if keyword in original_msg:
-                return hint
+                return cls.ERROR_HINTS[keyword]
         return original_msg
 
     def __init__(self, config: Config | None = None):
@@ -284,8 +302,11 @@ class App(QObject):
         # Aux model lookup needs it. An unusable folder (removed drive) falls
         # back to the default; the user is told once the tray is up.
         self._models_dir_notice = ""
-        if not set_models_dir(self._config.models_dir):
-            self._models_dir_notice = f"模型目录不可用，已改用默认目录：{self._config.models_dir}"
+        if not self._sync_models_dir():
+            self._models_dir_notice = (
+                f"模型目录不可用，已改用默认目录：{self._config.get('stt.models_dir', '')}"
+            )
+
         self._speakers = self._new_speaker_session()
         self._reclustered_session_id: str | None = None
         self._continuous_user_stopped = False
@@ -344,6 +365,16 @@ class App(QObject):
         self._sync_hotkey_trigger_mode()
         self._configure_stt()
         self._update_tray_models()
+
+    def _sync_models_dir(self) -> bool:
+        """Apply only a folder the user actually chose.
+
+        The default location still has to see the model shipped beside the
+        program. Passing that default path in as a custom directory would
+        hide the installed copy and tell the user to download it again.
+        """
+        chosen = str(self._config.get("stt.models_dir", "") or "").strip()
+        return set_models_dir(chosen or None)
 
     def _init_modules(self):
         self._hotkey_mgr = HotKeyManager(
@@ -820,7 +851,7 @@ class App(QObject):
             )
         else:
             self._floating.show_meeting_paused("转写快捷键在会议中不可用")
-        QTimer.singleShot(MEETING_BAR_REFRESH_MS, self._refresh_meeting_bar)
+        self._later(MEETING_BAR_REFRESH_MS, self._refresh_meeting_bar)
         return True
 
     def _refresh_meeting_bar(self) -> None:
@@ -890,7 +921,7 @@ class App(QObject):
             return False
         self._hold_open_pending = False
         self._reset_recording_ui_after_abort()
-        QTimer.singleShot(0, self._apply_pending_recognition_settings)
+        self._later(0, self._apply_pending_recognition_settings)
         return True
 
     def _on_recording_stop(self):
@@ -911,7 +942,7 @@ class App(QObject):
         # The key is up: the bar must stop saying 「松开结束，Esc 取消」.
         self._floating.end_capture()
         self._recorder.stop()
-        QTimer.singleShot(0, self._apply_pending_recognition_settings)
+        self._later(0, self._apply_pending_recognition_settings)
 
     def _reset_recording_ui_after_abort(self):
         """录音未真正开始或已结束时，收回托盘/浮窗状态（防止短按后浮窗常驻）。"""
@@ -958,7 +989,7 @@ class App(QObject):
         self._reset_recording_ui_after_abort()
         self._recorder.cancel()
         self._floating.show_cancelled()
-        QTimer.singleShot(0, self._apply_pending_recognition_settings)
+        self._later(0, self._apply_pending_recognition_settings)
 
     def _on_continuous_hotkey_start(self):
         if self._recovery_busy:
@@ -1052,7 +1083,7 @@ class App(QObject):
             self._maybe_finish_dictation_speakers()
             self._apply_pending_recognition_settings()
             # Re-checks state: a session restarted within the delay keeps its bar.
-            QTimer.singleShot(BAR_REFRESH_AFTER_STOP_MS, self._refresh_continuous_ui_after_output)
+            self._later(BAR_REFRESH_AFTER_STOP_MS, self._refresh_continuous_ui_after_output)
 
     def _on_recorder_error(self, error_msg: str):
         if self.__dict__.get("_exit_started", False):
@@ -1133,7 +1164,7 @@ class App(QObject):
                     5000,
                 )
 
-        QTimer.singleShot(CONTINUOUS_START_DELAY_MS, _begin)
+        self._later(CONTINUOUS_START_DELAY_MS, _begin)
 
     def _stop_continuous_listening(self):
         if self._recorder.is_continuous or self._recorder.is_recording:
@@ -1474,7 +1505,7 @@ class App(QObject):
             if not self._is_continuous_mode():
                 # The recorder counts this flush as delivered and sends no
                 # recording_finished; finish the hold once stop() has returned.
-                QTimer.singleShot(0, self._finish_hold_after_dropped_segment)
+                self._later(0, self._finish_hold_after_dropped_segment)
             return
         context = self._capture_segment_context()
         if context is not None:
@@ -1506,7 +1537,7 @@ class App(QObject):
         # Output may still be busy: the pump can use that time to prefetch.
         # Never schedule another native decode while one already owns ASR.
         if not self._is_transcribing and self._prefetch_segment is None:
-            QTimer.singleShot(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
+            self._later(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
 
     # ── Recognition ───────────────────────────────────
 
@@ -1805,11 +1836,35 @@ class App(QObject):
             self._floating.show_error(self._friendly_error("未识别"))
         self._pump_segment_queue()
 
+    def _later(self, msec: int, slot) -> None:
+        """One-shot timer owned by this app.
+
+        ``QTimer.singleShot`` is parented to the process, so it still fired
+        after the window was gone and could copy text into a later task.
+        A child timer stops on exit with the other ``QTimer``s.
+        """
+        if QTimer.singleShot is not _QT_SINGLE_SHOT:
+            QTimer.singleShot(msec, slot)
+            return
+        try:
+            timer = QTimer(self)
+        except RuntimeError:
+            _QT_SINGLE_SHOT(msec, slot)
+            return
+        timer.setSingleShot(True)
+
+        def fire() -> None:
+            timer.deleteLater()
+            slot()
+
+        timer.timeout.connect(fire)
+        timer.start(msec)
+
     def _mark_output_busy(self) -> None:
         self._output_busy = True
         self._output_token += 1
         token = self._output_token
-        QTimer.singleShot(OUTPUT_WATCHDOG_MS, lambda: self._release_stuck_output(token))
+        self._later(OUTPUT_WATCHDOG_MS, lambda: self._release_stuck_output(token))
 
     def _release_stuck_output(self, token: int) -> None:
         if not self._output_busy or token != self._output_token:
@@ -2270,10 +2325,10 @@ class App(QObject):
                 self._floating.show_info(title, hint)
             else:
                 self._floating.show_success(title, hint)
-            QTimer.singleShot(refresh_ms, self._refresh_continuous_ui_after_output)
+            self._later(refresh_ms, self._refresh_continuous_ui_after_output)
         elif self._continuous_user_stopped:
             self._floating.show_continuous_stopped(stopped_text)
-            QTimer.singleShot(RESULT_TOAST_WITH_HINT_MS, self._refresh_continuous_ui_after_output)
+            self._later(RESULT_TOAST_WITH_HINT_MS, self._refresh_continuous_ui_after_output)
         elif self._recorder.is_recording:
             self._floating.show_recording()
         elif use_info:
@@ -2379,7 +2434,7 @@ class App(QObject):
         self._enqueue_history_record(record, target_app=target_app)
         # Last words of a stopped continuous session are in: settle speakers.
         self._maybe_finish_dictation_speakers()
-        QTimer.singleShot(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
+        self._later(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
 
     def _refresh_open_history_ui(self) -> None:
         if self._main is None:
@@ -2802,7 +2857,7 @@ class App(QObject):
         if not self._meeting_active():
             return
         self._floating.show_info(title, detail)
-        QTimer.singleShot(BAR_REFRESH_AFTER_STOP_MS, self._refresh_meeting_bar)
+        self._later(BAR_REFRESH_AFTER_STOP_MS, self._refresh_meeting_bar)
 
     def _on_minutes_generated(self, meeting_id: str) -> None:
         main = self._main
@@ -2981,7 +3036,7 @@ class App(QObject):
         if not self._restore_main_after_menu:
             return
         self._restore_main_after_menu = False
-        QTimer.singleShot(0, self._reactivate_main_window)
+        self._later(0, self._reactivate_main_window)
 
     def _reactivate_main_window(self) -> None:
         main = self._main
@@ -3114,7 +3169,7 @@ class App(QObject):
             # changes apply when it ends (_on_meeting_ended reconfigures).
             log.info("会议进行中，音频与引擎设置将在会议结束后生效")
             self._apply_immediate_preferences()
-            set_models_dir(self._config.models_dir)
+            self._sync_models_dir()
             self._update_tray_models()
             return
         if self._recorder.is_recording or self._hold_open_pending:
@@ -3148,7 +3203,7 @@ class App(QObject):
         if self._audio_runtime_key() != getattr(self, "_applied_audio_key", None):
             self._apply_audio_config()
         if self._recognition_runtime_key() != getattr(self, "_applied_recognition_key", None):
-            set_models_dir(self._config.models_dir)
+            self._sync_models_dir()
             self._configure_stt()
             self._update_tray_models()
         self._sync_hotkey_trigger_mode()
@@ -3316,6 +3371,9 @@ class App(QObject):
         if self._exit_started:
             return
         self._exit_started = True
+        from sayink.ui.theme import unwatch_system_color_scheme
+
+        unwatch_system_color_scheme()
         recovery = getattr(self, "_recovery_dialog", None)
         if recovery is not None:
             recovery.cancel_processing()
@@ -3357,7 +3415,7 @@ class App(QObject):
 
     def _complete_quit_when_idle(self):
         if getattr(self._recorder, "storage_busy", False) is True:
-            QTimer.singleShot(QUIT_POLL_MS, self._complete_quit_when_idle)
+            self._later(QUIT_POLL_MS, self._complete_quit_when_idle)
             return
         owners = [self._recognizer, self._polisher, self._meeting, self._updates, self._settings_widget()]
         owners.append(getattr(self, "_recovery_dialog", None))
@@ -3369,7 +3427,7 @@ class App(QObject):
                    for worker in getattr(owner, "running_workers", ())
                    if isinstance(worker, QThread) and worker.isRunning()]
         if pending:
-            QTimer.singleShot(QUIT_POLL_MS, self._complete_quit_when_idle)
+            self._later(QUIT_POLL_MS, self._complete_quit_when_idle)
             return
         self._config.save_immediate()
         QApplication.quit()
@@ -3386,7 +3444,7 @@ class App(QObject):
         self._meeting.mark_interrupted()
         self._meeting.resume_generation_queue()
         self._enqueue_history_cleanup()
-        QTimer.singleShot(UPDATE_CHECK_STARTUP_DELAY_MS, self._updates.maybe_auto_check)
+        self._later(UPDATE_CHECK_STARTUP_DELAY_MS, self._updates.maybe_auto_check)
         self._onboarding.schedule(self._recognizer.ready)
 
     def _settings_widget(self):

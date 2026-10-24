@@ -69,18 +69,53 @@ def current_effective_theme() -> EffectiveTheme:
     return _current_effective
 
 
-def watch_system_color_scheme(callback) -> bool:
-    """Call ``callback()`` when Windows switches light/dark (Qt 6.5+)."""
+_scheme_callback = None
+
+
+def _color_scheme_signal():
     from PyQt6.QtGui import QGuiApplication
 
     app = QGuiApplication.instance()
     hints = app.styleHints() if app is not None else None
-    signal = getattr(hints, "colorSchemeChanged", None)
+    return getattr(hints, "colorSchemeChanged", None)
+
+
+def watch_system_color_scheme(callback) -> bool:
+    """Call ``callback()`` when Windows switches light/dark (Qt 6.5+).
+
+    The callback is connected directly and remembered. A lambda closed over
+    the window was never disconnected, so every exited session stayed alive
+    on the process-wide style-hints object.
+    """
+    global _scheme_callback
+    signal = _color_scheme_signal()
     if signal is None:
         log.info("当前 Qt 不支持系统配色变化通知，「跟随系统」仅在启动和切换时生效")
         return False
-    signal.connect(lambda *_args: callback())
+    if _scheme_callback is not None:
+        try:
+            signal.disconnect(_scheme_callback)
+        except (RuntimeError, TypeError):
+            pass
+    signal.connect(callback)
+    _scheme_callback = callback
     return True
+
+
+def unwatch_system_color_scheme() -> None:
+    """Drop the Auto-theme callback before the application object is destroyed."""
+    global _scheme_callback
+    callback = _scheme_callback
+    _scheme_callback = None
+    if callback is None:
+        return
+    signal = _color_scheme_signal()
+    if signal is None:
+        return
+    try:
+        signal.disconnect(callback)
+    except (RuntimeError, TypeError):
+        pass
 
 
 def _application_palette(effective: EffectiveTheme) -> QPalette:

@@ -390,6 +390,47 @@ class TestIsModelDownloaded:
             (model_dir / name).write_bytes(b"")
         assert is_model_downloaded("sensevoice") is False
 
+    def test_portable_lfs_pointers_are_not_a_downloaded_model(self, tmp_path, monkeypatch):
+        import sayink.speech_recognizer as sr
+
+        info = sr.get_model_info("sensevoice")
+        folder = tmp_path / "models" / info["dir_name"]
+        folder.mkdir(parents=True)
+        pointer = (
+            b"version https://git-lfs.github.com/spec/v1\n"
+            b"oid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+            b"size 950000000\n"
+        )
+        for name in info["files"]:
+            (folder / name).write_bytes(pointer)
+        monkeypatch.setattr(sr, "_portable_model_roots", lambda: [tmp_path / "models"])
+        assert sr._get_portable_model_dir("sensevoice") is None
+        assert sr.is_model_downloaded("sensevoice") is False
+
+    def test_explicit_models_dir_is_not_shadowed_by_a_portable_copy(self, tmp_path, monkeypatch):
+        import sayink.speech_recognizer as sr
+
+        info = sr.get_model_info("sensevoice")
+        portable = tmp_path / "portable"
+        bundled = portable / info["dir_name"]
+        bundled.mkdir(parents=True)
+        for name in info["files"]:
+            (bundled / name).write_bytes(b"\x00" * 2048)
+        monkeypatch.setattr(sr, "_portable_model_roots", lambda: [portable])
+        chosen = tmp_path / "chosen"
+        try:
+            assert sr.set_models_dir(str(chosen)) is True
+            assert sr.is_model_downloaded("sensevoice") is False
+            assert str(sr.get_model_dir("sensevoice")).startswith(str(chosen))
+            for name in info["files"]:
+                (chosen / info["dir_name"]).mkdir(parents=True, exist_ok=True)
+                (chosen / info["dir_name"] / name).write_bytes(b"\x00" * 2048)
+            assert sr.delete_model("sensevoice") is True
+            assert sr.is_model_downloaded("sensevoice") is False
+        finally:
+            sr.set_models_dir(None)
+        assert sr.is_model_downloaded("sensevoice") is True
+
 
 class TestGetModelsDir:
     def test_returns_path(self):

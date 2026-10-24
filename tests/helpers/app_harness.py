@@ -95,6 +95,7 @@ def app_harness(config_overrides: dict | None = None, *, real_history: bool = Fa
         # test's processEvents, a modal dialog or a real network check would
         # block the suite.
         app._onboarding.show_welcome = lambda: None
+        app._onboarding.show_setup = lambda: None
         app._onboarding.ask_history_enabled = lambda: False
         app._updates.maybe_auto_check = lambda: None
         harness = {
@@ -125,7 +126,17 @@ def app_harness(config_overrides: dict | None = None, *, real_history: bool = Fa
         try:
             yield harness
         finally:
+            from PyQt6.QtCore import QEvent, QTimer
+            from PyQt6.QtWidgets import QApplication
+
+            from sayink.ui.theme import unwatch_system_color_scheme
+
+            unwatch_system_color_scheme()
+            for timer in app.findChildren(QTimer):
+                timer.stop()
             if real_history:
                 app._history.close(timeout=2.0)
             for p in reversed(patches):
                 p.stop()
+            app.deleteLater()
+            QApplication.sendPostedEvents(app, QEvent.Type.DeferredDelete.value)

@@ -31,6 +31,25 @@ class Embedder:
         return vector / norm if norm > 1e-6 else vector
 
 
+def test_embed_failure_logs_one_warning_until_the_throttle_window_passes(caplog):
+    import logging
+
+    class Boom:
+        threshold = 0.55
+
+        def __call__(self, _audio):
+            raise RuntimeError("onnx exploded")
+
+    detector = SpeakerTurnDetector(Boom())
+    audio = voice(1, 0.2)
+    with caplog.at_level(logging.WARNING, logger="SayInk"):
+        assert detector._embed_or_none(audio) is None
+        assert detector._embed_or_none(audio) is None
+    assert [r.message for r in caplog.records if "onnx exploded" in r.message] == [
+        "说话人声纹计算失败，本段暂不判断说话人: onnx exploded"
+    ]
+
+
 def test_one_person_without_pauses_stays_one_turn():
     audio = voice(1, 8)
     result = SpeakerTurnDetector(Embedder())(audio)

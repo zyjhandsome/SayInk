@@ -5,9 +5,8 @@
 > This copy may still contain landing-page / Inter / red-primary defaults from ui-ux-pro-max generation.
 > **2026-10-18 settings review:** Four task groups, explicit output policy, advanced recognition disclosure, selected compact-card outlines and keyboard behavior are specified in the canonical [`../MASTER.md`](../MASTER.md). This archived palette does not override them.
 
-> **LOGIC:** When building a specific page, first check `design-system/pages/[page-name].md`.
-> If that file exists, its rules **override** this Master file.
-> If not, strictly follow the rules below.
+> **LOGIC:** This file is archived. Do not implement the colors or fonts below.
+> The product authority is [`../MASTER.md`](../MASTER.md) and `sayink/ui/design_tokens.py`.
 
 ---
 

@@ -21,13 +21,14 @@ def _runner(overrides=None):
         "git rev-parse": (0, f"{HEAD}\n"),
         "git ls-remote": (0, f"{OTHER}\trefs/tags/v2.2.5\n{HEAD}\trefs/tags/v2.2.5^{{}}\n"),
         "gh run": (0, json.dumps([{"status": "completed", "conclusion": "success"}])),
+        "ruff check": (0, ""),
     }
     responses.update(overrides or {})
     calls = []
 
     def run(cmd):
         calls.append(cmd)
-        key = " ".join(cmd[:2])
+        key = "ruff check" if "ruff" in cmd else " ".join(cmd[:2])
         if key not in responses:
             raise AssertionError(f"unexpected command: {cmd}")
         result = responses[key]
@@ -89,6 +90,17 @@ def test_missing_gh_is_reported_instead_of_crashing():
     problems = release_problems("2.2.5", run=_runner({"gh run": FileNotFoundError("gh")}))
     assert len(problems) == 1
     assert "gh" in problems[0]
+
+
+def test_ruff_findings_block_the_release():
+    problems = release_problems("2.2.5", run=_runner({"ruff check": (1, "sayink/app.py:1:1 F401 unused")}))
+    assert any(p.startswith("ruff check failed:") for p in problems)
+
+
+def test_workspace_passes_ruff():
+    from sayink_build.release_gate import _ruff_problem, _run
+
+    assert _ruff_problem(_run) is None
 
 
 def test_failed_git_command_is_reported():
