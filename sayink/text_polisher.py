@@ -334,6 +334,52 @@ def custom_prompt_or_empty(prompt: str) -> str:
     return "" if custom in (POLISH_PROMPT, CORRECTION_PROMPT) else custom
 
 
+_CODE_APPS = {
+    "code.exe", "cursor.exe", "devenv.exe", "idea64.exe", "pycharm64.exe",
+    "windowsterminal.exe", "cmd.exe", "powershell.exe", "wt.exe", "windowsTerminal.exe",
+}
+_CHAT_APPS = {
+    "wechat.exe", "weixin.exe", "telegram.exe", "discord.exe", "slack.exe",
+    "feishu.exe", "dingtalk.exe", "qq.exe", "tim.exe",
+}
+_DOC_APPS = {
+    "winword.exe", "powerpnt.exe", "excel.exe", "notion.exe", "onenote.exe",
+    "wps.exe", "wpp.exe", "et.exe",
+}
+
+
+def app_context_instruction(target_app: str) -> str:
+    """A short built-in hint for the window the text will be pasted into.
+
+    Empty when the process is unknown. Custom prompts are left untouched;
+    this hint is only appended to the built-in polish / correction prompt.
+    """
+    name = (target_app or "").strip().replace("/", "\\").rsplit("\\", 1)[-1].casefold()
+    if name in {item.casefold() for item in _CODE_APPS}:
+        return (
+            "当前文字会输入到代码或终端：保留英文标识符、驼峰命名和代码符号，"
+            "不要把它们翻译成中文，不要补全或改写代码。"
+        )
+    if name in {item.casefold() for item in _CHAT_APPS}:
+        return "当前文字会输入到聊天软件：保持简短口语，不要改成公文，不要加标题。"
+    if name in {item.casefold() for item in _DOC_APPS}:
+        return "当前文字会输入到文档：整理成通顺书面语，但不要增删事实。"
+    return ""
+
+
+def system_prompt_for(
+    mode: str = LLM_MODE_POLISH,
+    *,
+    custom_prompt: str = "",
+    target_app: str = "",
+) -> str:
+    prompt = build_system_prompt(mode, custom_prompt=custom_prompt)
+    if custom_prompt_or_empty(custom_prompt):
+        return prompt
+    hint = app_context_instruction(target_app)
+    return f"{prompt}\n\n{hint}" if hint else prompt
+
+
 def build_system_prompt(
     mode: str = LLM_MODE_POLISH,
     *,
@@ -501,6 +547,7 @@ class TextPolisher(QObject):
         mode: str = LLM_MODE_POLISH,
         glossary=(),
         context: str = "",
+        target_app: str = "",
     ):
         if not text.strip():
             self.polish_complete.emit(text)
@@ -508,9 +555,10 @@ class TextPolisher(QObject):
 
         self.cancel()
 
-        system_prompt = build_system_prompt(
+        system_prompt = system_prompt_for(
             mode,
             custom_prompt=prompt,
+            target_app=target_app,
         )
         worker = PolishWorker(
             api_url,

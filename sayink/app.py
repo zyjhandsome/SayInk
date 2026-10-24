@@ -109,6 +109,7 @@ RESULT_TOAST_MS = 1700
 RESULT_TOAST_WITH_HINT_MS = 2200
 BAR_REFRESH_AFTER_STOP_MS = 1200
 MEETING_BAR_REFRESH_MS = 1500
+MEETING_IDLE_REMINDER_SEC = 15 * 60
 # One event-loop turn after the bar painted 「录音中」 before opening the device.
 CONTINUOUS_START_DELAY_MS = 50
 QUIT_POLL_MS = 80
@@ -366,6 +367,12 @@ class App(QObject):
             pending_segments=self._pending_segment_count,
             parent=self,
         )
+        self._deferred_audio_settings = False
+        self._meeting_idle_warned = False
+        self._unrecognized_meeting_notice = ""
+        self._meeting_idle_timer = QTimer(self)
+        self._meeting_idle_timer.setInterval(30_000)
+        self._meeting_idle_timer.timeout.connect(self._on_meeting_idle_tick)
 
     def _init_ui(self):
         self._floating = FloatingWindow()
@@ -630,6 +637,67 @@ class App(QObject):
         in_flight = self._is_transcribing or self._output_busy
         return len(self._segment_queue) + (1 if in_flight else 0)
 
+    def _discardable_segment_count(self) -> int:
+        """Segments a settings change will actually drop.
+
+        A live meeting keeps its queue. A sentence already in polish or paste
+        is not cancelled by ``_clear_queued_audio``, so it must not be counted
+        as something the confirmation dialog is about to discard.
+        """
+        if self._meeting_active():
+            return 0
+        pending = len(self._segment_queue)
+        if self._prefetch_segment is not None:
+            pending += 1
+        return pending
+
+    def _recording_blocks_mic_test(self) -> bool:
+        recorder = getattr(self, "_recorder", None)
+        if recorder is None:
+            return False
+        return bool(
+            recorder.is_recording
+            or recorder.is_continuous
+            or self._hold_open_pending
+            or self._meeting_active()
+        )
+
+    def _drop_unrecognized_meeting_audio(self, reason: str) -> int:
+        """Tell the user when draining drops audio because no model can take it."""
+        count = len(self._segment_queue) + (1 if self._prefetch_segment is not None else 0)
+        if count <= 0:
+            return 0
+        log.warning("%s，丢弃 %d 段未识别的会议语音", reason, count)
+        self._clear_queued_audio()
+        detail = (
+            f"语音模型未就绪，会议末尾 {count} 段语音未能识别。"
+            "若已开启录音恢复，可从原始录音找回。"
+        )
+        self._unrecognized_meeting_notice = detail
+        meeting = self._meeting_or_none()
+        if meeting is not None:
+            meeting.notice.emit("会议语音未识别", detail)
+        tray = getattr(self, "_tray", None)
+        show = getattr(tray, "showMessage", None)
+        if callable(show):
+            show("SayInk", detail, QSystemTrayIcon.MessageIcon.Warning, 8000)
+        return count
+
+    def _on_meeting_idle_tick(self) -> None:
+        if not self._meeting_active() or self._meeting.state is not MeetingState.LIVE:
+            return
+        elapsed = self._recorder.seconds_since_last_speech()
+        if not isinstance(elapsed, (int, float)) or elapsed < 60:
+            self._meeting_idle_warned = False
+            return
+        if elapsed < MEETING_IDLE_REMINDER_SEC or self._meeting_idle_warned:
+            return
+        self._meeting_idle_warned = True
+        minutes = max(1, int(elapsed // 60))
+        detail = f"已连续 {minutes} 分钟没有检测到发言。如果会议已经结束，可以点结束。"
+        self._meeting.notice.emit("会议可能已结束", detail)
+        self._tray.showMessage("SayInk", detail, QSystemTrayIcon.MessageIcon.Information, 8000)
+
     def _pipeline_busy(self) -> bool:
         return (self._is_transcribing or self._output_busy or self._prefetch_segment is not None
                 or getattr(self, "_recovery_busy", False))
@@ -691,12 +759,7 @@ class App(QObject):
                 if self._recorder.is_continuous or self._recorder.is_recording:
                     self._recorder.stop_continuous()
                 if self._meeting.state is MeetingState.DRAINING and not self._recognizer.is_ready:
-                    if self._segment_queue:
-                        log.warning(
-                            "模型载入失败，丢弃 %d 段未识别的会议语音",
-                            len(self._segment_queue),
-                        )
-                        self._clear_queued_audio()
+                    self._drop_unrecognized_meeting_audio("模型载入失败")
                     self._refresh_meeting_bar()
                 elif not self._meeting_user_paused:
                     self._meeting.pause("语音模型载入失败 · 请检查模型后在会议页继续或结束")
@@ -1812,6 +1875,7 @@ class App(QObject):
                 self._floating.show_continuous_stopped(f"正在处理剩余内容 · 正在{action}")
             else:
                 self._floating.show_polishing(text, action=action)
+            target_app = pending.target_app if pending is not None else ""
             self._polisher.polish(
                 text,
                 api_url,
@@ -1821,6 +1885,7 @@ class App(QObject):
                 mode=mode,
                 glossary=self._output_glossary,
                 context=self._recent_output_context(),
+                target_app=target_app,
             )
         elif llm_enabled:
             log.warning("文字润色已开启但配置不完整，直接输出原文")
@@ -1847,7 +1912,7 @@ class App(QObject):
             log.warning("会议识别失败: %s", error_msg)
             if not self._recognizer.is_ready and not self._recognizer.is_loading:
                 if self._meeting.state is MeetingState.DRAINING:
-                    self._clear_queued_audio()
+                    self._drop_unrecognized_meeting_audio("会议识别失败")
                 elif not self._meeting_user_paused:
                     self._meeting_capture_pending = False
                     if self._recorder.is_continuous or self._recorder.is_recording:
@@ -2670,16 +2735,21 @@ class App(QObject):
         self._meeting_capture_pending = False
         if self._recorder.is_continuous or self._recorder.is_recording:
             self._recorder.stop_continuous()
-        if self._segment_queue and not self._recognizer.is_ready and not self._recognizer.is_loading:
+        if not self._recognizer.is_ready and not self._recognizer.is_loading:
             # No model will ever come for these; do not wait on them forever.
-            log.warning("模型不可用，丢弃 %d 段未识别的会议语音", len(self._segment_queue))
-            self._clear_queued_audio()
+            self._drop_unrecognized_meeting_audio("模型不可用")
         self._sound.play_stop()
         self._tray.set_activity_tooltip("recognizing" if self._pending_segment_count() else None)
         self._refresh_meeting_bar()
         self._meeting.request_end()
 
     def _on_meeting_state_changed(self, state: MeetingState) -> None:
+        timer = getattr(self, "_meeting_idle_timer", None)
+        if state is MeetingState.LIVE and timer is not None:
+            self._meeting_idle_warned = False
+            timer.start()
+        elif timer is not None:
+            timer.stop()
         if state is MeetingState.DRAINING:
             self._refresh_meeting_bar()
         elif state is MeetingState.ENDED:
@@ -2691,7 +2761,9 @@ class App(QObject):
         log.info("会议 %s 已结束", meeting_id[:8])
         self._tray.set_meeting_in_progress(False)
         self._tray.set_activity_tooltip(None)
-        self._floating.end_meeting_state()
+        dropped = self._unrecognized_meeting_notice
+        self._unrecognized_meeting_notice = ""
+        self._floating.end_meeting_state(dropped)
         # Hand the pipeline back to dictation (segmenter profile included).
         self._recognition_change_pending = False
         self._embedder = None
@@ -2709,7 +2781,13 @@ class App(QObject):
         else:
             job = self._meeting.queued_generation(meeting_id)
             host = self._meeting.remote_host_needing_confirmation() if job is not None and job.automatic else ""
-            if not host:
+            if dropped:
+                # The generic "meeting ended" balloon would replace this, and
+                # it is the only notice that the last audio was not transcribed.
+                self._tray.showMessage(
+                    "SayInk", dropped, QSystemTrayIcon.MessageIcon.Warning, 8000,
+                )
+            elif not host:
                 # An unconfirmed host is refused as soon as the queue runs,
                 # and that failure already tells the user. Don't claim the
                 # minutes have started.
@@ -2848,7 +2926,8 @@ class App(QObject):
                 meeting_page.resume_requested.connect(self.resume_meeting_capture)
                 meeting_page.aux_models_changed.connect(self._on_models_changed)
             settings = self._main.settings_panel
-            settings.set_pending_segment_counter(self._pending_segment_count)
+            settings.set_pending_segment_counter(self._discardable_segment_count)
+            settings.set_recording_busy_checker(self._recording_blocks_mic_test)
             settings.hotkey_updated.connect(self._on_hotkey_updated)
             settings.settings_changed.connect(self._on_settings_changed)
             settings.audio_options_changed.connect(self._apply_audio_options)
@@ -2949,24 +3028,39 @@ class App(QObject):
         self._update_tray_models()
 
     def _apply_pending_recognition_settings(self) -> None:
-        if not self._recognition_change_pending:
+        if self._recognition_change_pending:
+            # Queued audio normally waits for the current model to finish it. When
+            # that model failed to load, the queue waits for *a* model and the
+            # change waits for the queue: let the new model through, it is the
+            # only thing that can drain the queue.
+            queue_blocks = bool(self._segment_queue) and (
+                self._recognizer.is_ready or self._recognizer.is_loading
+            )
+            blocked = (self._meeting_active() or self._recorder.is_recording or self._hold_open_pending
+                       or self._pipeline_busy() or queue_blocks)
+            if not blocked:
+                self._recognition_change_pending = False
+                self._embedder = None
+                self._apply_dictation_segmenter_profile()
+                self._speaker_embedder()
+                self._configure_stt()
+                self._sync_recognition_runtime_status()
+        self._apply_deferred_audio_settings()
+
+    def _apply_deferred_audio_settings(self) -> None:
+        """Finish a settings save that arrived while hold-to-talk was open.
+
+        The utterance already being recorded keeps the segmenter it started
+        with. The new device / model applies once that utterance has left
+        the queue, and it is not discarded.
+        """
+        if not getattr(self, "_deferred_audio_settings", False):
             return
-        # Queued audio normally waits for the current model to finish it. When
-        # that model failed to load, the queue waits for *a* model and the
-        # change waits for the queue: let the new model through, it is the
-        # only thing that can drain the queue.
-        queue_blocks = bool(self._segment_queue) and (
-            self._recognizer.is_ready or self._recognizer.is_loading
-        )
         if (self._meeting_active() or self._recorder.is_recording or self._hold_open_pending
-                or self._pipeline_busy() or queue_blocks):
+                or self._pipeline_busy() or self._segment_queue):
             return
-        self._recognition_change_pending = False
-        self._embedder = None
-        self._apply_dictation_segmenter_profile()
-        self._speaker_embedder()
-        self._configure_stt()
-        self._sync_recognition_runtime_status()
+        self._deferred_audio_settings = False
+        self._commit_audio_settings(clear_queue=False)
 
     def _on_recognition_settings_changed(self):
         """Glossary / language / VAD changed: same handling as a model change
@@ -3019,23 +3113,35 @@ class App(QObject):
             # The meeting keeps its device, model and queue; audio / engine
             # changes apply when it ends (_on_meeting_ended reconfigures).
             log.info("会议进行中，音频与引擎设置将在会议结束后生效")
-            self._sound.enabled = self._config.get("sound_enabled", True)
-            self._tray.set_auto_start(self._config.get("auto_start", False))
+            self._apply_immediate_preferences()
             set_models_dir(self._config.models_dir)
             self._update_tray_models()
-            self._paster.restore_clipboard = self._config.get("output.restore_clipboard", False)
             return
-        if self._segment_queue:
-            log.warning("设置已保存，丢弃 %d 段待识别语音", len(self._segment_queue))
-        self._clear_queued_audio()
-        was_continuous = self._recorder.is_continuous
-        if was_continuous:
-            self._stop_continuous_listening()
+        if self._recorder.is_recording or self._hold_open_pending:
+            # Rebuilding the segmenter under an open hold resets the audio
+            # anchor mid-sentence. Keep this utterance, apply once it is done.
+            log.info("单次录音进行中，音频与引擎设置将在本次录音结束后生效")
+            self._deferred_audio_settings = True
+            self._apply_immediate_preferences()
+            return
+        self._commit_audio_settings(clear_queue=True)
 
-        self._continuous_user_stopped = False
-        self._keep_unsaved_continuous_text = False
+    def _apply_immediate_preferences(self) -> None:
         self._sound.enabled = self._config.get("sound_enabled", True)
         self._tray.set_auto_start(self._config.get("auto_start", False))
+        self._paster.restore_clipboard = self._config.get("output.restore_clipboard", False)
+
+    def _commit_audio_settings(self, *, clear_queue: bool) -> None:
+        if clear_queue:
+            if self._segment_queue:
+                log.warning("设置已保存，丢弃 %d 段待识别语音", len(self._segment_queue))
+            self._clear_queued_audio()
+            was_continuous = self._recorder.is_continuous
+            if was_continuous:
+                self._stop_continuous_listening()
+            self._continuous_user_stopped = False
+            self._keep_unsaved_continuous_text = False
+        self._apply_immediate_preferences()
         # A trigger-mode click used to re-open the recognizer, rescan every
         # audio device and restyle the window. Only the pieces that changed
         # are applied; theme has its own signal.
@@ -3045,9 +3151,6 @@ class App(QObject):
             set_models_dir(self._config.models_dir)
             self._configure_stt()
             self._update_tray_models()
-        self._paster.restore_clipboard = self._config.get(
-            "output.restore_clipboard", False
-        )
         self._sync_hotkey_trigger_mode()
 
     def _show_audio_recovery(self):

@@ -118,6 +118,7 @@ class SettingsWindow(QWidget):
         super().__init__(parent)
         self._config = config
         self._pending_segment_count = pending_segment_count
+        self._recording_busy = None
         self._model_cards: dict[str, ModelCard] = {}
         self._dl_workers: dict[str, object] = {}
         self._download_threads: list[QThread] = []
@@ -1474,8 +1475,16 @@ class SettingsWindow(QWidget):
         except TypeError:
             pass
 
+    def set_recording_busy_checker(self, checker) -> None:
+        """``checker()`` is true while dictation or a meeting already owns the device."""
+        self._recording_busy = checker
+
     def _run_mic_probe(self):
         if self._mic_probe_active or self._mic_test_recorder.is_recording:
+            return
+        busy = self._recording_busy
+        if callable(busy) and busy():
+            self._set_mic_test_status("请先暂停或结束当前录音或会议，再测试声音。")
             return
         if self._mic_device_combo.count() <= 1 or self._system_device_combo.count() <= 1:
             self._refresh_audio_device_lists()

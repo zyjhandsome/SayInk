@@ -468,7 +468,7 @@ class FloatingWindow(QWidget):
         self._apply_excerpt(detail or "采集已暂停，可在会议页继续或结束")
         self._present()
 
-    def end_meeting_state(self) -> None:
+    def end_meeting_state(self, detail: str = "") -> None:
         self._meeting_active = False
         self._meeting_paused_detail = ""
         self._listening_active = False
@@ -476,7 +476,7 @@ class FloatingWindow(QWidget):
         self.set_esc_stops_continuous(self._esc_stops_continuous)
         self._mark_btn.hide()
         self._live_text = ""
-        self.show_success("会议已结束", "可到「会议」页生成纪要")
+        self.show_success("会议已结束", detail or "可到「会议」页生成纪要")
 
     def _set_state(self, text: str, color: str, pulse: bool = False):
         self._state_token = color

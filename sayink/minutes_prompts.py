@@ -176,6 +176,36 @@ def format_timestamp(ms: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def format_srt_timestamp(ms: int) -> str:
+    ms = max(0, int(ms))
+    total_s, milli = divmod(ms, 1000)
+    hours, rem = divmod(total_s, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milli:03d}"
+
+
+def render_srt(lines: Sequence[TranscriptLine], names: dict[int, str] | None = None) -> str:
+    """SubRip cues from transcript lines. End time uses duration, else the next cue."""
+    usable = [line for line in lines if (line.text or "").strip()]
+    blocks = []
+    for index, line in enumerate(usable):
+        start = max(0, int(line.offset_ms))
+        duration = max(0, int(line.duration_ms or 0))
+        if duration > 0:
+            end = start + duration
+        elif index + 1 < len(usable):
+            end = max(start + 1000, int(usable[index + 1].offset_ms))
+        else:
+            end = start + 3000
+        if end <= start:
+            end = start + 1000
+        body = f"{speaker_label(line.speaker_id, names)}：{line.text.strip()}"
+        blocks.append(
+            f"{index + 1}\n{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n{body}"
+        )
+    return ("\n\n".join(blocks) + "\n") if blocks else ""
+
+
 _TS_RE = re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})$")
 
 
@@ -217,6 +247,7 @@ class TranscriptLine:
     speaker_id: int
     text: str
     route: str = ""
+    duration_ms: int = 0
 
     def render(self, names: dict[int, str] | None = None) -> str:
         return f"[{format_timestamp(self.offset_ms)}] {speaker_label(self.speaker_id, names)}：{self.text}"
@@ -239,6 +270,7 @@ def transcript_lines(
                 speaker_id=int(seg.speaker_id),
                 text=text,
                 route=seg.speaker_route or "",
+                duration_ms=max(0, int(seg.duration_ms or 0)),
             )
         )
     return lines

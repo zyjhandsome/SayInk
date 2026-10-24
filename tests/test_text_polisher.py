@@ -118,6 +118,17 @@ class TestPolishPromptOnly:
         prompt = build_system_prompt(LLM_MODE_POLISH, custom_prompt="")
         assert prompt == POLISH_PROMPT
 
+    def test_built_in_prompt_mentions_the_target_app(self):
+        from sayink.text_polisher import LLM_MODE_POLISH, app_context_instruction, system_prompt_for
+
+        assert "标识符" in app_context_instruction(r"C:\Program Files\cursor.exe")
+        assert app_context_instruction("notepad.exe") == ""
+        prompted = system_prompt_for(LLM_MODE_POLISH, target_app="WINWORD.EXE")
+        assert prompted.startswith(POLISH_PROMPT)
+        assert "书面语" in prompted
+        custom = system_prompt_for(LLM_MODE_POLISH, custom_prompt="只改标点", target_app="Code.exe")
+        assert custom == "只改标点"
+
     def test_translate_mode_constant_removed(self):
         import sayink.text_polisher as tp
 

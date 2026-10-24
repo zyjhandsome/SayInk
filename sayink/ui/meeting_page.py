@@ -907,6 +907,24 @@ class _CurrentPageStack(QStackedWidget):
         return super().event(event)
 
 
+def _export_kind(path: str, selected: str) -> str:
+    chosen = selected or ""
+    lower = path.lower()
+    if chosen.startswith("SRT") or lower.endswith(".srt"):
+        return "srt"
+    if chosen.startswith("纯文本") or lower.endswith(".txt"):
+        return "txt"
+    return "md"
+
+
+def _with_export_suffix(path: str, kind: str) -> str:
+    suffix = {"md": ".md", "txt": ".txt", "srt": ".srt"}[kind]
+    target = Path(path)
+    if target.suffix.lower() == suffix:
+        return str(target)
+    return str(target.with_suffix(suffix))
+
+
 class MeetingPage(QWidget):
     start_requested = pyqtSignal(object)   # MeetingOptions
     end_requested = pyqtSignal()
@@ -2730,11 +2748,28 @@ class MeetingPage(QWidget):
             return
         label = {"notes": self._result_label(), "transcript": "文字稿", "all": "完整会议记录"}[scope]
         default = f"{safe_filename(record.display_title)}-{label}-{time.strftime('%Y%m%d', time.localtime(record.started_at / 1000))}.md"
-        path, _filter = QFileDialog.getSaveFileName(self, "导出" + label, default, "Markdown (*.md)")
+        path, selected = QFileDialog.getSaveFileName(
+            self, "导出" + label, default,
+            "Markdown (*.md);;纯文本 (*.txt);;SRT 字幕 (*.srt)",
+        )
         if not path:
             return
+        kind = _export_kind(path, selected)
+        path = _with_export_suffix(path, kind)
         try:
-            if scope == "transcript":
+            if kind == "srt":
+                text = self._ctrl.export_transcript_srt(record.id)
+            elif kind == "txt":
+                if scope == "notes":
+                    text = self._current_notes_text()
+                elif scope == "transcript":
+                    text = self._ctrl.transcript_text(record.id)
+                else:
+                    notes = self._current_notes_text().rstrip()
+                    text = (notes + "\n\n" if notes else "") + self._ctrl.transcript_text(record.id)
+                    if text and not text.endswith("\n"):
+                        text += "\n"
+            elif scope == "transcript":
                 text = self._ctrl.export_transcript_markdown(record.id)
             elif scope == "notes":
                 text = self._current_notes_text()
@@ -2750,7 +2785,10 @@ class MeetingPage(QWidget):
         except OSError as exc:
             QMessageBox.critical(self, "导出失败", f"无法写入文件：{exc}")
             return
-        self._set_status("已导出" + label + ("（包含当前草稿）" if self._editing_notes and scope != "transcript" else ""))
+        if kind == "srt":
+            self._set_status("已导出文字稿字幕")
+        else:
+            self._set_status("已导出" + label + ("（包含当前草稿）" if self._editing_notes and scope != "transcript" else ""))
 
     def _delete(self) -> None:
         record = self._store.get_meeting(self._detail_id) if self._detail_id else None

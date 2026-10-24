@@ -31,7 +31,18 @@ _CN_DIGITS = {
 }
 _CN_UNITS = {"十": 10, "百": 100, "千": 1000}
 _CN_BIG_UNITS = {"万": 10_000, "亿": 100_000_000}
-_CN_NUMERAL_RE = re.compile(r"[一二两三四五六七八九十][零〇一二两三四五六七八九十百千万亿]*")
+# A numeral may contain an arabic chunk (一亿零500万). It still has to start
+# with a Chinese digit so version numbers and plain 100万 stay out of this pass.
+_CN_NUMERAL_RE = re.compile(
+    r"[一二两三四五六七八九十][零〇一二两三四五六七八九十百千万亿\d.]*"
+)
+_CN_DECIMAL_RE = re.compile(
+    r"([零〇一二两三四五六七八九十百千万亿两]+)点([零〇一二三四五六七八九]+)"
+)
+# The amount has to start at a token boundary: 1.5亿 must not be read as 5亿.
+_SCALED_PAIR_RE = re.compile(r"(?<![\d.])(\d+)亿(\d+)万")
+_SCALED_ARABIC_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)(万|亿)")
+_SIGNED_NUMBER_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
 _REPEATED_NEGATION_RE = re.compile(r"([不没别未无非勿莫])\1+")
 # Spoken filler a polish is allowed to drop; the compression guard measures
 # the raw text without it so a cleaned-up ramble is not mistaken for a summary.
@@ -42,8 +53,31 @@ _ANSWER_PREFIX_RE = re.compile(r"^(?:好的|好啊|以下是|当然可以|当然
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
+def _format_counted(value: float | int) -> str:
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return format(value, "f").rstrip("0").rstrip(".")
+    return str(value)
+
+
+def _read_arabic_chunk(numeral: str, index: int) -> tuple[float | int, int]:
+    end = index + 1
+    while end < len(numeral) and (numeral[end].isdigit() or numeral[end] == "."):
+        end += 1
+    raw = numeral[index:end]
+    if raw.count(".") > 1 or raw in {".", ""}:
+        raise ValueError(raw)
+    number: float | int = float(raw) if "." in raw else int(raw)
+    return number, end
+
+
 def _cn_numeral_to_arabic(numeral: str) -> str:
-    """两千五百 → 2500; 一三八零零 → 13800; 三四 → "3 4" (an approximate range)."""
+    """两千五百 → 2500; 一三八零零 → 13800; 三四 → "3 4" (an approximate range).
+
+    万/亿 add the current section. They must not multiply everything already
+    accumulated: 一亿五千万 is 150000000, not 1亿 times another 万.
+    """
     if all(ch in _CN_DIGITS for ch in numeral):
         digits = [_CN_DIGITS[ch] for ch in numeral]
         if len(digits) == 2 and 0 not in digits and abs(digits[0] - digits[1]) == 1:
@@ -51,24 +85,56 @@ def _cn_numeral_to_arabic(numeral: str) -> str:
         return "".join(str(d) for d in digits)
     total = 0
     section = 0
-    number = 0
-    for ch in numeral:
+    number: float | int = 0
+    number_set = False
+    index = 0
+    while index < len(numeral):
+        ch = numeral[index]
+        if ch.isdigit() or ch == ".":
+            try:
+                number, index = _read_arabic_chunk(numeral, index)
+            except ValueError:
+                return numeral
+            number_set = True
+            continue
         if ch in _CN_DIGITS:
             number = _CN_DIGITS[ch]
-        elif ch in _CN_UNITS:
-            section += (number or 1) * _CN_UNITS[ch]
+            number_set = True
+            index += 1
+            continue
+        if ch in _CN_UNITS:
+            section += (number if number_set else 1) * _CN_UNITS[ch]
             number = 0
-        else:
-            total = (total + section + number) * _CN_BIG_UNITS[ch]
+            number_set = False
+            index += 1
+            continue
+        if ch in _CN_BIG_UNITS:
+            total += (section + (number if number_set else 0)) * _CN_BIG_UNITS[ch]
             section = 0
             number = 0
-    if number and len(numeral) > 1:
+            number_set = False
+            index += 1
+            continue
+        return numeral
+    if number and len(numeral) > 1 and numeral[-1] in _CN_DIGITS:
         # Colloquial 三万五 / 两千五: the trailing digit takes the next unit down.
         before = numeral[-2]
         unit = _CN_UNITS.get(before) or _CN_BIG_UNITS.get(before) or 0
         if unit >= 100:
             number *= unit // 10
-    return str(total + section + number)
+    return _format_counted(total + section + number)
+
+
+def _cn_decimal_replace(match: re.Match) -> str:
+    whole = _cn_numeral_to_arabic(match.group(1))
+    if not re.fullmatch(r"\d+", whole):
+        return match.group(0)
+    frac = []
+    for ch in match.group(2):
+        if ch not in _CN_DIGITS:
+            return match.group(0)
+        frac.append(str(_CN_DIGITS[ch]))
+    return f"{int(whole)}.{''.join(frac)}"
 
 
 def _normalize_cn_numerals(text: str) -> str:
@@ -80,18 +146,57 @@ def _normalize_cn_numerals(text: str) -> str:
             return numeral
         return f" {_cn_numeral_to_arabic(numeral)} "
 
+    text = _CN_DECIMAL_RE.sub(_cn_decimal_replace, text)
     return _CN_NUMERAL_RE.sub(_replace, text)
+
+
+def _expand_cn_scales(text: str) -> str:
+    """15000万 / 1.5亿 / 1亿2000万 → the same integer a Chinese numeral becomes."""
+
+    def _pair(match: re.Match) -> str:
+        value = int(match.group(1)) * 100_000_000 + int(match.group(2)) * 10_000
+        return f" {value} "
+
+    def _one(match: re.Match) -> str:
+        scale = 10_000 if match.group(2) == "万" else 100_000_000
+        value = float(match.group(1)) * scale
+        # Keep a separator so 1.5亿2000万 stays two amounts, not one glued integer.
+        return f" {_format_counted(value)} "
+
+    return _SCALED_ARABIC_RE.sub(_one, _SCALED_PAIR_RE.sub(_pair, text))
+
+
+def _prepare_number_text(text: str) -> str:
+    return _expand_cn_scales(_normalize_cn_numerals(_THOUSANDS_SEP_RE.sub("", text or "")))
+
+
+def _canonical_number(match: str) -> str:
+    sign = ""
+    body = match
+    if body[:1] in "+-":
+        sign = "-" if body[0] == "-" else ""
+        body = body[1:]
+    whole, _, frac = body.partition(".")
+    frac = frac.rstrip("0")
+    whole = whole.lstrip("0") or "0"
+    return sign + whole + (f".{frac}" if frac else "")
 
 
 def _number_sequence(text: str) -> list[str]:
     """Numbers in the order they appear, after Chinese-numeral normalization."""
-    values = []
-    text = _normalize_cn_numerals(_THOUSANDS_SEP_RE.sub("", text))
-    for match in _NUMBER_RE.findall(text):
-        whole, _, frac = match.partition(".")
-        value = (whole.lstrip("0") or "0") + (f".{frac.rstrip('0')}" if frac.rstrip("0") else "")
-        values.append(value)
-    return values
+    prepared = _prepare_number_text(text)
+    return [_canonical_number(match) for match in _NUMBER_RE.findall(prepared)]
+
+
+def normalized_number_tokens(text: str) -> list[str]:
+    """Same normalization as the polish guard, keeping a leading minus.
+
+    Refinement compares these so 二十万 and 20万 are one fact, while -10 and
+    10 are not. The polish guard itself still ignores a bare sign: a range
+    written 3-5 must not look like a negated 5.
+    """
+    prepared = _prepare_number_text(text)
+    return [_canonical_number(match) for match in _SIGNED_NUMBER_RE.findall(prepared)]
 
 
 def _numbers(text: str) -> set[str]:

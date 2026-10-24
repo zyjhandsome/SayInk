@@ -15,6 +15,7 @@ from sayink.ui.history_window import (
     HistoryWindow,
     build_batch_export_markdown,
     build_single_session_markdown,
+    build_single_session_plain,
     suggest_batch_export_filename,
     suggest_single_export_filename,
 )
@@ -1077,6 +1078,9 @@ def test_single_export_markdown_frontmatter_and_effective_text_by_seq():
     assert "model: fire-red" in markdown
     assert "segment_count: 2" in markdown
     assert markdown.index("first raw") < markdown.index("second polished") < markdown.index("third polished")
+    plain = build_single_session_plain(session, segments)
+    assert "---" not in plain
+    assert plain.index("first raw") < plain.index("second polished") < plain.index("third polished")
     assert "second raw" not in markdown
 
 

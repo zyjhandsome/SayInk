@@ -15,7 +15,13 @@ from sayink.ui.flow_layout import PairedToolBar
 from sayink.history_store import HistoryStore, SegmentRecord
 from sayink.meeting_session import MeetingController, MeetingOptions, MeetingState, resolve_capabilities
 from sayink.meeting_store import MeetingStore
-from sayink.ui.meeting_page import MeetingPage, _SegmentTextDialog, notes_for_display
+from sayink.ui.meeting_page import (
+    MeetingPage,
+    _SegmentTextDialog,
+    _export_kind,
+    _with_export_suffix,
+    notes_for_display,
+)
 
 
 @pytest.fixture
@@ -267,6 +273,31 @@ def test_transcript_copy_is_disabled_for_empty_meeting(meeting):
     page.show_meeting(empty.id)
     page._tab_transcript.click()
     assert page._transcript_copy_btn.isVisible() and not page._transcript_copy_btn.isEnabled()
+
+
+def test_export_kind_follows_filter_and_rewrites_the_suffix():
+    assert _export_kind(r"C:\tmp\notes.md", "SRT 字幕 (*.srt)") == "srt"
+    assert _export_kind(r"C:\tmp\talk.srt", "Markdown (*.md)") == "srt"
+    assert _export_kind(r"C:\tmp\talk.txt", "") == "txt"
+    assert _export_kind(r"C:\tmp\talk.md", "Markdown (*.md)") == "md"
+    assert _with_export_suffix(r"C:\tmp\talk.md", "srt").endswith(".srt")
+    assert _with_export_suffix(r"C:\tmp\talk.SRT", "srt").endswith(".SRT")
+
+
+def test_srt_export_writes_transcript_cues(meeting, monkeypatch, tmp_path):
+    page, _controller, _history, _record = meeting
+    out = tmp_path / "talk.md"
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName",
+        lambda *_args, path=out: (str(path), "SRT 字幕 (*.srt)"),
+    )
+    page._export("notes")
+    written = tmp_path / "talk.srt"
+    text = written.read_text(encoding="utf-8")
+    assert "-->" in text
+    assert "采用方案 A" in text
+    assert "当前草稿" not in text
+    assert page._status_label.text() == "已导出文字稿字幕" or "字幕" in page._status_label.text()
 
 
 def test_draft_copy_and_export_use_unsaved_text_without_saving_it(meeting, monkeypatch, tmp_path):

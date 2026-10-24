@@ -86,6 +86,8 @@ class OnboardingController(QObject):
         self._probe_peak = 0.0
         self._trial_audio = None
         self._trial_worker = None
+        self._download_worker = None
+        self._mic_heard = False
 
     # ── Scheduling ─────────────────────────────────────
 
@@ -233,19 +235,27 @@ class OnboardingController(QObject):
             return
         self._finish_setup()
 
+    def _recognizer_ready(self) -> bool:
+        speech = getattr(self.parent(), "_recognizer", None)
+        return bool(getattr(speech, "_is_ready", False))
+
+    def _trial_ready(self) -> bool:
+        return bool(self._model_installed() and self._recognizer_ready())
+
     def note_mic_level(self, level: float) -> None:
         dialog = self._setup_dialog
         if dialog is None:
             return
-        heard = float(level) >= _MIC_HEARD_THRESHOLD
-        if heard:
+        self._mic_heard = float(level) >= _MIC_HEARD_THRESHOLD
+        if self._mic_heard and self._trial_ready():
             dialog.mic_status.setText("已听到声音。可以试说一句。")
-            dialog.trial_btn.setEnabled(True)
+        elif self._mic_heard:
+            dialog.mic_status.setText("已听到声音。模型载入完成后可以试说一句。")
         else:
             dialog.mic_status.setText("没有听到声音。可以重试，或稍后继续。")
-            dialog.trial_btn.setEnabled(False)
         dialog.mic_btn.setEnabled(True)
         dialog.close_btn.setEnabled(True)
+        dialog.trial_btn.setEnabled(bool(self._mic_heard and self._trial_ready() and not self._setup_mode))
 
     def submit_trial(self, text: str) -> None:
         dialog = self._setup_dialog
@@ -297,7 +307,11 @@ class OnboardingController(QObject):
         dialog = self._setup_dialog
         if dialog is None or self._setup_mode:
             return
-        dialog.mic_btn.setEnabled(bool(self._model_installed()))
+        dialog.mic_btn.setEnabled(self._setup_mode != "probe")
+        dialog.trial_btn.setEnabled(bool(self._mic_heard and self._trial_ready() and not self._setup_mode))
+        if self._model_installed() and not self._recognizer_ready() and self._download_worker is None:
+            dialog.download_btn.setText("模型正在载入…")
+            dialog.download_btn.setEnabled(False)
 
     def _finish_setup(self) -> None:
         if self._setup_closed:
@@ -319,9 +333,6 @@ class OnboardingController(QObject):
         dialog = self._setup_dialog
         if dialog is None:
             return
-        if not self._model_installed():
-            dialog.mic_status.setText("请先下载模型，再测试麦克风。")
-            return
         if not self._begin_setup_capture("probe"):
             return
         dialog.mic_status.setText("正在听…请对着麦克风说一句话。")
@@ -334,6 +345,9 @@ class OnboardingController(QObject):
             return
         if not self._model_installed():
             dialog.trial_result.setText("请先下载模型，再试说一句。")
+            return
+        if not self._recognizer_ready():
+            dialog.trial_result.setText("模型正在载入内存，请稍候…")
             return
         if not self._begin_setup_capture("trial"):
             return
@@ -472,8 +486,58 @@ class OnboardingController(QObject):
             return
         dialog.trial_result.setText(f"试说没有完成。{message} 可以再试一次，或稍后继续。".strip())
 
+    def _start_inline_model_download(self) -> None:
+        dialog = self._setup_dialog
+        if dialog is None or self._download_worker is not None:
+            return
+        from sayink.speech_recognizer import DEFAULT_MODEL_ID, ModelDownloadWorker
+
+        model_id = self._config.get("stt.model_id", "") or DEFAULT_MODEL_ID
+        worker = ModelDownloadWorker(
+            model_id,
+            source=self._config.get("stt.download_source", "auto"),
+        )
+        self._download_worker = worker
+        dialog.download_btn.setEnabled(False)
+        dialog.download_btn.setText("正在下载… 0%")
+        worker.progress.connect(self._on_setup_download_progress)
+        worker.finished_ok.connect(self._on_setup_download_done)
+        worker.error.connect(self._on_setup_download_error)
+        worker.start()
+
+    def _on_setup_download_progress(self, pct: int) -> None:
+        dialog = self._setup_dialog
+        if dialog is None:
+            return
+        dialog.download_btn.setText(f"正在下载… {int(pct)}%")
+
+    def _on_setup_download_done(self, model_id: str) -> None:
+        self._download_worker = None
+        self._config.set("stt.model_id", model_id)
+        dialog = self._setup_dialog
+        if dialog is not None:
+            dialog.download_btn.setText("模型已下载，正在载入…")
+            dialog.download_btn.setEnabled(False)
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_on_models_changed"):
+            parent._on_models_changed()
+        self._refresh_setup_steps()
+
+    def _on_setup_download_error(self, message: str) -> None:
+        self._download_worker = None
+        dialog = self._setup_dialog
+        if dialog is None:
+            return
+        dialog.download_btn.setEnabled(True)
+        dialog.download_btn.setText("下载模型")
+        dialog.mic_status.setText(f"模型下载没有完成。{message} 可以重试，或稍后继续。".strip())
+
     def _stop_setup_audio(self) -> None:
         self._setup_mode = ""
+        download = self._download_worker
+        if download is not None and hasattr(download, "cancel"):
+            download.cancel()
+        self._download_worker = None
         worker = self._trial_worker
         if worker is not None and worker.isRunning():
             worker.cancel()
@@ -535,18 +599,23 @@ class _SetupDialog(QDialog):
         self.download_btn.setStyleSheet(ss.BTN_PRIMARY)
         self.download_btn.setDefault(True)
         self.download_btn.setAutoDefault(True)
-        self.download_btn.clicked.connect(controller._open_engine_from_setup)
+        self.download_btn.clicked.connect(controller._start_inline_model_download)
         layout.addWidget(self.download_btn)
+        self.engine_btn = QPushButton("在引擎页查看其他模型")
+        self.engine_btn.setAccessibleName("在引擎页查看其他模型")
+        self.engine_btn.setStyleSheet(ss.BTN_GHOST)
+        self.engine_btn.clicked.connect(controller._open_engine_from_setup)
+        layout.addWidget(self.engine_btn)
 
         mic_step = QLabel("2. 测试麦克风")
         layout.addWidget(mic_step)
         self.mic_btn = QPushButton("测试麦克风")
         self.mic_btn.setAccessibleName("测试麦克风")
         self.mic_btn.setStyleSheet(ss.BTN_GHOST)
-        self.mic_btn.setEnabled(bool(controller._model_installed()))
+        self.mic_btn.setEnabled(True)
         self.mic_btn.clicked.connect(controller._start_setup_mic_test)
         layout.addWidget(self.mic_btn)
-        self.mic_status = QLabel("下载模型后可以测试麦克风。")
+        self.mic_status = QLabel("可以先测试麦克风，不必等模型下载完。")
         self.mic_status.setObjectName("setupMicStatus")
         self.mic_status.setAccessibleName("麦克风测试状态")
         self.mic_status.setWordWrap(True)

@@ -52,6 +52,7 @@ from sayink.minutes_prompts import (
     find_template,
     format_timestamp,
     get_template,
+    render_srt,
     speaker_label,
     transcript_lines,
 )
@@ -704,6 +705,13 @@ class MeetingController(QObject):
             return ""
         names = self.speaker_names(meeting_id)
         return "\n".join(line.render(names) for line in transcript_lines(self._store.get_segments(meeting_id), record.started_at))
+
+    def export_transcript_srt(self, meeting_id: str) -> str:
+        record = self._store.get_meeting(meeting_id)
+        if record is None:
+            return ""
+        lines = transcript_lines(self._store.get_segments(meeting_id), record.started_at)
+        return render_srt(lines, self.speaker_names(meeting_id))
 
     def export_transcript_markdown(self, meeting_id: str) -> str:
         record = self._store.get_meeting(meeting_id)

@@ -136,6 +136,12 @@ class AudioRecorder(QObject):
         self._last_overflow_warning = float("-inf")
         self._suppress_empty_finished = False
 
+    def seconds_since_last_speech(self) -> float | None:
+        """How long the open stream has been without speech, or None if idle."""
+        if not self._is_recording or self._last_speech_at <= 0:
+            return None
+        return max(0.0, time.monotonic() - self._last_speech_at)
+
     def _warn_overflow(self, role):
         now = time.monotonic()
         if now - self._last_overflow_warning >= 5:

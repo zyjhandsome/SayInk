@@ -532,6 +532,31 @@ def test_replacing_legacy_file_key_removes_plaintext_even_if_store_fails(config_
     assert _key_on_disk(config_home) == ""
 
 
+def test_missing_secret_store_keeps_a_new_key_in_memory_only(config_home):
+    from sayink.config import Config
+
+    cfg = Config(config_dir=config_home, file_secrets=False)
+    cfg.set("llm.api_key", "sk-plaintext")
+    cfg.save_immediate()
+
+    assert cfg.get("llm.api_key") == "sk-plaintext"
+    assert cfg.secret_persist_failed is True
+    assert _key_on_disk(config_home) == ""
+    assert "sk-plaintext" not in (config_home / "config.json").read_text(encoding="utf-8")
+
+
+def test_missing_secret_store_scrubs_a_legacy_file_key(config_home):
+    from sayink.config import Config
+
+    _write_config(config_home, {"llm": {"api_key": "sk-file"}})
+    cfg = Config(config_dir=config_home, file_secrets=False)
+
+    assert cfg.get("llm.api_key") == "sk-file"
+    assert cfg.secret_persist_failed is True
+    assert _key_on_disk(config_home) == ""
+    assert "sk-file" not in (config_home / "config.json").read_text(encoding="utf-8")
+
+
 def test_isolated_config_dir_does_not_use_credential_store(config_home, monkeypatch):
     from sayink.config import Config
 

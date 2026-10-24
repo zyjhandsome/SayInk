@@ -11,6 +11,7 @@ from unittest.mock import patch
 import numpy as np
 from PyQt6.QtCore import QCoreApplication
 
+from sayink.app import _QueuedSegment
 from sayink.audio_utils import TARGET_SAMPLE_RATE
 from sayink.meeting_session import MeetingOptions, MeetingState
 from tests.helpers.app_harness import app_harness
@@ -589,3 +590,34 @@ def test_meeting_keeps_text_only_no_audio_or_voiceprint_on_disk(tmp_path, monkey
         assert sorted(p.name for p in data_dir.rglob("*") if p.is_file()) == sorted(
             p.name for p in data_dir.glob("history.db*"))
         assert list(scratch.iterdir()) == []
+
+
+def test_long_meeting_silence_reminds_once_until_speech_returns():
+    with app_harness({"audio.trigger_mode": "hotkey"}) as h:
+        app = h["app"]
+        _start(app, h)
+        h["recorder"].seconds_since_last_speech.return_value = 15 * 60 + 5
+        app._on_meeting_idle_tick()
+        app._on_meeting_idle_tick()
+        assert h["tray"].showMessage.call_count == 1
+        assert "结束" in h["tray"].showMessage.call_args.args[1]
+        h["recorder"].seconds_since_last_speech.return_value = 10
+        app._on_meeting_idle_tick()
+        h["recorder"].seconds_since_last_speech.return_value = 16 * 60
+        app._on_meeting_idle_tick()
+        assert h["tray"].showMessage.call_count == 2
+
+
+def test_ending_without_a_model_reports_the_dropped_audio():
+    with app_harness({"audio.trigger_mode": "hotkey"}) as h:
+        app = h["app"]
+        _start(app, h)
+        clip = np.zeros(1600, dtype=np.float32)
+        app._segment_queue = [_QueuedSegment(audio=clip)]
+        app._prefetch_segment = _QueuedSegment(audio=clip)
+        h["recognizer"].is_ready = False
+        h["recognizer"].is_loading = False
+        app._end_meeting()
+        assert app._segment_queue == []
+        assert app._prefetch_segment is None
+        assert "2 段" in h["tray"].showMessage.call_args.args[1]

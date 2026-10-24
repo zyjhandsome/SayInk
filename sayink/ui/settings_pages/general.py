@@ -385,7 +385,9 @@ def build_recognition_section(win) -> QWidget:
     win._meeting_glossary_edit.textChanged.connect(win._on_meeting_glossary_changed)
     lay.addWidget(stacked_field_row(
         "自定义词汇", win._meeting_glossary_edit,
-        "帮助识别专有名词；最多 50 条，每条不超过 20 字。「词=误写1、误写2」会把常被听错的写法直接改回来",
+        "帮助识别专有名词；建议 10–15 条，最多 50 条，每条不超过 20 字。"
+        "普通同音误写优先写「正确词=常见误写」，这种替换不改变解码。"
+        "纯热词过多可能让整句识别变差。",
     ))
     win._recognition_capability_label = footnote("")
     win._recognition_capability_row = inline_action_row(win._recognition_capability_label, margins=(16, 0, 16, 10))
@@ -426,12 +428,14 @@ def build_recognition_section(win) -> QWidget:
     )
     win._quiet_speech_row.toggled.connect(win._on_recognition_setting_changed)
     advanced.addWidget(win._quiet_speech_row)
+    # Kept for an existing config value, but not shown: the two CTC models that
+    # support it got worse CER with it on, and the default model cannot use it.
     win._boundary_context_row = ToggleOptionRow(
         "跨段音频上下文（实验性）",
         "默认关闭；仅支持带时间戳的 CTC 模型，强制分段最多多等 0.3 秒。尚未验证稳定精度收益。",
     )
     win._boundary_context_row.toggled.connect(win._on_recognition_setting_changed)
-    advanced.addWidget(win._boundary_context_row)
+    win._boundary_context_row.hide()
     advanced.addWidget(group_divider())
     win._speaker_enabled_row = ToggleOptionRow(
         "增强说话人区分", "使用 CAM++ 帮助区分不同声音；用于持续转写与会议，不验证人物身份",
@@ -586,7 +590,6 @@ def build_general_page(win) -> QWidget:
         win._meeting_vad_combo,
         win._vad_download_btn,
         win._quiet_speech_row,
-        win._boundary_context_row,
         win._speaker_enabled_row,
         win._speaker_activity_row,
         win._meeting_source_combo,

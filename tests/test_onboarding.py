@@ -307,32 +307,43 @@ def test_setup_trial_stays_on_the_page_and_close_marks_welcome_seen(monkeypatch)
     assert shown == ["setup"]
 
 
-def test_setup_download_opens_the_engine_page_without_marking_welcome(monkeypatch):
+def test_setup_download_starts_in_the_dialog_and_mic_does_not_wait(monkeypatch):
+    from PyQt6.QtCore import QObject, pyqtSignal
     from PyQt6.QtWidgets import QDialog, QPushButton
 
     cfg = _Config(first_run_welcome_seen=False)
     cfg.set("history.onboarded", True)
     ctl = _controller(cfg, model_installed=False)
+    started = []
+
+    class _Worker(QObject):
+        progress = pyqtSignal(int)
+        finished_ok = pyqtSignal(str)
+        error = pyqtSignal(str)
+
+        def __init__(self, model_id, source="auto"):
+            super().__init__()
+            started.append((model_id, source))
+
+        def start(self):
+            started.append("start")
+
+    monkeypatch.setattr("sayink.speech_recognizer.ModelDownloadWorker", _Worker)
 
     def exec_(dialog):
+        assert dialog.mic_btn.isEnabled()
+        assert not dialog.trial_btn.isEnabled()
         button = next(item for item in dialog.findChildren(QPushButton) if item.text() == "下载模型")
         button.click()
-        return QDialog.DialogCode.Accepted
+        assert dialog.download_btn.text().startswith("正在下载")
+        return QDialog.DialogCode.Rejected
 
     monkeypatch.setattr(QDialog, "exec", exec_)
-    activated = []
-    monkeypatch.setattr(QDialog, "show", lambda dialog: None)
-    monkeypatch.setattr(QDialog, "raise_", lambda dialog: activated.append("raise"))
-    monkeypatch.setattr(QDialog, "activateWindow", lambda dialog: activated.append("activate"))
     ctl.show_setup()
-    from PyQt6.QtCore import Qt
-    from PyQt6.QtWidgets import QApplication
-    QApplication.processEvents()
-    assert ctl.opened == ["engine"]
+    assert started[0][0]
+    assert "start" in started
+    assert ctl.opened == []
     assert cfg.get("first_run_welcome_seen") is False
-    assert ctl._setup_dialog.download_btn.isDefault()
-    assert not ctl._setup_dialog.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
-    assert activated == []
 
 
 def test_closing_setup_schedules_the_history_question(monkeypatch):

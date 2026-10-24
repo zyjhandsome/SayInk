@@ -322,6 +322,28 @@ class TestSettingsChangedQueue:
             app._on_settings_changed()
             assert [s.audio for s in app._segment_queue] == [tail]
 
+    def test_settings_discard_count_ignores_polish_and_a_live_meeting(self):
+        with app_harness() as h:
+            app = h["app"]
+            app._output_busy = True
+            assert app._discardable_segment_count() == 0
+            app._output_busy = False
+            app._segment_queue = _queued(np.zeros(1600, dtype=np.float32))
+            assert app._discardable_segment_count() == 1
+            app._meeting_active = lambda: True
+            assert app._discardable_segment_count() == 0
+
+    def test_hold_recording_defers_audio_reconfigure(self):
+        with app_harness() as h:
+            app = h["app"]
+            h["recorder"].is_recording = True
+            app._segment_queue = _queued(np.zeros(1600, dtype=np.float32))
+            h["recorder"].configure.reset_mock()
+            app._on_settings_changed()
+            assert app._segment_queue
+            assert app._deferred_audio_settings is True
+            h["recorder"].configure.assert_not_called()
+
     def test_pending_segment_count_counts_queue_and_active(self):
         with app_harness() as h:
             app = h["app"]

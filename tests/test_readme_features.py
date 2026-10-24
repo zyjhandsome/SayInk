@@ -20,6 +20,17 @@ from sayink.hotkey_manager import HotKeyManager
 from sayink.text_paster import PasteResult
 
 
+def test_readme_version_matches_the_package():
+    from pathlib import Path
+
+    from sayink.version import __version__
+
+    text = Path("README.md").read_text(encoding="utf-8")
+    assert f"当前 **{__version__}**" in text
+    assert f"SayInk-Setup-{__version__}.exe" in text
+    assert f"SayInk-Setup-{__version__}-full.exe" in text
+
+
 def test_recording_bar_receives_the_saved_esc_preference_on_startup():
     with app_harness({"audio.esc_stops_continuous": False}) as h:
         h["floating"].set_esc_stops_continuous.assert_called_with(False)

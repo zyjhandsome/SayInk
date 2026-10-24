@@ -434,6 +434,14 @@ def suggest_batch_export_filename(*, now_ms: int | None = None) -> str:
     return f"sayink-export-{_filename_dt(stamp)}.md"
 
 
+def build_single_session_plain(
+    session: SessionSummary,
+    segments: list[SegmentRecord],
+) -> str:
+    del session
+    return _session_body(segments).rstrip() + "\n"
+
+
 def build_single_session_markdown(
     session: SessionSummary,
     segments: list[SegmentRecord],
@@ -2296,20 +2304,25 @@ class HistoryWindow(QWidget):
 
     def _export_single(self, session: SessionSummary) -> None:
         default = suggest_single_export_filename(session)
-        path, _selected_filter = QFileDialog.getSaveFileName(
+        path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "导出历史",
             default,
-            "Markdown (*.md)",
+            "Markdown (*.md);;纯文本 (*.txt)",
         )
         if not path:
             return
+        kind = "txt" if (selected_filter or "").startswith("纯文本") or path.lower().endswith(".txt") else "md"
+        if kind == "txt" and not path.lower().endswith(".txt"):
+            path = str(Path(path).with_suffix(".txt"))
         segments = self._get_session_segments_effective(session.session_id)
         try:
-            Path(path).write_text(
-                build_single_session_markdown(session, segments),
-                encoding="utf-8",
+            text = (
+                build_single_session_plain(session, segments)
+                if kind == "txt"
+                else build_single_session_markdown(session, segments)
             )
+            Path(path).write_text(text, encoding="utf-8")
         except OSError as exc:
             QMessageBox.critical(self, "导出失败", f"无法写入文件：{exc}")
             return

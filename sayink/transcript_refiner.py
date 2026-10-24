@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from sayink.minutes_prompts import TranscriptLine, speaker_label
+from sayink.polish_fidelity import normalized_number_tokens
 
 REFINE_CHUNK_CHARS = 1600  # Leave room for a near-verbatim reply in 4096 tokens.
 _UNIT_CHARS = 500
@@ -151,11 +152,6 @@ def split_refinement_units(units: Sequence[RefinementUnit]) -> tuple[list[Refine
             [RefinementUnit(2, unit.speaker_id, unit.text[cut:])])
 
 
-_NUMBER = re.compile(
-    r"(?:[+-]?\d+(?:\.\d+)?|[零〇一二三四五六七八九十百千万亿两]{2,}|"
-    r"[零〇一二三四五六七八九十两](?=[年月日天周个家人次万元亿]))"
-    r"(?:个百分点|小时|分钟|万元|亿元|万|亿|元|人|家|天|周|月|年|秒|个|次|%)?"
-)
 _ENGLISH = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:[._+#/-][A-Za-z0-9]+)*")
 _NEGATION = re.compile(r"不|没|未|无|别|\b(?:not|never|no|cannot)\b|n't", re.I)
 _NON_NEGATING = re.compile(
@@ -206,7 +202,8 @@ def validate_refinement(payload: dict | None, units: Sequence[RefinementUnit]) -
             raise RefinementValidationError("正文包含标题、列表或对话标签")
         if any(len(_compact(p)) > 800 for p in re.split(r"\n\s*\n", text)):
             raise RefinementValidationError("段落过长，请按话题细分段落")
-        source_numbers, edited_numbers = Counter(_NUMBER.findall(original)), Counter(_NUMBER.findall(rewritten))
+        source_numbers = Counter(normalized_number_tokens(original))
+        edited_numbers = Counter(normalized_number_tokens(rewritten))
         if source_numbers != edited_numbers:
             missing = list((source_numbers - edited_numbers).elements())[:12]
             extra = list((edited_numbers - source_numbers).elements())[:12]
@@ -220,8 +217,16 @@ def validate_refinement(payload: dict | None, units: Sequence[RefinementUnit]) -
             raise RefinementValidationError("英文名称被改动")
         if _negation_count(original) != _negation_count(rewritten):
             raise RefinementValidationError("否定表达被改动")
-        if set(_QUALIFIER.findall(source)) != set(_QUALIFIER.findall(edited)):
-            raise RefinementValidationError("条件或不确定性表达被改动")
+        source_qualifiers = Counter(_QUALIFIER.findall(source))
+        edited_qualifiers = Counter(_QUALIFIER.findall(edited))
+        if source_qualifiers != edited_qualifiers:
+            missing = list((source_qualifiers - edited_qualifiers).elements())[:12]
+            extra = list((edited_qualifiers - source_qualifiers).elements())[:12]
+            raise RefinementValidationError("条件或不确定性表达被改动", retry_hint=(
+                "条件或不确定性表达被改动；必须恢复："
+                f"{json.dumps(missing, ensure_ascii=False)}；不得新增："
+                f"{json.dumps(extra, ensure_ascii=False)}。重复的限定词也要按原话保留。"
+            ))
         if len(source) >= 80 and len(edited) < len(source) * 0.65:
             raise RefinementValidationError("内容被大幅压缩")
         if len(edited) > len(source) * 1.8 + 60:

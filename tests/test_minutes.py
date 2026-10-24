@@ -20,7 +20,9 @@ from sayink.minutes_prompts import (
     build_system_prompt,
     build_user_prompt,
     chunk_transcript,
+    format_srt_timestamp,
     format_timestamp,
+    render_srt,
     get_template,
     list_templates,
     parse_timestamp,
@@ -82,6 +84,22 @@ class TestTranscript:
         assert text == "[00:00:00] 说话人1：润色\n[00:00:02] 李四：第二句"
         raw = render_transcript(transcript_lines(segs, 0, prefer_polished=False))
         assert raw.startswith("[00:00:00] 说话人1：原始\n")
+
+    def test_srt_uses_duration_and_falls_back_to_the_next_cue(self):
+        assert format_srt_timestamp(3_723_456) == "01:02:03,456"
+        lines = transcript_lines(
+            [
+                _seg(0, "第一句", created_at=5_000, captured_at=1_000, duration_ms=1500),
+                _seg(1, "第二句", created_at=8_000, captured_at=4_000, duration_ms=0),
+                _seg(2, "第三句", created_at=12_000, captured_at=9_000, duration_ms=2000, speaker_id=2),
+            ],
+            0,
+        )
+        srt = render_srt(lines, {2: "李四"})
+        assert "1\n00:00:01,000 --> 00:00:02,500\n说话人1：第一句" in srt
+        assert "2\n00:00:04,000 --> 00:00:09,000\n说话人1：第二句" in srt
+        assert "3\n00:00:09,000 --> 00:00:11,000\n李四：第三句" in srt
+        assert render_srt([]) == ""
 
     def test_chunk_transcript_splits_at_lines(self):
         lines = [TranscriptLine(i * 1000, 1, "字" * 50) for i in range(10)]
@@ -640,6 +658,24 @@ class TestRefinement:
     def test_obvious_fidelity_failures_are_rejected(self, source, edited, reason):
         with pytest.raises(RefinementValidationError, match=reason):
             validate_refinement({"paragraphs": [{"source_ids": [1], "text": edited}]}, [RefinementUnit(1, 1, source)])
+
+    def test_chinese_and_arabic_numbers_with_the_same_value_pass(self):
+        source = "这个项目预算二十万。"
+        edited = "这个项目预算20万。"
+        validate_refinement(
+            {"paragraphs": [{"source_ids": [1], "text": edited}]},
+            [RefinementUnit(1, 1, source)],
+        )
+
+    def test_repeated_qualifier_cannot_be_dropped(self):
+        source = "可能下周评审，也可能再议。"
+        edited = "可能下周评审，再议。"
+        with pytest.raises(RefinementValidationError, match="条件") as caught:
+            validate_refinement(
+                {"paragraphs": [{"source_ids": [1], "text": edited}]},
+                [RefinementUnit(1, 1, source)],
+            )
+        assert "可能" in caught.value.retry_hint
 
     def test_greetings_can_be_removed_but_not_business_details(self):
         units = [RefinementUnit(1, 1, "嗯，大家好。"), RefinementUnit(2, 2, "今天讨论预算。")]

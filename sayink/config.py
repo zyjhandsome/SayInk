@@ -233,16 +233,28 @@ LEGACY_AUTO_START_VALUE = "VoiceInk"
 
 
 class Config:
-    def __init__(self, config_dir: Path | str | None = None, secret_store=None):
+    def __init__(
+        self,
+        config_dir: Path | str | None = None,
+        secret_store=None,
+        *,
+        file_secrets: bool | None = None,
+    ):
+        explicit_dir = config_dir is not None
         if config_dir is not None:
             self._config_dir = Path(config_dir)
         else:
             self._config_dir = user_data_dir()
-        # Only the real profile uses Credential Manager; isolated dirs (tests,
-        # portable copies) keep everything in their own config.json.
-        if secret_store is None and config_dir is None:
+        # The real profile (~/.sayink) uses Credential Manager. If that store
+        # is missing, the key stays in memory and is never written to
+        # config.json. An explicit directory (tests, a portable copy) is its
+        # own profile and may keep the key in that directory's config.json.
+        if secret_store is None and not explicit_dir:
             secret_store = default_secret_store()
         self._secrets = secret_store
+        if file_secrets is None:
+            file_secrets = self._secrets is None and explicit_dir
+        self._file_secrets = bool(file_secrets) and self._secrets is None
         self._secret_value: str | None = None
         self._secret_persist_failed = False
         self._secret_read_failed = False
@@ -289,17 +301,24 @@ class Config:
         # 必须先于下面的迁移落盘，否则新文件会把欢迎写成已看过。
         if not config_existed:
             self._config["first_run_welcome_seen"] = False
+        # Before any migration save, so a plaintext key is lifted into memory
+        # and stripped instead of being written back out.
+        self._load_secret()
         output_migrated = self._migrate_output_by_mode()
         if self._strip_test_pollution() or moved or output_migrated or self._type_repairs:
             self.save_immediate()
         self._migrate_stt_model()
-        self._load_secret()
 
     def _load_secret(self) -> None:
         store = getattr(self, "_secrets", None)
-        if store is None:
-            return
         in_file = str(self._config.get("llm", {}).get("api_key", "") or "")
+        if store is None:
+            if in_file and not self._file_secrets:
+                self._secret_value = in_file
+                self._scrub_plaintext_key(
+                    "没有可用的凭据存储，配置文件中的 API Key 已移除，仅本次运行有效"
+                )
+            return
         stored = store.read()
         if stored is None:
             # Credential Manager unreadable: an older plaintext key still works
@@ -528,6 +547,13 @@ class Config:
 
     def save(self):
         """Atomic write: write to temp file then rename to prevent corruption."""
+        llm = self._config.get("llm")
+        if isinstance(llm, dict) and llm.get("api_key") and not self._file_secrets:
+            leaked = str(llm.get("api_key") or "")
+            if leaked and not (self._secret_value or ""):
+                self._secret_value = leaked
+                self._secret_persist_failed = True
+            llm["api_key"] = ""
         data = {**self._config, **self._extra_keys}
         tmp_path = None
         try:
@@ -546,7 +572,9 @@ class Config:
                     pass
 
     def get(self, key: str, default: Any = None) -> Any:
-        if key == SECRET_KEY and getattr(self, "_secrets", None) is not None:
+        if key == SECRET_KEY and (
+            getattr(self, "_secrets", None) is not None or self._secret_value is not None
+        ):
             return self._secret_value or ""
         keys = key.split(".")
         value = self._config
@@ -566,6 +594,26 @@ class Config:
 
     def set(self, key: str, value: Any):
         store = getattr(self, "_secrets", None)
+        if key == SECRET_KEY and store is None and not self._file_secrets:
+            secret = str(value or "")
+            llm = self._config.setdefault("llm", {})
+            leaked = bool(llm.get("api_key"))
+            if not secret:
+                self._secret_value = ""
+                self._secret_persist_failed = False
+                if leaked:
+                    llm["api_key"] = ""
+                    self._save_timer.start(500)
+                return
+            if secret == (self._secret_value or "") and self._secret_persist_failed and not leaked:
+                return
+            self._secret_value = secret
+            self._secret_persist_failed = True
+            if leaked:
+                llm["api_key"] = ""
+                self._save_timer.start(500)
+            log.warning("没有可用的凭据存储，API Key 仅在本次运行中有效，未写入配置文件")
+            return
         if key == SECRET_KEY and store is not None:
             secret = str(value or "")
             if secret == (self._secret_value or "") and not self._secret_persist_failed:
