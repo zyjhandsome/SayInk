@@ -69,6 +69,22 @@ def test_a_b_a_results_keep_timestamps_and_move_only_unsaved_later_sequences():
         # Whole-chunk mic dominance cannot prove where each split turn came
         # from. Do not invent per-turn source provenance.
         assert [r.speaker_route for r in records] == ["", "", ""]
+
+
+def test_a_real_capture_lane_keeps_its_route_when_a_mixed_chunk_splits():
+    with app_harness({"history.enabled": False}) as h:
+        app = h["app"]
+        _start(app, h, input_source="mixed")
+        h["recorder"].input_source = "mixed"
+        first = make_context(app, 10_000)
+        first.route_reliable = True
+        app._begin_transcription(np.full(48000, 0.1, dtype=np.float32), route="system", context=first)
+        with patch("sayink.app.QTimer.singleShot"):
+            app._on_speaker_turn_result(batch())
+            app._pump_segment_queue()
+            app._pump_segment_queue()
+        records = _enqueued_records(h["history"])
+        assert [r.speaker_route for r in records] == ["system", "system", "system"]
         assert h["recognizer"].transcribe_final.call_count == 1
         h["paster"].paste_async.assert_not_called()
         assert app._pending_turn_audio is None

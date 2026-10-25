@@ -13,6 +13,7 @@ from sayink.history_store import SegmentRecord, SessionSummary
 from sayink.app import App
 from sayink.ui.history_window import (
     HistoryWindow,
+    _segment_clock_ms,
     build_batch_export_markdown,
     build_single_session_markdown,
     build_single_session_plain,
@@ -1581,6 +1582,13 @@ def test_multi_segment_inline_edit_collapse_suppresses_trailing_segments_without
     raw_rendered = window._details.toPlainText()
     assert "raw first" in raw_rendered
     assert "raw second" in raw_rendered
+
+
+def test_history_time_uses_when_the_person_spoke():
+    spoken = SegmentRecord("s", 0, 1_700_000_000_000, "甲", captured_at=1_700_000_500_000)
+    saved_only = SegmentRecord("s", 1, 1_700_000_000_000, "乙")
+    assert _segment_clock_ms(spoken) == 1_700_000_500_000
+    assert _segment_clock_ms(saved_only) == 1_700_000_000_000
 
 
 

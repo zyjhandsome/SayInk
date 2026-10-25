@@ -45,6 +45,36 @@ def test_tiny_leading_suffix_keeps_asr_bounds_and_labels_first_turn_by_its_domin
     assert result[1].learnable
 
 
+def test_a_short_opening_cut_prefers_a_stable_later_boundary(monkeypatch):
+    context, model = SpeakerTurnContext(), Embedder()
+    run(context, model, voice(1, 3.2), 1000)
+    current = np.r_[voice(1, 0.9), voice(2, 4)]
+    detector = SpeakerTurnDetector(model, context=context, start_ms=4200, route="system")
+    a, b = np.eye(3, dtype=np.float32)[:2]
+
+    def analyze(samples, **kwargs):
+        if len(samples) == len(current):
+            return [
+                SpeakerTurn(0, int(4 * RATE), b, True),
+                SpeakerTurn(int(4 * RATE), len(current), b, True),
+            ]
+        cut = int(2.2 * RATE)  # 200 ms into the new chunk
+        return [SpeakerTurn(0, cut, a, True), SpeakerTurn(cut, len(samples), b, True)]
+
+    def recover(samples, turns, prefix, cancelled=None):
+        detector.context_action = "short_split"
+        cut = int(0.9 * RATE)
+        return [SpeakerTurn(0, cut, a, False), SpeakerTurn(cut, turns[0].stop, b, False), *turns[1:]]
+
+    monkeypatch.setattr(detector, "_analyze", analyze)
+    monkeypatch.setattr(detector, "_short_leading_context", recover)
+    result = detector(current)
+    assert detector.context_action == "short_split"
+    assert result[0].stop == int(0.9 * RATE)
+    assert int(np.argmax(result[0].embedding)) == 0 and not result[0].learnable
+    assert int(np.argmax(result[1].embedding)) == 1
+
+
 def test_tiny_leading_suffix_still_labels_the_turn_when_a_live_session_has_its_voice(monkeypatch):
     context, model = SpeakerTurnContext(), Embedder()
     session = MeetingSpeakerSession(threshold=0.55)

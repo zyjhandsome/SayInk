@@ -225,8 +225,14 @@ class SpeakerTurnDetector:
                 break
         if uncertain and not evidence.overlaps:
             return self._plain_single(audio, uncertain=True)
+        # A long overlap is not a place to slice the sentence. A short one
+        # still marks a possible interjection. Either way the overlapped
+        # audio keeps its voice vector so a known speaker can match it, and
+        # that vector is never allowed to train a profile.
+        short_limit = int(1.5 * TARGET_SAMPLE_RATE)
         bounds = sorted({0, len(audio), *cuts,
-                         *(at for interval in evidence.overlaps for at in interval)})
+                         *(at for begin, end in evidence.overlaps
+                           if end - begin <= short_limit for at in (begin, end))})
         # Do not create tiny ASR slices around uncertain edges. Removing a
         # boundary expands the unknown region instead of deleting any audio.
         while len(bounds) > 2:
@@ -242,10 +248,12 @@ class SpeakerTurnDetector:
             if cancelled is not None and cancelled():
                 return []
             unsafe = any(start < end and stop > begin for begin, end in evidence.overlaps)
-            turn = self._plain_single(audio[start:stop], uncertain=unsafe or uncertain, mixed=unsafe)[0]
+            turn = self._plain_single(audio[start:stop], uncertain=unsafe or uncertain, mixed=False)[0]
             # A clear flank beside suspected overlap may match an established
             # voice, but must not seed or change a profile from this evidence.
-            turns.append(SpeakerTurn(start, stop, turn.embedding, turn.learnable and not evidence.overlaps))
+            # Overlapped audio keeps the same rule: match, never learn.
+            learnable = bool(turn.learnable) and not unsafe and not evidence.overlaps
+            turns.append(SpeakerTurn(start, stop, turn.embedding, learnable))
         return turns
 
     def __call__(self, audio: np.ndarray, *, cancelled=None) -> list[SpeakerTurn]:
@@ -276,6 +284,15 @@ class SpeakerTurnDetector:
             if cut < minimum:
                 if len(turns) < 2 or first.stop > int(CONTEXT_HEAD_SEC * TARGET_SAMPLE_RATE):
                     return turns  # A tiny suffix must not reject a whole long utterance.
+                if cancelled is not None and cancelled():
+                    return []
+                # The first cut can land inside a short reply. Look for a
+                # longer boundary that still matches the previous voice before
+                # folding the opening into whoever fills the rest of the slice.
+                recovered = self._short_leading_context(samples, turns, prefix, cancelled=cancelled)
+                if self.context_action == "short_split":
+                    return recovered
+                self.context_action = "none"
                 if cancelled is not None and cancelled():
                     return []
                 dominant = self._embed_or_none(samples[cut:first.stop])

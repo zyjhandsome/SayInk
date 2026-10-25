@@ -63,6 +63,16 @@ class TestDrainMixedMono:
         out = rec._drain_mixed_mono()
         assert out is not None and out.size == 1600
 
+    def test_a_silent_lane_does_not_rescale_the_only_audible_lane(self):
+        rec = AudioRecorder()
+        rec._lanes = [
+            _make_lane(role="microphone", chunks=[np.zeros(1600, dtype=np.float32)]),
+            _make_lane(role="system", chunks=[np.full(1600, 0.2, dtype=np.float32)]),
+        ]
+        out = rec._drain_mixed_mono()
+        assert out is not None
+        assert np.allclose(out, 0.2)
+
     def test_two_lanes_are_mixed(self):
         rec = AudioRecorder()
         rec._lanes = [
@@ -276,6 +286,19 @@ class TestContinuousTick:
         rec._on_continuous_tick()
         assert warnings == [True]
         assert rec._no_speech_warned is True
+
+    def test_tick_warns_when_the_device_sends_no_blocks(self):
+        rec = AudioRecorder()
+        rec._is_recording = True
+        rec._continuous_mode = True
+        rec._segmenter = _FakeSegmenter(feed_result=None)
+        rec._drain_mixed_mono = lambda: None
+        rec._no_speech_warned = False
+        rec._last_speech_at = 0.0
+        warnings = []
+        rec.no_speech_warning.connect(lambda: warnings.append(True))
+        rec._on_continuous_tick()
+        assert warnings == [True]
 
 
 class TestHoldLiveSegments:

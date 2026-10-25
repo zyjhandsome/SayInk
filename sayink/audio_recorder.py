@@ -39,6 +39,10 @@ from sayink.vad_segmenter import (
     make_speech_gate,
 )
 
+# A lane this quiet is digital silence, not a person. Mixing it in still
+# runs the loudness balancer on the only real lane and moves the cut points.
+_DIGITAL_SILENCE_RMS = 1e-4
+
 log = logging.getLogger("SayInk")
 
 
@@ -101,6 +105,7 @@ class AudioRecorder(QObject):
         self._block_mic_energy = 0.0
         self._block_system_energy = 0.0
         self._segment_route = ""
+        self._segment_route_reliable = False
         self._vad_kind = VAD_ENERGY
         self._vad_model_path: str | None = None
         # Silero's ONNX session stays here. Rebuilding the segmenter (a mode
@@ -208,6 +213,7 @@ class AudioRecorder(QObject):
         while self._split_ready and (ending or self._split_ready[0][1][1] <= watermark):
             audio, metadata = self._split_ready.pop(0)
             self._segment_route, self._segment_captured_at, self._segment_target = metadata
+            self._segment_route_reliable = True
             self.segment_ready.emit(audio)
             released += 1
         return released
@@ -568,7 +574,13 @@ class AudioRecorder(QObject):
             try:
                 self._open_lane_stream(lane)
                 if ep.device.index != primary.device.index:
-                    log.info("系统声音改用备用设备: %s", ep.device.name)
+                    warn = (
+                        f"电脑声音改用「{ep.device.name}」。"
+                        "如果正在播放的声音不从这台设备出来，将录不到声音。"
+                    )
+                    log.info(warn)
+                    self._last_start_warning = warn
+                    self.warning.emit(warn)
                 return lane
             except Exception as e:
                 last_err = e
@@ -670,6 +682,13 @@ class AudioRecorder(QObject):
             if track.size < take:
                 track = np.concatenate([track, np.zeros(take - track.size, dtype=np.float32)])
             return track
+        if len(tracks) > 1:
+            audible = [track for track in tracks if rms_volume(track) >= _DIGITAL_SILENCE_RMS]
+            if len(audible) == 1:
+                only = audible[0]
+                if only.size < take:
+                    only = np.concatenate([only, np.zeros(take - only.size, dtype=np.float32)])
+                return only
         if self._balancer is not None and len(gains) == len(tracks):
             return mix_to_mono(tracks, TARGET_SAMPLE_RATE, gains=gains)
         return mix_to_mono(tracks, TARGET_SAMPLE_RATE)
@@ -721,6 +740,7 @@ class AudioRecorder(QObject):
             return
         block = self._drain_mixed_mono()
         if block is None or block.size == 0:
+            self._warn_if_silent()
             return
         vol = rms_volume(block)
         self.volume_changed.emit(vol)
@@ -730,22 +750,24 @@ class AudioRecorder(QObject):
         if self._split_segmenters:
             if self._feed_split_tracks(block):
                 self._last_speech_at = time.monotonic()
-            elif (not self._no_speech_warned
-                  and time.monotonic() - self._last_speech_at >= self.NO_SPEECH_WARN_SEC):
-                self._no_speech_warned = True
-                self.no_speech_warning.emit()
+            elif self._warn_if_silent():
+                return
             return
         segment = self._feed_segmenter(block)
         if segment is not None and segment.size > 0:
             self._last_speech_at = time.monotonic()
             log.debug("持续监听切分片段: %d 采样点", segment.size)
             self._emit_segment(segment)
-        elif (
-            not self._no_speech_warned
-            and time.monotonic() - self._last_speech_at >= self.NO_SPEECH_WARN_SEC
-        ):
-            self._no_speech_warned = True
-            self.no_speech_warning.emit()
+        else:
+            self._warn_if_silent()
+
+    def _warn_if_silent(self) -> bool:
+        if (self._no_speech_warned
+                or time.monotonic() - self._last_speech_at < self.NO_SPEECH_WARN_SEC):
+            return False
+        self._no_speech_warned = True
+        self.no_speech_warning.emit()
+        return True
 
     def start(self, *, continuous: bool = False):
         if self._is_recording:
@@ -936,6 +958,7 @@ class AudioRecorder(QObject):
                                           (self._segment_route, self._segment_captured_at, self._segment_target))
             self._release_boundary_context()
         else:
+            self._segment_route_reliable = False
             self.segment_ready.emit(segment)
 
     def _release_boundary_context(self, *, ending=False):
@@ -944,6 +967,7 @@ class AudioRecorder(QObject):
         released = 0
         for audio, metadata in self._boundary_buffer.release(ending=ending):
             self._segment_route, self._segment_captured_at, self._segment_target = metadata
+            self._segment_route_reliable = False
             self.segment_ready.emit(audio)
             released += 1
         return released
@@ -953,6 +977,16 @@ class AudioRecorder(QObject):
         route = self._segment_route
         self._segment_route = ""
         return route
+
+    def consume_segment_route_reliable(self) -> bool:
+        """True when the route is the lane that captured this segment.
+
+        A mixed recording's dominant-energy guess is not reliable: splitting
+        that chunk into turns must not stamp every turn with the chunk route.
+        """
+        reliable = bool(self._segment_route_reliable)
+        self._segment_route_reliable = False
+        return reliable
 
     def consume_segment_captured_at(self) -> int:
         """Wall-clock ms when the segment just emitted started (0 if unknown)."""

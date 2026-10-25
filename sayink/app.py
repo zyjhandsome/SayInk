@@ -180,6 +180,9 @@ class _SegmentContext:
     model: str = ""
     # Wall-clock ms when the utterance started (0 = unknown).
     captured_at: int = 0
+    # True when speaker_route is the lane that captured the audio, not a
+    # guess from which mixed lane was louder.
+    route_reliable: bool = False
     target_hwnd: int = 0
     target_app: str = ""
     # Speaker embedding function; None = dictation's log-mel summary.
@@ -1488,6 +1491,12 @@ class App(QObject):
             return
         self._finish_dictation_speakers()
 
+    def _segment_route_reliable_from_recorder(self) -> bool:
+        consume = getattr(self._recorder, "consume_segment_route_reliable", None)
+        if not callable(consume):
+            return False
+        return bool(consume())
+
     def _segment_captured_at_from_recorder(self) -> int:
         consume = getattr(self._recorder, "consume_segment_captured_at", None)
         if not callable(consume):
@@ -1497,6 +1506,7 @@ class App(QObject):
 
     def _on_segment_ready(self, audio: np.ndarray):
         route = self._segment_route_from_recorder()
+        route_reliable = self._segment_route_reliable_from_recorder()
         captured_at = self._segment_captured_at_from_recorder()
         # SpeechSegmenter has already rejected independent short noises. A
         # legitimate continuation after its time limit may be shorter than
@@ -1510,6 +1520,7 @@ class App(QObject):
         context = self._capture_segment_context()
         if context is not None:
             context.captured_at = captured_at
+            context.route_reliable = route_reliable
         if not self._recognizer.is_ready:
             self._hold_audio_until_ready(audio, route, front=False, context=context)
             return
@@ -1642,9 +1653,10 @@ class App(QObject):
                 self._current_seq += extra
         prepared = []
         route = self._pending_record.speaker_route if self._pending_record is not None else ""
-        if len(turns) > 1 and context.source == "mixed":
+        if len(turns) > 1 and context.source == "mixed" and not context.route_reliable:
             # A dominant lane for the whole chunk does not identify each
-            # individual turn. Leave provenance unknown until tracks exist.
+            # individual turn. A lane that was captured on its own keeps
+            # its route when the turn detector splits that lane.
             route = ""
         for index, turn in enumerate(turns):
             turn_context = replace(

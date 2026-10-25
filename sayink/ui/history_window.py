@@ -341,6 +341,14 @@ def history_shows_speakers(segments: list[SegmentRecord]) -> bool:
     )
 
 
+def _segment_clock_ms(segment: SegmentRecord) -> int:
+    """When the person spoke, or when the line was saved if that is unknown."""
+    captured = int(getattr(segment, "captured_at", 0) or 0)
+    if captured > 0:
+        return captured
+    return int(segment.created_at)
+
+
 def _route_caption(route: str) -> str:
     return {"mic": "麦克风", "system": "电脑声音"}.get((route or "").strip(), "")
 
@@ -1685,7 +1693,7 @@ class HistoryWindow(QWidget):
             if not text:
                 continue
             if many or show_speakers:
-                stamp = datetime.fromtimestamp(segment.created_at / 1000).strftime("%H:%M:%S")
+                stamp = datetime.fromtimestamp(_segment_clock_ms(segment) / 1000).strftime("%H:%M:%S")
                 if show_speakers:
                     head = _speaker_heading(segment)
                 else:
