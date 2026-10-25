@@ -18,6 +18,7 @@ from sayink.ui.settings_components import (
     ToggleOptionRow,
     footnote,
     group_divider,
+    inline_action_row,
     page_header,
     polish_preview_content,
     settings_group,
@@ -232,6 +233,14 @@ def _build_minutes_section(win) -> QWidget:
     )
     win._minutes_auto_row.toggled.connect(win._on_minutes_auto_toggled)
     lay.addWidget(win._minutes_auto_row)
+    from sayink.ui.settings_pages.general import _ghost_button
+
+    win._minutes_auto_reset_btn = _ghost_button(
+        "自动纪要恢复默认",
+        win._restore_default_auto_minutes,
+        tooltip="仅关闭会后自动生成纪要，不改变接口、密钥、纪要模板和已确认的远程地址",
+    )
+    lay.addWidget(inline_action_row(win._minutes_auto_reset_btn))
     return settings_section("会议纪要", group)
 
 

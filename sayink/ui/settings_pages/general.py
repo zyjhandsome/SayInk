@@ -96,6 +96,12 @@ def build_recording_section(win) -> QWidget:
     )
     lay.addWidget(stacked_field_row("录音快捷键", win._hotkey_edit))
     lay.addWidget(win._hotkey_hint)
+    win._hotkey_reset_btn = _ghost_button(
+        "快捷键恢复默认",
+        win._restore_default_hotkey,
+        tooltip="仅将录音快捷键恢复为 Alt+X，不改变转写模式、Esc、音频来源和结果去向",
+    )
+    lay.addWidget(inline_action_row(win._hotkey_reset_btn))
     win._esc_stop_divider = group_divider()
     lay.addWidget(win._esc_stop_divider)
     win._esc_stop_row = ToggleOptionRow(
@@ -450,6 +456,12 @@ def build_recognition_section(win) -> QWidget:
     )
     win._speaker_activity_row.toggled.connect(win._on_recognition_setting_changed)
     advanced.addWidget(win._speaker_activity_row)
+    win._recognition_reset_btn = _ghost_button(
+        "高级识别恢复默认",
+        win._restore_default_recognition,
+        tooltip="仅恢复语音分段、说话人增强、多人发言检测和轻声增强，不改变识别语言、自定义词汇和当前引擎",
+    )
+    advanced.addWidget(inline_action_row(win._recognition_reset_btn, margins=(16, 8, 16, 12)))
     lay.addWidget(win._advanced_recognition_panel)
     section = settings_section("识别", card)
     section.setObjectName("sharedRecognitionSection")
@@ -488,6 +500,12 @@ def build_meeting_section(win) -> QWidget:
     )
     win._meeting_start_card_row.toggled.connect(win._on_meeting_setting_changed)
     lay.addWidget(win._meeting_start_card_row)
+    win._meeting_start_card_reset_btn = _ghost_button(
+        "开始卡片恢复默认",
+        win._restore_default_meeting_start_card,
+        tooltip="仅重新开启开始前的会议信息卡，不改变会议音源、会议模型和纪要模板",
+    )
+    lay.addWidget(inline_action_row(win._meeting_start_card_reset_btn))
     section = settings_section("会议默认设置", card)
     section.setObjectName("meetingDefaultsSection")
     return section
@@ -570,6 +588,7 @@ def build_general_page(win) -> QWidget:
         win._trigger_hotkey_rb.parentWidget(),
         win._trigger_continuous_rb.parentWidget(),
         win._hotkey_edit,
+        win._hotkey_reset_btn,
         win._esc_stop_row,
         win._src_mic_rb.parentWidget(),
         win._src_sys_rb.parentWidget(),
@@ -592,9 +611,11 @@ def build_general_page(win) -> QWidget:
         win._quiet_speech_row,
         win._speaker_enabled_row,
         win._speaker_activity_row,
+        win._recognition_reset_btn,
         win._meeting_source_combo,
         win._meeting_model_combo,
         win._meeting_start_card_row,
+        win._meeting_start_card_reset_btn,
         win._theme_combo,
         win._auto_start_row,
         win._sound_row,

@@ -53,14 +53,15 @@ def test_tab_walks_the_general_page_top_to_bottom_then_back_to_the_current_nav(m
     win.setFocus()
     _qapp_session.processEvents()
 
-    stops = _tab_stops(win, _qapp_session, 29)
+    stops = _tab_stops(win, _qapp_session, 31)
     assert stops == [
         "通用", "录音与输入", "识别", "会议默认", "应用与历史",
-        "单次转写", "录音快捷键", "仅麦克风", "识别结果去向",
+        "单次转写", "录音快捷键", "快捷键恢复默认", "仅麦克风", "识别结果去向",
         "测试声音（约 2 秒）", "设备恢复自动选择", "手动选择音频设备",
         "混合音源分别识别（实验性）",
         "识别语言", "自定义词汇", "展开高级识别设置",
-        "会议音频来源", "会议识别模型", "开始前显示会议信息卡", "主题模式：暗色",
+        "会议音频来源", "会议识别模型", "开始前显示会议信息卡", "开始卡片恢复默认",
+        "主题模式：暗色",
         "开机时自动启动", "录音提示音", "粘贴后恢复剪贴板", "保存转写历史",
         "历史保留天数", "最多保留会话数", "录音恢复（本机缓存）", "查看 / 恢复录音", "通用",
     ]
@@ -73,10 +74,10 @@ def test_tab_enters_radio_groups_on_the_checked_option(main_window, _qapp_sessio
     win._settings.reload_settings()
     win.setFocus()
     _qapp_session.processEvents()
-    stops = _tab_stops(win, _qapp_session, 9)
+    stops = _tab_stops(win, _qapp_session, 10)
     assert stops[:5] == ["通用", "录音与输入", "识别", "会议默认", "应用与历史"]
     assert stops[5] == "持续转写"
-    assert stops[8] == "混合音源"
+    assert stops[6:] == ["录音快捷键", "快捷键恢复默认", "允许 Esc 结束持续转写", "混合音源"]
 
 
 def test_theme_segment_uses_arrows_and_keeps_only_current_option_tabbable(main_window, _qapp_session):

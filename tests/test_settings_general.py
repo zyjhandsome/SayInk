@@ -1400,3 +1400,109 @@ class TestMeetingSettings:
         settings_window.cancel_all_downloads()
         assert events == ["cancel"]
         assert settings_window._dl_workers["funasr-nano"] is worker
+
+
+class TestSectionDefaultRestore:
+    def _answers(self, settings_window, monkeypatch, accepted: bool):
+        seen = []
+
+        def confirm(title, text, *, accept, cancel="取消", destructive=False):
+            seen.append((title, text, accept, cancel, destructive))
+            return accepted
+
+        monkeypatch.setattr(settings_window, "_confirm", confirm)
+        return seen
+
+    def test_declining_hotkey_restore_keeps_the_custom_shortcut(
+            self, settings_window, config, monkeypatch):
+        config.set("hotkey", "ctrl+shift+z")
+        config.set("audio.trigger_mode", "continuous")
+        settings_window.reload_settings()
+        seen = self._answers(settings_window, monkeypatch, False)
+        settings_window._hotkey_reset_btn.click()
+        assert config.get("hotkey") == "ctrl+shift+z"
+        assert config.get("audio.trigger_mode") == "continuous"
+        assert "Alt+X" in seen[0][1]
+        assert "转写模式" in seen[0][1]
+
+    def test_hotkey_restore_returns_alt_x_and_notifies_the_listener(
+            self, settings_window, config, monkeypatch):
+        config.set("hotkey", "ctrl+shift+z")
+        settings_window.reload_settings()
+        emitted = []
+        settings_window.hotkey_updated.connect(emitted.append)
+        self._answers(settings_window, monkeypatch, True)
+        settings_window._hotkey_reset_btn.click()
+        assert config.get("hotkey") == "alt+x"
+        assert settings_window._hotkey_edit.value == "alt+x"
+        assert emitted == ["alt+x"]
+
+    def test_recognition_restore_resets_only_the_four_advanced_switches(
+            self, settings_window, config, monkeypatch):
+        glossary = [{"term": "SayInk", "variants": ["say ink"]}]
+        config.set("stt.vad", "energy")
+        config.set("stt.speaker_model_enabled", False)
+        config.set("stt.speaker_activity_enabled", True)
+        config.set("stt.quiet_speech_enabled", True)
+        config.set("stt.boundary_context_enabled", True)
+        config.set("stt.language", "en")
+        config.set("stt.glossary", glossary)
+        config.set("stt.model_id", "funasr-nano")
+        settings_window.reload_settings()
+        seen = self._answers(settings_window, monkeypatch, False)
+        settings_window._recognition_reset_btn.click()
+        assert config.get("stt.vad") == "energy"
+        assert "自定义词汇" in seen[0][1]
+
+        changed = []
+        settings_window.recognition_changed.connect(lambda: changed.append(True))
+        self._answers(settings_window, monkeypatch, True)
+        settings_window._recognition_reset_btn.click()
+        assert config.get("stt.vad") == "silero"
+        assert config.get("stt.speaker_model_enabled") is True
+        assert config.get("stt.speaker_activity_enabled") is False
+        assert config.get("stt.quiet_speech_enabled") is False
+        assert config.get("stt.boundary_context_enabled") is True
+        assert config.get("stt.language") == "en"
+        assert config.get("stt.glossary") == glossary
+        assert config.get("stt.model_id") == "funasr-nano"
+        assert changed == [True]
+
+    def test_start_card_restore_leaves_the_meeting_source_and_model(
+            self, settings_window, config, monkeypatch):
+        config.set("meeting.show_start_card", False)
+        config.set("meeting.input_source", "microphone")
+        config.set("meeting.model_id", "funasr-nano")
+        config.set("meeting.template_id", "general")
+        settings_window.reload_settings()
+        self._answers(settings_window, monkeypatch, False)
+        settings_window._meeting_start_card_reset_btn.click()
+        assert config.get("meeting.show_start_card") is False
+
+        self._answers(settings_window, monkeypatch, True)
+        settings_window._meeting_start_card_reset_btn.click()
+        assert config.get("meeting.show_start_card") is True
+        assert config.get("meeting.input_source") == "microphone"
+        assert config.get("meeting.model_id") == "funasr-nano"
+        assert config.get("meeting.template_id") == "general"
+
+    def test_auto_minutes_restore_only_turns_the_switch_off(
+            self, settings_window, config, monkeypatch):
+        config.set("meeting.auto_generate", True)
+        config.set("meeting.template_id", "general")
+        config.set("meeting.model_name", "my-minutes-model")
+        config.set("meeting.confirmed_remote_hosts", ["api.example.com"])
+        config.set("llm.api_key", "secret-key")
+        settings_window.reload_settings()
+        self._answers(settings_window, monkeypatch, False)
+        settings_window._minutes_auto_reset_btn.click()
+        assert config.get("meeting.auto_generate") is True
+
+        seen = self._answers(settings_window, monkeypatch, True)
+        settings_window._minutes_auto_reset_btn.click()
+        assert config.get("meeting.auto_generate") is False
+        assert config.get("meeting.template_id") == "general"
+        assert config.get("meeting.model_name") == "my-minutes-model"
+        assert config.get("meeting.confirmed_remote_hosts") == ["api.example.com"]
+        assert config.get("llm.api_key") == "secret-key"
+        assert "密钥" in seen[0][1]

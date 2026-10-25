@@ -1988,6 +1988,62 @@ class SettingsWindow(QWidget):
             self.hotkey_updated.emit(hotkey)
         self._refresh_about_runtime_rows()
 
+    def _restore_default_hotkey(self) -> None:
+        if not self._confirm(
+            "恢复录音快捷键",
+            "录音快捷键将恢复为 Alt+X。转写模式、Esc、音频来源和结果去向保持不变。",
+            accept="恢复",
+        ):
+            return
+        self._hotkey_edit.set_value(DEFAULT_HOTKEY)
+        self._apply_hotkey_setting(DEFAULT_HOTKEY)
+
+    def _restore_default_recognition(self) -> None:
+        if not self._confirm(
+            "恢复高级识别",
+            "将恢复这四项：语音分段改为自动检测语音；增强说话人区分改为开启；"
+            "多人发言检测改为关闭；轻声增强改为关闭。"
+            "识别语言、自定义词汇和当前引擎保持不变。",
+            accept="恢复",
+        ):
+            return
+        self._loading = True
+        try:
+            self._set_combo_by_data(self._meeting_vad_combo, "silero")
+            self._speaker_enabled_row.setChecked(True)
+            self._speaker_activity_row.setChecked(False)
+            self._quiet_speech_row.setChecked(False)
+        finally:
+            self._loading = False
+        self._on_recognition_setting_changed()
+
+    def _restore_default_meeting_start_card(self) -> None:
+        if not self._confirm(
+            "恢复会议信息卡",
+            "「开始前显示会议信息卡」将恢复为开启。会议音源、会议模型和纪要模板保持不变。",
+            accept="恢复",
+        ):
+            return
+        self._loading = True
+        try:
+            self._meeting_start_card_row.setChecked(True)
+        finally:
+            self._loading = False
+        self._on_meeting_setting_changed()
+
+    def _restore_default_auto_minutes(self) -> None:
+        if not self._confirm(
+            "恢复自动纪要",
+            "「会议结束后自动生成纪要」将恢复为关闭。"
+            "接口、密钥、纪要模板和已确认的远程地址保持不变。",
+            accept="恢复",
+        ):
+            return
+        if self._minutes_auto_row.isChecked():
+            self._minutes_auto_row.setChecked(False)
+        else:
+            self._config.set("meeting.auto_generate", False)
+
     def _on_input_source_radio_toggled(self, checked: bool):
         if not checked or self._loading:
             return
