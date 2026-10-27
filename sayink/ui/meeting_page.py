@@ -2622,7 +2622,9 @@ class MeetingPage(QWidget):
         """
         if not hasattr(self, "_notes_edit"):
             return True
-        self.flush_pending_user_notes()
+        if not self.flush_pending_user_notes():
+            self._set_status("笔记尚未保存，输入已保留。")
+            return False
         if not self._save_record_notes():
             return False
         return self._save_notes_draft()
@@ -2654,7 +2656,8 @@ class MeetingPage(QWidget):
 
     def unsaved_exit_draft(self) -> str | None:
         """Save what we can. Return text that did not land, so exit can ask first."""
-        self.flush_pending_user_notes()
+        if not self.flush_pending_user_notes():
+            return (self._user_notes.toPlainText() if hasattr(self, "_user_notes") else "") or " "
         if not self._save_record_notes():
             return self._record_notes.toPlainText() or " "
         if not self._editing_notes or not self._detail_id:
@@ -3217,7 +3220,8 @@ class MeetingPage(QWidget):
         if state in (MeetingState.DRAINING, MeetingState.ENDED):
             # current_id is still this meeting. The debounce timer must not
             # fire later, after the controller has cleared it.
-            self.flush_pending_user_notes()
+            if not self.flush_pending_user_notes():
+                self._keep_unsaved_live_notes()
         if state is MeetingState.LIVE and self._stack.currentIndex() != PAGE_LIVE:
             self._enter_live()
         elif state in (MeetingState.PAUSED, MeetingState.DRAINING, MeetingState.LIVE):
@@ -3320,15 +3324,46 @@ class MeetingPage(QWidget):
             self._mark_note.clear()
             self._render_live()
 
-    def flush_pending_user_notes(self) -> None:
+    def flush_pending_user_notes(self) -> bool:
+        """Write the live note and read it back. False leaves the typed text."""
         if hasattr(self, "_user_notes_timer"):
             self._user_notes_timer.stop()
-        self._save_user_notes()
-        # Browse opens on ENDED and reads the database. The queued note has to
-        # be visible before that, not only eventually.
+        meeting_id = getattr(self._ctrl, "current_id", None)
+        if not meeting_id or not hasattr(self, "_user_notes"):
+            return True
+        text = self._user_notes.toPlainText()
         store = getattr(self, "_store", None)
-        if store is not None:
-            store.flush()
+        if store is None:
+            self._save_user_notes()
+            return True
+        # Compare with the database. A failed write still updates the
+        # in-memory meeting, and the next debounce would then skip the retry.
+        for _attempt in (1, 2):
+            record = store.get_meeting(meeting_id)
+            if record is None:
+                return True
+            if record.notes_user == text:
+                store.flush()
+                return True
+            self._ctrl.update_meeting(meeting_id, notes_user=text)
+            if not store.flush():
+                continue
+            saved = store.get_meeting(meeting_id)
+            if saved is not None and saved.notes_user == text:
+                return True
+        self._set_status("笔记尚未保存，输入已保留。")
+        return False
+
+    def _keep_unsaved_live_notes(self) -> None:
+        """Hold the live note in the post-meeting editor when the write failed."""
+        meeting_id = getattr(self._ctrl, "current_id", None) or self._record_notes_meeting_id
+        if not meeting_id or not hasattr(self, "_user_notes"):
+            return
+        self._record_notes_meeting_id = meeting_id
+        self._record_notes.setPlainText(self._user_notes.toPlainText())
+        if hasattr(self, "_record_notes_timer"):
+            self._record_notes_timer.start()
+        self._set_status("笔记尚未保存，输入已保留。")
 
     def _save_user_notes(self) -> None:
         meeting_id = self._ctrl.current_id

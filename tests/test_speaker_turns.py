@@ -159,6 +159,36 @@ def test_a_b_a_without_silence_has_three_ordered_turns():
     assert sum(t.stop - t.start for t in result) == len(audio)
 
 
+def test_repeated_isolated_incompatible_windows_do_not_create_a_mixed_profile():
+    # Each burst supplies just one clear analysis window. The ordinary
+    # consecutive-window rule cannot locate a safe cut even though two
+    # different voices recur. Keep all speech for ASR but do not label or
+    # learn the mixed whole-clip embedding as a single person.
+    gap = np.zeros(int(1.2 * RATE), dtype=np.float32)
+    audio = np.concatenate([voice(1, 1.2), gap, voice(2, 1.2), gap,
+                            voice(1, 1.2), gap, voice(2, 1.2)])
+    result = SpeakerTurnDetector(Embedder())(audio)
+    assert len(result) == 1
+    assert (result[0].start, result[0].stop) == (0, len(audio))
+    assert not result[0].learnable
+    assert not np.any(result[0].embedding)
+    from sayink.meeting_speakers import MeetingSpeakerSession
+
+    session = MeetingSpeakerSession(threshold=0.55, margin=0.08)
+    assert session.assign(result[0].embedding, learnable=result[0].learnable) == 0
+    assert session.speaker_count == 0
+
+
+def test_one_isolated_different_window_does_not_block_a_clear_voice():
+    # A single short feature change does not establish a second recurring
+    # voice; preserve the established behavior for normal speaker variation.
+    gap = np.zeros(int(1.2 * RATE), dtype=np.float32)
+    audio = np.concatenate([voice(1, 1.2), gap, voice(2, 1.2), gap,
+                            voice(1, 1.2), gap, voice(1, 1.2)])
+    result = SpeakerTurnDetector(Embedder())(audio)
+    assert len(result) == 1 and result[0].learnable
+
+
 def test_short_interjection_does_not_create_an_unstable_extra_turn():
     audio = np.concatenate([voice(1, 3.2), voice(2, 0.25), voice(1, 3.2)])
     result = SpeakerTurnDetector(Embedder())(audio)

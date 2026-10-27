@@ -30,7 +30,9 @@ from sayink.minutes_prompts import (
     render_transcript,
 )
 from sayink.minutes_render import apply_speaker_names, extract_json, render_markdown
-from sayink.text_polisher import LLMCancelled, LLMResponseError, LLMTruncatedError, api_url_error
+from sayink.text_polisher import (
+    LLMCancelled, LLMResponseError, LLMTruncatedError, api_url_error, strip_model_thinking,
+)
 from sayink.llm_transport import (
     Cancellation, LLMBrokenStream, LLMContextError, LLMDeadlineError, completion, is_billing_error,
 )
@@ -186,7 +188,7 @@ class MinutesWorker(QThread):
             self._publish_preview()
 
     def _publish_preview(self):
-        raw = self._preview_raw.lstrip()
+        raw = strip_model_thinking(self._preview_raw).lstrip()
         readable = []
         for match in re.finditer(r'"(?:summary|text|task)"\s*:\s*"((?:\\.|[^"\\])*)(?:"|$)', raw):
             value = match.group(1)

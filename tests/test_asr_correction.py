@@ -1,5 +1,6 @@
 """Glossary mis-hearing variants and the LLM 纠错 (correction) mode."""
 
+import json
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -233,6 +234,30 @@ class TestCorrectionMode:
         client.post.return_value = response
         client.__enter__ = lambda self: client
         client.__exit__ = lambda self, *exc: False
+        json_dumps = json.dumps
+
+        def stream(method, url, headers=None, json=None, **kwargs):
+            resp = client.post(url, headers=headers, json=json)
+            content = resp.json()["choices"][0]["message"]["content"]
+            resp.status_code = 200
+            resp.iter_lines.return_value = iter((
+                "data: " + json_dumps(
+                    {"choices": [{"delta": {"content": content}, "finish_reason": None}]}
+                ),
+                "",
+                "data: " + json_dumps(
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+                ),
+                "",
+                "data: [DONE]",
+                "",
+            ))
+            ctx = MagicMock()
+            ctx.__enter__.return_value = resp
+            ctx.__exit__.return_value = False
+            return ctx
+
+        client.stream.side_effect = stream
         fake_httpx = MagicMock()
         fake_httpx.Client.return_value = client
         fake_httpx.NetworkError = type("NetworkError", (Exception,), {})
@@ -248,6 +273,7 @@ class TestCorrectionMode:
         assert results == ["今天赠送一套"]
         payload = client.post.call_args.kwargs["json"]
         assert payload["temperature"] == 0.0
+        assert payload["stream"] is True
         assert payload["thinking"] == {"type": "disabled"}
         assert payload["messages"][0]["content"] == CORRECTION_PROMPT
         assert payload["messages"][1]["content"].endswith("待校对：\n今天增送一套")

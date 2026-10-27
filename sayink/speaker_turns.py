@@ -37,6 +37,7 @@ CONTEXT_SEC = 2.0
 CONTEXT_HEAD_SEC = 6.0
 CONTEXT_GAP_MS = 50
 SHORT_CONTEXT_STEP_SEC = 0.1
+REPEATED_WINDOW_SIMILARITY = 0.9
 log = logging.getLogger("SayInk")
 
 
@@ -89,6 +90,34 @@ def _vector(value) -> np.ndarray | None:
         return None
     norm = float(np.linalg.norm(vec))
     return vec / norm if np.isfinite(norm) and norm > 1e-6 else None
+
+
+def _conflicting_repeated_windows(vectors) -> bool:
+    """Detect two recurring, distinct voices without inventing a cut point.
+
+    Windows already passed the clear-speech gate. Each candidate needs a
+    second consistent window and must differ strongly from both windows of
+    the other candidate. This only signals uncertainty, not identities.
+    """
+    valid = [v for v in vectors if v is not None]
+    if len(valid) < 4:
+        return False
+    stacked = np.stack(valid)
+    similarities = stacked @ stacked.T
+    count = len(valid)
+    for left in range(count):
+        for right in range(left + 1, count):
+            if similarities[left, right] > CHANGE_SIMILARITY:
+                continue
+            left_support = [i for i in range(count) if i not in (left, right)
+                            and similarities[left, i] >= REPEATED_WINDOW_SIMILARITY
+                            and similarities[right, i] <= CHANGE_SIMILARITY]
+            right_support = [i for i in range(count) if i not in (left, right)
+                             and similarities[right, i] >= REPEATED_WINDOW_SIMILARITY
+                             and similarities[left, i] <= CHANGE_SIMILARITY]
+            if any(a != b for a in left_support for b in right_support):
+                return True
+    return False
 
 
 class SpeakerTurnContext:
@@ -493,6 +522,11 @@ class SpeakerTurnDetector:
             elif confirmed is None:
                 unresolved.append(cut)
         if not cuts:
+            # Distinct voices may recur only in isolated windows, leaving no
+            # stable consecutive run and no reliable cut. Their whole-clip
+            # embedding would blend voices and could poison a speaker profile.
+            if not proposed and self._activity_guard is None and _conflicting_repeated_windows(vectors):
+                return self._plain_single(samples, uncertain=True, mixed=True)
             return self._single(samples, uncertain=bool(unresolved), cancelled=cancelled)
         bounds = [0, *cuts[:MAX_TURNS - 1], samples.size]
         turns = []

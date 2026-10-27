@@ -142,6 +142,30 @@ def test_ctrl_s_saves_minutes_draft(config, tmp_path):
         history.close(timeout=2)
 
 
+def test_live_notes_are_written_again_when_the_first_save_does_not_land(config, tmp_path, monkeypatch):
+    page, controller, history, _record = _page(config, tmp_path)
+    try:
+        live = _live(page, controller, history)
+        real = controller.update_meeting
+        calls = {"n": 0}
+
+        def flaky(meeting_id, **fields):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return
+            return real(meeting_id, **fields)
+
+        monkeypatch.setattr(controller, "update_meeting", flaky)
+        page._user_notes.setPlainText("不能丢")
+        assert page.flush_pending_user_notes() is True
+        assert controller.store.get_meeting(live.id).notes_user == "不能丢"
+        assert calls["n"] == 2
+    finally:
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
 def test_external_end_saves_the_note_still_waiting_for_autosave(config, tmp_path):
     page, controller, history, _record = _page(config, tmp_path)
     try:

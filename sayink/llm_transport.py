@@ -9,8 +9,9 @@ import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from sayink.text_polisher import (
-    LLMCancelled, LLMResponseError, LLMTruncatedError, _request_headers, chat_completions_url,
-    normalize_api_key, normalize_model_name, thinking_payload_extra,
+    LLMBrokenStream, LLMCancelled, LLMResponseError, LLMTruncatedError, _request_headers,
+    chat_completions_url, normalize_api_key, normalize_model_name, strip_model_thinking,
+    thinking_payload_extra,
 )
 
 log = logging.getLogger("SayInk")
@@ -18,10 +19,6 @@ log = logging.getLogger("SayInk")
 
 class LLMContextError(LLMResponseError):
     """The provider rejected the input budget."""
-
-
-class LLMBrokenStream(LLMResponseError):
-    """The stream ended without a successful model finish event."""
 
 
 class LLMDeadlineError(LLMResponseError):
@@ -91,6 +88,14 @@ def _retry_after(response, fallback):
             return max(0.0, (stamp - datetime.now(timezone.utc)).total_seconds())
         except (ValueError, TypeError, OverflowError):
             return fallback
+
+
+def _visible_text(text: str) -> str:
+    """Drop a provider's ``<think>`` block. What remains is the only saved text."""
+    text = strip_model_thinking(text)
+    if not text:
+        raise LLMResponseError("API 返回空内容")
+    return text
 
 
 def _check_choice(choice, *, streamed=False):
@@ -199,10 +204,7 @@ async def _stream_text(response, *, first_timeout, idle_timeout, on_delta, on_st
         # SSE comments and event/id fields are intentionally ignored.
     if not finished:
         raise LLMBrokenStream("流式连接提前结束，结果未保存，请重试")
-    text = "".join(pieces).strip()
-    if not text:
-        raise LLMResponseError("API 返回空内容")
-    return text
+    return _visible_text("".join(pieces))
 
 
 async def completion(client, httpx, *, api_url, api_key, model_name, messages,
@@ -295,10 +297,7 @@ async def completion(client, httpx, *, api_url, api_key, model_name, messages,
                             choices = data.get("choices") if isinstance(data, dict) else None
                             if not isinstance(choices, list) or not choices:
                                 raise LLMResponseError("API 响应格式异常")
-                            text, _ = _check_choice(choices[0])
-                            text = text.strip()
-                            if not text:
-                                raise LLMResponseError("API 返回空内容")
+                            text = _visible_text(_check_choice(choices[0])[0])
                             if on_status:
                                 on_status("正在接收正文…")
                             if on_delta:

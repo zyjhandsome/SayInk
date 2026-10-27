@@ -1,4 +1,5 @@
 import ipaddress
+import json
 import logging
 import re
 import time
@@ -165,6 +166,11 @@ def chat_completions_url(api_url: str) -> str:
 # longest acceptable wait, and it falls back (raw text / error) anyway.
 CHAT_RETRY_STATUS = frozenset({502, 503, 504})
 CHAT_RETRY_DELAY_SEC = 0.5
+# Streaming waits for the first byte, then for the next one. A non-streaming
+# call makes the gateway buffer the whole answer and often returns 504 first.
+STREAM_CONNECT_TIMEOUT = 10.0
+STREAM_READ_TIMEOUT = 120.0
+STREAM_TOTAL_TIMEOUT = 600.0
 
 # Official dual-mode DeepSeek models think by default; the reasoning shares
 # the output budget with the edit and can leave ``content`` empty. Other
@@ -196,6 +202,77 @@ class LLMTruncatedError(LLMResponseError):
     """The provider stopped at its output limit; the text is incomplete."""
 
 
+class LLMBrokenStream(LLMResponseError):
+    """The stream ended without a successful model finish event."""
+
+
+def http_stream_timeout(httpx):
+    """Connect quickly, then allow a slow first token. Read timeout is per
+    socket read, so it is also the longest silent gap between chunks."""
+    return httpx.Timeout(
+        connect=STREAM_CONNECT_TIMEOUT,
+        read=STREAM_READ_TIMEOUT,
+        write=30.0,
+        pool=10.0,
+    )
+
+
+_STREAM_REJECT_TERMS = ("not support", "unsupported", "not allowed", "not implemented", "不支持")
+_TEMPERATURE_REJECT_TERMS = ("not support", "unsupported", "only the default", "不支持")
+
+
+def _rejects_stream(message: str) -> bool:
+    text = (message or "").lower()
+    return "stream" in text and any(term in text for term in _STREAM_REJECT_TERMS)
+
+
+def _adapt_chat_flags(message: str, token_parameter: str, include_temperature: bool):
+    """Updated request flags when a 400 names a field the model will not take.
+
+    ``None`` when the message is not one of those compatibility errors.
+    Switching flags does not consume the single network retry.
+    """
+    text = (message or "").lower()
+    if token_parameter == "max_tokens" and "max_completion_tokens" in text:
+        return "max_completion_tokens", include_temperature
+    if (
+        include_temperature
+        and "temperature" in text
+        and any(term in text for term in _TEMPERATURE_REJECT_TERMS)
+    ):
+        return token_parameter, False
+    return None
+
+
+def _chat_payload(
+    model_name: str,
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int,
+    extra_payload: dict | None,
+    *,
+    stream: bool,
+    token_parameter: str,
+    include_temperature: bool,
+) -> dict:
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": temperature,
+        token_parameter: max_tokens,
+        **(extra_payload or {}),
+    }
+    other = "max_completion_tokens" if token_parameter == "max_tokens" else "max_tokens"
+    payload.pop(other, None)
+    if not include_temperature:
+        payload.pop("temperature", None)
+    if stream:
+        payload["stream"] = True
+    else:
+        payload.pop("stream", None)
+    return payload
+
+
 def chat_completion(
     client,
     httpx,
@@ -211,33 +288,34 @@ def chat_completion(
     label: str = "LLM",
     reject_truncated: bool = False,
     extra_payload: dict | None = None,
+    token_parameter: str = "max_tokens",
+    include_temperature: bool = True,
 ) -> str:
-    """One OpenAI-compatible chat completion, shared by polishing and minutes.
+    """One non-streaming OpenAI-compatible chat completion.
 
     POSTs once and retries once after ``retry_delay_sec`` on a transient
     network error or a 502/503/504. Returns the stripped message content.
-    Raises :class:`LLMCancelled` when ``is_cancelled()`` turns true,
-    :class:`LLMResponseError` for malformed/empty answers, and lets
-    ``httpx`` exceptions (timeout, HTTP status) propagate. ``extra_payload``
+    Raises :class:`LLMCancelled` when ``is_cancelled()`` turns true, and
+    :class:`LLMResponseError` for an HTTP error or a malformed answer.
+    Timeouts still propagate as ``httpx`` exceptions. ``extra_payload``
     adds provider-specific fields (see :func:`thinking_payload_extra`).
     """
     cancelled = is_cancelled or (lambda: False)
     model_name = normalize_model_name(model_name)
     api_key = normalize_api_key(api_key)
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        **(extra_payload or {}),
-    }
     url = chat_completions_url(api_url)
     headers = _request_headers(api_key)
     transient = (httpx.NetworkError, httpx.RemoteProtocolError)
     response = None
-    for attempt in (1, 2):
+    attempt = 0
+    while attempt < 2:
+        attempt += 1
         if cancelled():
             raise LLMCancelled()
+        payload = _chat_payload(
+            model_name, messages, temperature, max_tokens, extra_payload,
+            stream=False, token_parameter=token_parameter, include_temperature=include_temperature,
+        )
         try:
             response = client.post(url, headers=headers, json=payload)
         except transient as exc:
@@ -246,17 +324,42 @@ def chat_completion(
             if attempt == 2:
                 raise
             log.warning("LLM %s 连接异常，%.1f 秒后重试一次: %s", label, retry_delay_sec, exc)
-        else:
-            if cancelled():
-                raise LLMCancelled()
-            if attempt == 2 or response.status_code not in CHAT_RETRY_STATUS:
-                break
-            log.warning("LLM %s 返回 HTTP %s，%.1f 秒后重试一次", label, response.status_code, retry_delay_sec)
-        time.sleep(retry_delay_sec)
-    if cancelled():
-        raise LLMCancelled()
-    response.raise_for_status()
+            time.sleep(retry_delay_sec)
+            continue
+        if cancelled():
+            raise LLMCancelled()
+        code = response.status_code if isinstance(getattr(response, "status_code", None), int) else None
+        if code in CHAT_RETRY_STATUS and attempt == 1:
+            log.warning("LLM %s 返回 HTTP %s，%.1f 秒后重试一次", label, code, retry_delay_sec)
+            time.sleep(retry_delay_sec)
+            continue
+        if code is not None and code >= 400:
+            try:
+                message = _body_error_message(response.json())
+            except Exception:
+                message = ""
+            adapted = _adapt_chat_flags(message, token_parameter, include_temperature)
+            if adapted is not None and adapted != (token_parameter, include_temperature):
+                token_parameter, include_temperature = adapted
+                attempt -= 1
+                continue
+            raise LLMResponseError(http_status_message(code))
+        break
+    if response is None:
+        raise LLMResponseError("API 响应格式异常")
     return chat_message_text(response.json(), reject_truncated=reject_truncated)
+
+
+def _body_error_message(body) -> str:
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and isinstance(err.get("message"), str):
+            return err["message"]
+        if isinstance(err, str):
+            return err
+    if isinstance(body, str):
+        return body
+    return ""
 
 
 _THINK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -312,6 +415,255 @@ def http_status_message(code: int | None) -> str:
     if code is None:
         return "HTTP 错误"
     return f"HTTP 错误: {code}"
+
+
+def _parse_sse_json(raw: str):
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        raise LLMResponseError("流式响应格式异常") from exc
+
+
+def _iter_sse_payloads(lines):
+    """Yield JSON objects from an SSE chat stream.
+
+    A provider that ignores ``stream: true`` and returns one JSON body is
+    accepted as a single event.
+    """
+    event = []
+    raw_lines = []
+    saw_data = False
+
+    def flush():
+        nonlocal saw_data
+        if not event:
+            return None
+        raw = "\n".join(event)
+        event.clear()
+        saw_data = True
+        if raw == "[DONE]":
+            return "[DONE]"
+        return _parse_sse_json(raw)
+
+    for line in lines:
+        if line is None:
+            continue
+        raw_lines.append(line)
+        if line == "":
+            item = flush()
+            if item == "[DONE]":
+                return
+            if item is not None:
+                yield item
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            event.append(line[5:].lstrip(" "))
+            continue
+        if line.startswith(("event:", "id:", "retry:")):
+            continue
+    item = flush()
+    if item == "[DONE]":
+        return
+    if item is not None:
+        yield item
+        return
+    if saw_data:
+        return
+    blob = "\n".join(line for line in raw_lines if line).strip()
+    if blob.startswith(("{", "[")):
+        yield _parse_sse_json(blob)
+
+
+def _iter_stream_pieces(lines):
+    """Yield ``(content, reasoning, finish_reason)`` from a chat stream."""
+    for data in _iter_sse_payloads(lines):
+        if not isinstance(data, dict) or data.get("error"):
+            raise LLMResponseError("流式响应返回错误")
+        choices = data.get("choices")
+        if choices == [] and data.get("usage") is not None:
+            continue
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise LLMResponseError("API 响应格式异常")
+        choice = choices[0]
+        reason = choice.get("finish_reason")
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                raise LLMResponseError("API 响应格式异常")
+            delta = message
+            if reason is None:
+                reason = "stop"
+        content = delta.get("content")
+        if content is None:
+            content = ""
+        elif not isinstance(content, str):
+            raise LLMResponseError("API 返回了不支持的正文格式")
+        reasoning = delta.get("reasoning_content") or ""
+        if not isinstance(reasoning, str):
+            reasoning = ""
+        yield content, reasoning, reason
+
+
+def _collect_stream_text(lines, *, is_cancelled, total_timeout: float, reject_truncated: bool) -> str:
+    pieces = []
+    finished = False
+    deadline = time.monotonic() + total_timeout
+    for content, _reasoning, reason in _iter_stream_pieces(lines):
+        if is_cancelled():
+            raise LLMCancelled()
+        if time.monotonic() > deadline:
+            raise TimeoutError("总时长超时")
+        if finished and content:
+            raise LLMResponseError("流式响应在结束后仍返回正文")
+        if content:
+            pieces.append(content)
+        if reason in ("length", "max_tokens"):
+            if reject_truncated:
+                raise LLMTruncatedError("模型输出被截断")
+            finished = True
+        elif reason == "stop":
+            finished = True
+        elif reason:
+            raise LLMResponseError("模型未正常完成输出（" + str(reason) + "）")
+    text = strip_model_thinking("".join(pieces))
+    if not finished:
+        raise LLMBrokenStream("流式连接提前结束，结果未保存，请重试")
+    if not text:
+        raise LLMResponseError("API 返回空内容")
+    return text
+
+
+def _stream_showed_activity(lines) -> bool:
+    """True once any visible token or reasoning token arrives."""
+    for content, reasoning, _reason in _iter_stream_pieces(lines):
+        if content.strip() or reasoning.strip():
+            return True
+    return False
+
+
+def _error_message(response) -> str:
+    try:
+        response.read()
+    except Exception:
+        pass
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    return _body_error_message(body)
+
+
+def _stream_unsupported(response) -> bool:
+    """True when the endpoint explicitly rejects streaming."""
+    return _rejects_stream(_error_message(response))
+
+
+def stream_chat_completion(
+    client,
+    httpx,
+    *,
+    api_url: str,
+    api_key: str,
+    model_name: str,
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int,
+    is_cancelled: Callable[[], bool] | None = None,
+    retry_delay_sec: float = CHAT_RETRY_DELAY_SEC,
+    label: str = "LLM",
+    reject_truncated: bool = False,
+    extra_payload: dict | None = None,
+    total_timeout: float = STREAM_TOTAL_TIMEOUT,
+) -> str:
+    """Streaming chat completion. Retries once on a dropped connection,
+    an unfinished stream, or a 502/503/504. Timeouts are not retried.
+    A model that rejects ``max_tokens`` or ``temperature`` is asked again
+    with the field it named; that adjustment is not the network retry.
+    """
+    cancelled = is_cancelled or (lambda: False)
+    model_name = normalize_model_name(model_name)
+    api_key = normalize_api_key(api_key)
+    url = chat_completions_url(api_url)
+    headers = _request_headers(api_key)
+    transient = (httpx.NetworkError, httpx.RemoteProtocolError, LLMBrokenStream)
+    token_parameter = "max_tokens"
+    include_temperature = True
+    downgrade = False
+    attempt = 0
+    while attempt < 2:
+        attempt += 1
+        if cancelled():
+            raise LLMCancelled()
+        payload = _chat_payload(
+            model_name, messages, temperature, max_tokens, extra_payload,
+            stream=True, token_parameter=token_parameter, include_temperature=include_temperature,
+        )
+        try:
+            with client.stream("POST", url, headers=headers, json=payload) as response:
+                code = response.status_code
+                if isinstance(code, int) and code >= 400:
+                    message = _error_message(response)
+                    if code in (400, 422, 501) and _rejects_stream(message):
+                        log.info("LLM %s 接口不支持流式，改用普通请求", label)
+                        downgrade = True
+                        break
+                    adapted = _adapt_chat_flags(message, token_parameter, include_temperature)
+                    if adapted is not None and adapted != (token_parameter, include_temperature):
+                        token_parameter, include_temperature = adapted
+                        attempt -= 1
+                        continue
+                    if attempt == 1 and code in CHAT_RETRY_STATUS and not cancelled():
+                        log.warning(
+                            "LLM %s 返回 HTTP %s，%.1f 秒后重试一次",
+                            label, code, retry_delay_sec,
+                        )
+                        time.sleep(retry_delay_sec)
+                        continue
+                    if cancelled():
+                        raise LLMCancelled()
+                    raise LLMResponseError(http_status_message(code))
+                if cancelled():
+                    raise LLMCancelled()
+                try:
+                    return _collect_stream_text(
+                        response.iter_lines(),
+                        is_cancelled=cancelled,
+                        total_timeout=total_timeout,
+                        reject_truncated=reject_truncated,
+                    )
+                except TimeoutError as exc:
+                    raise httpx.TimeoutException(str(exc)) from exc
+        except transient as exc:
+            if cancelled():
+                raise LLMCancelled() from exc
+            if attempt == 2:
+                raise
+            if isinstance(exc, LLMBrokenStream):
+                log.warning("LLM %s 流式连接提前结束，%.1f 秒后重试一次", label, retry_delay_sec)
+            else:
+                log.warning("LLM %s 连接异常，%.1f 秒后重试一次: %s", label, retry_delay_sec, exc)
+            time.sleep(retry_delay_sec)
+    if downgrade:
+        return chat_completion(
+            client, httpx,
+            api_url=api_url,
+            api_key=api_key,
+            model_name=model_name,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            is_cancelled=cancelled,
+            retry_delay_sec=retry_delay_sec,
+            label=label,
+            reject_truncated=reject_truncated,
+            extra_payload=extra_payload,
+            token_parameter=token_parameter,
+            include_temperature=include_temperature,
+        )
+    raise LLMResponseError("API 响应格式异常")
 
 POLISH_PROMPT = (
     "你是一个纯文本润色工具，不是对话助手。\n"
@@ -481,8 +833,7 @@ class PolishWorker(QThread):
 
     def cancel(self):
         """Stop the worker: set the flag and drop the HTTP connection so a
-        request already waiting on the server does not hold the thread (and
-        app exit) for the full 15 s timeout."""
+        request already sent does not hold the thread for the read timeout."""
         self._cancelled = True
         client = self._client
         if client is not None:
@@ -508,12 +859,12 @@ class PolishWorker(QThread):
             log.debug("原文长度: %d 字符", len(self._text))
 
             options = self.request_options()
-            with httpx.Client(timeout=15.0) as client:
+            with httpx.Client(timeout=http_stream_timeout(httpx)) as client:
                 self._client = client
                 try:
                     if self._cancelled:
                         return
-                    polished = chat_completion(
+                    polished = stream_chat_completion(
                         client, httpx,
                         api_url=self._api_url,
                         api_key=self._api_key,
@@ -656,19 +1007,39 @@ class TextPolisher(QObject):
                 "model": model,
                 "messages": [{"role": "user", "content": "Hello"}],
                 "max_tokens": 16,
+                "stream": True,
                 **thinking_payload_extra(api_url, model, "disabled"),
             }
 
-            with httpx.Client(timeout=10.0) as client:
-                response = client.post(
-                    chat_completions_url(api_url),
-                    headers=_request_headers(key),
-                    json=payload,
-                )
-                response.raise_for_status()
-                chat_message_text(response.json())
-
-            return True, "连接成功"
+            headers = _request_headers(key)
+            url = chat_completions_url(api_url)
+            downgrade = False
+            with httpx.Client(timeout=http_stream_timeout(httpx)) as client:
+                with client.stream("POST", url, headers=headers, json=payload) as response:
+                    code = response.status_code
+                    if isinstance(code, int) and code >= 400:
+                        unsupported = code in (400, 422, 501) and _stream_unsupported(response)
+                        if unsupported:
+                            downgrade = True
+                        else:
+                            try:
+                                response.read()
+                            except Exception:
+                                pass
+                            return False, http_status_message(code)
+                    elif not _stream_showed_activity(response.iter_lines()):
+                        return False, "API 返回空内容"
+                    else:
+                        return True, "连接成功"
+                if downgrade:
+                    fallback = {k: v for k, v in payload.items() if k != "stream"}
+                    response = client.post(url, headers=headers, json=fallback)
+                    code = response.status_code if isinstance(getattr(response, "status_code", None), int) else None
+                    if code is not None and code >= 400:
+                        return False, http_status_message(code)
+                    chat_message_text(response.json())
+                    return True, "连接成功"
+            return False, "连接失败: 未收到响应"
         except httpx.TimeoutException:
             return False, "连接超时"
         except httpx.HTTPStatusError as exc:

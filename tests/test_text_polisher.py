@@ -1,3 +1,4 @@
+import json
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -90,7 +91,60 @@ def _fake_httpx_module(response=None, raise_exc=None):
         client.post.side_effect = raise_exc
     else:
         client.post.return_value = response
+
+    def stream(method, url, headers=None, json=None, **kwargs):
+        resp = client.post(url, headers=headers, json=json)
+        _prepare_sse(resp)
+        ctx = MagicMock()
+        ctx.__enter__.return_value = resp
+        ctx.__exit__.return_value = False
+        return ctx
+
+    client.stream.side_effect = stream
     return fake, client
+
+
+def _prepare_sse(resp):
+    """Turn a chat-completion JSON body into SSE lines for streaming callers."""
+    if resp is None or not hasattr(resp, "json"):
+        return
+    try:
+        payload = resp.json()
+    except Exception:
+        resp.iter_lines.return_value = iter(())
+        return
+    if not isinstance(payload, dict):
+        resp.iter_lines.return_value = iter(("data: not-json", ""))
+        return
+    choices = payload.get("choices")
+    message = None
+    reason = "stop"
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+        reason = choices[0].get("finish_reason") or "stop"
+    if isinstance(message, dict) and "content" in message and isinstance(message.get("content"), str):
+        content = message.get("content")
+        resp.iter_lines.return_value = iter((
+            "data: " + json.dumps(
+                {"choices": [{"delta": {"content": content}, "finish_reason": None}]},
+                ensure_ascii=False,
+            ),
+            "",
+            "data: " + json.dumps(
+                {"choices": [{"delta": {}, "finish_reason": reason}]},
+                ensure_ascii=False,
+            ),
+            "",
+            "data: [DONE]",
+            "",
+        ))
+        return
+    resp.iter_lines.return_value = iter((
+        "data: " + json.dumps(payload, ensure_ascii=False),
+        "",
+        "data: [DONE]",
+        "",
+    ))
 
 
 class TestPolishPrompt:
@@ -320,8 +374,14 @@ class TestPolishWorkerRun:
         results, errors = self._run_worker(worker, fake)
         assert results == ["润色后的文本"]
         assert errors == []
-        # URL gets /chat/completions appended
-        assert client.post.call_args[0][0].endswith("/chat/completions")
+        # URL gets /chat/completions appended, and the body is streamed so a
+        # slow gateway can forward the first token instead of buffering.
+        sent = client.post.call_args
+        assert sent[0][0].endswith("/chat/completions")
+        assert sent.kwargs["json"]["stream"] is True
+        timeout = fake.Timeout.call_args.kwargs
+        assert timeout["connect"] == 10.0
+        assert timeout["read"] == 120.0
 
     def test_cancel_during_the_request_closes_the_connection_and_emits_nothing(self):
         """Exit must not wait the full 15 s timeout on a request already sent:
@@ -471,6 +531,19 @@ class TestPolishWorkerRetry:
         assert errors and "超时" in errors[0]
         assert client.post.call_count == 1
 
+    def test_unsupported_stream_falls_back_to_a_json_body(self):
+        bad = _make_response({"error": {"message": "stream is unsupported"}})
+        bad.status_code = 400
+        ok = _make_response({"choices": [{"message": {"content": "润色"}}]})
+        ok.status_code = 200
+        fake, client = _fake_httpx_module()
+        client.post.side_effect = [bad, ok]
+        results, errors = self._run_worker(self._worker(), fake)
+        assert results == ["润色"] and errors == []
+        assert client.post.call_count == 2
+        assert client.post.call_args_list[0].kwargs["json"]["stream"] is True
+        assert "stream" not in client.post.call_args_list[1].kwargs["json"]
+
     def test_rate_limit_is_not_retried(self):
         bad = _make_response({}, status_ok=False)
         bad.status_code = 429
@@ -495,7 +568,7 @@ class TestPolishWorkerRetry:
 
 
 class TestChatCompletionHelper:
-    """chat_completion() is the one HTTP path shared by 润色 and 会议纪要."""
+    """chat_completion() is the non-streaming helper. Polish streams."""
 
     def _call(self, client, fake, **overrides):
         from sayink.text_polisher import chat_completion
@@ -552,11 +625,13 @@ class TestChatCompletionHelper:
                 self._call(client, fake)
 
     def test_gateway_and_network_errors_retry_once_then_propagate(self):
+        from sayink.text_polisher import LLMResponseError
+
         bad = _make_response({}, status_ok=False)
         bad.status_code = 502
         fake, client = _fake_httpx_module()
         client.post.side_effect = [bad, bad]
-        with pytest.raises(RuntimeError, match="HTTP 500"):  # the fake's raise_for_status
+        with pytest.raises(LLMResponseError, match="502"):
             self._call(client, fake)
         assert client.post.call_count == 2
 
@@ -712,8 +787,97 @@ class TestTestConnectionRun:
         assert payload["model"] == "deepseek-flash"
         assert payload["max_tokens"] == 16
         assert payload["thinking"] == {"type": "disabled"}
+        assert payload["stream"] is True
         assert client.post.call_args.kwargs["headers"]["Authorization"] == "Bearer sk-x"
         assert client.post.call_args[0][0] == "https://api.deepseek.com/chat/completions"
+        timeout = fake.Timeout.call_args.kwargs
+        assert timeout["read"] == 120.0
+
+    def test_first_token_is_enough_to_call_the_connection_ok(self):
+        """A slow gateway 504s when the client waits for the whole body.
+        The probe returns as soon as the first token arrives."""
+        fake, client = _fake_httpx_module()
+        resp = MagicMock()
+        resp.status_code = 200
+
+        def lines():
+            yield "data: " + json.dumps(
+                {"choices": [{"delta": {"content": "好"}, "finish_reason": None}]}
+            )
+            yield ""
+            raise AssertionError("测试连接不应等待后续正文")
+
+        resp.iter_lines.side_effect = lines
+        ctx = MagicMock()
+        ctx.__enter__.return_value = resp
+        ctx.__exit__.return_value = False
+
+        def stream(method, url, headers=None, json=None, **kwargs):
+            client.post(url, headers=headers, json=json)
+            return ctx
+
+        client.stream.side_effect = stream
+        with patch.dict(sys.modules, {"httpx": fake}):
+            ok, msg = TextPolisher.test_connection("https://api.example.com/v1", "k", "m")
+        assert ok is True
+        assert "成功" in msg
+        assert client.post.call_args.kwargs["json"]["stream"] is True
+
+    def test_reasoning_token_counts_as_connected(self):
+        fake, client = _fake_httpx_module()
+        resp = MagicMock()
+        resp.status_code = 200
+
+        def lines():
+            yield "data: " + json.dumps(
+                {"choices": [{"delta": {"reasoning_content": "想"}, "finish_reason": None}]}
+            )
+            yield ""
+            raise AssertionError("测试连接不应等待正文")
+
+        resp.iter_lines.side_effect = lines
+        ctx = MagicMock()
+        ctx.__enter__.return_value = resp
+        ctx.__exit__.return_value = False
+        client.stream.side_effect = lambda *a, **k: ctx
+        with patch.dict(sys.modules, {"httpx": fake}):
+            ok, msg = TextPolisher.test_connection("https://api.example.com/v1", "k", "m")
+        assert ok is True
+        assert "成功" in msg
+
+    def test_plain_400_does_not_downgrade(self):
+        bad = _make_response({"error": {"message": "model not found"}})
+        bad.status_code = 400
+        fake, client = _fake_httpx_module()
+        client.post.side_effect = [bad]
+        with patch.dict(sys.modules, {"httpx": fake}):
+            ok, msg = TextPolisher.test_connection("https://api.example.com/v1", "k", "m")
+        assert ok is False
+        assert "模型" in msg
+        assert client.post.call_count == 1
+
+    def test_unsupported_stream_retries_without_streaming(self):
+        bad = _make_response({"error": {"message": "stream is not supported by this endpoint"}})
+        bad.status_code = 400
+        ok_resp = _make_response(_CHAT_OK)
+        ok_resp.status_code = 200
+        fake, client = _fake_httpx_module()
+        client.post.side_effect = [bad, ok_resp]
+        with patch.dict(sys.modules, {"httpx": fake}):
+            ok, msg = TextPolisher.test_connection("https://api.example.com/v1", "k", "m")
+        assert ok is True and "成功" in msg
+        assert client.post.call_count == 2
+        assert client.post.call_args_list[0].kwargs["json"]["stream"] is True
+        assert "stream" not in client.post.call_args_list[1].kwargs["json"]
+
+    def test_a_json_body_is_accepted_when_the_server_ignores_streaming(self):
+        from sayink.text_polisher import _collect_stream_text
+
+        body = json.dumps({"choices": [{"message": {"content": " 润色 "}}]})
+        text = _collect_stream_text(
+            [body], is_cancelled=lambda: False, total_timeout=5, reject_truncated=True,
+        )
+        assert text == "润色"
 
     def test_http_401_names_the_key(self):
         resp = _make_response({})
@@ -805,3 +969,128 @@ class TestPolishWorkerLifecycle:
 
         QCoreApplication.processEvents()
         assert worker not in polisher._workers
+
+
+def _stream_response(lines, status=200):
+    resp = MagicMock()
+    resp.status_code = status
+    resp.iter_lines.return_value = iter(lines)
+    resp.read.return_value = b""
+    resp.json.return_value = {}
+    ctx = MagicMock()
+    ctx.__enter__.return_value = resp
+    ctx.__exit__.return_value = False
+    return resp, ctx
+
+
+def _call_stream(client, fake, contexts):
+    from sayink.text_polisher import stream_chat_completion
+
+    def stream(method, url, headers=None, json=None, **kwargs):
+        return contexts.pop(0)
+
+    client.stream.side_effect = stream
+    return stream_chat_completion(
+        client, fake,
+        api_url="https://api.example.com/v1",
+        api_key="k",
+        model_name="m",
+        messages=[{"role": "user", "content": "hi"}],
+        temperature=0.3,
+        max_tokens=32,
+        retry_delay_sec=0,
+    )
+
+
+class TestStreamRecovery:
+    def _broken(self):
+        _resp, ctx = _stream_response((
+            'data: {"choices":[{"delta":{"content":"半"},"finish_reason":null}]}',
+            "",
+            "data: [DONE]",
+            "",
+        ))
+        return ctx
+
+    def _done(self):
+        _resp, ctx = _stream_response((
+            'data: {"choices":[{"delta":{"content":"完整"},"finish_reason":null}]}',
+            "",
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "",
+            "data: [DONE]",
+            "",
+        ))
+        return ctx
+
+    def test_an_unfinished_stream_is_retried_once(self):
+        from sayink.text_polisher import LLMBrokenStream
+
+        fake, client = _fake_httpx_module()
+        assert _call_stream(client, fake, [self._broken(), self._done()]) == "完整"
+        with pytest.raises(LLMBrokenStream, match="提前结束"):
+            _call_stream(client, fake, [self._broken(), self._broken()])
+
+    def test_content_filter_is_named_and_not_retried(self):
+        from sayink.text_polisher import LLMResponseError
+
+        fake, client = _fake_httpx_module()
+        _resp, ctx = _stream_response((
+            'data: {"choices":[{"delta":{"content":"no"},"finish_reason":"content_filter"}]}',
+            "",
+        ))
+        with pytest.raises(LLMResponseError, match="content_filter"):
+            _call_stream(client, fake, [ctx])
+        assert client.stream.call_count == 1
+
+    def test_http_401_uses_the_key_message(self):
+        from sayink.text_polisher import LLMResponseError
+
+        fake, client = _fake_httpx_module()
+        resp, ctx = _stream_response((), status=401)
+        resp.json.return_value = {"error": {"message": "invalid api key"}}
+        with pytest.raises(LLMResponseError, match="密钥"):
+            _call_stream(client, fake, [ctx])
+
+    def test_max_tokens_and_temperature_are_adapted_without_burning_the_retry(self):
+        fake, client = _fake_httpx_module()
+        payloads = []
+
+        def stream(method, url, headers=None, json=None, **kwargs):
+            payloads.append(json)
+            if "max_tokens" in json:
+                resp, ctx = _stream_response((), status=400)
+                resp.json.return_value = {"error": {"message": "Use max_completion_tokens instead of max_tokens"}}
+                return ctx
+            if "temperature" in json:
+                resp, ctx = _stream_response((), status=400)
+                resp.json.return_value = {"error": {"message": "temperature is unsupported"}}
+                return ctx
+            _resp, ctx = _stream_response((
+                'data: {"choices":[{"delta":{"content":"好"},"finish_reason":"stop"}]}',
+                "",
+            ))
+            return ctx
+
+        client.stream.side_effect = stream
+        from sayink.text_polisher import stream_chat_completion
+
+        text = stream_chat_completion(
+            client, fake,
+            api_url="https://api.example.com/v1", api_key="k", model_name="m",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.3, max_tokens=32, retry_delay_sec=0,
+        )
+        assert text == "好"
+        assert "max_tokens" in payloads[0]
+        assert payloads[-1]["max_completion_tokens"] == 32
+        assert "temperature" not in payloads[-1]
+        assert "max_tokens" not in payloads[-1]
+
+    def test_streamed_think_block_is_not_returned(self):
+        fake, client = _fake_httpx_module()
+        _resp, ctx = _stream_response((
+            'data: {"choices":[{"delta":{"content":"<think>草稿</think>润色后"},"finish_reason":"stop"}]}',
+            "",
+        ))
+        assert _call_stream(client, fake, [ctx]) == "润色后"

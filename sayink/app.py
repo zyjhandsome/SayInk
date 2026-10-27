@@ -94,7 +94,7 @@ MIN_AUDIO_SAMPLES = 1600  # 0.1s at 16kHz — ignore recordings shorter than thi
 # speech gate never opened, so the hint is "no speech", not "too short".
 HOLD_NO_SPEECH_SEC = 1.0
 SHORT_TAP_TRAY_COOLDOWN_S = 300  # 托盘「按过短」提示最少间隔，避免输入法反复弹窗
-OUTPUT_WATCHDOG_MS = 45_000  # 润色超时 15s + 粘贴校验，远小于此值
+OUTPUT_WATCHDOG_MS = 45_000  # 流式润色可读更久；到点仍改出原文，避免后面的句子一直排队
 # Queued speech beyond this pauses continuous listening (≈11 MB of float32);
 # captured audio is never dropped, only further capture stops.
 MAX_BACKLOG_AUDIO_SECONDS = 180

@@ -98,6 +98,27 @@ def test_gateway_ignoring_stream_can_return_json():
     })) == "plain"
 
 
+def test_think_blocks_are_removed_before_minutes_parse_the_answer():
+    """A draft JSON object inside <think> must not become the saved minutes."""
+    from sayink.minutes_render import extract_json
+
+    body = '<think>{"summary":"draft"}</think>{"summary":"final"}'
+    text = run(lambda request: streaming([event(body), event(finish="stop")]))
+    assert text == '{"summary":"final"}'
+    assert extract_json(text) == {"summary": "final"}
+
+
+def test_a_json_body_also_drops_a_think_block():
+    assert run(lambda request: httpx.Response(200, json={
+        "choices": [{"message": {"content": "<think>草稿</think>plain"}, "finish_reason": "stop"}]
+    })) == "plain"
+
+
+def test_a_think_block_with_no_answer_is_empty():
+    with pytest.raises(LLMResponseError, match="空内容"):
+        run(lambda request: streaming([event("<think>only</think>"), event(finish="stop")]))
+
+
 def test_continuous_reasoning_does_not_trigger_first_content_timeout():
     calls, deltas = [], []
 
