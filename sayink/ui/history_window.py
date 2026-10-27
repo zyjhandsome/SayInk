@@ -1841,7 +1841,7 @@ class HistoryWindow(QWidget):
 
     # ── actions ───────────────────────────────────────────────────
 
-    def _map_edited_text_to_segments(self, segments: list[SegmentRecord], text: str) -> dict[int, str]:
+    def _map_edited_text_to_segments(self, segments: list[SegmentRecord], text: str) -> dict[int, str] | None:
         ordered = _segments_in_order(segments)
         if not ordered:
             return {}
@@ -1849,6 +1849,9 @@ class HistoryWindow(QWidget):
         if len(ordered) == 1:
             return {ordered[0].seq: cleaned}
         parts = [p.strip() for p in re.split(r"\n\s*\n", cleaned) if p.strip()]
+        if len(parts) > len(ordered):
+            # A blank line inside one segment must not swallow every later segment.
+            return None
         if len(parts) == len(ordered):
             return {seg.seq: part for seg, part in zip(ordered, parts, strict=True)}
         out: dict[int, str] = {ordered[0].seq: cleaned}
@@ -1939,6 +1942,9 @@ class HistoryWindow(QWidget):
             self._exit_inline_edit_state()
         else:
             mapping = self._map_edited_text_to_segments(segments, new_text)
+            if mapping is None:
+                self._show_feedback("空行比段落多，修改未保存。请去掉多余空行后再保存。")
+                return
             updater = getattr(self._store, "enqueue_update_polished", None)
             if callable(updater):
                 updater(session_id, mapping)
@@ -2051,6 +2057,10 @@ class HistoryWindow(QWidget):
         if cleaned:
             segments = _segments_in_order(self._get_session_segments_effective(session_id))
             mapping = self._map_edited_text_to_segments(segments, cleaned)
+            if mapping is None:
+                self._show_feedback(f"{label}结果分段与原文不一致，未保存")
+                self.refresh()
+                return
             updater = getattr(self._store, "enqueue_update_polished", None)
             if callable(updater):
                 updater(session_id, mapping)

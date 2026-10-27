@@ -179,6 +179,16 @@ def test_repeated_isolated_incompatible_windows_do_not_create_a_mixed_profile():
     assert session.speaker_count == 0
 
 
+def test_repeated_windows_at_a_normal_match_still_refuse_a_blended_profile():
+    from sayink.speaker_turns import _conflicting_repeated_windows
+
+    voice_a = np.array([1.0, 0.0], dtype=np.float32)
+    voice_a_again = np.array([0.8, 0.6], dtype=np.float32)
+    voice_b = np.array([-1.0, 0.0], dtype=np.float32)
+    voice_b_again = np.array([-0.8, 0.6], dtype=np.float32)
+    assert _conflicting_repeated_windows([voice_a, voice_b, voice_a_again, voice_b_again])
+
+
 def test_one_isolated_different_window_does_not_block_a_clear_voice():
     # A single short feature change does not establish a second recurring
     # voice; preserve the established behavior for normal speaker variation.

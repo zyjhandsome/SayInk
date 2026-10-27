@@ -1013,32 +1013,43 @@ class TextPolisher(QObject):
 
             headers = _request_headers(key)
             url = chat_completions_url(api_url)
+            token_parameter = "max_tokens"
             downgrade = False
             with httpx.Client(timeout=http_stream_timeout(httpx)) as client:
-                with client.stream("POST", url, headers=headers, json=payload) as response:
-                    code = response.status_code
-                    if isinstance(code, int) and code >= 400:
-                        unsupported = code in (400, 422, 501) and _stream_unsupported(response)
-                        if unsupported:
-                            downgrade = True
-                        else:
+                for _attempt in range(3):
+                    body = {key: value for key, value in payload.items() if key not in ("max_tokens", "max_completion_tokens", "stream")}
+                    body[token_parameter] = 16
+                    if downgrade:
+                        response = client.post(url, headers=headers, json=body)
+                        code = response.status_code if isinstance(getattr(response, "status_code", None), int) else None
+                        if code is not None and code >= 400:
                             try:
-                                response.read()
+                                message = _body_error_message(response.json())
                             except Exception:
-                                pass
+                                message = ""
+                            adapted = _adapt_chat_flags(message, token_parameter, False)
+                            if adapted is not None and adapted[0] != token_parameter:
+                                token_parameter = adapted[0]
+                                continue
                             return False, http_status_message(code)
-                    elif not _stream_showed_activity(response.iter_lines()):
-                        return False, "API 返回空内容"
-                    else:
+                        chat_message_text(response.json())
                         return True, "连接成功"
-                if downgrade:
-                    fallback = {k: v for k, v in payload.items() if k != "stream"}
-                    response = client.post(url, headers=headers, json=fallback)
-                    code = response.status_code if isinstance(getattr(response, "status_code", None), int) else None
-                    if code is not None and code >= 400:
-                        return False, http_status_message(code)
-                    chat_message_text(response.json())
-                    return True, "连接成功"
+                    body["stream"] = True
+                    with client.stream("POST", url, headers=headers, json=body) as response:
+                        code = response.status_code
+                        if isinstance(code, int) and code >= 400:
+                            message = _error_message(response)
+                            if code in (400, 422, 501) and _rejects_stream(message):
+                                downgrade = True
+                                continue
+                            adapted = _adapt_chat_flags(message, token_parameter, False)
+                            if adapted is not None and adapted[0] != token_parameter:
+                                token_parameter = adapted[0]
+                                continue
+                            return False, http_status_message(code)
+                        if not _stream_showed_activity(response.iter_lines()):
+                            return False, "API 返回空内容"
+                        return True, "连接成功"
             return False, "连接失败: 未收到响应"
         except httpx.TimeoutException:
             return False, "连接超时"

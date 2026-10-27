@@ -823,6 +823,8 @@ class FloatingWindow(QWidget):
 
     def show_live_transcript(self, text: str) -> None:
         cleaned = " ".join((text or "").split())
+        if self._meeting_bar_stays(cleaned):
+            return
         if self._hold_capture():
             self._show_capture_transcript(cleaned)
             return
@@ -920,7 +922,21 @@ class FloatingWindow(QWidget):
         self._hide_timer.stop()
         self.hide()
 
+    def _meeting_bar_stays(self, excerpt: str = "") -> bool:
+        """A meeting keeps 「会议中」 and the clock. Other states only update the line of text."""
+        if not self._meeting_active:
+            return False
+        cleaned = " ".join((excerpt or "").split())
+        if cleaned:
+            self._live_text = cleaned
+            self._apply_excerpt(cleaned, keep_tail=True)
+        self._hide_timer.stop()
+        self._present()
+        return True
+
     def show_recognizing(self, partial_text: str = ""):
+        if self._meeting_bar_stays(partial_text):
+            return
         if self._hold_capture():
             if partial_text:
                 self._show_capture_transcript(partial_text)
@@ -954,6 +970,8 @@ class FloatingWindow(QWidget):
 
     def show_polishing(self, text: str = "", *, action: str = "润色"):
         """``action`` is the configured LLM step: 润色 or 纠错."""
+        if self._meeting_bar_stays(text or self._live_text):
+            return
         busy = f"{action}中"
         if self._hold_capture():
             if self._live_text:
@@ -987,6 +1005,8 @@ class FloatingWindow(QWidget):
         self._present()
 
     def show_success(self, message: str = "已输入", subtitle: str = ""):
+        if self._meeting_bar_stays(subtitle or self._live_text):
+            return
         self._model_loading_active = False
         if self._listening_active:
             self._set_state(f"正在听 · {message}", "STATE_LISTEN", pulse=False)
@@ -1018,6 +1038,8 @@ class FloatingWindow(QWidget):
             self._hide_timer.start(dur)
 
     def show_info(self, message: str, subtitle: str = ""):
+        if self._meeting_bar_stays(subtitle or self._live_text):
+            return
         if (self._listening_active or self._capture_active) and self._live_text:
             if self._listening_active:
                 self._set_state(f"正在听 · {message}", "STATE_LISTEN", pulse=False)
@@ -1046,6 +1068,8 @@ class FloatingWindow(QWidget):
     def show_warning(self, message: str, subtitle: str = ""):
         if self._model_loading_active:
             return
+        if self._meeting_bar_stays(subtitle or message):
+            return
         self._restore_compact_height()
         self._waveform.stop()
         self._waveform.hide()
@@ -1068,6 +1092,8 @@ class FloatingWindow(QWidget):
 
     def show_error(self, message: str, *, auto_dismiss_ms: int = 5000):
         if self._model_loading_active:
+            return
+        if self._meeting_bar_stays(message):
             return
         self._set_mode("compact")
         self._waveform.stop()

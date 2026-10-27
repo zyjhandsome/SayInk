@@ -355,6 +355,9 @@ class SettingsWindow(QWidget):
             if self._recognition_pending else
             "更改自动保存；空闲时应用，录音或处理期间的更改在本场结束后生效。"
         )
+        skipped = getattr(self, "_glossary_skip_note", "")
+        if skipped:
+            apply_text += " " + skipped
         if status is not None and status.error:
             apply_text += " 语音检测模型加载失败，当前按音量分段；可展开高级设置查看。"
         self._recognition_apply_label.setText(apply_text)
@@ -1928,6 +1931,7 @@ class SettingsWindow(QWidget):
 
         terms: list[dict] = []
         seen: set[str] = set()
+        skipped: list[str] = []
         for raw in self._meeting_glossary_edit.toPlainText().splitlines():
             # ``术语=误写1、误写2`` keeps the mis-hearings as variants; a plain
             # line is just the term.
@@ -1935,13 +1939,18 @@ class SettingsWindow(QWidget):
             if entry is None:
                 continue
             term = entry["term"]
-            if len(term) > MAX_HOTWORD_CHARS or term in seen:
+            if len(term) > MAX_HOTWORD_CHARS:
+                skipped.append(f"「{term[:8]}…」超过 {MAX_HOTWORD_CHARS} 字，未写入")
+                continue
+            if term in seen:
                 continue
             seen.add(term)
             entry["term"] = term
             terms.append(entry)
             if len(terms) >= MAX_HOTWORDS:
+                skipped.append(f"只保存前 {MAX_HOTWORDS} 条")
                 break
+        self._glossary_skip_note = " ".join(skipped)
         if terms != (self._config.get("stt.glossary", []) or []):
             self._config.set("stt.glossary", terms)
             self.recognition_changed.emit()

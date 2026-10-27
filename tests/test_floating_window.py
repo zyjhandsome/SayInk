@@ -265,6 +265,21 @@ def test_listen_bar_is_thin_without_extra_actions(win):
     assert not hasattr(win, "_settings_btn")
 
 
+def test_meeting_bar_keeps_its_clock_when_a_sentence_is_recognized(win):
+    from sayink.runtime_status import MEETING_STATE_LABELS
+
+    win.show_meeting("00:01:02")
+    title = MEETING_STATE_LABELS["live_short"]
+    win.show_recognizing("正在说的话")
+    win.show_live_transcript("正在说的话")
+    win.show_success("已记录", "正在说的话")
+    win.show_warning("似乎没采集到声音", "请检查麦克风")
+    assert win._status_label.text().startswith(title)
+    assert win._hide_timer.isActive() is False
+    win.update_meeting_clock("00:01:03")
+    assert win._status_label.text() == f"{title} · 00:01:03"
+
+
 def test_end_action_respects_esc_preference_and_preserves_meeting_semantics(win):
     win.set_esc_stops_continuous(False)
     win.show_listening()

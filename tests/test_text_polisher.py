@@ -856,6 +856,19 @@ class TestTestConnectionRun:
         assert "模型" in msg
         assert client.post.call_count == 1
 
+    def test_max_completion_tokens_is_accepted_by_the_connection_probe(self):
+        bad = _make_response({"error": {"message": "Use max_completion_tokens instead of max_tokens"}})
+        bad.status_code = 400
+        ok_resp = _make_response(_CHAT_OK)
+        ok_resp.status_code = 200
+        fake, client = _fake_httpx_module()
+        client.post.side_effect = [bad, ok_resp]
+        with patch.dict(sys.modules, {"httpx": fake}):
+            ok, msg = TextPolisher.test_connection("https://api.example.com/v1", "k", "m")
+        assert ok is True and "成功" in msg
+        assert "max_completion_tokens" in client.post.call_args.kwargs["json"]
+        assert "max_tokens" not in client.post.call_args.kwargs["json"]
+
     def test_unsupported_stream_retries_without_streaming(self):
         bad = _make_response({"error": {"message": "stream is not supported by this endpoint"}})
         bad.status_code = 400

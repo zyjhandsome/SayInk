@@ -841,6 +841,8 @@ class App(QObject):
         return "麦克风"
 
     def _on_no_speech_warning(self):
+        if self._meeting_active():
+            return
         log.warning("持续监听长时间未检测到有效语音")
         source = self._capture_source_name()
         self._floating.show_warning(

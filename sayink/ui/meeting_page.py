@@ -2779,7 +2779,9 @@ class MeetingPage(QWidget):
                     text = self._ctrl.transcript_text(record.id)
                 else:
                     notes = self._current_notes_text().rstrip()
-                    text = (notes + "\n\n" if notes else "") + self._ctrl.transcript_text(record.id)
+                    supplement = self._ctrl.supplements_markdown(record.id).strip()
+                    chunks = [part for part in (notes, supplement, self._ctrl.transcript_text(record.id).rstrip()) if part]
+                    text = "\n\n".join(chunks)
                     if text and not text.endswith("\n"):
                         text += "\n"
             elif scope == "transcript":

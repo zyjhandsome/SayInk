@@ -87,6 +87,16 @@ def should_auto_check(
     return (now - last_check_at) >= interval_sec
 
 
+def _version_token_in_name(name: str, version: str) -> bool:
+    """True when ``version`` is a whole number in the filename.
+
+    ``2.2.1`` must not match ``SayInk-Setup-2.2.10.exe`` or ``SayInk-Setup-12.2.1.exe``.
+    """
+    if not version:
+        return False
+    return re.search(rf"(?<!\d){re.escape(version)}(?!\d)", name) is not None
+
+
 def pick_installer_asset(assets: list[dict], version: str) -> dict | None:
     """Prefer ``SayInk-Setup-<version>.exe`` — the lite installer without
     Fun-ASR-Nano. CAM++ and Silero VAD travel with it; an already installed
@@ -110,8 +120,7 @@ def pick_installer_asset(assets: list[dict], version: str) -> dict | None:
         elif (
             fallback is None
             and name.startswith("SayInk-Setup-")
-            and version
-            and version in name
+            and _version_token_in_name(name, version)
         ):
             fallback = asset
     return exact or fallback

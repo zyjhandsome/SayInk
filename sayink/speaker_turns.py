@@ -37,7 +37,9 @@ CONTEXT_SEC = 2.0
 CONTEXT_HEAD_SEC = 6.0
 CONTEXT_GAP_MS = 50
 SHORT_CONTEXT_STEP_SEC = 0.1
-REPEATED_WINDOW_SIMILARITY = 0.9
+# Same bar as a stable run. 0.90 only caught near-identical windows, so two
+# voices at a normal CAM++ match still blended into one learnable profile.
+REPEATED_WINDOW_SIMILARITY = STABLE_SIMILARITY
 log = logging.getLogger("SayInk")
 
 

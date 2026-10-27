@@ -122,6 +122,10 @@ class TestReleaseSelection:
         assert pick_installer_asset([lite, full], "2.3.0") is lite
         # A release that only ships the full installer is still an update.
         assert pick_installer_asset([full], "2.3.0") is full
+        longer = {"name": "SayInk-Setup-2.3.0-x64.exe", "browser_download_url": base + "SayInk-Setup-2.3.0-x64.exe"}
+        other = {"name": "SayInk-Setup-2.3.01.exe", "browser_download_url": base + "SayInk-Setup-2.3.01.exe"}
+        assert pick_installer_asset([other, longer], "2.3.0") is longer
+        assert pick_installer_asset([other], "2.3.0") is None
 
     def test_installer_names_agree_between_build_and_updater(self):
         import sys
