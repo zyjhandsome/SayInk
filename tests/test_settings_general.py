@@ -1263,8 +1263,11 @@ class TestMeetingSettings:
         win._meeting_glossary_edit.setPlainText("\n".join(lines))
         win._flush_meeting_glossary()
         terms = [g["term"] for g in config.get("stt.glossary")]
-        assert terms[:3] == ["SayInk", "FireRedASR2", "x" * 20]
+        # A term longer than the hotword cap is left out. Cutting it in the
+        # middle would save a fragment and splice that fragment into later text.
+        assert terms[:3] == ["SayInk", "FireRedASR2", "t0"]
         assert len(terms) == 50
+        assert all(len(term) <= 20 for term in terms)
         win.reload_settings()
         assert win._meeting_glossary_edit.toPlainText().splitlines()[:2] == ["SayInk", "FireRedASR2"]
 
