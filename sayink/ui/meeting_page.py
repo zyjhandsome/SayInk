@@ -390,9 +390,19 @@ class _TranscriptView(_ReadingView):
         saved = self._capture_body_selection()
         self._action_block = None
         super().setHtml(text)
+        # setHtml only lays out the first screen. A long meeting then shows a
+        # scrollbar full of blank paragraphs until something touches each block.
+        self._layout_every_block()
         self._hide_all_actions()
         self.reset_actions()
         self._restore_body_selection(saved)
+
+    def _layout_every_block(self) -> None:
+        layout = self.document().documentLayout()
+        block = self.document().begin()
+        while block.isValid():
+            layout.blockBoundingRect(block)
+            block = block.next()
 
     def _seq_in_block(self, block) -> int | None:
         it = block.begin()

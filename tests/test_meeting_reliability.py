@@ -4,7 +4,7 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QLabel
+from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QLabel
 
 from sayink.history_store import HistoryStore, SegmentRecord
 from sayink.meeting_session import MeetingController, MeetingOptions, resolve_capabilities
@@ -58,6 +58,31 @@ def test_partial_copy_keeps_text_after_an_emoji():
     assert cursor.selectedText() == "方案"
     assert view.createMimeDataFromSelection().text() == "方案"
     view.deleteLater()
+
+
+def test_rebuilding_a_long_transcript_lays_out_every_paragraph():
+    """纠正发言人 replaces the whole document. Qt only lays out the first
+    screen after setHtml, so the rest of a long meeting paints blank."""
+    view = _TranscriptView()
+    view.resize(640, 480)
+    view.show()
+    view.document().setTextWidth(600)
+    view.setHtml("".join(
+        f"<p style='margin:0 0 6px 0'><a name='seg{i}'></a>"
+        f"<span style='color:#888'>[{i // 60:02d}:{i % 60:02d}]</span> "
+        f"第{i}段，这里是一句用于计时的示例发言内容。</p>"
+        for i in range(400)
+    ))
+    QApplication.processEvents()
+    blank = 0
+    block = view.document().begin()
+    while block.isValid():
+        layout = block.layout()
+        if layout is None or layout.boundingRect().height() <= 0:
+            blank += 1
+        block = block.next()
+    view.deleteLater()
+    assert blank == 0
 
 
 def test_restore_original_stays_undoable(config, tmp_path):
