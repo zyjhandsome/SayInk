@@ -1,15 +1,28 @@
 from PyQt6.QtWidgets import (
-    QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
+    QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QMenu,
+    QApplication,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QPoint, QEvent, pyqtSignal
 from PyQt6.QtGui import QFontMetrics, QPainter, QColor, QFont, QCursor
 import math
 from sayink.runtime_status import MEETING_STATE_LABELS
 from sayink.ui import design_tokens as tok
 from sayink.ui.island_chrome import (
+    clamp_top_left,
+    coerce_saved_positions,
     island_window_flags,
+    normalize_listen_bar_placement,
+    placement_anchor,
     position_listen_bar,
+    relative_listen_position,
+    resolve_listen_placement,
+    screen_storage_key,
 )
+
+# A few pixels separate a click (open the meeting) from a drag.
+DRAG_THRESHOLD_PX = 6
+# Long sessions tuck the live line away after this much silence.
+LISTEN_BAR_IDLE_MS = 12_000
 
 BAR_HEIGHT = 44
 BAR_EXCERPT_HEIGHT = 68
@@ -183,6 +196,10 @@ class FloatingWindow(QWidget):
     # Meeting state: 「标记」 button and a click on the bar body.
     meeting_mark_requested = pyqtSignal()
     meeting_open_requested = pyqtSignal()
+    # Drag committed a screen-relative spot. Payload: screen, rel_x, rel_y, anchor.
+    position_committed = pyqtSignal(dict)
+    # Double-click or the context menu asked for the automatic spot again.
+    placement_reset = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -208,6 +225,30 @@ class FloatingWindow(QWidget):
         self._after_paint_timer = QTimer(self)
         self._after_paint_timer.setSingleShot(True)
         self._after_paint_timer.timeout.connect(self._run_after_paint)
+        self._placement_pref = "auto"
+        self._saved_positions: dict = {}
+        self._position_pinned = False
+        self._pin_screen = None
+        self._pin_anchor = "top"
+        self._pin_x = 0
+        self._pin_edge = 0
+        self._pinned_long = False
+        self._pinned_token = ""
+        self._user_moved = False
+        self._drag_tracking = False
+        self._moved_past_threshold = False
+        self._suppress_click = False
+        self._press_global = QPoint()
+        self._press_origin = QPoint()
+        self._autohide_enabled = True
+        self._autohide_idle_ms = LISTEN_BAR_IDLE_MS
+        self._idle_collapsed = False
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setSingleShot(True)
+        self._idle_timer.timeout.connect(self._collapse_idle_excerpt)
+        self._meeting_click_timer = QTimer(self)
+        self._meeting_click_timer.setSingleShot(True)
+        self._meeting_click_timer.timeout.connect(self._open_meeting_from_click)
 
     def call_when_painted(self, fn) -> None:
         """Run ``fn`` once the bar's current state is on screen.
@@ -364,6 +405,8 @@ class FloatingWindow(QWidget):
         self.reapply_theme()
         self.set_input_source("microphone")
         self._set_mode("compact")
+        self._use_drag_cursor()
+        self._install_position_menu()
 
     def _set_mode(self, mode: str) -> None:
         self._mode = mode
@@ -405,15 +448,203 @@ class FloatingWindow(QWidget):
     def _on_end_clicked(self) -> None:
         self.continuous_stop_requested.emit()
 
-    def _position_on_screen(self):
-        position_listen_bar(self, width=self.width())
+    def set_placement_preference(self, placement: str) -> None:
+        self._placement_pref = normalize_listen_bar_placement(placement)
+
+    def set_saved_positions(self, positions) -> None:
+        self._saved_positions = coerce_saved_positions(positions)
+
+    def set_autohide(self, enabled: bool) -> None:
+        self._autohide_enabled = bool(enabled)
+        if not self._autohide_enabled:
+            self._idle_timer.stop()
+            self._restore_idle_excerpt()
+
+    def set_autohide_idle_ms(self, milliseconds: int) -> None:
+        self._autohide_idle_ms = max(1, int(milliseconds))
+
+    def reposition_for_preference(self) -> None:
+        """Settings changed the preset: drop the in-session pin and place again."""
+        self._user_moved = False
+        self._position_pinned = False
+        self._pinned_token = ""
+        if self.isVisible():
+            self._place_initial(self._is_long_session())
+
+    def _is_long_session(self) -> bool:
+        return bool(self._listening_active or self._meeting_active)
+
+    def _screen_for_placement(self):
+        if self._position_pinned and self._pin_screen is not None:
+            return self._pin_screen
+        return QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+
+    def _token_for(self, long_session: bool, screen) -> tuple[str, dict | None]:
+        pref = normalize_listen_bar_placement(self._placement_pref)
+        if pref == "last" and screen is not None:
+            saved = self._saved_positions.get(screen_storage_key(screen))
+            if isinstance(saved, dict):
+                return "saved", saved
+        return resolve_listen_placement(pref, long_session=long_session), None
+
+    def _ensure_position(self) -> None:
+        long_session = self._is_long_session()
+        screen = self._screen_for_placement()
+        token, saved = self._token_for(long_session, screen)
+        entering_long = long_session and not self._pinned_long
+        if self._position_pinned and (
+            self._user_moved or not (entering_long and token != self._pinned_token)
+        ):
+            self._pinned_long = long_session
+            self._hold_pinned_edges()
+            return
+        self._place_initial(long_session, token, saved, screen)
+
+    def _place_initial(self, long_session: bool, token=None, saved=None, screen=None) -> None:
+        screen = screen or self._screen_for_placement()
+        if screen is None:
+            return
+        if token is None:
+            token, saved = self._token_for(long_session, screen)
+        if token == "saved" and saved:
+            position_listen_bar(self, width=self.width(), saved=saved, screen=screen)
+            anchor = saved.get("anchor")
+            self._pin_anchor = anchor if anchor in ("top", "bottom") else "top"
+        else:
+            placement = token if token in ("top_center", "bottom_center", "bottom_right") else (
+                resolve_listen_placement(self._placement_pref, long_session=long_session)
+            )
+            position_listen_bar(self, width=self.width(), placement=placement, screen=screen)
+            self._pin_anchor = placement_anchor(placement)
+            token = placement
+        self._pin_screen = screen
+        self._position_pinned = True
+        self._pinned_long = long_session
+        self._pinned_token = token
+        self._user_moved = False
+        self._capture_pin_from_widget()
+
+    def _capture_pin_from_widget(self) -> None:
+        self._pin_x = self.x()
+        if self._pin_anchor == "bottom":
+            self._pin_edge = self.y() + self.height()
+        else:
+            self._pin_edge = self.y()
+
+    def _hold_pinned_edges(self) -> None:
+        screen = self._pin_screen or QApplication.primaryScreen()
+        if screen is None:
+            return
+        try:
+            geo = screen.availableGeometry()
+        except RuntimeError:
+            return
+        width = max(1, self.width())
+        height = max(1, self.height())
+        y = self._pin_edge - height if self._pin_anchor == "bottom" else self._pin_edge
+        x, y = clamp_top_left(self._pin_x, y, width, height, geo)
+        self._pin_x = x
+        self._pin_edge = y + height if self._pin_anchor == "bottom" else y
+        if self.x() != x or self.y() != y:
+            self.move(x, y)
 
     def _present(self) -> None:
         self._hide_timer.stop()
         self._end_btn.setVisible(self._listening_active)
         self._mark_btn.setVisible(self._meeting_active)
-        self._position_on_screen()
+        self._ensure_position()
         self.show()
+        self._note_bar_activity()
+
+    def _note_bar_activity(self) -> None:
+        if not self._autohide_enabled or not self._is_long_session() or not self.isVisible():
+            self._idle_timer.stop()
+            return
+        self._idle_timer.start(self._autohide_idle_ms)
+
+    def _collapse_idle_excerpt(self) -> None:
+        if not self._autohide_enabled or not self._is_long_session():
+            return
+        if self.underMouse():
+            self._note_bar_activity()
+            return
+        if self._mode != "excerpt" or not self._text_label.isVisible():
+            return
+        self._idle_collapsed = True
+        self._text_label.hide()
+        self._set_mode("compact")
+        self._hold_pinned_edges()
+
+    def _restore_idle_excerpt(self) -> None:
+        if not self._idle_collapsed:
+            return
+        self._idle_collapsed = False
+        if self._text_label.text():
+            self._text_label.show()
+            self._set_mode("excerpt")
+            self._hold_pinned_edges()
+
+    def _use_drag_cursor(self) -> None:
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def _remember_move_hint(self) -> None:
+        hint = "拖动可挪开。双击或右键恢复默认位置。"
+        current = self._status_label.toolTip()
+        if hint in current:
+            return
+        self._status_label.setToolTip(f"{current} {hint}".strip() if current else hint)
+
+    def _install_position_menu(self) -> None:
+        for widget in (self._container, *self._container.findChildren(QWidget)):
+            widget.installEventFilter(self)
+
+    def _position_menu(self) -> QMenu:
+        menu = QMenu(self)
+        action = menu.addAction("恢复默认位置")
+        action.triggered.connect(self.reset_to_default_position)
+        return menu
+
+    def _show_position_menu(self, global_pos: QPoint) -> None:
+        self._position_menu().exec(global_pos)
+
+    def reset_to_default_position(self) -> None:
+        self._placement_pref = "auto"
+        self._user_moved = False
+        self._position_pinned = False
+        self._pinned_token = ""
+        self.placement_reset.emit()
+        if self.isVisible():
+            self._place_initial(self._is_long_session())
+
+    def _commit_drag(self) -> None:
+        center = self.frameGeometry().center()
+        screen = QApplication.screenAt(center) or self._pin_screen or QApplication.primaryScreen()
+        if screen is None:
+            return
+        try:
+            geo = screen.availableGeometry()
+        except RuntimeError:
+            return
+        self._pin_anchor = "bottom" if center.y() >= geo.y() + geo.height() / 2 else "top"
+        x, y = clamp_top_left(self.x(), self.y(), self.width(), self.height(), geo)
+        self.move(x, y)
+        self._pin_screen = screen
+        self._position_pinned = True
+        self._user_moved = True
+        self._pinned_long = self._is_long_session()
+        self._pinned_token = "saved"
+        self._capture_pin_from_widget()
+        saved = relative_listen_position(
+            geo, self.x(), self.y(), self.width(), self.height(), self._pin_anchor
+        )
+        key = screen_storage_key(screen)
+        self._saved_positions[key] = saved
+        self._placement_pref = "last"
+        self.position_committed.emit({"screen": key, **saved})
+
+    def _open_meeting_from_click(self) -> None:
+        if self._meeting_active:
+            self.meeting_open_requested.emit()
 
     # ── Meeting state ─────────────────────────────────────
 
@@ -434,7 +665,8 @@ class FloatingWindow(QWidget):
         self._end_btn.setAccessibleName("结束会议")
         self._end_btn.setToolTip("结束会议并整理文字稿")
         self._set_state(f"{_MEETING_SHORT} · {self._meeting_elapsed}", "STATE_RECORD", pulse=True)
-        self.unsetCursor()
+        self._remember_move_hint()
+        self._use_drag_cursor()
         self._waveform.set_compact(True)
         self._waveform.show()
         self._waveform.start()
@@ -512,6 +744,7 @@ class FloatingWindow(QWidget):
         self._text_label.setText(display)
         self._text_label.setToolTip(stripped)
         self._text_label.show()
+        self._idle_collapsed = False
         self._set_mode("excerpt")
 
     def _hold_capture(self) -> bool:
@@ -571,13 +804,14 @@ class FloatingWindow(QWidget):
         self._capture_released = False
         self.set_esc_stops_continuous(self._esc_stops_continuous)
         self._status_label.setToolTip(self._end_btn.toolTip())
+        self._remember_move_hint()
         if target_app is not None:
             self._listen_target = target_app
         label = "正在听" if self._live_text else "正在听 · 停顿后出字"
         if self._listen_target:
             label = f"{label} · {self._listen_target}"
         self._set_state(label, "STATE_LISTEN", pulse=False)
-        self.unsetCursor()
+        self._use_drag_cursor()
         self._waveform.set_compact(bool(self._live_text))
         self._waveform.show()
         self._waveform.start()
@@ -616,7 +850,7 @@ class FloatingWindow(QWidget):
         self._listening_active = False
         self._set_state("待开始", "STATE_MUTED", pulse=False)
         self._apply_excerpt(f"按住 {hotkey} 开始持续监听")
-        self.unsetCursor()
+        self._use_drag_cursor()
         self._waveform.stop()
         self._waveform.hide()
         self._present()
@@ -626,7 +860,7 @@ class FloatingWindow(QWidget):
         self._listening_active = False
         self._set_state("已停止监听", "STATE_MUTED", pulse=False)
         self._apply_excerpt(detail)
-        self.unsetCursor()
+        self._use_drag_cursor()
         self._waveform.stop()
         self._waveform.hide()
         self._present()
@@ -679,7 +913,7 @@ class FloatingWindow(QWidget):
         self._capture_active = False
         self._capture_released = False
         self._set_mode("compact")
-        self.unsetCursor()
+        self._use_drag_cursor()
         self._waveform.stop()
         self._waveform.hide()
         self._dot.stop_pulse()
@@ -899,7 +1133,93 @@ class FloatingWindow(QWidget):
     def clear_model_loading_lock(self) -> None:
         self._model_loading_active = False
 
+    def hideEvent(self, event):
+        self._position_pinned = False
+        self._user_moved = False
+        self._pinned_token = ""
+        self._idle_timer.stop()
+        self._meeting_click_timer.stop()
+        super().hideEvent(event)
+
+    def enterEvent(self, event):
+        self._restore_idle_excerpt()
+        self._note_bar_activity()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._note_bar_activity()
+        super().leaveEvent(event)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.ContextMenu:
+            pos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+            self._show_position_menu(pos)
+            return True
+        return super().eventFilter(watched, event)
+
     def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._meeting_click_timer.stop()
+            self._drag_tracking = True
+            self._moved_past_threshold = False
+            self._press_global = event.globalPosition().toPoint()
+            self._press_origin = self.pos()
+            event.accept()
+            return
         super().mousePressEvent(event)
-        if self._meeting_active and event.button() == Qt.MouseButton.LeftButton:
-            self.meeting_open_requested.emit()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_tracking and event.buttons() & Qt.MouseButton.LeftButton:
+            delta = event.globalPosition().toPoint() - self._press_global
+            if not self._moved_past_threshold:
+                if delta.manhattanLength() < DRAG_THRESHOLD_PX:
+                    return
+                self._moved_past_threshold = True
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.move(self._press_origin + delta)
+            self._user_moved = True
+            self._capture_pin_from_widget()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseReleaseEvent(event)
+            return
+        if self._suppress_click:
+            self._suppress_click = False
+            self._drag_tracking = False
+            self._moved_past_threshold = False
+            self._use_drag_cursor()
+            event.accept()
+            return
+        moved = self._moved_past_threshold
+        tracking = self._drag_tracking
+        self._drag_tracking = False
+        self._moved_past_threshold = False
+        self._use_drag_cursor()
+        if tracking and moved:
+            self._commit_drag()
+            event.accept()
+            return
+        if tracking and self._meeting_active:
+            delay = QApplication.doubleClickInterval()
+            self._meeting_click_timer.start(delay if delay > 0 else 250)
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._suppress_click = True
+            self._meeting_click_timer.stop()
+            self._drag_tracking = False
+            self._moved_past_threshold = False
+            self.reset_to_default_position()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        pos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+        self._show_position_menu(pos)
+        event.accept()

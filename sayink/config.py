@@ -131,6 +131,11 @@ DEFAULT_CONFIG = {
     },
     "appearance": {
         "theme_mode": "dark",
+        # auto: one-shot near the top, continuous / meeting along the bottom.
+        "listen_bar_placement": "auto",
+        # screen name → {rel_x, rel_y, anchor}; used when placement is "last".
+        "listen_bar_position": {},
+        "listen_bar_autohide": True,
     },
     # 会议记录 / 会议纪要（docs/meeting-notes-design.md §4.8）。
     "meeting": {
@@ -179,6 +184,31 @@ def _parse_bool(value):
             return True
         if word in _BOOL_FALSE:
             return False
+    return None
+
+
+def _parse_unix_time(value):
+    """Whole seconds since the epoch. A fractional ``time.time()`` is kept, truncated.
+
+    Other integer settings must not do this: ``1.5`` in a count is a bad edit
+    and still falls through to the default. Only the update timestamp is written
+    as a float by this app.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value == value and abs(value) != float("inf"):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text and text.lstrip("+-").replace(".", "", 1).isdigit():
+            try:
+                number = float(text)
+            except ValueError:
+                return None
+            if number == number and abs(number) != float("inf"):
+                return int(number)
     return None
 
 
@@ -258,6 +288,9 @@ class Config:
         self._secret_value: str | None = None
         self._secret_persist_failed = False
         self._secret_read_failed = False
+        # Unreadable config whose backup also failed. Saving would replace it
+        # with defaults and drop hotkeys, glossary and templates.
+        self._persist_blocked = False
         self._config_file = self._config_dir / "config.json"
         self._models_dir = _get_default_models_dir()
         self._config: dict = {}
@@ -283,12 +316,14 @@ class Config:
         raw: dict = {}
         if config_existed:
             try:
-                with open(self._config_file, "r", encoding="utf-8") as f:
+                with open(self._config_file, "r", encoding="utf-8-sig") as f:
                     raw = json.load(f)
                 if not isinstance(raw, dict):
                     raise ValueError("顶层不是对象")
-            except (json.JSONDecodeError, ValueError, OSError) as e:
+            except (json.JSONDecodeError, ValueError, OSError, RecursionError) as e:
                 backup = self._backup_unreadable_config()
+                if backup is None:
+                    self._persist_blocked = True
                 log.warning(
                     "配置文件读取失败，使用默认配置（原文件已备份到 %s）: %s", backup, e
                 )
@@ -305,7 +340,10 @@ class Config:
         # and stripped instead of being written back out.
         self._load_secret()
         output_migrated = self._migrate_output_by_mode()
-        if self._strip_test_pollution() or moved or output_migrated or self._type_repairs:
+        if (
+            not self._persist_blocked
+            and (self._strip_test_pollution() or moved or output_migrated or self._type_repairs)
+        ):
             self.save_immediate()
         self._migrate_stt_model()
 
@@ -512,6 +550,23 @@ class Config:
                             )
                             result[key] = parsed
                             self._type_repairs = True
+                    elif dotted == "update.last_check_at":
+                        parsed = _parse_unix_time(value)
+                        if parsed is None:
+                            log.warning(
+                                "配置项 %s 的类型与默认值不符（实际为 %s），已改为可用的值",
+                                dotted, type(value).__name__,
+                            )
+                            result[key] = default_value
+                            self._type_repairs = True
+                        else:
+                            result[key] = parsed
+                            if type(value) is not int:
+                                log.warning(
+                                    "配置项 %s 的类型与默认值不符（实际为 %s），已改为可用的值",
+                                    dotted, type(value).__name__,
+                                )
+                                self._type_repairs = True
                     else:
                         coerced, repaired = _coerce_known_value(default_value, value)
                         if repaired:
@@ -541,12 +596,18 @@ class Config:
         self.save()
 
     def save_immediate(self):
-        """立即保存配置，用于应用退出前"""
+        """立即保存配置，用于应用退出前。失败时返回 False。"""
         self._save_timer.stop()
-        self.save()
+        return self.save()
 
     def save(self):
-        """Atomic write: write to temp file then rename to prevent corruption."""
+        """Atomic write: write to temp file then rename to prevent corruption.
+
+        Returns False when the file on disk was left unchanged.
+        """
+        if self._persist_blocked:
+            log.error("配置未能读出且无法备份，已停止写回以免覆盖原文件")
+            return False
         llm = self._config.get("llm")
         if isinstance(llm, dict) and llm.get("api_key") and not self._file_secrets:
             leaked = str(llm.get("api_key") or "")
@@ -570,6 +631,8 @@ class Config:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+            return False
+        return True
 
     def get(self, key: str, default: Any = None) -> Any:
         if key == SECRET_KEY and (

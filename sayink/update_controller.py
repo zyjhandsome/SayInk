@@ -182,7 +182,7 @@ class UpdateController(QObject):
         self._set_status(text, action=action)
 
     def _remember_check(self) -> None:
-        self._config.set("update.last_check_at", time.time())
+        self._config.set("update.last_check_at", int(time.time()))
 
     # ── Worker slots ───────────────────────────────────
 

@@ -68,6 +68,19 @@ def test_quota_failure_does_not_overwrite_earlier_recording(tmp_path):
     assert item.samples == 16
 
 
+@pytest.mark.parametrize("complete", ["false", "0", 1, [False]])
+def test_expiry_ignores_a_complete_flag_that_is_not_boolean_true(tmp_path, complete):
+    folder = tmp_path / ("c" * 32)
+    folder.mkdir()
+    (folder / "session.json").write_text(json.dumps({
+        "sample_rate": RATE, "complete": complete, "started_at": time.time() - 8 * 86400,
+    }))
+    np.ones(10, "<f4").tofile(folder / "audio.f32")
+    journal = RecordingJournal(tmp_path)
+    assert journal.close()
+    assert folder.exists()
+
+
 def test_expiry_only_removes_completed_old_recordings(tmp_path):
     for name, complete in (("a", True), ("b", False)):
         folder = tmp_path / (name * 32)

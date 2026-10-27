@@ -140,7 +140,7 @@ def _ensure_meeting_note_columns(conn: sqlite3.Connection) -> None:
 _SESSION_SUMMARY_SQL = """
 SELECT
   h.session_id,
-  MIN(h.created_at) AS session_created,
+  MIN(CASE WHEN h.captured_at > 0 THEN h.captured_at ELSE h.created_at END) AS session_created,
   COUNT(*) AS segment_count,
   (
     SELECT source FROM history h2
@@ -274,6 +274,8 @@ class HistoryStore:
         self._init_error: BaseException | None = None
         self._committed_callbacks: list[Callable[[], None]] = []
         self._failed_callbacks: list[Callable[[str], None]] = []
+        self._fail_lock = threading.Lock()
+        self._write_failures = 0
 
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -556,8 +558,13 @@ class HistoryStore:
         if self.disabled or self._thread is None:
             return True
         done = threading.Event()
+        with self._fail_lock:
+            before = self._write_failures
         self._queue.put(("barrier", done))
-        return done.wait(timeout=timeout)
+        if not done.wait(timeout=timeout):
+            return False
+        with self._fail_lock:
+            return self._write_failures == before
 
     def read(self, fn: Callable[[sqlite3.Connection], Any], default: Any = None) -> Any:
         """Run ``fn(conn)`` on a short-lived read-only connection."""
@@ -763,6 +770,8 @@ class HistoryStore:
                     except Exception:
                         logger.exception("HistoryStore rollback after custom write failed")
                     self._notify_failed(notice)
+                    with self._fail_lock:
+                        self._write_failures += 1
                     return
             else:
                 return
@@ -851,39 +860,33 @@ class HistoryStore:
                 (cutoff_ms,),
             ).fetchall()
             to_delete = [r[0] for r in rows if r[0] != active_session_id]
-            if to_delete:
-                placeholders = ",".join("?" for _ in to_delete)
-                conn.execute(
-                    f"DELETE FROM history WHERE session_id IN ({placeholders})",
-                    to_delete,
-                )
-                conn.commit()
+            self._delete_sessions(conn, to_delete)
 
         if max_entries > 0:
-            # Delete oldest non-active sessions until within limit (ADR-0005).
-            # Active session is never deleted, even if that leaves us briefly
-            # unable to shrink further when only active remains.
-            while True:
-                rows = conn.execute(
-                    f"""
-                    SELECT session_id
-                    FROM history
-                    WHERE session_id NOT IN ({_PROTECTED_SESSIONS_SQL})
-                    GROUP BY session_id
-                    ORDER BY MIN(created_at) ASC
-                    """
-                ).fetchall()
-                session_ids = [r[0] for r in rows]
-                if len(session_ids) <= max_entries:
-                    break
-                victim = next(
-                    (s for s in session_ids if s != active_session_id),
-                    None,
-                )
-                if victim is None:
-                    break
-                conn.execute(
-                    "DELETE FROM history WHERE session_id = ?",
-                    (victim,),
-                )
-                conn.commit()
+            # One pass: drop the oldest sessions beyond the cap. The active
+            # session is kept even when that leaves the table briefly over the cap.
+            rows = conn.execute(
+                f"""
+                SELECT session_id
+                FROM history
+                WHERE session_id NOT IN ({_PROTECTED_SESSIONS_SQL})
+                GROUP BY session_id
+                ORDER BY MIN(created_at) ASC
+                """
+            ).fetchall()
+            session_ids = [r[0] for r in rows]
+            overflow = len(session_ids) - max_entries
+            if overflow > 0:
+                victims = [s for s in session_ids if s != active_session_id][:overflow]
+                self._delete_sessions(conn, victims)
+
+    def _delete_sessions(self, conn: sqlite3.Connection, session_ids: list[str]) -> None:
+        # SQLite binds at most 32766 variables. Delete in chunks either way.
+        for start in range(0, len(session_ids), 500):
+            chunk = session_ids[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(
+                f"DELETE FROM history WHERE session_id IN ({placeholders})",
+                chunk,
+            )
+            conn.commit()

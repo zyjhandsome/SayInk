@@ -131,12 +131,20 @@ class RecordingJournal:
         self._meta = {**(metadata or {}), "sample_rate": TARGET_SAMPLE_RATE,
                       "started_at": time.time(), "complete": False}
         root.mkdir(parents=True, exist_ok=True)
-        # Only completed old recordings expire automatically. Interrupted
-        # recordings require an explicit export/delete, even under quota pressure.
-        for item in recordings(root):
-            if item.metadata.get("complete") and time.time() - item.metadata.get("started_at", 0) > RETENTION_SECONDS:
+        # One directory scan. Completed recordings older than the retention
+        # window are the only ones removed automatically.
+        existing = recordings(root)
+        kept = []
+        for item in existing:
+            expired = (
+                item.metadata.get("complete") is True
+                and time.time() - item.metadata.get("started_at", 0) > RETENTION_SECONDS
+            )
+            if expired:
                 delete_recording(root, item)
-        self._existing_bytes = sum(item.cache_bytes for item in recordings(root))
+            else:
+                kept.append(item)
+        self._existing_bytes = sum(item.cache_bytes for item in kept)
         if self._existing_bytes >= max_bytes or shutil.disk_usage(root).free < MIN_FREE_BYTES:
             raise OSError("录音缓存空间不足，请导出或删除旧录音后重试")
         self.path.mkdir()

@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 from unittest.mock import MagicMock
 
 from sayink.app import App, MIN_AUDIO_SAMPLES, _QueuedSegment
+from sayink.audio_devices import INPUT_SOURCE_SYSTEM
 from sayink.runtime_status import ModelLoadPhase, RuntimeState
 from sayink.text_paster import PasteResult
 from tests.helpers.app_harness import app_harness
@@ -37,6 +38,20 @@ class TestAppErrorHints:
     )
     def test_error_hints_cover_common_cases(self, keyword):
         assert keyword in App.ERROR_HINTS
+
+    def test_device_hints_name_the_real_settings_group(self):
+        for key in ("已断开", "音频设备"):
+            text = App.ERROR_HINTS[key]
+            assert "声音收录" not in text
+            assert "设置 → 通用 → 录音与输入" in text
+
+    def test_silence_warning_names_system_audio_when_that_is_the_source(self):
+        with app_harness() as h:
+            h["recorder"].input_source = INPUT_SOURCE_SYSTEM
+            h["app"]._on_no_speech_warning()
+            detail = h["floating"].show_warning.call_args[0][1]
+            assert "电脑声音" in detail
+            assert "麦克风" not in detail
 
 
 class TestIslandUserCopy:
@@ -650,6 +665,44 @@ class TestFinalResultFlow:
 
             h["recorder"].start.assert_not_called()
             h["floating"].show_cancelled.assert_called_once()
+
+    def test_esc_on_a_new_hold_keeps_the_sentence_still_being_polished(self):
+        """A new hold may start while the previous sentence is polishing.
+
+        Esc cancels only that new hold. The sentence already in polish still
+        goes to its original window and still gets a history row.
+        """
+        with app_harness({
+            "audio.trigger_mode": "hotkey",
+            "llm.enabled": True,
+            "llm.api_url": "https://example.invalid/v1",
+            "llm.api_key": "k",
+            "llm.model_name": "m",
+        }) as h:
+            app = h["app"]
+            targets = iter([(111, "notepad.exe"), (222, "chat.exe")])
+            app._read_paste_target = lambda: next(targets)
+            h["recorder"].start.side_effect = lambda **_kwargs: setattr(h["recorder"], "is_recording", True)
+            h["recorder"].stop.side_effect = lambda: setattr(h["recorder"], "is_recording", False)
+            h["recorder"].cancel.side_effect = lambda: setattr(h["recorder"], "is_recording", False)
+
+            app._on_recording_start()
+            app._on_segment_ready(np.full(16000, 0.1, np.float32))
+            app._on_recording_stop()
+            app._on_recording_finished(np.zeros(0, np.float32))
+            app._on_final_result("今天下午三点开会")
+            assert app._output_busy
+
+            app._on_recording_start()
+            h["recorder"].is_recording = True
+            app._on_recording_cancel()
+            app._on_polish_complete("今天下午三点开会。")
+
+            kwargs = h["paster"].paste_async.call_args.kwargs
+            assert kwargs["target_hwnd"] == 111
+            assert kwargs["target_app"] == "notepad.exe"
+            h["paster"].paste_async.call_args.args[1](PasteResult("sent", target_app="notepad.exe"))
+            assert h["history"].enqueue.call_count == 1
 
     def test_esc_on_a_refused_hold_keeps_the_previous_utterance(self):
         """hold → release → hold again (refused) → Esc: the queued previous

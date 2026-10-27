@@ -22,7 +22,11 @@ def _coerce_text_fields(item: dict, key: str) -> None:
             continue
         if value is None:
             item[name] = ""
-        elif not isinstance(value, str):
+        elif isinstance(value, str):
+            continue
+        elif name not in ITEM_FIELDS.get(key, ()) and name not in ("title", "label", "text", "task", "summary"):
+            item.pop(name, None)
+        else:
             raise LLMResponseError(f"纪要条目字段 {name} 格式错误")
 
 

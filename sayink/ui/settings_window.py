@@ -104,6 +104,7 @@ class SettingsWindow(QWidget):
     # Glossary / language / VAD (stt.*): shared by dictation and meetings.
     recognition_changed = pyqtSignal()
     theme_changed = pyqtSignal(str)
+    listen_bar_prefs_changed = pyqtSignal()
     hotkey_capture_started = pyqtSignal()
     hotkey_capture_ended = pyqtSignal()
     update_check_requested = pyqtSignal()
@@ -1276,6 +1277,17 @@ class SettingsWindow(QWidget):
         self._theme_combo.blockSignals(True)
         self._theme_combo.setCurrentIndex(max(0, idx))
         self._theme_combo.blockSignals(False)
+        from sayink.ui.island_chrome import normalize_listen_bar_placement
+
+        self._set_combo_by_data(
+            self._listen_bar_combo,
+            normalize_listen_bar_placement(
+                self._config.get("appearance.listen_bar_placement", "auto")
+            ),
+        )
+        self._listen_bar_autohide_row.setChecked(
+            bool(self._config.get("appearance.listen_bar_autohide", True))
+        )
 
         self._apply_input_source_radios(
             self._config.get("audio.input_source", INPUT_SOURCE_MICROPHONE)
@@ -1679,6 +1691,38 @@ class SettingsWindow(QWidget):
         self._config.save_immediate()
         self.theme_changed.emit(mode)
 
+    def _on_listen_bar_placement_changed(self, _index: int = 0):
+        if self._loading:
+            return
+        from sayink.ui.island_chrome import normalize_listen_bar_placement
+
+        placement = normalize_listen_bar_placement(self._listen_bar_combo.currentData())
+        self._config.set("appearance.listen_bar_placement", placement)
+        self.listen_bar_prefs_changed.emit()
+
+    def _on_listen_bar_autohide_toggled(self, checked: bool):
+        if self._loading:
+            return
+        self._config.set("appearance.listen_bar_autohide", bool(checked))
+        self.listen_bar_prefs_changed.emit()
+
+    def set_listen_bar_placement(self, placement: str) -> None:
+        """Mirror a drag or reset without writing config again."""
+        from sayink.ui.island_chrome import normalize_listen_bar_placement
+
+        combo = getattr(self, "_listen_bar_combo", None)
+        if combo is None:
+            return
+        idx = combo.findData(normalize_listen_bar_placement(placement))
+        if idx < 0 or combo.currentIndex() == idx:
+            return
+        was_loading = self._loading
+        self._loading = True
+        try:
+            combo.setCurrentIndex(idx)
+        finally:
+            self._loading = was_loading
+
     def _on_auto_start_toggled(self, checked: bool):
         if self._loading:
             return
@@ -1890,8 +1934,8 @@ class SettingsWindow(QWidget):
             entry = parse_glossary_line(raw)
             if entry is None:
                 continue
-            term = entry["term"][:MAX_HOTWORD_CHARS]
-            if term in seen:
+            term = entry["term"]
+            if len(term) > MAX_HOTWORD_CHARS or term in seen:
                 continue
             seen.add(term)
             entry["term"] = term

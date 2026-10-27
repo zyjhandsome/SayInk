@@ -43,10 +43,16 @@ _SPELLING_GAP_MS = 30_000
 _NON_NAMES = re.compile(r"负责|经理|老师|总|助理|主任|同事|先生|女士|用户|客户|系统|公司|项目|测试|王者|主人|中国|北京|上海|开发|工程|管理员|明天|今天|高兴|高管|主任")
 
 
+# A self-introduction that merely starts with a surname character is still a
+# role or origin (程序员、江西人). Auto-naming would rather miss a name.
+_ROLE_ENDINGS = ("人", "员", "生", "师", "工", "头", "党", "医", "兵", "贩", "栈", "手", "官")
+_NOT_PERSONAL_NAMES = frozenset({"司机", "房东", "黄牛", "路人", "全栈"})
+
+
 def _plausible_name(name: str) -> bool:
     if name.isascii():
         return name not in {"DeepSeek", "SayInk", "Windows", "Python", "Assistant", "Unknown", "None", "Null"}
-    if _NON_NAMES.search(name):
+    if _NON_NAMES.search(name) or name in _NOT_PERSONAL_NAMES or name.endswith(_ROLE_ENDINGS):
         return False
     if name.startswith(_COMPOUND_SURNAMES):
         return len(name) in (3, 4)

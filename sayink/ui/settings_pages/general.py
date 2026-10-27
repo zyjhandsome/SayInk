@@ -344,9 +344,34 @@ def _build_history_rows(win, lay: QVBoxLayout) -> None:
     lay.addWidget(win._history_cleanup_hint_wrap)
 
 
+def _build_listen_bar_row(win) -> QWidget:
+    from sayink.ui.island_chrome import LISTEN_BAR_PLACEMENT_LABELS
+
+    win._listen_bar_combo = QComboBox()
+    win._listen_bar_combo.setAccessibleName("转写条位置")
+    win._listen_bar_combo.setMinimumWidth(220)
+    for key, label in LISTEN_BAR_PLACEMENT_LABELS:
+        win._listen_bar_combo.addItem(label, key)
+    win._listen_bar_combo.currentIndexChanged.connect(win._on_listen_bar_placement_changed)
+    return labeled_row(
+        "转写条位置",
+        win._listen_bar_combo,
+        "单次转写短暂出现在上方；持续转写和会议默认在下方。拖动后会记住。",
+    )
+
+
 def build_preferences_section(win) -> QWidget:
     card, lay = _card()
     lay.addWidget(_build_theme_row(win))
+    lay.addWidget(group_divider())
+    lay.addWidget(_build_listen_bar_row(win))
+    lay.addWidget(group_divider())
+    win._listen_bar_autohide_row = ToggleOptionRow(
+        "一段时间后收起转写文字",
+        "持续转写和会议中，约 12 秒没有新文字就收起，鼠标移上去再展开。",
+    )
+    win._listen_bar_autohide_row.toggled.connect(win._on_listen_bar_autohide_toggled)
+    lay.addWidget(win._listen_bar_autohide_row)
     lay.addWidget(group_divider())
     _build_toggle_rows(win, lay)
     _build_history_rows(win, lay)
@@ -617,6 +642,8 @@ def build_general_page(win) -> QWidget:
         win._meeting_start_card_row,
         win._meeting_start_card_reset_btn,
         win._theme_combo,
+        win._listen_bar_combo,
+        win._listen_bar_autohide_row,
         win._auto_start_row,
         win._sound_row,
         win._restore_clipboard_row,

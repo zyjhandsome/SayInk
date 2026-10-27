@@ -1,5 +1,6 @@
 import ipaddress
 import logging
+import re
 import time
 from typing import Callable
 from urllib.parse import urlparse, urlunparse
@@ -258,6 +259,30 @@ def chat_completion(
     return chat_message_text(response.json(), reject_truncated=reject_truncated)
 
 
+_THINK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def strip_model_thinking(text: str) -> str:
+    """Drop provider reasoning blocks so they are not pasted or saved."""
+    return _THINK_RE.sub("", text or "").strip()
+
+
+def _content_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            else:
+                raise LLMResponseError("API 响应格式异常")
+        return "".join(parts)
+    raise LLMResponseError("API 响应格式异常")
+
+
 def chat_message_text(data, *, reject_truncated: bool = False) -> str:
     """Message text from a chat-completion body, or a response error."""
     choices = data.get("choices") if isinstance(data, dict) else None
@@ -269,7 +294,7 @@ def chat_message_text(data, *, reject_truncated: bool = False) -> str:
     if not isinstance(message, dict):
         raise LLMResponseError("API 响应格式异常")
     content = message.get("content")
-    text = str(content).strip() if content is not None else ""
+    text = strip_model_thinking(_content_text(content)) if content is not None else ""
     if not text:
         raise LLMResponseError("API 返回空内容")
     return text
@@ -503,6 +528,7 @@ class PolishWorker(QThread):
                         retry_delay_sec=self._RETRY_DELAY_SEC,
                         label=self._action_label,
                         extra_payload=options["extra_payload"],
+                        reject_truncated=True,
                     )
                 finally:
                     self._client = None

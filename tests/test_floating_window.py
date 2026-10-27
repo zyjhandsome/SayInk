@@ -390,11 +390,12 @@ def test_partial_text_grows_excerpt_only(win):
 
 
 def test_update_partial_text_keeps_width_and_center_on_excerpt(win, qapp):
-    """U-12: the excerpt line only adds height; the bar must not jump sideways."""
+    """U-12: the excerpt line only adds height; a long session stays bottom-centered."""
     from PyQt6.QtGui import QCursor
     from PyQt6.QtWidgets import QApplication
 
     from sayink.ui.floating_window import BAR_EXCERPT_HEIGHT, BAR_HEIGHT, BAR_WIDTH
+    from sayink.ui.island_chrome import ISLAND_BOTTOM_MARGIN
 
     screen = QApplication.screenAt(QCursor.pos()) or qapp.primaryScreen()
     assert screen is not None
@@ -403,15 +404,18 @@ def test_update_partial_text_keeps_width_and_center_on_excerpt(win, qapp):
     win.show_listening()
     qapp.processEvents()
     compact_x = win.x()
+    bottom = win.y() + win.height()
     assert win.width() == BAR_WIDTH
     assert win.height() == BAR_HEIGHT
     assert compact_x == geo.x() + (geo.width() - BAR_WIDTH) // 2
+    assert bottom == geo.y() + geo.height() - ISLAND_BOTTOM_MARGIN
 
     win.update_partial_text("下一步把这份纪要贴到会议群里。")
     qapp.processEvents()
     assert win.width() == BAR_WIDTH
     assert win.height() == BAR_EXCERPT_HEIGHT
     assert win.x() == compact_x
+    assert win.y() + win.height() == bottom
 
 
 class TestCloseButton:
@@ -457,3 +461,177 @@ class TestSubWidgets:
         wf.stop()
         assert not wf._timer.isActive()
         assert all(h == 0.0 for h in wf._bar_heights)
+
+
+def _mouse(widget, kind, global_pos, buttons):
+    from PyQt6.QtCore import QEvent, QPointF, Qt
+    from PyQt6.QtGui import QMouseEvent
+
+    local = widget.mapFromGlobal(global_pos)
+    event = QMouseEvent(
+        kind,
+        QPointF(local),
+        QPointF(global_pos),
+        Qt.MouseButton.LeftButton,
+        buttons,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    if kind == QEvent.Type.MouseButtonPress:
+        widget.mousePressEvent(event)
+    elif kind == QEvent.Type.MouseMove:
+        widget.mouseMoveEvent(event)
+    elif kind == QEvent.Type.MouseButtonRelease:
+        widget.mouseReleaseEvent(event)
+    else:
+        widget.mouseDoubleClickEvent(event)
+
+
+def _drag(widget, start, end):
+    from PyQt6.QtCore import QEvent, Qt
+
+    _mouse(widget, QEvent.Type.MouseButtonPress, start, Qt.MouseButton.LeftButton)
+    _mouse(widget, QEvent.Type.MouseMove, end, Qt.MouseButton.LeftButton)
+    _mouse(widget, QEvent.Type.MouseButtonRelease, end, Qt.MouseButton.NoButton)
+
+
+class TestListenBarPlacement:
+    def test_one_shot_stays_near_the_top(self, win, qapp):
+        from PyQt6.QtGui import QCursor
+        from PyQt6.QtWidgets import QApplication
+
+        win.show_recording()
+        screen = QApplication.screenAt(QCursor.pos()) or qapp.primaryScreen()
+        geo = screen.availableGeometry()
+        assert win.y() <= geo.y() + 140
+        assert win.x() == geo.x() + (geo.width() - win.width()) // 2
+
+    def test_model_loading_then_listening_moves_to_the_bottom(self, win, qapp):
+        from PyQt6.QtGui import QCursor
+        from PyQt6.QtWidgets import QApplication
+
+        from sayink.ui.island_chrome import ISLAND_BOTTOM_MARGIN
+
+        screen = QApplication.screenAt(QCursor.pos()) or qapp.primaryScreen()
+        geo = screen.availableGeometry()
+        win.show_model_loading("载入中")
+        assert win.y() <= geo.y() + 140
+        win.show_listening()
+        assert win.y() + win.height() == geo.y() + geo.height() - ISLAND_BOTTOM_MARGIN
+
+    def test_later_states_do_not_pull_a_moved_bar_back(self, win):
+        from PyQt6.QtCore import QPoint
+
+        win.show_listening()
+        start = win.pos()
+        _drag(win, start + QPoint(40, 20), start + QPoint(40, -180))
+        moved = win.pos()
+        assert moved.y() < start.y() - 100
+        win.show_success("已输入")
+        win.update_partial_text("这句还在底部附近")
+        assert win.x() == moved.x()
+        assert win.y() < start.y() - 80
+
+    def test_drag_remembers_position_and_a_click_still_opens_the_meeting(self, win, qapp):
+        from PyQt6.QtCore import QEvent, QPoint, Qt
+
+        opened = []
+        saved = []
+        win.meeting_open_requested.connect(lambda: opened.append(1))
+        win.position_committed.connect(saved.append)
+        win.show_meeting()
+        start = win.pos()
+        _drag(win, start + QPoint(30, 16), start + QPoint(90, 16))
+        assert win.x() == start.x() + 60
+        assert saved and "rel_x" in saved[-1] and saved[-1]["screen"]
+        assert opened == []
+
+        click = start + QPoint(30, 16)
+        _mouse(win, QEvent.Type.MouseButtonPress, click, Qt.MouseButton.LeftButton)
+        _mouse(win, QEvent.Type.MouseButtonRelease, click, Qt.MouseButton.NoButton)
+        assert opened == []
+        assert win._meeting_click_timer.isActive()
+        win._meeting_click_timer.stop()
+        win._open_meeting_from_click()
+        assert opened == [1]
+
+    def test_double_click_restores_the_default_and_does_not_open_the_meeting(self, win, qapp):
+        from PyQt6.QtCore import QEvent, QPoint, Qt
+
+        opened = []
+        reset = []
+        win.meeting_open_requested.connect(lambda: opened.append(1))
+        win.placement_reset.connect(lambda: reset.append(1))
+        win.show_meeting()
+        start = win.pos()
+        press = start + QPoint(24, 12)
+        _drag(win, press, press + QPoint(0, -160))
+        assert win.y() < start.y() - 100
+        _mouse(win, QEvent.Type.MouseButtonPress, press, Qt.MouseButton.LeftButton)
+        _mouse(win, QEvent.Type.MouseButtonRelease, press, Qt.MouseButton.NoButton)
+        _mouse(win, QEvent.Type.MouseButtonDblClick, press, Qt.MouseButton.LeftButton)
+        qapp.processEvents()
+        assert opened == []
+        assert reset == [1]
+        assert abs(win.y() - start.y()) <= 2
+        assert [action.text() for action in win._position_menu().actions()] == ["恢复默认位置"]
+
+    def test_saved_position_is_reused_for_the_next_session(self, win, qapp):
+        from PyQt6.QtGui import QCursor
+        from PyQt6.QtWidgets import QApplication
+
+        from sayink.ui.island_chrome import origin_from_relative, screen_storage_key
+
+        screen = QApplication.screenAt(QCursor.pos()) or qapp.primaryScreen()
+        geo = screen.availableGeometry()
+        saved = {"rel_x": 0.05, "rel_y": 0.2, "anchor": "top"}
+        win.set_placement_preference("last")
+        win.set_saved_positions({screen_storage_key(screen): saved})
+        win.show_listening()
+        expected = origin_from_relative(geo, win.width(), win.height(), saved)
+        assert (win.x(), win.y()) == expected
+
+    def test_idle_excerpt_collapses_and_hover_restores_it(self, win):
+        from PyQt6.QtCore import QPointF
+        from PyQt6.QtGui import QEnterEvent
+
+        win.set_autohide(True)
+        win.set_autohide_idle_ms(30)
+        win.show_listening()
+        win.update_partial_text("这行字会先露出来")
+        assert win._text_label.isVisible()
+        assert win._idle_timer.isActive()
+        win.underMouse = lambda: False
+        win._collapse_idle_excerpt()
+        assert not win._text_label.isVisible()
+        assert win._end_btn.isVisible()
+        win.enterEvent(QEnterEvent(QPointF(4, 4), QPointF(4, 4), QPointF(4, 4)))
+        assert win._text_label.isVisible()
+        assert "这行字" in win._text_label.text() or "露出来" in win._text_label.text()
+
+    def test_one_shot_excerpt_does_not_autohide(self, win, qapp):
+        import time
+
+        win.set_autohide(True)
+        win.set_autohide_idle_ms(30)
+        win.show_recording()
+        assert "松开识别" in win._text_label.text()
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.01)
+        assert win._text_label.isVisible()
+        assert "松开识别" in win._text_label.text()
+
+
+def test_app_loads_listen_bar_preferences(qapp):
+    from tests.helpers.app_harness import app_harness
+
+    with app_harness({
+        "appearance.listen_bar_placement": "bottom_right",
+        "appearance.listen_bar_autohide": False,
+        "appearance.listen_bar_position": {"DISPLAY1": {"rel_x": 0.2, "rel_y": 0.8, "anchor": "bottom"}},
+    }) as harness:
+        floating = harness["floating"]
+        floating.set_placement_preference.assert_any_call("bottom_right")
+        floating.set_autohide.assert_any_call(False)
+        floating.set_saved_positions.assert_called()

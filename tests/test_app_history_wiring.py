@@ -1054,3 +1054,41 @@ def test_meeting_start_does_not_ask_about_the_dictation_history_conflict(monkeyp
         started = h["app"].start_meeting(MeetingOptions())
         assert started is False
         assert asked == []
+
+
+def test_key_release_during_the_history_dialog_does_not_start_recording():
+    """The key-up is delivered inside the modal, before the device opens.
+
+    Choosing 「开启历史」 must not start a recording that no later key-up
+    or Esc can stop.
+    """
+    from pynput import keyboard
+
+    from sayink.hotkey_manager import HotKeyManager
+
+    with app_harness({"audio.trigger_mode": "hotkey", "output.mode": "history", "history.enabled": False}) as h:
+        app, rec = h["app"], h["recorder"]
+        rec.start.side_effect = lambda **_kwargs: setattr(rec, "is_recording", True)
+        rec.stop.side_effect = lambda: setattr(rec, "is_recording", False)
+        rec.cancel.side_effect = lambda: setattr(rec, "is_recording", False)
+        hk = HotKeyManager("alt+x")
+        hk.recording_start.connect(app._on_recording_start)
+        hk.recording_stop.connect(app._on_recording_stop)
+        hk.recording_cancel.connect(app._on_recording_cancel)
+
+        def release_inside_the_dialog(**_kwargs):
+            hk._on_release(keyboard.KeyCode.from_char("x"))
+            hk._on_release(keyboard.Key.alt_l)
+            return "history"
+
+        app._ask_history_output_conflict = release_inside_the_dialog
+        hk._on_press(keyboard.Key.alt_l)
+        hk._on_press(keyboard.KeyCode.from_char("x"))
+        hk._on_hold_timeout()
+
+        assert rec.start.call_count == 0
+        assert rec.is_recording is False
+        hk._on_press(keyboard.Key.esc)
+        hk._on_release(keyboard.Key.esc)
+        assert rec.cancel.call_count == 0
+        assert rec.is_recording is False

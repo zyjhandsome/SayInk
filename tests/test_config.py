@@ -563,3 +563,54 @@ def test_isolated_config_dir_does_not_use_credential_store(config_home, monkeypa
     monkeypatch.setattr("sayink.config.default_secret_store", lambda: _FakeSecrets("sk-real"))
     cfg = Config(config_dir=config_home)
     assert cfg.get("llm.api_key") == ""
+
+
+def test_fractional_last_check_at_survives_restart(config_home):
+    """Update checks store time.time(). A fractional stamp must not reset to 0."""
+    import json
+    import time
+
+    from sayink.config import Config
+    from sayink.updater import should_auto_check
+
+    stamp = time.time()
+    cfg = Config(config_dir=config_home)
+    cfg.set("update.last_check_at", stamp)
+    cfg.save_immediate()
+    loaded = Config(config_dir=config_home).get("update.last_check_at")
+    assert loaded == int(stamp)
+    assert json.loads((config_home / "config.json").read_text(encoding="utf-8"))["update"]["last_check_at"] == int(stamp)
+    assert should_auto_check(enabled=True, last_check_at=float(loaded), now=stamp + 60) is False
+
+
+def test_config_with_bom_is_not_treated_as_corrupt(config_home):
+    from sayink.config import Config
+
+    (config_home / "config.json").write_text(
+        '{"history": {"enabled": false}}', encoding="utf-8-sig",
+    )
+    cfg = Config(config_dir=config_home)
+    assert cfg.get("history.enabled") is False
+    assert not list(config_home.glob("config.corrupt-*.json"))
+
+
+def test_deeply_nested_config_falls_back_instead_of_crashing(config_home):
+    from sayink.config import Config
+
+    (config_home / "config.json").write_text('{"unknown": ' + ("[" * 2000) + "0" + ("]" * 2000) + "}", encoding="utf-8")
+    cfg = Config(config_dir=config_home)
+    assert cfg.get("history.enabled") is True
+    assert list(config_home.glob("config.corrupt-*.json"))
+
+
+def test_save_failure_is_visible_to_the_caller(config_home, monkeypatch):
+    from sayink.config import Config
+
+    cfg = Config(config_dir=config_home)
+    cfg.set("history.enabled", False)
+
+    def deny(_src, _dst):
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr("sayink.config.os.replace", deny)
+    assert cfg.save_immediate() is False

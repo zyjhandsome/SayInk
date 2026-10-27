@@ -185,16 +185,16 @@ def test_event_loop_starts_prefetch_before_polish_completes(arrival):
         timeout.stop()
         h["recognizer"].prefetch_final.assert_called_once()
         h["paster"].paste_async.assert_not_called()
-        assert app._pending_record.raw_text == "第一句"
+        assert app._record_for_output().raw_text == "第一句"
         app._clear_queued_audio()
 
 
 def test_prefetch_finishes_during_polish_without_changing_current_output():
     with app_harness(LLM) as h, patch("sayink.app.QTimer.singleShot"):
         app, callbacks = _two_segments(h)
-        session = app._pending_record.session_id
+        session = app._record_for_output().session_id
         callbacks["on_text"]("第二句")
-        assert app._pending_record.raw_text == "第一句"
+        assert app._record_for_output().raw_text == "第一句"
         assert app._output_raw_text == "第一句"
         assert len(app._segment_queue) == 1
         h["paster"].paste_async.assert_not_called()
@@ -244,7 +244,7 @@ def test_cancelled_prefetch_cannot_restore_discarded_queue():
         callbacks["on_text"]("已取消")
         assert app._prefetch_segment is None
         assert app._segment_queue == []
-        assert app._pending_record.raw_text == "第一句"
+        assert app._record_for_output().raw_text == "第一句"
 
 
 def test_prefetched_old_session_keeps_its_identity_after_restart():
@@ -255,7 +255,7 @@ def test_prefetched_old_session_keeps_its_identity_after_restart():
         h["recorder"].is_continuous = False
         callbacks["on_text"]("旧场尾句")
         _finish_first_output(h)
-        assert app._pending_record.session_id == old_id
+        assert app._record_for_output().session_id == old_id
         assert app._current_session_id == "new-session" and app._current_seq == 0
         assert h["polisher"].polish.call_args.args[0] == "旧场尾句"
 

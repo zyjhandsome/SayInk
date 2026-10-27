@@ -285,3 +285,62 @@ def test_polishing_remains_serial_and_does_not_lose_ready_turns():
                     app._pump_segment_queue()
         assert [r.raw_text for r in _enqueued_records(h["history"])] == [t.text for t in batch()]
         assert h["recognizer"].transcribe_final.call_count == 1
+
+
+def test_history_conflict_dialog_does_not_let_the_watchdog_paste_twice():
+    """The conflict dialog runs a nested event loop while the output watchdog
+    is armed. It must not open a second dialog or paste the same sentence twice."""
+    from PyQt6.QtCore import QEventLoop, QTimer
+
+    import sayink.app as app_mod
+
+    def spin(ms: int) -> None:
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    with app_harness({
+        "audio.trigger_mode": "continuous",
+        "output.mode": "history",
+        "history.enabled": False,
+    }) as h:
+        app, rec, paster = h["app"], h["recorder"], h["paster"]
+        rec.is_continuous = True
+        rec.is_recording = True
+        dialogs = []
+
+        def answer_after_the_watchdog(**_kwargs):
+            dialogs.append(1)
+            spin(200 if len(dialogs) == 1 else 20)
+            return "paste"
+
+        app._ask_history_output_conflict = answer_after_the_watchdog
+        app_mod.OUTPUT_WATCHDOG_MS = 40
+        try:
+            app._on_segment_ready(np.full(16000, 0.1, np.float32))
+            app._on_final_result("请把周报发给我")
+        finally:
+            app_mod.OUTPUT_WATCHDOG_MS = 45_000
+
+        assert len(dialogs) == 1
+        assert paster.paste_async.call_count == 1
+        assert paster.paste_async.call_args[0][0] == "请把周报发给我"
+
+
+def test_turn_result_during_model_reload_releases_the_pipeline():
+    """A model reload that lands while turn analysis is in flight must not
+    leave `_is_transcribing` set, or every later segment waits forever."""
+    with app_harness({"audio.trigger_mode": "continuous"}) as h:
+        app = start(h)
+        begin(app)
+        assert app._is_transcribing
+        h["recognizer"].is_ready = False
+        h["recognizer"].is_loading = True
+        app._on_speaker_turn_result(batch()[:1])
+        assert app._is_transcribing is False
+        assert app._segment_queue
+        h["recognizer"].is_ready = True
+        h["recognizer"].is_loading = False
+        app._on_stt_ready()
+        assert h["paster"].paste_async.called
+        assert app._segment_queue == []

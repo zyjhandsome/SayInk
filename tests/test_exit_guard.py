@@ -62,6 +62,18 @@ def test_idle_exit_needs_no_confirmation():
             quit_app.assert_called_once()
 
 
+def test_finish_quit_cancels_a_paste_still_waiting_to_send():
+    """Paste and clipboard-restore timers are not children of the app.
+
+    Stopping the app's own timers is not enough: a Ctrl+V already queued
+    inside TextPaster must be dropped before the process goes away.
+    """
+    with app_harness() as h:
+        with patch("sayink.app.QApplication.quit"):
+            h["app"]._finish_quit()
+        h["paster"].cancel.assert_called_once()
+
+
 def test_exit_waits_for_native_worker_without_blocking_the_event_loop():
     import threading
     from PyQt6.QtCore import QThread

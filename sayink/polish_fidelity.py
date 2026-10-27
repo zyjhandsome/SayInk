@@ -34,14 +34,16 @@ _CN_BIG_UNITS = {"万": 10_000, "亿": 100_000_000}
 # A numeral may contain an arabic chunk (一亿零500万). It still has to start
 # with a Chinese digit so version numbers and plain 100万 stay out of this pass.
 _CN_NUMERAL_RE = re.compile(
-    r"[一二两三四五六七八九十][零〇一二两三四五六七八九十百千万亿\d.]*"
+    r"[一二两三四五六七八九十][零〇一二两三四五六七八九十百千万亿\d]*"
 )
+# A unary sign, not the hyphen in 3-5. The character before it must not be a digit.
+_UNARY_SIGN_RE = re.compile(r"(?<![\d.])([+-])(\d+(?:\.\d+)?)")
 _CN_DECIMAL_RE = re.compile(
     r"([零〇一二两三四五六七八九十百千万亿两]+)点([零〇一二三四五六七八九]+)"
 )
 # The amount has to start at a token boundary: 1.5亿 must not be read as 5亿.
 _SCALED_PAIR_RE = re.compile(r"(?<![\d.])(\d+)亿(\d+)万")
-_SCALED_ARABIC_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)(万|亿)")
+_SCALED_ARABIC_RE = re.compile(r"(?<![\d.])([+-])?(\d+(?:\.\d+)?)(万|亿)")
 _SIGNED_NUMBER_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
 _REPEATED_NEGATION_RE = re.compile(r"([不没别未无非勿莫])\1+")
 # Spoken filler a polish is allowed to drop; the compression guard measures
@@ -158,10 +160,12 @@ def _expand_cn_scales(text: str) -> str:
         return f" {value} "
 
     def _one(match: re.Match) -> str:
-        scale = 10_000 if match.group(2) == "万" else 100_000_000
-        value = float(match.group(1)) * scale
+        sign = match.group(1) or ""
+        scale = 10_000 if match.group(3) == "万" else 100_000_000
+        value = float(match.group(2)) * scale
         # Keep a separator so 1.5亿2000万 stays two amounts, not one glued integer.
-        return f" {_format_counted(value)} "
+        # A unary sign stays glued so -5.2万 and 5.2万 are not the same fact.
+        return f" {sign}{_format_counted(value)} "
 
     return _SCALED_ARABIC_RE.sub(_one, _SCALED_PAIR_RE.sub(_pair, text))
 
@@ -180,6 +184,16 @@ def _canonical_number(match: str) -> str:
     frac = frac.rstrip("0")
     whole = whole.lstrip("0") or "0"
     return sign + whole + (f".{frac}" if frac else "")
+
+
+def _signed_number_facts(text: str) -> list[str]:
+    """Unary signed numbers only. ``3-5`` stays two unsigned amounts."""
+    prepared = _prepare_number_text(text)
+    facts = []
+    for sign, body in _UNARY_SIGN_RE.findall(prepared):
+        token = ("-" if sign == "-" else "+") + _canonical_number(body)
+        facts.append(token)
+    return facts
 
 
 def _number_sequence(text: str) -> list[str]:
@@ -294,11 +308,17 @@ def polish_rejection_reason(raw: str, polished: str) -> str:
         raw_numbers - polished_numbers
         or (polished_numbers - raw_numbers) - {"0"}
         or not _number_order_kept(raw_sequence, polished_sequence)
+        or _signed_number_facts(raw) != _signed_number_facts(polished)
     ):
         return "数字被改动"
     # Count, not presence: 我不同意，也没准备好 → 我不同意，也准备好了 drops one.
-    if _negation_count(polished) < _negation_count(raw):
+    # Adding 不/没 is the other direction (去 → 不去) and is not a light edit.
+    raw_negation = _negation_count(raw)
+    polished_negation = _negation_count(polished)
+    if polished_negation < raw_negation:
         return "否定词丢失"
+    if polished_negation > raw_negation:
+        return "否定词新增"
     raw_clauses = _clause_negation_counts(raw)
     polished_clauses = _clause_negation_counts(polished)
     # Same number of clauses: a negation that moved to another clause flipped

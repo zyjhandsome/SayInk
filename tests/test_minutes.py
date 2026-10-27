@@ -1024,3 +1024,11 @@ def test_repeated_fidelity_failure_is_split_without_relaxing_checks(fake_httpx):
     assert "必须恢复" in prompts[1] and "83万元" in prompts[1]
     assert any("未通过核对" in text for text in progress)
     assert results[0].markdown.count("83万元") == 6 and results[0].markdown.count("38万元") == 6
+
+
+@pytest.mark.parametrize("sections", [None, 1, False])
+def test_custom_template_with_a_bad_sections_field_still_lists(sections):
+    from sayink.minutes_prompts import list_templates
+
+    templates = list_templates([{"id": "broken", "name": "坏模板", "sections": sections}])
+    assert any(item.id == "broken" for item in templates)

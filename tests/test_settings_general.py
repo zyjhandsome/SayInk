@@ -27,6 +27,25 @@ from sayink.ui.settings_window import SettingsWindow
 _REAL_DEVICE_REFRESH = SettingsWindow._refresh_audio_device_lists
 
 
+def test_listen_bar_placement_defaults_to_auto_and_persists(settings_window, config):
+    assert config.get("appearance.listen_bar_placement") == "auto"
+    assert config.get("appearance.listen_bar_autohide") is True
+    assert settings_window._listen_bar_combo.currentData() == "auto"
+    assert settings_window._listen_bar_autohide_row.isChecked()
+
+    settings_window._listen_bar_combo.setCurrentIndex(
+        settings_window._listen_bar_combo.findData("bottom_right")
+    )
+    settings_window._listen_bar_autohide_row.setChecked(False)
+    assert config.get("appearance.listen_bar_placement") == "bottom_right"
+    assert config.get("appearance.listen_bar_position") == {}
+    assert config.get("appearance.listen_bar_autohide") is False
+
+    settings_window.reload_settings()
+    assert settings_window._listen_bar_combo.currentData() == "bottom_right"
+    assert not settings_window._listen_bar_autohide_row.isChecked()
+
+
 def test_experimental_activity_toggle_is_off_by_default_and_saves_separately(settings_window, config):
     assert not settings_window._speaker_activity_row.isChecked()
     original_speaker = config.get("stt.speaker_model_enabled")

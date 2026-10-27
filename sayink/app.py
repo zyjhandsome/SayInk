@@ -219,13 +219,13 @@ class App(QObject):
 
     # 友好化错误信息映射
     ERROR_HINTS: ClassVar[dict[str, str]] = {
-        "已断开": "音频设备已断开\n请重新连接设备，或在设置 → 通用 → 声音收录 中刷新并选择其他设备",
+        "已断开": "音频设备已断开\n请重新连接设备，或在设置 → 通用 → 录音与输入 中刷新并选择其他设备",
         "麦克风": "无法访问麦克风\n请检查：1) 麦克风是否已连接\n2) 是否被其他应用占用\n3) 系统隐私设置",
         "模型未就绪": "语音模型未就绪\n请打开 SayInk（双击托盘图标）→ 引擎 → 下载模型",
         "模型未下载": "语音模型未下载\n请打开 SayInk（双击托盘图标）→ 引擎 → 下载模型",
         "录音过短": "录音过短\n请按住快捷键说完一句再松开",
         "未识别": "未识别到语音内容\n请确保音频来源与设备正确，并靠近麦克风或播放电脑声音",
-        "音频设备": "无法打开音频设备\n请在设置 → 通用 → 声音收录 中刷新并选择设备",
+        "音频设备": "无法打开音频设备\n请在设置 → 通用 → 录音与输入 中刷新并选择设备",
         "系统声音": "无法采集系统声音\nWindows 可启用立体声混音或安装 PyAudioWPatch；混合模式需配置电脑播放设备",
         "输出失败": "输出失败\n请确保目标窗口可接收文本输入",
     }
@@ -270,6 +270,9 @@ class App(QObject):
         # A hold whose bar is up but whose audio device is not opened yet.
         self._hold_open_pending = False
         self._hold_opened_at = 0.0
+        # Bumped when the key goes up before this hold opens the device, so a
+        # dialog that is still on the stack does not start recording afterwards.
+        self._hold_request = 0
         self._is_transcribing = False
         # Output stays serial. One next segment may be decoded into the queue
         # while the pending history record and polisher own the current one.
@@ -285,6 +288,9 @@ class App(QObject):
         # The history row of the sentence being pasted, so the watchdog can
         # still save it when the paster's callback never arrives.
         self._output_stage_record: SegmentRecord | None = None
+        # Pending row owned by polish/paste. Esc on a newer hold clears
+        # `_pending_record` and must not drop this sentence or its window.
+        self._output_pending_record: _PendingHistoryRecord | None = None
         # Which LLM mode owns the in-flight sentence and the glossary it was
         # sent with, so the right acceptance guard runs when the reply lands.
         self._output_llm_mode = LLM_MODE_POLISH
@@ -418,6 +424,9 @@ class App(QObject):
             self._config.get("audio.input_source", "microphone")
         )
         self._floating.set_esc_stops_continuous(self._config.get("audio.esc_stops_continuous", True))
+        self._floating.position_committed.connect(self._on_listen_bar_position_committed)
+        self._floating.placement_reset.connect(self._on_listen_bar_placement_reset)
+        self._apply_listen_bar_preferences()
         # Re-apply after surfaces exist so cold-start dark/system is not stuck
         # on import-time light snapshots for inline-styled widgets.
         self.apply_appearance_theme()
@@ -823,15 +832,24 @@ class App(QObject):
         self._tray.set_activity_tooltip("loading")
         self._sync_settings_runtime_status()
 
+    def _capture_source_name(self) -> str:
+        source = getattr(self._recorder, "input_source", "")
+        if source == INPUT_SOURCE_SYSTEM:
+            return "电脑声音"
+        if source == INPUT_SOURCE_MIXED:
+            return "麦克风和电脑声音"
+        return "麦克风"
+
     def _on_no_speech_warning(self):
         log.warning("持续监听长时间未检测到有效语音")
+        source = self._capture_source_name()
         self._floating.show_warning(
             "似乎没采集到声音",
-            "请检查麦克风设备与系统隐私权限",
+            f"请检查{source}设备与系统隐私权限",
         )
         self._tray.showMessage(
             "SayInk",
-            "持续监听中长时间未检测到语音，请检查麦克风与设备设置。",
+            f"持续监听中长时间未检测到语音，请检查{source}与设备设置。",
             QSystemTrayIcon.MessageIcon.Warning,
             6000,
         )
@@ -893,7 +911,13 @@ class App(QObject):
             self._floating.show_busy_transcribing()
             return
 
+        self._hold_request += 1
+        request = self._hold_request
         if not self._ensure_history_output_ready():
+            return
+        if request != self._hold_request:
+            log.info("确认框期间快捷键已松开，不开始录音")
+            self._reset_recording_ui_after_abort()
             return
         log.info("开始录音（来源: %s）...", self._recorder.input_source_display)
         self._hold_target = self._read_paste_target()
@@ -927,9 +951,16 @@ class App(QObject):
         self._later(0, self._apply_pending_recognition_settings)
         return True
 
+    def _note_hold_abandoned_before_open(self) -> None:
+        """A key-up or Esc before the device opens cancels the hold being confirmed."""
+        if self._hold_open_pending or getattr(self._recorder, "is_recording", False):
+            return
+        self._hold_request += 1
+
     def _on_recording_stop(self):
         if self._meeting_active() or self._is_continuous_mode():
             return
+        self._note_hold_abandoned_before_open()
         if self._abort_pending_hold():
             log.warning("录音设备尚未打开就已松开，忽略")
             self._floating.show_error(self._friendly_error("录音过短"))
@@ -965,6 +996,7 @@ class App(QObject):
     def _on_recording_cancel(self):
         if self._meeting_active() or self._is_continuous_mode():
             return
+        self._note_hold_abandoned_before_open()
         if self._abort_pending_hold():
             self._floating.show_cancelled()
             return
@@ -985,6 +1017,8 @@ class App(QObject):
         if callable(cancel_current) and cancel_current():
             log.info("Esc：放弃正在识别的切片")
         self._is_transcribing = False
+        # Only this hold's row. A sentence already in polish lives in
+        # `_output_pending_record` and keeps its original window.
         self._pending_record = None
         self._pending_turn_context = None
         self._pending_turn_audio = None
@@ -1425,7 +1459,7 @@ class App(QObject):
         must not fall through to an older hold: that would type into the
         wrong application.
         """
-        pending = self._pending_record
+        pending = self._record_for_output()
         if pending is not None:
             return int(getattr(pending, "target_hwnd", 0) or 0), str(getattr(pending, "target_app", "") or "")
         held = getattr(self, "_hold_target", (0, ""))
@@ -1590,6 +1624,9 @@ class App(QObject):
     ):
         if not self._recognizer.is_ready:
             self._hold_audio_until_ready(audio, route, front=True, context=context)
+            # Turn analysis may already have set this. Leaving it set blocks
+            # `_on_stt_ready` from ever draining the queue.
+            self._is_transcribing = False
             return
         if context is None:
             context = self._capture_segment_context()
@@ -1632,9 +1669,14 @@ class App(QObject):
         context = self._pending_turn_context
         audio = self._pending_turn_audio
         if self.__dict__.get("_exit_started", False) or context is None or audio is None or not turns:
+            if not self.__dict__.get("_exit_started", False):
+                self._is_transcribing = False
+                self._pump_segment_queue()
             return
         if context.trigger_mode == TRIGGER_MODE_MEETING:
             if not self._meeting_active() or self._meeting.current_id != context.session_id:
+                self._is_transcribing = False
+                self._pump_segment_queue()
                 return
         elif context.trigger_mode != TRIGGER_MODE_CONTINUOUS:
             return
@@ -1772,9 +1814,27 @@ class App(QObject):
         self._deliver_recognized_text(text)
         return True
 
+    def _record_for_output(self):
+        """Row owned by the sentence in polish/paste, else the hold still being recognized."""
+        owned = self._output_pending_record
+        if owned is not None:
+            return owned
+        return self._pending_record
+
+    def _claim_pending_record_for_output(self) -> None:
+        """Detach the current row from the hold slot before polish starts.
+
+        A new hold is allowed while polish runs. Esc on that hold clears
+        `_pending_record`; this sentence must already live elsewhere, with
+        the window captured when it was spoken.
+        """
+        if self._output_pending_record is None and self._pending_record is not None:
+            self._output_pending_record = self._pending_record
+            self._pending_record = None
+
     def _glossary_for_pending_segment(self) -> list:
         """The meeting's own terms for a meeting row, else the applied dictation glossary."""
-        record = self._pending_record
+        record = self._record_for_output()
         meeting = self._meeting_or_none()
         if (
             record is not None
@@ -1917,12 +1977,13 @@ class App(QObject):
         self._pump_segment_queue()
 
     def _deliver_recognized_text(self, text: str) -> None:
+        self._claim_pending_record_for_output()
         self._mark_output_busy()
         self._output_raw_text = text
         self._output_stage = OutputStage.POLISH
         self._output_stage_text = ""
         llm_enabled = self._config.get("llm.enabled", False)
-        pending = self._pending_record
+        pending = self._record_for_output()
         if pending is not None and pending.trigger_mode == TRIGGER_MODE_MEETING:
             # Meeting rows go to the minutes model later, in one pass; a
             # per-sentence polish would only add latency and API cost.
@@ -2188,7 +2249,10 @@ class App(QObject):
             self._output_stage = OutputStage.IDLE
             self._output_stage_text = ""
             self._output_stage_record = None
-            self._pending_record = None
+            if self._output_pending_record is not None:
+                self._output_pending_record = None
+            else:
+                self._pending_record = None
             self._finish_empty_recognition()
             return
 
@@ -2203,6 +2267,7 @@ class App(QObject):
             self._last_output_text = text
             self._last_output_at = time.monotonic()
         preserve_tail = self._keep_unsaved_continuous_text and not getattr(self._recorder, "is_continuous", False)
+        dialog_disarmed = False
         if not is_meeting_row and self._history_output_blocked() and (
             getattr(self._recorder, "is_continuous", False) is True or preserve_tail
         ):
@@ -2215,6 +2280,11 @@ class App(QObject):
                 )
                 self._release_unsaved_hold()
                 return
+            # The dialog runs a nested event loop. Drop the polish watchdog
+            # first, or a slow answer re-enters this sentence and pastes it twice.
+            self._output_token += 1
+            self._output_stage = OutputStage.PASTE
+            dialog_disarmed = True
             choice = self._ask_history_output_conflict(listening=True)
             if choice == "history":
                 self._config.set("history.enabled", True)
@@ -2245,8 +2315,11 @@ class App(QObject):
         self._output_stage = OutputStage.PASTE
         self._output_stage_text = text
         # Kept outside the paste callback so the watchdog can still save the
-        # row when the paster never answers.
+        # row when the paster never answers. A conflict dialog disarms the
+        # polish watchdog; arm a fresh one for the paste itself.
         self._output_stage_record = record
+        if dialog_disarmed:
+            self._mark_output_busy()
         self._paster.paste_async(
             text,
             lambda result, record=record: self._handle_paste_result(
@@ -2263,7 +2336,12 @@ class App(QObject):
         output_text: str,
         degraded_from_polish: bool,
     ) -> SegmentRecord | None:
-        pending = self._pending_record
+        pending = self._output_pending_record
+        if pending is not None:
+            self._output_pending_record = None
+        else:
+            pending = self._pending_record
+            self._pending_record = None
         if pending is None:
             return None
         raw_text = pending.raw_text or output_text
@@ -2273,7 +2351,6 @@ class App(QObject):
             polished_text = output_text
         else:
             polished_text = pending.polished_text
-        self._pending_record = None
         return SegmentRecord(
             session_id=pending.session_id,
             seq=pending.seq,
@@ -2670,6 +2747,17 @@ class App(QObject):
             return HISTORY_DISABLED_MEETING_REFUSAL
         if self._recorder.is_recording and not self._recorder.is_continuous:
             return "正在进行单次转写，请松开快捷键后再开始会议"
+        if (
+            not self._is_continuous_mode()
+            and not self._hold_paste_sent
+            and (
+                self._is_transcribing
+                or bool(self._segment_queue)
+                or self._output_busy
+                or bool((self._live_committed or "").strip())
+            )
+        ):
+            return "上一句还在处理，请等它完成后再开始会议"
         configured = options.model_id or str(self._config.get("stt.model_id", DEFAULT_MODEL_ID))
         if not configured or not is_model_downloaded(configured):
             return "语音模型未下载：请在 设置 → 引擎 下载后再开始会议"
@@ -3010,6 +3098,7 @@ class App(QObject):
             settings.models_changed.connect(self._on_models_changed)
             settings.recognition_changed.connect(self._on_recognition_settings_changed)
             settings.theme_changed.connect(self._on_theme_changed)
+            settings.listen_bar_prefs_changed.connect(self._on_listen_bar_prefs_changed)
             settings.finished.connect(self._on_settings_closed)
             settings.hotkey_capture_started.connect(self._hotkey_mgr.pause)
             settings.hotkey_capture_ended.connect(self._hotkey_mgr.resume)
@@ -3137,6 +3226,59 @@ class App(QObject):
     def _on_theme_changed(self, mode: str):
         """Apply appearance without reconfiguring STT / audio."""
         self.apply_appearance_theme(mode)
+
+    def _apply_listen_bar_preferences(self) -> None:
+        floating = getattr(self, "_floating", None)
+        config = getattr(self, "_config", None)
+        if floating is None or config is None:
+            return
+        floating.set_placement_preference(
+            config.get("appearance.listen_bar_placement", "auto")
+        )
+        saved = config.get("appearance.listen_bar_position", {})
+        floating.set_saved_positions(saved if isinstance(saved, dict) else {})
+        floating.set_autohide(bool(config.get("appearance.listen_bar_autohide", True)))
+
+    def _on_listen_bar_prefs_changed(self) -> None:
+        self._apply_listen_bar_preferences()
+        floating = getattr(self, "_floating", None)
+        reposition = getattr(floating, "reposition_for_preference", None)
+        if callable(reposition):
+            reposition()
+
+    def _on_listen_bar_position_committed(self, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
+        screen = str(payload.get("screen") or "")
+        if not screen:
+            return
+        try:
+            entry = {
+                "rel_x": float(payload["rel_x"]),
+                "rel_y": float(payload["rel_y"]),
+                "anchor": payload.get("anchor") if payload.get("anchor") in ("top", "bottom") else "top",
+            }
+        except (KeyError, TypeError, ValueError):
+            return
+        current = self._config.get("appearance.listen_bar_position", {})
+        positions = dict(current) if isinstance(current, dict) else {}
+        positions[screen] = entry
+        self._config.set("appearance.listen_bar_position", positions)
+        self._config.set("appearance.listen_bar_placement", "last")
+        self._floating.set_saved_positions(positions)
+        self._floating.set_placement_preference("last")
+        main = getattr(self, "_main", None)
+        panel = getattr(main, "settings_panel", None) if main is not None else None
+        if panel is not None and hasattr(panel, "set_listen_bar_placement"):
+            panel.set_listen_bar_placement("last")
+
+    def _on_listen_bar_placement_reset(self) -> None:
+        self._config.set("appearance.listen_bar_placement", "auto")
+        self._floating.set_placement_preference("auto")
+        main = getattr(self, "_main", None)
+        panel = getattr(main, "settings_panel", None) if main is not None else None
+        if panel is not None and hasattr(panel, "set_listen_bar_placement"):
+            panel.set_listen_bar_placement("auto")
 
     def apply_appearance_theme(self, mode: str | None = None) -> None:
         from PyQt6.QtWidgets import QApplication
@@ -3418,6 +3560,9 @@ class App(QObject):
             self._main.history_panel.flush_pending_delete()
         self._recognizer.shutdown(wait_ms=0)
         self._polisher.cancel()
+        # Paste and clipboard-restore timers belong to TextPaster, not this
+        # window, so stopping child QTimers does not drop a queued Ctrl+V.
+        self._paster.cancel()
         self._updates.shutdown()
         self._tray.hide()
         # Queued history writes finish before the process goes away; the

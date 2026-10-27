@@ -86,6 +86,44 @@ class TestIslandChrome:
         assert win.x() >= screen.x()
         assert win.y() <= screen.y() + 140
 
+    def test_listen_bar_presets_avoid_the_top_ribbon(self, qapp, win):
+        from sayink.ui.island_chrome import (
+            ISLAND_BOTTOM_MARGIN,
+            ISLAND_EDGE_MARGIN,
+            position_listen_bar,
+        )
+
+        win.resize(420, 44)
+        screen = qapp.primaryScreen()
+        geo = screen.availableGeometry()
+        position_listen_bar(win, width=420, placement="bottom_center", screen=screen)
+        assert win.x() == geo.x() + (geo.width() - 420) // 2
+        assert win.y() == geo.y() + geo.height() - 44 - ISLAND_BOTTOM_MARGIN
+
+        position_listen_bar(win, width=420, placement="bottom_right", screen=screen)
+        assert win.x() == geo.x() + geo.width() - 420 - ISLAND_EDGE_MARGIN
+        assert win.y() == geo.y() + geo.height() - 44 - ISLAND_BOTTOM_MARGIN
+
+    def test_saved_listen_bar_position_is_clamped_into_view(self):
+        from PyQt6.QtCore import QRect
+
+        from sayink.ui.island_chrome import origin_from_relative
+
+        geo = QRect(10, 20, 800, 600)
+        x, y = origin_from_relative(
+            geo, 420, 44, {"rel_x": 0.99, "rel_y": 3, "anchor": "top"}
+        )
+        assert geo.x() <= x <= geo.x() + geo.width() - 420
+        assert geo.y() <= y <= geo.y() + geo.height() - 44
+
+    def test_auto_placement_depends_on_session_length(self):
+        from sayink.ui.island_chrome import resolve_listen_placement
+
+        assert resolve_listen_placement("auto", long_session=False) == "top_center"
+        assert resolve_listen_placement("auto", long_session=True) == "bottom_center"
+        assert resolve_listen_placement("bottom_right", long_session=True) == "bottom_right"
+        assert resolve_listen_placement("nope", long_session=False) == "top_center"
+
     def test_listen_bar_has_no_source_chips(self, win):
         win.set_input_source("mixed")
         win.show_listening()

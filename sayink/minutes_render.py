@@ -46,8 +46,12 @@ def extract_json(text: str) -> dict[str, Any] | None:
         return data if isinstance(data, dict) else None
     except (ValueError, RecursionError):
         pass
+    if "}" not in candidate:
+        return None
     start = candidate.find("{")
-    while start != -1:
+    tries = 0
+    while start != -1 and tries < 32:
+        tries += 1
         depth = 0
         in_string = False
         escape = False
@@ -155,8 +159,7 @@ def _canonical_speaker_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
         return payload
     patterns = []
     for name in sorted(aliases, key=len, reverse=True):
-        head = r"(?<![0-9A-Za-z])" if re.match(r"[0-9A-Za-z]", name) else ""
-        tail = r"(?![0-9A-Za-z])" if re.search(r"[0-9A-Za-z]$", name) else ""
+        head, tail = _name_bounds(name)
         patterns.append(head + re.escape(name) + tail)
     pattern = re.compile("|".join(patterns))
 
@@ -345,15 +348,31 @@ def _render_section(
     return ""
 
 
+def _name_bounds(label: str) -> tuple[str, str]:
+    """Don't let a short label rewrite a longer token.
+
+    ``说话人2`` stops before ``说话人21``. A Chinese name may be followed by
+    a verb (负责、审核) but not by another character that lengthens the name
+    (``王总`` must not hit ``王总监``).
+    """
+    head = r"(?<![0-9A-Za-z])" if re.match(r"[0-9A-Za-z]", label) else ""
+    tail = r"(?![0-9A-Za-z])" if re.search(r"[0-9A-Za-z]$", label) else ""
+    if re.search(r"[\u4e00-\u9fff]", label):
+        head = head or r"(?<![\u4e00-\u9fff])"
+        following = (
+            r"(?:(?![\u4e00-\u9fff])|(?=[负责审核补充确认说明汇报参加记录整理总结"
+            r"提出建议决定安排介绍解释指出表示问道说讲的了着过和与及并而把被在从对向给]))"
+        )
+        tail = f"(?![0-9A-Za-z]){following}" if tail else following
+    return head, tail
+
+
 def replace_names_in_markdown(markdown: str, old_label: str, new_label: str) -> tuple[str, int]:
     """Whole-label replacement for user-edited (free text) notes; returns the
     new text and how many places changed."""
     if not old_label or not new_label or old_label == new_label:
         return markdown, 0
-    # 「说话人2」 must not match inside 「说话人21」; names ending in a letter
-    # or digit likewise stop at the next letter/digit.
-    tail = r"(?![0-9A-Za-z])" if re.search(r"[0-9A-Za-z]$", old_label) else ""
-    head = r"(?<![0-9A-Za-z])" if re.match(r"[0-9A-Za-z]", old_label) else ""
+    head, tail = _name_bounds(old_label)
     pattern = re.compile(head + re.escape(old_label) + tail)
     new_text, count = pattern.subn(new_label, markdown)
     return new_text, count

@@ -313,6 +313,30 @@ def test_start_meeting_refused_while_holding_the_hotkey() -> None:
         h["floating"].show_error.assert_called()
 
 
+def test_start_meeting_waits_for_a_released_hold_still_being_recognized():
+    """Key-up does not mean the utterance is finished. A meeting must not
+    wipe the part already recognized and paste only the slice that lands later."""
+    with app_harness() as h:
+        app = h["app"]
+        h["recorder"].stop.side_effect = lambda: setattr(h["recorder"], "is_recording", False)
+        h["recorder"].is_recording = True
+        app._on_segment_ready(np.full(16000, 0.1, np.float32))
+        app._on_final_result("第一句话很重要")
+        app._on_recording_stop()
+        app._on_segment_ready(np.full(16000, 0.1, np.float32))
+        assert app._live_committed == "第一句话很重要"
+        assert app._is_transcribing
+
+        with patch("sayink.meeting_session.aux_model_path", return_value=None):
+            assert app.start_meeting(MeetingOptions()) is False
+        assert app._live_committed == "第一句话很重要"
+        assert not app.meeting.is_active
+
+        app._on_final_result("第二句话")
+        assert h["paster"].paste_async.call_count == 1
+        assert h["paster"].paste_async.call_args[0][0] == "第一句话很重要第二句话"
+
+
 def test_confirm_exit_mentions_the_live_meeting() -> None:
     with app_harness() as h:
         app = h["app"]

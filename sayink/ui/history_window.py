@@ -1935,15 +1935,19 @@ class HistoryWindow(QWidget):
         session_id = self._editing_session_id
         new_text = self._details.toPlainText().strip()
         segments = _segments_in_order(self._get_session_segments_effective(session_id))
-        self._exit_inline_edit_state()
-        if new_text and segments:
+        if not new_text or not segments:
+            self._exit_inline_edit_state()
+        else:
             mapping = self._map_edited_text_to_segments(segments, new_text)
             updater = getattr(self._store, "enqueue_update_polished", None)
             if callable(updater):
                 updater(session_id, mapping)
             flush = getattr(self._store, "flush", None)
-            if callable(flush):
-                flush(timeout=2.0)
+            saved = flush(timeout=2.0) if callable(flush) else True
+            if saved is False:
+                self._show_feedback("未能保存修改")
+                return
+            self._exit_inline_edit_state()
             self._view_polished = True
             self._view_polished_btn.blockSignals(True)
             self._view_polished_btn.setChecked(True)

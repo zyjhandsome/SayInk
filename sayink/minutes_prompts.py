@@ -143,7 +143,10 @@ def find_template(template_id: str, custom: Iterable[dict[str, Any]] | None = No
     for entry in custom or ():
         if isinstance(entry, dict) and entry.get("id") == template_id:
             output_mode = "refine" if entry.get("output_mode") == "refine" else "minutes"
-            sections = tuple(s for s in entry.get("sections", ALL_SECTIONS) if s in ALL_SECTIONS) or ALL_SECTIONS
+            raw_sections = entry.get("sections", ALL_SECTIONS)
+            if not isinstance(raw_sections, (list, tuple)):
+                raw_sections = ALL_SECTIONS
+            sections = tuple(s for s in raw_sections if s in ALL_SECTIONS) or ALL_SECTIONS
             return MinutesTemplate(
                 id=str(entry["id"]),
                 name=str(entry.get("name") or entry["id"]),

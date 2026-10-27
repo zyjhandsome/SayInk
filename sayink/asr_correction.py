@@ -140,6 +140,8 @@ def glossary_variant_map(glossary: Iterable) -> list[tuple[str, str]]:
             continue
         for variant in variants:
             key = variant.casefold()
+            if len(variant) == 1 and re.fullmatch(r"[\u4e00-\u9fff]", variant):
+                continue
             if key in term_set or key in pairs:
                 continue
             if any(key in other for other in terms):
