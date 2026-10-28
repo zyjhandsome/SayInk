@@ -2016,6 +2016,7 @@ class App(QObject):
                 glossary=self._output_glossary,
                 context=self._recent_output_context(),
                 target_app=target_app,
+                proxy_mode=self._config.get("llm.proxy_mode", "system"),
             )
         elif llm_enabled:
             log.warning("文字润色已开启但配置不完整，直接输出原文")

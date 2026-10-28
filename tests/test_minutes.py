@@ -371,6 +371,30 @@ def _run(worker):
 
 
 class TestMinutesWorker:
+    def test_direct_mode_reaches_the_async_http_client(self, monkeypatch):
+        options = []
+
+        class StopAfterConnect(Exception):
+            pass
+
+        class Client:
+            async def __aenter__(self):
+                raise StopAfterConnect()
+
+            async def __aexit__(self, *_args):
+                pass
+
+        def capture(**kwargs):
+            options.append(kwargs)
+            return Client()
+
+        monkeypatch.setattr(httpx, "AsyncClient", capture)
+        worker = MinutesWorker(_request(proxy_mode="direct"))
+        coroutine = worker._run_pipeline(httpx, 0)
+        with pytest.raises(StopAfterConnect):
+            coroutine.send(None)
+        assert options[0]["trust_env"] is False
+
     @pytest.mark.parametrize("script, transient", [
         ([(503, "busy"), (503, "busy")], True),
         ([(429, "rate limited"), (429, "rate limited")], True),

@@ -217,6 +217,23 @@ def http_stream_timeout(httpx):
     )
 
 
+def http_client_options(mode: str) -> dict:
+    """Disable environment proxies for direct connections, retaining configured CAs."""
+    if mode != "direct":
+        return {"trust_env": True}
+    import os
+    import ssl
+
+    options = {"trust_env": False}
+    cafile = os.environ.get("SSL_CERT_FILE")
+    capath = os.environ.get("SSL_CERT_DIR")
+    if cafile:
+        options["verify"] = ssl.create_default_context(cafile=cafile)
+    elif capath:
+        options["verify"] = ssl.create_default_context(capath=capath)
+    return options
+
+
 _STREAM_REJECT_TERMS = ("not support", "unsupported", "not allowed", "not implemented", "不支持")
 _TEMPERATURE_REJECT_TERMS = ("not support", "unsupported", "only the default", "不支持")
 
@@ -795,6 +812,7 @@ class PolishWorker(QThread):
         mode: str = LLM_MODE_POLISH,
         glossary=(),
         context: str = "",
+        proxy_mode: str = "system",
     ):
         super().__init__()
         self._api_url = api_url.rstrip("/")
@@ -805,6 +823,7 @@ class PolishWorker(QThread):
         self._prompt = prompt or build_system_prompt(self._mode)
         self._glossary = tuple(glossary or ())
         self._context = context or ""
+        self._proxy_mode = proxy_mode
         self._cancelled = False
         self._client = None
         self._action_label = _mode_label(self._mode)
@@ -859,7 +878,7 @@ class PolishWorker(QThread):
             log.debug("原文长度: %d 字符", len(self._text))
 
             options = self.request_options()
-            with httpx.Client(timeout=http_stream_timeout(httpx)) as client:
+            with httpx.Client(timeout=http_stream_timeout(httpx), **http_client_options(self._proxy_mode)) as client:
                 self._client = client
                 try:
                     if self._cancelled:
@@ -925,6 +944,7 @@ class TextPolisher(QObject):
         glossary=(),
         context: str = "",
         target_app: str = "",
+        proxy_mode: str = "system",
     ):
         if not text.strip():
             self.polish_complete.emit(text)
@@ -946,6 +966,7 @@ class TextPolisher(QObject):
             mode=mode,
             glossary=glossary,
             context=context,
+            proxy_mode=proxy_mode,
         )
         worker.result_ready.connect(self._on_result)
         worker.error.connect(self._on_error)
@@ -993,7 +1014,7 @@ class TextPolisher(QObject):
         self.polish_error.emit(error_msg)
 
     @staticmethod
-    def test_connection(api_url: str, api_key: str, model_name: str) -> tuple[bool, str]:
+    def test_connection(api_url: str, api_key: str, model_name: str, *, proxy_mode: str = "system") -> tuple[bool, str]:
         problem = api_url_error(api_url)
         if problem:
             return False, problem
@@ -1015,7 +1036,7 @@ class TextPolisher(QObject):
             url = chat_completions_url(api_url)
             token_parameter = "max_tokens"
             downgrade = False
-            with httpx.Client(timeout=http_stream_timeout(httpx)) as client:
+            with httpx.Client(timeout=http_stream_timeout(httpx), **http_client_options(proxy_mode)) as client:
                 for _attempt in range(3):
                     body = {key: value for key, value in payload.items() if key not in ("max_tokens", "max_completion_tokens", "stream")}
                     body[token_parameter] = 16

@@ -1031,6 +1031,7 @@ class MeetingController(QObject):
             api_url=api_url,
             api_key=api_key,
             model_name=model,
+            proxy_mode=self._config.get("llm.proxy_mode", "system"),
             template=template,
             context=context,
             lines=lines,

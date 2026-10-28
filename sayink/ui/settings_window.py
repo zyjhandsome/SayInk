@@ -1241,6 +1241,8 @@ class SettingsWindow(QWidget):
         return getattr(self, "_model_cards_for_id", None) == active
 
     def _load_settings_fields(self, *, refresh_devices: bool, heavy: bool):
+        proxy_mode = self._config.get("llm.proxy_mode", "system")
+        self._set_combo_by_data(self._llm_proxy_combo, proxy_mode if proxy_mode in ("system", "direct") else "system")
         self._hotkey_edit.set_value(self._config.get("hotkey", DEFAULT_HOTKEY))
         self._auto_start_row.setChecked(self._config.get("auto_start", False))
         self._sound_row.setChecked(self._config.get("sound_enabled", True))
@@ -1685,6 +1687,13 @@ class SettingsWindow(QWidget):
         self._set_section_visible(self._esc_stop_divider, continuous)
         self._refresh_output_controls()
         self._refresh_meeting_defaults()
+
+    def _on_llm_proxy_changed(self, _index: int = 0):
+        if not self._loading:
+            self._config.set("llm.proxy_mode", self._llm_proxy_combo.currentData())
+            self._llm_test_stamp = None
+            self._update_llm_configuration_status()
+            self._set_llm_status(self._minutes_test_status, "代理模式已更改，请重新测试连接。", "idle")
 
     def _on_theme_mode_changed(self, _index: int = 0):
         if self._loading:
@@ -2242,16 +2251,17 @@ class SettingsWindow(QWidget):
             return None
 
         class _W(QThread):
-            def __init__(self, u, k, m, parent=None):
+            def __init__(self, u, k, m, proxy_mode, parent=None):
                 super().__init__(parent)
                 self.u, self.k, self.m = u, k, m
+                self.proxy_mode = proxy_mode
                 self.ok, self.msg = False, ""
 
             def run(self):
                 from sayink.text_polisher import TextPolisher
-                self.ok, self.msg = TextPolisher.test_connection(self.u, self.k, self.m)
+                self.ok, self.msg = TextPolisher.test_connection(self.u, self.k, self.m, proxy_mode=self.proxy_mode)
 
-        worker = _W(url, key, model, self)
+        worker = _W(url, key, model, self._config.get("llm.proxy_mode", "system"), self)
         self._test_workers.append(worker)
         worker.finished.connect(lambda w=worker: self._on_test_done(w, btn, status, ok_text))
         self._release_button_without_shifting_focus(btn)
@@ -2267,6 +2277,12 @@ class SettingsWindow(QWidget):
             pass
         btn.setEnabled(True)
         btn.setText("测试连接")
+        if w.proxy_mode != self._config.get("llm.proxy_mode", "system"):
+            if status is self._llm_test_status:
+                self._update_llm_configuration_status()
+            else:
+                self._set_llm_status(status, "代理模式已更改，请重新测试连接。", "idle")
+            return
         if status is self._llm_test_status:
             self._llm_test_stamp = (w.u, w.k, w.m, w.ok, ok_text if w.ok else w.msg)
             self._update_llm_configuration_status()

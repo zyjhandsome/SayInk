@@ -122,6 +122,17 @@ def settings_window(_shared_settings, config, monkeypatch):
     yield win
 
 
+def test_ai_proxy_mode_is_saved_and_reloaded(settings_window, config):
+    combo = settings_window._llm_proxy_combo
+    assert combo.currentData() == "system"
+    combo.setCurrentIndex(combo.findData("direct"))
+    assert config.get("llm.proxy_mode") == "direct"
+    config.save_immediate()
+    config._load()
+    settings_window.reload_settings(refresh_devices=False, heavy=False)
+    assert combo.currentData() == "direct"
+
+
 class TestGeneralPageLayout:
     def test_island_nav_labels(self, settings_window):
         assert isinstance(settings_window, QWidget)
@@ -1007,7 +1018,7 @@ class TestPolishConfigurationStatus:
         calls = []
         monkeypatch.setattr(
             "sayink.text_polisher.TextPolisher.test_connection",
-            staticmethod(lambda u, k, m: (calls.append((u, k, m)), (True, ""))[1]),
+            staticmethod(lambda u, k, m, **_kwargs: (calls.append((u, k, m)), (True, ""))[1]),
         )
         settings_window._llm_url_edit.setText("https://api.deepseek.com/v1")
         settings_window._llm_key_edit.setText("sk-x")

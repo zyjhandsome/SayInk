@@ -31,7 +31,7 @@ from sayink.minutes_prompts import (
 )
 from sayink.minutes_render import apply_speaker_names, extract_json, render_markdown
 from sayink.text_polisher import (
-    LLMCancelled, LLMResponseError, LLMTruncatedError, api_url_error, strip_model_thinking,
+    LLMCancelled, LLMResponseError, LLMTruncatedError, api_url_error, strip_model_thinking, http_client_options,
 )
 from sayink.llm_transport import (
     Cancellation, LLMBrokenStream, LLMContextError, LLMDeadlineError, completion, is_billing_error,
@@ -76,6 +76,7 @@ class MinutesRequest:
     total_timeout_sec: float = 600.0
     checkpoints: dict[str, str] = field(default_factory=dict)
     save_checkpoint: Callable[[str, str], None] | None = None
+    proxy_mode: str = "system"
 
 
 def request_fingerprint(request: MinutesRequest) -> str:
@@ -457,7 +458,7 @@ class MinutesWorker(QThread):
         chunks = self._plan_chunks(system_prompt) if not req.template.is_refinement else []
         chunked = len(chunks) > 1
         timeout = httpx.Timeout(req.timeout_sec, connect=min(10, req.timeout_sec), write=30, pool=10)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, **http_client_options(req.proxy_mode)) as client:
             payload: dict[str, Any] | None
             markdown_text = ""
             if req.template.is_refinement:

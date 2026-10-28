@@ -362,6 +362,17 @@ def _build_listen_bar_row(win) -> QWidget:
 
 def build_preferences_section(win) -> QWidget:
     card, lay = _card()
+    win._llm_proxy_combo = QComboBox()
+    win._llm_proxy_combo.setMinimumWidth(220)
+    win._llm_proxy_combo.setAccessibleName("AI 服务代理模式")
+    win._llm_proxy_combo.addItem("使用系统 / 环境代理", "system")
+    win._llm_proxy_combo.addItem("直连（不使用代理）", "direct")
+    win._llm_proxy_combo.currentIndexChanged.connect(win._on_llm_proxy_changed)
+    lay.addWidget(labeled_row(
+        "AI 服务代理", win._llm_proxy_combo,
+        "适用于连接测试、文字处理和会议纪要；内网接口超时可尝试直连。更新不受此设置影响。",
+    ))
+    lay.addWidget(group_divider())
     lay.addWidget(_build_theme_row(win))
     lay.addWidget(group_divider())
     lay.addWidget(_build_listen_bar_row(win))
@@ -641,6 +652,7 @@ def build_general_page(win) -> QWidget:
         win._meeting_model_combo,
         win._meeting_start_card_row,
         win._meeting_start_card_reset_btn,
+        win._llm_proxy_combo,
         win._theme_combo,
         win._listen_bar_combo,
         win._listen_bar_autohide_row,

@@ -13,6 +13,40 @@ from sayink.text_polisher import (
 )
 
 
+def test_connection_can_bypass_a_gateway_proxy(monkeypatch):
+    import httpx
+
+    calls = []
+    def respond(transport, request):
+        pool = type(transport._pool).__name__
+        calls.append((pool, str(request.url)))
+        if pool == "HTTPProxy":
+            return httpx.Response(504, content=b"gateway timeout")
+        return httpx.Response(200, content=b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n')
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", respond)
+    for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.test:8080")
+    url = "http://internal.example.test/v1"
+    ok, message = TextPolisher.test_connection(url, "key", "model", proxy_mode="system")
+    assert not ok and "504" in message
+    ok, _ = TextPolisher.test_connection(url, "key", "model", proxy_mode="direct")
+    assert ok
+    assert calls == [("HTTPProxy", url + "/chat/completions"), ("ConnectionPool", url + "/chat/completions")]
+
+
+def test_direct_keeps_configured_certificate_authority(monkeypatch):
+    from sayink.text_polisher import http_client_options
+
+    monkeypatch.setenv("SSL_CERT_FILE", "company-ca.pem")
+    with patch("ssl.create_default_context", return_value=object()) as create:
+        options = http_client_options("direct")
+    assert options["trust_env"] is False
+    assert options["verify"] is create.return_value
+    create.assert_called_once_with(cafile="company-ca.pem")
+
+
 class TestSecureOrLocalUrl:
     @pytest.mark.parametrize(
         "url",
@@ -382,6 +416,13 @@ class TestPolishWorkerRun:
         timeout = fake.Timeout.call_args.kwargs
         assert timeout["connect"] == 10.0
         assert timeout["read"] == 120.0
+
+    def test_direct_mode_is_used_for_live_text_processing(self):
+        fake, _client = _fake_httpx_module(_make_response({"choices": [{"message": {"content": "结果"}}]}))
+        worker = PolishWorker("https://api.example.com/v1", "k", "m", "文本", proxy_mode="direct")
+        results, errors = self._run_worker(worker, fake)
+        assert results == ["结果"] and not errors
+        assert fake.Client.call_args.kwargs["trust_env"] is False
 
     def test_cancel_during_the_request_closes_the_connection_and_emits_nothing(self):
         """Exit must not wait the full 15 s timeout on a request already sent:
