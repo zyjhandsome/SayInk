@@ -954,6 +954,152 @@ def test_default_output_mode_still_pastes() -> None:
         h["paster"].paste_async.assert_called_once()
 
 
+def test_system_audio_stays_in_history_when_the_source_setting_moves_to_the_microphone() -> None:
+    """Automatic destination follows the audio still being captured.
+
+    Changing the source control to the microphone updates the saved
+    destination immediately, but the open recorder is still on system audio.
+    That playback must not be typed into the foreground window.
+    """
+    with app_harness({
+        "audio.trigger_mode": "continuous",
+        "audio.input_source": "system",
+        "llm.enabled": False,
+    }) as h:
+        app = h["app"]
+        h["config"].follow_input_source_for_output("system")
+        h["recorder"].input_source = "system"
+        app._begin_transcription(_audio())
+        h["config"].set("audio.input_source", "microphone")
+        h["config"].follow_input_source_for_output("microphone")
+        assert h["config"].history_only_output() is False
+
+        app._on_final_result("播放里的一句")
+
+        h["paster"].paste_async.assert_not_called()
+        records = _enqueued_records(h["history"])
+        assert [record.raw_text for record in records] == ["播放里的一句"]
+        assert records[0].source == "system"
+
+
+def test_microphone_audio_still_pastes_when_the_source_setting_moves_to_system() -> None:
+    """The sentence already captured from the microphone keeps cursor input."""
+    with app_harness({
+        "audio.trigger_mode": "continuous",
+        "audio.input_source": "microphone",
+        "llm.enabled": False,
+    }) as h:
+        app = h["app"]
+        h["config"].follow_input_source_for_output("microphone")
+        h["recorder"].input_source = "microphone"
+        app._begin_transcription(_audio())
+        h["config"].set("audio.input_source", "system")
+        h["config"].follow_input_source_for_output("system")
+        assert h["config"].history_only_output() is True
+
+        app._on_final_result("麦克风里的一句")
+
+        assert h["paster"].paste_async.call_args[0][0] == "麦克风里的一句"
+
+
+def test_explicit_paste_still_types_system_audio() -> None:
+    """A fixed 「输入当前光标」 choice is not undone by the captured source."""
+    with app_harness({
+        "audio.trigger_mode": "continuous",
+        "audio.input_source": "system",
+        "llm.enabled": False,
+    }) as h:
+        app = h["app"]
+        h["config"].set_output_mode("paste", auto=False)
+        h["recorder"].input_source = "system"
+        app._begin_transcription(_audio())
+        app._on_final_result("要贴出去")
+        assert h["paster"].paste_async.call_args[0][0] == "要贴出去"
+
+
+def test_esc_still_ends_continuous_after_the_trigger_setting_changes() -> None:
+    """The open continuous session keeps its own stop rule until it ends."""
+    with app_harness({"audio.trigger_mode": "continuous"}) as h:
+        app = h["app"]
+        _start_continuous_user_session(app)
+        h["recorder"].is_continuous = True
+        h["recorder"].is_recording = True
+        h["config"].set("audio.trigger_mode", "hotkey")
+
+        app._on_esc_pressed()
+
+        h["recorder"].stop_continuous.assert_called_once()
+
+
+def test_end_button_still_stops_continuous_after_the_trigger_setting_changes() -> None:
+    with app_harness({"audio.trigger_mode": "continuous"}) as h:
+        app = h["app"]
+        _start_continuous_user_session(app)
+        h["recorder"].is_continuous = True
+        h["recorder"].is_recording = True
+        h["config"].set("audio.trigger_mode", "hotkey")
+
+        app._stop_continuous_user_session()
+
+        h["recorder"].stop_continuous.assert_called_once()
+
+
+def test_continuous_text_is_not_dropped_when_the_trigger_setting_changes() -> None:
+    """A previous hold must not discard the continuous sentence still in flight."""
+    with app_harness({"audio.trigger_mode": "continuous", "llm.enabled": False}) as h:
+        app = h["app"]
+        _start_continuous_user_session(app)
+        h["recorder"].is_continuous = True
+        h["recorder"].is_recording = True
+        app._hold_paste_sent = True
+        app._begin_transcription(_audio())
+        h["config"].set("audio.trigger_mode", "hotkey")
+
+        app._on_final_result("还在说")
+
+        assert h["paster"].paste_async.call_args[0][0] == "还在说"
+
+
+def test_continuous_system_audio_keeps_its_destination_when_the_trigger_setting_changes() -> None:
+    """The other mode's saved destination must not receive audio still in this session."""
+    with app_harness({
+        "audio.trigger_mode": "continuous",
+        "audio.input_source": "system",
+        "llm.enabled": False,
+    }) as h:
+        app = h["app"]
+        h["config"].follow_input_source_for_output("system")
+        h["config"].set("audio.trigger_mode", "hotkey")
+        h["config"].set_output_mode("paste", auto=False)
+        h["config"].set("audio.trigger_mode", "continuous")
+        h["recorder"].input_source = "system"
+        _start_continuous_user_session(app)
+        h["recorder"].is_continuous = True
+        h["recorder"].is_recording = True
+        app._begin_transcription(_audio())
+        h["config"].set("audio.trigger_mode", "hotkey")
+        assert h["config"].history_only_output() is False
+
+        app._on_final_result("播放内容")
+
+        h["paster"].paste_async.assert_not_called()
+        records = _enqueued_records(h["history"])
+        assert [record.raw_text for record in records] == ["播放内容"]
+
+
+def test_hold_release_still_stops_after_the_trigger_setting_changes() -> None:
+    """An open hold still ends on release after the saved mode becomes continuous."""
+    with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+        app = h["app"]
+        app._on_recording_start()
+        h["recorder"].is_recording = True
+        h["config"].set("audio.trigger_mode", "continuous")
+
+        app._on_recording_stop()
+
+        h["recorder"].stop.assert_called_once()
+
+
 def test_esc_does_not_end_continuous_session_when_disabled() -> None:
     with app_harness({"audio.trigger_mode": "continuous", "audio.esc_stops_continuous": False}) as h:
         app = h["app"]

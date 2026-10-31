@@ -857,6 +857,49 @@ class Config:
     def history_only_output(self) -> bool:
         return Config.output_mode(self) == OUTPUT_MODE_HISTORY
 
+    def _destination_for(self, trigger: str) -> tuple[str, bool]:
+        """``(mode, follows_source)`` for one trigger mode, without writing."""
+        by_mode = self.get("output.by_mode")
+        slot = by_mode.get(trigger) if isinstance(by_mode, dict) else None
+        if isinstance(slot, dict):
+            follow = slot.get("follow_input_source", None)
+            mode = slot.get("mode", OUTPUT_MODE_PASTE)
+        else:
+            follow = self.get("output.follow_input_source", None)
+            mode = self.get("output.mode", OUTPUT_MODE_PASTE)
+        if mode not in OUTPUT_MODES:
+            mode = OUTPUT_MODE_PASTE
+        if isinstance(follow, bool):
+            follows = follow
+        else:
+            follows = mode == OUTPUT_MODE_PASTE or bool(self.get("output.mode_auto", False))
+        return mode, follows
+
+    def history_only_for_capture(
+        self,
+        captured_source: str | None = None,
+        *,
+        trigger_mode: str | None = None,
+    ) -> bool:
+        """Destination for audio already captured.
+
+        The source control and the trigger-mode control save immediately, but
+        an open recorder keeps the previous device and the previous mode.
+        Automatic destination follows that captured audio and the mode that
+        captured it. An explicit paste or history choice for that mode stays.
+        When nothing has diverged, this is the same answer as
+        ``history_only_output``.
+        """
+        active = Config._active_output_trigger(self)
+        trigger = trigger_mode if trigger_mode in (TRIGGER_MODE_HOTKEY, TRIGGER_MODE_CONTINUOUS) else active
+        mode, follows = Config._destination_for(self, trigger)
+        captured_input = {"mic": "microphone", "system": "system", "mixed": "mixed"}.get(captured_source or "")
+        settings_source = str(self.get("audio.input_source", "microphone") or "microphone")
+        diverged = bool(captured_input) and (captured_input != settings_source or trigger != active)
+        if follows and captured_input and diverged:
+            return captured_input in HISTORY_ONLY_INPUT_SOURCES
+        return mode == OUTPUT_MODE_HISTORY
+
     def set_output_mode(self, mode: str, *, auto: bool = False) -> None:
         """Pick where results go. ``auto`` marks a choice made by the app."""
         if mode not in OUTPUT_MODES:

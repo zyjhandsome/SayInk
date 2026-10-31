@@ -19,6 +19,9 @@ from sayink.ui.prompts import confirm
 from sayink.config import (
     OUTPUT_MODE_PASTE,
     Config,
+    # Tests replace ``Config`` with a mock constructor. Destination rules stay
+    # on the real class, which only reads ``get`` / ``set``.
+    Config as _ConfigRules,
     DEFAULT_HOTKEY,
     format_hotkey,
     TRIGGER_MODE_CONTINUOUS,
@@ -452,11 +455,24 @@ class App(QObject):
         meeting = self._meeting_or_none()
         return meeting is not None and meeting.is_active
 
+    def _capture_open(self) -> bool:
+        """A hold or continuous listen still owns the device."""
+        if getattr(self, "_hold_open_pending", False):
+            return True
+        recorder = getattr(self, "_recorder", None)
+        return bool(recorder is not None and getattr(recorder, "is_recording", False))
+
     def _is_continuous_mode(self) -> bool:
         # A meeting is a continuous session whatever the dictation trigger
         # mode is: segments flow through the same VAD → queue → history path.
         if self._meeting_active():
             return True
+        # The saved trigger mode can change while this capture is still open.
+        # Stop, paste and segment identity stay on the mode that started it.
+        if self._capture_open():
+            locked = getattr(self, "_locked_trigger_mode", None)
+            if locked in (TRIGGER_MODE_HOTKEY, TRIGGER_MODE_CONTINUOUS):
+                return locked == TRIGGER_MODE_CONTINUOUS
         return self._config.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY) == TRIGGER_MODE_CONTINUOUS
 
     def _continuous_session_active(self) -> bool:
@@ -922,6 +938,7 @@ class App(QObject):
             self._reset_recording_ui_after_abort()
             return
         log.info("开始录音（来源: %s）...", self._recorder.input_source_display)
+        self._locked_trigger_mode = TRIGGER_MODE_HOTKEY
         self._hold_target = self._read_paste_target()
         self._current_transcription = ""
         self._hold_paste_sent = False
@@ -1061,6 +1078,7 @@ class App(QObject):
         self._speakers = self._new_speaker_session()
         self._clear_live_transcript()
         self._publish_open_history_session()
+        self._locked_trigger_mode = TRIGGER_MODE_CONTINUOUS
         self._start_continuous_listening()
 
     def _on_hotkey_tap_too_short(self):
@@ -1175,6 +1193,7 @@ class App(QObject):
             return
         if not self._ensure_history_output_ready():
             return
+        self._locked_trigger_mode = TRIGGER_MODE_CONTINUOUS
         log.info("开启持续转写（来源: %s）", self._recorder.input_source_display)
         self._sound.play_start()
 
@@ -1712,6 +1731,14 @@ class App(QObject):
         self._segment_queue[0:0] = prepared[1:]
         first = prepared[0]
         self._begin_transcription(first.audio, route=first.route, context=first.context)
+
+    def _utterance_history_only(self, record) -> bool:
+        """History-only for this utterance, not for a setting that changed later."""
+        source = getattr(record, "source", None) if record is not None else None
+        trigger = getattr(record, "trigger_mode", None) if record is not None else None
+        if trigger == TRIGGER_MODE_MEETING:
+            trigger = None
+        return _ConfigRules.history_only_for_capture(self._config, source, trigger_mode=trigger)
 
     def _history_source(self) -> str:
         return {
@@ -2264,6 +2291,7 @@ class App(QObject):
         paste_hwnd, paste_app = self._paste_target_for_output()
         record = self._freeze_pending_history_record(text, degraded_from_polish)
         is_meeting_row = record is not None and record.trigger_mode == TRIGGER_MODE_MEETING
+        history_only = self._utterance_history_only(record)
         if not is_meeting_row:
             # Context for the next correction: only dictation that is about to
             # go out, never a meeting row the user is not typing anywhere.
@@ -2271,8 +2299,12 @@ class App(QObject):
             self._last_output_at = time.monotonic()
         preserve_tail = self._keep_unsaved_continuous_text and not getattr(self._recorder, "is_continuous", False)
         dialog_disarmed = False
-        if not is_meeting_row and self._history_output_blocked() and (
-            getattr(self._recorder, "is_continuous", False) is True or preserve_tail
+        if (
+            not is_meeting_row
+            and not self._meeting_active()
+            and history_only
+            and not bool(self._config.get("history.enabled", True))
+            and (getattr(self._recorder, "is_continuous", False) is True or preserve_tail)
         ):
             if preserve_tail:
                 copied = self._copy_clipboard(text)
@@ -2304,7 +2336,11 @@ class App(QObject):
                 )
                 self._release_unsaved_hold()
                 return
-        if is_meeting_row or self._config.history_only_output():
+            # 「改为输入光标」/「开启历史」apply to this sentence. Re-read after
+            # the dialog; the captured-source rule still applies if the user
+            # only turned history back on.
+            history_only = self._utterance_history_only(record)
+        if is_meeting_row or history_only:
             # Meeting / playback capture: the words go to history, never to
             # whatever window happens to be in front.
             saved = is_meeting_row or bool(self._config.get("history.enabled", True))
