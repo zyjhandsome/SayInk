@@ -1032,6 +1032,7 @@ class MeetingController(QObject):
             api_key=api_key,
             model_name=model,
             proxy_mode=self._config.get("llm.proxy_mode", "system"),
+            proxy_bypass_suffixes=str(self._config.get("llm.proxy_bypass_suffixes", "") or ""),
             template=template,
             context=context,
             lines=lines,

@@ -920,7 +920,22 @@ class SettingsWindow(QWidget):
             _settings_styles.BTN_ACCENT_SM if visible else _settings_styles.BTN_GHOST_SM
         )
 
+    def _with_proxy_suffix_note(self, text: str) -> str:
+        from sayink.text_polisher import parse_proxy_bypass_suffixes
+
+        edit = getattr(self, "_llm_proxy_suffix_edit", None)
+        raw = edit.text() if edit is not None else str(self._config.get("llm.proxy_bypass_suffixes", "") or "")
+        _valid, ignored = parse_proxy_bypass_suffixes(raw)
+        if not ignored:
+            return text
+        note = "这些直连后缀不会生效：" + "、".join(ignored)
+        if note in text:
+            return text
+        return f"{text} {note}".strip()
+
     def _set_llm_status(self, label: QLabel, text: str, tone: str) -> None:
+        if label is getattr(self, "_llm_test_status", None):
+            text = self._with_proxy_suffix_note(text)
         label.setProperty("viTone", tone)
         label.setText(text)
         self._paint_llm_status(label)
@@ -1243,6 +1258,7 @@ class SettingsWindow(QWidget):
     def _load_settings_fields(self, *, refresh_devices: bool, heavy: bool):
         proxy_mode = self._config.get("llm.proxy_mode", "system")
         self._set_combo_by_data(self._llm_proxy_combo, proxy_mode if proxy_mode in ("system", "direct") else "system")
+        self._llm_proxy_suffix_edit.setText(str(self._config.get("llm.proxy_bypass_suffixes", "") or ""))
         self._hotkey_edit.set_value(self._config.get("hotkey", DEFAULT_HOTKEY))
         self._auto_start_row.setChecked(self._config.get("auto_start", False))
         self._sound_row.setChecked(self._config.get("sound_enabled", True))
@@ -1694,6 +1710,12 @@ class SettingsWindow(QWidget):
             self._llm_test_stamp = None
             self._update_llm_configuration_status()
             self._set_llm_status(self._minutes_test_status, "代理模式已更改，请重新测试连接。", "idle")
+
+    def _on_llm_proxy_suffix_changed(self, _text: str = ""):
+        if not self._loading:
+            self._config.set("llm.proxy_bypass_suffixes", self._llm_proxy_suffix_edit.text())
+            self._llm_test_stamp = None
+            self._update_llm_configuration_status()
 
     def _on_theme_mode_changed(self, _index: int = 0):
         if self._loading:
@@ -2251,17 +2273,27 @@ class SettingsWindow(QWidget):
             return None
 
         class _W(QThread):
-            def __init__(self, u, k, m, proxy_mode, parent=None):
+            def __init__(self, u, k, m, proxy_mode, suffixes, parent=None):
                 super().__init__(parent)
                 self.u, self.k, self.m = u, k, m
                 self.proxy_mode = proxy_mode
+                self.suffixes = suffixes
                 self.ok, self.msg = False, ""
 
             def run(self):
                 from sayink.text_polisher import TextPolisher
-                self.ok, self.msg = TextPolisher.test_connection(self.u, self.k, self.m, proxy_mode=self.proxy_mode)
+                self.ok, self.msg = TextPolisher.test_connection(
+                    self.u, self.k, self.m,
+                    proxy_mode=self.proxy_mode,
+                    proxy_bypass_suffixes=self.suffixes,
+                )
 
-        worker = _W(url, key, model, self._config.get("llm.proxy_mode", "system"), self)
+        worker = _W(
+            url, key, model,
+            self._config.get("llm.proxy_mode", "system"),
+            str(self._config.get("llm.proxy_bypass_suffixes", "") or ""),
+            self,
+        )
         self._test_workers.append(worker)
         worker.finished.connect(lambda w=worker: self._on_test_done(w, btn, status, ok_text))
         self._release_button_without_shifting_focus(btn)
@@ -2277,7 +2309,8 @@ class SettingsWindow(QWidget):
             pass
         btn.setEnabled(True)
         btn.setText("测试连接")
-        if w.proxy_mode != self._config.get("llm.proxy_mode", "system"):
+        suffixes_now = str(self._config.get("llm.proxy_bypass_suffixes", "") or "")
+        if w.proxy_mode != self._config.get("llm.proxy_mode", "system") or w.suffixes != suffixes_now:
             if status is self._llm_test_status:
                 self._update_llm_configuration_status()
             else:

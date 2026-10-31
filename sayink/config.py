@@ -117,6 +117,7 @@ DEFAULT_CONFIG = {
     "llm": {
         "enabled": False,
         "proxy_mode": "system",
+        "proxy_bypass_suffixes": "",
         "api_url": "",
         "api_key": "",
         "model_name": "",

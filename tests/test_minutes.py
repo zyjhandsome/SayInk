@@ -395,6 +395,70 @@ class TestMinutesWorker:
             coroutine.send(None)
         assert options[0]["trust_env"] is False
 
+    def test_system_mode_private_host_does_not_trust_the_environment(self, monkeypatch):
+        options = []
+
+        class StopAfterConnect(Exception):
+            pass
+
+        class Client:
+            async def __aenter__(self):
+                raise StopAfterConnect()
+
+            async def __aexit__(self, *_args):
+                pass
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: options.append(kwargs) or Client())
+        worker = MinutesWorker(_request(api_url="http://10.1.2.3/v1", proxy_mode="system"))
+        coroutine = worker._run_pipeline(httpx, 0)
+        with pytest.raises(StopAfterConnect):
+            coroutine.send(None)
+        assert options[0]["trust_env"] is False
+
+    def test_system_mode_suffix_does_not_trust_the_environment(self, monkeypatch):
+        options = []
+
+        class StopAfterConnect(Exception):
+            pass
+
+        class Client:
+            async def __aenter__(self):
+                raise StopAfterConnect()
+
+            async def __aexit__(self, *_args):
+                pass
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: options.append(kwargs) or Client())
+        worker = MinutesWorker(_request(
+            api_url="https://llm.example.internal/v1",
+            proxy_mode="system",
+            proxy_bypass_suffixes=".example.internal",
+        ))
+        coroutine = worker._run_pipeline(httpx, 0)
+        with pytest.raises(StopAfterConnect):
+            coroutine.send(None)
+        assert options[0]["trust_env"] is False
+
+    def test_system_mode_public_host_trusts_the_environment(self, monkeypatch):
+        options = []
+
+        class StopAfterConnect(Exception):
+            pass
+
+        class Client:
+            async def __aenter__(self):
+                raise StopAfterConnect()
+
+            async def __aexit__(self, *_args):
+                pass
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: options.append(kwargs) or Client())
+        worker = MinutesWorker(_request(proxy_mode="system"))
+        coroutine = worker._run_pipeline(httpx, 0)
+        with pytest.raises(StopAfterConnect):
+            coroutine.send(None)
+        assert options[0]["trust_env"] is True
+
     @pytest.mark.parametrize("script, transient", [
         ([(503, "busy"), (503, "busy")], True),
         ([(429, "rate limited"), (429, "rate limited")], True),

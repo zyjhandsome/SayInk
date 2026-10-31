@@ -47,6 +47,105 @@ def test_direct_keeps_configured_certificate_authority(monkeypatch):
     create.assert_called_once_with(cafile="company-ca.pem")
 
 
+def _proxy_env(monkeypatch):
+    import httpx
+
+    calls = []
+
+    def respond(transport, request):
+        pool = type(transport._pool).__name__
+        calls.append((pool, str(request.url)))
+        if pool == "HTTPProxy":
+            return httpx.Response(504, content=b"gateway timeout")
+        return httpx.Response(200, content=b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n')
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", respond)
+    for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.test:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.test:8080")
+    return calls
+
+
+def test_system_mode_reaches_a_private_host_without_the_gateway(monkeypatch):
+    calls = _proxy_env(monkeypatch)
+    url = "http://10.1.2.3/v1"
+    ok, _message = TextPolisher.test_connection(url, "key", "model", proxy_mode="system")
+    assert ok
+    assert calls == [("ConnectionPool", url + "/chat/completions")]
+
+
+def test_system_mode_still_uses_the_gateway_for_a_public_host(monkeypatch):
+    calls = _proxy_env(monkeypatch)
+    url = "http://api.example.com/v1"
+    ok, message = TextPolisher.test_connection(url, "key", "model", proxy_mode="system")
+    assert not ok and "504" in message
+    assert calls == [("HTTPProxy", url + "/chat/completions")]
+
+
+def test_plain_dns_name_is_not_treated_as_private(monkeypatch):
+    calls = _proxy_env(monkeypatch)
+    url = "http://llm.corp.example/v1"
+    ok, message = TextPolisher.test_connection(url, "key", "model", proxy_mode="system")
+    assert not ok and "504" in message
+    assert calls == [("HTTPProxy", url + "/chat/completions")]
+
+
+def test_saved_suffix_bypasses_only_matching_hosts(monkeypatch):
+    calls = _proxy_env(monkeypatch)
+    internal = "http://llm.example.internal/v1"
+    ok, _message = TextPolisher.test_connection(
+        internal, "key", "model", proxy_mode="system", proxy_bypass_suffixes=".example.internal, bad",
+    )
+    assert ok
+    lookalike = "http://notexample.com/v1"
+    ok, message = TextPolisher.test_connection(
+        lookalike, "key", "model", proxy_mode="system", proxy_bypass_suffixes="example.com",
+    )
+    assert not ok and "504" in message
+    assert calls == [
+        ("ConnectionPool", internal + "/chat/completions"),
+        ("HTTPProxy", lookalike + "/chat/completions"),
+    ]
+
+
+def test_suffix_parser_ignores_tokens_without_a_dot():
+    from sayink.text_polisher import parse_proxy_bypass_suffixes
+
+    valid, ignored = parse_proxy_bypass_suffixes(".Example.Internal, bad, *.wild, http://nope")
+    assert valid == ("example.internal",)
+    assert ignored == ("bad", "*.wild", "http://nope")
+
+
+def test_private_bypass_keeps_configured_certificate_authority(monkeypatch):
+    from sayink.text_polisher import http_client_options
+
+    monkeypatch.setenv("SSL_CERT_FILE", "company-ca.pem")
+    with patch("ssl.create_default_context", return_value=object()) as create:
+        options = http_client_options("system", "https://10.1.2.3/v1", "")
+    assert options["trust_env"] is False
+    assert options["verify"] is create.return_value
+    create.assert_called_once_with(cafile="company-ca.pem")
+
+
+def test_direct_mode_ignores_suffixes_and_keeps_the_certificate_authority(monkeypatch):
+    from sayink.text_polisher import http_client_options
+
+    monkeypatch.setenv("SSL_CERT_FILE", "company-ca.pem")
+    with patch("ssl.create_default_context", return_value=object()) as create:
+        options = http_client_options("direct", "https://api.example.com/v1", ".example.com")
+    assert options["trust_env"] is False
+    assert options["verify"] is create.return_value
+
+
+def test_update_and_model_download_do_not_read_proxy_suffixes():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "sayink"
+    for name in ("updater.py", "speech_recognizer.py"):
+        assert "proxy_bypass_suffixes" not in (root / name).read_text(encoding="utf-8")
+
+
 class TestSecureOrLocalUrl:
     @pytest.mark.parametrize(
         "url",

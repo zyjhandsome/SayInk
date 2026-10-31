@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QButtonGroup,
     QComboBox,
     QHBoxLayout,
+    QLineEdit,
     QLabel,
     QPushButton,
     QRadioButton,
@@ -372,6 +373,16 @@ def build_preferences_section(win) -> QWidget:
         "AI 服务代理", win._llm_proxy_combo,
         "适用于连接测试、文字处理和会议纪要；内网接口超时可尝试直连。更新不受此设置影响。",
     ))
+    win._llm_proxy_suffix_edit = QLineEdit()
+    win._llm_proxy_suffix_edit.setAccessibleName("额外直连域名")
+    win._llm_proxy_suffix_edit.setPlaceholderText(".example.internal")
+    win._llm_proxy_suffix_edit.setClearButtonEnabled(True)
+    win._llm_proxy_suffix_edit.textChanged.connect(win._on_llm_proxy_suffix_changed)
+    lay.addWidget(labeled_row(
+        "额外直连域名",
+        win._llm_proxy_suffix_edit,
+        "仅在「使用系统 / 环境代理」时生效。每项是域名后缀，用逗号或空格分隔。本地和私网地址不用填写。",
+    ))
     lay.addWidget(group_divider())
     lay.addWidget(_build_theme_row(win))
     lay.addWidget(group_divider())
@@ -653,6 +664,7 @@ def build_general_page(win) -> QWidget:
         win._meeting_start_card_row,
         win._meeting_start_card_reset_btn,
         win._llm_proxy_combo,
+        win._llm_proxy_suffix_edit,
         win._theme_combo,
         win._listen_bar_combo,
         win._listen_bar_autohide_row,

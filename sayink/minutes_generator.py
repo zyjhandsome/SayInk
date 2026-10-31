@@ -77,6 +77,7 @@ class MinutesRequest:
     checkpoints: dict[str, str] = field(default_factory=dict)
     save_checkpoint: Callable[[str, str], None] | None = None
     proxy_mode: str = "system"
+    proxy_bypass_suffixes: str = ""
 
 
 def request_fingerprint(request: MinutesRequest) -> str:
@@ -458,7 +459,10 @@ class MinutesWorker(QThread):
         chunks = self._plan_chunks(system_prompt) if not req.template.is_refinement else []
         chunked = len(chunks) > 1
         timeout = httpx.Timeout(req.timeout_sec, connect=min(10, req.timeout_sec), write=30, pool=10)
-        async with httpx.AsyncClient(timeout=timeout, **http_client_options(req.proxy_mode)) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            **http_client_options(req.proxy_mode, req.api_url, req.proxy_bypass_suffixes),
+        ) as client:
             payload: dict[str, Any] | None
             markdown_text = ""
             if req.template.is_refinement:

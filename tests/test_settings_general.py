@@ -133,6 +133,27 @@ def test_ai_proxy_mode_is_saved_and_reloaded(settings_window, config):
     assert combo.currentData() == "direct"
 
 
+def test_proxy_bypass_suffixes_are_saved_and_invalid_tokens_are_named(settings_window, config):
+    edit = settings_window._llm_proxy_suffix_edit
+    assert edit.accessibleName() == "额外直连域名"
+    edit.setText(".example.internal, bad")
+    assert config.get("llm.proxy_bypass_suffixes") == ".example.internal, bad"
+    assert "bad" in settings_window._llm_test_status.text()
+    config.save_immediate()
+    config._load()
+    settings_window.reload_settings(refresh_devices=False, heavy=False)
+    assert settings_window._llm_proxy_suffix_edit.text() == ".example.internal, bad"
+
+
+def test_old_config_without_suffix_field_loads_empty(settings_window, config):
+    config._config["llm"].pop("proxy_bypass_suffixes", None)
+    config.save_immediate()
+    config._load()
+    assert config.get("llm.proxy_bypass_suffixes") == ""
+    settings_window.reload_settings(refresh_devices=False, heavy=False)
+    assert settings_window._llm_proxy_suffix_edit.text() == ""
+
+
 class TestGeneralPageLayout:
     def test_island_nav_labels(self, settings_window):
         assert isinstance(settings_window, QWidget)

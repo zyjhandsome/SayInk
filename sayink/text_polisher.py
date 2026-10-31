@@ -217,9 +217,52 @@ def http_stream_timeout(httpx):
     )
 
 
-def http_client_options(mode: str) -> dict:
-    """Disable environment proxies for direct connections, retaining configured CAs."""
-    if mode != "direct":
+_SUFFIX_SPLIT = re.compile(r"[\s,，;；]+")
+
+
+def parse_proxy_bypass_suffixes(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split a suffix field into lowercase matches and the tokens left unused.
+
+    A usable entry may start with one dot and must still contain a dot after
+    that. Wildcards, URLs, and single labels are ignored but kept for the
+    settings hint.
+    """
+    valid: list[str] = []
+    ignored: list[str] = []
+    for token in _SUFFIX_SPLIT.split(text or ""):
+        token = token.strip()
+        if not token:
+            continue
+        suffix = token[1:] if token.startswith(".") else token
+        if (
+            not suffix
+            or "." not in suffix
+            or any(char in token for char in "*/:@\\")
+        ):
+            ignored.append(token)
+            continue
+        valid.append(suffix.lower())
+    return tuple(valid), tuple(ignored)
+
+
+def _host_matches_suffix(host: str, suffix: str) -> bool:
+    return host == suffix or host.endswith("." + suffix)
+
+
+def bypasses_env_proxy(mode: str, url: str = "", suffixes: str = "") -> bool:
+    """True when this AI call must not consult HTTP(S)_PROXY or ALL_PROXY."""
+    if mode == "direct" or is_local_endpoint(url):
+        return True
+    host = (urlparse((url or "").strip()).hostname or "").strip("[]").lower()
+    if not host:
+        return False
+    valid, _ignored = parse_proxy_bypass_suffixes(suffixes)
+    return any(_host_matches_suffix(host, suffix) for suffix in valid)
+
+
+def http_client_options(mode: str, url: str = "", suffixes: str = "") -> dict:
+    """Disable environment proxies for direct or excepted hosts, retaining CAs."""
+    if not bypasses_env_proxy(mode, url, suffixes):
         return {"trust_env": True}
     import os
     import ssl
@@ -813,6 +856,7 @@ class PolishWorker(QThread):
         glossary=(),
         context: str = "",
         proxy_mode: str = "system",
+        proxy_bypass_suffixes: str = "",
     ):
         super().__init__()
         self._api_url = api_url.rstrip("/")
@@ -824,6 +868,7 @@ class PolishWorker(QThread):
         self._glossary = tuple(glossary or ())
         self._context = context or ""
         self._proxy_mode = proxy_mode
+        self._proxy_bypass_suffixes = proxy_bypass_suffixes
         self._cancelled = False
         self._client = None
         self._action_label = _mode_label(self._mode)
@@ -878,7 +923,10 @@ class PolishWorker(QThread):
             log.debug("原文长度: %d 字符", len(self._text))
 
             options = self.request_options()
-            with httpx.Client(timeout=http_stream_timeout(httpx), **http_client_options(self._proxy_mode)) as client:
+            with httpx.Client(
+                timeout=http_stream_timeout(httpx),
+                **http_client_options(self._proxy_mode, self._api_url, self._proxy_bypass_suffixes),
+            ) as client:
                 self._client = client
                 try:
                     if self._cancelled:
@@ -945,6 +993,7 @@ class TextPolisher(QObject):
         context: str = "",
         target_app: str = "",
         proxy_mode: str = "system",
+        proxy_bypass_suffixes: str = "",
     ):
         if not text.strip():
             self.polish_complete.emit(text)
@@ -967,6 +1016,7 @@ class TextPolisher(QObject):
             glossary=glossary,
             context=context,
             proxy_mode=proxy_mode,
+            proxy_bypass_suffixes=proxy_bypass_suffixes,
         )
         worker.result_ready.connect(self._on_result)
         worker.error.connect(self._on_error)
@@ -1014,7 +1064,14 @@ class TextPolisher(QObject):
         self.polish_error.emit(error_msg)
 
     @staticmethod
-    def test_connection(api_url: str, api_key: str, model_name: str, *, proxy_mode: str = "system") -> tuple[bool, str]:
+    def test_connection(
+        api_url: str,
+        api_key: str,
+        model_name: str,
+        *,
+        proxy_mode: str = "system",
+        proxy_bypass_suffixes: str = "",
+    ) -> tuple[bool, str]:
         problem = api_url_error(api_url)
         if problem:
             return False, problem
@@ -1036,7 +1093,10 @@ class TextPolisher(QObject):
             url = chat_completions_url(api_url)
             token_parameter = "max_tokens"
             downgrade = False
-            with httpx.Client(timeout=http_stream_timeout(httpx), **http_client_options(proxy_mode)) as client:
+            with httpx.Client(
+                timeout=http_stream_timeout(httpx),
+                **http_client_options(proxy_mode, api_url, proxy_bypass_suffixes),
+            ) as client:
                 for _attempt in range(3):
                     body = {key: value for key, value in payload.items() if key not in ("max_tokens", "max_completion_tokens", "stream")}
                     body[token_parameter] = 16

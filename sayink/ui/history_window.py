@@ -2021,6 +2021,7 @@ class HistoryWindow(QWidget):
             self._polishing_raw, api_url, api_key, model_name, prompt,
             mode=self._polishing_mode, glossary=self._polishing_glossary,
             proxy_mode=config.get("llm.proxy_mode", "system") if config is not None else "system",
+            proxy_bypass_suffixes=str(config.get("llm.proxy_bypass_suffixes", "") or "") if config is not None else "",
         )
 
     def _polish_rejection(self, polished_text: str) -> str:
