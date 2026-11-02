@@ -78,6 +78,12 @@ def test_start_meeting_switches_pipeline_and_tags_rows() -> None:
         assert h["floating"].show_success.call_args[0][0] == "已记录"
 
 
+def test_meeting_start_names_its_audio_source_on_the_bar() -> None:
+    with app_harness({"meeting.show_start_card": False}) as h:
+        _start(h["app"], h, input_source="system")
+        h["floating"].set_meeting_source.assert_called_with("电脑声音")
+
+
 def test_meeting_segments_skip_per_sentence_polish() -> None:
     overrides = {
         "llm.enabled": True, "llm.api_url": "http://localhost:1234/v1",

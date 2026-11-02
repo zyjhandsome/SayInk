@@ -37,6 +37,7 @@ from sayink.audio_devices import (
     INPUT_SOURCE_MICROPHONE,
     INPUT_SOURCE_SYSTEM,
     INPUT_SOURCE_MIXED,
+    input_source_label,
 )
 from sayink.audio_recorder import AudioRecorder
 from sayink.audio_utils import TARGET_SAMPLE_RATE
@@ -1210,7 +1211,7 @@ class App(QObject):
                 self._floating.show_error("无法开启持续监听\n请检查音频设备设置")
                 return
             self._tray.set_activity_tooltip("listening")
-            self._floating.show_listening("")
+            self._floating.show_listening(self._listening_target(""))
             if (
                 self._config.get("audio.input_source") == "system"
                 and self._recorder.is_continuous
@@ -1488,12 +1489,20 @@ class App(QObject):
             return int(held[0] or 0), str(held[1] or "")
         return 0, ""
 
+    def _listening_target(self, name: str) -> str:
+        """What the bar names after 「正在听」; never a window that gets no paste."""
+        if _ConfigRules.history_only_for_capture(
+            self._config, self._history_source(), trigger_mode=TRIGGER_MODE_CONTINUOUS,
+        ):
+            return "仅保存到历史"
+        return name
+
     def _on_utterance_opened(self, hwnd: int, name: str) -> None:
         if self._meeting_active() or not self._is_continuous_mode():
             return
         show = getattr(self._floating, "show_listening", None)
         if callable(show):
-            show(target_app=str(name or ""))
+            show(target_app=self._listening_target(str(name or "")))
 
     # ── Speaker numbering (shared with meetings) ──────
 
@@ -2515,8 +2524,13 @@ class App(QObject):
             )
         elif status == "recorded":
             saved = error_detail != "history_disabled"
-            title = ("已记录" if saved else "未保存 · 历史已关闭") + ("（原文）" if degraded_from_polish else "")
-            hint = "" if saved else "当前为「仅保存到历史」，但历史已关闭；请在设置中打开历史或改为输入当前光标"
+            meeting_row = getattr(record, "trigger_mode", None) == TRIGGER_MODE_MEETING
+            done = "已记录" if meeting_row else "已保存到历史"
+            title = (done if saved else "未保存 · 历史已关闭") + ("（原文）" if degraded_from_polish else "")
+            if not saved:
+                hint = "当前为「仅保存到历史」，但历史已关闭；请在设置中打开历史或改为输入当前光标"
+            else:
+                hint = "" if meeting_row else "未输入其他应用"
             self._show_post_output_floating(
                 title,
                 hint,
@@ -2861,6 +2875,7 @@ class App(QObject):
         self._tray.set_meeting_in_progress(True)
         self._tray.set_activity_tooltip("meeting")
         self._sound.play_start()
+        self._floating.set_meeting_source(input_source_label(options.input_source))
         self._floating.show_meeting(self._meeting.elapsed_text())
         for note in caps.notes:
             log.info("会议提示：%s", note)

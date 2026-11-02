@@ -929,8 +929,20 @@ def test_history_only_output_records_without_pasting() -> None:
         records = _enqueued_records(h["history"])
         assert [r.raw_text for r in records] == ["远端在说话"]
         assert records[0].target_app == ""
-        assert h["floating"].show_success.call_args[0][0] == "已记录"
+        assert h["floating"].show_success.call_args[0][0] == "已保存到历史"
         assert app._output_busy is False
+
+
+def test_history_only_single_shot_says_where_the_words_went() -> None:
+    with app_harness({"audio.trigger_mode": "hotkey", "output.mode": "history"}) as h:
+        app = h["app"]
+        app._begin_transcription(_audio())
+        app._on_final_result("只进历史")
+
+        h["paster"].paste_async.assert_not_called()
+        title, hint = h["floating"].show_success.call_args[0][:2]
+        assert title == "已保存到历史"
+        assert hint == "未输入其他应用"
 
 
 def test_history_only_output_warns_when_history_is_disabled() -> None:

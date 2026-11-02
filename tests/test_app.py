@@ -3,7 +3,7 @@ import sys
 import pytest
 import numpy as np
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sayink.app import App, MIN_AUDIO_SAMPLES, _QueuedSegment
 from sayink.audio_devices import INPUT_SOURCE_SYSTEM
@@ -925,6 +925,43 @@ def test_listening_bar_shows_process_name_not_a_window_title():
         assert "notepad.exe" not in win._status_label.text()
     finally:
         win.close()
+
+
+_CONTINUOUS_HISTORY_ONLY = {
+    "audio.trigger_mode": "continuous",
+    "audio.input_source": "mixed",
+    "output.by_mode": {
+        "hotkey": {"mode": "paste", "follow_input_source": True},
+        "continuous": {"mode": "history", "follow_input_source": True},
+    },
+}
+
+
+def test_history_only_continuous_bar_names_history_not_the_front_app():
+    with app_harness(_CONTINUOUS_HISTORY_ONLY) as h:
+        h["recorder"].input_source = "mixed"
+        h["app"]._on_utterance_opened(111, "WeChat.exe")
+        assert h["floating"].show_listening.call_args.kwargs["target_app"] == "仅保存到历史"
+
+
+def test_paste_continuous_bar_keeps_naming_the_front_app():
+    with app_harness({"audio.trigger_mode": "continuous"}) as h:
+        h["app"]._on_utterance_opened(111, "notepad.exe")
+        assert h["floating"].show_listening.call_args.kwargs["target_app"] == "notepad.exe"
+
+
+def test_history_only_continuous_session_names_history_from_the_start():
+    with app_harness(_CONTINUOUS_HISTORY_ONLY) as h:
+        app = h["app"]
+        h["recorder"].input_source = "mixed"
+
+        def opened():
+            h["recorder"].is_continuous = True
+
+        h["recorder"].start_continuous.side_effect = opened
+        with patch.object(app, "_later", side_effect=lambda _ms, fn: fn()):
+            app._start_continuous_listening()
+        assert h["floating"].show_listening.call_args.args[0] == "仅保存到历史"
 
 
 def test_continuous_ready_notice_uses_the_real_pause():

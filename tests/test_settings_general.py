@@ -580,6 +580,14 @@ class TestOutputMode:
         assert "单次转写" in settings_window._output_mode_hint.text()
         assert "持续转写" in settings_window._output_mode_hint.text()
 
+    def test_automatic_hint_spells_out_the_source_rule(self, settings_window):
+        text = settings_window._output_mode_hint.text()
+        assert "麦克风输入当前光标" in text
+        assert "电脑声音和混合音源仅保存到历史" in text
+        combo = settings_window._output_mode_combo
+        combo.setCurrentIndex(combo.findData("paste"))
+        assert "电脑声音和混合音源" not in settings_window._output_mode_hint.text()
+
     def test_system_or_mixed_source_switches_to_history_only(self, settings_window, config, monkeypatch):
         monkeypatch.setattr(settings_window, "_confirm_discard_pending", lambda: True)
         settings_window._src_sys_rb.setChecked(True)
@@ -1224,6 +1232,16 @@ class TestMeetingSettings:
         assert settings_window._meeting_start_card_row.isChecked()
         assert settings_window._meeting_glossary_edit.toPlainText() == ""
         assert settings_window._minutes_template_combo.currentData() == "general"
+
+    def test_meeting_defaults_name_sources_like_the_start_card(self, settings_window, config):
+        from sayink.audio_devices import input_source_label
+
+        combo = settings_window._meeting_source_combo
+        current = input_source_label(config.get("audio.input_source", "microphone"))
+        assert combo.itemText(combo.findData("")) == f"跟随转写（当前：{current}）"
+        for key in ("mixed", "microphone", "system"):
+            assert combo.itemText(combo.findData(key)) == input_source_label(key)
+        assert settings_window._meeting_model_combo.itemText(0) == "与转写相同"
 
     def test_meeting_choices_persist(self, settings_window, config):
         win = settings_window

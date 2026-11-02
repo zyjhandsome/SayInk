@@ -280,6 +280,15 @@ def test_meeting_bar_keeps_its_clock_when_a_sentence_is_recognized(win):
     assert win._status_label.text() == f"{title} · 00:01:03"
 
 
+def test_meeting_bar_names_its_audio_source_until_the_meeting_ends(win):
+    win.set_meeting_source("麦克风 + 电脑声音")
+    win.show_meeting("00:00:01")
+    assert "麦克风 + 电脑声音" in win._text_label.toolTip()
+    win.end_meeting_state()
+    win.show_meeting("00:00:01")
+    assert "麦克风 + 电脑声音" not in win._text_label.toolTip()
+
+
 def test_end_action_respects_esc_preference_and_preserves_meeting_semantics(win):
     win.set_esc_stops_continuous(False)
     win.show_listening()

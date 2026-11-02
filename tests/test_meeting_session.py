@@ -784,6 +784,13 @@ class TestMeetingPage:
         assert page._opt_source.itemText(0) == "跟随转写（当前：电脑声音）"
         assert page._opt_source.currentData() == "microphone"
 
+    def test_start_card_names_sources_with_the_shared_labels(self, page):
+        from sayink.audio_devices import input_source_label
+
+        page.show_start_card()
+        for key in ("mixed", "microphone", "system"):
+            assert page._opt_source.itemText(page._opt_source.findData(key)) == input_source_label(key)
+
     def test_start_card_emits_options_without_changing_defaults(self, page, config):
         received = []
         page.start_requested.connect(received.append)

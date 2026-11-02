@@ -856,10 +856,11 @@ class MainWindow(QWidget):
     def _hit_test(self, x: int, y: int) -> int | None:
         """Edge resize, or the caption behaviors a frameless window otherwise loses.
 
-        The max button reports HTMAXBUTTON so Windows 11 can offer snap
-        layouts. Empty caption reports HTCAPTION so a drag snaps to the
-        screen edge and a drag from the maximized state restores. Min and
-        close stay client widgets.
+        Empty caption reports HTCAPTION so a drag snaps to the screen edge and
+        a drag from the maximized state restores. Min, max, and close stay
+        client widgets: HTMAXBUTTON makes Windows 11 draw its own maximize
+        glyph over the close button and open snap layouts, and the Qt button
+        never receives the click.
         """
         edge = self._hit_test_edge(x, y)
         if edge is not None:
@@ -867,19 +868,19 @@ class MainWindow(QWidget):
         if not hasattr(self, "_caption"):
             return None
         point = QPoint(x, y)
-        if self._widget_rect(self._min_btn).contains(point) or self._widget_rect(self._close_btn).contains(point):
+        buttons = (self._min_btn, self._max_btn, self._close_btn)
+        if any(self._widget_rect(btn).contains(point) for btn in buttons):
             return None
-        if self._widget_rect(self._max_btn).contains(point):
-            return _HTMAXBUTTON
         if self._widget_rect(self._caption).contains(point):
             return _HTCAPTION
         return None
 
     def _enable_native_snap(self) -> None:
-        """Give the frameless window back Aero Snap, the system menu and snap layouts.
+        """Give the frameless window back Aero Snap and the system menu.
 
         The style bits are what Windows uses for those gestures. WM_NCCALCSIZE
         then keeps the native caption from painting over the custom one.
+        The maximize button stays a client widget; see _hit_test.
         """
         if sys.platform != "win32" or getattr(self, "_native_snap_ready", False):
             return

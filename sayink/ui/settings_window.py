@@ -1830,7 +1830,10 @@ class SettingsWindow(QWidget):
         self._output_mode_combo.blockSignals(was_blocked)
         history_only = self._config.history_only_output()
         destination = "仅保存到历史，不输入其他应用" if history_only else "输入当前光标"
-        rule = "自动模式随音源切换" if automatic else "固定选择，切换音源后保持不变"
+        rule = (
+            "自动规则：麦克风输入当前光标，电脑声音和混合音源仅保存到历史"
+            if automatic else "固定选择，切换音源后保持不变"
+        )
         mode_name = "持续转写" if self._selected_trigger_mode() == TRIGGER_MODE_CONTINUOUS else "单次转写"
         other_name = "单次转写" if mode_name == "持续转写" else "持续转写"
         text = f"当前是{mode_name}：{destination}。{rule}。{other_name}沿用自己的选择。"
@@ -1857,22 +1860,20 @@ class SettingsWindow(QWidget):
         model_id = self._config.get("stt.model_id", "")
         info = get_model_info(model_id)
         model_name = info["name"] if info else model_id or "尚未选择"
-        follow = f"跟随录音（{source}）"
+        follow = f"跟随转写（当前：{source}）"
         if self._meeting_source_combo.itemText(0) != follow:
             self._meeting_source_combo.setItemText(0, follow)
         longest = self._meeting_source_combo.fontMetrics().horizontalAdvance(
-            "跟随录音（麦克风 + 电脑声音）"
+            "跟随转写（当前：麦克风 + 电脑声音）"
         ) + 40
         if self._meeting_source_combo.minimumWidth() < longest:
             self._meeting_source_combo.setMinimumWidth(longest)
-        if self._meeting_model_combo.itemText(0) != "跟随录音模型":
-            self._meeting_model_combo.setItemText(0, "跟随录音模型")
         selected = self._meeting_model_combo.currentData()
         selected_info = get_model_info(selected) if selected else None
         effective_name = selected_info["name"] if selected_info else model_name
         model_missing = bool(selected and not is_model_downloaded(selected))
         if model_missing:
-            effective_name = f"{effective_name} 未下载，请到「引擎」下载或选择跟随录音模型"
+            effective_name = f"{effective_name} 未下载，请到「引擎」下载或改选「与转写相同」"
         effective_source = self._meeting_source_combo.currentText()
         self._meeting_defaults_hint.setText(
             f"新会议：{effective_source} · {effective_name}。仅影响之后开始的会议。"

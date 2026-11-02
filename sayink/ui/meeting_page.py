@@ -83,7 +83,7 @@ PAGE_BROWSE = 0
 PAGE_START = 1
 PAGE_LIVE = 2
 
-_SOURCE_LABELS = (("mixed", "混合音频（麦克风 + 电脑声音）"), ("microphone", "麦克风"), ("system", "电脑声音"))
+_SOURCE_LABELS = tuple((key, input_source_label(key)) for key in ("mixed", "microphone", "system"))
 _LANGUAGE_LABELS = (("auto", "自动（中文优先）"), ("zh", "中文"), ("en", "English"), ("ja", "日本語"))
 _STATUS_TEXT = {STATUS_LIVE: "进行中", STATUS_INTERRUPTED: "已中断", STATUS_ENDED: "已结束"}
 

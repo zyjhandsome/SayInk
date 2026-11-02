@@ -209,6 +209,7 @@ class FloatingWindow(QWidget):
         self._meeting_active = False
         self._meeting_elapsed = "00:00:00"
         self._meeting_paused_detail = ""
+        self._meeting_source = ""
         self._capture_active = False
         # Set by end_capture() once the hold key is up; cleared by show_recording().
         self._capture_released = False
@@ -652,6 +653,10 @@ class FloatingWindow(QWidget):
     def meeting_active(self) -> bool:
         return self._meeting_active
 
+    def set_meeting_source(self, label: str) -> None:
+        """Audio source of the meeting about to start; cleared when it ends."""
+        self._meeting_source = label
+
     def show_meeting(self, elapsed: str | None = None, detail: str = "") -> None:
         """Red-dot meeting bar: 「会议中 · hh:mm:ss」 + 标记 + 结束."""
         if elapsed is not None:
@@ -674,6 +679,8 @@ class FloatingWindow(QWidget):
             self._apply_excerpt(detail)
         elif self._live_text:
             self._apply_excerpt(self._live_text, keep_tail=True)
+        elif self._meeting_source:
+            self._apply_excerpt(f"音频来源：{self._meeting_source} · 点此打开会议页")
         else:
             self._apply_excerpt("点此打开会议页 · 停顿后出字")
         self._present()
@@ -703,6 +710,7 @@ class FloatingWindow(QWidget):
     def end_meeting_state(self, detail: str = "") -> None:
         self._meeting_active = False
         self._meeting_paused_detail = ""
+        self._meeting_source = ""
         self._listening_active = False
         self._capture_active = False
         self.set_esc_stops_continuous(self._esc_stops_continuous)

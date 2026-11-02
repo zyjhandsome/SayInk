@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from sayink.audio_devices import input_source_label
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles
 from sayink.ui.hotkey_edit import HotkeyEdit
@@ -523,11 +524,11 @@ def build_meeting_section(win) -> QWidget:
     win._meeting_source_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
     win._meeting_source_combo.setMinimumContentsLength(16)
     win._meeting_source_combo.setAccessibleName("会议音频来源")
-    for key, label in (("", "跟随转写设置"), ("mixed", "混合（麦克风 + 电脑声音）"),
-                       ("microphone", "仅麦克风"), ("system", "仅电脑声音")):
-        win._meeting_source_combo.addItem(label, key)
+    win._meeting_source_combo.addItem("跟随转写设置", "")
+    for key in ("mixed", "microphone", "system"):
+        win._meeting_source_combo.addItem(input_source_label(key), key)
     win._meeting_source_combo.currentIndexChanged.connect(win._on_meeting_setting_changed)
-    lay.addWidget(labeled_row("默认音频来源", win._meeting_source_combo, "跟随录音设置，或为会议固定选择一个音源"))
+    lay.addWidget(labeled_row("默认音频来源", win._meeting_source_combo, "跟随转写设置，或为会议固定选择一个音源"))
     lay.addWidget(group_divider())
     win._meeting_model_combo = QComboBox()
     win._meeting_model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)

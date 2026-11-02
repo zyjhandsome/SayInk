@@ -616,7 +616,7 @@ def test_failed_minutes_save_keeps_the_meeting_page(qapp, tmp_path, monkeypatch)
         store.close()
 
 
-def test_caption_hit_enables_system_drag_and_snap_button(qapp, tmp_path, monkeypatch):
+def test_caption_hit_keeps_buttons_clickable_and_title_draggable(qapp, tmp_path, monkeypatch):
     from PyQt6.QtCore import QPoint
 
     from sayink.ui.main_window import _HTCAPTION, _HTMAXBUTTON
@@ -627,10 +627,17 @@ def test_caption_hit_enables_system_drag_and_snap_button(qapp, tmp_path, monkeyp
         qapp.processEvents()
         title = win._title.mapTo(win, QPoint(2, 2))
         assert win._hit_test(title.x(), title.y()) == _HTCAPTION
-        maximize = win._max_btn.mapTo(win, QPoint(4, 4))
-        assert win._hit_test(maximize.x(), maximize.y()) == _HTMAXBUTTON
-        close = win._close_btn.mapTo(win, QPoint(4, 4))
-        assert win._hit_test(close.x(), close.y()) is None
+        # Caption buttons stay in the client area. Reporting HTMAXBUTTON makes
+        # Windows 11 paint its own glyph over the close button and open snap
+        # layouts instead of delivering the click that maximizes the window.
+        for btn in (win._min_btn, win._max_btn, win._close_btn):
+            point = btn.mapTo(win, QPoint(4, 4))
+            assert win._hit_test(point.x(), point.y()) is None
+        calls: list[str] = []
+        monkeypatch.setattr(win, "isMaximized", lambda: False)
+        monkeypatch.setattr(win, "showMaximized", lambda: calls.append("max"))
+        win._max_btn.click()
+        assert calls == ["max"]
         edge = win._hit_test(2, win.height() // 2)
         assert edge not in (None, _HTCAPTION, _HTMAXBUTTON)
         monkeypatch.setattr(win, "isMaximized", lambda: True)
