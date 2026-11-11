@@ -209,10 +209,10 @@ class ReloadCoordinator:
             return
         settings = shared or self.applied_recognition_settings
         seg_status = getattr(self.recorder, "segmentation_status", None)
-        recognizer.quiet_speech = (
-            settings.quiet_speech_enabled
-            and getattr(seg_status, "effective", "") == VAD_SILERO
-        )
+        if getattr(seg_status, "effective", "") != VAD_SILERO:
+            recognizer.quiet_speech = False
+        else:
+            recognizer.quiet_speech = settings.quiet_speech_mode
 
     def apply_audio_config(self) -> None:
         source = self.config.get("audio.input_source", "microphone")
@@ -253,7 +253,7 @@ class ReloadCoordinator:
         meetings (Silero when downloaded, else energy)."""
         self.applied_recognition_settings = RecognitionSettings.from_config(self.config)
         vad = self.applied_recognition_settings.vad
-        self.recorder.set_quiet_speech(self.applied_recognition_settings.quiet_speech_enabled)
+        self.recorder.set_quiet_speech(self.applied_recognition_settings.quiet_speech_mode)
         self.set_boundary_context_for_model(self.applied_recognition_settings.model_id)
         model_path = self.vad_aux_path(vad)
         self.applied_vad_aux = model_path
@@ -379,7 +379,7 @@ class ReloadCoordinator:
         if embedder is not None and getattr(embedder, "name", "") == "campplus":
             speaker = "CAM++ 已下载 · 已加载；用于持续转写与会议"
             if getattr(embedder, "activity_guard", None) is not None:
-                speaker += "；多人发言检测（实验性）已加载"
+                speaker += "；多人发言检测（按需护档）已加载"
             elif getattr(embedder, "activity_guard_error", ""):
                 speaker += "；多人发言检测加载失败，本场未启用"
             elif (
@@ -390,7 +390,11 @@ class ReloadCoordinator:
                 speaker += "；多人发言检测未加载，请在引擎页检查检测模型"
             return speaker
         if not enabled:
-            return "CAM++ 增强已关闭 · 使用频谱粗略区分"
+            if self.config.get("stt.debug_force_speaker_model", None) is False:
+                return "CAM++ 增强已关闭 · 使用频谱粗略区分"
+            if self.aux_model_path_fn(AUX_MODEL_SPEAKER) is not None:
+                return "CAM++ 已下载 · 待加载（会议或含电脑声音时自动启用）"
+            return "CAM++ 未下载 · 会议或含电脑声音时使用频谱粗略区分；可在引擎页下载"
         if embedder is not None and getattr(embedder, "model_available", False):
             return "CAM++ 已下载 · 加载失败 · 已回退频谱粗略区分"
         if self.aux_model_path_fn(AUX_MODEL_SPEAKER) is not None:
@@ -552,12 +556,20 @@ class ReloadCoordinator:
         # A trigger-mode click used to re-open the recognizer, rescan every
         # audio device and restyle the window. Only the pieces that changed
         # are applied; theme has its own signal.
+        old_settings = self.applied_recognition_settings
+        new_settings = RecognitionSettings.from_config(self.config)
+        speaker_changed = new_settings.speaker_key != old_settings.speaker_key
         if self.audio_runtime_key() != self.applied_audio_key:
             self.apply_audio_config()
-        if self.recognition_runtime_key() != self.applied_recognition_key:
+        else:
+            self.applied_recognition_settings = new_settings
+        if speaker_changed:
+            self.rebuild_speaker_embedder()
+        if self.recognition_runtime_key(new_settings) != self.applied_recognition_key:
             self.sync_models_dir()
             self.configure_stt()
             self.update_tray_models()
+        self.sync_recognition_runtime_status()
         self.sync_hotkey_trigger_mode()
 
     def on_tray_model_switch(self, model_id: str) -> None:

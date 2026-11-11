@@ -112,28 +112,55 @@ class TestConfigInit:
 
 
 class TestSharedRecognitionSettings:
-    """Glossary / language / VAD / speaker model are shared by dictation and
-    meetings, so they live under ``stt.*``; an older ``meeting.*`` layout is
-    moved there once on load."""
+    """Glossary / language / VAD are shared by dictation and meetings under
+    ``stt.*``; retired manual switches (quiet_boost / quiet_speech_enabled /
+    speaker_model_enabled / enhanced_diarization / speaker_activity*) are
+    stripped cleanly on load without error or policy lock-in."""
 
-    def test_defaults_live_under_stt(self):
+    def test_defaults_live_under_stt_without_retired_manual_switches(self):
         stt = DEFAULT_CONFIG["stt"]
         assert stt["glossary"] == []
         assert stt["language"] == "auto"
         assert stt["vad"] == "silero"
-        assert stt["speaker_model_enabled"] is True
-        for key in ("glossary", "language", "vad", "speaker_model_enabled"):
+        for key in ("glossary", "language", "vad"):
             assert key not in DEFAULT_CONFIG["meeting"]
+        for retired in (
+            "speaker_model_enabled",
+            "speaker_activity_enabled",
+            "quiet_speech_enabled",
+            "quiet_boost",
+            "enhanced_diarization",
+            "speaker_activity",
+        ):
+            assert retired not in stt
+            assert retired not in DEFAULT_CONFIG["meeting"]
 
-    def test_legacy_meeting_keys_are_migrated_and_saved(self, config_home):
+    def test_legacy_meeting_keys_are_migrated_and_retired_switches_stripped(self, config_home):
         legacy = {
+            "quiet_boost": False,
+            "enhanced_diarization": False,
+            "speaker_activity": True,
+            "audio": {
+                "quiet_boost": True,
+            },
+            "stt": {
+                "quiet_speech_enabled": False,
+                "quiet_boost": "off",
+                "speaker_model_enabled": False,
+                "enhanced_diarization": 0,
+                "speaker_activity_enabled": True,
+                "speaker_activity": {"bad": "type"},
+                "debug_force_quiet_speech": True,
+            },
             "meeting": {
                 "input_source": "microphone",
                 "glossary": [{"term": "SayInk"}],
                 "language": "en",
                 "vad": "energy",
                 "speaker_model_enabled": False,
-            }
+                "speaker_activity_enabled": True,
+                "quiet_speech_enabled": True,
+            },
         }
         with open(config_home / "config.json", "w", encoding="utf-8") as f:
             json.dump(legacy, f)
@@ -141,13 +168,28 @@ class TestSharedRecognitionSettings:
         assert config.get("stt.glossary") == [{"term": "SayInk"}]
         assert config.get("stt.language") == "en"
         assert config.get("stt.vad") == "energy"
-        assert config.get("stt.speaker_model_enabled") is False
+        assert config.get("stt.debug_force_quiet_speech") is True
+        for retired in (
+            "speaker_model_enabled",
+            "speaker_activity_enabled",
+            "quiet_speech_enabled",
+            "quiet_boost",
+            "enhanced_diarization",
+            "speaker_activity",
+        ):
+            assert config.get(f"stt.{retired}") is None
+            assert config.get(f"meeting.{retired}") is None
+            assert config.get(f"audio.{retired}") is None
+            assert config.get(retired) is None
         assert config.get("meeting.input_source") == "microphone"
         assert config.get("meeting.glossary") is None
         with open(config_home / "config.json", encoding="utf-8") as f:
             on_disk = json.load(f)
         assert on_disk["stt"]["language"] == "en"
         assert "language" not in on_disk["meeting"]
+        assert "speaker_model_enabled" not in on_disk["stt"]
+        assert "quiet_speech_enabled" not in on_disk["stt"]
+        assert "quiet_boost" not in on_disk
 
     def test_existing_stt_value_wins_over_legacy(self, config_home):
         data = {"stt": {"language": "zh"}, "meeting": {"language": "en"}}

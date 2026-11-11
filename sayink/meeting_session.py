@@ -108,9 +108,10 @@ class MeetingOptions:
 
     @classmethod
     def from_config(cls, config: Config) -> "MeetingOptions":
-        shared = RecognitionSettings.from_config(config)
+        source = audio_source(config, meeting=True)
+        shared = RecognitionSettings.from_config(config, meeting=True, input_source=source)
         return cls(
-            input_source=audio_source(config, meeting=True),
+            input_source=source,
             model_id=str(config.get("meeting.model_id", "") or ""),
             glossary=shared.glossary,
             vad=shared.vad,
@@ -159,8 +160,11 @@ class MeetingCapabilities:
 def resolve_capabilities(config: Config, options: MeetingOptions, *, dictation_model_id: str) -> MeetingCapabilities:
     model_id = options.model_id or dictation_model_id
     shared = replace(
-        RecognitionSettings.from_config(config), model_id=model_id,
-        glossary=options.glossary, language=options.language, vad=options.vad,
+        RecognitionSettings.from_config(config, meeting=True, input_source=options.input_source),
+        model_id=model_id,
+        glossary=options.glossary,
+        language=options.language,
+        vad=options.vad,
     )
     vad = options.vad
     if vad == VAD_SILERO and aux_model_path(AUX_MODEL_SILERO_VAD) is None:

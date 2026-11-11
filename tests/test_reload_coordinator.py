@@ -62,7 +62,7 @@ class _FakeRecorder:
     )
     configured: list[dict] = field(default_factory=list)
     segmenter_profiles: list[dict] = field(default_factory=list)
-    quiet_speech_calls: list[bool] = field(default_factory=list)
+    quiet_speech_calls: list[bool | None] = field(default_factory=list)
     boundary_calls: list[bool] = field(default_factory=list)
     recovery_dirs: list[Path | None] = field(default_factory=list)
     separate_lanes_calls: list[bool] = field(default_factory=list)
@@ -73,7 +73,7 @@ class _FakeRecorder:
     def set_segmenter_profile(self, **kwargs) -> None:
         self.segmenter_profiles.append(kwargs)
 
-    def set_quiet_speech(self, enabled: bool) -> None:
+    def set_quiet_speech(self, enabled: bool | None) -> None:
         self.quiet_speech_calls.append(enabled)
 
     def set_boundary_context(self, enabled: bool) -> None:
@@ -91,7 +91,7 @@ class _FakeRecognizer:
     is_ready: bool = True
     is_loading: bool = False
     current_model_id: str = "funasr-nano"
-    quiet_speech: bool = False
+    quiet_speech: bool | None = False
     configure_calls: list[dict] = field(default_factory=list)
 
     def configure(
@@ -278,11 +278,60 @@ class TestReloadCoordinatorDiffAndSubsystemIsolation:
         assert ctx["speaker_rebuilds"][0] == 0
 
         ctx["recorder"].segmenter_profiles.clear()
-        ctx["config"].set("stt.speaker_model_enabled", False)
+        ctx["config"].set("stt.debug_force_speaker_model", True)
         coord.on_recognition_settings_changed()
         assert ctx["speaker_rebuilds"][0] == 1
         assert ctx["recorder"].segmenter_profiles == []
         assert ctx["recognizer"].configure_calls == []
+
+    def test_mode_and_source_hot_switches_apply_policy_without_asr_reload(self) -> None:
+        coord, ctx = _build_coordinator(
+            {"audio.trigger_mode": "hotkey", "audio.input_source": "microphone"}
+        )
+        coord.apply_audio_config()
+        coord.configure_stt()
+        # Adaptive quiet speech passes None under Silero VAD.
+        assert ctx["recorder"].quiet_speech_calls[-1] is None
+        assert ctx["recognizer"].quiet_speech is None
+
+        ctx["recognizer"].configure_calls.clear()
+        ctx["speaker_rebuilds"][0] = 0
+
+        # 1) hotkey(mic) -> continuous(mic): speaker stays off, zero ASR reload, zero embedder rebuild.
+        ctx["config"].set("audio.trigger_mode", "continuous")
+        coord.on_settings_changed()
+        assert coord.applied_recognition_settings.speaker_model_enabled is False
+        assert coord.applied_recognition_settings.speaker_activity_enabled is False
+        assert ctx["speaker_rebuilds"][0] == 0
+        assert ctx["recognizer"].configure_calls == []
+
+        # 2) continuous(mic) -> continuous(mixed): auto-enables CAM++ & activity guard, zero ASR reload.
+        ctx["config"].set("audio.input_source", "mixed")
+        coord.on_settings_changed()
+        assert coord.applied_recognition_settings.speaker_model_enabled is True
+        assert coord.applied_recognition_settings.speaker_activity_enabled is True
+        assert ctx["speaker_rebuilds"][0] == 1
+        assert ctx["recognizer"].configure_calls == []
+
+        # 3) continuous(mixed) -> continuous(system): speaker stays enabled, zero embedder rebuild, zero ASR reload.
+        ctx["config"].set("audio.input_source", "system")
+        coord.on_settings_changed()
+        assert coord.applied_recognition_settings.speaker_model_enabled is True
+        assert ctx["speaker_rebuilds"][0] == 1
+        assert ctx["recognizer"].configure_calls == []
+
+        # 4) continuous(system) -> hotkey(system): single-shot disables speaker separation, zero ASR reload.
+        ctx["config"].set("audio.trigger_mode", "hotkey")
+        coord.on_settings_changed()
+        assert coord.applied_recognition_settings.speaker_model_enabled is False
+        assert coord.applied_recognition_settings.speaker_activity_enabled is False
+        assert ctx["speaker_rebuilds"][0] == 2
+        assert ctx["recognizer"].configure_calls == []
+
+        # 5) Energy VAD fallback disables recognizer quiet_speech adaptive gain.
+        ctx["recorder"].segmentation_status = SegmentationStatus(VAD_ENERGY, VAD_ENERGY)
+        coord.sync_recognizer_quiet_speech()
+        assert ctx["recognizer"].quiet_speech is False
 
 
 class TestReloadCoordinatorDeferralAndUnblocking:

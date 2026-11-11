@@ -512,13 +512,57 @@ class TestDictationSharesRecognitionSettings:
             before = app._speaker_embedder()
             h["recognizer"].configure.reset_mock()
             h["recorder"].set_segmenter_profile.reset_mock()
-            app._config.set("stt.speaker_activity_enabled", True)
+            app._config.set("stt.debug_force_speaker_model", True)
             app._config.set("stt.vad", "energy")
             app._config.set("stt.language", "en")
             app._on_recognition_settings_changed()
             h["recognizer"].configure.assert_called_once()
             h["recorder"].set_segmenter_profile.assert_called_once()
             assert app._speaker_embedder() is not before
+
+    def test_continuous_source_policy_auto_binds_campplus_and_skips_turn_split_on_mic(self) -> None:
+        class _FakeCampPlus:
+            name = "campplus"
+            supports_turn_detection = True
+            threshold = 0.55
+            sticky_threshold = 0.45
+            recluster_threshold = 0.50
+            cluster_threshold = 0.52
+
+            def __call__(self, _audio):
+                return np.array([1.0, 0.0], dtype=np.float32)
+
+        calls: list[tuple] = []
+
+        def fake_make_embedder(path, *, enabled=True, activity_enabled=False):
+            calls.append((path, bool(enabled), bool(activity_enabled)))
+            if enabled and path:
+                return _FakeCampPlus()
+            from sayink.speaker_embedding import MelEmbedder
+            return MelEmbedder()
+
+        with app_harness({"audio.trigger_mode": "continuous", "audio.input_source": "microphone"}) as h:
+            app = h["app"]
+            with (
+                patch("sayink.app.make_embedder", side_effect=fake_make_embedder),
+                patch("sayink.app.aux_model_path", return_value="C:/models/campplus.onnx"),
+            ):
+                app._rebuild_speaker_embedder()
+                # Mic-only continuous: CAM++ & activity guard OFF, turn-splitting OFF (fastest output).
+                assert calls[-1] == (None, False, False)
+                app._begin_transcription(_audio())
+                assert "turn_analyzer" not in h["recognizer"].transcribe_final.call_args.kwargs
+                app._on_final_result("纯麦克风最快出字")
+                h["paster"].paste_async.call_args[0][1]("pasted")
+
+                # Switch source to mixed -> auto-enables CAM++ & activity guard without reloading ASR!
+                h["recognizer"].configure.reset_mock()
+                app._config.set("audio.input_source", "mixed")
+                h["recorder"].input_source = "mixed"
+                app._on_settings_changed()
+                h["recognizer"].configure.assert_not_called()
+                assert calls[-1] == ("C:/models/campplus.onnx", True, True)
+                assert app._speaker_embedder().supports_turn_detection is True
 
 
 def test_history_commit_refreshes_open_main_window() -> None:

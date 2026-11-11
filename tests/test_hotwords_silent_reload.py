@@ -229,9 +229,9 @@ def test_speaker_and_vad_are_isolated_from_glossary_and_language_changes():
         h["recognizer"].configure.assert_not_called()
         assert app._embedder is embedder_before
 
-        # 4) Speaker setting change -> rebuilds embedder only; keeps segmenter & STT.
+        # 4) Speaker policy override -> rebuilds embedder only; keeps segmenter & STT.
         h["recorder"].set_segmenter_profile.reset_mock()
-        app._config.set("stt.speaker_model_enabled", False)
+        app._config.set("stt.debug_force_speaker_model", True)
         app._on_recognition_settings_changed()
         assert app._embedder is not embedder_before
         h["recorder"].set_segmenter_profile.assert_not_called()
