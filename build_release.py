@@ -20,6 +20,10 @@ Usage:
   python build_release.py --with-model    # full installer (needs the model locally)
   python build_release.py --keep-staging  # keep dist/SayInk for debugging
   python build_release.py --skip-release-checks  # local trial build, never publish it
+
+Optional supply-chain environment hooks:
+  SAYINK_SIGNTOOL_CMD         Authenticode signing command for SayInk.exe and Setup EXE
+  SAYINK_RELEASE_PRIVATE_KEY  64-hex Ed25519 seed to emit dist/SayInk-Setup-<version>.exe.sig
 """
 
 import argparse

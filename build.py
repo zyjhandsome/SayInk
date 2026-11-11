@@ -17,6 +17,9 @@ Distribution:
   Version from `sayink/version.py`; staging folder removed after Inno Setup.
 - **Portable folder:** run this script only, then zip `dist/SayInk/` for
   users who should not run an installer.
+- **Optional Authenticode signing:** set `SAYINK_SIGNTOOL_CMD` (e.g.
+  `signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /a`)
+  to sign `dist/SayInk/SayInk.exe` before Inno Setup bundles it.
 """
 
 import os
@@ -33,6 +36,7 @@ if __name__ == "__main__" and __package__ is None:
 
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
+BUILD_DIR = SCRIPT_DIR / "build"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -212,11 +216,13 @@ def build():
         print(f"\n[ERROR] Missing runtime hook: {win_dll_rthook}")
         sys.exit(1)
 
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
     spin_icons = SCRIPT_DIR / "sayink" / "ui" / "icons"
     args = [
         main_script,
         f"--name={app_name}",
         f"--distpath={dist_parent}",
+        f"--specpath={BUILD_DIR}",
         "--onedir",
         "--windowed",
         "--noconfirm",
@@ -231,7 +237,7 @@ def build():
     if sys.platform == "win32":
         from sayink_build.pyinstaller_version_info import write_version_file
 
-        vf = SCRIPT_DIR / "build" / "file_version_info.txt"
+        vf = BUILD_DIR / "file_version_info.txt"
         write_version_file(vf)
         args.append(f"--version-file={vf}")
 
@@ -292,6 +298,14 @@ def build():
 
     if not exe_path.exists():
         print("\n[ERROR] Build failed — SayInk.exe not found.")
+        sys.exit(1)
+
+    from sayink_build.release_signing import SigningError, sign_file_if_configured
+
+    try:
+        sign_file_if_configured(exe_path)
+    except SigningError as exc:
+        print(f"\n[ERROR] {exc}")
         sys.exit(1)
 
     print()

@@ -1,0 +1,131 @@
+{
+  "schema_version": "delivery-handoff/v1",
+  "family_version": "delivery-family/1.6",
+  "type": "delivery-handoff",
+  "handoff_id": "ai-system-proxy-private-bypass-plan-tasks-20261028T100742",
+  "previous_handoff_id": null,
+  "generated_at": "2026-10-28T10:07:42Z",
+  "stage": "delivery-plan-tasks",
+  "source_revision": {
+    "repo_head": "ba342b2d12f92de19a7c2066324cd45677b6350e",
+    "artifact_revision": "sha256:08a0ddecf194d656e5f67bf81875a104418bfa5ff13d486939d3b5c22b5ddb04",
+    "state_observed_at": "2026-10-28T10:07:42Z"
+  },
+  "state_source": {
+    "kind": "openspec_change",
+    "label": "change #ai-system-proxy-private-bypass",
+    "anchor": "openspec/changes/ai-system-proxy-private-bypass"
+  },
+  "capability_snapshot": {
+    "memory": "ok",
+    "openspec": "initialized",
+    "superpowers": "inline"
+  },
+  "capability_bindings": {
+    "openspec": {
+      "version": "1.6.0",
+      "schema": "spec-driven",
+      "operations": {
+        "create_change": "openspec new change",
+        "inspect_change": "openspec list",
+        "continue_artifacts": "openspec instructions",
+        "validate_structure": "openspec validate --strict"
+      }
+    },
+    "memory": {
+      "server": "user-codebase-memory-mcp",
+      "resolved_tools": ["list_projects", "search_code", "search_graph", "get_code_snippet"]
+    },
+    "superpowers": {
+      "source": "delivery-inline",
+      "resolved_methods": ["evidence-before-opinion"]
+    },
+    "subagents": {
+      "max_concurrency": null,
+      "worktree_support": "unknown",
+      "independent_review": "unavailable"
+    }
+  },
+  "presentation_capability": {
+    "mode": "markdown",
+    "source": "unknown"
+  },
+  "gate_status": {
+    "status": "pending",
+    "summary": "规格已批准。设计、任务、回滚、安全和验证已内部核对，实现闸门尚未放行。",
+    "evidence": [
+      "openspec validate ai-system-proxy-private-bypass --strict",
+      "validate_delivery_change.mjs PASS"
+    ],
+    "approved_by": null,
+    "approved_at": null,
+    "binds_to_revision": null,
+    "accepted_warning_ids": []
+  },
+  "evidence_mode": "full",
+  "next_skill": null,
+  "next_action": null,
+  "required_inputs": ["实现闸门放行"],
+  "stop_condition": "实现闸门尚未批准，不得修改产品代码。",
+  "stage_payload": {
+    "plan_tasks": [
+      "任务 1：系统代理下私网直连、公网仍走代理",
+      "任务 2：会议纪要使用同一规则",
+      "任务 3：设置保存额外直连域名"
+    ],
+    "plan_decisions": {
+      "agent_decided": [
+        "按单次请求设置 trust_env，不修改进程 NO_PROXY",
+        "纪要指纹不包含后缀",
+        "无效后缀追加到 AI 状态句"
+      ],
+      "user_decided": [
+        "系统代理下本地和私网自动直连，公司域名由用户填写"
+      ],
+      "returned_to_frame": [],
+      "remaining_blockers": []
+    },
+    "traceability": [
+      "私网直连 → 任务 1/2",
+      "公网走代理 → 任务 1/2",
+      "后缀与设置 → 任务 1/3",
+      "更新与模型下载不受影响 → 任务 1"
+    ],
+    "readiness_result": {
+      "blockers": [],
+      "warnings": [],
+      "suggestions": []
+    },
+    "validation_plan": [
+      "python -m pytest tests/test_text_polisher.py tests/test_minutes.py tests/test_settings_general.py tests/test_ux_redesign.py -q --tb=short"
+    ],
+    "quality_profiles": {
+      "functional": "required",
+      "visual": "not_required",
+      "accessibility": "required",
+      "performance": "not_required",
+      "compatibility": "required"
+    },
+    "visual_validation_plan": [],
+    "risk_gates": [
+      "high",
+      "design/tasks/rollback/security/validation internally checked",
+      "implementation gate pending"
+    ],
+    "parallel_ownership": [
+      "顺序：任务 1 → 任务 2 → 任务 3",
+      "无其他 active change 路径重叠"
+    ]
+  },
+  "presentation": {
+    "schema": "delivery-presentation/v1",
+    "from_task": "计划·就绪审查完成",
+    "to_task": "等待实现闸门",
+    "summary": "系统代理下本地和私网自动直连，公司后缀由用户填写；设计和任务已就绪，还差一次实现放行。",
+    "evidence": [
+      "openspec validate 通过",
+      "delivery change checks 通过"
+    ],
+    "continue_prompt": "end"
+  }
+}

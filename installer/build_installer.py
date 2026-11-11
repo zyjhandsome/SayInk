@@ -17,8 +17,9 @@ to preserve it for debugging.
 """
 
 import argparse
-import subprocess
+import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -29,6 +30,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from sayink.version import __version__, file_version_quad
+from sayink_build.release_signing import (
+    SIGNTOOL_ENV_VAR,
+    SigningError,
+    inno_signtool_command,
+    sign_file_if_configured,
+    write_detached_signature_if_configured,
+)
 
 FULL_SUFFIX = "-full"
 
@@ -162,17 +170,29 @@ def build_installer(*, keep_staging: bool = False, with_model: bool = False):
 
     inno_path = find_inno_setup()
     installer_script = SCRIPT_DIR / "SayInk-Setup.iss"
+    iscc_cmd = [
+        str(inno_path),
+        f"/DAppVersionStr={__version__}",
+        f"/DAppVersionQuad={file_version_quad()}",
+        f"/DOutputSuffix={FULL_SUFFIX if with_model else ''}",
+    ]
+    signtool_template = (os.environ.get(SIGNTOOL_ENV_VAR) or "").strip()
+    use_inno_signtool = bool(signtool_template) and (
+        os.environ.get("SAYINK_INNO_SIGNTOOL", "").strip().lower() in ("1", "true", "yes")
+    )
+    if use_inno_signtool:
+        iscc_cmd.extend(
+            [
+                "/DUseSignTool=1",
+                f"/Ssayinksign={inno_signtool_command(signtool_template)}",
+            ]
+        )
+    iscc_cmd.append(str(installer_script))
 
     # Stream ISCC output (do not capture) so long compress steps do not look hung.
     try:
         result = subprocess.run(
-            [
-                str(inno_path),
-                f"/DAppVersionStr={__version__}",
-                f"/DAppVersionQuad={file_version_quad()}",
-                f"/DOutputSuffix={FULL_SUFFIX if with_model else ''}",
-                str(installer_script),
-            ],
+            iscc_cmd,
             cwd=str(SCRIPT_DIR),
             timeout=7200,  # 2 h — ~1 GB+ payloads with ultra compression
             check=False,
@@ -195,6 +215,14 @@ def build_installer(*, keep_staging: bool = False, with_model: bool = False):
         print("\n[ERROR] Installer not created!")
         sys.exit(1)
 
+    try:
+        if not use_inno_signtool:
+            sign_file_if_configured(output_file)
+        sig_file = write_detached_signature_if_configured(output_file)
+    except SigningError as exc:
+        print(f"\n[ERROR] {exc}")
+        sys.exit(1)
+
     # Get file size
     size_mb = output_file.stat().st_size / (1024 * 1024)
 
@@ -204,9 +232,13 @@ def build_installer(*, keep_staging: bool = False, with_model: bool = False):
     print("=" * 60)
     print(f"  Output file : {output_file}")
     print(f"  File size   : {size_mb:.0f} MB")
+    if sig_file is not None:
+        print(f"  Signature   : {sig_file}")
     print()
     print("  Distribution:")
     print(f"    Share {output_file.name} with users.")
+    if sig_file is not None:
+        print(f"    Upload {sig_file.name} alongside {output_file.name} on GitHub Releases.")
     print("    Users run the installer to install SayInk.")
     print("=" * 60)
 
@@ -218,7 +250,10 @@ def build_installer(*, keep_staging: bool = False, with_model: bool = False):
             marker.unlink(missing_ok=True)
         print()
         print(f"  Removed staging folder (intermediate build): {staging_dir}")
-        print(f"  dist/ now contains {output_file.name} only.")
+        if sig_file is not None:
+            print(f"  dist/ now contains {output_file.name} and {sig_file.name} only.")
+        else:
+            print(f"  dist/ now contains {output_file.name} only.")
 
     return output_file
 

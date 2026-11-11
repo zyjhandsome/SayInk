@@ -47,6 +47,12 @@ UninstallDisplayName=SayInk
 DirExistsWarning=no
 ; 确保显示安装路径选择界面
 DisableDirPage=no
+#ifdef UseSignTool
+; Optional Authenticode signing for Setup + Uninstaller when build_installer.py
+; runs with SAYINK_SIGNTOOL_CMD and SAYINK_INNO_SIGNTOOL=1.
+SignTool=sayinksign
+SignedUninstaller=yes
+#endif
 
 ; Version info
 VersionInfoVersion={#AppVersionQuad}

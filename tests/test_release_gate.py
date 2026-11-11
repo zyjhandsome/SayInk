@@ -22,13 +22,19 @@ def _runner(overrides=None):
         "git ls-remote": (0, f"{OTHER}\trefs/tags/v2.2.5\n{HEAD}\trefs/tags/v2.2.5^{{}}\n"),
         "gh run": (0, json.dumps([{"status": "completed", "conclusion": "success"}])),
         "ruff check": (0, ""),
+        "pytest": (0, ""),
     }
     responses.update(overrides or {})
     calls = []
 
     def run(cmd):
         calls.append(cmd)
-        key = "ruff check" if "ruff" in cmd else " ".join(cmd[:2])
+        if "ruff" in cmd:
+            key = "ruff check"
+        elif "pytest" in cmd:
+            key = "pytest"
+        else:
+            key = " ".join(cmd[:2])
         if key not in responses:
             raise AssertionError(f"unexpected command: {cmd}")
         result = responses[key]
@@ -53,12 +59,38 @@ def test_ci_is_looked_up_for_the_head_commit():
 
 
 def test_uncommitted_changes_and_untracked_sources_block_the_release():
-    status = " M sayink/app.py\n?? sayink/new_module.py\n?? build/app/SayInk.exe\n"
+    status = (
+        " M sayink/app.py\n"
+        "?? sayink/new_module.py\n"
+        "?? openspec/changes/unarchived/proposal.md\n"
+        "?? 1761310000\n"
+        "?? build/app/SayInk.exe\n"
+    )
     problems = release_problems("2.2.5", run=_runner({"git status": (0, status)}))
     assert len(problems) == 1
     assert "sayink/app.py" in problems[0]
     assert "sayink/new_module.py" in problems[0]
+    assert "openspec/changes/unarchived/proposal.md" in problems[0]
+    assert "1761310000" in problems[0]
     assert "build/app" not in problems[0]
+
+
+def test_readme_contract_failure_blocks_the_release():
+    problems = release_problems(
+        "2.2.5",
+        run=_runner({"pytest": (1, "FAILED tests/test_readme_features.py::test_x")}),
+    )
+    assert any(p.startswith("README truth-source check failed:") for p in problems)
+
+
+def test_build_script_places_pyinstaller_spec_inside_build_dir():
+    from pathlib import Path
+
+    import build
+
+    assert build.BUILD_DIR == build.SCRIPT_DIR / "build"
+    text = (Path(__file__).resolve().parents[1] / "build.py").read_text(encoding="utf-8")
+    assert "--specpath=" in text
 
 
 def test_tag_must_exist_on_the_remote():

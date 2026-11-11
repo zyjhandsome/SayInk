@@ -7,6 +7,7 @@ dist/SayInk/
 # Installers / binaries (build locally or attach to GitHub Releases)
 dist/SayInk-Setup-*.exe
 dist/*.exe
+dist/release-notes-*.md
 
 # Models (large files, download separately)
 models/

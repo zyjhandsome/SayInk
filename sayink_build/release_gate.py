@@ -8,14 +8,16 @@ come from a commit anyone can check out again: committed, tagged
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = "tests.yml"
-# Untracked files here end up in the installer; elsewhere (build/, caches) they do not.
-SOURCE_DIRS = ("sayink/", "sayink_build/", "installer/")
+# Untracked files in source/spec directories or at repo root must not slip past
+# a release check; build/, caches, and gitignored staging folders stay ignored.
+SOURCE_DIRS = ("sayink/", "sayink_build/", "installer/", "openspec/")
 
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
@@ -25,8 +27,11 @@ class _CommandFailed(Exception):
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     return subprocess.run(
-        cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
+        cmd, cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
     )
 
 
@@ -47,7 +52,8 @@ def _uncommitted(run: Runner) -> str | None:
     dirty = []
     for line in status.splitlines():
         code, path = line[:2], line[3:]
-        if code != "??" or path.startswith(SOURCE_DIRS):
+        is_root_stray = code == "??" and "/" not in path and not path.startswith(".")
+        if code != "??" or path.startswith(SOURCE_DIRS) or is_root_stray:
             dirty.append(path)
     if not dirty:
         return None
@@ -90,12 +96,18 @@ def _ci_not_green(run: Runner, head: str) -> str | None:
 
 
 def _ruff_problem(run: Runner) -> str | None:
-    """Lint the tree that CI would ship. The workflow file cannot run ruff itself."""
+    """Lint the tree before packaging.
+
+    CI also enforces this via ``tests/test_release_gate.py::test_workspace_passes_ruff``
+    (originally added when the push token lacked GitHub ``workflow`` scope to edit
+    ``.github/workflows/tests.yml`` directly).
+    """
     import sys
 
     cmd = [
-        sys.executable, "-m", "ruff", "check",
-        "sayink", "sayink_build", "tests", "build.py", "build_release.py", "run.py",
+        sys.executable, "-m", "ruff", "check", "--no-cache",
+        "sayink", "sayink_build", "tools", "tests",
+        "build.py", "build_release.py", "installer/build_installer.py", "run.py",
     ]
     try:
         result = run(cmd)
@@ -105,6 +117,25 @@ def _ruff_problem(run: Runner) -> str | None:
         detail = (result.stdout or result.stderr or "").strip().splitlines()
         tail = "; ".join(detail[:4])
         return f"ruff check failed: {tail}"
+    return None
+
+
+def _readme_contract_problem(run: Runner) -> str | None:
+    """Verify the README truth-source contract and OpenSpec archive hygiene."""
+    import sys
+
+    cmd = [
+        sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+        "tests/test_readme_features.py", "-q",
+    ]
+    try:
+        result = run(cmd)
+    except OSError as exc:
+        return f"Could not run README contract tests: {exc}"
+    if result.returncode != 0:
+        detail = (result.stdout or result.stderr or "").strip().splitlines()
+        tail = "; ".join(detail[-4:])
+        return f"README truth-source check failed: {tail}"
     return None
 
 
@@ -122,6 +153,7 @@ def release_problems(version: str, run: Runner = _run) -> list[str]:
 
     check(_uncommitted)
     check(_ruff_problem)
+    check(_readme_contract_problem)
     try:
         head = _output(run, ["git", "rev-parse", "HEAD"]).strip()
     except _CommandFailed as exc:
