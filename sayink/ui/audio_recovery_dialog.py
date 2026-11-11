@@ -74,10 +74,14 @@ class RecoveryWorker(QThread):
                 return
             seg = SpeechSegmenter()
             seg.set_gate(make_speech_gate(self.vad, seg, model_path=self.vad_path))
-            seg.quiet_speech = self.quiet and seg.gate_name == "silero"
-            self._active_quiet = seg.quiet_speech
-            if seg.gate_name == "silero":
-                seg.gate.input_gain = 4.0 if self.quiet else 1.0
+            if self.quiet is None:
+                self._active_quiet = None if seg.gate_name == "silero" else False
+                seg.quiet_speech = self._active_quiet
+            else:
+                seg.quiet_speech = bool(self.quiet) and seg.gate_name == "silero"
+                self._active_quiet = seg.quiet_speech
+                if seg.gate_name == "silero":
+                    seg.gate.input_gain = 4.0 if self.quiet else 1.0
             done = 0
             # Same 100 ms blocks as live capture; bounded to one ASR slice.
             for block in self.recording.blocks(TARGET_SAMPLE_RATE // 10):

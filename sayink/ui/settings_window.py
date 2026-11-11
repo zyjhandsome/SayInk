@@ -255,7 +255,7 @@ class SettingsWindow(QWidget):
         self._recognition_pending = False
         self._meeting_glossary_dirty = False
         self._glossary_skip_note = ""
-        self._speaker_runtime_text = "尚未获取说话人增强运行状态"
+        self._speaker_runtime_text = "尚未获取说话人区分运行状态"
         self._setup_window()
         self._setup_ui()
         self._connect_page_signals()
@@ -625,7 +625,7 @@ class SettingsWindow(QWidget):
         name = info["name"] if info else model_id
         if is_aux_model(model_id):
             text = (
-                f"{name} 已下载。按识别设置启用；正在录音或处理语音时，"
+                f"{name} 已下载。将按当前模式与音源自动启用；正在录音或处理语音时，"
                 f"待本场结束后生效。可在 {ADVANCED_RECOGNITION_PATH} 查看实际加载状态。"
             )
         elif self._config.get("stt.model_id", "") == model_id:
@@ -1247,23 +1247,14 @@ class SettingsWindow(QWidget):
         gp = self.general_page
         vad = str(gp.meeting_vad_combo.currentData() or "silero")
         language = str(gp.meeting_language_combo.currentData() or "auto")
-        speaker = gp.speaker_enabled_row.isChecked()
-        activity = gp.speaker_activity_row.isChecked()
-        quiet = gp.quiet_speech_row.isChecked()
         boundary = gp.boundary_context_row.isChecked()
         changed = (
             vad != self._config.get("stt.vad", "silero")
             or language != self._config.get("stt.language", "auto")
-            or speaker != self._config.get("stt.speaker_model_enabled", True)
-            or activity != self._config.get("stt.speaker_activity_enabled", False)
-            or quiet != self._config.get("stt.quiet_speech_enabled", False)
             or boundary != self._config.get("stt.boundary_context_enabled", False)
         )
         self._config.set("stt.vad", vad)
         self._config.set("stt.language", language)
-        self._config.set("stt.speaker_model_enabled", speaker)
-        self._config.set("stt.speaker_activity_enabled", activity)
-        self._config.set("stt.quiet_speech_enabled", quiet)
         self._config.set("stt.boundary_context_enabled", boundary)
         if changed:
             self.recognition_changed.emit()
@@ -1361,8 +1352,7 @@ class SettingsWindow(QWidget):
     def _restore_default_recognition(self) -> None:
         if not self._confirm(
             "恢复高级识别",
-            "将恢复这四项：语音分段改为自动检测语音；增强说话人区分改为开启；"
-            "多人发言检测改为关闭；轻声增强改为关闭。"
+            "将语音分段恢复为「自动检测语音（推荐）」。"
             "识别语言、自定义词汇和当前引擎保持不变。",
             accept="恢复",
         ):
@@ -1371,9 +1361,6 @@ class SettingsWindow(QWidget):
         self._loading = True
         try:
             set_combo_by_data(gp.meeting_vad_combo, "silero")
-            gp.speaker_enabled_row.setChecked(True)
-            gp.speaker_activity_row.setChecked(False)
-            gp.quiet_speech_row.setChecked(False)
         finally:
             self._loading = False
         self._on_recognition_setting_changed()

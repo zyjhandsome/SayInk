@@ -84,7 +84,7 @@ class ModelCard(QFrame):
         layout.addSpacing(6)
 
         if self._is_aux:
-            scope = "三种模式共用" if self._model_id == "silero-vad" else "持续转写与会议共用"
+            scope = "三种模式共用" if self._model_id == "silero-vad" else "按模式与音源自动启用"
             self._meta_lbl = QLabel(
                 f"{self._info['languages']} · {scope}；加载状态见 {ADVANCED_RECOGNITION_PATH}"
             )
