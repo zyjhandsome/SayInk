@@ -1505,3 +1505,62 @@ class TestModelDownloadSources:
 
         assert download_endpoints("") == (HF_URL, HF_MIRROR_URL)
         assert download_endpoints("hf-mirror") == (HF_MIRROR_URL,)
+
+
+class TestDynamicQuietAsrAudio:
+    def test_adaptive_mode_boosts_quiet_modulated_speech_up_to_32x_but_ignores_steady_fan_noise(self):
+        from sayink.speech_recognizer import prepare_quiet_asr_audio
+
+        rate = 16000
+        t = np.arange(rate, dtype=np.float32) / rate
+        # Modulated whisper (~0.0005 peak in quiet 0.00015 floor): needs >8x dynamic gain.
+        envelope = np.where((t >= 0.25) & (t <= 0.75), 1.0, 0.0).astype(np.float32)
+        whisper = (0.00015 * np.sin(2 * np.pi * 90 * t) + 0.0006 * envelope * np.sin(2 * np.pi * 220 * t)).astype(
+            np.float32
+        )
+        boosted = prepare_quiet_asr_audio(whisper, rate, assume_speech=None)
+        gain = float(np.max(np.abs(boosted)) / np.max(np.abs(whisper)))
+        assert 12.0 < gain <= 32.01
+        assert float(np.max(np.abs(boosted))) <= 0.9
+
+        # Steady colored/Gaussian fan noise at 0.0008 RMS must NEVER be amplified 32x.
+        rng = np.random.default_rng(42)
+        fan = rng.normal(0.0, 0.0008, rate).astype(np.float32)
+        np.testing.assert_array_equal(prepare_quiet_asr_audio(fan, rate, assume_speech=None), fan)
+
+    def test_adaptive_mode_backs_off_when_segment_noise_floor_is_elevated(self):
+        from sayink.speech_recognizer import TranscribeWorker, prepare_quiet_asr_audio
+        from sayink.vad_segmenter import attach_segment_acoustics
+        from sayink.asr_context import with_context
+        from types import SimpleNamespace
+
+        rate = 16000
+        t = np.arange(rate, dtype=np.float32) / rate
+        soft = np.zeros(rate, dtype=np.float32)
+        soft[4000:12000] = (0.0012 * np.sin(2 * np.pi * 200 * t[4000:12000])).astype(np.float32)
+
+        quiet_out = prepare_quiet_asr_audio(soft, rate, assume_speech=None, noise_floor=0.0003)
+        noisy_out = prepare_quiet_asr_audio(soft, rate, assume_speech=None, noise_floor=0.0025)
+        assert float(np.max(np.abs(quiet_out))) > float(np.max(np.abs(soft))) * 10.0
+        np.testing.assert_array_equal(noisy_out, soft)
+
+        # Segment noise_floor metadata survives with_context() inside TranscribeWorker.
+        tagged = attach_segment_acoustics(soft.copy(), noise_floor=0.0025, quiet_level=0.0)
+        contextual = with_context(tagged, np.zeros(1600, np.float32), np.zeros(1600, np.float32))
+        tagged_ctx = attach_segment_acoustics(contextual, noise_floor=0.0025, quiet_level=0.0)
+        seen = []
+
+        class Rec:
+            def create_stream(self):
+                return SimpleNamespace(
+                    result=SimpleNamespace(text="ok"),
+                    accept_waveform=lambda _r, wav: seen.append(wav.copy()),
+                )
+
+            def decode_stream(self, _s):
+                pass
+
+        worker = TranscribeWorker(Rec(), tagged_ctx)
+        assert worker.quiet_speech is None
+        worker.run()
+        assert any(len(w) == rate and np.array_equal(w, soft) for w in seen)

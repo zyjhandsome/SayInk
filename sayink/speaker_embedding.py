@@ -53,6 +53,10 @@ MODEL_MIN_SEC = 0.5
 MEL_MIN_SEC = 1.0
 _QUIET_RMS = 0.005
 
+ACTIVITY_MODE_ON_DEMAND = "on_demand"
+ACTIVITY_MODE_STRICT = "strict"
+ACTIVITY_MODE_OFF = "off"
+
 
 class SpeakerEmbedder:
     name = "embedder"
@@ -61,6 +65,7 @@ class SpeakerEmbedder:
     supports_turn_detection = False
     activity_guard = None
     activity_guard_error = ""
+    activity_mode = ACTIVITY_MODE_ON_DEMAND
     threshold = MEL_MATCH_THRESHOLD
     sticky_threshold = MEL_STICKY_THRESHOLD
     recluster_threshold = MEL_RECLUSTER_THRESHOLD
@@ -136,19 +141,28 @@ class ModelEmbedder(SpeakerEmbedder):
         return vector / norm
 
 
-def make_embedder(model_path: str | Path | None, *, enabled: bool = True,
-                  activity_enabled: bool = False, activity_model_path: str | Path | None = None) -> SpeakerEmbedder:
+def make_embedder(
+    model_path: str | Path | None,
+    *,
+    enabled: bool = True,
+    activity_enabled: bool = False,
+    activity_model_path: str | Path | None = None,
+    activity_path: str | Path | None = None,
+    activity_mode: str = ACTIVITY_MODE_ON_DEMAND,
+) -> SpeakerEmbedder:
     """CAM++ when enabled and available, otherwise the mel summary.
 
-    Activity checking additionally requires its explicit opt-in and a local
-    model file. Its load failure does not disable a working CAM++ backend.
+    Activity checking runs as an internal on-demand voiceprint guardrail by
+    default when ``activity_enabled`` is True and the local model file exists.
+    Its load failure does not disable a working CAM++ backend.
     """
     fallback = MelEmbedder()
     fallback.model_available = bool(model_path and Path(model_path).is_file())
     if enabled and fallback.model_available:
         try:
             embedder = ModelEmbedder(model_path)
-            if activity_enabled:
+            embedder.activity_mode = activity_mode
+            if activity_enabled and activity_mode != ACTIVITY_MODE_OFF:
                 # Resolve lazily: the registry imports the turn-analysis module.
                 # Availability is optional and never starts a network download.
                 try:
@@ -156,9 +170,13 @@ def make_embedder(model_path: str | Path | None, *, enabled: bool = True,
                     from sayink.speech_recognizer import AUX_MODEL_SPEAKER_ACTIVITY
                     from sayink.speaker_activity import SpeakerActivityGuard
 
-                    activity_path = activity_model_path or aux_model_path(AUX_MODEL_SPEAKER_ACTIVITY)
-                    if activity_path is not None:
-                        embedder.activity_guard = SpeakerActivityGuard(activity_path)
+                    resolved_activity = (
+                        activity_model_path
+                        or activity_path
+                        or aux_model_path(AUX_MODEL_SPEAKER_ACTIVITY)
+                    )
+                    if resolved_activity is not None:
+                        embedder.activity_guard = SpeakerActivityGuard(resolved_activity)
                 except Exception as exc:
                     embedder.activity_guard_error = str(exc)
                     log.warning("多人发言检测模型加载失败，本场未启用该增强: %s", exc)

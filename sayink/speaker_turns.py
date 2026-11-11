@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import math
 import threading
 import time
 
@@ -37,9 +38,10 @@ CONTEXT_SEC = 2.0
 CONTEXT_HEAD_SEC = 6.0
 CONTEXT_GAP_MS = 50
 SHORT_CONTEXT_STEP_SEC = 0.1
-# Same bar as a stable run. 0.90 only caught near-identical windows, so two
-# voices at a normal CAM++ match still blended into one learnable profile.
-REPEATED_WINDOW_SIMILARITY = STABLE_SIMILARITY
+# Require strong within-speaker agreement (0.80) and non-trivial window share
+# so stray laughter/phonetic windows inside a monologue do not trigger a false
+# multi-voice conflict, while genuine alternating voices still abstain.
+REPEATED_WINDOW_SIMILARITY = 0.80
 log = logging.getLogger("SayInk")
 
 
@@ -104,6 +106,7 @@ def _conflicting_repeated_windows(vectors) -> bool:
     valid = [v for v in vectors if v is not None]
     if len(valid) < 4:
         return False
+    min_share = max(2, math.ceil(len(valid) * 0.2))
     stacked = np.stack(valid)
     similarities = stacked @ stacked.T
     count = len(valid)
@@ -117,13 +120,15 @@ def _conflicting_repeated_windows(vectors) -> bool:
             right_support = [i for i in range(count) if i not in (left, right)
                              and similarities[right, i] >= REPEATED_WINDOW_SIMILARITY
                              and similarities[left, i] <= CHANGE_SIMILARITY]
-            if any(a != b for a in left_support for b in right_support):
+            if (1 + len(left_support) >= min_share
+                    and 1 + len(right_support) >= min_share
+                    and any(a != b for a in left_support for b in right_support)):
                 return True
     return False
 
 
 class SpeakerTurnContext:
-    """Two seconds of session-only audio, used only for adjacent input chunks."""
+    """Two seconds of session-only audio and lightweight voice prototypes."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -131,6 +136,8 @@ class SpeakerTurnContext:
         self._tail = np.zeros(0, dtype=np.float32)
         self._stop_ms = 0
         self._key = None
+        self._voices_embed = None
+        self._voices: list[np.ndarray] = []
 
     def reset(self):
         with self._lock:
@@ -138,6 +145,50 @@ class SpeakerTurnContext:
             self._tail = np.zeros(0, dtype=np.float32)
             self._stop_ms = 0
             self._key = None
+            self._voices_embed = None
+            self._voices = []
+
+    def session_voice_conflict(self, embedder, vector: np.ndarray | None) -> bool:
+        """True when ``vector`` sits in a low-margin or borderline zone vs session voices."""
+        if vector is None:
+            return False
+        with self._lock:
+            if self._voices_embed is not embedder or not self._voices:
+                return False
+            voices = [v for v in self._voices if v.size == vector.size]
+        if not voices:
+            return False
+        scores = sorted((float(v @ vector) for v in voices), reverse=True)
+        best = scores[0]
+        runner_up = scores[1] if len(scores) > 1 else -1.0
+        match = float(getattr(embedder, "threshold", 0.55))
+        sticky = float(getattr(embedder, "sticky_threshold", match - 0.10))
+        margin = 0.08
+        if len(scores) >= 2 and best >= sticky and best - runner_up < margin * 1.5:
+            return True
+        return (sticky - 0.05) <= best < (match + margin / 2)
+
+    def _record_voices_locked(self, embedder, turns: list[SpeakerTurn]) -> None:
+        if self._voices_embed is not embedder:
+            self._voices_embed = embedder
+            self._voices = []
+        match = float(getattr(embedder, "threshold", 0.55))
+        for turn in turns:
+            if not turn.learnable:
+                continue
+            vec = _vector(turn.embedding)
+            if vec is None:
+                continue
+            same_dim = [(idx, float(proto @ vec)) for idx, proto in enumerate(self._voices) if proto.size == vec.size]
+            if same_dim:
+                best_idx, best_sim = max(same_dim, key=lambda item: item[1])
+                if best_sim >= match:
+                    updated = _vector(0.75 * self._voices[best_idx] + 0.25 * vec)
+                    if updated is not None:
+                        self._voices[best_idx] = updated
+                    continue
+            if len(self._voices) < MAX_TURNS:
+                self._voices.append(vec)
 
     def analyze(self, audio, detector, *, start_ms, route, cancelled=None):
         samples = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -158,26 +209,42 @@ class SpeakerTurnContext:
             return []
         with self._lock:
             stop_ms = int(start_ms + len(samples) * 1000 / TARGET_SAMPLE_RATE)
-            if generation == self._generation and stop_ms >= self._stop_ms:
-                self._tail = samples[-int(CONTEXT_SEC * TARGET_SAMPLE_RATE):].copy()
-                self._stop_ms, self._key = stop_ms, key
+            if generation == self._generation:
+                self._record_voices_locked(detector._embed, turns)
+                if stop_ms >= self._stop_ms:
+                    self._tail = samples[-int(CONTEXT_SEC * TARGET_SAMPLE_RATE):].copy()
+                    self._stop_ms, self._key = stop_ms, key
         return turns
 
 
 class SpeakerTurnDetector:
     """Require sustained, clearly separated voice states before inserting a cut.
 
-    Short interjections may remain unresolved. Detected mixed or inconsistent evidence
-    which cannot support a stable cut stays unknown and does not train a
-    speaker profile. Thresholds require calibration on real meeting recordings.
+    Short interjections may remain unresolved. By default, ``activity_guard``
+    runs on demand as a voiceprint guardrail only when primary CAM++ evidence
+    shows boundary ambiguity, conflict, or low session margin: unsafe clips
+    are marked ``learnable=False`` without vetoing primary CAM++ attribution.
+    Pass ``activity_mode="strict"`` to run full legacy overlap checks/splits.
     """
 
-    def __init__(self, embedder, *, context: SpeakerTurnContext | None = None, start_ms=0, route=""):
+    def __init__(
+        self,
+        embedder,
+        *,
+        context: SpeakerTurnContext | None = None,
+        start_ms=0,
+        route="",
+        activity_mode: str | None = None,
+    ):
         self._embed = embedder
         self._match = float(embedder.threshold)
-        self._activity_guard = getattr(embedder, "activity_guard", None)
+        mode = str(activity_mode or getattr(embedder, "activity_mode", "on_demand") or "on_demand").strip().lower()
+        self._activity_mode = mode
+        self._strict_activity = mode in ("strict", "full")
+        self._activity_guard = None if mode == "off" else getattr(embedder, "activity_guard", None)
         self._context, self._start_ms, self._route = context, int(start_ms or 0), route
         self.context_action = "none"
+        self.activity_checks = 0
         self._embed_warned_at = 0.0
 
     @property
@@ -197,11 +264,12 @@ class SpeakerTurnDetector:
     def _activity_unsafe(self, audio, *, cancelled=None):
         if self._activity_guard is None:
             return False
+        self.activity_checks += 1
         try:
             return self._activity_guard.is_unsafe(audio, cancelled=cancelled)
         except Exception as exc:
             # A failed configured check must not silently approve training.
-            log.warning("多人发言检测失败，本段保留文字识别并暂不判断说话人: %s", exc)
+            log.warning("多人发言检测失败，本段保留文字识别并阻止声纹入库: %s", exc)
             return True
 
     def _plain_single(self, audio, *, uncertain=False, mixed=False):
@@ -217,9 +285,85 @@ class SpeakerTurnDetector:
         return [SpeakerTurn(0, len(audio), vector if vector is not None else np.zeros(1, dtype=np.float32),
                             vector is not None and not uncertain and voice_sample_is_clear(audio))]
 
-    def _single(self, audio, *, uncertain=False, cancelled=None, allow_activity_splits=True):
+    def _verified_sequential_turns(self, audio, cuts, *, cancelled=None) -> list[SpeakerTurn] | None:
+        minimum = int(MIN_ACTIVITY_VERIFY_SEC * TARGET_SAMPLE_RATE)
+        proposed = [0, *cuts, len(audio)]
+        if len(proposed) - 1 > MAX_TURNS or any(b - a < minimum for a, b in zip(proposed, proposed[1:], strict=False)):
+            return None
+        for index, cut in enumerate(cuts, 1):
+            if cancelled is not None and cancelled():
+                return []
+            similarity = self._change_similarity(
+                audio, cut, proposed[index - 1], proposed[index + 1], minimum_sec=MIN_ACTIVITY_VERIFY_SEC
+            )
+            if similarity is None or similarity > CHANGE_SIMILARITY:
+                return None
+        turns = []
+        for start, stop in zip(proposed, proposed[1:], strict=False):
+            if cancelled is not None and cancelled():
+                return []
+            turn = self._plain_single(audio[start:stop], uncertain=False, mixed=False)[0]
+            turns.append(SpeakerTurn(start, stop, turn.embedding, bool(turn.learnable)))
+        return turns
+
+    def _single(
+        self,
+        audio,
+        *,
+        uncertain=False,
+        cancelled=None,
+        allow_activity_splits=True,
+        need_guard=False,
+        anchors=None,
+    ):
+        if not self._strict_activity:
+            vector = self._embed_or_none(audio)
+            clear = vector is not None and voice_sample_is_clear(audio)
+            if not clear:
+                return [
+                    SpeakerTurn(
+                        0,
+                        len(audio),
+                        vector if vector is not None else np.zeros(1, dtype=np.float32),
+                        False,
+                    )
+                ]
+            same_dim_anchors = [a for a in (anchors or ()) if a.size == vector.size]
+            anchor_mismatch = bool(same_dim_anchors) and max(float(a @ vector) for a in same_dim_anchors) < STABLE_SIMILARITY
+            should_guard = (
+                need_guard
+                or anchor_mismatch
+                or (self._context is not None and self._context.session_voice_conflict(self._embed, vector))
+            )
+            if self._activity_guard is None or not should_guard:
+                return [SpeakerTurn(0, len(audio), vector, not uncertain)]
+            analyze = getattr(self._activity_guard, "analyze", None)
+            if callable(analyze):
+                self.activity_checks += 1
+                try:
+                    evidence = analyze(audio, cancelled=cancelled)
+                except Exception as exc:
+                    if cancelled is not None and cancelled():
+                        return []
+                    log.warning("局部发言检测失败，保留主声纹并阻止声纹入库: %s", exc)
+                    return [SpeakerTurn(0, len(audio), vector, False)]
+                if (
+                    allow_activity_splits
+                    and not uncertain
+                    and evidence.cuts
+                    and not evidence.overlaps
+                    and not evidence.unresolved
+                ):
+                    verified = self._verified_sequential_turns(audio, evidence.cuts, cancelled=cancelled)
+                    if verified is not None:
+                        return verified
+                return [SpeakerTurn(0, len(audio), vector, not (uncertain or evidence.unsafe))]
+            unsafe = self._activity_unsafe(audio, cancelled=cancelled)
+            return [SpeakerTurn(0, len(audio), vector, not (uncertain or unsafe))]
+
         analyze = getattr(self._activity_guard, "analyze", None)
         if callable(analyze):
+            self.activity_checks += 1
             try:
                 evidence = analyze(audio, cancelled=cancelled)
                 allow_cuts = not uncertain and allow_activity_splits
@@ -334,7 +478,7 @@ class SpeakerTurnDetector:
             for start, stop in ((0, cut), (cut, first.stop)):
                 if cancelled is not None and cancelled():
                     return []
-                pieces.append(self._single(samples[start:stop], cancelled=cancelled))
+                pieces.append(self._single(samples[start:stop], cancelled=cancelled, need_guard=True))
             if cancelled is not None and cancelled():
                 return []
             # Context proposes only one leading boundary. Extra unstable
@@ -404,22 +548,41 @@ class SpeakerTurnDetector:
         if not candidates:
             return turns
         _, cut, _, _ = max(candidates, key=lambda item: (item[0], -item[1]))
+        fallback_vec = np.zeros(1, dtype=np.float32) if self._strict_activity else first.embedding
         pieces = []
         for start, stop in ((0, cut), (cut, first.stop)):
             if cancelled is not None and cancelled():
                 return []
-            pieces.append(self._single(samples[start:stop], cancelled=cancelled))
+            if not self._strict_activity:
+                if self._activity_guard is not None:
+                    analyze = getattr(self._activity_guard, "analyze", None)
+                    if callable(analyze):
+                        self.activity_checks += 1
+                        try:
+                            unsafe = analyze(samples[start:stop], cancelled=cancelled).unsafe
+                        except Exception:
+                            if cancelled is not None and cancelled():
+                                return []
+                            unsafe = True
+                    else:
+                        unsafe = self._activity_unsafe(samples[start:stop], cancelled=cancelled)
+                    if unsafe:
+                        self.context_action = "short_abstain"
+                        return [SpeakerTurn(0, first.stop, fallback_vec, False), *turns[1:]]
+                pieces.append(self._plain_single(samples[start:stop], uncertain=True, mixed=False))
+            else:
+                pieces.append(self._single(samples[start:stop], cancelled=cancelled))
         if cancelled is not None and cancelled():
             return []
         if any(len(part) != 1 for part in pieces):
             self.context_action = "short_abstain"
-            return [SpeakerTurn(0, first.stop, np.zeros(1, dtype=np.float32), False), *turns[1:]]
+            return [SpeakerTurn(0, first.stop, fallback_vec, False), *turns[1:]]
         left, right = (_vector(part[0].embedding) for part in pieces)
         if (left is None or right is None or left.size != old.size or right.size != old.size
                 or float(left @ old) < STABLE_SIMILARITY or float(left @ right) > CHANGE_SIMILARITY
                 or float(right @ following) < STABLE_SIMILARITY):
             self.context_action = "short_abstain"
-            return [SpeakerTurn(0, first.stop, np.zeros(1, dtype=np.float32), False), *turns[1:]]
+            return [SpeakerTurn(0, first.stop, fallback_vec, False), *turns[1:]]
         self.context_action = "short_split"
         return [SpeakerTurn(0, cut, left, False), SpeakerTurn(cut, first.stop, right, False), *turns[1:]]
 
@@ -457,9 +620,8 @@ class SpeakerTurnDetector:
             # proposed a speaker change. Clips under that analysis length
             # already seed a profile when the whole utterance is clear; forcing
             # uncertain here left the opening of a meeting unnamed. A configured
-            # activity check can still abstain, but it must not invent splits
-            # the windows never supported.
-            return self._single(samples, cancelled=cancelled, allow_activity_splits=False)
+            # activity check can still abstain on demand, without inventing splits.
+            return self._single(samples, cancelled=cancelled, allow_activity_splits=False, need_guard=True)
         # A new voice may first appear in a window straddling the change.
         # Replace that mixed anchor with a repeated, better-separated state.
         # Otherwise the mixed anchor can hide a real A→B boundary.
@@ -527,17 +689,34 @@ class SpeakerTurnDetector:
             # Distinct voices may recur only in isolated windows, leaving no
             # stable consecutive run and no reliable cut. Their whole-clip
             # embedding would blend voices and could poison a speaker profile.
-            if not proposed and self._activity_guard is None and _conflicting_repeated_windows(vectors):
+            repeated_conflict = not proposed and _conflicting_repeated_windows(vectors)
+            if repeated_conflict and self._activity_guard is None:
                 return self._plain_single(samples, uncertain=True, mixed=True)
-            return self._single(samples, uncertain=bool(unresolved), cancelled=cancelled)
+            dubious = bool(proposed) or bool(unresolved) or repeated_conflict
+            turns = self._single(
+                samples,
+                uncertain=bool(unresolved) or repeated_conflict,
+                cancelled=cancelled,
+                need_guard=dubious,
+                anchors=anchors,
+            )
+            if repeated_conflict and len(turns) == 1 and self._strict_activity:
+                return self._plain_single(samples, uncertain=True, mixed=True)
+            return turns
         bounds = [0, *cuts[:MAX_TURNS - 1], samples.size]
         turns = []
         for start, stop in zip(bounds, bounds[1:], strict=False):
             if cancelled is not None and cancelled():
                 return []
             piece = samples[start:stop]
-            local = self._single(piece, uncertain=any(start < boundary < stop for boundary in unresolved),
-                                 cancelled=cancelled)
+            has_unresolved = any(start < boundary < stop for boundary in unresolved)
+            short_piece = (stop - start) < int(MIN_VERIFY_SEC * TARGET_SAMPLE_RATE)
+            local = self._single(
+                piece,
+                uncertain=has_unresolved,
+                cancelled=cancelled,
+                need_guard=has_unresolved or short_piece,
+            )
             turns.extend(SpeakerTurn(start + t.start, start + t.stop, t.embedding, t.learnable) for t in local)
         if len(turns) > MAX_TURNS:
             return self._plain_single(samples, uncertain=True, mixed=True)

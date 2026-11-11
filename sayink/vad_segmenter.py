@@ -9,6 +9,7 @@ Pause durations are mode-specific while the detection algorithm is shared.
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 from typing import Callable
 
@@ -88,6 +89,58 @@ MEETING_SILENCE_HOLD_SEC = 1.5
 # A talker who goes on for a long time: cut at a breath, not mid-word, but
 # well inside the ASR context window.
 MEETING_MAX_SPEECH_SEC = MAX_SEGMENT_SEC
+# Real-time ambient noise-floor zones for dynamic quiet-speech boost (Silero):
+# <= 0.0008 (~-62 dBFS): quiet room, ramp detection gain toward 4x and relax
+# neural RMS floor toward 0.1x when voice is soft;
+# 0.0008..0.0018: smooth cosine falloff + asymmetric EMA;
+# >= 0.0018 (~-55 dBFS): busy/fan floor, stay at 1.0x gain & standard floor.
+QUIET_FLOOR_LOW = 0.0008
+QUIET_FLOOR_HIGH = 0.0018
+QUIET_VOICE_SOFT_RMS = 0.008
+QUIET_VOICE_LOUD_RMS = 0.025
+QUIET_BOOST_MAX_GAIN = 4.0
+QUIET_BOOST_MIN_FLOOR_SCALE = 0.1
+QUIET_FLOOR_WINDOW_SEC = 2.5
+QUIET_TRUST_SEC = 0.6
+QUIET_ACTIVE_LEVEL = 0.15
+_DIGITAL_ZERO_RMS = 1e-5
+
+
+def _cosine_falloff(value: float, low: float, high: float) -> float:
+    if value <= low:
+        return 1.0
+    if value >= high or high <= low:
+        return 0.0
+    t = (value - low) / (high - low)
+    return 0.5 * (1.0 + math.cos(math.pi * t))
+
+
+class SegmentedAudio(np.ndarray):
+    """Emitted mono segment carrying real-time acoustic metadata for ASR."""
+
+    noise_floor: float | None
+    quiet_level: float
+
+    def __array_finalize__(self, obj) -> None:
+        if obj is None:
+            return
+        self.noise_floor = getattr(obj, "noise_floor", None)
+        self.quiet_level = getattr(obj, "quiet_level", 0.0)
+
+
+def attach_segment_acoustics(
+    audio: np.ndarray,
+    *,
+    noise_floor: float | None = None,
+    quiet_level: float = 0.0,
+) -> np.ndarray:
+    view = audio.view(SegmentedAudio) if type(audio) is np.ndarray else audio
+    try:
+        view.noise_floor = None if noise_floor is None else float(noise_floor)
+        view.quiet_level = float(quiet_level)
+    except AttributeError:
+        pass
+    return view
 
 
 class SpeechGate:
@@ -203,6 +256,7 @@ def make_meeting_segmenter(
     vad: str = VAD_ENERGY,
     model_path: str | Path | None = None,
     gate_factory: Callable[["SpeechSegmenter"], SpeechGate] | None = None,
+    quiet_boost: bool | None = None,
 ) -> "SpeechSegmenter":
     """The meeting-profile segmenter exactly as the recorder runs it.
 
@@ -217,6 +271,7 @@ def make_meeting_segmenter(
         speech_threshold=speech_threshold,
         silence_hold_sec=MEETING_SILENCE_HOLD_SEC,
         max_speech_sec=MEETING_MAX_SPEECH_SEC,
+        quiet_boost=quiet_boost,
     )
     if gate_factory is not None:
         segmenter.set_gate(gate_factory(segmenter))
@@ -243,10 +298,11 @@ class SpeechSegmenter:
         short_silence_hold_sec: float = SHORT_SILENCE_HOLD_SEC,
         trailing_silence_keep_sec: float = TRAILING_SILENCE_KEEP_SEC,
         gate: SpeechGate | None = None,
+        quiet_boost: bool | None = None,
     ):
         self._rate = sample_rate
         self._gate: SpeechGate = gate if gate is not None else EnergyGate(self)
-        self.quiet_speech = False
+        self._quiet_boost: bool | None = None if quiet_boost is None else bool(quiet_boost)
         self._speech_threshold = speech_threshold
         self._silence_hold_samples = int(sample_rate * silence_hold_sec)
         self._pre_roll_samples = int(sample_rate * max(0.0, pre_roll_sec))
@@ -264,6 +320,16 @@ class SpeechSegmenter:
         self._floor_trust_samples = int(sample_rate * NOISE_FLOOR_TRUST_SEC)
         self._floor_blocks: list[tuple[int, float]] = []
         self._floor_total = 0
+        self._quiet_window_samples = int(sample_rate * QUIET_FLOOR_WINDOW_SEC)
+        self._quiet_trust_samples = int(sample_rate * QUIET_TRUST_SEC)
+        self._nonzero_blocks: list[tuple[int, float]] = []
+        self._nonzero_total = 0
+        self._ambient_ema: float | None = None
+        self._speech_rms_ema: float | None = None
+        self._quiet_level: float = (
+            1.0 if (self._quiet_boost is True and not isinstance(self._gate, EnergyGate)) else 0.0
+        )
+        self._sync_gate_gain()
         self.reset()
 
     @property
@@ -278,10 +344,126 @@ class SpeechSegmenter:
     def set_gate(self, gate: SpeechGate | None) -> None:
         self._gate = gate if gate is not None else EnergyGate(self)
         self._gate.reset()
+        if isinstance(self._gate, EnergyGate) or self._quiet_boost is False:
+            self._quiet_level = 0.0
+        elif self._quiet_boost is True:
+            self._quiet_level = 1.0
+        self._sync_gate_gain()
 
     @property
     def gate_name(self) -> str:
         return self._gate.name
+
+    @property
+    def quiet_boost(self) -> bool | None:
+        """Tri-state quiet boost mode: ``None`` = dynamic closed-loop, ``bool`` = forced."""
+        return self._quiet_boost
+
+    @quiet_boost.setter
+    def quiet_boost(self, value: bool | None) -> None:
+        self._quiet_boost = None if value is None else bool(value)
+        if isinstance(self._gate, EnergyGate) or self._quiet_boost is False:
+            self._quiet_level = 0.0
+        elif self._quiet_boost is True:
+            self._quiet_level = 1.0
+        self._sync_gate_gain()
+
+    @property
+    def quiet_speech(self) -> bool:
+        """Whether neural quiet-speech boost is currently active."""
+        if isinstance(self._gate, EnergyGate):
+            return False
+        if self._quiet_boost is True:
+            return True
+        if self._quiet_boost is False or not self._adaptive:
+            return False
+        return self._quiet_level >= QUIET_ACTIVE_LEVEL
+
+    @quiet_speech.setter
+    def quiet_speech(self, value: bool | None) -> None:
+        self.quiet_boost = value
+
+    @property
+    def quiet_level(self) -> float:
+        """Current smoothed quiet-boost factor in ``[0.0, 1.0]``."""
+        if isinstance(self._gate, EnergyGate) or self._quiet_boost is False:
+            return 0.0
+        if self._quiet_boost is True:
+            return 1.0
+        if not self._adaptive:
+            return 0.0
+        return float(self._quiet_level)
+
+    @property
+    def dynamic_input_gain(self) -> float:
+        return 1.0 + (QUIET_BOOST_MAX_GAIN - 1.0) * self.quiet_level
+
+    @property
+    def quiet_floor_scale(self) -> float:
+        return 1.0 - (1.0 - QUIET_BOOST_MIN_FLOOR_SCALE) * self.quiet_level
+
+    @property
+    def ambient_noise_floor(self) -> float | None:
+        """Real-time ambient noise estimate filtering out digital-zero padding."""
+        candidates: list[float] = []
+        if self._nonzero_blocks:
+            candidates.append(float(np.percentile([r for _c, r in self._nonzero_blocks], 10)))
+        if self._ambient_ema is not None:
+            candidates.append(float(self._ambient_ema))
+        return max(candidates) if candidates else None
+
+    def _sync_gate_gain(self) -> None:
+        gate = getattr(self, "_gate", None)
+        if gate is not None and not isinstance(gate, EnergyGate) and hasattr(gate, "input_gain"):
+            gate.input_gain = self.dynamic_input_gain
+
+    def _update_quiet_state(self, block_size: int, rms: float, *, raw_loud: bool) -> None:
+        if rms >= _DIGITAL_ZERO_RMS:
+            self._nonzero_blocks.append((block_size, rms))
+            self._nonzero_total += block_size
+            while self._nonzero_total > self._quiet_window_samples and len(self._nonzero_blocks) > 1:
+                count, _ = self._nonzero_blocks.pop(0)
+                self._nonzero_total -= count
+            if not raw_loud:
+                if self._ambient_ema is None:
+                    self._ambient_ema = rms
+                else:
+                    alpha_amb = 0.40 if rms > self._ambient_ema else 0.15
+                    self._ambient_ema += alpha_amb * (rms - self._ambient_ema)
+            else:
+                if self._speech_rms_ema is None:
+                    self._speech_rms_ema = rms
+                else:
+                    self._speech_rms_ema += 0.25 * (rms - self._speech_rms_ema)
+        if not raw_loud and self._speech_rms_ema is not None:
+            self._speech_rms_ema = max(rms, self._speech_rms_ema * 0.94)
+
+        if isinstance(self._gate, EnergyGate) or self._quiet_boost is False:
+            self._quiet_level = 0.0
+            self._sync_gate_gain()
+            return
+        if self._quiet_boost is True:
+            self._quiet_level = 1.0
+            self._sync_gate_gain()
+            return
+        if not self._adaptive or self._nonzero_total < self._quiet_trust_samples:
+            target = 0.0
+        else:
+            noise_est = self.ambient_noise_floor
+            if noise_est is None:
+                target = 0.0
+            else:
+                env_factor = _cosine_falloff(noise_est, QUIET_FLOOR_LOW, QUIET_FLOOR_HIGH)
+                voice_rms = self._speech_rms_ema if self._speech_rms_ema is not None else 0.0
+                voice_factor = _cosine_falloff(voice_rms, QUIET_VOICE_SOFT_RMS, QUIET_VOICE_LOUD_RMS)
+                target = env_factor * voice_factor
+        alpha = 0.40 if target < self._quiet_level else 0.25
+        self._quiet_level += alpha * (target - self._quiet_level)
+        if self._quiet_level < 1e-4:
+            self._quiet_level = 0.0
+        elif self._quiet_level > 0.999:
+            self._quiet_level = 1.0
+        self._sync_gate_gain()
 
     @property
     def effective_threshold(self) -> float:
@@ -381,14 +563,17 @@ class SpeechSegmenter:
 
         rms = rms_volume(block)
         self._track_noise_floor(int(block.size), float(rms))
-        loud = self._gate.is_speech(block, float(rms), in_speech=self._in_speech)
+        self._sync_gate_gain()
+        raw_loud = self._gate.is_speech(block, float(rms), in_speech=self._in_speech)
+        self._update_quiet_state(int(block.size), float(rms), raw_loud=bool(raw_loud))
+        loud = raw_loud
         if loud and not isinstance(self._gate, EnergyGate):
             # A neural gate still needs *something* above the static RMS
             # floor (not the adaptive room floor, which would mute quiet
             # talkers Silero can hear); a hum scored as speech must not open
             # the gate on digital silence.
             floor = min(self.hold_threshold, self._speech_threshold)
-            loud = rms >= (floor * 0.1 if self.quiet_speech else floor)
+            loud = rms >= max(_DIGITAL_ZERO_RMS, floor * self.quiet_floor_scale)
         if loud:
             if not self._in_speech:
                 self._in_speech = True
@@ -513,10 +698,12 @@ class SpeechSegmenter:
         if trim:
             out = out[: out.size - trim]
         mic, system, _tail = self._split_energy(out.size)
+        noise_floor = self.ambient_noise_floor
+        quiet_level = self.quiet_level
         self._reset_buffer()
         self._last_route = dominant_route(mic, system)
         self._last_bounds = (start, start + int(out.size))
-        return out
+        return attach_segment_acoustics(out, noise_floor=noise_floor, quiet_level=quiet_level)
 
     def _remember_block(
         self, block: np.ndarray, mic_energy: float, system_energy: float, rms: float = 0.0
@@ -569,6 +756,8 @@ class SpeechSegmenter:
         audio = np.concatenate(self._buffer).astype(np.float32, copy=False)
         take = audio.size if limit is None else min(int(limit), int(audio.size))
         mic, system, tail_energy = self._split_energy(take)
+        noise_floor = self.ambient_noise_floor
+        quiet_level = self.quiet_level
         tail = audio[take:] if take < audio.size else None
         self._reset_buffer()
         self._continuation = tail_is_speech
@@ -590,4 +779,6 @@ class SpeechSegmenter:
             # The carried tail came from the loud run that forced this cut.
             self._loud_samples = int(tail.size)
             self._energy = tail_energy
-        return audio[:take]
+        return attach_segment_acoustics(
+            audio[:take], noise_floor=noise_floor, quiet_level=quiet_level
+        )

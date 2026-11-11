@@ -12,7 +12,7 @@ from PyQt6.QtCore import QObject, pyqtSignal, QThread
 from sayink.audio_utils import MAX_SEGMENT_SEC, TARGET_SAMPLE_RATE
 from sayink.runtime_status import ModelLoadPhase
 from sayink.speaker_turns import RecognizedTurn, analyze_turns
-from sayink.vad_segmenter import CUT_SEARCH_SEC
+from sayink.vad_segmenter import CUT_SEARCH_SEC, QUIET_FLOOR_HIGH, QUIET_FLOOR_LOW, _cosine_falloff
 
 log = logging.getLogger("SayInk")
 
@@ -1214,33 +1214,78 @@ def _repetition_overflow(text: str, samples: int, sample_rate: int) -> bool:
     return any(not match.group(1).isdigit() for match in _REPEATED_ASR_UNIT.finditer(core))
 
 
-def prepare_quiet_asr_audio(audio: np.ndarray, sample_rate: int = SAMPLE_RATE, *, assume_speech=False) -> np.ndarray:
+def prepare_quiet_asr_audio(
+    audio: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    *,
+    assume_speech: bool | None = False,
+    noise_floor: float | None = None,
+) -> np.ndarray:
     """Raise clearly modulated, quiet speech without another native decode.
 
     This only affects ASR input; raw recording and speaker embeddings stay
     unchanged. Near silence, steady hum and normal-volume clips are untouched.
+    When ``assume_speech is None`` (dynamic adaptive mode), maximum gain and
+    modulation floor scale smoothly with the real-time ambient noise floor.
     """
     samples = np.asarray(audio, dtype=np.float32)
     frame = max(1, sample_rate // 50)
     if samples.size < frame * 10 or not np.all(np.isfinite(samples)):
         return samples
-    levels = np.sqrt(np.mean(samples[:samples.size // frame * frame].reshape(-1, frame)**2, axis=1))
-    low, high = np.percentile(levels, [20, 90])
-    if not (0.00005 if assume_speech else 0.0005) <= high < 0.008:
-        return samples
-    if not assume_speech and high < max(low * 4, 0.0005):
-        return samples
-    gain = min(32.0 if assume_speech else 8.0, 0.02 / high,
-               0.9 / max(float(np.max(np.abs(samples))), 1e-8))
+    levels = np.sqrt(np.mean(samples[:samples.size // frame * frame].reshape(-1, frame) ** 2, axis=1))
+    low, high = (float(v) for v in np.percentile(levels, [20, 90]))
+    if assume_speech is True:
+        if not 0.00005 <= high < 0.008:
+            return samples
+        max_gain = 32.0
+        noise_cap = 32.0
+    elif assume_speech is False:
+        if not 0.0005 <= high < 0.008:
+            return samples
+        if high < max(low * 4.0, 0.0005):
+            return samples
+        max_gain = 8.0
+        noise_cap = 8.0
+    else:
+        seg_floor = noise_floor if noise_floor is not None else getattr(audio, "noise_floor", None)
+        eff_floor = max(low, float(seg_floor)) if seg_floor is not None else low
+        q = _cosine_falloff(eff_floor, QUIET_FLOOR_LOW, QUIET_FLOOR_HIGH)
+        min_high = 0.0005 - (0.0005 - 0.00008) * q
+        if not min_high <= high < 0.008:
+            return samples
+        min_ratio = 4.0 - (4.0 - 2.2) * q
+        if high < max(low * min_ratio, eff_floor * 2.0, min_high):
+            return samples
+        max_gain = 8.0 + (32.0 - 8.0) * q
+        noise_cap = 0.012 / max(eff_floor, 1e-6)
+    gain = min(
+        max_gain,
+        noise_cap,
+        0.02 / high,
+        0.9 / max(float(np.max(np.abs(samples))), 1e-8),
+    )
     return samples * np.float32(gain) if gain > 1.2 else samples
 
 
-def decode_asr_slice(recognizer, audio: np.ndarray, *, sample_rate: int = SAMPLE_RATE,
-                     retry_empty: bool = False, cancelled=None, quiet_speech=False) -> str:
+def decode_asr_slice(
+    recognizer,
+    audio: np.ndarray,
+    *,
+    sample_rate: int = SAMPLE_RATE,
+    retry_empty: bool = False,
+    cancelled=None,
+    quiet_speech: bool | None = False,
+    noise_floor: float | None = None,
+) -> str:
     """The same normalized, bounded decode policy for the app and benchmark."""
+    seg_floor = noise_floor if noise_floor is not None else getattr(audio, "noise_floor", None)
+
     def decode(piece):
         stream = recognizer.create_stream()
-        stream.accept_waveform(sample_rate, prepare_quiet_asr_audio(piece, sample_rate, assume_speech=quiet_speech))
+        stream.accept_waveform(
+            sample_rate,
+            prepare_quiet_asr_audio(piece, sample_rate, assume_speech=quiet_speech, noise_floor=seg_floor),
+        )
         recognizer.decode_stream(stream)
         return normalize_asr_output(stream.result.text)
 
@@ -1267,7 +1312,12 @@ def decode_asr_slice(recognizer, audio: np.ndarray, *, sample_rate: int = SAMPLE
             log.warning("异常重复重识别失败，保留首次文字: %s", exc)
     if text or not retry_empty or (cancelled is not None and cancelled()):
         return text
-    retry_source = prepare_quiet_asr_audio(audio, sample_rate, assume_speech=True) if quiet_speech else audio
+    if quiet_speech is True or quiet_speech is None:
+        retry_source = prepare_quiet_asr_audio(
+            audio, sample_rate, assume_speech=quiet_speech, noise_floor=seg_floor
+        )
+    else:
+        retry_source = audio
     retry = short_retry_audio(retry_source, sample_rate)
     if retry is None:
         return text
@@ -1305,7 +1355,8 @@ class TranscribeWorker(QThread):
         self._retry_empty = retry_empty
         self._turn_analyzer = turn_analyzer
         self.native_lock = None
-        self.quiet_speech = False
+        self.quiet_speech: bool | None = None
+        self._segment_noise_floor: float | None = getattr(audio_data, "noise_floor", None)
 
     def cancel(self):
         """Set cancellation flag."""
@@ -1315,17 +1366,30 @@ class TranscribeWorker(QThread):
         from sayink.asr_context import decode_owned_context
         if not self._cancelled and (len(getattr(audio, "prefix", ())) or len(getattr(audio, "suffix", ()))):
             try:
-                text = decode_owned_context(self._recognizer, audio, normalize_asr_output,
-                                             prepare=lambda window: prepare_quiet_asr_audio(window, assume_speech=self.quiet_speech))
+                text = decode_owned_context(
+                    self._recognizer,
+                    audio,
+                    normalize_asr_output,
+                    prepare=lambda window: prepare_quiet_asr_audio(
+                        window,
+                        assume_speech=self.quiet_speech,
+                        noise_floor=self._segment_noise_floor,
+                    ),
+                )
                 if text:
                     return text
             except Exception as exc:
                 log.warning("跨段时间对齐不可用，识别原始片段: %s", exc)
         if self._cancelled:
             return ""
-        options = {"quiet_speech": True} if self.quiet_speech else {}
-        return decode_asr_slice(self._recognizer, audio, retry_empty=self._retry_empty,
-                                cancelled=lambda: self._cancelled, **options)
+        return decode_asr_slice(
+            self._recognizer,
+            audio,
+            retry_empty=self._retry_empty,
+            cancelled=lambda: self._cancelled,
+            quiet_speech=self.quiet_speech,
+            noise_floor=self._segment_noise_floor,
+        )
 
     def run(self):
         if self.native_lock is None:
@@ -1345,6 +1409,7 @@ class TranscribeWorker(QThread):
 
         try:
             from sayink.asr_context import with_context
+            self._segment_noise_floor = getattr(self._audio_data, "noise_floor", self._segment_noise_floor)
             audio = with_context(self._audio_data, getattr(self._audio_data, "prefix", None),
                                  getattr(self._audio_data, "suffix", None))
             if audio.ndim > 1:
@@ -1499,7 +1564,7 @@ class SpeechRecognizer(QObject):
         self._active_seq = 0
         self._workers: list[TranscribeWorker] = []
         self._decode_lock = threading.Lock()
-        self.quiet_speech = False
+        self.quiet_speech: bool | None = None
 
     def _target(self) -> LoadTarget:
         return (self._model_id, self._num_threads, self._hotwords, self._language)

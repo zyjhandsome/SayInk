@@ -393,3 +393,118 @@ class TestMeetingSegmenterFactory:
 
         seg = make_meeting_segmenter(gate_factory=factory)
         assert seen == [seg]
+
+
+class _GainTrackingNeuralGate:
+    """Mock neural gate recording per-block input_gain seen during feed()."""
+
+    name = "silero"
+    fallback_reason = ""
+
+    def __init__(self, speech_fn):
+        self._speech_fn = speech_fn
+        self.input_gain = 1.0
+        self.seen_gains: list[float] = []
+
+    def is_speech(self, block: np.ndarray, rms: float, *, in_speech: bool) -> bool:
+        self.seen_gains.append(float(self.input_gain))
+        return bool(self._speech_fn(block, rms, self.input_gain, in_speech))
+
+    def reset(self) -> None:
+        pass
+
+
+class TestDynamicQuietAutoGain:
+    """Real-time ambient noise-floor closed-loop for Silero quiet speech."""
+
+    def test_quiet_ambient_and_soft_speech_smoothly_ramp_gain_and_emit_segment(self):
+        # Soft speech (RMS=0.0004) only crosses neural VAD once input_gain > 2.2x
+        # and neural RMS floor relaxes below 0.0004.
+        gate = _GainTrackingNeuralGate(lambda _b, rms, gain, _in: rms >= 0.00035 and gain >= 2.2)
+        seg = SpeechSegmenter(
+            speech_threshold=0.002,
+            silence_hold_sec=0.4,
+            short_speech_sec=0.0,
+            min_speech_sec=0.25,
+            gate=gate,
+        )
+        assert seg.quiet_boost is None
+        assert seg.dynamic_input_gain == pytest.approx(1.0)
+        assert not seg.quiet_speech
+
+        # 1.2s of quiet room ambient (~0.00025 RMS <= 0.0008): gain ramps up smoothly.
+        for _ in range(12):
+            assert seg.feed(_tone(0.1, 0.00025)) is None
+        assert gate.seen_gains[0] == pytest.approx(1.0)
+        assert seg.dynamic_input_gain > 2.8
+        assert seg.quiet_floor_scale < 0.45
+        assert seg.quiet_speech is True
+
+        # 0.8s of whisper (0.0004 RMS < standard 0.001 floor) opens and emits cleanly.
+        segments = _feed_blocks(
+            seg,
+            np.concatenate([_tone(0.8, 0.0004), _tone(0.6, 0.00025)]),
+        )
+        assert len(segments) == 1
+        assert getattr(segments[0], "noise_floor", None) == pytest.approx(0.00025, rel=0.2)
+        assert getattr(segments[0], "quiet_level", 0.0) > 0.7
+
+    def test_noisy_fan_floor_smoothly_backs_off_and_recovers_when_quiet_again(self):
+        gate = _GainTrackingNeuralGate(lambda _b, _rms, _gain, _in: False)
+        seg = SpeechSegmenter(speech_threshold=0.002, gate=gate)
+
+        # Ramp up in a quiet room (0.0003 RMS).
+        for _ in range(15):
+            seg.feed(_noisy(0.1, 0.0003))
+        peak_gain = seg.dynamic_input_gain
+        assert peak_gain > 3.3
+        assert seg.quiet_speech is True
+
+        # Fan turns on (0.0025 RMS >= 0.0018): smooth monotonic backoff to 1.0x.
+        backoff_gains = []
+        for _ in range(15):
+            seg.feed(_noisy(0.1, 0.0025))
+            backoff_gains.append(seg.dynamic_input_gain)
+        assert backoff_gains[0] < peak_gain
+        assert backoff_gains == sorted(backoff_gains, reverse=True)
+        assert seg.dynamic_input_gain == pytest.approx(1.0, abs=0.05)
+        assert seg.quiet_floor_scale == pytest.approx(1.0, abs=0.03)
+        assert seg.quiet_speech is False
+
+        # Fan stops (back to 0.0003 RMS): smoothly recovers boost.
+        for _ in range(25):
+            seg.feed(_noisy(0.1, 0.0003))
+        assert seg.dynamic_input_gain > 3.0
+        assert seg.quiet_speech is True
+
+    def test_digital_zero_padding_never_pins_noisy_room_floor_to_zero(self):
+        gate = _GainTrackingNeuralGate(lambda _b, _rms, _gain, _in: False)
+        seg = SpeechSegmenter(speech_threshold=0.002, gate=gate)
+
+        # Interleave noisy fan blocks (0.0025) with digital zero alignment blocks (0.0).
+        for i in range(20):
+            block = _silence(0.1) if i % 4 == 0 else _noisy(0.1, 0.0025)
+            seg.feed(block)
+        assert seg.ambient_noise_floor is not None and seg.ambient_noise_floor >= 0.0018
+        assert seg.dynamic_input_gain == pytest.approx(1.0)
+        assert seg.quiet_speech is False
+
+    def test_loud_voice_relaxes_gain_and_explicit_bool_overrides_stay_compatible(self):
+        gate = _GainTrackingNeuralGate(lambda _b, rms, _gain, _in: rms >= 0.01)
+        seg = SpeechSegmenter(speech_threshold=0.002, gate=gate)
+        for _ in range(12):
+            seg.feed(_tone(0.1, 0.0003))
+        assert seg.dynamic_input_gain > 3.0
+
+        # Normal loud talker (0.05 RMS >= 0.025) does not need 4x input gain.
+        for _ in range(15):
+            seg.feed(_tone(0.1, 0.05))
+        assert seg.dynamic_input_gain < 1.25
+
+        # Explicit True / False overrides remain deterministic for debug/tests.
+        seg.quiet_boost = True
+        assert seg.quiet_boost is True and seg.dynamic_input_gain == pytest.approx(4.0)
+        assert seg.quiet_floor_scale == pytest.approx(0.1) and seg.quiet_speech is True
+        seg.quiet_boost = False
+        assert seg.quiet_boost is False and seg.dynamic_input_gain == pytest.approx(1.0)
+        assert seg.quiet_floor_scale == pytest.approx(1.0) and seg.quiet_speech is False

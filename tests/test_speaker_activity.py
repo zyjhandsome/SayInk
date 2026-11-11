@@ -95,6 +95,24 @@ def test_overlap_includes_the_uncertain_transition_but_not_clear_flanks(runtime)
     assert end > 140 * 270 and end < 4 * RATE
 
 
+def test_brief_overlap_spike_near_pauses_does_not_expand_across_whole_utterance(runtime):
+    # Ambiguous/low-confidence frames across a 6s utterance with a 0.25s laugh
+    # spike must stay locally bounded instead of expanding to 0..len(audio).
+    ambiguous = np.log(np.full((1, FRAMES, 7), 1 / 7, dtype=np.float32))
+    ambiguous[0, 150:162, :] = 0.001
+    ambiguous[0, 150:162, 4] = 0.994
+    ambiguous[0, 150:162, :] = np.log(ambiguous[0, 150:162, :])
+    runtime.output = ambiguous
+    guard = SpeakerActivityGuard("model.onnx")
+    evidence = guard.analyze(np.full(6 * RATE, 0.1, dtype=np.float32))
+    assert guard.calls == 1
+    assert len(evidence.overlaps) == 1
+    begin, end = evidence.overlaps[0]
+    assert begin > int(1.5 * RATE)
+    assert end < int(4.0 * RATE)
+    assert (end - begin) < int(2.0 * RATE)
+
+
 def test_sequential_cut_offsets_never_export_window_local_speaker_labels(runtime):
     labels = np.ones(FRAMES, dtype=int)
     labels[100:150] = 2

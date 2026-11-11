@@ -20,6 +20,7 @@ MIN_OVERLAP_SEC = 0.20
 SINGLE_PROBABILITY = 0.60
 MIN_LOCAL_VOICE_SEC = 0.30
 ACTIVITY_EDGE_SEC = 0.12
+MAX_OVERLAP_TRANSITION_SEC = 0.60
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,7 @@ class SpeakerActivityGuard:
                 or not 0 < self._shift <= self._field <= self._window):
             raise ValueError("invalid speaker activity timing metadata")
         self._input = self._session.get_inputs()[0].name
+        self.calls = 0
 
     def is_unsafe(self, audio: np.ndarray, *, cancelled=None) -> bool:
         return self.analyze(audio, cancelled=cancelled).unsafe
@@ -111,21 +113,37 @@ class SpeakerActivityGuard:
         Different 10-second windows can permute their local labels. Compare
         labels only inside each window, then combine sample offsets, never ids.
         """
+        self.calls += 1
         overlaps, cuts = [], []
         unresolved = False
         overlap_frames = math.ceil(MIN_OVERLAP_SEC * TARGET_SAMPLE_RATE / self._shift)
         local_frames = math.ceil(MIN_LOCAL_VOICE_SEC * TARGET_SAMPLE_RATE / self._shift)
+        max_expand = math.ceil(MAX_OVERLAP_TRANSITION_SEC * TARGET_SAMPLE_RATE / self._shift)
         edge = int(ACTIVITY_EDGE_SEC * TARGET_SAMPLE_RATE)
         for offset, probabilities in self._probability_windows(audio, cancelled=cancelled):
             origin = offset + (self._field - self._shift) // 2
             clear = [(begin, end) for begin, end in _runs(probabilities[:, 1:4].max(axis=1) >= SINGLE_PROBABILITY)
                      if end - begin >= local_frames]
+            silence = probabilities[:, 0] >= SINGLE_PROBABILITY
             for begin, end in _runs(probabilities[:, 4:].sum(axis=1) >= OVERLAP_PROBABILITY):
                 if end - begin >= overlap_frames:
                     # Include the uncertain transition up to sustained clear
-                    # speech. A fading overlap score is not a safe voice edge.
-                    begin = max((stop for _start, stop in clear if stop <= begin), default=0)
-                    end = min((start for start, _stop in clear if start >= end), default=len(probabilities))
+                    # speech or silence, bounded to MAX_OVERLAP_TRANSITION_SEC
+                    # so a brief laugh/breath spike never swallows a whole clip.
+                    left_floor = max(0, begin - max_expand)
+                    left_stops = [stop for _start, stop in clear if stop <= begin]
+                    left_sil = np.flatnonzero(silence[left_floor:begin])
+                    if left_sil.size:
+                        left_stops.append(left_floor + int(left_sil[-1]) + 1)
+                    begin = max(left_floor, max(left_stops, default=left_floor))
+
+                    right_ceil = min(len(probabilities), end + max_expand)
+                    right_starts = [start for start, _stop in clear if start >= end]
+                    right_sil = np.flatnonzero(silence[end:right_ceil])
+                    if right_sil.size:
+                        right_starts.append(end + int(right_sil[0]))
+                    end = min(right_ceil, min(right_starts, default=right_ceil))
+
                     overlaps.append((max(0, origin + begin * self._shift - edge),
                                      min(len(audio), origin + end * self._shift + edge)))
             stable = []

@@ -212,8 +212,8 @@ def test_detected_multiple_voices_keep_all_samples_but_cannot_train_a_profile():
 
     model = Embedder()
     model.activity_guard = Guard()
-    audio = voice(1, 1.8)  # Even the short path must run the activity check.
-    result = SpeakerTurnDetector(model)(audio)
+    audio = voice(1, 1.8)  # Strict mode checks even clean short clips.
+    result = SpeakerTurnDetector(model, activity_mode="strict")(audio)
     assert len(result) == 1 and not result[0].learnable
     assert not np.any(result[0].embedding)
     assert result[0].start == 0 and result[0].stop == len(audio)
@@ -226,7 +226,7 @@ def test_a_failed_activity_check_cannot_silently_approve_profile_learning():
 
     model = Embedder()
     model.activity_guard = BrokenGuard()
-    result = SpeakerTurnDetector(model)(voice(1, 5))
+    result = SpeakerTurnDetector(model, activity_mode="strict")(voice(1, 5))
     assert len(result) == 1 and not result[0].learnable
     assert not np.any(result[0].embedding)
 
@@ -243,7 +243,7 @@ def test_activity_is_checked_for_each_final_turn_including_returning_voices():
     model = Embedder()
     guard = model.activity_guard = Guard()
     audio = np.concatenate([voice(1), voice(2), voice(1)])
-    result = SpeakerTurnDetector(model)(audio)
+    result = SpeakerTurnDetector(model, activity_mode="strict")(audio)
     assert len(result) == 3 and len(guard.seen) == 3
     assert [t.learnable for t in result] == [True, False, True]
     assert not np.any(result[1].embedding)
@@ -289,7 +289,7 @@ def test_neural_proposals_recover_short_turns_but_only_clear_long_turns_can_trai
     model = Embedder()
     model.activity_guard = Guard()
     clip = np.concatenate([voice(1, 2.4), voice(2, 0.8), voice(1, 2.4)])
-    result = SpeakerTurnDetector(model)(clip)
+    result = SpeakerTurnDetector(model, activity_mode="strict")(clip)
     assert [int(np.argmax(t.embedding)) for t in result] == [0, 1, 0]
     assert [t.learnable for t in result] == [True, False, True]
     assert np.array_equal(np.concatenate([clip[t.start:t.stop] for t in result]), clip)
@@ -303,7 +303,7 @@ def test_overlap_only_abstains_locally_and_cannot_create_a_mixed_profile():
     model = Embedder()
     model.activity_guard = Guard()
     clip = voice(1, 5)
-    result = SpeakerTurnDetector(model)(clip)
+    result = SpeakerTurnDetector(model, activity_mode="strict")(clip)
     assert [(t.start, t.stop) for t in result] == [(0, 2 * RATE), (2 * RATE, 3 * RATE), (3 * RATE, 5 * RATE)]
     assert [t.learnable for t in result] == [False, False, False]
     assert np.any(result[1].embedding)
@@ -325,7 +325,7 @@ def test_unresolved_single_voice_offers_its_embedding_but_cannot_train():
 
     model = Embedder()
     model.activity_guard = Guard()
-    result = SpeakerTurnDetector(model)(voice(1, 5))
+    result = SpeakerTurnDetector(model, activity_mode="strict")(voice(1, 5))
     assert len(result) == 1 and not result[0].learnable
     assert np.argmax(result[0].embedding) == 0 and np.any(result[0].embedding)
 
@@ -342,7 +342,7 @@ def test_unresolved_or_rejected_change_keeps_overlap_local_and_out_of_clustering
     model = Embedder()
     model.activity_guard = Guard()
     audio = voice(1, 5)
-    turns = SpeakerTurnDetector(model)(audio)
+    turns = SpeakerTurnDetector(model, activity_mode="strict")(audio)
     assert [(t.start, t.stop) for t in turns] == [(0, 2 * RATE), (2 * RATE, 3 * RATE), (3 * RATE, 5 * RATE)]
     assert np.array_equal(np.concatenate([audio[t.start:t.stop] for t in turns]), audio)
     assert not any(t.learnable for t in turns)
@@ -362,7 +362,7 @@ def test_an_already_uncertain_turn_still_preserves_clear_sides_of_overlap():
 
     model = Embedder()
     model.activity_guard = Guard()
-    turns = SpeakerTurnDetector(model)._single(voice(1, 5), uncertain=True)
+    turns = SpeakerTurnDetector(model, activity_mode="strict")._single(voice(1, 5), uncertain=True)
     assert [(t.start, t.stop) for t in turns] == [(0, 2 * RATE), (2 * RATE, 3 * RATE), (3 * RATE, 5 * RATE)]
     assert [bool(np.any(t.embedding)) for t in turns] == [True, True, True]
     assert not any(t.learnable for t in turns)
@@ -375,7 +375,7 @@ def test_a_long_overlap_does_not_slice_the_sentence_or_train_a_profile():
 
     model = Embedder()
     model.activity_guard = Guard()
-    turns = SpeakerTurnDetector(model)(voice(1, 8))
+    turns = SpeakerTurnDetector(model, activity_mode="strict")(voice(1, 8))
     assert [(t.start, t.stop) for t in turns] == [(0, 8 * RATE)]
     assert np.any(turns[0].embedding) and not turns[0].learnable
 
@@ -415,7 +415,7 @@ def test_local_labels_without_a_cam_voice_change_cannot_split_one_person():
 
     model = Embedder()
     model.activity_guard = Guard()
-    result = SpeakerTurnDetector(model)(voice(1, 5))
+    result = SpeakerTurnDetector(model, activity_mode="strict")(voice(1, 5))
     assert len(result) == 1 and not result[0].learnable
 
 
@@ -426,7 +426,7 @@ def test_tiny_unknown_edge_expands_abstention_without_dropping_the_edge_audio():
 
     model = Embedder()
     model.activity_guard = Guard()
-    result = SpeakerTurnDetector(model)(voice(1, 4))
+    result = SpeakerTurnDetector(model, activity_mode="strict")(voice(1, 4))
     assert [(t.start, t.stop) for t in result] == [(0, RATE), (RATE, 4 * RATE)]
     assert np.any(result[0].embedding) and np.any(result[1].embedding)
     assert not result[0].learnable and not result[1].learnable
@@ -461,3 +461,157 @@ def test_long_unbounded_audio_does_not_trigger_unbounded_model_work():
 def test_invalid_audio_is_rejected(audio):
     with pytest.raises(ValueError):
         SpeakerTurnDetector(Embedder())(audio)
+
+
+class TestOnDemandActivityGuardrail:
+    """Default on-demand voiceprint guardrail skips clean turns and never vetoes primary CAM++."""
+
+    def test_clean_single_and_verified_multi_speaker_turns_skip_guard_saving_over_80_percent(self):
+        from sayink.meeting_speakers import MeetingSpeakerSession
+
+        class CountingGuard:
+            def __init__(self):
+                self.calls = 0
+
+            def analyze(self, audio, **kwargs):
+                self.calls += 1
+                # Even if a guard would falsely flag laughter as overlap, clean turns skip it!
+                return ActivityEvidence(overlaps=((RATE, 2 * RATE),))
+
+        model = Embedder()
+        guard = model.activity_guard = CountingGuard()
+        session = MeetingSpeakerSession(threshold=0.55, margin=0.08, keep_history=True)
+        chunks = [
+            voice(1, 1.8),
+            voice(1, 5.0),
+            voice(2, 4.2),
+            np.concatenate([voice(1, 3.2), voice(2, 3.2)]),
+            voice(1, 4.5),
+            voice(2, 3.8),
+        ]
+        assigned = []
+        clock_ms = 1000
+        for idx, chunk in enumerate(chunks):
+            detector = SpeakerTurnDetector(model, context=session.turn_context, start_ms=clock_ms, route="system")
+            turns = detector(chunk)
+            for sub_idx, turn in enumerate(turns):
+                assert turn.learnable
+                spk = session.assign(turn.embedding, sample_key=idx * 10 + sub_idx, learnable=turn.learnable)
+                assigned.append(spk)
+            clock_ms += int(len(chunk) * 1000 / RATE) + 500
+        assert guard.calls == 0
+        assert assigned == [1, 1, 2, 1, 2, 1, 2]
+
+    def test_dubious_cut_proposal_triggers_guard_on_demand_without_chopping_or_vetoing_speaker(self):
+        from sayink.meeting_speakers import MeetingSpeakerSession
+
+        class LaughterFalseChange(Embedder):
+            def __call__(self, audio):
+                if len(audio) > int(1.3 * RATE):
+                    return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                return super().__call__(audio)
+
+        class OverlapGuard:
+            def __init__(self):
+                self.calls = 0
+
+            def analyze(self, audio, **kwargs):
+                self.calls += 1
+                return ActivityEvidence(overlaps=((int(2.0 * RATE), int(2.8 * RATE)),))
+
+        model = LaughterFalseChange()
+        guard = model.activity_guard = OverlapGuard()
+        session = MeetingSpeakerSession(threshold=0.55, margin=0.08, keep_history=True)
+        # Seed speaker 1 on a clean turn first (0 guard calls).
+        clean_turns = SpeakerTurnDetector(model, context=session.turn_context, start_ms=1000)(voice(1, 4.0))
+        assert guard.calls == 0 and clean_turns[0].learnable
+        assert session.assign(clean_turns[0].embedding, sample_key=1, learnable=True) == 1
+
+        # Next chunk has short-window laughter instability -> triggers Guard on demand!
+        dubious_clip = np.concatenate([voice(1, 3.2), voice(2, 3.2), voice(1, 3.2)])
+        detector = SpeakerTurnDetector(model, context=session.turn_context, start_ms=6000)
+        turns = detector(dubious_clip)
+        assert guard.calls == 1 and detector.activity_checks == 1
+        # Not chopped into fragments, blocked from polluting profile, yet keeps CAM++ vector -> Speaker 1!
+        assert [(t.start, t.stop) for t in turns] == [(0, len(dubious_clip))]
+        assert not turns[0].learnable
+        assert np.any(turns[0].embedding)
+        assert session.assign(turns[0].embedding, sample_key=2, learnable=turns[0].learnable) == 1
+        assert len(session.history) == 1
+
+    def test_low_margin_session_conflict_triggers_guard_while_distinct_new_speaker_skips_guard(self):
+        from sayink.speaker_turns import SpeakerTurnContext
+
+        class BlendedEmbedder:
+            threshold = 0.55
+            sticky_threshold = 0.45
+
+            def __call__(self, audio):
+                tag = round(float(audio[0]), 2)
+                if tag == 0.10:
+                    return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                if tag == 0.20:
+                    return np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                if tag == 0.30:
+                    return np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                vec = np.array([0.72, 0.69, 0.0], dtype=np.float32)
+                return vec / np.linalg.norm(vec)
+
+        class UnsafeGuard:
+            def __init__(self):
+                self.calls = 0
+
+            def is_unsafe(self, audio, **kwargs):
+                self.calls += 1
+                return True
+
+        model = BlendedEmbedder()
+        guard = model.activity_guard = UnsafeGuard()
+        ctx = SpeakerTurnContext()
+
+        # Seed Speaker 1 and Speaker 2 cleanly: 0 guard calls.
+        assert SpeakerTurnDetector(model, context=ctx, start_ms=1000)(voice(1, 3.5))[0].learnable
+        assert SpeakerTurnDetector(model, context=ctx, start_ms=5000)(voice(2, 3.5))[0].learnable
+        assert guard.calls == 0
+
+        # Distinct new Speaker 3 (similarity 0.0 < 0.40) also skips guard and opens profile cleanly.
+        t3 = SpeakerTurnDetector(model, context=ctx, start_ms=9000)(voice(3, 3.5))
+        assert guard.calls == 0 and t3[0].learnable
+
+        # Low-margin blended clip between Speaker 1 and Speaker 2 triggers guard on demand -> learnable=False!
+        blended = np.full(int(3.5 * RATE), 0.15, dtype=np.float32)
+        det = SpeakerTurnDetector(model, context=ctx, start_ms=13000)
+        tb = det(blended)
+        assert guard.calls == 1 and det.activity_checks == 1
+        assert not tb[0].learnable and np.any(tb[0].embedding)
+
+    def test_make_embedder_accepts_activity_path_alias_and_defaults_to_on_demand(self, monkeypatch, tmp_path):
+        from pathlib import Path
+        from sayink import speaker_embedding as se
+
+        speaker_file = tmp_path / "campplus.onnx"
+        speaker_file.write_bytes(b"onnx")
+        activity_file = tmp_path / "activity.onnx"
+        activity_file.write_bytes(b"onnx")
+
+        class FakeModelEmbedder(se.SpeakerEmbedder):
+            name = "campplus"
+            model_available = True
+            supports_turn_detection = True
+
+            def __init__(self, _path, **_kw):
+                pass
+
+            def __call__(self, _audio):
+                return np.array([1.0, 0.0], dtype=np.float32)
+
+        seen_paths = []
+        monkeypatch.setattr(se, "ModelEmbedder", FakeModelEmbedder)
+        monkeypatch.setattr(
+            "sayink.speaker_activity.SpeakerActivityGuard",
+            lambda p: seen_paths.append(Path(p)) or "guard-instance",
+        )
+        emb = se.make_embedder(speaker_file, enabled=True, activity_enabled=True, activity_path=activity_file)
+        assert emb.activity_guard == "guard-instance"
+        assert emb.activity_mode == se.ACTIVITY_MODE_ON_DEMAND
+        assert seen_paths == [activity_file]

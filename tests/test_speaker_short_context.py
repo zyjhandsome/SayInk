@@ -68,12 +68,22 @@ def test_local_activity_rejection_keeps_words_together_and_prevents_profile_lear
 
     model = AmbiguousWindows()
     model.activity_guard = Guard()
-    detector = SpeakerTurnDetector(model, context=seeded_context(model), start_ms=4200, route="system")
     current = np.r_[voice(1, .8), voice(2, 4)]
+
+    # Default on-demand guardrail blocks learning & splitting while keeping primary CAM++ vector.
+    detector = SpeakerTurnDetector(model, context=seeded_context(model), start_ms=4200, route="system")
     turns = detector(current)
     assert detector.context_action == "short_abstain"
     assert len(turns) == 1 and turns[0].stop == len(current)
-    assert not turns[0].learnable and not np.any(turns[0].embedding)
+    assert not turns[0].learnable and np.any(turns[0].embedding)
+
+    # Explicit strict mode zeroes the embedding as before.
+    strict_det = SpeakerTurnDetector(
+        model, context=seeded_context(model), start_ms=4200, route="system", activity_mode="strict"
+    )
+    strict_turns = strict_det(current)
+    assert strict_det.context_action == "short_abstain"
+    assert len(strict_turns) == 1 and not strict_turns[0].learnable and not np.any(strict_turns[0].embedding)
 
 
 def test_unknown_original_turn_cannot_be_approved_by_short_context():
@@ -85,8 +95,15 @@ def test_unknown_original_turn_cannot_be_approved_by_short_context():
     model.activity_guard = Guard()
     detector = SpeakerTurnDetector(model, context=seeded_context(model), start_ms=4200, route="system")
     turns = detector(np.r_[voice(1, .8), voice(2, 4)])
-    assert len(turns) == 1 and not np.any(turns[0].embedding) and not turns[0].learnable
+    assert len(turns) == 1 and np.any(turns[0].embedding) and not turns[0].learnable
     assert detector.context_action == "none"
+
+    strict_det = SpeakerTurnDetector(
+        model, context=seeded_context(model), start_ms=4200, route="system", activity_mode="strict"
+    )
+    strict_turns = strict_det(np.r_[voice(1, .8), voice(2, 4)])
+    assert len(strict_turns) == 1 and not np.any(strict_turns[0].embedding) and not strict_turns[0].learnable
+    assert strict_det.context_action == "none"
 
 
 def test_cancel_during_short_search_stops_model_work_and_does_not_emit_or_cache(monkeypatch):

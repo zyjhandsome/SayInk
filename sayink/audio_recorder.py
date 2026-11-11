@@ -35,6 +35,7 @@ from sayink.vad_segmenter import (
     VAD_ENERGY,
     VAD_SILERO,
     SpeechSegmenter,
+    attach_segment_acoustics,
     make_meeting_segmenter,
     make_speech_gate,
 )
@@ -139,7 +140,7 @@ class AudioRecorder(QObject):
         self._block_tracks = {}
         self._recovery_tracks = {}
         self._split_ready = []
-        self._quiet_speech = False
+        self._quiet_speech: bool | None = None
         self._last_overflow_warning = float("-inf")
         self._suppress_empty_finished = False
 
@@ -155,8 +156,17 @@ class AudioRecorder(QObject):
             self._last_overflow_warning = now
             self.warning.emit(f"音频设备报告输入溢出（{role}），这一时刻可能有录音缺口；已继续采集后续声音。")
 
-    def set_quiet_speech(self, enabled: bool):
-        self._quiet_speech = bool(enabled)
+    def set_quiet_speech(self, enabled: bool | None = None):
+        self._quiet_speech = None if enabled is None else bool(enabled)
+        self._apply_quiet_mode(self._segmenter)
+        for seg in self._split_segmenters.values():
+            self._apply_quiet_mode(seg)
+
+    def _apply_quiet_mode(self, segmenter: SpeechSegmenter) -> None:
+        if segmenter.gate_name == VAD_SILERO:
+            segmenter.quiet_boost = self._quiet_speech
+        else:
+            segmenter.quiet_boost = False
 
     def set_separate_lanes(self, enabled: bool) -> None:
         self._separate_lanes_requested = bool(enabled)
@@ -183,9 +193,7 @@ class AudioRecorder(QObject):
             self._split_segmenters[role] = segmenter
             if self._vad_kind == VAD_SILERO and segmenter.gate_name != VAD_SILERO:
                 self.warning.emit(f"{role} 的语音检测模型未能启用，使用能量断句；本路轻声增强未启用。")
-            segmenter.quiet_speech = self._quiet_speech and segmenter.gate_name == VAD_SILERO
-            if segmenter.gate_name == VAD_SILERO:
-                segmenter.gate.input_gain = 4.0 if self._quiet_speech else 1.0
+            self._apply_quiet_mode(segmenter)
             self._split_targets[role] = (0, "")
             if self._boundary_requested:
                 self._split_boundaries[role] = BoundaryContextBuffer()
@@ -195,13 +203,14 @@ class AudioRecorder(QObject):
         self._segment_route = "mic" if role == "microphone" else "system"
         self._segment_captured_at = self._stream_anchor_ms + int(seg.last_bounds[0] * 1000 / TARGET_SAMPLE_RATE)
         self._segment_target = self._split_targets[role]
+        acoustics = (getattr(segment, "noise_floor", None), float(getattr(segment, "quiet_level", 0.0)))
+        metadata = (self._segment_route, self._segment_captured_at, self._segment_target, acoustics)
         boundary = self._split_boundaries.get(role)
         if boundary is not None:
-            boundary.capture(segment, seg.last_bounds, seg.last_forced,
-                             (self._segment_route, self._segment_captured_at, self._segment_target))
+            boundary.capture(segment, seg.last_bounds, seg.last_forced, metadata)
             self._release_split_context(role)
         else:
-            self._split_ready.append((segment, (self._segment_route, self._segment_captured_at, self._segment_target)))
+            self._split_ready.append((segment, metadata))
 
     def _release_split_context(self, role, *, ending=False):
         boundary = self._split_boundaries.get(role)
@@ -218,7 +227,8 @@ class AudioRecorder(QObject):
         released = 0
         while self._split_ready and (ending or self._split_ready[0][1][1] <= watermark):
             audio, metadata = self._split_ready.pop(0)
-            self._segment_route, self._segment_captured_at, self._segment_target = metadata
+            self._segment_route, self._segment_captured_at, self._segment_target, acoustics = metadata
+            audio = attach_segment_acoustics(audio, noise_floor=acoustics[0], quiet_level=acoustics[1])
             self._segment_route_reliable = True
             self.segment_ready.emit(audio)
             released += 1
@@ -334,9 +344,7 @@ class AudioRecorder(QObject):
             segmenter = SpeechSegmenter(speech_threshold=threshold)
             segmenter.set_gate(self._speech_gate(segmenter))
         gate = segmenter.gate
-        segmenter.quiet_speech = self._quiet_speech and gate.name == VAD_SILERO
-        if gate.name == VAD_SILERO:
-            gate.input_gain = 4.0 if self._quiet_speech else 1.0
+        self._apply_quiet_mode(segmenter)
         self._segmenter = segmenter
         self._stream_anchor_ms = 0
         self._segmentation_status = SegmentationStatus(
@@ -377,6 +385,11 @@ class AudioRecorder(QObject):
     @property
     def vad_name(self) -> str:
         """Which gate the segmenter is actually using (energy / silero)."""
+        return self._segmenter.gate_name
+
+    @property
+    def vad_backend(self) -> str:
+        """Alias of :attr:`vad_name` for pipeline/coordinator queries."""
         return self._segmenter.gate_name
 
     @property
@@ -973,8 +986,13 @@ class AudioRecorder(QObject):
         if self._stream_anchor_ms and bounds is not None and bounds[1] - bounds[0] == segment.size:
             self._segment_captured_at = self._stream_anchor_ms + int(bounds[0] * 1000 / TARGET_SAMPLE_RATE)
         if self._boundary_buffer is not None and bounds is not None:
-            self._boundary_buffer.capture(segment, bounds, self._segmenter.last_forced,
-                                          (self._segment_route, self._segment_captured_at, self._segment_target))
+            acoustics = (getattr(segment, "noise_floor", None), float(getattr(segment, "quiet_level", 0.0)))
+            self._boundary_buffer.capture(
+                segment,
+                bounds,
+                self._segmenter.last_forced,
+                (self._segment_route, self._segment_captured_at, self._segment_target, acoustics),
+            )
             self._release_boundary_context()
         else:
             self._segment_route_reliable = False
@@ -985,7 +1003,8 @@ class AudioRecorder(QObject):
             return 0
         released = 0
         for audio, metadata in self._boundary_buffer.release(ending=ending):
-            self._segment_route, self._segment_captured_at, self._segment_target = metadata
+            self._segment_route, self._segment_captured_at, self._segment_target, acoustics = metadata
+            audio = attach_segment_acoustics(audio, noise_floor=acoustics[0], quiet_level=acoustics[1])
             self._segment_route_reliable = False
             self.segment_ready.emit(audio)
             released += 1
