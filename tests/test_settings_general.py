@@ -988,7 +988,7 @@ class TestPolishConfigurationStatus:
         assert warnings
         assert config.get("llm.api_url", "") != "ftp://api.example.com/v1"
 
-    def test_public_http_url_is_saved(self, settings_window, config, monkeypatch):
+    def test_public_http_url_rejected_unless_bypass_suffix_matches(self, settings_window, config, monkeypatch):
         warnings = []
         monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warnings.append(a)))
         settings_window._llm_enable_row.setChecked(False)
@@ -996,8 +996,15 @@ class TestPolishConfigurationStatus:
         settings_window._llm_key_edit.setText("sk-x")
         settings_window._llm_model_edit.setText("m")
         settings_window._flush_llm_fields()
+        assert warnings and "https://" in warnings[0][2]
+        assert config.get("llm.api_url", "") != "http://api.example.com/v1"
+
+        warnings.clear()
+        config.set("llm.proxy_bypass_suffixes", ".example.internal")
+        settings_window._llm_url_edit.setText("http://llm.example.internal/v1")
+        settings_window._flush_llm_fields()
         assert warnings == []
-        assert config.get("llm.api_url", "") == "http://api.example.com/v1"
+        assert config.get("llm.api_url", "") == "http://llm.example.internal/v1"
         assert "明文" in settings_window._llm_test_status.text()
 
     def test_model_placeholder_names_deepseek_flash(self, settings_window):
@@ -1439,7 +1446,7 @@ class TestMeetingSettings:
         monkeypatch.setattr(win, "_confirm", lambda *a, **k: True)
         win._minutes_auto_row.setChecked(True)
         assert config.get("meeting.auto_generate") is True
-        assert "api.example.com" in config.get("meeting.confirmed_remote_hosts")
+        assert "https://api.example.com" in config.get("meeting.confirmed_remote_hosts")
         win._minutes_auto_row.setChecked(False)
         monkeypatch.setattr(win, "_confirm", lambda *a, **k: pytest.fail("host already confirmed"))
         win._minutes_auto_row.setChecked(True)

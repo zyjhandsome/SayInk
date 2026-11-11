@@ -110,6 +110,54 @@ class TestPasteShortcut:
         assert [result.status for result in results] == ["clipboard"]
         assert paste_env["clipboard"] == "keep this text"
 
+    def test_linux_paste_shortcut_clears_held_modifiers(self, monkeypatch):
+        from unittest.mock import Mock
+
+        run_mock = Mock()
+        monkeypatch.setattr(tp.sys, "platform", "linux")
+        monkeypatch.setattr(tp.subprocess, "run", run_mock)
+        _REAL_PASTE_SHORTCUT()
+        run_mock.assert_called_once_with(
+            ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+            timeout=2,
+            check=True,
+        )
+
+    def test_macos_foreground_window_queries_integer_pid_and_detects_app_switch(
+        self, paste_env, monkeypatch
+    ):
+        outputs = ["4821\nVisual Studio Code\n", "5910\nSlack\n"]
+        monkeypatch.setattr(tp.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            tp.subprocess,
+            "check_output",
+            lambda *_a, **_k: outputs.pop(0),
+        )
+        info_first = tp.get_foreground_window_info()
+        info_second = tp.get_foreground_window_info()
+        assert info_first == (4821, "Visual Studio Code")
+        assert isinstance(info_first[0], int)
+        assert info_second == (5910, "Slack")
+
+        # Switching frontmost app on macOS between utterance start and paste aborts Ctrl+V/Cmd+V.
+        paste_env["set_foreground"]([info_second])
+        results = []
+        TextPaster().paste_async(
+            "macOS dictation",
+            results.append,
+            target_hwnd=info_first[0],
+            target_app=info_first[1],
+        )
+        assert paste_env["shortcut_calls"] == 0
+        assert [(r.status, r.detail) for r in results] == [("clipboard", "focus_changed")]
+
+    def test_macos_foreground_window_returns_zero_on_osascript_failure(self, monkeypatch):
+        def _fail(*_a, **_k):
+            raise OSError("osascript unavailable")
+
+        monkeypatch.setattr(tp.subprocess, "check_output", _fail)
+        assert tp._get_foreground_window_macos() == (0, "")
+
 
 class TestCrossPlatformSupport:
     def test_platform_detection(self):

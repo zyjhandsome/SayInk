@@ -28,7 +28,8 @@ def test_connection_can_bypass_a_gateway_proxy(monkeypatch):
     for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.test:8080")
-    url = "http://internal.example.test/v1"
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.test:8080")
+    url = "https://internal.example.test/v1"
     ok, message = TextPolisher.test_connection(url, "key", "model", proxy_mode="system")
     assert not ok and "504" in message
     ok, _ = TextPolisher.test_connection(url, "key", "model", proxy_mode="direct")
@@ -77,7 +78,7 @@ def test_system_mode_reaches_a_private_host_without_the_gateway(monkeypatch):
 
 def test_system_mode_still_uses_the_gateway_for_a_public_host(monkeypatch):
     calls = _proxy_env(monkeypatch)
-    url = "http://api.example.com/v1"
+    url = "https://api.example.com/v1"
     ok, message = TextPolisher.test_connection(url, "key", "model", proxy_mode="system")
     assert not ok and "504" in message
     assert calls == [("HTTPProxy", url + "/chat/completions")]
@@ -85,7 +86,7 @@ def test_system_mode_still_uses_the_gateway_for_a_public_host(monkeypatch):
 
 def test_plain_dns_name_is_not_treated_as_private(monkeypatch):
     calls = _proxy_env(monkeypatch)
-    url = "http://llm.corp.example/v1"
+    url = "https://llm.corp.example/v1"
     ok, message = TextPolisher.test_connection(url, "key", "model", proxy_mode="system")
     assert not ok and "504" in message
     assert calls == [("HTTPProxy", url + "/chat/completions")]
@@ -98,7 +99,7 @@ def test_saved_suffix_bypasses_only_matching_hosts(monkeypatch):
         internal, "key", "model", proxy_mode="system", proxy_bypass_suffixes=".example.internal, bad",
     )
     assert ok
-    lookalike = "http://notexample.com/v1"
+    lookalike = "https://notexample.com/v1"
     ok, message = TextPolisher.test_connection(
         lookalike, "key", "model", proxy_mode="system", proxy_bypass_suffixes="example.com",
     )
@@ -115,6 +116,38 @@ def test_suffix_parser_ignores_tokens_without_a_dot():
     valid, ignored = parse_proxy_bypass_suffixes(".Example.Internal, bad, *.wild, http://nope")
     assert valid == ("example.internal",)
     assert ignored == ("bad", "*.wild", "http://nope")
+
+
+def test_suffix_parser_rejects_public_multi_label_tlds_but_keeps_concrete_subdomains():
+    from sayink.text_polisher import (
+        PUBLIC_HTTP_ERROR,
+        api_url_error,
+        bypasses_env_proxy,
+        parse_proxy_bypass_suffixes,
+    )
+
+    raw = (
+        ".com.cn, org.cn, .net.cn, .gov.cn, .edu.cn, .ac.cn, "
+        ".co.uk, .org.uk, .ac.uk, .co.jp, .ne.jp, .or.jp, "
+        ".com.hk, .com.tw, .com.au, .com.sg, .co.kr, .com.br, "
+        "..com.cn, com., .Corp.Com.Cn, intranet.co.uk"
+    )
+    valid, ignored = parse_proxy_bypass_suffixes(raw)
+    assert valid == ("corp.com.cn", "intranet.co.uk")
+    assert ".com.cn" in ignored
+    assert ".co.uk" in ignored
+    assert ".co.jp" in ignored
+    assert "..com.cn" in ignored
+    assert "com." in ignored
+
+    # Broad .com.cn typo must neither bypass proxy nor allow cleartext HTTP on public hosts.
+    assert bypasses_env_proxy("system", "https://api.vendor.com.cn/v1", ".com.cn") is False
+    assert api_url_error("http://api.vendor.com.cn/v1", proxy_bypass_suffixes=".com.cn") == PUBLIC_HTTP_ERROR
+
+    # Concrete enterprise domain underneath .com.cn still works as intended.
+    assert bypasses_env_proxy("system", "https://llm.corp.com.cn/v1", ".corp.com.cn") is True
+    assert api_url_error("http://llm.corp.com.cn/v1", proxy_bypass_suffixes=".corp.com.cn") is None
+    assert api_url_error("http://other.com.cn/v1", proxy_bypass_suffixes=".corp.com.cn") == PUBLIC_HTTP_ERROR
 
 
 def test_private_bypass_keeps_configured_certificate_authority(monkeypatch):
@@ -152,6 +185,7 @@ class TestSecureOrLocalUrl:
         [
             "https://api.deepseek.com/v1",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "HTTPS://api.example.com/v1",
             "http://localhost:11434/v1",
             "http://127.0.0.1:11434/v1",
             "http://[::1]:11434/v1",
@@ -160,11 +194,7 @@ class TestSecureOrLocalUrl:
             "http://10.0.0.5:8000/v1",
             "http://172.16.3.4/v1",
             "http://ollama-box.local:11434/v1",
-            "http://api.example.com/v1",
-            "http://8.8.8.8/v1",
-            "http://172.32.0.1/v1",
-            "http://insecure-remote.com/chat/completions",
-            "HTTP://api.example.com/v1",
+            "http://ollama:11434/v1",
         ],
     )
     def test_allowed_urls(self, url):
@@ -173,6 +203,12 @@ class TestSecureOrLocalUrl:
     @pytest.mark.parametrize(
         "url",
         [
+            "http://api.openai.com/v1",
+            "http://api.example.com/v1",
+            "http://8.8.8.8/v1",
+            "http://172.32.0.1/v1",
+            "http://insecure-remote.com/chat/completions",
+            "HTTP://api.example.com/v1",
             "ftp://localhost/x",
             "file:///etc/passwd",
             "api.example.com/v1",
@@ -183,6 +219,25 @@ class TestSecureOrLocalUrl:
     )
     def test_rejected_urls(self, url):
         assert is_secure_or_local_url(url) is False
+
+    def test_public_cleartext_http_explains_https_and_intranet_suffix_allows_http(self):
+        from sayink.text_polisher import PUBLIC_HTTP_ERROR, api_url_error, public_cleartext_note
+
+        assert api_url_error("http://api.openai.com/v1") == PUBLIC_HTTP_ERROR
+        assert is_secure_or_local_url(
+            "http://llm.example.internal/v1",
+            proxy_bypass_suffixes=".example.internal",
+        ) is True
+        assert api_url_error(
+            "http://llm.example.internal/v1",
+            proxy_bypass_suffixes=".example.internal",
+        ) is None
+        assert "明文" in public_cleartext_note("http://llm.example.internal/v1")
+        assert public_cleartext_note("http://localhost:11434/v1") == ""
+        assert api_url_error(
+            "http://api.openai.com/v1",
+            proxy_bypass_suffixes=".example.internal",
+        ) == PUBLIC_HTTP_ERROR
 
     def test_ollama_default_endpoint_allowed(self):
         # Regression for SD-03: Ollama's default HTTP endpoint must be usable.
@@ -570,12 +625,26 @@ class TestPolishWorkerRun:
         assert errors == [INSECURE_URL_ERROR]
         client.post.assert_not_called()
 
-    def test_run_allows_remote_http(self):
-        payload = {"choices": [{"message": {"content": "远程明文"}}]}
+    def test_run_rejects_public_cleartext_http_unless_suffix_bypassed(self):
+        from sayink.text_polisher import PUBLIC_HTTP_ERROR
+
+        payload = {"choices": [{"message": {"content": "内网明文"}}]}
         fake, client = _fake_httpx_module(_make_response(payload))
-        worker = PolishWorker("http://api.example.com/v1", "k", "m", "文本")
-        results, errors = self._run_worker(worker, fake)
-        assert results == ["远程明文"]
+        blocked = PolishWorker("http://api.example.com/v1", "k", "m", "文本")
+        results, errors = self._run_worker(blocked, fake)
+        assert results == []
+        assert errors == [PUBLIC_HTTP_ERROR]
+        client.post.assert_not_called()
+
+        allowed = PolishWorker(
+            "http://llm.example.internal/v1",
+            "k",
+            "m",
+            "文本",
+            proxy_bypass_suffixes=".example.internal",
+        )
+        results, errors = self._run_worker(allowed, fake)
+        assert results == ["内网明文"]
         assert errors == []
         client.post.assert_called_once()
 
@@ -884,11 +953,23 @@ class TestTestConnectionRun:
         assert ok is True
         assert "成功" in msg
 
-    def test_remote_http_is_requested(self):
+    def test_remote_http_rejected_without_suffix_bypass(self):
+        from sayink.text_polisher import PUBLIC_HTTP_ERROR
+
         fake, client = _fake_httpx_module(_make_response(_CHAT_OK))
         with patch.dict(sys.modules, {"httpx": fake}):
             ok, msg = TextPolisher.test_connection(
                 "http://api.example.com/v1", "k", "m"
+            )
+            assert ok is False
+            assert msg == PUBLIC_HTTP_ERROR
+            client.post.assert_not_called()
+
+            ok, msg = TextPolisher.test_connection(
+                "http://llm.example.internal/v1",
+                "k",
+                "m",
+                proxy_bypass_suffixes=".example.internal",
             )
         assert ok is True
         assert "成功" in msg

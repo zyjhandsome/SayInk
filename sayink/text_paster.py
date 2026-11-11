@@ -43,14 +43,23 @@ def _get_foreground_window_win32():
 
 
 def _get_foreground_window_macos():
-    """macOS: get frontmost application name via osascript."""
+    """macOS: get frontmost process PID and name via osascript."""
     try:
         out = subprocess.check_output(
-            ["osascript", "-e",
-             'tell application "System Events" to get name of first process whose frontmost is true'],
-            timeout=2, text=True,
-        ).strip()
-        return 1, out
+            [
+                "osascript",
+                "-e",
+                'tell application "System Events" to tell (first process whose frontmost is true) '
+                "to return (unix id as text) & linefeed & name",
+            ],
+            timeout=2,
+            text=True,
+        )
+        pid_text, sep, app_name = out.partition("\n")
+        pid = int(pid_text.strip())
+        if pid <= 0 or not sep:
+            return 0, ""
+        return pid, app_name.strip()
     except Exception:
         log.debug("osascript 读取前台应用失败", exc_info=True)
         return 0, ""
@@ -222,7 +231,7 @@ def _paste_shortcut():
             check=True,
         )
     else:
-        subprocess.run(["xdotool", "key", "ctrl+v"], timeout=2, check=True)
+        subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"], timeout=2, check=True)
 
 
 # Sided VKs: re-pressing the generic VK_SHIFT / VK_MENU lands on the left key,

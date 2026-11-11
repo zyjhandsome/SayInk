@@ -1,11 +1,20 @@
-"""Settings page builders. Widgets stay attached to the SettingsWindow instance."""
+"""Typed QWidget subpages for SettingsWindow."""
 
-from sayink.ui.settings_pages.about import build_about_page
-from sayink.ui.settings_pages.general import build_general_page
-from sayink.ui.settings_pages.model import build_model_page
-from sayink.ui.settings_pages.polish import build_polish_page
+from sayink.ui.settings_pages.about import AboutSettingsPage, build_about_page
+from sayink.ui.settings_pages.general import (
+    GeneralSettingsPage,
+    SectionJumpBar,
+    build_general_page,
+)
+from sayink.ui.settings_pages.model import ModelSettingsPage, build_model_page
+from sayink.ui.settings_pages.polish import PolishSettingsPage, build_polish_page
 
 __all__ = [
+    "AboutSettingsPage",
+    "GeneralSettingsPage",
+    "ModelSettingsPage",
+    "PolishSettingsPage",
+    "SectionJumpBar",
     "build_about_page",
     "build_general_page",
     "build_model_page",

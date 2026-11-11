@@ -12,16 +12,20 @@ from sayink.asr_correction import CORRECTION_PROMPT, correction_user_prompt
 
 log = logging.getLogger("SayInk")
 
-# Hosts treated as this machine or the LAN. Plain HTTP is allowed for any
-# host; this set only decides whether an API key is optional and whether
-# sending a meeting transcript needs an extra confirmation.
+# Hosts treated as this machine or the LAN. Plain HTTP is allowed only for
+# local/private endpoints (plus intranet suffixes configured in proxy bypass);
+# public endpoints require HTTPS so API keys and transcripts never travel in cleartext.
 _LOCAL_HOSTNAMES = {"localhost", "127.0.0.1", "::1"}
 
 INSECURE_URL_ERROR = "接口地址须以 http:// 或 https:// 开头，并包含主机名"
+PUBLIC_HTTP_ERROR = (
+    "公网地址请使用 https://，避免明文传输密钥和转写内容；"
+    "内网域名若确需 http://，请加入「额外直连域名」。"
+)
 FULLWIDTH_URL_ERROR = "接口地址含有全角冒号或斜杠，请改用半角的 http:// 或 https://，并包含主机名"
 HOST_GARBLED_ERROR = "接口地址的主机名含有空格或不可见字符。"
 URL_USERINFO_ERROR = "接口地址里的账号或密钥已去掉，请把密钥填在「API 密钥」。"
-PUBLIC_HTTP_NOTE = "该地址是公网 HTTP，密钥和转写内容会明文传输。"
+PUBLIC_HTTP_NOTE = "该地址使用明文 HTTP，密钥和转写内容会明文传输。"
 
 _INVISIBLE_CHARS = "\u200b\u200c\u200d\ufeff\u2060\u00ad"
 _INVISIBLE_TRANS = dict.fromkeys(map(ord, _INVISIBLE_CHARS), None)
@@ -33,11 +37,11 @@ _CANONICAL_MODELS = {
 
 
 def is_local_endpoint(url: str) -> bool:
-    """True for this machine or the home/office LAN (localhost, 192.168.x.x, *.local…)."""
+    """True for this machine or the home/office LAN (localhost, 192.168.x.x, *.local, single-label hosts…)."""
     host = (urlparse((url or "").strip()).hostname or "").strip("[]").lower()
-    if not host:
+    if not _host_is_clean(host):
         return False
-    if host in _LOCAL_HOSTNAMES or host.endswith(".local"):
+    if host in _LOCAL_HOSTNAMES or host.endswith(".local") or ("." not in host and ":" not in host):
         return True
     try:
         ip = ipaddress.ip_address(host)
@@ -59,28 +63,44 @@ def _request_netloc(parsed) -> str:
     return host
 
 
-def is_secure_or_local_url(url: str) -> bool:
-    """Allow any ``http`` or ``https`` URL that has a host.
+def _matches_bypass_suffixes(url: str, suffixes: str) -> bool:
+    if not suffixes:
+        return False
+    host = (urlparse((url or "").strip()).hostname or "").strip("[]").lower()
+    if not _host_is_clean(host):
+        return False
+    valid, _ignored = parse_proxy_bypass_suffixes(suffixes)
+    return any(_host_matches_suffix(host, suffix) for suffix in valid)
 
-    The scheme is the only gate. Public HTTP is permitted because the user
-    types the address; the key and transcript then travel in cleartext.
-    Other schemes are rejected. A host that itself contains spaces or
-    invisible characters is rejected. Whether the host is local is a
-    separate question (:func:`is_local_endpoint`).
+
+def is_secure_or_local_url(url: str, *, proxy_bypass_suffixes: str = "") -> bool:
+    """Allow ``https://`` anywhere, and ``http://`` only on local/LAN or bypassed intranet hosts.
+
+    Public cleartext HTTP is rejected by default so a typo like
+    ``http://api.openai.com/v1`` cannot transmit Bearer API keys or transcripts
+    in cleartext. Intranet FQDN endpoints that genuinely run plain HTTP can be
+    listed under ``proxy_bypass_suffixes``.
     """
     parsed = urlparse((url or "").strip())
-    return parsed.scheme in {"http", "https"} and _host_is_clean(parsed.hostname or "")
+    host = parsed.hostname or ""
+    if parsed.scheme not in {"http", "https"} or not _host_is_clean(host):
+        return False
+    if parsed.scheme == "https":
+        return True
+    return is_local_endpoint(url) or _matches_bypass_suffixes(url, proxy_bypass_suffixes)
 
 
-def api_url_error(url: str) -> str | None:
+def api_url_error(url: str, *, proxy_bypass_suffixes: str = "") -> str | None:
     """User-facing reason the address cannot be used, or ``None`` when it can."""
     text = (url or "").strip()
-    if is_secure_or_local_url(text):
+    if is_secure_or_local_url(text, proxy_bypass_suffixes=proxy_bypass_suffixes):
         return None
     parsed = urlparse(text)
     host = parsed.hostname or ""
     if parsed.scheme in {"http", "https"} and host and not _host_is_clean(host):
         return HOST_GARBLED_ERROR
+    if parsed.scheme == "http" and _host_is_clean(host):
+        return PUBLIC_HTTP_ERROR
     if "：" in text or "／" in text:
         return FULLWIDTH_URL_ERROR
     return INSECURE_URL_ERROR
@@ -218,14 +238,86 @@ def http_stream_timeout(httpx):
 
 
 _SUFFIX_SPLIT = re.compile(r"[\s,，;；]+")
+# Known two-label public country-code registries (ccSLDs). Allowing any of these
+# directly in ``proxy_bypass_suffixes`` would bypass corporate proxies or enable
+# cleartext ``http://`` across an entire public TLD; concrete subdomains beneath
+# them (such as ``.corp.com.cn``) remain allowed.
+_PUBLIC_MULTI_LABEL_TLDS = frozenset(
+    {
+        "com.cn",
+        "org.cn",
+        "net.cn",
+        "gov.cn",
+        "edu.cn",
+        "ac.cn",
+        "mil.cn",
+        "co.uk",
+        "org.uk",
+        "ac.uk",
+        "gov.uk",
+        "net.uk",
+        "me.uk",
+        "co.jp",
+        "ne.jp",
+        "or.jp",
+        "ac.jp",
+        "go.jp",
+        "ed.jp",
+        "gr.jp",
+        "com.hk",
+        "org.hk",
+        "net.hk",
+        "edu.hk",
+        "gov.hk",
+        "com.tw",
+        "org.tw",
+        "net.tw",
+        "edu.tw",
+        "gov.tw",
+        "com.sg",
+        "org.sg",
+        "net.sg",
+        "edu.sg",
+        "gov.sg",
+        "co.kr",
+        "or.kr",
+        "ne.kr",
+        "ac.kr",
+        "go.kr",
+        "com.au",
+        "org.au",
+        "net.au",
+        "edu.au",
+        "gov.au",
+        "co.nz",
+        "org.nz",
+        "net.nz",
+        "co.in",
+        "org.in",
+        "net.in",
+        "ac.in",
+        "gov.in",
+        "com.br",
+        "org.br",
+        "net.br",
+        "gov.br",
+        "edu.br",
+        "co.za",
+        "org.za",
+        "net.za",
+        "gov.za",
+        "ac.za",
+    }
+)
 
 
 def parse_proxy_bypass_suffixes(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Split a suffix field into lowercase matches and the tokens left unused.
 
     A usable entry may start with one dot and must still contain a dot after
-    that. Wildcards, URLs, and single labels are ignored but kept for the
-    settings hint.
+    that. Wildcards, URLs, single labels, and broad two-label public country
+    registries (such as ``.com.cn`` or ``.co.uk``) are ignored and reported in
+    the settings hint, while concrete domains under them (``.corp.com.cn``) pass.
     """
     valid: list[str] = []
     ignored: list[str] = []
@@ -234,14 +326,17 @@ def parse_proxy_bypass_suffixes(text: str) -> tuple[tuple[str, ...], tuple[str, 
         if not token:
             continue
         suffix = token[1:] if token.startswith(".") else token
+        lowered = suffix.lower()
+        parts = lowered.split(".") if lowered else []
         if (
-            not suffix
-            or "." not in suffix
+            len(parts) < 2
+            or any(not part for part in parts)
             or any(char in token for char in "*/:@\\")
+            or lowered in _PUBLIC_MULTI_LABEL_TLDS
         ):
             ignored.append(token)
             continue
-        valid.append(suffix.lower())
+        valid.append(lowered)
     return tuple(valid), tuple(ignored)
 
 
@@ -913,9 +1008,12 @@ class PolishWorker(QThread):
         try:
             import httpx
 
-            problem = api_url_error(self._api_url)
+            problem = api_url_error(
+                self._api_url,
+                proxy_bypass_suffixes=self._proxy_bypass_suffixes,
+            )
             if problem:
-                log.warning("API URL 不是 http 或 https 地址")
+                log.warning("API URL 未通过安全检查: %s", problem)
                 self.error.emit(problem)
                 return
 
@@ -1072,7 +1170,7 @@ class TextPolisher(QObject):
         proxy_mode: str = "system",
         proxy_bypass_suffixes: str = "",
     ) -> tuple[bool, str]:
-        problem = api_url_error(api_url)
+        problem = api_url_error(api_url, proxy_bypass_suffixes=proxy_bypass_suffixes)
         if problem:
             return False, problem
 
