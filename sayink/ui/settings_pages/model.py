@@ -304,7 +304,7 @@ class ModelSettingsPage(SettingsPage):
         section_lay.setContentsMargins(0, 0, 0, 0)
         section_lay.setSpacing(10)
         section_lay.addWidget(section_header("公共识别辅助模型"))
-        hint = footnote(f"语音检测用于三种模式；说话人增强用于持续转写与会议。加载状态见 {ADVANCED_RECOGNITION_PATH}。")
+        hint = footnote(f"语音检测用于三种模式；说话人区分按模式与音源自动启用。加载状态见 {ADVANCED_RECOGNITION_PATH}。")
         section_lay.addWidget(hint)
         list_host = QWidget()
         list_lay = QVBoxLayout(list_host)

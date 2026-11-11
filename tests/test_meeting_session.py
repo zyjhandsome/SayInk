@@ -1253,3 +1253,22 @@ class TestMeetingPageAuxDownload:
         page._on_aux_finished(False, "Silero VAD 下载失败：网络超时")
         assert "网络超时" in page._card_notes.text()
         assert page._card_dl_btn.isVisibleTo(page) and page._card_dl_btn.isEnabled()
+
+    def test_start_card_has_no_manual_recognition_switches_and_aux_copy_is_automatic(
+        self, page, monkeypatch
+    ):
+        from sayink.ui.settings_components import ToggleOptionRow
+
+        missing = [{"id": "speaker-campplus", "name": "说话人嵌入 CAM++", "size_mb": 28}]
+        monkeypatch.setattr("sayink.ui.meeting_page.missing_aux_models", lambda: missing)
+        page.show_start_card()
+        assert page._start_scroll.findChildren(ToggleOptionRow) == []
+        card_texts = [lb.text() for lb in page._start_scroll.findChildren(QLabel)]
+        for forbidden in ("轻声增强", "增强说话人区分", "多人发言检测", "按共享识别设置"):
+            assert all(forbidden not in text for text in card_texts), forbidden
+        assert "自动加载" in page._card_dl_btn.toolTip()
+        assert "按共享识别设置" not in page._card_dl_btn.toolTip()
+        monkeypatch.setattr("sayink.ui.meeting_page.missing_aux_models", list)
+        page._on_aux_finished(True, "")
+        assert "自动加载" in page._card_notes.text()
+        assert "按共享识别设置" not in page._card_notes.text()

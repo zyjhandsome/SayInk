@@ -440,9 +440,6 @@ class GeneralSettingsPage(SettingsPage):
             self.advanced_recognition_btn,
             self.meeting_vad_combo,
             self.vad_download_btn,
-            self.quiet_speech_row,
-            self.speaker_enabled_row,
-            self.speaker_activity_row,
             self.recognition_reset_btn,
             self.meeting_source_combo,
             self.meeting_model_combo,
@@ -800,9 +797,6 @@ class GeneralSettingsPage(SettingsPage):
     def _build_recognition_section(self) -> QWidget:
         """Common preferences, with actual runtime feedback supplied by App."""
         card, lay = _card()
-        intro = footnote("录音与会议共用。识别模型可在「引擎」中更换。")
-        intro.setProperty("viRole", "importantHint")
-        lay.addWidget(inline_action_row(intro, margins=(16, 12, 16, 0)))
 
         self.meeting_language_combo = QComboBox()
         self.meeting_language_combo.setAccessibleName("识别语言")
@@ -851,7 +845,7 @@ class GeneralSettingsPage(SettingsPage):
         self.meeting_vad_combo.currentIndexChanged.connect(
             lambda _idx=0: self.recognition_setting_changed.emit()
         )
-        advanced.addWidget(labeled_row("语音分段", self.meeting_vad_combo, "检测语音和停顿，不决定标点；按住录音仍在松开后统一输出"))
+        advanced.addWidget(labeled_row("语音分段", self.meeting_vad_combo, "检测语音和停顿，不决定标点；单次转写仍在松开后统一输出"))
         self.vad_runtime_label = footnote("尚未获取语音分段运行状态")
         self.vad_runtime_label.setAccessibleName("语音分段实际运行状态")
         advanced.addWidget(inline_action_row(self.vad_runtime_label, margins=(16, 0, 16, 8)))
@@ -863,14 +857,11 @@ class GeneralSettingsPage(SettingsPage):
         self.vad_download_row = inline_action_row(self.vad_download_btn, margins=(16, 0, 16, 12))
         self.vad_download_row.layout().setAlignment(self.vad_download_btn, Qt.AlignmentFlag.AlignLeft)
         advanced.addWidget(self.vad_download_row)
-        self.quiet_speech_row = ToggleOptionRow(
-            "轻声增强（安静环境）",
-            "默认关闭；用语音模型判断更轻的声音，原始录音不变。需要 Silero；嘈杂环境可能增加误触发。",
-        )
-        self.quiet_speech_row.toggled.connect(
-            lambda _checked=False: self.recognition_setting_changed.emit()
-        )
-        advanced.addWidget(self.quiet_speech_row)
+
+        # Retired manual switches kept off-layout as hidden compatibility stubs
+        # so typed-page legacy attribute delegations never raise AttributeError.
+        self.quiet_speech_row = ToggleOptionRow("")
+        self.quiet_speech_row.hide()
         self.boundary_context_row = ToggleOptionRow(
             "跨段音频上下文（实验性）",
             "默认关闭；仅支持带时间戳的 CTC 模型，强制分段最多多等 0.3 秒。尚未验证稳定精度收益。",
@@ -879,30 +870,23 @@ class GeneralSettingsPage(SettingsPage):
             lambda _checked=False: self.recognition_setting_changed.emit()
         )
         self.boundary_context_row.hide()
+        self.speaker_enabled_row = ToggleOptionRow("")
+        self.speaker_enabled_row.hide()
+        self.speaker_activity_row = ToggleOptionRow("")
+        self.speaker_activity_row.hide()
+
         advanced.addWidget(group_divider())
-        self.speaker_enabled_row = ToggleOptionRow(
-            "增强说话人区分", "使用 CAM++ 帮助区分不同声音；用于持续转写与会议，不验证人物身份",
-        )
-        self.speaker_enabled_row.toggled.connect(
-            lambda _checked=False: self.recognition_setting_changed.emit()
-        )
-        advanced.addWidget(self.speaker_enabled_row)
-        self.speaker_runtime_label = footnote("尚未获取说话人增强运行状态")
-        advanced.addWidget(inline_action_row(self.speaker_runtime_label, margins=(16, 0, 16, 12)))
-        advanced.addWidget(group_divider())
-        self.speaker_activity_row = ToggleOptionRow(
-            "多人发言检测（实验性）", "辅助分段，疑似重叠部分待确认；可能增加耗时，需在引擎页下载检测模型并启用 CAM++",
-        )
-        self.speaker_activity_row.toggled.connect(
-            lambda _checked=False: self.recognition_setting_changed.emit()
-        )
-        advanced.addWidget(self.speaker_activity_row)
+        speaker_diag_title = footnote("说话人区分（按模式与音源自动启停）")
+        speaker_diag_title.setProperty("viRole", "importantHint")
+        advanced.addWidget(inline_action_row(speaker_diag_title, margins=(16, 10, 16, 4)))
+        self.speaker_runtime_label = footnote("尚未获取说话人区分运行状态")
+        advanced.addWidget(inline_action_row(self.speaker_runtime_label, margins=(16, 0, 16, 8)))
         self.recognition_reset_btn = _ghost_button(
             "高级识别恢复默认",
             self.recognition_reset_requested.emit,
-            tooltip="仅恢复语音分段、说话人增强、多人发言检测和轻声增强，不改变识别语言、自定义词汇和当前引擎",
+            tooltip="仅将语音分段恢复为自动检测语音，不改变识别语言、自定义词汇和当前引擎",
         )
-        advanced.addWidget(inline_action_row(self.recognition_reset_btn, margins=(16, 8, 16, 12)))
+        advanced.addWidget(inline_action_row(self.recognition_reset_btn, margins=(16, 4, 16, 12)))
         lay.addWidget(self.advanced_recognition_panel)
         section = settings_section("识别", card)
         section.setObjectName("sharedRecognitionSection")
@@ -1269,16 +1253,20 @@ class GeneralSettingsPage(SettingsPage):
         self.recognition_capability_label.setText("\n".join(shared.notes))
         self.recognition_capability_label.setVisible(bool(shared.notes))
         set_section_visible(self.recognition_capability_row, bool(shared.notes))
-        apply_text = (
-            "已保存 · 待本场结束且已录语音处理完成后生效。"
-            if recognition_pending else
-            "更改自动保存；空闲时应用，录音或处理期间的更改在本场结束后生效。"
-        )
+        apply_parts: list[str] = []
+        if recognition_pending:
+            apply_parts.append("已保存 · 待本场结束且已录语音处理完成后生效。")
         if glossary_skip_note:
-            apply_text += " " + glossary_skip_note
+            apply_parts.append(glossary_skip_note)
         if segmentation_status is not None and segmentation_status.error:
-            apply_text += " 语音检测模型加载失败，当前按音量分段；可展开高级设置查看。"
+            apply_parts.append("语音检测模型加载失败，当前按音量分段；可展开高级设置查看。")
+        apply_text = " ".join(apply_parts)
         self.recognition_apply_label.setText(apply_text)
+        show_apply = bool(apply_text)
+        self.recognition_apply_label.setVisible(show_apply)
+        apply_row = self.recognition_apply_label.parentWidget()
+        if apply_row is not None:
+            set_section_visible(apply_row, show_apply)
         if not vad_downloading:
             set_section_visible(self.vad_download_row, not downloaded)
             set_section_visible(self.vad_download_status_row, bool(downloaded))
@@ -1341,9 +1329,6 @@ class GeneralSettingsPage(SettingsPage):
         set_combo_by_data(self.meeting_vad_combo, config.get("stt.vad", "silero"))
         set_combo_by_data(self.meeting_language_combo, config.get("stt.language", "auto"))
         self.meeting_start_card_row.setChecked(bool(config.get("meeting.show_start_card", True)))
-        self.speaker_enabled_row.setChecked(bool(config.get("stt.speaker_model_enabled", True)))
-        self.speaker_activity_row.setChecked(bool(config.get("stt.speaker_activity_enabled", False)))
-        self.quiet_speech_row.setChecked(bool(config.get("stt.quiet_speech_enabled", False)))
         self.boundary_context_row.setChecked(bool(config.get("stt.boundary_context_enabled", False)))
 
         glossary = config.get("stt.glossary", []) or []

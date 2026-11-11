@@ -46,14 +46,51 @@ def test_listen_bar_placement_defaults_to_auto_and_persists(settings_window, con
     assert not settings_window._listen_bar_autohide_row.isChecked()
 
 
-def test_experimental_activity_toggle_is_off_by_default_and_saves_separately(settings_window, config):
-    assert not settings_window._speaker_activity_row.isChecked()
-    original_speaker = config.get("stt.speaker_model_enabled")
-    settings_window._speaker_activity_row.setChecked(True)
-    assert config.get("stt.speaker_activity_enabled") is True
-    assert config.get("stt.speaker_model_enabled") == original_speaker
-    settings_window._load_meeting_settings()
-    assert settings_window._speaker_activity_row.isChecked()
+def test_retired_manual_recognition_switches_are_hidden_and_not_exposed_in_ui(
+    settings_window, qapp
+):
+    from sayink.ui.settings_components import ToggleOptionRow
+    from sayink.ui.theme import apply_theme
+
+    settings_window.resize(980, 760)
+    settings_window.show()
+    qapp.processEvents()
+
+    # Idle state: no defensive "更改自动保存；空闲时应用..." clutter in 通用 → 识别.
+    assert settings_window._recognition_apply_label.text() == ""
+    assert not settings_window._recognition_apply_label.isVisible()
+
+    # Expand advanced recognition disclosure and verify none of the 3 retired switches appear.
+    settings_window._advanced_recognition_btn.setChecked(True)
+    qapp.processEvents()
+    assert settings_window._advanced_recognition_panel.isVisible()
+
+    for retired in (
+        settings_window._quiet_speech_row,
+        settings_window._speaker_enabled_row,
+        settings_window._speaker_activity_row,
+    ):
+        assert retired.isHidden()
+        assert not retired.isVisible()
+        assert retired not in settings_window.general_page.general_tab_chain
+
+    rec_section = settings_window.findChild(QWidget, "sharedRecognitionSection")
+    assert rec_section is not None
+    assert rec_section.findChildren(ToggleOptionRow) == []
+
+    all_label_texts = [lb.text() for lb in settings_window.findChildren(QLabel)]
+    for forbidden in ("轻声增强", "增强说话人区分", "多人发言检测"):
+        assert all(forbidden not in text for text in all_label_texts), forbidden
+
+    # Theme switch (dark <-> light) with panel expanded and collapsed stays crash-free and aligned.
+    page = settings_window.general_page
+    for mode in ("dark", "light"):
+        apply_theme(qapp, mode=mode, surfaces=[settings_window])
+        qapp.processEvents()
+        assert page.horizontalScrollBar().maximum() == 0
+
+    settings_window._advanced_recognition_btn.setChecked(False)
+    qapp.processEvents()
 
 
 @pytest.fixture(scope="module")
@@ -117,7 +154,7 @@ def settings_window(_shared_settings, config, monkeypatch):
     win.set_pending_segment_counter(None)
     win._segmentation_status = None
     win._recognition_pending = False
-    win._speaker_runtime_text = "尚未获取说话人增强运行状态"
+    win._speaker_runtime_text = "尚未获取说话人区分运行状态"
     win.reload_settings()
     yield win
 
@@ -1276,11 +1313,19 @@ class TestMeetingSettings:
         win._flush_meeting_glossary()
         assert len(fired) == 3
 
-    def test_speaker_enhancement_round_trips_through_shared_settings(self, settings_window, config):
-        settings_window._speaker_enabled_row.setChecked(False)
-        assert config.get("stt.speaker_model_enabled") is False
-        settings_window.reload_settings()
-        assert not settings_window._speaker_enabled_row.isChecked()
+    def test_recognition_changes_do_not_write_retired_switch_keys(self, settings_window, config):
+        stt = config._config.setdefault("stt", {})
+        for retired_key in ("speaker_model_enabled", "speaker_activity_enabled", "quiet_speech_enabled"):
+            stt.pop(retired_key, None)
+
+        settings_window._meeting_language_combo.setCurrentIndex(
+            settings_window._meeting_language_combo.findData("zh")
+        )
+        settings_window._meeting_vad_combo.setCurrentIndex(
+            settings_window._meeting_vad_combo.findData("energy")
+        )
+        for retired_key in ("speaker_model_enabled", "speaker_activity_enabled", "quiet_speech_enabled"):
+            assert retired_key not in config._config.get("stt", {})
 
     def test_actual_vad_failure_and_pending_settings_are_visible(self, settings_window, config, monkeypatch):
         from sayink.runtime_status import SegmentationStatus
@@ -1516,35 +1561,35 @@ class TestSectionDefaultRestore:
         assert settings_window._hotkey_edit.value == "alt+x"
         assert emitted == ["alt+x"]
 
-    def test_recognition_restore_resets_only_the_four_advanced_switches(
+    def test_recognition_restore_resets_vad_without_touching_language_glossary_or_model(
             self, settings_window, config, monkeypatch):
         glossary = [{"term": "SayInk", "variants": ["say ink"]}]
         config.set("stt.vad", "energy")
-        config.set("stt.speaker_model_enabled", False)
-        config.set("stt.speaker_activity_enabled", True)
-        config.set("stt.quiet_speech_enabled", True)
         config.set("stt.boundary_context_enabled", True)
         config.set("stt.language", "en")
         config.set("stt.glossary", glossary)
         config.set("stt.model_id", "funasr-nano")
+        for retired_key in ("speaker_model_enabled", "speaker_activity_enabled", "quiet_speech_enabled"):
+            config._config.get("stt", {}).pop(retired_key, None)
         settings_window.reload_settings()
         seen = self._answers(settings_window, monkeypatch, False)
         settings_window._recognition_reset_btn.click()
         assert config.get("stt.vad") == "energy"
         assert "自定义词汇" in seen[0][1]
+        for forbidden in ("轻声增强", "增强说话人区分", "多人发言检测"):
+            assert forbidden not in seen[0][1]
 
         changed = []
         settings_window.recognition_changed.connect(lambda: changed.append(True))
         self._answers(settings_window, monkeypatch, True)
         settings_window._recognition_reset_btn.click()
         assert config.get("stt.vad") == "silero"
-        assert config.get("stt.speaker_model_enabled") is True
-        assert config.get("stt.speaker_activity_enabled") is False
-        assert config.get("stt.quiet_speech_enabled") is False
         assert config.get("stt.boundary_context_enabled") is True
         assert config.get("stt.language") == "en"
         assert config.get("stt.glossary") == glossary
         assert config.get("stt.model_id") == "funasr-nano"
+        for retired_key in ("speaker_model_enabled", "speaker_activity_enabled", "quiet_speech_enabled"):
+            assert retired_key not in config._config.get("stt", {})
         assert changed == [True]
 
     def test_start_card_restore_leaves_the_meeting_source_and_model(

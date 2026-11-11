@@ -774,17 +774,25 @@ class TestReadmeMeetingNotes:
         assert "持续转写与会议共用谨慎的说话人匹配" in text
         assert "再用可靠样本重新聚类" in text
         assert "高级识别设置" in text and "单次转写、持续转写与会议共用" in text
+        assert "轻声自适应增益" in text and "按模式与音源自动启停" in text
         assert "麦克风 + 电脑声音" in text and "跟随转写设置" in text and "仅用于本场" in text
         assert "加载失败并回退" in text and "已保存，待生效" in text
         assert "chat_completion()" in text
-        # Settings copy uses the shared names; the old 会议-prefixed ones are gone.
-        for stale in ("设置 → 通用 → 会议 ", "会议断句方式", "会议术语表"):
+        # Settings copy uses the shared names; the old 会议-prefixed ones and retired manual switch guides are gone.
+        for stale in (
+            "设置 → 通用 → 会议 ",
+            "会议断句方式",
+            "会议术语表",
+            "公共识别页可开关 CAM++ 增强",
+            "轻声增强（默认关闭）",
+        ):
             assert stale not in text
 
     def test_shared_recognition_settings_live_under_stt(self):
         from sayink.config import DEFAULT_CONFIG, SHARED_RECOGNITION_KEYS
 
-        assert set(SHARED_RECOGNITION_KEYS) == {"glossary", "language", "vad", "speaker_model_enabled"}
+        assert {"glossary", "language", "vad"}.issubset(SHARED_RECOGNITION_KEYS)
+        assert set(SHARED_RECOGNITION_KEYS).issubset({"glossary", "language", "vad", "speaker_model_enabled"})
         for key in SHARED_RECOGNITION_KEYS:
             assert key in DEFAULT_CONFIG["stt"] and key not in DEFAULT_CONFIG["meeting"]
 

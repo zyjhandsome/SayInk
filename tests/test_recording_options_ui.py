@@ -32,12 +32,15 @@ def test_optional_recording_controls_save_without_discarding_runtime_queue(setti
     assert len(changes) == 2 and len(runtime) == 0
 
 
-def test_quiet_speech_uses_existing_deferred_shared_recognition_change(settings, config):
-    changes = QSignalSpy(settings.recognition_changed)
-    settings._quiet_speech_row.setChecked(True)
-    assert len(changes) == 1 and config.get("stt.quiet_speech_enabled") is True
-    settings._load_settings(refresh_devices=False, heavy=False)
-    assert settings._quiet_speech_row.isChecked() and len(changes) == 1
+def test_quiet_speech_switch_is_hidden_and_not_in_recording_or_recognition_sections(settings):
+    from PyQt6.QtWidgets import QLabel, QWidget
+
+    assert settings._quiet_speech_row.isHidden()
+    assert not settings._quiet_speech_row.isVisible()
+    for section_name in ("recordingInputSection", "sharedRecognitionSection"):
+        section = settings.findChild(QWidget, section_name)
+        assert section is not None
+        assert all("轻声增强" not in lb.text() for lb in section.findChildren(QLabel))
 
 
 def test_recovery_dialog_selects_raw_tracks_and_recognizes_locally(tmp_path):
@@ -66,3 +69,20 @@ def test_recovery_button_routes_to_app_without_enabling_recording(settings, conf
     requested = QSignalSpy(settings.audio_recovery_requested)
     settings._recovery_btn.click()
     assert len(requested) == 1 and not config.get("audio.recovery_enabled")
+
+
+def test_recovery_dialog_accepts_adaptive_quiet_none(tmp_path):
+    journal = RecordingJournal(tmp_path)
+    audio = np.full(8000, 0.1, np.float32)
+    assert journal.append(audio)
+    journal.close()
+    dialog = AudioRecoveryDialog(tmp_path, quiet=None, recognizer=Recognizer(["自适应恢复"]))
+    dialog._transcribe()
+    worker = dialog.worker
+    finished = QSignalSpy(worker.finished)
+    if worker.isRunning():
+        assert finished.wait(3000)
+    QApplication.processEvents()
+    assert dialog.output.toPlainText() == "自适应恢复"
+    dialog.reject()
+    dialog.deleteLater()

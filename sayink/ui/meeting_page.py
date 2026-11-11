@@ -2446,7 +2446,7 @@ class MeetingPage(QWidget):
         label = f"下载辅助模型（约 {aux_models_size_mb(missing)} MB）" if missing else ""
         what = describe_aux_models(missing)
         self._card_dl_btn.setToolTip(
-            f"{what}：下载后按共享识别设置在开始时加载；实际状态可在 {ADVANCED_RECOGNITION_PATH} 查看"
+            f"{what}：下载后在会议开始时自动加载；实际状态可在 {ADVANCED_RECOGNITION_PATH} 查看"
         )
         self._live_dl_btn.setToolTip(f"{what}：本场会议已按当前方式进行，下载后从下一场开始生效")
         for button in (self._card_dl_btn, self._live_dl_btn):
@@ -2482,7 +2482,7 @@ class MeetingPage(QWidget):
             if self._stack.currentIndex() == PAGE_START:
                 self._update_card_notes()
                 self._card_notes.setText(
-                    "· 辅助模型已下载，将按共享识别设置在开始时加载。\n" + self._card_notes.text()
+                    "· 辅助模型已下载，将在会议开始时自动加载。\n" + self._card_notes.text()
                 )
                 self._card_notes.show()
             elif self._stack.currentIndex() == PAGE_LIVE:
