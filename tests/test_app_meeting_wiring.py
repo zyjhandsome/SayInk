@@ -9,6 +9,7 @@ import time
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 from PyQt6.QtCore import QCoreApplication
 
 from sayink.app import _QueuedSegment
@@ -415,7 +416,8 @@ def test_request_meeting_start_skips_prompt_when_nothing_missing() -> None:
             assert app.meeting.is_active
 
 
-def test_download_then_start_waits_for_the_batch() -> None:
+@pytest.mark.parametrize("ok, message", [(True, ""), (False, "已取消")])
+def test_download_then_start_waits_for_the_batch(ok, message) -> None:
     from typing import ClassVar
 
     from PyQt6.QtCore import QObject, pyqtSignal
@@ -428,6 +430,7 @@ def test_download_then_start_waits_for_the_batch() -> None:
         def __init__(self, source, parent=None):
             super().__init__(parent)
             self.cancelled = False
+            self.downloaded_any = True
             _FakeBatch.instances.append(self)
 
         def start(self, ids=None):
@@ -440,14 +443,19 @@ def test_download_then_start_waits_for_the_batch() -> None:
         app = h["app"]
         h["recorder"].start_continuous.side_effect = lambda: setattr(h["recorder"], "is_continuous", True)
         with patch("sayink.aux_models.AuxModelDownloads", _FakeBatch), \
-             patch("sayink.meeting_session.aux_model_path", return_value=None):
+             patch("sayink.meeting_session.aux_model_path", return_value=None), \
+             patch.object(app, "_on_models_changed") as refresh:
             app._download_aux_then_start(MeetingOptions(title="等模型"))
             assert not app.meeting.is_active                   # still downloading
             batch = _FakeBatch.instances[-1]
             batch.progress.emit(60)
-            batch.finished.emit(True, "")
-            assert app.meeting.is_active
-            assert app.meeting.current.title == "等模型"
+            batch.finished.emit(ok, message)
+            refresh.assert_called_once()
+            assert app.meeting.is_active is ok
+            if ok:
+                assert app.meeting.current.title == "等模型"
+            else:
+                h["recorder"].start_continuous.assert_not_called()
 
 
 AUTO_MINUTES = {

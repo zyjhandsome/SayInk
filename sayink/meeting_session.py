@@ -59,6 +59,7 @@ from sayink.minutes_prompts import (
 from sayink.minutes_render import apply_speaker_names, render_markdown, replace_names_in_markdown
 from sayink.recognition_settings import (
     ADVANCED_RECOGNITION_PATH,
+    HOTWORDS_UNSUPPORTED_NOTE,
     RecognitionSettings,
     audio_source,
     aux_model_path,
@@ -140,7 +141,7 @@ class MeetingCapabilities:
     def notes(self) -> list[str]:
         out: list[str] = []
         if self.hotwords and not self.hotwords_supported:
-            out.append("当前识别模型不支持识别期热词，本场术语只用于纪要。")
+            out.append(HOTWORDS_UNSUPPORTED_NOTE)
         if not self.language_supported:
             out.append("当前模型不支持指定识别语言，将按模型自身能力识别。")
         if self.vad_requested == VAD_SILERO and self.vad == VAD_ENERGY:

@@ -275,7 +275,19 @@ class TestRender:
         assert md.startswith("# 备用标题\n")
         assert md.count(EMPTY_SECTION_TEXT) == len(ALL_SECTIONS)
         md = render_markdown(None, template=get_template("standup"))
-        assert "## 决策" not in md and "## 发言人摘要" in md
+        assert "## 决策" not in md and "## 每人进展" in md
+
+    def test_one_on_one_chapter_names_match_the_blurb(self):
+        from sayink.minutes_prompts import describe_template, section_title
+
+        template = get_template("one_on_one")
+        described = describe_template(template)
+        assert "话题与对方关切" in described
+        assert "双方承诺" in described
+        assert "下次跟进" in described
+        assert "议题要点" not in described
+        assert section_title(template, "action_items") == "双方承诺"
+        assert "双方承诺" in build_system_prompt(template)
 
     def test_flag_unverified(self):
         assert flag_unverified("3月1日上线", "我们 3 月 1 日 上线") == "3月1日上线"

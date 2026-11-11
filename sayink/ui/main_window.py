@@ -477,7 +477,7 @@ class MainWindow(QWidget):
             self._status_tone_override = ""
             self._runtime_label.setText(self._model_runtime_text)
             self._runtime_label.setToolTip("")
-            self._mode_label.setText(f"{hints.source}\n{hints.mode}")
+            self._mode_label.setText(f"{hints.source} · {hints.mode}")
             self._shortcut_label.setText(hints.shortcut)
             self._output_label.setText(hints.output)
             self._output_label.setProperty("outputWarning", hints.output_warning)
@@ -503,6 +503,13 @@ class MainWindow(QWidget):
             self._clear_round_mask()
             return
         self._apply_window_shape()
+
+    def show(self) -> None:
+        # The tray can reopen a window that is still visible to Qt but minimized
+        # by Windows. Restore its previous normal or maximized state first.
+        if self.isMinimized():
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        super().show()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)

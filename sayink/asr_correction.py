@@ -80,28 +80,36 @@ def parse_glossary_line(line: str) -> dict | None:
     variant equal to the term and anything beyond the caps are dropped.
     Returns ``None`` for a blank line or one with no term before the ``=``.
     """
+    return parse_glossary_line_with_warnings(line)[0]
+
+
+def parse_glossary_line_with_warnings(line: str) -> tuple[dict | None, list[str]]:
+    """Parse an editor line and report values omitted by the limits."""
     text = (line or "").strip()
     if not text:
-        return None
+        return None, []
     term, sep, rest = _split_once(text)
     if not term:
-        return None
+        return None, ["缺少正确词"]
     if not sep:
-        return {"term": term}
+        return {"term": term}, []
     variants: list[str] = []
+    warnings: list[str] = []
     for variant in _VARIANT_SPLIT_RE.split(rest):
         variant = variant.strip()
-        if (
-            not variant
-            or variant == term
-            or variant in variants
-            or len(variant) > MAX_GLOSSARY_VARIANT_CHARS
-        ):
+        if not variant or variant == term or variant in variants:
+            continue
+        if len(variant) > MAX_GLOSSARY_VARIANT_CHARS:
+            if "误写超过 20 字" not in warnings:
+                warnings.append("误写超过 20 字")
+            continue
+        if len(variants) >= MAX_GLOSSARY_VARIANTS:
+            if "误写超过 5 个" not in warnings:
+                warnings.append("误写超过 5 个")
             continue
         variants.append(variant)
-        if len(variants) >= MAX_GLOSSARY_VARIANTS:
-            break
-    return {"term": term, "variants": variants} if variants else {"term": term}
+    entry = {"term": term, "variants": variants} if variants else {"term": term}
+    return entry, warnings
 
 
 def _split_once(text: str) -> tuple[str, str, str]:

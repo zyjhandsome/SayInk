@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import html
+from pathlib import Path
 import re
 import time
 
@@ -122,6 +123,23 @@ def _highlight_html(text: str, query: str, mark_css: str) -> str:
         return escaped
     pattern = re.compile(re.escape(html.escape(q)), re.IGNORECASE)
     return pattern.sub(lambda m: f'<span style="{mark_css}">{m.group(0)}</span>', escaped)
+
+
+def export_directory() -> str:
+    """A SayInk folder under Documents, so export does not open in the app's working directory."""
+    home = Path.home()
+    documents = home / "Documents"
+    base = documents if documents.is_dir() else home
+    target = base / "SayInk"
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return str(base)
+    return str(target)
+
+
+def export_save_path(filename: str) -> str:
+    return str(Path(export_directory()) / filename)
 
 
 def suggest_single_export_filename(session: SessionSummary) -> str:

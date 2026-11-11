@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox, QWidget
+from PyQt6.QtWidgets import QApplication, QComboBox, QLabel, QMessageBox, QPushButton, QWidget
 
 from sayink.audio_devices import (
     INPUT_SOURCE_MICROPHONE,
@@ -77,6 +77,7 @@ def test_retired_manual_recognition_switches_are_hidden_and_not_exposed_in_ui(
     rec_section = settings_window.findChild(QWidget, "sharedRecognitionSection")
     assert rec_section is not None
     assert rec_section.findChildren(ToggleOptionRow) == []
+    assert not any(combo.accessibleName() == "语音分段方式" for combo in rec_section.findChildren(QComboBox))
 
     all_label_texts = [lb.text() for lb in settings_window.findChildren(QLabel)]
     for forbidden in ("轻声增强", "增强说话人区分", "多人发言检测"):
@@ -91,6 +92,22 @@ def test_retired_manual_recognition_switches_are_hidden_and_not_exposed_in_ui(
 
     settings_window._advanced_recognition_btn.setChecked(False)
     qapp.processEvents()
+
+
+def test_auxiliary_model_card_distinguishes_bundled_and_downloaded(qapp, monkeypatch):
+    from sayink.speech_recognizer import AUX_MODEL_SILERO_VAD, get_model_info
+    from sayink.ui.model_card import ModelCard
+
+    info = get_model_info(AUX_MODEL_SILERO_VAD)
+    monkeypatch.setattr("sayink.speech_recognizer.is_bundled_model", lambda _mid: True)
+    bundled = ModelCard(info, True, False)
+    assert bundled._delete_btn is None
+    assert any(label.text() == "随安装包提供" for label in bundled.findChildren(QLabel))
+    monkeypatch.setattr("sayink.speech_recognizer.is_bundled_model", lambda _mid: False)
+    downloaded = ModelCard(info, True, False)
+    assert downloaded._delete_btn is not None
+    bundled.close()
+    downloaded.close()
 
 
 @pytest.fixture(scope="module")
@@ -192,6 +209,23 @@ def test_old_config_without_suffix_field_loads_empty(settings_window, config):
 
 
 class TestGeneralPageLayout:
+    def test_settings_dropdowns_share_width_at_normal_and_narrow_sizes(self, settings_window, qapp):
+        from sayink.ui.design_tokens import CONTROL_SETTINGS_COMBO_WIDTH
+
+        page = settings_window.general_page
+        combos = (page.output_mode_combo, page.mic_device_combo, page.system_device_combo,
+                  page.meeting_language_combo, page.meeting_source_combo, page.meeting_model_combo,
+                  page.listen_bar_combo, page.llm_proxy_combo,
+                  settings_window.model_page.download_source_combo,
+                  settings_window.polish_page.llm_mode_combo,
+                  settings_window.polish_page.minutes_language_combo)
+        for width in (980, 860):
+            settings_window.resize(width, 760)
+            settings_window.show()
+            qapp.processEvents()
+            assert all(combo.width() == CONTROL_SETTINGS_COMBO_WIDTH for combo in combos)
+            assert page.horizontalScrollBar().maximum() == 0
+
     def test_island_nav_labels(self, settings_window):
         assert isinstance(settings_window, QWidget)
         assert settings_window._pages.count() == 4
@@ -1271,30 +1305,35 @@ class TestMeetingSettings:
     def test_meeting_defaults_load(self, settings_window, config):
         assert settings_window._meeting_source_combo.currentData() == "mixed"
         assert settings_window._meeting_model_combo.currentData() == ""
-        assert settings_window._meeting_vad_combo.currentData() == "silero"
         assert settings_window._meeting_language_combo.currentData() == "auto"
         assert settings_window._meeting_start_card_row.isChecked()
         assert settings_window._meeting_glossary_edit.toPlainText() == ""
         assert settings_window._minutes_template_combo.currentData() == "general"
 
-    def test_meeting_defaults_name_sources_like_the_start_card(self, settings_window, config):
+    def test_meeting_defaults_show_inherited_source_in_summary(self, settings_window, config):
         from sayink.audio_devices import input_source_label
 
         combo = settings_window._meeting_source_combo
-        current = input_source_label(config.get("audio.input_source", "microphone"))
-        assert combo.itemText(combo.findData("")) == f"跟随转写（当前：{current}）"
+        config.set("audio.input_source", "mixed")
+        combo.setCurrentIndex(combo.findData(""))
+        assert combo.currentText() == "跟随转写"
+        summary = settings_window.general_page.meeting_defaults_hint
+        assert f"跟随转写（当前：{input_source_label('mixed')}）" in summary.text()
+        config.set("audio.input_source", "system")
+        settings_window.general_page.refresh_meeting_defaults(config)
+        assert f"跟随转写（当前：{input_source_label('system')}）" in summary.text()
+        assert combo.currentText() == "跟随转写"
         for key in ("mixed", "microphone", "system"):
             assert combo.itemText(combo.findData(key)) == input_source_label(key)
-        assert settings_window._meeting_model_combo.itemText(0) == "与转写相同"
+        assert settings_window._meeting_model_combo.itemText(0).startswith("与转写相同（当前：")
 
     def test_meeting_choices_persist(self, settings_window, config):
         win = settings_window
         win._meeting_source_combo.setCurrentIndex(win._meeting_source_combo.findData("microphone"))
-        win._meeting_vad_combo.setCurrentIndex(win._meeting_vad_combo.findData("energy"))
         win._meeting_language_combo.setCurrentIndex(win._meeting_language_combo.findData("en"))
         win._meeting_start_card_row.setChecked(False)
         assert config.get("meeting.input_source") == "microphone"
-        assert config.get("stt.vad") == "energy"
+        assert config.get("stt.vad") == "silero"
         assert config.get("stt.language") == "en"
         assert config.get("meeting.show_start_card") is False
         assert config.get("meeting.vad") is None and config.get("meeting.language") is None
@@ -1303,15 +1342,14 @@ class TestMeetingSettings:
         win = settings_window
         fired = []
         win.recognition_changed.connect(lambda: fired.append(True))
-        win._meeting_vad_combo.setCurrentIndex(win._meeting_vad_combo.findData("energy"))
         win._meeting_language_combo.setCurrentIndex(win._meeting_language_combo.findData("en"))
         win._meeting_glossary_edit.setPlainText("SayInk")
         win._flush_meeting_glossary()
-        assert len(fired) == 3
+        assert len(fired) == 2
         # Meeting-only defaults never reload the shared recognizer.
         win._meeting_source_combo.setCurrentIndex(win._meeting_source_combo.findData("microphone"))
         win._flush_meeting_glossary()
-        assert len(fired) == 3
+        assert len(fired) == 2
 
     def test_recognition_changes_do_not_write_retired_switch_keys(self, settings_window, config):
         stt = config._config.setdefault("stt", {})
@@ -1320,9 +1358,6 @@ class TestMeetingSettings:
 
         settings_window._meeting_language_combo.setCurrentIndex(
             settings_window._meeting_language_combo.findData("zh")
-        )
-        settings_window._meeting_vad_combo.setCurrentIndex(
-            settings_window._meeting_vad_combo.findData("energy")
         )
         for retired_key in ("speaker_model_enabled", "speaker_activity_enabled", "quiet_speech_enabled"):
             assert retired_key not in config._config.get("stt", {})
@@ -1340,6 +1375,17 @@ class TestMeetingSettings:
         assert "bad onnx" == settings_window._vad_runtime_label.toolTip()
         assert "待本场结束" in settings_window._recognition_apply_label.text()
         assert "CAM++ 已加载" in settings_window._speaker_runtime_label.text()
+        page = settings_window.general_page
+        assert not page.vad_download_row.isHidden()
+        assert page.vad_download_btn.text() == "修复语音检测模型"
+        started = []
+        monkeypatch.setattr(settings_window, "_start_download", lambda model_id, **kw: started.append((model_id, kw)))
+        page.vad_download_btn.click()
+        assert started == [("silero-vad", {"show_error": True})]
+        settings_window.set_recognition_runtime_status(
+            SegmentationStatus("silero", "silero", True), speaker_status="CAM++ 已加载",
+        )
+        assert page.vad_download_row.isHidden()
 
     def test_downloaded_alone_is_not_reported_as_loaded(self, settings_window, monkeypatch):
         monkeypatch.setattr("sayink.speech_recognizer.is_model_downloaded", lambda _mid: True)
@@ -1384,6 +1430,27 @@ class TestMeetingSettings:
         ]
         win.reload_settings()
         assert win._meeting_glossary_edit.toPlainText().splitlines() == ["五证=五中、无证", "SayInk", "张鑫=张新、张欣"]
+
+    def test_glossary_limit_warnings_and_count(self, settings_window, config):
+        win = settings_window
+        page = win.general_page
+        win._meeting_glossary_edit.setPlainText("\n".join(f"词{i}" for i in range(50)))
+        assert "50 行" in page.glossary_count_label.text()
+        win._flush_meeting_glossary()
+        assert len(config.get("stt.glossary")) == 50
+        assert not win._glossary_skip_note
+
+        win._meeting_glossary_edit.appendPlainText("额外词")
+        win._flush_meeting_glossary()
+        assert len(config.get("stt.glossary")) == 50
+        assert "超过 50 个词" in win._glossary_skip_note
+
+        win._meeting_glossary_edit.setPlainText("正确=一、二、三、四、五、六、" + "长" * 21 + "\n=缺少正确词")
+        win._flush_meeting_glossary()
+        assert config.get("stt.glossary") == [{"term": "正确", "variants": ["一", "二", "三", "四", "五"]}]
+        assert "误写超过 5 个" in win._glossary_skip_note
+        assert "误写超过 20 字" in win._glossary_skip_note
+        assert "第 2 行：缺少正确词" in win._glossary_skip_note
 
     def test_plain_string_glossary_entries_from_a_hand_edited_config_are_shown(self, settings_window, config):
         """The recognizer accepts ``"SayInk"`` as a hotword; hiding it in the
@@ -1561,36 +1628,15 @@ class TestSectionDefaultRestore:
         assert settings_window._hotkey_edit.value == "alt+x"
         assert emitted == ["alt+x"]
 
-    def test_recognition_restore_resets_vad_without_touching_language_glossary_or_model(
-            self, settings_window, config, monkeypatch):
-        glossary = [{"term": "SayInk", "variants": ["say ink"]}]
-        config.set("stt.vad", "energy")
-        config.set("stt.boundary_context_enabled", True)
-        config.set("stt.language", "en")
-        config.set("stt.glossary", glossary)
-        config.set("stt.model_id", "funasr-nano")
-        for retired_key in ("speaker_model_enabled", "speaker_activity_enabled", "quiet_speech_enabled"):
-            config._config.get("stt", {}).pop(retired_key, None)
-        settings_window.reload_settings()
-        seen = self._answers(settings_window, monkeypatch, False)
-        settings_window._recognition_reset_btn.click()
-        assert config.get("stt.vad") == "energy"
-        assert "自定义词汇" in seen[0][1]
-        for forbidden in ("轻声增强", "增强说话人区分", "多人发言检测"):
-            assert forbidden not in seen[0][1]
+    def test_legacy_energy_preference_uses_automatic_segmentation(self, settings_window, config):
+        from sayink.recognition_settings import RecognitionSettings
 
-        changed = []
-        settings_window.recognition_changed.connect(lambda: changed.append(True))
-        self._answers(settings_window, monkeypatch, True)
-        settings_window._recognition_reset_btn.click()
-        assert config.get("stt.vad") == "silero"
-        assert config.get("stt.boundary_context_enabled") is True
-        assert config.get("stt.language") == "en"
-        assert config.get("stt.glossary") == glossary
-        assert config.get("stt.model_id") == "funasr-nano"
-        for retired_key in ("speaker_model_enabled", "speaker_activity_enabled", "quiet_speech_enabled"):
-            assert retired_key not in config._config.get("stt", {})
-        assert changed == [True]
+        config.set("stt.vad", "energy")
+        settings_window.reload_settings()
+        assert RecognitionSettings.from_config(config).vad == "silero"
+        assert RecognitionSettings.from_config(config, meeting=True).vad == "silero"
+        panel = settings_window.general_page.advanced_recognition_panel
+        assert not any("恢复默认" in button.text() for button in panel.findChildren(QPushButton))
 
     def test_start_card_restore_leaves_the_meeting_source_and_model(
             self, settings_window, config, monkeypatch):

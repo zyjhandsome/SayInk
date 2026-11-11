@@ -141,7 +141,7 @@ class AboutSettingsPage(SettingsPage):
         status_lay = QVBoxLayout()
         status_lay.setSpacing(4)
         status_lay.addWidget(self.about_version_label)
-        self.about_update_status = QLabel("本次启动尚未检查更新")
+        self.about_update_status = QLabel("本次启动尚未检查。自动检查至少隔 24 小时，不自动下载。")
         self.about_update_status.setObjectName("aboutUpdateStatus")
         self.about_update_status.setWordWrap(True)
         self.about_update_status.setTextFormat(Qt.TextFormat.PlainText)
@@ -173,9 +173,9 @@ class AboutSettingsPage(SettingsPage):
         entries = (
             ("语音识别模型", "管理模型", "engine", ""),
             ("录音快捷键", "修改快捷键", "general", "hotkey"),
-            ("音频来源", "", "", ""),
-            ("录制方式", "", "", ""),
-            ("输出去向", "", "", ""),
+            ("音频来源", "调整", "general", "source"),
+            ("录制方式", "调整", "general", "mode"),
+            ("输出去向", "调整", "general", "output"),
             ("文字润色", "配置润色", "polish", "polish"),
         )
         for index, (key, action, target, focus) in enumerate(entries):
@@ -259,6 +259,9 @@ class AboutSettingsPage(SettingsPage):
             when = None
         self.about_update_checked_at.setText(
             f"上次检查：{when:%Y-%m-%d %H:%M}" if when else "尚无检查记录"
+        )
+        self.about_update_status.setToolTip(
+            "启动时若距上次成功检查已满 24 小时才会自动检查，本次启动未检查不代表没有检查记录。"
         )
         self.about_update_checked_at.setVisible(when is not None)
 

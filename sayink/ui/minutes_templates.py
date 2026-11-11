@@ -188,7 +188,8 @@ class MinutesTemplatesDialog(QDialog):
         layout.addLayout(row)
         self._list.itemDoubleClicked.connect(lambda _item: self._edit() if self._edit_btn.isEnabled() else self._copy())
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存并使用所选模板")
+        self._save_btn = buttons.button(QDialogButtonBox.StandardButton.Save)
+        self._save_btn.setText("使用所选模板")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -216,8 +217,20 @@ class MinutesTemplatesDialog(QDialog):
         template = self._selected()
         self.selected_template_id = template.id
         self._description.setPlainText(describe_template(template))
-        self._edit_btn.setEnabled(not template.builtin)
-        self._delete_btn.setEnabled(not template.builtin)
+        builtin = template.builtin
+        self._edit_btn.setEnabled(not builtin)
+        self._delete_btn.setEnabled(not builtin)
+        self._edit_btn.setToolTip("内置模板请先点「复制」，再改副本" if builtin else "")
+        self._delete_btn.setToolTip("内置模板不能删除，可先复制一份" if builtin else "")
+        self._refresh_save_label()
+
+    def _refresh_save_label(self) -> None:
+        saved = self._config.get("meeting.custom_templates", []) or []
+        dirty = self._custom != saved
+        self._save_btn.setText("保存并使用所选模板" if dirty else "使用所选模板")
+        self._save_btn.setToolTip(
+            "自定义模板有未写入的修改" if dirty else "把当前选中的模板设为会议默认，不改模板内容"
+        )
 
     def _save_editor(self, template, *, new=False) -> None:
         editor = TemplateEditorDialog(template, self)

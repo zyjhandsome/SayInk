@@ -21,9 +21,9 @@ from sayink.minutes_prompts import (
     SECTION_OPEN_QUESTIONS,
     SECTION_SPEAKERS,
     SECTION_SUMMARY,
-    SECTION_TITLES,
     SECTION_TOPICS,
     MinutesTemplate,
+    section_title,
     parse_timestamp,
     speaker_label,
 )
@@ -202,7 +202,7 @@ def render_markdown(
 
     def section(key: str) -> None:
         out.append("")
-        out.append(f"## {SECTION_TITLES[key]}")
+        out.append(f"## {section_title(template, key)}")
         body = _render_section(key, payload, duration_ms, transcript_text, speaker_names)
         out.append(body if body else EMPTY_SECTION_TEXT)
 

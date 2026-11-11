@@ -114,7 +114,6 @@ _GENERAL_LEGACY_NAMES = (
     "_recognition_apply_label",
     "_advanced_recognition_btn",
     "_advanced_recognition_panel",
-    "_meeting_vad_combo",
     "_vad_runtime_label",
     "_vad_download_status",
     "_vad_download_status_row",
@@ -125,7 +124,6 @@ _GENERAL_LEGACY_NAMES = (
     "_speaker_enabled_row",
     "_speaker_runtime_label",
     "_speaker_activity_row",
-    "_recognition_reset_btn",
     "_meeting_source_combo",
     "_meeting_model_combo",
     "_meeting_defaults_hint",
@@ -342,7 +340,6 @@ class SettingsWindow(QWidget):
         gp.glossary_text_changed.connect(self._on_meeting_glossary_changed)
         gp.glossary_editing_finished.connect(self._flush_meeting_glossary)
         gp.vad_download_requested.connect(self._download_shared_vad)
-        gp.recognition_reset_requested.connect(self._restore_default_recognition)
         gp.meeting_setting_changed.connect(self._on_meeting_setting_changed)
         gp.meeting_start_card_reset_requested.connect(self._restore_default_meeting_start_card)
         gp.llm_proxy_changed.connect(self._on_llm_proxy_changed)
@@ -421,8 +418,22 @@ class SettingsWindow(QWidget):
         self.show_page({"general": 0, "engine": 1, "polish": 2}[page])
         self.navigation_requested.emit(page)
         if focus == "hotkey":
-            self.general_page.ensureWidgetVisible(self.general_page.hotkey_edit)
-            self.general_page.hotkey_edit.setFocus(Qt.FocusReason.TabFocusReason)
+            edit = self.general_page.hotkey_edit
+            self.general_page.ensureWidgetVisible(edit)
+            edit.setFocus(Qt.FocusReason.TabFocusReason)
+            QTimer.singleShot(0, edit.begin_capture)
+        elif focus == "source":
+            target_widget = self.general_page.src_mic_rb
+            self.general_page.ensureWidgetVisible(target_widget)
+            target_widget.setFocus(Qt.FocusReason.TabFocusReason)
+        elif focus == "mode":
+            target_widget = self.general_page.trigger_hotkey_rb
+            self.general_page.ensureWidgetVisible(target_widget)
+            target_widget.setFocus(Qt.FocusReason.TabFocusReason)
+        elif focus == "output":
+            target_widget = self.general_page.output_mode_combo
+            self.general_page.ensureWidgetVisible(target_widget)
+            target_widget.setFocus(Qt.FocusReason.TabFocusReason)
         elif focus == "polish":
             self.polish_page.ensureWidgetVisible(self.polish_page.llm_enable_row)
             self.polish_page.llm_enable_row.setFocus(Qt.FocusReason.TabFocusReason)
@@ -481,7 +492,7 @@ class SettingsWindow(QWidget):
     def _download_shared_vad(self) -> None:
         from sayink.speech_recognizer import AUX_MODEL_SILERO_VAD
 
-        self._start_download(AUX_MODEL_SILERO_VAD)
+        self._start_download(AUX_MODEL_SILERO_VAD, show_error=True)
 
     def _on_shared_download_progress(self, model_id: str, pct: int) -> None:
         from sayink.speech_recognizer import AUX_MODEL_SILERO_VAD
@@ -577,7 +588,7 @@ class SettingsWindow(QWidget):
         elif action == "delete":
             self._delete_model(model_id)
 
-    def _start_download(self, model_id: str) -> None:
+    def _start_download(self, model_id: str, *, show_error: bool = False) -> None:
         if model_id in self._dl_workers:
             return
         from sayink.speech_recognizer import ModelDownloadWorker
@@ -596,7 +607,9 @@ class SettingsWindow(QWidget):
         worker.progress.connect(lambda pct, mid=model_id: self._on_shared_download_progress(mid, pct))
         worker.finished_ok.connect(lambda mid: self._on_dl_done(mid))
         worker.error.connect(
-            lambda msg, mid=model_id: self._on_dl_error(msg, self.model_page.model_cards.get(mid), mid)
+            lambda msg: self._on_dl_error(
+                msg, self.model_page.model_cards.get(model_id), model_id, show_error=show_error,
+            )
         )
         worker.start()
 
@@ -613,7 +626,7 @@ class SettingsWindow(QWidget):
         worker = self._dl_workers.pop(model_id, None)
         if worker is not None and getattr(worker, "_cancelled", False) is True:
             return
-        from sayink.speech_recognizer import get_downloaded_models, get_model_info, is_aux_model
+        from sayink.speech_recognizer import AUX_MODEL_SILERO_VAD, get_downloaded_models, get_model_info, is_aux_model
 
         downloaded = get_downloaded_models()
         if len(downloaded) == 1 and downloaded[0] == model_id:
@@ -623,7 +636,12 @@ class SettingsWindow(QWidget):
         self._refresh_recognition_feedback()
         info = get_model_info(model_id)
         name = info["name"] if info else model_id
-        if is_aux_model(model_id):
+        if model_id == AUX_MODEL_SILERO_VAD:
+            text = (
+                f"{name} 文件已通过校验。正在录音或处理语音时，待本场结束后加载。"
+                f"可在 {ADVANCED_RECOGNITION_PATH} 查看加载结果。"
+            )
+        elif is_aux_model(model_id):
             text = (
                 f"{name} 已下载。将按当前模式与音源自动启用；正在录音或处理语音时，"
                 f"待本场结束后生效。可在 {ADVANCED_RECOGNITION_PATH} 查看实际加载状态。"
@@ -637,7 +655,7 @@ class SettingsWindow(QWidget):
             text = f"{name} 已下载。当前仍使用原来的模型；点击该模型卡片上的「使用此模型」即可切换。"
         QMessageBox.information(self, "完成", text)
 
-    def _on_dl_error(self, msg: str, card, model_id: str = "") -> None:
+    def _on_dl_error(self, msg: str, card, model_id: str = "", *, show_error: bool = False) -> None:
         worker = self._dl_workers.pop(model_id or (card._model_id if card else ""), None)
         cancelled = worker is not None and getattr(worker, "_cancelled", False) is True
         if card:
@@ -645,18 +663,21 @@ class SettingsWindow(QWidget):
                 card.set_download_cancelled()
             else:
                 card.set_download_error(msg)
-        elif not cancelled:
-            QMessageBox.warning(self, "下载失败", msg)
         self._refresh_recognition_feedback()
+        if not cancelled and (show_error or card is None):
+            QMessageBox.warning(self, "下载失败", msg)
 
     def _delete_model(self, model_id: str) -> None:
         from sayink.speech_recognizer import delete_model, get_downloaded_models, get_model_info, is_aux_model
 
         info = get_model_info(model_id)
         name = info["name"] if info else model_id
+        impact = ""
+        if is_aux_model(model_id):
+            impact = "\n删除后相关识别增强会自动降级；可稍后重新下载。"
         if not self._confirm(
             "删除模型",
-            f"确定删除「{name}」吗？删除后需重新下载。",
+            f"确定删除「{name}」吗？删除后需重新下载。{impact}",
             accept="删除",
             destructive=True,
         ):
@@ -1245,15 +1266,12 @@ class SettingsWindow(QWidget):
         if self._loading:
             return
         gp = self.general_page
-        vad = str(gp.meeting_vad_combo.currentData() or "silero")
         language = str(gp.meeting_language_combo.currentData() or "auto")
         boundary = gp.boundary_context_row.isChecked()
         changed = (
-            vad != self._config.get("stt.vad", "silero")
-            or language != self._config.get("stt.language", "auto")
+            language != self._config.get("stt.language", "auto")
             or boundary != self._config.get("stt.boundary_context_enabled", False)
         )
-        self._config.set("stt.vad", vad)
         self._config.set("stt.language", language)
         self._config.set("stt.boundary_context_enabled", boundary)
         if changed:
@@ -1338,6 +1356,7 @@ class SettingsWindow(QWidget):
         if hotkey != old:
             self.hotkey_updated.emit(hotkey)
         self._refresh_about_runtime_rows()
+        self._refresh_hotkey_hint()
 
     def _restore_default_hotkey(self) -> None:
         if not self._confirm(
@@ -1348,22 +1367,6 @@ class SettingsWindow(QWidget):
             return
         self.general_page.hotkey_edit.set_value(DEFAULT_HOTKEY)
         self._apply_hotkey_setting(DEFAULT_HOTKEY)
-
-    def _restore_default_recognition(self) -> None:
-        if not self._confirm(
-            "恢复高级识别",
-            "将语音分段恢复为「自动检测语音（推荐）」。"
-            "识别语言、自定义词汇和当前引擎保持不变。",
-            accept="恢复",
-        ):
-            return
-        gp = self.general_page
-        self._loading = True
-        try:
-            set_combo_by_data(gp.meeting_vad_combo, "silero")
-        finally:
-            self._loading = False
-        self._on_recognition_setting_changed()
 
     def _restore_default_meeting_start_card(self) -> None:
         if not self._confirm(

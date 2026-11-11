@@ -270,10 +270,10 @@ class TestReloadCoordinatorDiffAndSubsystemIsolation:
         ctx["recorder"].segmenter_profiles.clear()
         ctx["recognizer"].configure_calls.clear()
 
-        ctx["config"].set("stt.vad", VAD_ENERGY)
+        ctx["config"].set("stt.debug_force_quiet_speech", False)
         coord.on_recognition_settings_changed()
         assert len(ctx["recorder"].segmenter_profiles) == 1
-        assert ctx["recorder"].segmenter_profiles[0]["vad"] == VAD_ENERGY
+        assert ctx["recorder"].segmenter_profiles[0]["vad"] == VAD_SILERO
         assert ctx["recognizer"].configure_calls == []
         assert ctx["speaker_rebuilds"][0] == 0
 
@@ -283,6 +283,27 @@ class TestReloadCoordinatorDiffAndSubsystemIsolation:
         assert ctx["speaker_rebuilds"][0] == 1
         assert ctx["recorder"].segmenter_profiles == []
         assert ctx["recognizer"].configure_calls == []
+
+    def test_repaired_silero_at_same_path_is_reloaded_when_capture_finishes(self) -> None:
+        coord, ctx = _build_coordinator()
+        coord.apply_audio_config()
+        recorder = ctx["recorder"]
+        recorder.segmenter_profiles.clear()
+        recorder.segmentation_status = SegmentationStatus(VAD_SILERO, VAD_ENERGY, True, "bad model")
+        recorder.is_recording = True
+
+        coord.on_models_changed()
+        assert coord.recognition_change_pending
+        assert not recorder.segmenter_profiles
+
+        recorder.is_recording = False
+        coord.apply_pending_recognition_settings()
+        assert not coord.recognition_change_pending
+        assert recorder.segmenter_profiles == [{
+            "vad": VAD_SILERO,
+            "vad_model_path": ctx["aux_paths"][AUX_MODEL_SILERO_VAD],
+            "meeting": False,
+        }]
 
     def test_mode_and_source_hot_switches_apply_policy_without_asr_reload(self) -> None:
         coord, ctx = _build_coordinator(
@@ -436,7 +457,7 @@ class TestReloadCoordinatorLoadEtaAndRuntimeStatus:
         ctx["recognizer"].is_loading = False
         ctx["recognizer"].is_ready = True
         assert coord.runtime_status().state is RuntimeState.READY
-        assert "CAM++ 已下载 · 待加载" in coord.speaker_runtime_status_text()
+        assert "CAM++ 已下载 · 按需加载" in coord.speaker_runtime_status_text()
 
 
 class TestAppHeadlessReloadDI:

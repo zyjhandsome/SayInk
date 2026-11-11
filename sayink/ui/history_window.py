@@ -55,6 +55,7 @@ from sayink.ui.history_export import (
     build_single_session_markdown,
     build_single_session_plain,
     history_shows_speakers,
+    export_save_path,
     suggest_batch_export_filename,
     suggest_single_export_filename,
 )
@@ -471,6 +472,22 @@ class _ClearHistoryDialog(QDialog):
         center = parent.mapToGlobal(parent.rect().center())
         frame = self.frameGeometry()
         self.move(center.x() - frame.width() // 2, center.y() - frame.height() // 2)
+
+
+def confirm_polish_while_disabled(parent) -> bool:
+    """History polish can run while the master switch is off, but only after a warning."""
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle("文字润色已关闭")
+    box.setText("文字润色是关闭的。继续会把这条原文发到已配置的 AI 服务，原文仍留在本机。")
+    box.setStandardButtons(QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok)
+    ok = box.button(QMessageBox.StandardButton.Ok)
+    cancel = box.button(QMessageBox.StandardButton.Cancel)
+    if ok is not None:
+        ok.setText("仍然发送")
+    if cancel is not None:
+        cancel.setText("取消")
+    return box.exec() == QMessageBox.StandardButton.Ok
 
 
 class HistoryWindow(QWidget):
@@ -1005,7 +1022,10 @@ class HistoryWindow(QWidget):
         self._copy_btn.clicked.connect(self._copy_selected_effective)
         tools.add(self._copy_btn)
         self._polish_btn = QPushButton("润色")
-        self._polish_btn.setToolTip("按「AI 服务」中的处理方式（润色或纠错）处理当前会话，原文保留")
+        self._polish_btn.setToolTip(
+            "按「AI 服务」的处理方式处理当前会话，原文保留。"
+            "文字润色关闭时会先确认，确认后才把原文发到已配置的服务。"
+        )
         self._polish_btn.clicked.connect(self._polish_selected_session)
         tools.add(self._polish_btn)
         self._edit_btn = QPushButton("编辑")
@@ -1886,6 +1906,9 @@ class HistoryWindow(QWidget):
             self._show_feedback("请先在 AI 服务中配置接口与模型")
             self.ai_settings_requested.emit()
             return
+        if config is not None and not bool(config.get("llm.enabled", False)):
+            if not confirm_polish_while_disabled(self):
+                return
         if self._settle_pending_merge():
             self.refresh()
             session_id = self._active_session_id() or session_id
@@ -2209,7 +2232,7 @@ class HistoryWindow(QWidget):
             self._export_batch(sessions)
 
     def _export_single(self, session: SessionSummary) -> None:
-        default = suggest_single_export_filename(session)
+        default = export_save_path(suggest_single_export_filename(session))
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "导出历史",
@@ -2235,7 +2258,7 @@ class HistoryWindow(QWidget):
         self._show_feedback("已导出历史")
 
     def _export_batch(self, sessions: list[SessionSummary]) -> None:
-        default = suggest_batch_export_filename()
+        default = export_save_path(suggest_batch_export_filename())
         path, _selected_filter = QFileDialog.getSaveFileName(
             self,
             "批量导出历史",

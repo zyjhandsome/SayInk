@@ -5,7 +5,7 @@ from __future__ import annotations
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QSize, QRectF, pyqtProperty, pyqtSignal
 from PyQt6.QtGui import QColor, QKeyEvent, QPainter, QPen
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel,
+    QComboBox, QFrame, QHBoxLayout, QLabel,
     QCheckBox, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
     QVBoxLayout, QWidget,
 )
@@ -548,6 +548,8 @@ def option_row(title: str, subtitle: str = "") -> QWidget:
 
 def labeled_row(label: str, widget: QWidget, hint: str = "") -> QWidget:
     """Title (+ optional subtitle) on the left; control on the right."""
+    if isinstance(widget, QComboBox):
+        widget.setFixedWidth(tok.CONTROL_SETTINGS_COMBO_WIDTH)
     row = QWidget()
     lay = QHBoxLayout(row)
     lay.setContentsMargins(SPACE_MD, SPACE_SM, SPACE_MD, SPACE_SM)

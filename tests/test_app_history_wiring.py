@@ -501,10 +501,10 @@ class TestDictationSharesRecognitionSettings:
 
         with app_harness({"stt.vad": "energy"}) as h:
             app = h["app"]
-            with patch("sayink.app.aux_model_path") as path:
+            with patch("sayink.app.aux_model_path", return_value=None) as path:
                 app._apply_dictation_segmenter_profile()
-            path.assert_not_called()
-            h["recorder"].set_segmenter_profile.assert_called_with(vad="energy", vad_model_path=None, meeting=False)
+            path.assert_called()
+            h["recorder"].set_segmenter_profile.assert_called_with(vad="silero", vad_model_path=None, meeting=False)
 
     def test_recognition_settings_change_rebuilds_embedder_and_reconfigures(self) -> None:
         with app_harness() as h:
@@ -513,7 +513,7 @@ class TestDictationSharesRecognitionSettings:
             h["recognizer"].configure.reset_mock()
             h["recorder"].set_segmenter_profile.reset_mock()
             app._config.set("stt.debug_force_speaker_model", True)
-            app._config.set("stt.vad", "energy")
+            app._config.set("stt.debug_force_quiet_speech", False)
             app._config.set("stt.language", "en")
             app._on_recognition_settings_changed()
             h["recognizer"].configure.assert_called_once()

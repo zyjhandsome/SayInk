@@ -781,6 +781,16 @@ class TestMeetingPage:
         page._leave_start_card()
         assert page._stack.currentIndex() == PAGE_BROWSE
 
+    def test_start_card_dropdowns_share_width_and_show_full_value_as_tooltip(self, page, _qapp_session):
+        page.resize(900, 650)
+        page.show()
+        page.show_start_card()
+        _qapp_session.processEvents()
+        combos = (page._opt_source, page._opt_model, page._opt_language)
+        assert max(combo.width() for combo in combos) - min(combo.width() for combo in combos) <= 1
+        for combo in combos:
+            assert combo.toolTip() == combo.currentText()
+
     def test_open_start_card_follows_dictation_source_without_replacing_a_choice(self, page, config):
         config.set("meeting.input_source", "")
         config.set("audio.input_source", "system")
@@ -1247,10 +1257,22 @@ class TestMeetingPageAuxDownload:
         assert not page._live_dl_btn.isVisibleTo(page)
 
     def test_failed_download_is_explained_on_card(self, page, monkeypatch):
+        from tests.test_aux_models import _factory
+
         missing = [{"id": "silero-vad", "name": "Silero VAD", "size_mb": 2}]
         monkeypatch.setattr("sayink.ui.meeting_page.missing_aux_models", lambda: missing)
+        installed = set()
+        monkeypatch.setattr("sayink.aux_models.is_model_downloaded", installed.__contains__)
+        workers = []
+        monkeypatch.setattr(page._aux_dl, "_factory", _factory(workers))
+        changed = []
+        page.aux_models_changed.connect(lambda: changed.append(True))
         page.show_start_card()
-        page._on_aux_finished(False, "Silero VAD 下载失败：网络超时")
+        page._download_aux_models()
+        installed.add(workers[0].model_id)
+        workers[0].finished_ok.emit(workers[0].model_id)
+        workers[1].error.emit("网络超时")
+        assert changed == [True]
         assert "网络超时" in page._card_notes.text()
         assert page._card_dl_btn.isVisibleTo(page) and page._card_dl_btn.isEnabled()
 

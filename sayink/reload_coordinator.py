@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import QSystemTrayIcon
 
 from sayink.audio_devices import INPUT_SOURCES, sanitize_system_device_index
 from sayink.recognition_settings import RecognitionSettings, aux_model_path
-from sayink.runtime_status import RuntimeStatus, runtime_status_from_flags
+from sayink.runtime_status import RuntimeStatus, SegmentationStatus, runtime_status_from_flags
 from sayink.speech_recognizer import (
     AUX_MODEL_SILERO_VAD,
     AUX_MODEL_SPEAKER,
@@ -393,7 +393,7 @@ class ReloadCoordinator:
             if self.config.get("stt.debug_force_speaker_model", None) is False:
                 return "CAM++ 增强已关闭 · 使用频谱粗略区分"
             if self.aux_model_path_fn(AUX_MODEL_SPEAKER) is not None:
-                return "CAM++ 已下载 · 待加载（会议或含电脑声音时自动启用）"
+                return "CAM++ 已下载 · 按需加载（会议及使用电脑声音的持续转写中自动启用）"
             return "CAM++ 未下载 · 会议或含电脑声音时使用频谱粗略区分；可在引擎页下载"
         if embedder is not None and getattr(embedder, "model_available", False):
             return "CAM++ 已下载 · 加载失败 · 已回退频谱粗略区分"
@@ -412,10 +412,13 @@ class ReloadCoordinator:
             models_changed
             and self.speaker_aux_paths(new) != self.applied_speaker_aux
         )
-        segmenter_changed = new.segmenter_key != old.segmenter_key or (
-            models_changed
-            and self.vad_aux_path(new.vad) != self.applied_vad_aux
-        )
+        segmenter_changed = new.segmenter_key != old.segmenter_key
+        if models_changed:
+            vad_path = self.vad_aux_path(new.vad)
+            status = getattr(self.recorder, "segmentation_status", None)
+            # Repair can replace the file in place, leaving the path unchanged.
+            retry_failed_vad = isinstance(status, SegmentationStatus) and bool(status.error and vad_path)
+            segmenter_changed = segmenter_changed or vad_path != self.applied_vad_aux or retry_failed_vad
         new_asr_key = self.recognition_runtime_key(new)
         old_asr_key = self.applied_recognition_key
         if old_asr_key is None:

@@ -1284,7 +1284,12 @@ def test_polish_during_a_pending_merge_commits_it_first(qapp):
 
     class Config:
         def get(self, key, default=None):
-            return {"llm.api_url": "http://localhost/v1", "llm.api_key": "k", "llm.model_name": "m"}.get(key, default)
+            return {
+                "llm.api_url": "http://localhost/v1",
+                "llm.api_key": "k",
+                "llm.model_name": "m",
+                "llm.enabled": True,
+            }.get(key, default)
 
     class Polisher(QObject):
         polish_complete = pyqtSignal(str)
@@ -1403,6 +1408,7 @@ def test_single_session_on_demand_ai_polish_and_error_protection(qapp):
                 "llm.model_name": "deepseek-chat",
                 "llm.prompt": "我的自定义提示词",
                 "llm.mode": "polish",
+                "llm.enabled": True,
                 "stt.glossary": [{"term": "SayInk", "variants": ["say ink"]}],
             }.get(key, default)
 
@@ -1465,6 +1471,7 @@ def test_history_ai_action_follows_correct_mode_and_fidelity_guard(qapp):
                 "llm.model_name": "deepseek-chat",
                 "llm.prompt": "",
                 "llm.mode": "correct",
+                "llm.enabled": True,
                 "stt.glossary": [{"term": "新盘", "variants": ["训盘"]}],
             }.get(key, default)
 
@@ -1493,6 +1500,43 @@ def test_history_ai_action_follows_correct_mode_and_fidelity_guard(qapp):
     assert store.updated_polished == [("older", {0: "这套房子赠送车位，新盘下周开。"})]
     assert "已完成纠错" in window._feedback_label.text()
     assert window._polish_btn.text() == "重新纠错"
+
+
+def test_history_polish_asks_before_sending_when_the_master_switch_is_off(qapp, monkeypatch):
+    from PyQt6.QtCore import QObject, pyqtSignal
+
+    class FakePolisher(QObject):
+        polish_complete = pyqtSignal(str)
+        polish_error = pyqtSignal(str)
+
+        def polish(self, text, *args, **kwargs):
+            self.text = text
+
+    class FakeConfig:
+        def get(self, key, default=None):
+            return {
+                "llm.api_url": "https://api.example.com/v1",
+                "llm.api_key": "sk-test",
+                "llm.model_name": "deepseek-chat",
+                "llm.enabled": False,
+            }.get(key, default)
+
+    store = FakeHistoryStore()
+    polisher = FakePolisher()
+    window = HistoryWindow(store, config=FakeConfig(), polisher=polisher)
+    window.show()
+    window._session_list.setCurrentItem(window.session_items()[1])
+    answers = iter((False, True))
+    monkeypatch.setattr(
+        "sayink.ui.history_window.confirm_polish_while_disabled",
+        lambda _parent: next(answers),
+    )
+
+    window._polish_btn.click()
+    assert not hasattr(polisher, "text")
+
+    window._polish_btn.click()
+    assert polisher.text == "older raw"
 
 
 def test_batch_merge_sessions_with_8s_undo_and_commit(qapp):

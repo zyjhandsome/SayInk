@@ -290,7 +290,6 @@ class GeneralSettingsPage(SettingsPage):
     glossary_text_changed = pyqtSignal()
     glossary_editing_finished = pyqtSignal()
     vad_download_requested = pyqtSignal()
-    recognition_reset_requested = pyqtSignal()
     meeting_setting_changed = pyqtSignal()
     meeting_start_card_reset_requested = pyqtSignal()
     llm_proxy_changed = pyqtSignal(int)
@@ -364,7 +363,6 @@ class GeneralSettingsPage(SettingsPage):
     recognition_apply_label: QLabel
     advanced_recognition_btn: QPushButton
     advanced_recognition_panel: QWidget
-    meeting_vad_combo: QComboBox
     vad_runtime_label: QLabel
     vad_download_status: QLabel
     vad_download_status_row: QWidget
@@ -375,7 +373,6 @@ class GeneralSettingsPage(SettingsPage):
     speaker_enabled_row: ToggleOptionRow
     speaker_runtime_label: QLabel
     speaker_activity_row: ToggleOptionRow
-    recognition_reset_btn: QPushButton
     meeting_source_combo: QComboBox
     meeting_model_combo: QComboBox
     meeting_defaults_hint: QLabel
@@ -438,9 +435,7 @@ class GeneralSettingsPage(SettingsPage):
             self.meeting_language_combo,
             self.meeting_glossary_edit,
             self.advanced_recognition_btn,
-            self.meeting_vad_combo,
             self.vad_download_btn,
-            self.recognition_reset_btn,
             self.meeting_source_combo,
             self.meeting_model_combo,
             self.meeting_start_card_row,
@@ -542,7 +537,6 @@ class GeneralSettingsPage(SettingsPage):
 
     def _build_output_controls(self, lay: QVBoxLayout) -> None:
         self.output_mode_combo = QComboBox()
-        self.output_mode_combo.setMinimumWidth(220)
         self.output_mode_combo.setAccessibleName("识别结果去向")
         self.output_mode_combo.addItem("自动（随音源切换）", "auto")
         self.output_mode_combo.addItem("输入当前光标", OUTPUT_MODE_PASTE)
@@ -629,7 +623,6 @@ class GeneralSettingsPage(SettingsPage):
         self.mic_device_combo.setAccessibleName("麦克风设备")
         self.system_device_combo.setAccessibleName("电脑声音设备")
         for combo in (self.mic_device_combo, self.system_device_combo):
-            combo.setFixedWidth(tok.CONTROL_DEVICE_COMBO_WIDTH)
             combo.currentIndexChanged.connect(self.audio_device_changed.emit)
         adv_lay.addWidget(labeled_row("麦克风", self.mic_device_combo))
         adv_lay.addWidget(group_divider())
@@ -734,7 +727,6 @@ class GeneralSettingsPage(SettingsPage):
 
         self.listen_bar_combo = QComboBox()
         self.listen_bar_combo.setAccessibleName("转写条位置")
-        self.listen_bar_combo.setMinimumWidth(220)
         for key, label in LISTEN_BAR_PLACEMENT_LABELS:
             self.listen_bar_combo.addItem(label, key)
         self.listen_bar_combo.currentIndexChanged.connect(self.listen_bar_placement_changed.emit)
@@ -747,7 +739,6 @@ class GeneralSettingsPage(SettingsPage):
     def _build_preferences_section(self) -> QWidget:
         card, lay = _card()
         self.llm_proxy_combo = QComboBox()
-        self.llm_proxy_combo.setMinimumWidth(220)
         self.llm_proxy_combo.setAccessibleName("AI 服务代理模式")
         self.llm_proxy_combo.addItem("使用系统 / 环境代理", "system")
         self.llm_proxy_combo.addItem("直连（不使用代理）", "direct")
@@ -810,7 +801,7 @@ class GeneralSettingsPage(SettingsPage):
 
         self.meeting_glossary_edit = GlossaryPlainTextEdit()
         self.meeting_glossary_edit.setAccessibleName("自定义词汇")
-        self.meeting_glossary_edit.setPlaceholderText("每行一个词，例如：\nSayInk\n张鑫=张新、张欣\n产品名、人名或专业缩写")
+        self.meeting_glossary_edit.setPlaceholderText("SayInk\n张鑫=张新、张欣")
         self.meeting_glossary_edit.setFixedHeight(96)
         self.meeting_glossary_edit.setTabChangesFocus(True)
         self.paint_glossary_edit()
@@ -818,10 +809,15 @@ class GeneralSettingsPage(SettingsPage):
         self.meeting_glossary_edit.editing_finished.connect(self.glossary_editing_finished.emit)
         lay.addWidget(stacked_field_row(
             "自定义词汇", self.meeting_glossary_edit,
-            "帮助识别专有名词；建议 10–15 条，最多 50 条，每条不超过 20 字。"
-            "普通同音误写优先写「正确词=常见误写」，这种替换不改变解码。"
-            "纯热词过多可能让整句识别变差。",
+            "每行填写一个产品名、人名或专业术语，单次转写、持续转写和会议共用。"
+            "支持热词的模型会在识别时参考这些词，词汇过多可能影响识别效果。\n"
+            "填写「正确词=误写1、误写2」可在识别后直接替换匹配的文字，适用于所有模型；请避免使用容易误替换的词。\n"
+            "最多 50 个词；正确词和每个误写各不超过 20 字，每个词最多 5 个误写。离开输入框、切换页面或关闭设置时保存。",
         ))
+        self.glossary_count_label = footnote("")
+        self.meeting_glossary_edit.textChanged.connect(self.update_glossary_count)
+        lay.addWidget(inline_action_row(self.glossary_count_label, margins=(16, 0, 16, 8)))
+        self.update_glossary_count()
         self.recognition_capability_label = footnote("")
         self.recognition_capability_row = inline_action_row(self.recognition_capability_label, margins=(16, 0, 16, 10))
         lay.addWidget(self.recognition_capability_row)
@@ -838,14 +834,8 @@ class GeneralSettingsPage(SettingsPage):
         advanced.setContentsMargins(0, 0, 0, 0)
         advanced.setSpacing(0)
         advanced.addWidget(group_divider())
-        self.meeting_vad_combo = QComboBox()
-        self.meeting_vad_combo.setAccessibleName("语音分段方式")
-        self.meeting_vad_combo.addItem("自动检测语音（推荐）", "silero")
-        self.meeting_vad_combo.addItem("按音量检测停顿", "energy")
-        self.meeting_vad_combo.currentIndexChanged.connect(
-            lambda _idx=0: self.recognition_setting_changed.emit()
-        )
-        advanced.addWidget(labeled_row("语音分段", self.meeting_vad_combo, "检测语音和停顿，不决定标点；单次转写仍在松开后统一输出"))
+        segmentation_hint = footnote("自动按语音和停顿分段；检测模型不可用时按音量分段。分段不决定标点，单次转写在松开快捷键后统一输出。")
+        advanced.addWidget(inline_action_row(segmentation_hint, margins=(16, 10, 16, 8)))
         self.vad_runtime_label = footnote("尚未获取语音分段运行状态")
         self.vad_runtime_label.setAccessibleName("语音分段实际运行状态")
         advanced.addWidget(inline_action_row(self.vad_runtime_label, margins=(16, 0, 16, 8)))
@@ -876,17 +866,11 @@ class GeneralSettingsPage(SettingsPage):
         self.speaker_activity_row.hide()
 
         advanced.addWidget(group_divider())
-        speaker_diag_title = footnote("说话人区分（按模式与音源自动启停）")
+        speaker_diag_title = footnote("说话人区分（会议及使用电脑声音的持续转写中自动启用）")
         speaker_diag_title.setProperty("viRole", "importantHint")
         advanced.addWidget(inline_action_row(speaker_diag_title, margins=(16, 10, 16, 4)))
         self.speaker_runtime_label = footnote("尚未获取说话人区分运行状态")
         advanced.addWidget(inline_action_row(self.speaker_runtime_label, margins=(16, 0, 16, 8)))
-        self.recognition_reset_btn = _ghost_button(
-            "高级识别恢复默认",
-            self.recognition_reset_requested.emit,
-            tooltip="仅将语音分段恢复为自动检测语音，不改变识别语言、自定义词汇和当前引擎",
-        )
-        advanced.addWidget(inline_action_row(self.recognition_reset_btn, margins=(16, 4, 16, 12)))
         lay.addWidget(self.advanced_recognition_panel)
         section = settings_section("识别", card)
         section.setObjectName("sharedRecognitionSection")
@@ -900,7 +884,7 @@ class GeneralSettingsPage(SettingsPage):
         self.meeting_source_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.meeting_source_combo.setMinimumContentsLength(16)
         self.meeting_source_combo.setAccessibleName("会议音频来源")
-        self.meeting_source_combo.addItem("跟随转写设置", "")
+        self.meeting_source_combo.addItem("跟随转写", "")
         for key in ("mixed", "microphone", "system"):
             self.meeting_source_combo.addItem(input_source_label(key), key)
         self.meeting_source_combo.currentIndexChanged.connect(
@@ -1138,6 +1122,13 @@ class GeneralSettingsPage(SettingsPage):
     def refresh_hotkey_hint(self, config: Config) -> None:
         self.hotkey_hint.setText(dictation_hints(config).detail)
         self.hotkey_hint.setToolTip("启动阈值：单次转写按住约 0.18 秒；持续转写按住约 0.30 秒，避免误触。")
+        is_default = config.get("hotkey", DEFAULT_HOTKEY) == DEFAULT_HOTKEY
+        self.hotkey_reset_btn.setEnabled(True)
+        self.hotkey_reset_btn.setToolTip(
+            "当前已是 Alt+X。点此只会再次确认，不改变转写模式、Esc、音频来源和结果去向。"
+            if is_default else
+            "恢复为 Alt+X，不改变转写模式、Esc、音频来源和结果去向。"
+        )
         continuous = self.selected_trigger_mode() == TRIGGER_MODE_CONTINUOUS
         set_section_visible(self.esc_stop_row, continuous)
         set_section_visible(self.esc_stop_divider, continuous)
@@ -1175,18 +1166,11 @@ class GeneralSettingsPage(SettingsPage):
     def refresh_meeting_defaults(self, config: Config) -> None:
         from sayink.speech_recognizer import get_model_info, is_model_downloaded
 
-        source = dictation_hints(config).source
         model_id = config.get("stt.model_id", "")
         info = get_model_info(model_id)
         model_name = info["name"] if info else model_id or "尚未选择"
-        follow = f"跟随转写（当前：{source}）"
-        if self.meeting_source_combo.itemText(0) != follow:
-            self.meeting_source_combo.setItemText(0, follow)
-        longest = self.meeting_source_combo.fontMetrics().horizontalAdvance(
-            "跟随转写（当前：麦克风 + 电脑声音）"
-        ) + 40
-        if self.meeting_source_combo.minimumWidth() < longest:
-            self.meeting_source_combo.setMinimumWidth(longest)
+        if self.meeting_model_combo.count():
+            self.meeting_model_combo.setItemText(0, f"与转写相同（当前：{model_name}）")
         selected = self.meeting_model_combo.currentData()
         selected_info = get_model_info(selected) if selected else None
         effective_name = selected_info["name"] if selected_info else model_name
@@ -1194,6 +1178,8 @@ class GeneralSettingsPage(SettingsPage):
         if model_missing:
             effective_name = f"{effective_name} 未下载，请到「引擎」下载或改选「与转写相同」"
         effective_source = self.meeting_source_combo.currentText()
+        if self.meeting_source_combo.currentData() == "":
+            effective_source = f"{effective_source}（当前：{dictation_hints(config).source}）"
         self.meeting_defaults_hint.setText(
             f"新会议：{effective_source} · {effective_name}。仅影响之后开始的会议。"
         )
@@ -1216,6 +1202,7 @@ class GeneralSettingsPage(SettingsPage):
 
         shared = RecognitionSettings.from_config(config)
         downloaded = is_model_downloaded(AUX_MODEL_SILERO_VAD)
+        failed = bool(segmentation_status is not None and segmentation_status.error)
         if segmentation_status is not None:
             scope = "当前会议" if segmentation_status.meeting else "当前转写"
             text = f"{scope}：{segmentation_status.label}"
@@ -1227,8 +1214,6 @@ class GeneralSettingsPage(SettingsPage):
             ):
                 text = f"{scope}：Silero VAD 已下载，待本场结束后加载 · 当前使用能量断句"
             self.vad_runtime_label.setToolTip(segmentation_status.error)
-        elif shared.vad == "energy":
-            text = "已选择能量断句 · 尚未获取实际运行状态"
         elif downloaded:
             text = "Silero VAD 已下载 · 尚未确认加载状态"
         else:
@@ -1258,8 +1243,8 @@ class GeneralSettingsPage(SettingsPage):
             apply_parts.append("已保存 · 待本场结束且已录语音处理完成后生效。")
         if glossary_skip_note:
             apply_parts.append(glossary_skip_note)
-        if segmentation_status is not None and segmentation_status.error:
-            apply_parts.append("语音检测模型加载失败，当前按音量分段；可展开高级设置查看。")
+        if failed:
+            apply_parts.append("语音检测模型加载失败，当前按音量分段。可展开高级设置修复。")
         apply_text = " ".join(apply_parts)
         self.recognition_apply_label.setText(apply_text)
         show_apply = bool(apply_text)
@@ -1268,11 +1253,13 @@ class GeneralSettingsPage(SettingsPage):
         if apply_row is not None:
             set_section_visible(apply_row, show_apply)
         if not vad_downloading:
-            set_section_visible(self.vad_download_row, not downloaded)
-            set_section_visible(self.vad_download_status_row, bool(downloaded))
-            self.vad_download_status.setText("语音检测模型（Silero VAD）：文件已下载；运行状态见上方。")
+            set_section_visible(self.vad_download_row, not downloaded or failed)
+            set_section_visible(self.vad_download_status_row, False)
             self.vad_download_btn.setEnabled(True)
-            self.vad_download_btn.setText("下载语音检测模型（约 2 MB）")
+            self.vad_download_btn.setText("修复语音检测模型" if downloaded and failed else "下载语音检测模型（约 2 MB）")
+            self.vad_download_btn.setToolTip(
+                "校验或重新下载模型，并在空闲时重新加载。" if downloaded and failed else ""
+            )
 
     def update_vad_download_progress(self, pct: int) -> None:
         self.vad_download_row.show()
@@ -1326,7 +1313,6 @@ class GeneralSettingsPage(SettingsPage):
 
         set_combo_by_data(self.meeting_source_combo, config.get("meeting.input_source", "") or "")
         set_combo_by_data(self.meeting_model_combo, config.get("meeting.model_id", "") or "")
-        set_combo_by_data(self.meeting_vad_combo, config.get("stt.vad", "silero"))
         set_combo_by_data(self.meeting_language_combo, config.get("stt.language", "auto"))
         self.meeting_start_card_row.setChecked(bool(config.get("meeting.show_start_card", True)))
         self.boundary_context_row.setChecked(bool(config.get("stt.boundary_context_enabled", False)))
@@ -1338,16 +1324,23 @@ class GeneralSettingsPage(SettingsPage):
             blocker = QSignalBlocker(self.meeting_glossary_edit)
             self.meeting_glossary_edit.setPlainText(text)
             del blocker
+        self.update_glossary_count()
+
+    def update_glossary_count(self) -> None:
+        count = sum(bool(line.strip()) for line in self.meeting_glossary_edit.toPlainText().splitlines())
+        self.glossary_count_label.setText(f"已填写 {count} 行 / 最多 50 个词")
 
     def parse_glossary_editor(self) -> tuple[list[dict], str]:
-        from sayink.asr_correction import parse_glossary_line
+        from sayink.asr_correction import parse_glossary_line_with_warnings
         from sayink.speech_recognizer import MAX_HOTWORD_CHARS, MAX_HOTWORDS
 
         terms: list[dict] = []
         seen: set[str] = set()
         skipped: list[str] = []
-        for raw in self.meeting_glossary_edit.toPlainText().splitlines():
-            entry = parse_glossary_line(raw)
+        for line_number, raw in enumerate(self.meeting_glossary_edit.toPlainText().splitlines(), 1):
+            entry, warnings = parse_glossary_line_with_warnings(raw)
+            if warnings:
+                skipped.append(f"第 {line_number} 行：{'、'.join(warnings)}，相关内容未保存")
             if entry is None:
                 continue
             term = entry["term"]
@@ -1355,13 +1348,14 @@ class GeneralSettingsPage(SettingsPage):
                 skipped.append(f"「{term[:8]}…」超过 {MAX_HOTWORD_CHARS} 字，未写入")
                 continue
             if term in seen:
+                skipped.append(f"第 {line_number} 行：正确词重复，未保存")
                 continue
+            if len(terms) >= MAX_HOTWORDS:
+                skipped.append(f"超过 {MAX_HOTWORDS} 个词，其余未保存")
+                break
             seen.add(term)
             entry["term"] = term
             terms.append(entry)
-            if len(terms) >= MAX_HOTWORDS:
-                skipped.append(f"只保存前 {MAX_HOTWORDS} 条")
-                break
         return terms, " ".join(skipped)
 
 

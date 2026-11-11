@@ -81,6 +81,11 @@ class AuxModelDownloads(QObject):
     def running_workers(self):
         return tuple(worker for worker in self._workers if isinstance(worker, QThread) and worker.isRunning())
 
+    @property
+    def downloaded_any(self) -> bool:
+        """Whether this batch placed any complete models on disk."""
+        return bool(self._done)
+
     def start(self, model_ids: list[str] | None = None) -> bool:
         """Begin downloading ``model_ids`` (default: everything missing).
         Returns False when there is nothing to do or a batch is running."""
@@ -108,7 +113,8 @@ class AuxModelDownloads(QObject):
             self._worker = None
             self._current = None
             self.progress.emit(100)
-            self.finished.emit(True, "")
+            # A modal progress dialog may dispatch a cancel while being updated.
+            self.finished.emit(not self._cancelled, "已取消" if self._cancelled else "")
             return
         self._current = self._queue.pop(0)
         worker = self._factory(str(self._current["id"]), self._source)
@@ -141,6 +147,9 @@ class AuxModelDownloads(QObject):
     def _on_worker_done(self, model_id: str) -> None:
         if self._current is not None:
             self._done.append(self._current)
+        if self._cancelled:
+            self._on_worker_error("已取消")
+            return
         prev = self._worker
         self._worker = None
         self._release_if_not_qthread(prev)
@@ -151,10 +160,14 @@ class AuxModelDownloads(QObject):
         self._worker = None
         self._release_if_not_qthread(prev)
         self._queue.clear()
-        name = str((self._current or {}).get("name") or "")
+        current = self._current
         self._current = None
         if self._cancelled:
+            # The worker may have written its last file just before seeing cancel.
+            if current is not None and current not in self._done and is_model_downloaded(current["id"]):
+                self._done.append(current)
             self.finished.emit(False, "已取消")
             return
+        name = str((current or {}).get("name") or "")
         log.warning("会议辅助模型 %s 下载失败: %s", name, message)
         self.finished.emit(False, f"{name} 下载失败：{message}" if name else str(message))

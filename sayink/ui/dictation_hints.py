@@ -41,5 +41,5 @@ def dictation_hints(config) -> DictationHints:
     else:
         output_clause = "；历史已关闭，结果不会保存或输入" if warning else f"并{destination}"
         detail = f"按住快捷键录音，松开后识别{output_clause}；Esc 取消本次录音，不保留本次内容。"
-        shortcut = f"按住 {hotkey}\n松开识别\nEsc 取消本次录音"
+        shortcut = f"按住 {hotkey}，松开识别\nEsc 取消本次录音"
     return DictationHints(source, mode, output, shortcut, detail, warning)

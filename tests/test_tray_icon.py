@@ -183,7 +183,7 @@ class TestTrayMenuStyleAndGrouping:
 def test_model_switch_keeps_the_active_name_beside_the_label(tray):
     tray.update_models(
         [
-            {"id": "firered", "name": "FireRedASR2", "languages": "中/英/方言"},
+            {"id": "firered", "name": "FireRedASR2", "languages": "中/英/方言", "choice_note": "均衡 CTC"},
             {"id": "qwen", "name": "Qwen3-ASR 0.6B", "languages": "中/英/多语种"},
             {"id": "fun", "name": "Fun-ASR-Nano", "languages": "中/英/日/方言"},
         ],
@@ -196,7 +196,7 @@ def test_model_switch_keeps_the_active_name_beside_the_label(tray):
 
     choices = switch.menu().actions()
     assert [a.text() for a in choices] == [
-        "FireRedASR2 · 中/英/方言",
+        "FireRedASR2 · 均衡 CTC · 中/英/方言",
         "Qwen3-ASR 0.6B · 中/英/多语种",
         "Fun-ASR-Nano · 中/英/日/方言",
     ]

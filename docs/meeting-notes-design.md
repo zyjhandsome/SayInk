@@ -341,7 +341,7 @@
 
 | 配置键 | 默认 | 说明 |
 |---|---|---|
-| `stt.vad` | `silero` | `silero / energy`；Silero 模型缺失时自动退回 `energy`。转写用它配短停顿，会议用它配长停顿 |
+| `stt.vad` | `silero` | 旧设置保留兼容；运行时自动尝试 Silero，模型缺失或加载失败时退回 `energy`。转写用短停顿，会议用长停顿 |
 | `stt.glossary` | `[]` | 全局词表，每项 `{"term": "张鑫", "variants": ["张新", "章鑫"]}`；`variants` 供同音替换与提示词使用；对转写与会议都作为热词 |
 | `stt.language` | `auto` | 传给支持 `language` 的加载器；`auto` → `zh`（`effective_language`） |
 | `stt.speaker_model_enabled` | `true` | 已下载时是否启用 CAM++（转写与会议） |

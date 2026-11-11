@@ -51,15 +51,26 @@ class MinutesTemplate:
     builtin: bool = True
     blurb: str = ""  # one user-facing line; ``focus`` is written for the model
     output_mode: str = "minutes"
+    # Optional display names so a template's chapter list matches its blurb.
+    # JSON keys stay the shared section ids; only the heading changes.
+    section_titles: tuple[tuple[str, str], ...] = ()
 
     @property
     def is_refinement(self) -> bool:
         return self.output_mode == "refine"
 
 
+def section_title(template: MinutesTemplate, key: str) -> str:
+    """Heading shown to people and to the model. Falls back to the shared name."""
+    for section, title in template.section_titles:
+        if section == key and title:
+            return title
+    return SECTION_TITLES.get(key, key)
+
+
 def describe_template(template: MinutesTemplate) -> str:
     """Tooltip text: what the template is for and which sections it produces."""
-    sections = "、".join(SECTION_TITLES[s] for s in template.sections if s in SECTION_TITLES)
+    sections = "、".join(section_title(template, s) for s in template.sections if s in SECTION_TITLES)
     lead = template.blurb or template.focus
     if template.is_refinement:
         return lead + "\n输出自然分段的书面文章，保留原文语言和个人口吻；不生成摘要、标题或列表。"
@@ -96,6 +107,11 @@ BUILTIN_TEMPLATES: tuple[MinutesTemplate, ...] = (
             "摘要控制在三句以内。"
         ),
         sections=(SECTION_SUMMARY, SECTION_SPEAKERS, SECTION_ACTION_ITEMS, SECTION_OPEN_QUESTIONS, SECTION_CHAPTERS),
+        section_titles=(
+            (SECTION_SPEAKERS, "每人进展"),
+            (SECTION_ACTION_ITEMS, "下一步"),
+            (SECTION_OPEN_QUESTIONS, "阻塞"),
+        ),
     ),
     MinutesTemplate(
         id="one_on_one",
@@ -106,6 +122,11 @@ BUILTIN_TEMPLATES: tuple[MinutesTemplate, ...] = (
             "语气克制，不评价人。"
         ),
         sections=(SECTION_SUMMARY, SECTION_TOPICS, SECTION_ACTION_ITEMS, SECTION_OPEN_QUESTIONS, SECTION_SPEAKERS),
+        section_titles=(
+            (SECTION_TOPICS, "话题与对方关切"),
+            (SECTION_ACTION_ITEMS, "双方承诺"),
+            (SECTION_OPEN_QUESTIONS, "下次跟进"),
+        ),
     ),
     MinutesTemplate(
         id="customer",
@@ -116,6 +137,11 @@ BUILTIN_TEMPLATES: tuple[MinutesTemplate, ...] = (
             "客户原话中的关键表述尽量保留。"
         ),
         sections=(SECTION_SUMMARY, SECTION_TOPICS, SECTION_OPEN_QUESTIONS, SECTION_ACTION_ITEMS, SECTION_SPEAKERS, SECTION_CHAPTERS),
+        section_titles=(
+            (SECTION_TOPICS, "背景、需求与痛点"),
+            (SECTION_OPEN_QUESTIONS, "顾虑"),
+            (SECTION_ACTION_ITEMS, "承诺与下一步"),
+        ),
     ),
     MinutesTemplate(
         id="review",
@@ -126,6 +152,11 @@ BUILTIN_TEMPLATES: tuple[MinutesTemplate, ...] = (
             "没有达成结论的议题进遗留问题。"
         ),
         sections=(SECTION_SUMMARY, SECTION_TOPICS, SECTION_DECISIONS, SECTION_OPEN_QUESTIONS, SECTION_ACTION_ITEMS, SECTION_CHAPTERS, SECTION_SPEAKERS),
+        section_titles=(
+            (SECTION_TOPICS, "议题与各方观点"),
+            (SECTION_DECISIONS, "结论与理由"),
+            (SECTION_OPEN_QUESTIONS, "未决与风险"),
+        ),
     ),
 )
 
@@ -331,7 +362,7 @@ def build_system_prompt(template: MinutesTemplate, *, output_language: str = "au
         from sayink.transcript_refiner import REFINE_SYSTEM_PROMPT
 
         return REFINE_SYSTEM_PROMPT
-    sections = "、".join(SECTION_TITLES[s] for s in template.sections)
+    sections = "、".join(section_title(template, s) for s in template.sections)
     return (
         _SYSTEM_RULES
         + _language_rule(output_language)
@@ -346,7 +377,7 @@ def build_system_prompt(template: MinutesTemplate, *, output_language: str = "au
 
 def build_markdown_system_prompt(template: MinutesTemplate, *, output_language: str = "auto") -> str:
     """Fallback prompt when the model will not produce valid JSON."""
-    sections = "\n".join(f"## {SECTION_TITLES[s]}" for s in template.sections)
+    sections = "\n".join(f"## {section_title(template, s)}" for s in template.sections)
     return (
         _SYSTEM_RULES
         + _language_rule(output_language)

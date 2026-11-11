@@ -128,7 +128,7 @@ class PolishSettingsPage(SettingsPage):
         self.add(self._build_connection_section())
         self.add(footnote(
             "支持 OpenAI、DeepSeek、通义千问、Ollama 等 OpenAI 兼容接口。"
-            "地址以 http:// 或 https:// 开头即可；公网 HTTP 会明文传输密钥和转写内容。"
+            "地址以 http:// 或 https:// 开头即可。只有地址本身是 http:// 时，密钥和转写内容才会明文传输。"
         ))
         self.add(self._build_polish_section())
         self.add(self._build_minutes_section(config))
@@ -271,6 +271,7 @@ class PolishSettingsPage(SettingsPage):
         self.minutes_model_edit.editingFinished.connect(self.minutes_fields_edited.emit)
         self.minutes_test_btn = QPushButton("测试连接")
         self.minutes_test_btn.setAccessibleName("测试纪要模型")
+        self.minutes_test_btn.setToolTip("模型名称留空时，用上方的接口模型测试。文字润色关闭也可以测。")
         self.style_action_button(self.minutes_test_btn)
         self.minutes_test_btn.clicked.connect(self.minutes_test_requested.emit)
         model_row.addWidget(self.minutes_model_edit, 1)
@@ -305,7 +306,7 @@ class PolishSettingsPage(SettingsPage):
         self.minutes_language_combo = QComboBox()
         self.minutes_language_combo.setAccessibleName("纪要输出语言")
         self.minutes_language_combo.setToolTip("适用于会议纪要；原文精整始终保留原文语言和中外文混用。")
-        for key, label in (("auto", "跟随会议语言"), ("zh", "中文"), ("en", "English"), ("ja", "日本語")):
+        for key, label in (("auto", "与会议语言相同"), ("zh", "中文"), ("en", "English"), ("ja", "日本語")):
             self.minutes_language_combo.addItem(label, key)
         self.minutes_language_combo.currentIndexChanged.connect(
             lambda _idx=0: self.minutes_fields_edited.emit()

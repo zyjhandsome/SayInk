@@ -127,12 +127,18 @@ class ModelCard(QFrame):
                     lambda: self.action_clicked.emit(self._model_id, "select")
                 )
                 actions.addWidget(self._select_btn)
-            self._delete_btn = QPushButton("删除")
-            self._delete_btn.setFixedHeight(btn_h)
-            self._delete_btn.clicked.connect(
-                lambda: self.action_clicked.emit(self._model_id, "delete")
-            )
-            actions.addWidget(self._delete_btn)
+            from sayink.speech_recognizer import is_bundled_model
+            if is_bundled_model(self._model_id):
+                bundled = QLabel("随安装包提供")
+                bundled.setToolTip("安装包自带的模型由安装程序管理。")
+                actions.addWidget(bundled)
+            else:
+                self._delete_btn = QPushButton("删除")
+                self._delete_btn.setFixedHeight(btn_h)
+                self._delete_btn.clicked.connect(
+                    lambda: self.action_clicked.emit(self._model_id, "delete")
+                )
+                actions.addWidget(self._delete_btn)
         else:
             self._action_btn = QPushButton("下载")
             self._action_btn.setFixedHeight(btn_h)

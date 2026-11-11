@@ -61,8 +61,13 @@ class HotkeyEdit(QLineEdit):
         self.setText(format_hotkey(hotkey))
 
     def mousePressEvent(self, event):
-        self._begin_capture()
+        self.begin_capture()
         super().mousePressEvent(event)
+
+    def begin_capture(self) -> None:
+        """Enter capture immediately. About's 「修改快捷键」 uses this so the first click is enough."""
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._begin_capture()
 
     def _begin_capture(self) -> None:
         from sayink.ui import design_tokens as tok
@@ -80,7 +85,7 @@ class HotkeyEdit(QLineEdit):
     def keyPressEvent(self, event):
         if not self._capturing:
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
-                self._begin_capture()
+                self.begin_capture()
                 event.accept()
                 return
             super().keyPressEvent(event)

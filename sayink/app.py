@@ -2453,9 +2453,9 @@ class App(QObject):
         box = QMessageBox(self._main)
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle("会议辅助模型")
-        box.setText("区分说话人和更稳的断句需要两个小模型，现在下载吗？")
+        box.setText("部分识别辅助模型尚未下载，现在下载吗？")
         box.setInformativeText(
-            f"{describe_aux_models(missing)}。不下载也能开会，但同一个人可能被分成多位说话人。"
+            f"{describe_aux_models(missing)}。不下载也能开会，但语音分段或说话人区分可能不够准确。"
             "之后随时可在 会议 页或 引擎 页下载；此提示只出现一次。"
         )
         download = box.addButton("下载后开始", QMessageBox.ButtonRole.AcceptRole)
@@ -2475,7 +2475,13 @@ class App(QObject):
 
         from sayink.aux_models import AuxModelDownloads
 
-        downloads = AuxModelDownloads(str(self._config.get("stt.download_source", "auto") or "auto"), self)
+        downloads = self._safe_attr("_meeting_start_downloads")
+        if downloads is not None and downloads.running:
+            return
+        # Retain the batch and its threads until they have exited, including on quit.
+        if downloads is None:
+            downloads = AuxModelDownloads(str(self._config.get("stt.download_source", "auto") or "auto"), self)
+            self._meeting_start_downloads = downloads
         dialog = QProgressDialog("正在下载会议辅助模型…", "取消", 0, 100, self._main)
         dialog.setWindowTitle("会议辅助模型")
         dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
@@ -2487,9 +2493,16 @@ class App(QObject):
         dialog.canceled.connect(downloads.cancel)
 
         def finished(ok: bool, message: str) -> None:
+            downloads.finished.disconnect(finished)
             dialog.close()
             dialog.deleteLater()
-            downloads.deleteLater()
+            if self._safe_attr("_exit_started", False):
+                return
+            if downloads.downloaded_any:
+                settings = self._settings_widget()
+                if settings is not None:
+                    settings._rebuild_model_cards()
+                self._on_models_changed()
             if ok:
                 log.info("会议辅助模型已就绪，开始会议")
                 self._start_meeting_or_show_browse(options)
@@ -2507,9 +2520,9 @@ class App(QObject):
         downloads.finished.connect(finished)
         if not downloads.start():
             # Someone downloaded them meanwhile: nothing to wait for.
+            downloads.finished.disconnect(finished)
             dialog.close()
             dialog.deleteLater()
-            downloads.deleteLater()
             self._start_meeting_or_show_browse(options)
             return
         dialog.show()
@@ -2781,7 +2794,7 @@ class App(QObject):
     def _sync_tray_status_summary(self, status: RuntimeStatus | None = None) -> None:
         status = status or self._runtime_status()
         if status.state is RuntimeState.READY:
-            summary = f"{status.label} · {self._active_model_display_name()}"
+            summary = f"{status.label} · 按住 {format_hotkey(self._config.get('hotkey', DEFAULT_HOTKEY))}"
         else:
             summary = status.label
         self._tray.set_status_summary(summary)
@@ -3253,6 +3266,9 @@ class App(QObject):
         settings = self._settings_widget()
         if settings is not None:
             settings.cancel_all_downloads()
+        meeting_start_downloads = self._safe_attr("_meeting_start_downloads")
+        if meeting_start_downloads is not None:
+            meeting_start_downloads.cancel()
         if self._main is not None:
             cancel_meeting_dl = getattr(self._main.meeting_panel, "cancel_downloads", None)
             if callable(cancel_meeting_dl):
@@ -3283,7 +3299,7 @@ class App(QObject):
             self._config.save_immediate()
         self._release_instance_lock_once()
         owners = [self._recognizer, self._polisher, self._meeting, self._updates, self._settings_widget()]
-        owners.append(getattr(self, "_recovery_dialog", None))
+        owners.extend((getattr(self, "_recovery_dialog", None), self._safe_attr("_meeting_start_downloads")))
         if self._main is not None:
             owners.append(self._main.meeting_panel)
         # Native model loading cannot safely be force-terminated. Keep the Qt

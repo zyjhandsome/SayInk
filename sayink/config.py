@@ -108,7 +108,7 @@ DEFAULT_CONFIG = {
         # 识别增强——转写与会议共用（曾是 meeting.* 键，启动时自动迁移）。
         "glossary": [],            # [{"term": "张鑫", "variants": ["张新"]}] → 热词
         "language": "auto",        # 语种锁定；auto → zh（支持 language 的模型）
-        "vad": "silero",           # silero / energy；Silero 未下载时自动退回 energy
+        "vad": "silero",           # 旧设置保留兼容；运行时自动尝试 Silero，失败时按音量分段
         "boundary_context_enabled": False,
     },
     "llm": {

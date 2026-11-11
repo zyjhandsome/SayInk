@@ -47,9 +47,9 @@ def _factory(created: list):
 def test_missing_and_description(monkeypatch):
     monkeypatch.setattr("sayink.aux_models.is_model_downloaded", lambda mid: mid == AUX_MODEL_SILERO_VAD)
     missing = missing_aux_models()
-    assert [m["id"] for m in missing] == [AUX_MODEL_SPEAKER]
-    assert aux_models_size_mb(missing) == 28
-    assert describe_aux_models(missing) == "说话人嵌入 CAM++（约 28 MB）"
+    assert [m["id"] for m in missing] == [AUX_MODEL_SPEAKER, AUX_MODEL_SPEAKER_ACTIVITY]
+    assert aux_models_size_mb(missing) == 30
+    assert describe_aux_models(missing) == "说话人嵌入 CAM++、多人发言检测（实验性）（约 30 MB）"
     assert describe_aux_models([]) == ""
     monkeypatch.setattr("sayink.aux_models.is_model_downloaded", lambda mid: True)
     assert missing_aux_models() == []
@@ -70,12 +70,16 @@ def test_sequential_batch_with_weighted_progress(monkeypatch):
     assert created[0].source == "mirror" and created[0].started
 
     created[0].progress.emit(50)
-    assert seen[-1] == int(28 * 0.5 / 30 * 100)            # 46 % of the whole batch
+    assert seen[-1] == int(28 * 0.5 / 32 * 100)
     created[0].finished_ok.emit(AUX_MODEL_SPEAKER)
     assert [w.model_id for w in created] == [AUX_MODEL_SPEAKER, AUX_MODEL_SILERO_VAD]
     created[1].progress.emit(100)
-    assert seen[-1] == 99                                   # capped until the last file lands
+    assert seen[-1] == int(30 / 32 * 100)
     created[1].finished_ok.emit(AUX_MODEL_SILERO_VAD)
+    assert created[2].model_id == AUX_MODEL_SPEAKER_ACTIVITY
+    created[2].progress.emit(100)
+    assert seen[-1] == 99  # capped until the last file lands
+    created[2].finished_ok.emit(AUX_MODEL_SPEAKER_ACTIVITY)
     assert seen[-1] == 100
     assert done == [(True, "")]
     assert not batch.running
@@ -91,9 +95,9 @@ def test_subset_and_nothing_to_do(monkeypatch):
     assert AuxModelDownloads(worker_factory=_factory([])).start() is False
 
 
-def test_experimental_activity_model_is_optional_but_explicitly_downloadable(monkeypatch):
+def test_activity_model_is_in_default_batch_and_explicitly_downloadable(monkeypatch):
     monkeypatch.setattr("sayink.aux_models.is_model_downloaded", lambda mid: False)
-    assert AUX_MODEL_SPEAKER_ACTIVITY not in {m["id"] for m in missing_aux_models()}
+    assert AUX_MODEL_SPEAKER_ACTIVITY in {m["id"] for m in missing_aux_models()}
     assert AUX_MODEL_SPEAKER_ACTIVITY in {m["id"] for m in missing_aux_models(include_optional=True)}
     created = []
     batch = AuxModelDownloads(worker_factory=_factory(created))
@@ -124,6 +128,22 @@ def test_cancel_reports_cancelled(monkeypatch):
     assert created[0].cancelled
     created[0].error.emit("cancelled")                      # the real worker reports via error
     assert done == [(False, "已取消")]
+
+
+def test_cancelled_batch_keeps_landed_model_without_starting_next_worker(monkeypatch):
+    monkeypatch.setattr("sayink.aux_models.is_model_downloaded", lambda _mid: False)
+    workers = []
+    batch = AuxModelDownloads(worker_factory=_factory(workers))
+    done = []
+    batch.finished.connect(lambda ok, msg: done.append((ok, msg)))
+    assert batch.start()
+
+    batch.cancel()
+    workers[0].finished_ok.emit(workers[0].model_id)
+
+    assert done == [(False, "已取消")]
+    assert batch.downloaded_any
+    assert len(workers) == 1 and not batch.running
 
 
 def test_registry_models_are_all_aux():

@@ -221,9 +221,9 @@ def test_speaker_and_vad_are_isolated_from_glossary_and_language_changes():
         h["recorder"].set_segmenter_profile.assert_not_called()
         assert app._embedder is embedder_before
 
-        # 3) VAD change -> rebuilds segmenter only; keeps embedder & STT.
+        # 3) Segmenter policy change -> rebuilds segmenter only; keeps embedder & STT.
         h["recognizer"].configure.reset_mock()
-        app._config.set("stt.vad", "energy")
+        app._config.set("stt.debug_force_quiet_speech", False)
         app._on_recognition_settings_changed()
         h["recorder"].set_segmenter_profile.assert_called_once()
         h["recognizer"].configure.assert_not_called()

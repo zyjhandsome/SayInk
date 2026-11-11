@@ -424,6 +424,32 @@ def test_close_hides_does_not_quit(qapp, tmp_path, monkeypatch):
         store.close()
 
 
+@pytest.mark.parametrize("maximized", [False, True])
+def test_reopening_minimized_window_restores_previous_size(qapp, tmp_path, monkeypatch, maximized):
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        if maximized:
+            win.showMaximized()
+        else:
+            win.show()
+        qapp.processEvents()
+        previous_size = win.size()
+
+        win.showMinimized()
+        qapp.processEvents()
+        assert win.isMinimized()
+
+        win.show()
+        qapp.processEvents()
+        assert win.isVisible()
+        assert not win.isMinimized()
+        assert win.isMaximized() is maximized
+        assert win.size() == previous_size
+    finally:
+        win.close()
+        store.close()
+
+
 def test_show_page_embeds_hosts(qapp, tmp_path, monkeypatch):
     from sayink.config import Config
     from sayink.history_store import HistoryStore

@@ -91,7 +91,16 @@ def _model_switch_title(active_name: str) -> str:
 
 
 def _model_choice_label(model: dict) -> str:
-    return _paired_label(str(model.get("name") or ""), str(model.get("languages") or ""))
+    """Name, then a short role when one exists, then languages.
+
+    Two FireRed builds share a family name; the role is what tells them apart
+    in a menu that has no room for the engine-page description.
+    """
+    name = str(model.get("name") or "")
+    note = str(model.get("choice_note") or "").strip()
+    languages = str(model.get("languages") or "").strip()
+    detail = _MENU_JOIN.join(part for part in (note, languages) if part)
+    return _paired_label(name, detail)
 
 
 def _paint_menu(menu) -> None:

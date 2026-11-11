@@ -1381,6 +1381,41 @@ def _sha256(body: bytes) -> str:
 
 
 class TestModelDownloadSources:
+    def test_silero_repair_uses_a_verified_user_copy_over_damaged_bundle(self, monkeypatch, tmp_path):
+        import httpx
+        import sayink.speech_recognizer as sr
+
+        model_id = sr.AUX_MODEL_SILERO_VAD
+        info = sr.get_model_info(model_id)
+        filename = info["files"][0]
+        weights = b"verified Silero weights"
+        monkeypatch.setitem(info, "sha256", {filename: _sha256(weights)})
+        bundled_root = tmp_path / "installed"
+        user_root = tmp_path / "user"
+        bundled = bundled_root / info["dir_name"] / filename
+        bundled.parent.mkdir(parents=True)
+        bundled.write_bytes(b"bad model")
+        monkeypatch.setattr(sr, "_portable_model_roots", lambda: [bundled_root])
+        monkeypatch.setattr(sr, "user_models_dir", lambda: user_root)
+        monkeypatch.setattr(httpx, "stream", lambda *_a, **_kw: _FakeHttpStream(weights))
+        assert sr.get_model_dir(model_id) == bundled.parent
+        assert sr.is_bundled_model(model_id)
+
+        done, errors = [], []
+        worker = sr.ModelDownloadWorker(model_id, source="huggingface")
+        worker.finished_ok.connect(done.append)
+        worker.error.connect(errors.append)
+        worker.run()
+
+        assert done == [model_id] and not errors
+        repaired = user_root / info["dir_name"] / filename
+        assert sr.get_model_dir(model_id) == repaired.parent
+        assert repaired.read_bytes() == weights
+        assert bundled.read_bytes() == b"bad model"
+        assert not sr.is_bundled_model(model_id)
+        assert sr.delete_model(model_id)
+        assert sr.get_model_dir(model_id) == bundled.parent
+
     def _worker(self, monkeypatch, tmp_path, responses, source="auto"):
         import httpx
         import sayink.speech_recognizer as sr

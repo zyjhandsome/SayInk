@@ -22,13 +22,14 @@ from sayink.speech_recognizer import (
     is_model_downloaded,
     model_supports,
 )
-from sayink.vad_segmenter import VAD_ENERGY, VAD_SILERO
+from sayink.vad_segmenter import VAD_SILERO
 
 # Where the shared recognition options (VAD, CAM++, overlap detection) and
 # their real load state live in the UI. Every hint that sends the user there
 # spells the path from here; the section was once called 「公共识别」 and that
 # name lingered in tooltips after the page moved.
 ADVANCED_RECOGNITION_PATH = "通用 → 识别 → 高级识别设置"
+HOTWORDS_UNSUPPORTED_NOTE = "当前模型不支持识别期热词。已配置的误写替换仍用于转写，术语也可用于会议纪要。"
 
 # Audio sources containing system loopback where multi-speaker separation is
 # automatically enabled in continuous dictation.
@@ -186,7 +187,6 @@ class RecognitionSettings:
         input_source: str | None = None,
     ) -> "RecognitionSettings":
         glossary = config.get("stt.glossary", [])
-        vad = config.get("stt.vad", VAD_SILERO)
         mode = "meeting" if meeting else str(config.get("audio.trigger_mode", "hotkey") or "hotkey")
         resolved_source = (
             input_source if input_source is not None else audio_source(config, meeting=meeting)
@@ -196,7 +196,9 @@ class RecognitionSettings:
             model_id=str(config.get("stt.model_id", DEFAULT_MODEL_ID) or DEFAULT_MODEL_ID),
             glossary=deepcopy(glossary) if isinstance(glossary, list) else [],
             language=str(config.get("stt.language", "auto") or "auto"),
-            vad=vad if vad in (VAD_SILERO, VAD_ENERGY) else VAD_SILERO,
+            # Retired manual energy-only preference: always try Silero first;
+            # the segmenter falls back to energy when the model cannot load.
+            vad=VAD_SILERO,
             speaker_model_enabled=policy.speaker_model_enabled,
             speaker_activity_enabled=policy.speaker_activity_enabled,
             quiet_speech_enabled=policy.quiet_speech_mode is not False,
@@ -269,11 +271,11 @@ class RecognitionSettings:
         notes = []
         if (self.boundary_context_enabled
                 and (get_model_info(self.model_id) or {}).get("loader") not in {"fire_red_asr_ctc", "zipformer_ctc"}):
-            notes.append("当前模型没有可用的词元时间戳，跨段上下文不生效；仍识别完整原片段。")
+            notes.append("当前模型不支持跨段上下文；语音仍会正常识别。")
         if self.quiet_speech_mode is True and self.vad != VAD_SILERO:
             notes.append("轻声增强需要实际加载 Silero；能量断句不启用此增强。")
         if self.hotwords and not self.hotwords_supported:
-            notes.append("当前模型不支持识别期热词；术语仍可用于会议纪要。")
+            notes.append(HOTWORDS_UNSUPPORTED_NOTE)
         if not self.language_supported:
             notes.append("当前模型不支持指定识别语言，将按模型自身能力识别。")
         return notes

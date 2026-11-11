@@ -168,7 +168,8 @@ READING_LINE_HEIGHT = 160
 
 # Wide enough for values like「5500 场」plus a 22px flat stepper column.
 CONTROL_NUMERIC_WIDTH = 120
-CONTROL_DEVICE_COMBO_WIDTH = 320
+CONTROL_SETTINGS_COMBO_WIDTH = 240
+CONTROL_DEVICE_COMBO_WIDTH = CONTROL_SETTINGS_COMBO_WIDTH
 
 # Shared box for settings small actions (accent + ghost) so paired
 # buttons like「使用此模型」/「删除」paint at the same outer height.

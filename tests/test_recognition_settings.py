@@ -128,7 +128,7 @@ def test_recognition_changes_wait_for_capture_and_queued_speech(continuous):
         recorder.is_continuous = continuous
         recorder.set_segmenter_profile.reset_mock()
         h["recognizer"].configure.reset_mock()
-        app._config.set("stt.vad", "energy")
+        app._config.set("stt.debug_force_quiet_speech", False)
         app._config.set("stt.language", "en")
         app._on_recognition_settings_changed()
         assert app._recognition_change_pending
@@ -151,7 +151,7 @@ def test_recognition_changes_wait_for_capture_and_queued_speech(continuous):
         saved = "".join(call.args[0].raw_text for call in h["history"].enqueue.call_args_list)
         assert "第一句" in saved and "第二句" in saved
         assert not app._recognition_change_pending
-        recorder.set_segmenter_profile.assert_called_once_with(vad="energy", vad_model_path=None, meeting=False)
+        recorder.set_segmenter_profile.assert_called_once_with(vad="silero", vad_model_path=None, meeting=False)
         assert h["recognizer"].configure.call_args.kwargs["language"] == "en"
 
 
@@ -215,7 +215,7 @@ def test_meeting_keeps_settings_until_finalize():
         recorder.start_continuous.side_effect = lambda: setattr(recorder, "is_continuous", True)
         assert app.start_meeting(MeetingOptions())
         recorder.set_segmenter_profile.reset_mock()
-        app._config.set("stt.vad", "energy")
+        app._config.set("stt.debug_force_quiet_speech", False)
         app._on_recognition_settings_changed()
         assert app._recognition_change_pending
         recorder.set_segmenter_profile.assert_not_called()
@@ -223,7 +223,7 @@ def test_meeting_keeps_settings_until_finalize():
         with patch("sayink.app.aux_model_path", return_value=None):
             app.meeting.finalize()
         assert not app._recognition_change_pending
-        recorder.set_segmenter_profile.assert_called_with(vad="energy", vad_model_path=None, meeting=False)
+        recorder.set_segmenter_profile.assert_called_with(vad="silero", vad_model_path=None, meeting=False)
 
 
 def test_dictation_spells_english_the_way_the_glossary_does():

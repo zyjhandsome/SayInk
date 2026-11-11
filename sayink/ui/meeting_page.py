@@ -73,6 +73,7 @@ from sayink.meeting_session import (
 )
 from sayink.meeting_store import STATUS_ENDED, STATUS_INTERRUPTED, STATUS_LIVE, MeetingRecord, QueuedGeneration, now_ms
 from sayink.minutes_prompts import describe_template, format_timestamp, get_template, list_templates, transcript_lines
+from sayink.ui.history_export import export_save_path
 from sayink.recognition_settings import ADVANCED_RECOGNITION_PATH, audio_source
 from sayink.speech_recognizer import DEFAULT_MODEL_ID, MODEL_REGISTRY, is_model_downloaded
 from sayink.ui import design_tokens as tok
@@ -415,7 +416,8 @@ class MeetingPage(QWidget):
         for index, button in enumerate((self._tab_notes, self._tab_transcript)):
             button.setCheckable(True)
             button.setObjectName("meetingTab")
-            button.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            button.setMinimumWidth(88)
+            button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
             self._tab_group.addButton(button, index)
             tabs_lay.addWidget(button, 0, Qt.AlignmentFlag.AlignVCenter)
         self._tab_notes.setChecked(True)
@@ -599,16 +601,20 @@ class MeetingPage(QWidget):
         self._opt_language.setAccessibleName("会议语言")
         for key, label in _LANGUAGE_LABELS:
             self._opt_language.addItem(label, key)
-        for caption, field, stretch in (("音频来源", self._opt_source, 2),
-                                        ("转写模型", self._opt_model, 2),
-                                        ("识别语言", self._opt_language, 1)):
+        for caption, field in (("音频来源", self._opt_source),
+                               ("转写模型", self._opt_model),
+                               ("识别语言", self._opt_language)):
+            field.setMinimumWidth(0)
+            field.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            field.currentTextChanged.connect(field.setToolTip)
+            field.setToolTip(field.currentText())
             column = QVBoxLayout()
             column.setSpacing(4)
             label = QLabel(caption)
             label.setBuddy(field)
             column.addWidget(label)
             column.addWidget(field)
-            row.addLayout(column, stretch)
+            row.addLayout(column, 1)
         lay.addLayout(row)
 
         self._card_notes = QLabel("")
@@ -899,7 +905,7 @@ class MeetingPage(QWidget):
                                    border-radius: {tok.RADIUS_MD}px; }}
             QPushButton#meetingTab {{ background: transparent; color: {tok.TEXT_SEC};
                                       border: 1px solid transparent; border-radius: {tok.RADIUS_SM}px;
-                                      padding: 0 12px; min-height: {chip_h}px; max-height: {chip_h}px;
+                                      padding: 0 16px; min-height: {chip_h}px; max-height: {chip_h}px;
                                       font-size: {tok.TYPE_BODY_SM}px; font-weight: 400; }}
             QPushButton#meetingTab:hover:!checked {{ color: {tok.TEXT}; background: {tok.ROW_HOVER}; }}
             QPushButton#meetingTab:checked {{ background: {tok.SECONDARY_CONTAINER}; color: {tok.TEXT};
@@ -1348,6 +1354,7 @@ class MeetingPage(QWidget):
         self._generate_btn.setStyleSheet(ss.BTN_GHOST_SM if has_notes and configured else ss.BTN_ACCENT_SM)
         self._generate_btn.setEnabled(not blocked and record.status != STATUS_LIVE)
         self._restore_action.setEnabled(not generating and notes is not None and bool(notes.previous_markdown))
+        self._restore_action.setToolTip("" if self._restore_action.isEnabled() else "还没有上一版可恢复")
         self._cancel_btn.setVisible(generating or waiting)
         self._cancel_btn.setText("取消" if generating else "取消排队")
         default_template = notes.template_id if notes is not None and notes.template_id else self._config.get("meeting.template_id", "general")
@@ -1401,6 +1408,8 @@ class MeetingPage(QWidget):
                 self._notes_empty.setText(self._notes_view.placeholderText())
                 self._notes_stack.setCurrentWidget(self._notes_empty)
         self._edit_btn.setEnabled(not generating and (bool(markdown) or self._editing_notes))
+        if not self._edit_btn.isEnabled():
+            self._edit_btn.setToolTip(f"还没有{self._result_label()}可编辑")
         self._sync_notes_state(notes)
 
         segments = self._store.get_segments(self._detail_id)
@@ -1592,6 +1601,8 @@ class MeetingPage(QWidget):
         has_notes = bool(self._current_notes_text().strip())
         has_transcript = bool(self._detail_id and self._transcript_offsets)
         self._copy_btn.setEnabled(has_notes)
+        if not has_notes:
+            self._copy_btn.setToolTip(f"还没有{self._result_label()}可复制")
         self._transcript_copy_btn.setEnabled(has_transcript)
         # Same filled action as 历史's copy button. The large primary style is
         # taller than the shared small-button box and made the two toolbars disagree.
@@ -2119,7 +2130,9 @@ class MeetingPage(QWidget):
         if record is None:
             return
         label = {"notes": self._result_label(), "transcript": "文字稿", "all": "完整会议记录"}[scope]
-        default = f"{safe_filename(record.display_title)}-{label}-{time.strftime('%Y%m%d', time.localtime(record.started_at / 1000))}.md"
+        default = export_save_path(
+            f"{safe_filename(record.display_title)}-{label}-{time.strftime('%Y%m%d', time.localtime(record.started_at / 1000))}.md"
+        )
         path, selected = QFileDialog.getSaveFileName(
             self, "导出" + label, default,
             "Markdown (*.md);;纯文本 (*.txt);;SRT 字幕 (*.srt)",
@@ -2402,19 +2415,27 @@ class MeetingPage(QWidget):
         self._opt_source.setCurrentIndex(max(0, index))
         self._opt_model.blockSignals(True)
         self._opt_model.clear()
-        self._opt_model.addItem("与转写相同", "")
+        self._opt_model.addItem(self._follow_model_label(), "")
         for model in MODEL_REGISTRY:
             if is_model_downloaded(model["id"]):
                 self._opt_model.addItem(model["name"], model["id"])
         index = self._opt_model.findData(defaults.model_id)
         self._opt_model.setCurrentIndex(max(0, index))
         self._opt_model.blockSignals(False)
+        self._opt_model.setToolTip(self._opt_model.currentText())
         index = self._opt_language.findData(defaults.language)
         self._opt_language.setCurrentIndex(max(0, index))
         self._update_card_notes()
         self._start_btn.setVisible(False)
         self._stack.setCurrentIndex(PAGE_START)
         self._opt_title.setFocus()
+
+    def _follow_model_label(self) -> str:
+        from sayink.speech_recognizer import get_model_info
+
+        info = get_model_info(self._config.get("stt.model_id", ""))
+        name = info["name"] if info else "尚未选择"
+        return f"与转写相同（当前：{name}）"
 
     def _sync_follow_source_label(self) -> None:
         """The follow option names the dictation source; a card choice stays put."""
@@ -2477,8 +2498,9 @@ class MeetingPage(QWidget):
             button.setText(f"下载中 {int(pct)}%")
 
     def _on_aux_finished(self, ok: bool, message: str) -> None:
-        if ok:
+        if ok or self._aux_dl.downloaded_any:
             self.aux_models_changed.emit()
+        if ok:
             if self._stack.currentIndex() == PAGE_START:
                 self._update_card_notes()
                 self._card_notes.setText(

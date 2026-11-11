@@ -300,6 +300,7 @@ MODEL_REGISTRY = [
         "id": "funasr-nano",
         "name": "Fun-ASR-Nano",
         "description": "默认。中/英/日与方言，支持热词和识别语言",
+        "choice_note": "日常默认",
         "accuracy": 5,
         "speed": 2,
         "languages": "中/英/日/方言",
@@ -348,7 +349,8 @@ MODEL_REGISTRY = [
     {
         "id": "qwen3-asr-0.6b",
         "name": "Qwen3-ASR 0.6B",
-        "description": "多语种，支持热词",
+        "description": "多语种，支持热词。0.6B 是参数规模，下载约 983 MB",
+        "choice_note": "多语种",
         "accuracy": 4,
         "speed": 2,
         "languages": "中/英/多语种",
@@ -378,7 +380,8 @@ MODEL_REGISTRY = [
     {
         "id": "fireredasr2-ctc",
         "name": "FireRedASR2",
-        "description": "中文和方言候选（CTC 分支）",
+        "description": "均衡速度的中文和方言候选（CTC）。适合和默认模型对比",
+        "choice_note": "均衡 CTC",
         "accuracy": 4,
         "speed": 3,
         "languages": "中/英/方言",
@@ -396,7 +399,8 @@ MODEL_REGISTRY = [
     {
         "id": "fireredasr2-aed",
         "name": "FireRedASR2 AED",
-        "description": "中文和方言的较慢精度候选",
+        "description": "较慢、更准的中文和方言候选（AED）。体积更大，确认需要更高精度再下载",
+        "choice_note": "更准更慢",
         "accuracy": 4,
         "speed": 2,
         "languages": "中/英/方言",
@@ -552,9 +556,8 @@ AUX_MODEL_REGISTRY = [
         },
         "files": ["model.int8.onnx", "LICENSE"],
         "aux": True,
-        # Shipped in both installers. Runtime use stays off until the user
-        # enables it, and a missing copy does not block a meeting.
-        "optional": True,
+        # Shipped in both installers and enabled automatically where useful.
+        # A missing copy degrades gracefully and can be downloaded later.
         "bundle": True,
     },
 ]
@@ -765,17 +768,31 @@ def _get_portable_model_dir(model_id: str) -> Path | None:
     return None
 
 
+def _model_location(model_id: str, info: dict) -> tuple[Path, bool]:
+    """Return the active model directory and whether it is bundled."""
+    # A folder the user chose is the only place to look, even when it is
+    # empty. The copy beside the program is a fallback for the default location.
+    if not _custom_models_dir:
+        if model_id == AUX_MODEL_SILERO_VAD:
+            # A repair writes a verified copy to the user directory. Use it
+            # before an installation copy which may still be damaged.
+            local = user_models_dir() / info["dir_name"]
+            try:
+                if local.is_dir() and not mismatched_model_files(info, local):
+                    return local, False
+            except OSError:
+                pass  # A concurrent removal must not mask the bundled copy.
+        portable = _get_portable_model_dir(model_id)
+        if portable is not None:
+            return portable, True
+    return _get_models_dir() / info["dir_name"], False
+
+
 def get_model_dir(model_id: str) -> Path:
     info = get_model_info(model_id)
     if not info:
         raise ValueError(f"未知模型: {model_id}")
-    # A folder the user chose is the only place to look, even when it is
-    # empty. The copy beside the program is a fallback for the default location.
-    if not _custom_models_dir:
-        portable = _get_portable_model_dir(model_id)
-        if portable:
-            return portable
-    return _get_models_dir() / info["dir_name"]
+    return _model_location(model_id, info)[0]
 
 
 def model_file_url(endpoint: str, info: dict, filename: str) -> str:
@@ -829,10 +846,8 @@ def is_model_downloaded(model_id: str) -> bool:
     info = get_model_info(model_id)
     if not info:
         return False
-    if not _custom_models_dir and _get_portable_model_dir(model_id):
-        return True
-    d = _get_models_dir() / info["dir_name"]
-    return all(_is_usable_model_file(d / f) for f in info["files"])
+    folder, bundled = _model_location(model_id, info)
+    return bundled or all(_is_usable_model_file(folder / name) for name in info["files"])
 
 
 def get_downloaded_models() -> list[str]:
@@ -868,16 +883,20 @@ def resolve_startup_model_id(configured_id: str | None) -> str:
     return configured
 
 
+def is_bundled_model(model_id: str) -> bool:
+    """Whether the active copy is supplied beside the application."""
+    info = get_model_info(model_id)
+    return bool(info and _model_location(model_id, info)[1])
+
+
 def delete_model(model_id: str) -> bool:
     # The bundled copy is not the user's download. An explicit models folder
     # is, so a portable copy elsewhere must not block deleting that folder.
-    if not _custom_models_dir and _get_portable_model_dir(model_id):
-        return False
     info = get_model_info(model_id)
     if not info:
         return False
-    d = _get_models_dir() / info["dir_name"]
-    if not d.exists():
+    d, bundled = _model_location(model_id, info)
+    if bundled or not d.exists():
         return False
     shutil.rmtree(d, ignore_errors=True)
     if d.exists():
@@ -978,7 +997,12 @@ class ModelDownloadWorker(QThread):
                 self.error.emit(f"未知模型: {self._model_id}")
                 return
 
-            model_dir = _get_models_dir() / info["dir_name"]
+            # Silero's download action is also its repair action. With the
+            # default location, install the replacement in user storage.
+            if self._model_id == AUX_MODEL_SILERO_VAD and not _custom_models_dir:
+                model_dir = user_models_dir() / info["dir_name"]
+            else:
+                model_dir = _get_models_dir() / info["dir_name"]
             model_dir.mkdir(parents=True, exist_ok=True)
 
             files = info["files"]
@@ -1004,7 +1028,7 @@ class ModelDownloadWorker(QThread):
                         self._emit_progress(i, total_files, 1.0, 0)
                         continue
                     log.warning("模型文件 %s 已存在但校验不通过，重新下载", target.name)
-                    target.unlink()
+                    # Keep the old file until the verified download replaces it.
 
                 last_err: Exception | None = None
                 for endpoint in self._endpoints:
@@ -1024,7 +1048,7 @@ class ModelDownloadWorker(QThread):
                     raise last_err
 
             if self._cancelled:
-                return
+                raise _DownloadCancelled()
 
             if is_model_downloaded(self._model_id):
                 log.info("模型下载完成: %s", info["name"])
