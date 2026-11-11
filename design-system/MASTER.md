@@ -164,7 +164,7 @@ shadow tokens to `design_tokens.py` unless a surface actually paints one.
 
 - Surface fill, 1px border, radius LG
 - Main navigation: ink wash (`NAV_SELECTED_BG`), semibold label, 40px row height, 2px keyboard focus ring. Focus ring appears only for keyboard navigation (TabFocus) — never as a second "selected" state on open.
-- Sidebar runtime status: hairline + 8px semantic dot (`GREEN` ready / `AMBER` loading / `RED` failure) + text. Not a filled card, so it cannot read as a sixth nav item.
+- Sidebar runtime status: hairline + 8px semantic dot (`GREEN` ready / `AMBER` loading / `RED` failure) + text. Not a filled card, so it cannot read as a seventh nav item beneath the six pages (历史 / 会议 / 通用 / 引擎 / AI 服务 / 关于).
 - Task choices: native radio indicator, title and task-specific explanation; full card is clickable. Selected compact cards use `ACCENT_SOFT` and a 2px `ACCENT` outline; unchecked cards keep a 2px neutral outline so selection does not move content. Keyboard focus remains visible on the native radio.
 - General settings use four groups: 录音与输入 / 识别 / 会议默认设置 / 应用与历史. A row of jumps under the page title scrolls to each group in one click. Result destination sits beside audio source, with an explicit automatic policy and two persistent fixed destinations. Low-frequency recognition algorithms and model diagnostics live in a keyboard-accessible disclosure; pending changes and failures remain visible while collapsed.
 - Theme segments have one Tab stop on the selected option and retain arrow-key navigation. Section titles use `TEXT_SEC` / `TYPE_BODY_SM`; behavior-critical explanations use `TEXT_SEC`. Audio testing is a secondary action, with a temporary input meter and actual opened device labels.
@@ -203,7 +203,7 @@ shadow tokens to `design_tokens.py` unless a surface actually paints one.
 ## UX Guidelines
 
 - Focus rings visible for keyboard users
-- Ctrl+1…5 switches pages, Ctrl+F opens history search, Ctrl+W hides to tray; shortcuts pause during hotkey capture.
+- Ctrl+1…6 switches the six sidebar pages (历史 / 会议 / 通用 / 引擎 / AI 服务 / 关于), Ctrl+F opens history search, Ctrl+W hides to tray; shortcuts pause during hotkey capture.
 - Model and audio test errors remain readable at their controls; success does not require a modal.
 - History refresh preserves selection and search; pending deletions stay hidden and share an eight-second undo batch.
 - Deleting sessions has exactly one safety net: the undo toast. No confirmation dialog. Only「清空全部历史」(irreversible) confirms.

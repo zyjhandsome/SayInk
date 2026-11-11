@@ -92,7 +92,7 @@
 | Zipformer CTC | 纯中文，无英文和热词 | 367 MB |
 | Qwen3-ASR 1.7B | 多语种大参数版，较慢；权重来自第三方仓库 | 2.4 GB |
 
-上表顺序就是引擎页、会议模型列表里的推荐顺序。「推荐」只标 Fun-ASR-Nano。精度 / 速度是目录内的相对评级，不是统一公开评测。准确率随口音、领域用词、麦克风和噪声变化很大；机器较弱或更在意出字速度时换 SenseVoice。想用数字说话，`tools/asr_bench.py` 可以在本机对几款模型跑同一组录音，输出字错率、热词命中率与实时率。默认先按会议的 Silero 断句再逐段识别，和开会时的切段一致（见 [`docs/asr-benchmark.md`](docs/asr-benchmark.md)）。说话人拆人 / 并人的标法见 [`docs/meeting-speaker-eval.md`](docs/meeting-speaker-eval.md)，目前还没有真人结果。
+上表顺序就是引擎页、会议模型列表里的推荐顺序。「推荐」只标 Fun-ASR-Nano。精度 / 速度是目录内的相对评级，不是统一公开评测。准确率随口音、领域用词、麦克风和噪声变化很大；机器较弱或更在意出字速度时换 SenseVoice。想用数字说话，`tools/asr_bench.py` 可以在本机对几款模型跑同一组录音，输出字错率、热词命中率与实时率。默认先按会议的 Silero 断句再逐段识别，和开会时的切段一致（见 [`docs/asr-benchmark.md`](docs/asr-benchmark.md)）。说话人拆人 / 并人的标法见 [`docs/meeting-speaker-eval.md`](docs/meeting-speaker-eval.md)；两场 AISHELL-4 真人远场会议上的实时与收尾重聚类说话人错误率（DER 分别从 39.79% 降至 27.37%、从 6.79% 降至 5.87%）见 [`docs/recognition-optimization-20261022.md`](docs/recognition-optimization-20261022.md)，本机麦克风 + 电脑声音双轨实录仍待补充对照标注。
 
 ### 会议
 
@@ -103,7 +103,7 @@
 - **文字稿**：每句话带相对时间戳与「说话人 N」，写入 `history.db`（`trigger_mode = meeting`），**即使关闭了转写历史也会保存**；不出现在历史页列表里，不受历史保留天数 / 最大会话数清理，也不被「清空全部历史」删掉——只能在会议页逐场删除。默认不保存音频，也不保存声纹；录音恢复须单独开启，缓存与文字稿分别删除
 - **暂停与核对**：会议页可「暂停采集 / 继续采集」。手动暂停期间不采集新音频，已录内容继续识别，不会自动恢复；继续后仍是同一场会议。主窗口侧栏持续显示本场音源、录制或暂停状态及会议保存去向，切换页面后仍可查看。实时文字稿更新保留选区和阅读位置，停在底部时才跟随最新发言。`Ctrl+F` 在会后列表搜索会议，在进行中查找本场文字稿；搜索无结果提供清除入口。会议开始卡与笔记区支持滚动，小屏幕下开始、暂停、继续和结束操作保持可达
 - **说话人**：**说话人嵌入 CAM++**（约 28 MB）用于持续转写与会议的说话人增强，**Silero VAD**（约 2 MB）用于三种模式的断句。公共识别页可开关 CAM++ 增强并查看实际加载或回退状态；单次转写无需区分说话人。第一次开会若还没下载，会问一次「下载后开始 / 直接开始」；之后开始卡片和进行中页面都保留「下载辅助模型」按钮（会中下载对下一场生效），引擎页也能下载。没下载或加载失败时退回频谱特征与能量断句；手动选能量断句或关闭 CAM++ 时不会误报模型缺失。持续转写与会议仅用清晰片段建立多段声音档案，短句证据不足、候选人接近或人数超出自动上限时保留待确认；较弱的连续性判断不更新档案。一场结束时对全部发言重新聚类并逐段归属：在线时被拆开的同一个人会合并，归错的单句会移回正确的人，用户命名或更正过的保持不变；声音档案只在本场内存中存在，不跨场识人。会议页可把「说话人 2」改成称呼，文字稿与纪要同步替换
-- **识别参数**：术语表（最多 50 条、每条 20 字）会作为**热词**传给支持的模型（Fun-ASR-Nano、Qwen3-ASR）；识别语言会传给支持的模型（Fun-ASR-Nano、SenseVoice）。两者对转写同样生效。不支持的模型只把术语交给纪要模型。无论哪个模型，识别结果里只是大小写不同的英文术语（如 FireRedASR2 输出的 `GITHUB`）都会改回术语表的写法。一行写成 **`词=误写1、误写2`**（如 `张鑫=张新、张欣`、`五证=五中`）时，等号后面是这个词常被听成的写法：识别结果里出现这些误写会被**直接改回**正确的词（英文整词、不分大小写；中文按原样匹配），不走网络、不加延迟；热词仍只传正确写法。每个词最多 5 个误写，误写也不超过 20 字。会议段落**不逐句润色**（`meeting.polish_segments`，默认关）
+- **识别参数**：术语表（最多 50 条、每条 20 字）会作为**热词**传给支持的模型（Fun-ASR-Nano、Qwen3-ASR）；识别语言会传给支持的模型（Fun-ASR-Nano、SenseVoice）。两者对转写同样生效。不支持的模型只把术语交给纪要模型。无论哪个模型，识别结果里只是大小写不同的英文术语（如 FireRedASR2 输出的 `GITHUB`）都会改回术语表的写法。一行写成 **`词=误写1、误写2`**（如 `张鑫=张新、张欣`、`五证=五中`）时，等号后面是这个词常被听成的写法：识别结果里出现这些误写会被**直接改回**正确的词（英文整词、不分大小写；中文按原样匹配），不走网络、不加延迟；热词仍只传正确写法。每个词最多 5 个误写，误写也不超过 20 字。自定义词汇输入框在输入过程中不会逐字保存或打断识别，离开输入框、切换设置页或关闭设置时统一保存生效；仅修改等号后的误写或在不支持热词的模型上编辑词汇无需重载识别模型，支持热词的模型在空闲且可用内存充足时会在后台静默加载新热词并平滑切换，切换完成前仍可继续用旧实例识别（内存紧张时退回常规重载）。会议段落**不逐句润色**（`meeting.polish_segments`，默认关）
 - **纪要**：会议结束后在会议页选模板（通用 / 站会 / 一对一 / 客户沟通 / 评审）点「生成纪要」。使用 设置 → AI 服务 → 接口配置 的地址与密钥（与润色共用，关闭润色时也一直可填），可在 AI 服务 → 会议纪要 单独指定更大的模型并测试连接、设默认模板与输出语言；不需要开启「文字润色」。没配置时会议页的按钮显示「配置 AI 接口」，点击直接跳到接口配置。会议页与 AI 服务页的「管理模板」支持新建、复制、编辑、删除自定义模板，可配置名称、整理要求、输出形式与章节；内置模板可复制后修改。远程端点第一次生成前会确认（只发文字稿，不发音频），确认后记住该地址。超过约 1 万字的文字稿分块生成再合并；纪要里找不到文字稿依据的内容标「（待核对）」，没内容的小节写「本场未识别到」
 - **会后自动生成**：AI 服务 → 会议纪要 可打开「会议结束后自动生成纪要」（`meeting.auto_generate`，默认关）。打开时若是远程端点会先确认一次；之后每场结束、文字稿满 200 字就按默认模板在后台生成，主窗口没打开时完成或失败会托盘提示。纪要一次只生成一场：连续多场会按结束顺序排队，会议列表标出「纪要排队中 / 生成中 / 生成失败」；另一场正在生成时手动点「生成纪要」会排到自动任务前面，不打断当前那场；排队中可「取消排队」。网络、超时、限流或服务端 5xx 失败时 1 分钟、5 分钟后各自动重试一次，密钥、余额或地址未确认等问题不重试，会议页显示原因，点「生成纪要」手动再试。用本机模型（`localhost` 等）时，会议进行中不跑自动任务，新会议开始会让出正在跑的自动任务，结束后从已完成的分段继续。退出或崩溃后，排队的任务下次启动继续。已有纪要（包括手写的）不会被自动任务覆盖
 - **原文精整**：会议模板可选「原文精整」，点击「整理原文」将多人的原始转写逐段、逐句融合为通顺、逻辑清晰的书面文章。保留业务细节、情绪、主观评价、个人口吻、条件及不同观点，仅去除口吃重复、纯粹口语赘词和无效寒暄；按人物、规划和话题变化细致分段，不按说话人或识别切片机械分段，不反复添加「某某表示」等转述套语，不生成摘要、标题或列表，始终保留原文语言。与纪要共用接口和模型，不需要开启文字润色。长文分块精整后直接拼接，不再摘要合并；检查来源片段覆盖、数字与单位、英文名称、否定和条件表达及明显压缩，输出截断或检查失败时重试一次，仍失败则保留当前版本并提示。规则检查不能保证完全无损，人名、观点归属等重要内容仍应对照文字稿核对。生成后可编辑、复制精整正文、导出；与纪要共用当前结果位置，重新生成会替换当前内容，可恢复上一版，模板与模型信息同步恢复。
@@ -242,7 +242,7 @@ py -3.10 run.py
 
 **会议记录：** 托盘 → **开始会议**（或主窗口 会议 页）→ 填信息卡（可跳过）→ 开会；需要时点转写条「标记」→ 转写条「结束」/ 托盘「结束会议」→ 会议页选模板点 **生成纪要**（或在 AI 服务 → 会议纪要 打开会后自动生成）→ 编辑 / 复制 / 导出。
 
-**AI 服务（可选）：** 设置 → AI 服务 → 接口配置，填 API URL / Key / 模型名；文字润色与会议纪要共用这组配置，可分别开启。接口地址以 `http://` 或 `https://` 开头即可（无论是否开启润色，保存时都会检查；其它协议会被拒绝）。公网 HTTP 会明文传输密钥和转写内容。公网地址请填写 Key；本机或局域网端点（`localhost`、`127.0.0.1`、`192.168.x.x` / `10.x.x.x` / `172.16–31.x.x`、`*.local`，如 Ollama `http://localhost:11434/v1`）Key 可留空（留空时不发送 `Authorization` 请求头）。  
+**AI 服务（可选）：** 设置 → AI 服务 → 接口配置，填 API URL / Key / 模型名；文字润色与会议纪要共用这组配置，可分别开启。公网接口地址须使用 `https://`（默认拒绝公网明文 `http://`，防止 API Key 与转写内容明文传输；无论是否开启润色，保存时都会检查，其它协议也会被拒绝）；本机或局域网端点（`localhost`、`127.0.0.1`、`192.168.x.x` / `10.x.x.x` / `172.16–31.x.x`、`*.local`、无点号内网主机名，如 Ollama `http://localhost:11434/v1`）以及加入「额外直连域名」的内网后缀可使用 `http://`。公网地址请填写 Key；本机或局域网端点 Key 可留空（留空时不发送 `Authorization` 请求头）。远程纪要端点的首次发送确认按协议与主机名分别记录，已确认的 `https://` 端点改为 `http://` 时会重新询问。
 
 **AI 服务代理：** 设置 → 通用 → 应用与历史 → AI 服务代理。默认使用系统 / 环境代理及其绕过规则；公司内网接口出现代理超时时，可选择「直连（不使用代理）」后重新测试连接。同一台电脑需要公网走代理、部分内网域名直连时，可在「额外直连域名」填写域名后缀（如 `.example.internal`，逗号或空格分隔）；本地和私网地址不用填写，这项只在「使用系统 / 环境代理」时生效。这个设置适用于 AI 连接测试、文字处理和会议纪要，不影响更新或模型下载。直连仍使用 `SSL_CERT_FILE` / `SSL_CERT_DIR` 配置的证书。自动代理配置脚本（PAC）可能无法被识别。
 **历史（可选）：** 设置 → 通用 → 历史，可开关「保存转写历史」，并调整「保留天数」与「最大会话数」。关闭开关只停止未来写入，不会删除已有历史。
@@ -271,7 +271,7 @@ py -3.10 run.py
 
 自动化测试在 `tests/`（含 `test_readme_features.py`、`test_theme_resolve.py`、`test_ui_styles.py`；会议相关为 `test_meeting_*.py`、`test_minutes.py`、`test_aux_models.py`、`test_app_meeting_wiring.py`）。
 
-**真相源：** 产品行为以本 README 为准，视觉 token 以 [`design-system/MASTER.md`](design-system/MASTER.md) 为准；两者与代码不一致时，先改代码或改文档，不能并存。`openspec/` 只保留已完成变更的归档（`openspec/changes/archive/`）供追溯，不再作为当前行为的依据；新的产品变更直接改 README 并补测试，不必再起 OpenSpec 变更。
+**真相源：** 产品行为以本 README 为准，视觉 token 以 [`design-system/MASTER.md`](design-system/MASTER.md) 为准；两者与代码不一致时，先改代码或改文档，不能并存。`openspec/` 仅保留已完成变更的归档（`openspec/changes/archive/`）与已归档规格快照（`openspec/specs/`、`openspec/config.yaml`）供追溯，`openspec/changes/` 下不保留未归档变更，也不再作为当前行为的依据；新的产品变更直接改 README 并补测试，不必再起 OpenSpec 变更。
 
 ---
 
@@ -293,6 +293,8 @@ python build.py                         # → dist/SayInk/SayInk.exe（须整目
 
 发布时把两个安装包都上传到同一个 Release；应用内更新器按文件名 `SayInk-Setup-<版本>.exe` 挑轻量包（`sayink/updater.py`），找不到时才退回同版本的其他安装包。便携版须整目录分发 `dist/SayInk/`。
 
+可选供应链签名：设置环境变量 `SAYINK_SIGNTOOL_CMD`（如 Windows `signtool` / Azure Trusted Signing 命令模板）可在打包时自动对 `SayInk.exe` 与 `SayInk-Setup-<版本>.exe` 执行 Authenticode 代码签名；设置 `SAYINK_RELEASE_PRIVATE_KEY`（或运行 `python -m sayink_build.release_signing`）可生成配套的 Ed25519 分离签名 `.sig` 文件供发布页一并上传。
+
 ---
 
 ## 变更审查清单（必读）
@@ -305,9 +307,9 @@ python build.py                         # → dist/SayInk/SayInk.exe（须整目
 py -3.10 -m pytest tests/test_readme_features.py tests/test_theme_resolve.py tests/test_ui_styles.py -q
 ```
 
-**全量测试与验证环境：** Windows x64 / Python 3.10 使用已验证的固定依赖约束：`python -m pip install -r requirements-dev.txt -c constraints-windows-py310.txt`。其他平台使用 `requirements-dev.txt`。设置 `QT_QPA_PLATFORM=offscreen`，运行 `python -m pytest -p no:cacheprovider tests -q`。`tests/conftest.py` 让整个测试会话跑在英文 Windows 代码页（cp1252，与 CI 运行机相同）上，并把用户目录和 `%APPDATA%` 指向临时目录：中文开发机上的结果与 CI 一致，测试也不会读写真实的 `~/.sayink`。唯一加载真实模型的检查（Silero VAD）默认跳过；想在本机跑，把 `SAYINK_REAL_MODELS_DIR` 设为应用的模型目录（如 `%USERPROFILE%\.sayink\models`），它只读取、不写入。
+**全量测试与验证环境：** Windows x64 / Python 3.10 使用已验证的固定依赖约束：`python -m pip install -r requirements-dev.txt -c constraints-windows-py310.txt`。其他平台使用 `requirements-dev.txt`。设置 `QT_QPA_PLATFORM=offscreen`，运行 `python -m pytest -p no:cacheprovider tests -q`（或直接运行无额外依赖的多进程分片加速脚本 `python tools/run_tests_parallel.py`，自动设置离屏环境与独立临时目录）。`tests/conftest.py` 让整个测试会话跑在英文 Windows 代码页（cp1252，与 CI 运行机相同）上，并把用户目录和 `%APPDATA%` 指向临时目录：中文开发机上的结果与 CI 一致，测试也不会读写真实的 `~/.sayink`。唯一加载真实模型的检查（Silero VAD）默认跳过；想在本机跑，把 `SAYINK_REAL_MODELS_DIR` 设为应用的模型目录（如 `%USERPROFILE%\.sayink\models`），它只读取、不写入。
 
-GitHub Actions 的 `.github/workflows/tests.yml` 会在 push / PR 时执行 `ruff check`（配置见 `ruff.toml`，只查语法错误、未定义 / 未使用名称等硬错误）、Windows 回归、`pip check` 与发布依赖检查。本地可用 `python -m ruff check sayink sayink_build tests build.py build_release.py run.py`。`python -m sayink_build.dependency_check` 核对当前环境与 `requirements.txt`；`build.py` 也会先检查依赖，再清理旧构建目录，低于要求的引擎不能继续打包。固定约束覆盖 Python 包版本，不包含 Windows 系统组件或安装包签名；模型权重另由模型表里的固定提交和 SHA-256 锁定，`build.py` 打包前会逐个校验这次要带上的模型文件。
+GitHub Actions 的 `.github/workflows/tests.yml` 会在 push / PR 时执行 `ruff check`（配置见 `ruff.toml`，只查语法错误、未定义 / 未使用名称等硬错误）、Windows 回归、`pip check` 与发布依赖检查。本地可用 `python -m ruff check sayink sayink_build tools tests build.py build_release.py installer/build_installer.py run.py`。`python -m sayink_build.dependency_check` 核对当前环境与 `requirements.txt`；`build.py` 也会先检查依赖，再清理旧构建目录，低于要求的引擎不能继续打包。固定约束覆盖 Python 包版本，不包含 Windows 系统组件或安装包签名；模型权重另由模型表里的固定提交和 SHA-256 锁定，`build.py` 打包前会逐个校验这次要带上的模型文件。
 
 记录结论时写明 Python、PyQt6、sherpa-onnx 版本：sherpa-onnx 低于下限（1.13.8）的环境只能证明测试里的应用逻辑，不能代表发布依赖。发版前仍应在干净环境中跑全量测试，并冒烟安装包。当前可靠性优化与验证记录见 [`docs/reliability-first-pass.md`](docs/reliability-first-pass.md)。
 
@@ -405,7 +407,7 @@ A: 启动时读不了 `config.json`，会先把它改名为 `config.corrupt-<时
 A: 同样处理：`history.db` 改名为 `history.corrupt-<时间>.db` 保留，重新建一个空库，并在托盘提示一次。之前的记录不会显示，但文件还在，可以手动恢复。数据库完全打不开（被占用、没有权限）时不会动原文件，本次运行只是不保存历史，托盘和历史窗口都会说明原因。单条记录写入失败也会在托盘提示一次，细节在日志里。
 
 **Q: 自动更新下载的安装包安全吗？**  
-A: 只从 GitHub Releases 下载，先存为 `.part`，核对大小与 GitHub 公布的 SHA-256 后才会运行；不完整或校验不符的安装包会被删除并提示重试。GitHub 没有公布该安装包 SHA-256 时，SayInk 不会下载或自动安装，会提示到发布页手动下载。安装包目前没有代码签名，Windows 可能提示「未知发布者」。
+A: 只从 GitHub Releases 下载，先存为 `.part`，核对大小与 GitHub 公布的 SHA-256 后才会运行；不完整或校验不符的安装包会被删除并提示重试。GitHub 没有公布该安装包 SHA-256 时，SayInk 不会下载或自动安装，会提示到发布页手动下载。若配置了发布签名公钥（`RELEASE_SIGNING_PUBLIC_KEY` 或环境变量 `SAYINK_UPDATE_PUBLIC_KEY`），更新器还会下载并校验安装包配套的 Ed25519 `.sig` 数字签名，签名不匹配即拒绝安装。默认开源构建未内置商业代码签名证书，未通过 `SAYINK_SIGNTOOL_CMD` 签名的安装包在 Windows 上可能提示「未知发布者」。
 
 **Q: 升级会不会重新下载模型？**  
 A: 不会重新下载 Fun-ASR-Nano。自动更新下载轻量包（约 81 MB，含 CAM++、Silero VAD 和多人发言检测）；安装目录里已有的 `models\` 和 `~/.sayink/models/` 里自己下载的模型都原样保留，升级后直接载入。只有卸载时选择「删除用户配置和模型数据」才会清掉。

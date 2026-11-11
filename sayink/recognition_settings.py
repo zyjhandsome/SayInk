@@ -99,6 +99,47 @@ class RecognitionSettings:
         return model_supports(self.model_id, SUPPORTS_LANGUAGE)
 
     @property
+    def effective_hotwords(self) -> str:
+        """Hotword string actually consumed by the active ASR model's decoder."""
+        return self.hotwords if self.hotwords_supported else ""
+
+    @property
+    def effective_asr_language(self) -> str:
+        """Language code actually consumed by the active ASR model's decoder."""
+        if get_model_info(self.model_id) is None:
+            return self.effective_language
+        return self.effective_language if self.language_supported else ""
+
+    @property
+    def effective_boundary_context(self) -> bool:
+        loader = (get_model_info(self.model_id) or {}).get("loader", "")
+        return self.boundary_context_enabled and loader in {"fire_red_asr_ctc", "zipformer_ctc"}
+
+    @property
+    def speaker_key(self) -> tuple[bool, bool]:
+        """Fields governing the resident CAM++ / speaker-activity embedder."""
+        return (self.speaker_model_enabled, self.speaker_activity_enabled)
+
+    @property
+    def segmenter_key(self) -> tuple[str, bool, bool, bool]:
+        """Fields governing the dictation VAD / speech segmenter profile."""
+        return (
+            self.vad,
+            self.quiet_speech_enabled,
+            self.boundary_context_enabled,
+            self.effective_boundary_context,
+        )
+
+    def asr_key(self, num_threads: int = 4) -> tuple[str, int, str, str]:
+        """Fields governing the resident OfflineRecognizer instance."""
+        return (
+            self.model_id,
+            int(num_threads or 4),
+            self.effective_hotwords,
+            self.effective_asr_language,
+        )
+
+    @property
     def notes(self) -> list[str]:
         notes = []
         if (self.boundary_context_enabled

@@ -670,8 +670,11 @@ class TestReadmeReliabilityPromises:
         root = Path(__file__).resolve().parents[1]
         assert (root / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml").exists()
         assert (root / ".github" / "ISSUE_TEMPLATE" / "feature_request.yml").exists()
-        # No live (unarchived) OpenSpec change directories remain.
-        live = [p for p in (root / "openspec" / "changes").iterdir() if p.is_dir() and p.name != "archive"]
+        assert not (root / "1761310000").exists()
+        assert list(root.glob("*.spec")) == []
+        # OpenSpec keeps only config.yaml, historical merged specs/, and archived changes.
+        assert {p.name for p in (root / "openspec").iterdir()} <= {"config.yaml", "specs", "changes"}
+        live = [p for p in (root / "openspec" / "changes").iterdir() if p.name != "archive"]
         assert live == []
 
     def test_output_and_polish_guarantees_are_documented(self):
@@ -683,6 +686,8 @@ class TestReadmeReliabilityPromises:
         assert "少了否定词" in text
         assert "已发送 · 未确认" in text
         assert "输出超时 · 已复制" in text
+        assert "默认拒绝公网明文" in text
+        assert "已确认的 `https://` 端点改为 `http://` 时会重新询问" in text
         assert "Key 可留空" in text
 
     def test_storage_and_update_guarantees_are_documented(self):
@@ -691,6 +696,10 @@ class TestReadmeReliabilityPromises:
         assert "残留的明文 Key 也会被清掉" in text
         assert "旧版 VoiceInk 还在运行时 SayInk 不会再开一个实例" in text
         assert "没有公布该安装包 SHA-256 时，SayInk 不会下载或自动安装" in text
+        assert "SAYINK_SIGNTOOL_CMD" in text
+        assert "SAYINK_RELEASE_PRIVATE_KEY" in text
+        assert "Ed25519" in text
+        assert "tools/run_tests_parallel.py" in text
         assert "长时间监听只在内存中保留当前这句话" not in text
         assert "自动暂停监听" in text
 
@@ -708,10 +717,17 @@ class TestReadmeReliabilityPromises:
         assert "不含 Fun-ASR-Nano" in text
 
     def test_unverified_claims_are_marked(self):
+        from pathlib import Path
+
         text = self._readme()
         assert "准确率最高" not in text
         assert "（实验性）" in text
         assert "尚未做系统验证" in text
+        eval_doc = (
+            Path(__file__).resolve().parents[1] / "docs" / "meeting-speaker-eval.md"
+        ).read_text(encoding="utf-8")
+        assert "尚无数据" not in eval_doc
+        assert "27.369%" in eval_doc and "5.865%" in eval_doc
 
 
 class TestReadmeSettingsLifecycle:
@@ -747,6 +763,9 @@ class TestReadmeMeetingNotes:
         assert "下载辅助模型" in text and "下载后开始" in text
         assert "沿用上一位" in text
         assert "docs/asr-benchmark.md" in text and "tools/asr_bench.py" in text
+        assert "docs/recognition-optimization-20261022.md" in text
+        assert "27.37%" in text and "5.87%" in text
+        assert "离开输入框" in text and "后台静默加载新热词" in text
 
     def test_readme_says_dictation_shares_the_meeting_stack(self):
         """持续转写 reuses the meeting speaker / VAD / glossary stack

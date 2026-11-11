@@ -112,6 +112,8 @@ class AudioRecorder(QObject):
         # or source change) must not load the model again on the UI thread.
         self._silero_gate = None
         self._silero_gate_path: str | None = None
+        self._split_silero_gates: dict[str, object] = {}
+        self._split_silero_gate_paths: dict[str, str] = {}
         self._meeting_profile = False
         self._segmentation_status = SegmentationStatus(VAD_ENERGY, VAD_ENERGY)
         # Per-lane loudness balancing for mixed capture (every profile).
@@ -169,11 +171,15 @@ class AudioRecorder(QObject):
         from sayink.asr_context import BoundaryContextBuffer
         for role, threshold in (("microphone", 0.002), ("system", 0.0006)):
             if self._meeting_profile:
-                segmenter = make_meeting_segmenter(speech_threshold=threshold, vad=self._vad_kind,
-                                                   model_path=self._vad_model_path)
+                segmenter = make_meeting_segmenter(
+                    speech_threshold=threshold,
+                    vad=self._vad_kind,
+                    model_path=self._vad_model_path,
+                    gate_factory=lambda seg, r=role: self._split_speech_gate(r, seg),
+                )
             else:
                 segmenter = SpeechSegmenter(speech_threshold=threshold)
-                segmenter.set_gate(make_speech_gate(self._vad_kind, segmenter, model_path=self._vad_model_path))
+                segmenter.set_gate(self._split_speech_gate(role, segmenter))
             self._split_segmenters[role] = segmenter
             if self._vad_kind == VAD_SILERO and segmenter.gate_name != VAD_SILERO:
                 self.warning.emit(f"{role} 的语音检测模型未能启用，使用能量断句；本路轻声增强未启用。")
@@ -349,6 +355,19 @@ class AudioRecorder(QObject):
         if gate.name == VAD_SILERO and path:
             self._silero_gate = gate
             self._silero_gate_path = path
+        return gate
+
+    def _split_speech_gate(self, role: str, segmenter: SpeechSegmenter):
+        path = self._vad_model_path or ""
+        if self._vad_kind == VAD_SILERO and path:
+            cached = self._split_silero_gates.get(role)
+            if cached is not None and self._split_silero_gate_paths.get(role) == path:
+                cached.reset()
+                return cached
+        gate = make_speech_gate(self._vad_kind, segmenter, model_path=self._vad_model_path)
+        if gate.name == VAD_SILERO and path:
+            self._split_silero_gates[role] = gate
+            self._split_silero_gate_paths[role] = path
         return gate
 
     @property

@@ -1,8 +1,9 @@
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass, replace
-from typing import ClassVar
+from typing import Callable, ClassVar
 from uuid import uuid4
 
 import numpy as np
@@ -17,7 +18,6 @@ from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMessageBox
 from sayink.ui.prompts import confirm
 
 from sayink.config import (
-    OUTPUT_MODE_PASTE,
     Config,
     # Tests replace ``Config`` with a mock constructor. Destination rules stay
     # on the real class, which only reads ``get`` / ``set``.
@@ -49,11 +49,11 @@ from sayink.speaker_turns import SpeakerTurnDetector
 from sayink.speech_recognizer import (
     AUX_MODEL_SILERO_VAD,
     AUX_MODEL_SPEAKER,
+    AUX_MODEL_SPEAKER_ACTIVITY,
     DEFAULT_MODEL_ID,
     SpeechRecognizer,
     set_models_dir,
     normalize_asr_output,
-    get_model_info,
     join_segment_texts,
     restore_glossary_case,
 )
@@ -66,21 +66,14 @@ from sayink.meeting_session import (
     MeetingState,
     resolve_capabilities,
 )
-from sayink.text_polisher import (
-    LLM_MODE_CORRECT,
-    LLM_MODE_POLISH,
-    TextPolisher,
-    normalize_llm_mode,
-    polish_settings_complete,
-    prompt_config_key,
-)
-from sayink.asr_correction import apply_glossary_variants, correction_rejection_reason
+from sayink.text_polisher import TextPolisher
+from sayink.asr_correction import apply_glossary_variants
 from sayink.text_paster import PasteResult, TextPaster
 from sayink.sound_manager import SoundManager
 from sayink.ui.floating_window import FloatingWindow
 from sayink.ui.tray_icon import TrayIcon
 from sayink.ui.main_window import MainWindow
-from sayink.runtime_status import (
+from sayink.runtime_status import (  # noqa: F401  (re-exported for callers and tests)
     ModelLoadPhase,
     OutputStage,
     RuntimeStatus,
@@ -90,6 +83,21 @@ from sayink.runtime_status import (
 )
 from sayink.update_controller import UpdateController
 from sayink.onboarding import OnboardingController
+from sayink.output_pipeline import (  # noqa: F401  (re-exported for callers and tests)
+    OUTPUT_WATCHDOG_MS,
+    RECENT_OUTPUT_CONTEXT_S,
+    RESULT_TOAST_MS,
+    RESULT_TOAST_WITH_HINT_MS,
+    SEGMENT_PUMP_DELAY_MS,
+    OutputPipeline,
+    _PendingHistoryRecord,
+    _QueuedSegment,
+    _SegmentContext,
+)
+from sayink.reload_coordinator import (  # noqa: F401  (re-exported for callers and tests)
+    LOAD_SECONDS_KEY,
+    ReloadCoordinator,
+)
 
 log = logging.getLogger("SayInk")
 
@@ -98,30 +106,30 @@ MIN_AUDIO_SAMPLES = 1600  # 0.1s at 16kHz — ignore recordings shorter than thi
 # speech gate never opened, so the hint is "no speech", not "too short".
 HOLD_NO_SPEECH_SEC = 1.0
 SHORT_TAP_TRAY_COOLDOWN_S = 300  # 托盘「按过短」提示最少间隔，避免输入法反复弹窗
-OUTPUT_WATCHDOG_MS = 45_000  # 流式润色可读更久；到点仍改出原文，避免后面的句子一直排队
 # Queued speech beyond this pauses continuous listening (≈11 MB of float32);
 # captured audio is never dropped, only further capture stops.
 MAX_BACKLOG_AUDIO_SECONDS = 180
-# Top-level key: Config drops unknown keys nested under defaults like "stt".
-LOAD_SECONDS_KEY = "stt_load_seconds"
-# A previous output older than this is no longer context for the next one.
-RECENT_OUTPUT_CONTEXT_S = 120.0
 
 HISTORY_DISABLED_MEETING_REFUSAL = "历史数据库不可用，会议文字稿无法保存；请重启应用或在 设置 → 通用 更换历史位置后再开始会议"
 
-# UI pacing (ms). Queued slices start on the next event-loop turn so a burst
-# of VAD cuts keeps spoken order; result toasts stay readable (a hint with a
-# second line gets the longer one) before the bar returns to its live state.
-SEGMENT_PUMP_DELAY_MS = 0
-RESULT_TOAST_MS = 1700
-RESULT_TOAST_WITH_HINT_MS = 2200
 BAR_REFRESH_AFTER_STOP_MS = 1200
 MEETING_BAR_REFRESH_MS = 1500
 MEETING_IDLE_REMINDER_SEC = 15 * 60
 # One event-loop turn after the bar painted 「录音中」 before opening the device.
 CONTINUOUS_START_DELAY_MS = 50
 QUIT_POLL_MS = 80
+QUIT_NATIVE_DRAIN_TIMEOUT_S = 12.0
 UPDATE_CHECK_STARTUP_DELAY_MS = 5000
+
+
+def _force_process_exit(code: int = 0) -> None:
+    """Bypass interpreter teardown when a native C++ worker thread is wedged."""
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
+    os._exit(code)
 
 
 from sayink.polish_fidelity import (  # noqa: F401  (re-exported for callers and tests)
@@ -138,8 +146,6 @@ def auto_start_command() -> str:
     a source checkout the interpreter alone would just open Python, so pass
     ``run.py`` as well.
     """
-    import os
-
     exe = os.path.abspath(sys.executable)
     if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
         return f'"{exe}"'
@@ -155,71 +161,73 @@ def _activity_state(embedder, requested: bool) -> str:
         return "加载失败"
     return "未加载" if requested else "关"
 
-@dataclass
-class _PendingHistoryRecord:
-    session_id: str
-    seq: int
-    raw_text: str
-    polished_text: str
-    source: str
-    duration_ms: int
-    trigger_mode: str
-    model: str
-    speaker_id: int = 0
-    speaker_route: str = ""
-    captured_at: int = 0
-    target_hwnd: int = 0
-    target_app: str = ""
+
+def _delegate_attr(owner_getter: str, attr_name: str):
+    """Forward legacy ``App._*`` state reads/writes to an extracted collaborator."""
+    return property(
+        lambda self: getattr(getattr(self, owner_getter)(), attr_name),
+        lambda self, value: setattr(getattr(self, owner_getter)(), attr_name, value),
+    )
 
 
-@dataclass
-class _SegmentContext:
-    """Continuous-session identity fixed when a segment is captured, not when it is recognized."""
+@dataclass(frozen=True)
+class AppModules:
+    """Optional pre-built collaborators for DI and headless testing without global patches."""
 
-    session_id: str
-    seq: int
-    source: str
-    speakers: SpeakerSession
-    trigger_mode: str = TRIGGER_MODE_CONTINUOUS
-    model: str = ""
-    # Wall-clock ms when the utterance started (0 = unknown).
-    captured_at: int = 0
-    # True when speaker_route is the lane that captured the audio, not a
-    # guess from which mixed lane was louder.
-    route_reliable: bool = False
-    target_hwnd: int = 0
-    target_app: str = ""
-    # Speaker embedding function; None = dictation's log-mel summary.
-    embed: object = None
-    recognized_text: str | None = None
-    speaker_vector: np.ndarray | None = None
-    speaker_learnable: bool | None = None
-
-
-@dataclass
-class _QueuedSegment:
-    """One captured utterance waiting for the recognizer.
-
-    Everything that belongs to the audio travels with it, so the queue cannot
-    fall out of step with a parallel list of routes or contexts.
-    """
-
-    audio: np.ndarray
-    route: str = ""
-    context: _SegmentContext | None = None
-    recognized_turns: list | None = None
-    prefetch_attempted: bool = False
-
-    def load_audio(self) -> np.ndarray:
-        from sayink.audio_recovery import StoredAudio
-        return self.audio.load() if isinstance(self.audio, StoredAudio) else self.audio
+    hotkey_mgr: HotKeyManager | None = None
+    recorder: AudioRecorder | None = None
+    recognizer: SpeechRecognizer | None = None
+    polisher: TextPolisher | None = None
+    paster: TextPaster | None = None
+    sound: SoundManager | None = None
+    history: HistoryStore | None = None
+    meeting: MeetingController | None = None
+    floating: FloatingWindow | None = None
+    tray: TrayIcon | None = None
+    updates: UpdateController | None = None
+    onboarding: OnboardingController | None = None
+    aux_model_path_fn: Callable[[str], object] | None = None
+    is_model_downloaded_fn: Callable[[str], bool] | None = None
+    set_models_dir_fn: Callable[[str | None], bool] | None = None
+    skip_theme_init: bool = False
 
 
 class App(QObject):
-    """Central orchestrator that connects all modules."""
+    """Central orchestrator that connects capture, recognition, meeting, UI, and lifecycle."""
 
     _history_committed = pyqtSignal()
     _history_failed = pyqtSignal(str)
+
+    # Delegated output-pipeline state (keeps legacy App._* access intact)
+    _output_busy = _delegate_attr("_output_pipeline", "busy")
+    _output_token = _delegate_attr("_output_pipeline", "token")
+    _output_raw_text = _delegate_attr("_output_pipeline", "raw_text")
+    _output_stage = _delegate_attr("_output_pipeline", "stage")
+    _output_stage_text = _delegate_attr("_output_pipeline", "stage_text")
+    _output_stage_record = _delegate_attr("_output_pipeline", "stage_record")
+    _output_pending_record = _delegate_attr("_output_pipeline", "output_pending_record")
+    _pending_record = _delegate_attr("_output_pipeline", "pending_record")
+    _output_llm_mode = _delegate_attr("_output_pipeline", "llm_mode")
+    _output_glossary = _delegate_attr("_output_pipeline", "glossary")
+    _last_output_text = _delegate_attr("_output_pipeline", "last_output_text")
+    _last_output_at = _delegate_attr("_output_pipeline", "last_output_at")
+    _output_dropped_slices = _delegate_attr("_output_pipeline", "dropped_slices")
+    _keep_unsaved_continuous_text = _delegate_attr("_output_pipeline", "keep_unsaved_continuous_text")
+    _history_failure_notified = _delegate_attr("_output_pipeline", "history_failure_notified")
+
+    # Delegated reload-coordinator state (keeps legacy App._* access intact)
+    _applied_recognition_settings = _delegate_attr("_reload_coordinator", "applied_recognition_settings")
+    _recognition_change_pending = _delegate_attr("_reload_coordinator", "recognition_change_pending")
+    _models_reload_pending = _delegate_attr("_reload_coordinator", "models_reload_pending")
+    _deferred_audio_settings = _delegate_attr("_reload_coordinator", "deferred_audio_settings")
+    _settings_after_recovery = _delegate_attr("_reload_coordinator", "settings_after_recovery")
+    _applied_audio_key = _delegate_attr("_reload_coordinator", "applied_audio_key")
+    _applied_recognition_key = _delegate_attr("_reload_coordinator", "applied_recognition_key")
+    _applied_speaker_aux = _delegate_attr("_reload_coordinator", "applied_speaker_aux")
+    _applied_vad_aux = _delegate_attr("_reload_coordinator", "applied_vad_aux")
+    _load_started_at = _delegate_attr("_reload_coordinator", "load_started_at")
+    _loading_model_id = _delegate_attr("_reload_coordinator", "loading_model_id")
+    _models_dir_notice = _delegate_attr("_reload_coordinator", "models_dir_notice")
 
     # 友好化错误信息映射
     ERROR_HINTS: ClassVar[dict[str, str]] = {
@@ -256,9 +264,101 @@ class App(QObject):
                 return cls.ERROR_HINTS[keyword]
         return original_msg
 
-    def __init__(self, config: Config | None = None):
+    @classmethod
+    def create_headless(
+        cls,
+        config: Config | None = None,
+        *,
+        modules: AppModules | None = None,
+        on_release_instance_lock: Callable[[], None] | None = None,
+        **overrides,
+    ) -> "App":
+        """Construct a real ``App`` with lightweight mock collaborators and no OS/UI hooks."""
+        from unittest.mock import MagicMock
+
+        base = modules or AppModules()
+        recorder = overrides.pop("recorder", base.recorder)
+        if recorder is None:
+            recorder = MagicMock()
+            recorder.is_recording = False
+            recorder.is_continuous = False
+            recorder.storage_busy = False
+            recorder.recovery_available = False
+            recorder.input_source = (
+                str(config.get("audio.input_source", "microphone"))
+                if config is not None
+                else "microphone"
+            )
+            recorder.input_source_display = "麦克风"
+        recognizer = overrides.pop("recognizer", base.recognizer)
+        if recognizer is None:
+            recognizer = MagicMock()
+            recognizer.is_ready = True
+            recognizer.is_loading = False
+            recognizer.is_silent_loading = False
+            recognizer.current_model_id = (
+                str(config.get("stt.model_id", DEFAULT_MODEL_ID) or DEFAULT_MODEL_ID)
+                if config is not None
+                else DEFAULT_MODEL_ID
+            )
+            recognizer.running_workers = ()
+            recognizer.running_transcribe_workers = ()
+        floating = overrides.pop("floating", base.floating)
+        if floating is None:
+            floating = MagicMock()
+            floating.call_when_painted.side_effect = lambda fn: fn()
+        fields: dict[str, object] = {
+            "hotkey_mgr": overrides.pop("hotkey_mgr", base.hotkey_mgr) or MagicMock(),
+            "recorder": recorder,
+            "recognizer": recognizer,
+            "polisher": overrides.pop("polisher", base.polisher) or MagicMock(),
+            "paster": overrides.pop("paster", base.paster) or MagicMock(),
+            "sound": overrides.pop("sound", base.sound) or MagicMock(),
+            "floating": floating,
+            "tray": overrides.pop("tray", base.tray) or MagicMock(),
+            "meeting": overrides.pop("meeting", base.meeting),
+            "updates": overrides.pop("updates", base.updates),
+            "onboarding": overrides.pop("onboarding", base.onboarding),
+            "aux_model_path_fn": overrides.pop(
+                "aux_model_path_fn", base.aux_model_path_fn or (lambda _mid: None)
+            ),
+            "is_model_downloaded_fn": overrides.pop(
+                "is_model_downloaded_fn", base.is_model_downloaded_fn or (lambda _mid: True)
+            ),
+            "set_models_dir_fn": overrides.pop(
+                "set_models_dir_fn", base.set_models_dir_fn or (lambda _p: True)
+            ),
+            "skip_theme_init": overrides.pop("skip_theme_init", True),
+        }
+        history = overrides.pop("history", base.history)
+        if history is None:
+            history = MagicMock()
+            history.disabled = False
+        fields["history"] = history
+        if overrides:
+            unknown = ", ".join(sorted(overrides))
+            raise TypeError(f"Unexpected create_headless collaborator(s): {unknown}")
+        app = cls(
+            config=config,
+            modules=AppModules(**fields),  # type: ignore[arg-type]
+            on_release_instance_lock=on_release_instance_lock,
+        )
+        app._onboarding.show_welcome = lambda: None
+        app._onboarding.show_setup = lambda: None
+        app._onboarding.ask_history_enabled = lambda: False
+        app._updates.maybe_auto_check = lambda: None
+        return app
+
+    def __init__(
+        self,
+        config: Config | None = None,
+        *,
+        modules: AppModules | None = None,
+        on_release_instance_lock: Callable[[], None] | None = None,
+    ):
         super().__init__()
 
+        self._modules = modules
         self._config = config if config is not None else Config()
         self._current_transcription = ""
         self._live_committed = ""
@@ -267,80 +367,38 @@ class App(QObject):
         self._hold_paste_sent = False
         self._hold_target = (0, "")
         self._hold_duration_ms = 0
-        # Slices of the current hold whose recognition failed (left out of
-        # the pasted text) and the count carried to the paste result hint.
         self._hold_failed_slices = 0
-        self._output_dropped_slices = 0
-        # A hold whose bar is up but whose audio device is not opened yet.
         self._hold_open_pending = False
         self._hold_opened_at = 0.0
-        # Bumped when the key goes up before this hold opens the device, so a
-        # dialog that is still on the stack does not start recording afterwards.
         self._hold_request = 0
         self._is_transcribing = False
-        # Output stays serial. One next segment may be decoded into the queue
-        # while the pending history record and polisher own the current one.
-        self._output_busy = False
-        self._output_token = 0
-        # Raw text of the segment currently being output. A new hold recording
-        # may start meanwhile and reset _current_transcription.
-        self._output_raw_text = ""
-        # "polish" while the polisher owns the sentence, "paste" once it was
-        # handed to the paster; the watchdog decides from this what to salvage.
-        self._output_stage = OutputStage.IDLE
-        self._output_stage_text = ""
-        # The history row of the sentence being pasted, so the watchdog can
-        # still save it when the paster's callback never arrives.
-        self._output_stage_record: SegmentRecord | None = None
-        # Pending row owned by polish/paste. Esc on a newer hold clears
-        # `_pending_record` and must not drop this sentence or its window.
-        self._output_pending_record: _PendingHistoryRecord | None = None
-        # Which LLM mode owns the in-flight sentence and the glossary it was
-        # sent with, so the right acceptance guard runs when the reply lands.
-        self._output_llm_mode = LLM_MODE_POLISH
-        self._output_glossary: list = []
-        # Tail of the previous output and when it went out; correction mode
-        # shows it to the model as read-only context for a split sentence.
-        self._last_output_text = ""
-        self._last_output_at = 0.0
         self._segment_queue: list[_QueuedSegment] = []
         self._prefetch_segment: _QueuedSegment | None = None
         self._failed_cached_audio = []
-        # Speaker numbering shares one stack with meetings: CAM++ when the aux
-        # model is downloaded (else the mel summary), continuity prior, and a
-        # re-clustering pass once a continuous session has fully drained.
         self._embedder: SpeakerEmbedder | None = None
-        self._recognition_change_pending = False
-        self._applied_recognition_settings = RecognitionSettings.from_config(self._config)
-        # Aux model lookup needs it. An unusable folder (removed drive) falls
-        # back to the default; the user is told once the tray is up.
-        self._models_dir_notice = ""
-        if not self._sync_models_dir():
-            self._models_dir_notice = (
-                f"模型目录不可用，已改用默认目录：{self._config.get('stt.models_dir', '')}"
-            )
+        self._reload_coord = self._build_reload_coordinator()
+        self._output_pipe = self._build_output_pipeline()
+        self._reload_coord.init_models_dir_notice()
 
         self._speakers = self._new_speaker_session()
         self._reclustered_session_id: str | None = None
         self._continuous_user_stopped = False
-        self._keep_unsaved_continuous_text = False
         self._current_session_id: str | None = None
         self._current_seq = 0
-        self._pending_record: _PendingHistoryRecord | None = None
         self._pending_turn_context: _SegmentContext | None = None
         self._pending_turn_audio: np.ndarray | None = None
-        self._load_started_at: float | None = None
-        self._loading_model_id = ""
         self._short_tap_tray_last_at = 0.0
         self._hotkey_conflict_warned = False
         self._exit_dialog_open = False
         self._exit_started = False
+        self._on_release_instance_lock = on_release_instance_lock
+        self._instance_lock_released = False
+        self._quit_drain_deadline: float | None = None
+        self._quit_drain_timeout_s = QUIT_NATIVE_DRAIN_TIMEOUT_S
         self._recovery_busy = False
-        # A meeting whose audio device is not opened yet (see _on_meeting_started).
         self._meeting_capture_pending = False
         self._meeting_user_paused = False
         self._restore_main_after_menu = False
-        self._history_failure_notified = False
         self._hotkey_mgr: HotKeyManager
         self._recorder: AudioRecorder
         self._recognizer: SpeechRecognizer
@@ -357,59 +415,220 @@ class App(QObject):
         self._init_modules()
         log.info("正在初始化界面...")
         self._init_ui()
-        self._updates = UpdateController(
-            self._config,
-            parent=self,
-            status_sink=self._settings_widget,
-            tray=self._tray,
-            show_about=lambda: self._show_main_window("about"),
-            confirm_exit=lambda: self._confirm_exit(install_update=True),
-            finish_quit=self._finish_quit,
-            exit_started=lambda: self._exit_started,
+        self._updates = (
+            modules.updates
+            if modules is not None and modules.updates is not None
+            else UpdateController(
+                self._config,
+                parent=self,
+                status_sink=self._settings_widget,
+                tray=self._tray,
+                show_about=lambda: self._show_main_window("about"),
+                confirm_exit=lambda: self._confirm_exit(install_update=True),
+                finish_quit=self._finish_quit,
+                exit_started=lambda: self._exit_started,
+            )
         )
-        self._onboarding = OnboardingController(
-            self._config,
-            parent=self,
-            dialog_parent=lambda: self._main,
-            is_continuous_mode=self._is_continuous_mode,
-            show_main_window=self._show_main_window,
+        self._onboarding = (
+            modules.onboarding
+            if modules is not None and modules.onboarding is not None
+            else OnboardingController(
+                self._config,
+                parent=self,
+                dialog_parent=lambda: self._main,
+                is_continuous_mode=self._is_continuous_mode,
+                show_main_window=self._show_main_window,
+            )
         )
         self._connect_signals()
         self._sync_hotkey_trigger_mode()
         self._configure_stt()
         self._update_tray_models()
 
-    def _sync_models_dir(self) -> bool:
-        """Apply only a folder the user actually chose.
+    def _safe_attr(self, name: str, default=None):
+        """Read an instance attribute without triggering ``QObject.__getattr__`` on ``__new__`` stubs."""
+        return self.__dict__.get(name, default)
 
-        The default location still has to see the model shipped beside the
-        program. Passing that default path in as a custom directory would
-        hide the installed copy and tell the user to download it again.
-        """
-        chosen = str(self._config.get("stt.models_dir", "") or "").strip()
-        return set_models_dir(chosen or None)
+    def _aux_model_path(self, model_id: str):
+        modules = self._safe_attr("_modules")
+        if modules is not None and modules.aux_model_path_fn is not None:
+            return modules.aux_model_path_fn(model_id)
+        return aux_model_path(model_id)
+
+    def _is_model_downloaded(self, model_id: str) -> bool:
+        modules = self._safe_attr("_modules")
+        if modules is not None and modules.is_model_downloaded_fn is not None:
+            return bool(modules.is_model_downloaded_fn(model_id))
+        from sayink.speech_recognizer import is_model_downloaded
+
+        return bool(is_model_downloaded(model_id))
+
+    def _build_output_pipeline(self) -> OutputPipeline:
+        from sayink.asr_correction import correction_rejection_reason
+
+        pipe = OutputPipeline(
+            schedule_later=lambda ms, fn: self._later(ms, fn),
+            pump_queue=lambda: self._pump_segment_queue(),
+            schedule_queue_pump=lambda: self._schedule_queue_pump(),
+            finish_empty_recognition=lambda: self._finish_empty_recognition(),
+            refresh_continuous_ui=lambda: self._refresh_continuous_ui_after_output(),
+            maybe_finish_dictation_speakers=lambda: self._maybe_finish_dictation_speakers(),
+            stop_continuous_user_session=lambda: self._stop_continuous_user_session(),
+            ask_history_output_conflict=lambda **kw: self._ask_history_output_conflict(**kw),
+            glossary_for_pending_segment=lambda: self._glossary_for_pending_segment(),
+            continuous_session_active=lambda: self._continuous_session_active(),
+            continuous_user_stopped=lambda: bool(self._safe_attr("_continuous_user_stopped", False)),
+            has_queued_segments=lambda: bool(self._safe_attr("_segment_queue")),
+            meeting_active=lambda: self._meeting_active(),
+            exit_started=lambda: bool(self._safe_attr("_exit_started", False)),
+            hold_target=lambda: self._safe_attr("_hold_target", (0, "")),
+            clear_transcribing=lambda: setattr(self, "_is_transcribing", False),
+            friendly_error=self._friendly_error,
+            output_text_dispatch=lambda text, **kw: self._output_text(text, **kw),
+            handle_paste_result_dispatch=lambda result, **kw: self._handle_paste_result(result, **kw),
+            copy_to_clipboard=lambda text: pyperclip.copy(text),
+            now_monotonic=lambda: time.monotonic(),
+            now_wall=lambda: time.time(),
+            platform_name=lambda: sys.platform,
+            watchdog_ms=lambda: OUTPUT_WATCHDOG_MS,
+            recent_context_window_s=lambda: RECENT_OUTPUT_CONTEXT_S,
+            polish_reject_fn=lambda raw, pol: polish_rejection_reason(raw, pol),
+            correction_reject_fn=lambda raw, pol, g: correction_rejection_reason(raw, pol, g),
+        )
+        self._sync_output_pipeline_refs(pipe)
+        return pipe
+
+    def _sync_output_pipeline_refs(self, pipe: OutputPipeline) -> None:
+        d = self.__dict__
+        pipe.config = d.get("_config")
+        pipe.polisher = d.get("_polisher")
+        pipe.paster = d.get("_paster")
+        pipe.history = d.get("_history")
+        pipe.floating = d.get("_floating")
+        pipe.tray = d.get("_tray")
+        pipe.recorder = d.get("_recorder")
+
+    def _output_pipeline(self) -> OutputPipeline:
+        d = self.__dict__
+        pipe = d.get("_output_pipe")
+        if pipe is None:
+            pipe = self._build_output_pipeline()
+            d["_output_pipe"] = pipe
+        else:
+            self._sync_output_pipeline_refs(pipe)
+        return pipe
+
+    def _reset_continuous_stop_flags(self) -> None:
+        self._continuous_user_stopped = False
+        self._keep_unsaved_continuous_text = False
+
+    def _rebuild_speaker_embedder(self) -> None:
+        self._embedder = None
+        self._speaker_embedder()
+
+    def _build_reload_coordinator(self) -> ReloadCoordinator:
+        modules = self._safe_attr("_modules")
+        set_dir_fn = (
+            modules.set_models_dir_fn
+            if modules is not None and modules.set_models_dir_fn is not None
+            else (lambda p: set_models_dir(p))
+        )
+        coord = ReloadCoordinator(
+            config=self._safe_attr("_config"),
+            aux_model_path_fn=lambda mid: self._aux_model_path(mid),
+            set_models_dir_fn=set_dir_fn,
+            is_model_downloaded_fn=(
+                modules.is_model_downloaded_fn
+                if modules is not None and modules.is_model_downloaded_fn is not None
+                else None
+            ),
+            now_monotonic=lambda: time.monotonic(),
+            meeting_active=lambda: self._meeting_active(),
+            hold_open_pending=lambda: bool(self._safe_attr("_hold_open_pending", False)),
+            pipeline_busy=lambda: self._pipeline_busy(),
+            has_queued_segments=lambda: bool(self._safe_attr("_segment_queue")),
+            queued_segment_count=lambda: len(self._safe_attr("_segment_queue") or ()),
+            recovery_busy=lambda: bool(self._safe_attr("_recovery_busy", False)),
+            exit_started=lambda: bool(self._safe_attr("_exit_started", False)),
+            clear_queued_audio=lambda: self._clear_queued_audio(),
+            stop_continuous_listening=lambda: self._stop_continuous_listening(),
+            reset_continuous_stop_flags=self._reset_continuous_stop_flags,
+            rebuild_speaker_embedder=self._rebuild_speaker_embedder,
+            sync_hotkey_trigger_mode=lambda: self._sync_hotkey_trigger_mode(),
+            sync_settings_runtime_status=lambda status=None: self._sync_settings_runtime_status(status),
+            sync_recognition_runtime_status=lambda: self._sync_recognition_runtime_status(),
+            sync_tray_status_summary=lambda status=None: self._sync_tray_status_summary(status),
+        )
+        self._sync_reload_coordinator_refs(coord)
+        return coord
+
+    def _sync_reload_coordinator_refs(self, coord: ReloadCoordinator) -> None:
+        d = self.__dict__
+        coord.sync_config_if_needed(d.get("_config"))
+        coord.recorder = d.get("_recorder")
+        coord.recognizer = d.get("_recognizer")
+        coord.floating = d.get("_floating")
+        coord.tray = d.get("_tray")
+        coord.sound = d.get("_sound")
+        coord.paster = d.get("_paster")
+
+    def _reload_coordinator(self) -> ReloadCoordinator:
+        d = self.__dict__
+        coord = d.get("_reload_coord")
+        if coord is None:
+            coord = self._build_reload_coordinator()
+            d["_reload_coord"] = coord
+        else:
+            self._sync_reload_coordinator_refs(coord)
+        return coord
+
+    def _sync_models_dir(self) -> bool:
+        return self._reload_coordinator().sync_models_dir()
 
     def _init_modules(self):
-        self._hotkey_mgr = HotKeyManager(
-            self._config.get("hotkey", DEFAULT_HOTKEY)
+        m = self._modules
+        self._hotkey_mgr = (
+            m.hotkey_mgr
+            if m is not None and m.hotkey_mgr is not None
+            else HotKeyManager(self._config.get("hotkey", DEFAULT_HOTKEY))
         )
-        self._recorder = AudioRecorder()
+        self._recorder = m.recorder if m is not None and m.recorder is not None else AudioRecorder()
+        cfg_dir = getattr(self._config, "config_dir", None)
+        if isinstance(cfg_dir, (str, os.PathLike)):
+            from pathlib import Path
+            from sayink.audio_recovery import sweep_orphan_pending
+
+            sweep_orphan_pending(Path(cfg_dir) / "audio-recovery")
         self._apply_audio_options()
         self._apply_audio_config()
-        self._recognizer = SpeechRecognizer()
-        self._polisher = TextPolisher()
-        self._paster = TextPaster(
-            restore_clipboard=self._config.get("output.restore_clipboard", False)
+        self._recognizer = (
+            m.recognizer if m is not None and m.recognizer is not None else SpeechRecognizer()
         )
-        self._sound = SoundManager(
-            enabled=self._config.get("sound_enabled", True)
+        self._polisher = m.polisher if m is not None and m.polisher is not None else TextPolisher()
+        self._paster = (
+            m.paster
+            if m is not None and m.paster is not None
+            else TextPaster(restore_clipboard=self._config.get("output.restore_clipboard", False))
         )
-        self._history = HistoryStore(db_path=self._config.config_dir / "history.db")
-        self._meeting = MeetingController(
-            self._config,
-            self._history,
-            pending_segments=self._pending_segment_count,
-            parent=self,
+        self._sound = (
+            m.sound
+            if m is not None and m.sound is not None
+            else SoundManager(enabled=self._config.get("sound_enabled", True))
+        )
+        self._history = (
+            m.history
+            if m is not None and m.history is not None
+            else HistoryStore(db_path=self._config.config_dir / "history.db")
+        )
+        self._meeting = (
+            m.meeting
+            if m is not None and m.meeting is not None
+            else MeetingController(
+                self._config,
+                self._history,
+                pending_segments=self._pending_segment_count,
+                parent=self,
+            )
         )
         self._deferred_audio_settings = False
         self._meeting_idle_warned = False
@@ -419,8 +638,9 @@ class App(QObject):
         self._meeting_idle_timer.timeout.connect(self._on_meeting_idle_tick)
 
     def _init_ui(self):
-        self._floating = FloatingWindow()
-        self._tray = TrayIcon()
+        m = self._modules
+        self._floating = m.floating if m is not None and m.floating is not None else FloatingWindow()
+        self._tray = m.tray if m is not None and m.tray is not None else TrayIcon()
 
         self._tray.set_auto_start(self._config.get("auto_start", False))
         self._tray.show()
@@ -431,12 +651,13 @@ class App(QObject):
         self._floating.position_committed.connect(self._on_listen_bar_position_committed)
         self._floating.placement_reset.connect(self._on_listen_bar_placement_reset)
         self._apply_listen_bar_preferences()
-        # Re-apply after surfaces exist so cold-start dark/system is not stuck
-        # on import-time light snapshots for inline-styled widgets.
-        self.apply_appearance_theme()
-        from sayink.ui.theme import watch_system_color_scheme
+        if m is None or not m.skip_theme_init:
+            # Re-apply after surfaces exist so cold-start dark/system is not stuck
+            # on import-time light snapshots for inline-styled widgets.
+            self.apply_appearance_theme()
+            from sayink.ui.theme import watch_system_color_scheme
 
-        watch_system_color_scheme(self._on_system_color_scheme_changed)
+            watch_system_color_scheme(self._on_system_color_scheme_changed)
 
     def _on_system_color_scheme_changed(self) -> None:
         if self._config.get("appearance.theme_mode", "dark") == "system":
@@ -444,12 +665,7 @@ class App(QObject):
             self.apply_appearance_theme()
 
     def _meeting_or_none(self) -> MeetingController | None:
-        # Tests build App via __new__; a missing attribute on a half-built
-        # QObject raises RuntimeError rather than AttributeError.
-        try:
-            return object.__getattribute__(self, "_meeting")
-        except (AttributeError, RuntimeError):
-            return None
+        return self._safe_attr("_meeting")
 
     def _meeting_active(self) -> bool:
         """A meeting owns the audio pipeline (live, paused or draining)."""
@@ -458,9 +674,9 @@ class App(QObject):
 
     def _capture_open(self) -> bool:
         """A hold or continuous listen still owns the device."""
-        if getattr(self, "_hold_open_pending", False):
+        if self._safe_attr("_hold_open_pending", False):
             return True
-        recorder = getattr(self, "_recorder", None)
+        recorder = self._safe_attr("_recorder")
         return bool(recorder is not None and getattr(recorder, "is_recording", False))
 
     def _is_continuous_mode(self) -> bool:
@@ -471,7 +687,7 @@ class App(QObject):
         # The saved trigger mode can change while this capture is still open.
         # Stop, paste and segment identity stay on the mode that started it.
         if self._capture_open():
-            locked = getattr(self, "_locked_trigger_mode", None)
+            locked = self._safe_attr("_locked_trigger_mode")
             if locked in (TRIGGER_MODE_HOTKEY, TRIGGER_MODE_CONTINUOUS):
                 return locked == TRIGGER_MODE_CONTINUOUS
         return self._config.get("audio.trigger_mode", TRIGGER_MODE_HOTKEY) == TRIGGER_MODE_CONTINUOUS
@@ -557,120 +773,34 @@ class App(QObject):
         self._tray.messageClicked.connect(self._updates.on_tray_message_clicked)
 
     def _audio_runtime_key(self) -> tuple[str, int, int]:
-        """Device choice only. Trigger mode must not look like an audio change."""
-        return (
-            str(self._config.get("audio.input_source", "microphone")),
-            int(self._config.get("audio.mic_device_index", -1)),
-            int(self._config.get("audio.system_device_index", -1)),
-        )
+        return self._reload_coordinator().audio_runtime_key()
 
-    def _recognition_runtime_key(self) -> tuple:
-        shared = RecognitionSettings.from_config(self._config)
-        return (
-            shared.model_id,
-            int(self._config.get("stt.num_threads", 4) or 4),
-            shared.hotwords,
-            shared.effective_language,
-        )
+    def _recognition_runtime_key(self, settings: RecognitionSettings | None = None) -> tuple:
+        return self._reload_coordinator().recognition_runtime_key(settings)
+
+    def _speaker_aux_paths(self, settings: RecognitionSettings) -> tuple:
+        return self._reload_coordinator().speaker_aux_paths(settings)
+
+    def _vad_aux_path(self, vad: str):
+        return self._reload_coordinator().vad_aux_path(vad)
+
+    def _sync_recognizer_quiet_speech(self, shared: RecognitionSettings | None = None) -> None:
+        self._reload_coordinator().sync_recognizer_quiet_speech(shared)
 
     def _apply_audio_config(self):
-        from sayink.audio_devices import INPUT_SOURCES, sanitize_system_device_index
-
-        source = self._config.get("audio.input_source", "microphone")
-        if source not in INPUT_SOURCES:
-            source = "microphone"
-            self._config.set("audio.input_source", source)
-        sys_idx = sanitize_system_device_index(
-            int(self._config.get("audio.system_device_index", -1))
-        )
-        if sys_idx != int(self._config.get("audio.system_device_index", -1)):
-            self._config.set("audio.system_device_index", sys_idx)
-        self._recorder.configure(
-            input_source=source,
-            mic_device_index=int(self._config.get("audio.mic_device_index", -1)),
-            system_device_index=sys_idx,
-        )
-        self._apply_dictation_segmenter_profile()
-        floating = getattr(self, "_floating", None)
-        if floating is not None:
-            setter = getattr(floating, "set_input_source", None)
-            if callable(setter):
-                setter(source)
-        # The device is opened on the next recording, not here. Enumerating
-        # PortAudio on this click froze the window for the whole query.
-        self._applied_audio_key = self._audio_runtime_key()
+        self._reload_coordinator().apply_audio_config()
 
     def _apply_audio_options(self):
-        root = self._config.config_dir / "audio-recovery" if self._config.get("audio.recovery_enabled", False) else None
-        self._recorder.set_recovery_directory(root)
-        self._recorder.set_separate_lanes(bool(self._config.get("audio.separate_lanes", False)))
+        self._reload_coordinator().apply_audio_options()
 
     def _apply_dictation_segmenter_profile(self) -> None:
-        """Dictation keeps its short pauses but uses the same VAD choice as
-        meetings (Silero when downloaded, else energy)."""
-        self._applied_recognition_settings = RecognitionSettings.from_config(self._config)
-        vad = self._applied_recognition_settings.vad
-        self._recorder.set_quiet_speech(self._applied_recognition_settings.quiet_speech_enabled)
-        self._set_boundary_context_for_model(self._applied_recognition_settings.model_id)
-        model_path = aux_model_path(AUX_MODEL_SILERO_VAD) if vad == VAD_SILERO else None
-        self._recorder.set_segmenter_profile(vad=vad, vad_model_path=model_path, meeting=False)
+        self._reload_coordinator().apply_dictation_segmenter_profile()
 
     def _set_boundary_context_for_model(self, model_id):
-        from sayink.speech_recognizer import get_model_info
-        loader = (get_model_info(model_id) or {}).get("loader", "")
-        self._recorder.set_boundary_context(
-            self._applied_recognition_settings.boundary_context_enabled
-            and loader in {"fire_red_asr_ctc", "zipformer_ctc"})
+        self._reload_coordinator().set_boundary_context_for_model(model_id)
 
     def _configure_stt(self):
-        from sayink.speech_recognizer import is_model_downloaded, resolve_startup_model_id
-
-        configured = self._config.get("stt.model_id", DEFAULT_MODEL_ID)
-        model_id = resolve_startup_model_id(configured)
-        if model_id and model_id != configured and is_model_downloaded(model_id):
-            # The saved model is not on disk (deleted, or the upgrade migration
-            # pointed at a default this build does not bundle). Record what is
-            # actually running so the engine page, tray menu and bar agree.
-            log.info("语音模型配置已改为实际使用的 %s（原 %s 未下载）", model_id, configured)
-            self._config.set("stt.model_id", model_id)
-        num_threads = self._config.get("stt.num_threads", 4)
-        # Same glossary / language as a meeting, so starting one does not
-        # force a model reload.
-        shared = RecognitionSettings.from_config(self._config)
-        hotwords, language = shared.hotwords, shared.effective_language
-        self._recognizer.quiet_speech = (shared.quiet_speech_enabled
-                                         and getattr(self._recorder.segmentation_status, "effective", "") == VAD_SILERO)
-
-        if model_id and is_model_downloaded(model_id):
-            info = get_model_info(model_id)
-            name = info["name"] if info else model_id
-            needs_load = not (
-                self._recognizer.current_model_id == model_id
-                and self._recognizer.is_ready
-            )
-            if needs_load and not self._recognizer.is_loading:
-                self._floating.show_model_loading(
-                    f"正在将 {name} 载入内存，请稍候（{self._load_eta_text(model_id)}）…"
-                )
-                self._tray.set_activity_tooltip("loading")
-                self._sync_settings_runtime_status()
-            self._recognizer.configure(model_id, num_threads, hotwords=hotwords, language=language)
-        else:
-            info = get_model_info(model_id) if model_id else None
-            name = info["name"] if info else (model_id or DEFAULT_MODEL_ID)
-            log.warning("语音模型 %s 未下载，请在设置中下载模型", name)
-            hint = (
-                f"请下载语音模型「{name}」。"
-                "Windows 可双击托盘打开主窗口，再到设置 → 引擎；或右键托盘 → 打开 SayInk。"
-            )
-            self._floating.show_error(hint)
-            self._tray.showMessage(
-                "SayInk",
-                hint,
-                QSystemTrayIcon.MessageIcon.Warning,
-                6000,
-            )
-        self._applied_recognition_key = self._recognition_runtime_key()
+        self._reload_coordinator().configure_stt()
 
     # ── Recording flow ────────────────────────────────
 
@@ -694,8 +824,8 @@ class App(QObject):
         )
 
     def _pending_segment_count(self) -> int:
-        in_flight = self._is_transcribing or self._output_busy
-        return len(self._segment_queue) + (1 if in_flight else 0)
+        in_flight = bool(self._safe_attr("_is_transcribing", False)) or self._output_busy
+        return len(self._safe_attr("_segment_queue") or ()) + (1 if in_flight else 0)
 
     def _discardable_segment_count(self) -> int:
         """Segments a settings change will actually drop.
@@ -712,13 +842,13 @@ class App(QObject):
         return pending
 
     def _recording_blocks_mic_test(self) -> bool:
-        recorder = getattr(self, "_recorder", None)
+        recorder = self._safe_attr("_recorder")
         if recorder is None:
             return False
         return bool(
             recorder.is_recording
             or recorder.is_continuous
-            or self._hold_open_pending
+            or self._safe_attr("_hold_open_pending", False)
             or self._meeting_active()
         )
 
@@ -737,7 +867,7 @@ class App(QObject):
         meeting = self._meeting_or_none()
         if meeting is not None:
             meeting.notice.emit("会议语音未识别", detail)
-        tray = getattr(self, "_tray", None)
+        tray = self._safe_attr("_tray")
         show = getattr(tray, "showMessage", None)
         if callable(show):
             show("SayInk", detail, QSystemTrayIcon.MessageIcon.Warning, 8000)
@@ -759,8 +889,12 @@ class App(QObject):
         self._tray.showMessage("SayInk", detail, QSystemTrayIcon.MessageIcon.Information, 8000)
 
     def _pipeline_busy(self) -> bool:
-        return (self._is_transcribing or self._output_busy or self._prefetch_segment is not None
-                or getattr(self, "_recovery_busy", False))
+        return bool(
+            self._safe_attr("_is_transcribing", False)
+            or self._output_busy
+            or self._safe_attr("_prefetch_segment") is not None
+            or self._safe_attr("_recovery_busy", False)
+        )
 
     def _on_esc_pressed(self):
         if self._meeting_active():
@@ -786,22 +920,14 @@ class App(QObject):
         self._floating.show_error(message or "快捷键监听未能启动")
 
     def _load_eta_text(self, model_id: str) -> str:
-        seconds = (self._config.get(LOAD_SECONDS_KEY, {}) or {}).get(model_id)
-        if isinstance(seconds, (int, float)) and seconds > 0:
-            return f"上次用时约 {max(1, round(seconds))} 秒"
-        return "约 10–40 秒"
+        return self._reload_coordinator().load_eta_text(model_id)
 
     def _remember_load_duration(self) -> None:
-        started = self._load_started_at
-        model_id = self._loading_model_id
-        self._load_started_at = None
-        if started is None or not model_id:
-            return
-        durations = dict(self._config.get(LOAD_SECONDS_KEY, {}) or {})
-        durations[model_id] = round(time.monotonic() - started, 1)
-        self._config.set(LOAD_SECONDS_KEY, durations)
+        self._reload_coordinator().remember_load_duration()
 
     def _on_model_load_progress(self, phase: ModelLoadPhase, msg: str):
+        if phase is ModelLoadPhase.LOADING and getattr(self._recognizer, "is_silent_loading", False) is True:
+            return
         if phase is ModelLoadPhase.READY:
             self._remember_load_duration()
             self._floating.clear_model_loading_lock()
@@ -840,11 +966,7 @@ class App(QObject):
             else:
                 log.info("模型重新加载，暂停持续监听")
                 self._stop_continuous_listening()
-        model_id = self._recognizer.current_model_id
-        if isinstance(model_id, str) and model_id:
-            self._load_started_at = time.monotonic()
-            self._loading_model_id = model_id
-            msg = f"{msg}（{self._load_eta_text(model_id)}）"
+        msg = self._reload_coordinator().begin_tracked_model_load(msg)
         self._floating.show_model_loading(msg)
         self._tray.set_activity_tooltip("loading")
         self._sync_settings_runtime_status()
@@ -911,7 +1033,7 @@ class App(QObject):
     def _on_recording_start(self):
         if self._recovery_busy:
             return
-        if self.__dict__.get("_exit_started", False):
+        if self._safe_attr("_exit_started", False):
             return
         if self._meeting_blocks_hotkey():
             return
@@ -1144,7 +1266,7 @@ class App(QObject):
             self._later(BAR_REFRESH_AFTER_STOP_MS, self._refresh_continuous_ui_after_output)
 
     def _on_recorder_error(self, error_msg: str):
-        if self.__dict__.get("_exit_started", False):
+        if self._safe_attr("_exit_started", False):
             return
         if self._meeting_active():
             # The meeting stays open. A dictation-style error toast would hide
@@ -1169,7 +1291,7 @@ class App(QObject):
         self._floating.show_error(self._friendly_error(error_msg))
 
     def _on_recorder_warning(self, warning_msg: str):
-        if self.__dict__.get("_exit_started", False):
+        if self._safe_attr("_exit_started", False):
             return
         log.warning("%s", warning_msg)
         self._floating.show_warning("音频采集受限", warning_msg)
@@ -1184,7 +1306,7 @@ class App(QObject):
     def _start_continuous_listening(self):
         if self._recovery_busy:
             return
-        if self.__dict__.get("_exit_started", False):
+        if self._safe_attr("_exit_started", False):
             return
         if not self._is_continuous_mode():
             return
@@ -1265,7 +1387,7 @@ class App(QObject):
         front: bool = False,
         context: _SegmentContext | None = None,
     ) -> None:
-        if self.__dict__.get("_exit_started", False):
+        if self._safe_attr("_exit_started", False):
             return
         segment = _QueuedSegment(audio=audio, route=route, context=context)
         # Only opt-in recording sessions may spill audio onto disk. Existing
@@ -1381,47 +1503,22 @@ class App(QObject):
         return context
 
     def _history_output_blocked(self) -> bool:
-        if self._meeting_active():
-            return False
-        return bool(self._config.history_only_output()) and not bool(self._config.get("history.enabled", True))
+        return self._output_pipeline().history_output_blocked()
 
     def _ensure_history_output_ready(self) -> bool:
-        """Block a new recording until history-only with history off is resolved."""
-        if not self._history_output_blocked():
-            return True
-        choice = self._ask_history_output_conflict()
-        if choice == "history":
-            self._config.set("history.enabled", True)
-            return True
-        if choice == "paste":
-            self._config.set_output_mode(OUTPUT_MODE_PASTE)
-            return True
-        return False
+        return self._output_pipeline().ensure_history_output_ready()
 
     def _copy_clipboard(self, text: str) -> bool:
-        import pyperclip
-
-        try:
-            pyperclip.copy(text)
-        except Exception:
-            log.warning("写入剪贴板失败", exc_info=True)
-            return False
-        return True
+        return self._output_pipeline().copy_clipboard(text)
 
     def _release_unsaved_hold(self) -> None:
-        """Drop the cancel-and-copy hold once the stopped session has no tail left."""
-        if not self._keep_unsaved_continuous_text:
-            return
-        if getattr(self._recorder, "is_continuous", False):
-            return
-        if self._segment_queue:
-            return
-        self._keep_unsaved_continuous_text = False
+        self._output_pipeline().release_unsaved_hold()
 
     def _ask_history_output_conflict(self, *, listening: bool = False) -> str:
         from PyQt6.QtWidgets import QWidget
 
-        parent = self._main if isinstance(getattr(self, "_main", None), QWidget) else None
+        main = self._safe_attr("_main")
+        parent = main if isinstance(main, QWidget) else None
         box = QMessageBox(parent)
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle("结果没有去处")
@@ -1475,19 +1572,7 @@ class App(QObject):
         return 0, ""
 
     def _paste_target_for_output(self) -> tuple[int, str]:
-        """Window remembered for the utterance still waiting to go out.
-
-        An explicit empty target (SayInk itself, or no foreground window)
-        must not fall through to an older hold: that would type into the
-        wrong application.
-        """
-        pending = self._record_for_output()
-        if pending is not None:
-            return int(getattr(pending, "target_hwnd", 0) or 0), str(getattr(pending, "target_app", "") or "")
-        held = getattr(self, "_hold_target", (0, ""))
-        if isinstance(held, tuple) and len(held) == 2:
-            return int(held[0] or 0), str(held[1] or "")
-        return 0, ""
+        return self._output_pipeline().paste_target_for_output()
 
     def _listening_target(self, name: str) -> str:
         """What the bar names after 「正在听」; never a window that gets no paste."""
@@ -1508,15 +1593,19 @@ class App(QObject):
 
     def _speaker_embedder(self) -> SpeakerEmbedder:
         """CAM++ when downloaded and enabled, else the mel summary; built once
-        and dropped when the model list changes."""
+        and dropped when the speaker preferences or aux models change."""
         embedder = self._embedder
         if embedder is None:
             enabled = bool(self._config.get("stt.speaker_model_enabled", True))
+            activity_enabled = bool(self._config.get("stt.speaker_activity_enabled", False))
+            speaker_path = self._aux_model_path(AUX_MODEL_SPEAKER) if enabled else None
+            activity_path = self._aux_model_path(AUX_MODEL_SPEAKER_ACTIVITY) if activity_enabled else None
             embedder = make_embedder(
-                aux_model_path(AUX_MODEL_SPEAKER) if enabled else None, enabled=enabled,
-                activity_enabled=bool(self._config.get("stt.speaker_activity_enabled", False)),
+                speaker_path, enabled=enabled,
+                activity_enabled=activity_enabled,
             )
             self._embedder = embedder
+            self._applied_speaker_aux = (speaker_path, activity_path)
         return embedder
 
     def _new_speaker_session(self) -> MeetingSpeakerSession:
@@ -1617,7 +1706,7 @@ class App(QObject):
     # ── Recognition ───────────────────────────────────
 
     def _on_recording_finished(self, full_audio: np.ndarray):
-        if self.__dict__.get("_exit_started", False):
+        if self._safe_attr("_exit_started", False):
             return
         if full_audio.size < MIN_AUDIO_SAMPLES:
             if self._emit_hold_output_if_ready():
@@ -1645,6 +1734,16 @@ class App(QObject):
             return
         self._begin_transcription(full_audio)
 
+    def _continuous_diarization_unused(self, context: _SegmentContext | None) -> bool:
+        """True only when continuous dictation neither stores nor displays speaker IDs."""
+        if context is None or context.trigger_mode != TRIGGER_MODE_CONTINUOUS:
+            return False
+        if bool(self._config.get("history.enabled", True)):
+            return False
+        return not _ConfigRules.history_only_for_capture(
+            self._config, context.source, trigger_mode=TRIGGER_MODE_CONTINUOUS,
+        )
+
     def _begin_transcription(
         self,
         audio: np.ndarray,
@@ -1661,12 +1760,21 @@ class App(QObject):
         if context is None:
             context = self._capture_segment_context()
         self._pending_record = self._build_pending_history_record(audio, context)
-        analyze_turns = (context is not None and context.trigger_mode in (TRIGGER_MODE_CONTINUOUS, TRIGGER_MODE_MEETING)
-                         and context.recognized_text is None
-                         and getattr(context.embed, "supports_turn_detection", False) is True)
+        skip_diarization = self._continuous_diarization_unused(context)
+        analyze_turns = (
+            not skip_diarization
+            and context is not None
+            and context.trigger_mode in (TRIGGER_MODE_CONTINUOUS, TRIGGER_MODE_MEETING)
+            and context.recognized_text is None
+            and getattr(context.embed, "supports_turn_detection", False) is True
+        )
         self._pending_turn_context = context if analyze_turns else None
         self._pending_turn_audio = audio if analyze_turns else None
-        speaker_id, speaker_route = (0, route) if analyze_turns else self._label_speaker(audio, route, context)
+        speaker_id, speaker_route = (
+            (0, route)
+            if (analyze_turns or skip_diarization)
+            else self._label_speaker(audio, route, context)
+        )
         self._pending_record.speaker_id = speaker_id
         self._pending_record.speaker_route = speaker_route
         if not self._is_continuous_mode():
@@ -1698,8 +1806,8 @@ class App(QObject):
         """
         context = self._pending_turn_context
         audio = self._pending_turn_audio
-        if self.__dict__.get("_exit_started", False) or context is None or audio is None or not turns:
-            if not self.__dict__.get("_exit_started", False):
+        if self._safe_attr("_exit_started", False) or context is None or audio is None or not turns:
+            if not self._safe_attr("_exit_started", False):
                 self._is_transcribing = False
                 self._pump_segment_queue()
             return
@@ -1742,12 +1850,7 @@ class App(QObject):
         self._begin_transcription(first.audio, route=first.route, context=first.context)
 
     def _utterance_history_only(self, record) -> bool:
-        """History-only for this utterance, not for a setting that changed later."""
-        source = getattr(record, "source", None) if record is not None else None
-        trigger = getattr(record, "trigger_mode", None) if record is not None else None
-        if trigger == TRIGGER_MODE_MEETING:
-            trigger = None
-        return _ConfigRules.history_only_for_capture(self._config, source, trigger_mode=trigger)
+        return self._output_pipeline().utterance_history_only(record)
 
     def _history_source(self) -> str:
         return {
@@ -1805,7 +1908,7 @@ class App(QObject):
             self._floating.show_live_transcript(text)
 
     def _on_partial_result(self, text: str) -> None:
-        if self.__dict__.get("_exit_started", False):
+        if self._safe_attr("_exit_started", False):
             return
         piece = (text or "").strip()
         if not piece:
@@ -1853,22 +1956,10 @@ class App(QObject):
         return True
 
     def _record_for_output(self):
-        """Row owned by the sentence in polish/paste, else the hold still being recognized."""
-        owned = self._output_pending_record
-        if owned is not None:
-            return owned
-        return self._pending_record
+        return self._output_pipeline().record_for_output()
 
     def _claim_pending_record_for_output(self) -> None:
-        """Detach the current row from the hold slot before polish starts.
-
-        A new hold is allowed while polish runs. Esc on that hold clears
-        `_pending_record`; this sentence must already live elsewhere, with
-        the window captured when it was spoken.
-        """
-        if self._output_pending_record is None and self._pending_record is not None:
-            self._output_pending_record = self._pending_record
-            self._pending_record = None
+        self._output_pipeline().claim_pending_record_for_output()
 
     def _glossary_for_pending_segment(self) -> list:
         """The meeting's own terms for a meeting row, else the applied dictation glossary."""
@@ -1884,7 +1975,7 @@ class App(QObject):
         return self._applied_recognition_settings.glossary
 
     def _on_final_result(self, text: str):
-        if self.__dict__.get("_exit_started", False):
+        if self._safe_attr("_exit_started", False):
             return
         glossary = self._glossary_for_pending_segment()
         raw_text = normalize_asr_output(text)
@@ -1971,104 +2062,16 @@ class App(QObject):
         timer.start(msec)
 
     def _mark_output_busy(self) -> None:
-        self._output_busy = True
-        self._output_token += 1
-        token = self._output_token
-        self._later(OUTPUT_WATCHDOG_MS, lambda: self._release_stuck_output(token))
+        self._output_pipeline().mark_busy()
 
     def _release_stuck_output(self, token: int) -> None:
-        if not self._output_busy or token != self._output_token:
-            return
-        raw = self._output_raw_text
-        if self._output_stage is OutputStage.POLISH and raw.strip():
-            # The polisher never answered. Its result would have been this
-            # sentence anyway, so output the raw words instead of losing them.
-            log.error("润色超时未回调，改为输出原文")
-            self._polisher.cancel()
-            self._output_stage = OutputStage.PASTE
-            # The paste stage gets its own watchdog window; the one that just
-            # fired must not be the last line of defence for it.
-            self._mark_output_busy()
-            self._output_text(raw, degraded_from_polish=True)
-            return
-        log.error("输出流程超时未回调，释放队列以免后续语音卡住")
-        self._output_busy = False
-        self._output_stage = OutputStage.IDLE
-        # The shortcut may still be waiting out its short delay. Sending it
-        # after telling the user to paste by hand inserts the sentence twice.
-        self._paster.cancel()
-        record = self._output_stage_record
-        self._output_stage_record = None
-        if self._output_stage_text.strip():
-            # Ctrl+V may or may not have gone out; leave the words on the
-            # clipboard rather than risk pasting them twice.
-            try:
-                pyperclip.copy(self._output_stage_text)
-            except Exception as exc:
-                log.warning("复制超时句子到剪贴板失败: %s", exc)
-            else:
-                self._floating.show_info("输出超时 · 已复制", "可按 Ctrl+V 粘贴")
-        if record is not None:
-            # The paster's callback (which normally saves the row) is gone with
-            # the cancel; the words are still worth keeping in history.
-            self._enqueue_history_record(record, target_app="")
-        self._pump_segment_queue()
+        self._output_pipeline().release_stuck_output(token)
 
     def _deliver_recognized_text(self, text: str) -> None:
-        self._claim_pending_record_for_output()
-        self._mark_output_busy()
-        self._output_raw_text = text
-        self._output_stage = OutputStage.POLISH
-        self._output_stage_text = ""
-        llm_enabled = self._config.get("llm.enabled", False)
-        pending = self._record_for_output()
-        if pending is not None and pending.trigger_mode == TRIGGER_MODE_MEETING:
-            # Meeting rows go to the minutes model later, in one pass; a
-            # per-sentence polish would only add latency and API cost.
-            llm_enabled = bool(self._config.get("meeting.polish_segments", False)) and llm_enabled
-        api_url = self._config.get("llm.api_url", "")
-        api_key = self._config.get("llm.api_key", "")
-        model_name = self._config.get("llm.model_name", "")
-        mode = normalize_llm_mode(self._config.get("llm.mode", LLM_MODE_POLISH))
-        prompt = self._config.get(prompt_config_key(mode), "")
-        self._output_llm_mode = mode
-        self._output_glossary = list(self._glossary_for_pending_segment() or [])
-
-        if llm_enabled and polish_settings_complete(api_url, api_key, model_name):
-            action = "纠错" if mode == LLM_MODE_CORRECT else "润色"
-            self._tray.set_activity_tooltip("correcting" if mode == LLM_MODE_CORRECT else "polishing")
-            if self._continuous_user_stopped:
-                self._floating.show_continuous_stopped(f"正在处理剩余内容 · 正在{action}")
-            else:
-                self._floating.show_polishing(text, action=action)
-            target_app = pending.target_app if pending is not None else ""
-            self._polisher.polish(
-                text,
-                api_url,
-                api_key,
-                model_name,
-                prompt,
-                mode=mode,
-                glossary=self._output_glossary,
-                context=self._recent_output_context(),
-                target_app=target_app,
-                proxy_mode=self._config.get("llm.proxy_mode", "system"),
-                proxy_bypass_suffixes=str(self._config.get("llm.proxy_bypass_suffixes", "") or ""),
-            )
-        elif llm_enabled:
-            log.warning("文字润色已开启但配置不完整，直接输出原文")
-            self._output_text(text, degraded_from_polish=True)
-        else:
-            self._output_text(text)
-        if self._output_busy:
-            self._schedule_queue_pump()
+        self._output_pipeline().deliver_recognized_text(text)
 
     def _recent_output_context(self) -> str:
-        """The previous output, if it went out recently enough to be the same
-        conversation; an old sentence from another window would only mislead."""
-        if not self._last_output_text or time.monotonic() - self._last_output_at > RECENT_OUTPUT_CONTEXT_S:
-            return ""
-        return self._last_output_text
+        return self._output_pipeline().recent_output_context()
 
     def _on_recognizer_error(self, error_msg: str):
         self._pending_turn_context = None
@@ -2169,7 +2172,10 @@ class App(QObject):
                 or context.recognized_text is not None or segment.prefetch_attempted):
             return
         analyzer = None
-        if getattr(context.embed, "supports_turn_detection", False) is True:
+        if (
+            not self._continuous_diarization_unused(context)
+            and getattr(context.embed, "supports_turn_detection", False) is True
+        ):
             analyzer = SpeakerTurnDetector(context.embed, context=getattr(context.speakers, "turn_context", None),
                                             start_ms=context.captured_at, route=f"{context.source}:{segment.route}")
         segment.prefetch_attempted = True
@@ -2201,6 +2207,11 @@ class App(QObject):
             complete(error=True)
 
     def _on_stt_ready(self):
+        if getattr(self._recognizer, "last_ready_silent", False) is True:
+            self._sync_settings_runtime_status()
+            if self._segment_queue and not self._is_transcribing:
+                self._pump_segment_queue()
+            return
         self._floating.clear_model_loading_lock()
         self._tray.set_activity_tooltip(None)
         self._sync_settings_runtime_status()
@@ -2236,184 +2247,24 @@ class App(QObject):
             6000 if self._is_continuous_mode() else 3000,
         )
 
-    # ── Polishing ─────────────────────────────────────
+    # ── Polishing & Output ────────────────────────────
 
     def _on_polish_complete(self, polished_text: str):
-        if self._output_stage is not OutputStage.POLISH:
-            log.warning("润色结果晚于超时到达，已输出原文，忽略")
-            return
-        raw = self._output_raw_text
-        # Check what would actually be pasted: normalisation can strip a reply
-        # down to nothing (「。」) or drop a numbered clause, and a reply that is
-        # empty after normalisation must not take the user's sentence with it.
-        polished = normalize_asr_output(polished_text or "")
-        if not polished.strip():
-            reason = "结果为空"
-        elif self._output_llm_mode == LLM_MODE_CORRECT:
-            # Correction promised to change almost nothing, so a reply that
-            # rewrites or trims the sentence is a failed correction, not a
-            # style choice; the raw words are the safer output.
-            reason = correction_rejection_reason(raw, polished, self._output_glossary)
-        else:
-            reason = polish_rejection_reason(raw, polished)
-        if reason:
-            log.warning(
-                "%s结果未通过保真检查（%s；原文 %d 字，结果 %d 字），改为输出原文",
-                "纠错" if self._output_llm_mode == LLM_MODE_CORRECT else "润色",
-                reason, len(raw), len(polished),
-            )
-            self._output_text(raw, degraded_from_polish=True)
-            return
-        self._output_text(polished)
+        self._output_pipeline().on_polish_complete(polished_text)
 
     def _on_polish_error(self, error_msg: str):
-        if self._output_stage is not OutputStage.POLISH:
-            return
-        log.warning("后处理失败，降级输出原文: %s", error_msg)
-        self._output_text(
-            self._output_raw_text,
-            degraded_from_polish=True,
-        )
-
-    # ── Output ────────────────────────────────────────
+        self._output_pipeline().on_polish_error(error_msg)
 
     def _output_text(self, text: str, *, degraded_from_polish: bool = False):
-        if self.__dict__.get("_exit_started", False):
-            return
-        self._is_transcribing = False
-        text = normalize_asr_output(text)
-        if not text.strip():
-            # Nothing to paste or save: release the output slot completely so
-            # the next sentence does not inherit this one's stage or record.
-            self._output_busy = False
-            self._output_stage = OutputStage.IDLE
-            self._output_stage_text = ""
-            self._output_stage_record = None
-            if self._output_pending_record is not None:
-                self._output_pending_record = None
-            else:
-                self._pending_record = None
-            self._finish_empty_recognition()
-            return
-
-        # Freeze drops the pending row, and that row is the only place a
-        # continuous utterance keeps the window from when speech started.
-        paste_hwnd, paste_app = self._paste_target_for_output()
-        record = self._freeze_pending_history_record(text, degraded_from_polish)
-        is_meeting_row = record is not None and record.trigger_mode == TRIGGER_MODE_MEETING
-        history_only = self._utterance_history_only(record)
-        if not is_meeting_row:
-            # Context for the next correction: only dictation that is about to
-            # go out, never a meeting row the user is not typing anywhere.
-            self._last_output_text = text
-            self._last_output_at = time.monotonic()
-        preserve_tail = self._keep_unsaved_continuous_text and not getattr(self._recorder, "is_continuous", False)
-        dialog_disarmed = False
-        if (
-            not is_meeting_row
-            and not self._meeting_active()
-            and history_only
-            and not bool(self._config.get("history.enabled", True))
-            and (getattr(self._recorder, "is_continuous", False) is True or preserve_tail)
-        ):
-            if preserve_tail:
-                copied = self._copy_clipboard(text)
-                self._handle_paste_result(
-                    PasteResult("clipboard" if copied else "failed", detail="history_conflict" if copied else "clipboard_failed"),
-                    degraded_from_polish=degraded_from_polish,
-                    record=record,
-                )
-                self._release_unsaved_hold()
-                return
-            # The dialog runs a nested event loop. Drop the polish watchdog
-            # first, or a slow answer re-enters this sentence and pastes it twice.
-            self._output_token += 1
-            self._output_stage = OutputStage.PASTE
-            dialog_disarmed = True
-            choice = self._ask_history_output_conflict(listening=True)
-            if choice == "history":
-                self._config.set("history.enabled", True)
-            elif choice == "paste":
-                self._config.set_output_mode(OUTPUT_MODE_PASTE)
-            else:
-                self._keep_unsaved_continuous_text = True
-                copied = self._copy_clipboard(text)
-                self._stop_continuous_user_session()
-                self._handle_paste_result(
-                    PasteResult("clipboard" if copied else "failed", detail="history_conflict" if copied else "clipboard_failed"),
-                    degraded_from_polish=degraded_from_polish,
-                    record=record,
-                )
-                self._release_unsaved_hold()
-                return
-            # 「改为输入光标」/「开启历史」apply to this sentence. Re-read after
-            # the dialog; the captured-source rule still applies if the user
-            # only turned history back on.
-            history_only = self._utterance_history_only(record)
-        if is_meeting_row or history_only:
-            # Meeting / playback capture: the words go to history, never to
-            # whatever window happens to be in front.
-            saved = is_meeting_row or bool(self._config.get("history.enabled", True))
-            log.info("只记录不粘贴：%d 字%s", len(text), "" if saved else "（历史已关闭，未保存）")
-            self._handle_paste_result(
-                PasteResult("recorded", detail="" if saved else "history_disabled"),
-                degraded_from_polish=degraded_from_polish,
-                record=record,
-            )
-            return
-        self._output_stage = OutputStage.PASTE
-        self._output_stage_text = text
-        # Kept outside the paste callback so the watchdog can still save the
-        # row when the paster never answers. A conflict dialog disarms the
-        # polish watchdog; arm a fresh one for the paste itself.
-        self._output_stage_record = record
-        if dialog_disarmed:
-            self._mark_output_busy()
-        self._paster.paste_async(
-            text,
-            lambda result, record=record: self._handle_paste_result(
-                result,
-                degraded_from_polish=degraded_from_polish,
-                record=record,
-            ),
-            target_hwnd=paste_hwnd,
-            target_app=paste_app,
-        )
+        self._output_pipeline().output_text(text, degraded_from_polish=degraded_from_polish)
 
     def _freeze_pending_history_record(
         self,
         output_text: str,
         degraded_from_polish: bool,
     ) -> SegmentRecord | None:
-        pending = self._output_pending_record
-        if pending is not None:
-            self._output_pending_record = None
-        else:
-            pending = self._pending_record
-            self._pending_record = None
-        if pending is None:
-            return None
-        raw_text = pending.raw_text or output_text
-        if degraded_from_polish:
-            polished_text = output_text
-        elif pending.raw_text and output_text != pending.raw_text:
-            polished_text = output_text
-        else:
-            polished_text = pending.polished_text
-        return SegmentRecord(
-            session_id=pending.session_id,
-            seq=pending.seq,
-            created_at=int(time.time() * 1000),
-            raw_text=raw_text,
-            polished_text=polished_text,
-            source=pending.source,
-            duration_ms=pending.duration_ms,
-            target_app="",
-            trigger_mode=pending.trigger_mode,
-            model=pending.model,
-            speaker_id=int(pending.speaker_id),
-            speaker_route=pending.speaker_route or "",
-            captured_at=int(pending.captured_at or 0),
+        return self._output_pipeline().freeze_pending_history_record(
+            output_text, degraded_from_polish
         )
 
     def _label_speaker(
@@ -2458,21 +2309,13 @@ class App(QObject):
         use_info: bool,
         refresh_ms: int,
     ) -> None:
-        if self._continuous_session_active():
-            if use_info:
-                self._floating.show_info(title, hint)
-            else:
-                self._floating.show_success(title, hint)
-            self._later(refresh_ms, self._refresh_continuous_ui_after_output)
-        elif self._continuous_user_stopped:
-            self._floating.show_continuous_stopped(stopped_text)
-            self._later(RESULT_TOAST_WITH_HINT_MS, self._refresh_continuous_ui_after_output)
-        elif self._recorder.is_recording:
-            self._floating.show_recording()
-        elif use_info:
-            self._floating.show_info(title, hint)
-        else:
-            self._floating.show_success(title, hint)
+        self._output_pipeline().show_post_output_floating(
+            title,
+            hint,
+            stopped_text=stopped_text,
+            use_info=use_info,
+            refresh_ms=refresh_ms,
+        )
 
     def _handle_paste_result(
         self,
@@ -2481,103 +2324,11 @@ class App(QObject):
         degraded_from_polish: bool = False,
         record: SegmentRecord | None = None,
     ):
-        if self.__dict__.get("_exit_started", False):
-            return
-        self._output_busy = False
-        self._output_stage = OutputStage.IDLE
-        self._output_stage_text = ""
-        self._output_stage_record = None
-        if isinstance(result, PasteResult):
-            status = result.status
-            target_app = result.target_app
-            error_detail = result.detail
-        else:
-            # Compatibility for tests and third-party integrations using the old callback.
-            status = result.split(":", 1)[0]
-            target_app = ""
-            error_detail = result.partition(":")[2]
-        paste_hint = "可按 Cmd+V 粘贴" if sys.platform == "darwin" else "可按 Ctrl+V 粘贴"
-        success_msg = "已发送（原文）" if degraded_from_polish else "已发送"
-        target_hint = f"发送到 {target_app}" if target_app else "请确认目标应用已接收"
-        dropped = self._output_dropped_slices
-        self._output_dropped_slices = 0
-        if dropped:
-            # A slice of the hold failed to recognise and was left out; the
-            # user would otherwise only notice the gap in the pasted text.
-            target_hint = f"{target_hint} · 有 {dropped} 段未识别"
-        if self._recorder.is_recording:
-            # The next hold is already being recorded.
-            self._tray.set_activity_tooltip("recording")
-        else:
-            self._tray.set_activity_tooltip(
-                "listening" if self._continuous_session_active() else None
-            )
-
-        if status in {"sent", "pasted"}:
-            log.info("已向目标窗口发送粘贴快捷键%s", f": {target_app}" if target_app else "")
-            self._show_post_output_floating(
-                success_msg,
-                target_hint,
-                stopped_text=f"剩余内容：{success_msg} · {target_hint}",
-                use_info=degraded_from_polish,
-                refresh_ms=RESULT_TOAST_MS,
-            )
-        elif status == "recorded":
-            saved = error_detail != "history_disabled"
-            meeting_row = getattr(record, "trigger_mode", None) == TRIGGER_MODE_MEETING
-            done = "已记录" if meeting_row else "已保存到历史"
-            title = (done if saved else "未保存 · 历史已关闭") + ("（原文）" if degraded_from_polish else "")
-            if not saved:
-                hint = "当前为「仅保存到历史」，但历史已关闭；请在设置中打开历史或改为输入当前光标"
-            else:
-                hint = "" if meeting_row else "未输入其他应用"
-            self._show_post_output_floating(
-                title,
-                hint,
-                stopped_text=f"剩余内容：{title}",
-                use_info=not (saved and not degraded_from_polish),
-                refresh_ms=RESULT_TOAST_MS,
-            )
-        elif status == "unverified":
-            # Ctrl+V already went out, then the foreground changed. Saying
-            # 「已复制」 here invites a second manual paste of the same words.
-            log.info("已发送粘贴快捷键，但焦点随后切换，无法确认是否已插入")
-            unverified_hint = f"焦点已切换，若 {target_app} 未出字{paste_hint}" if target_app else f"焦点已切换，若未出字{paste_hint}"
-            self._show_post_output_floating(
-                "已发送 · 未确认",
-                unverified_hint,
-                stopped_text=f"剩余内容：已发送 · 未确认 · {unverified_hint}",
-                use_info=True,
-                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
-            )
-        elif status == "clipboard" and error_detail == "focus_changed":
-            log.info("开口后的目标窗口已变化，未发送粘贴键")
-            title = f"未输入到 {target_app}" if target_app else "未输入到原来的窗口"
-            self._show_post_output_floating(
-                title,
-                paste_hint,
-                stopped_text=f"剩余内容：{title} · {paste_hint}",
-                use_info=True,
-                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
-            )
-        elif status == "clipboard":
-            log.info("已复制到剪贴板（粘贴未确认成功）")
-            idle_title = "已复制" if self._continuous_session_active() else "已复制到剪贴板"
-            self._show_post_output_floating(
-                idle_title,
-                paste_hint,
-                stopped_text=f"剩余内容：已复制 · {paste_hint}",
-                use_info=False,
-                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
-            )
-        else:
-            log.error("输出失败: %s", error_detail)
-            self._floating.show_error(self._friendly_error("输出失败"))
-
-        self._enqueue_history_record(record, target_app=target_app)
-        # Last words of a stopped continuous session are in: settle speakers.
-        self._maybe_finish_dictation_speakers()
-        self._later(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
+        self._output_pipeline().handle_paste_result(
+            result,
+            degraded_from_polish=degraded_from_polish,
+            record=record,
+        )
 
     def _refresh_open_history_ui(self) -> None:
         if self._main is None:
@@ -2601,13 +2352,7 @@ class App(QObject):
         )
 
     def _on_history_write_failed(self, message: str) -> None:
-        """One tray warning per run; the log keeps every failure."""
-        if self._history_failure_notified:
-            return
-        self._history_failure_notified = True
-        self._tray.showMessage(
-            "SayInk", message, QSystemTrayIcon.MessageIcon.Warning, 8000
-        )
+        self._output_pipeline().on_history_write_failed(message)
 
     def _publish_open_history_session(self) -> None:
         """Keep history from deleting or merging a session that is still being written."""
@@ -2618,7 +2363,7 @@ class App(QObject):
             and (getattr(self._recorder, "is_continuous", False) or self._pending_segment_count() > 0)
         ):
             session_id = self._current_session_id
-        main = getattr(self, "_main", None)
+        main = self._safe_attr("_main")
         panel = getattr(main, "history_panel", None) if main is not None else None
         setter = getattr(panel, "set_open_session", None) if panel is not None else None
         if callable(setter):
@@ -2630,32 +2375,7 @@ class App(QObject):
         *,
         target_app: str = "",
     ) -> None:
-        if record is None:
-            return
-        # Meeting transcripts are the meeting itself, not dictation history:
-        # they are kept even when the user has switched history off.
-        is_meeting_row = record.trigger_mode == TRIGGER_MODE_MEETING
-        if not is_meeting_row and not self._config.get("history.enabled", True):
-            return
-        if not (record.raw_text.strip() or record.polished_text.strip()):
-            return
-        self._history.enqueue(
-            SegmentRecord(
-                session_id=record.session_id,
-                seq=record.seq,
-                created_at=record.created_at,
-                raw_text=record.raw_text,
-                polished_text=record.polished_text,
-                source=record.source,
-                duration_ms=record.duration_ms,
-                target_app=target_app or "",
-                trigger_mode=record.trigger_mode,
-                model=record.model,
-                speaker_id=int(record.speaker_id),
-                speaker_route=record.speaker_route or "",
-                captured_at=int(record.captured_at or 0),
-            )
-        )
+        self._output_pipeline().enqueue_history_record(record, target_app=target_app)
 
     def _enqueue_history_cleanup(self) -> None:
         self._history.enqueue_cleanup(
@@ -2788,8 +2508,6 @@ class App(QObject):
 
     def _meeting_refusal(self, options: MeetingOptions) -> str:
         """Why a meeting cannot start right now ("" when it can)."""
-        from sayink.speech_recognizer import is_model_downloaded
-
         if self._recovery_busy:
             return "正在恢复录音，请完成后再开始会议"
 
@@ -2813,7 +2531,7 @@ class App(QObject):
         ):
             return "上一句还在处理，请等它完成后再开始会议"
         configured = options.model_id or str(self._config.get("stt.model_id", DEFAULT_MODEL_ID))
-        if not configured or not is_model_downloaded(configured):
+        if not configured or not self._is_model_downloaded(configured):
             return "语音模型未下载：请在 设置 → 引擎 下载后再开始会议"
         return ""
 
@@ -2841,7 +2559,7 @@ class App(QObject):
         )
         self._recorder.set_segmenter_profile(
             vad=options.vad,
-            vad_model_path=aux_model_path(AUX_MODEL_SILERO_VAD) if options.vad == VAD_SILERO else None,
+            vad_model_path=self._aux_model_path(AUX_MODEL_SILERO_VAD) if options.vad == VAD_SILERO else None,
             meeting=True,
         )
         actual = self._recorder.segmentation_status
@@ -2975,10 +2693,8 @@ class App(QObject):
         self._unrecognized_meeting_notice = ""
         self._floating.end_meeting_state(dropped)
         # Hand the pipeline back to dictation (segmenter profile included).
-        self._recognition_change_pending = False
         self._embedder = None
-        self._apply_audio_config()
-        self._configure_stt()
+        self._reload_coordinator().reset_for_meeting_end()
         self._current_session_id = None
         self._current_seq = 0
         self._speakers = self._new_speaker_session()
@@ -3037,30 +2753,16 @@ class App(QObject):
     # ── Settings ──────────────────────────────────────
 
     def _runtime_status(self) -> RuntimeStatus:
-        return runtime_status_from_flags(
-            is_loading=bool(self._recognizer.is_loading),
-            is_ready=bool(self._recognizer.is_ready),
-        )
+        return self._reload_coordinator().runtime_status()
 
     def _runtime_status_label(self) -> str:
         return self._runtime_status().label
 
     def _active_model_display_name(self) -> str:
-        from sayink.speech_recognizer import MODEL_REGISTRY
-
-        active_id = self._dictation_model_id()
-        for model in MODEL_REGISTRY:
-            if model["id"] == active_id:
-                return model["name"]
-        return active_id or "未选择模型"
+        return self._reload_coordinator().active_model_display_name()
 
     def _dictation_model_id(self) -> str:
-        current = self._recognizer.current_model_id
-        if isinstance(current, str) and current:
-            return current
-        if self._recognition_change_pending:
-            return self._applied_recognition_settings.model_id
-        return str(self._config.get("stt.model_id", DEFAULT_MODEL_ID) or DEFAULT_MODEL_ID)
+        return self._reload_coordinator().dictation_model_id()
 
     def _sync_tray_status_summary(self, status: RuntimeStatus | None = None) -> None:
         status = status or self._runtime_status()
@@ -3087,34 +2789,17 @@ class App(QObject):
         status = self._recorder.segmentation_status
         if settings is None or not isinstance(status, SegmentationStatus):
             return
-        meeting = self._meeting_or_none()
-        active = meeting is not None and meeting.is_active
-        embedder = meeting.embedder if active else self._embedder
-        enabled = (meeting.capabilities.speaker_enabled if active and meeting.capabilities is not None
-                   else self._applied_recognition_settings.speaker_model_enabled)
-        if embedder is not None and embedder.name == "campplus":
-            speaker = "CAM++ 已下载 · 已加载；用于持续转写与会议"
-            if getattr(embedder, "activity_guard", None) is not None:
-                speaker += "；多人发言检测（实验性）已加载"
-            elif getattr(embedder, "activity_guard_error", ""):
-                speaker += "；多人发言检测加载失败，本场未启用"
-            elif (meeting.capabilities.speaker_activity_enabled if active and meeting.capabilities is not None
-                  else self._applied_recognition_settings.speaker_activity_enabled):
-                speaker += "；多人发言检测未加载，请在引擎页检查检测模型"
-        elif not enabled:
-            speaker = "CAM++ 增强已关闭 · 使用频谱粗略区分"
-        elif embedder is not None and embedder.model_available:
-            speaker = "CAM++ 已下载 · 加载失败 · 已回退频谱粗略区分"
-        elif aux_model_path(AUX_MODEL_SPEAKER) is not None:
-            speaker = "CAM++ 已下载 · 待加载 · 本场使用频谱粗略区分"
-        else:
-            speaker = "CAM++ 未下载 · 使用频谱粗略区分；可在引擎页下载"
+        coord = self._reload_coordinator()
+        speaker = coord.speaker_runtime_status_text(
+            active_meeting=self._meeting_or_none(),
+            dictation_embedder=self._embedder,
+        )
         settings.set_recognition_runtime_status(
-            status, speaker_status=speaker, pending=self._recognition_change_pending,
+            status, speaker_status=speaker, pending=coord.recognition_change_pending,
         )
 
     def _show_main_window(self, page: str | None = None):
-        if self.__dict__.get("_exit_started", False):
+        if self._safe_attr("_exit_started", False):
             return
         if self._main is None:
             try:
@@ -3231,52 +2916,29 @@ class App(QObject):
     def _on_hotkey_updated(self, new_hotkey: str):
         self._hotkey_mgr.update_hotkey(new_hotkey)
 
+    def _recognition_diff(
+        self,
+        old: RecognitionSettings,
+        new: RecognitionSettings,
+        *,
+        models_changed: bool = False,
+    ) -> tuple[bool, bool, bool]:
+        return self._reload_coordinator().recognition_diff(old, new, models_changed=models_changed)
+
     def _on_models_changed(self):
         """Keep current speech intact; apply the latest settings when idle."""
-        self._recognition_change_pending = True
-        self._apply_pending_recognition_settings()
-        self._sync_recognition_runtime_status()
-        self._update_tray_models()
+        self._reload_coordinator().on_models_changed()
 
     def _apply_pending_recognition_settings(self) -> None:
-        if self._recognition_change_pending:
-            # Queued audio normally waits for the current model to finish it. When
-            # that model failed to load, the queue waits for *a* model and the
-            # change waits for the queue: let the new model through, it is the
-            # only thing that can drain the queue.
-            queue_blocks = bool(self._segment_queue) and (
-                self._recognizer.is_ready or self._recognizer.is_loading
-            )
-            blocked = (self._meeting_active() or self._recorder.is_recording or self._hold_open_pending
-                       or self._pipeline_busy() or queue_blocks)
-            if not blocked:
-                self._recognition_change_pending = False
-                self._embedder = None
-                self._apply_dictation_segmenter_profile()
-                self._speaker_embedder()
-                self._configure_stt()
-                self._sync_recognition_runtime_status()
-        self._apply_deferred_audio_settings()
+        self._reload_coordinator().apply_pending_recognition_settings()
 
     def _apply_deferred_audio_settings(self) -> None:
-        """Finish a settings save that arrived while hold-to-talk was open.
-
-        The utterance already being recorded keeps the segmenter it started
-        with. The new device / model applies once that utterance has left
-        the queue, and it is not discarded.
-        """
-        if not getattr(self, "_deferred_audio_settings", False):
-            return
-        if (self._meeting_active() or self._recorder.is_recording or self._hold_open_pending
-                or self._pipeline_busy() or self._segment_queue):
-            return
-        self._deferred_audio_settings = False
-        self._commit_audio_settings(clear_queue=False)
+        self._reload_coordinator().apply_deferred_audio_settings()
 
     def _on_recognition_settings_changed(self):
-        """Glossary / language / VAD changed: same handling as a model change
-        (a hotword or language change rebuilds the recognizer)."""
-        self._on_models_changed()
+        """Glossary / language / VAD / speaker settings changed: apply only the
+        affected subsystem so glossary edits do not rebuild VAD or CAM++."""
+        self._reload_coordinator().on_recognition_settings_changed()
 
     def _on_theme_changed(self, mode: str):
         """Apply appearance without reconfiguring STT / audio."""
@@ -3339,15 +3001,7 @@ class App(QObject):
         from PyQt6.QtWidgets import QApplication
         from sayink.ui.theme import apply_theme
 
-        # Tests may construct App via __new__ without QObject __init__;
-        # use object.__getattribute__ to avoid Qt "super-class __init__" errors.
-        def _attr(name, default=None):
-            try:
-                return object.__getattribute__(self, name)
-            except (AttributeError, RuntimeError):
-                return default
-
-        config = _attr("_config")
+        config = self._safe_attr("_config")
         theme_mode = "dark"
         if mode is not None:
             theme_mode = mode
@@ -3357,9 +3011,9 @@ class App(QObject):
         surfaces = [
             surface
             for attr in ("_main", "_floating", "_tray")
-            if (surface := _attr(attr)) is not None
+            if (surface := self._safe_attr(attr)) is not None
         ]
-        main = _attr("_main")
+        main = self._safe_attr("_main")
         if main is not None:
             for child_attr in ("_settings", "_history", "_meeting"):
                 child = getattr(main, child_attr, None)
@@ -3368,59 +3022,30 @@ class App(QObject):
         apply_theme(QApplication.instance(), mode=theme_mode, surfaces=surfaces)
 
     def _on_settings_changed(self):
-        if self._recovery_busy:
-            self._settings_after_recovery = True
-            return
-        # Drop only what the confirmation counted; the sentence cut off by
-        # stopping below is still the user's speech and gets transcribed.
-        if self._meeting_active():
-            # The meeting keeps its device, model and queue; audio / engine
-            # changes apply when it ends (_on_meeting_ended reconfigures).
-            log.info("会议进行中，音频与引擎设置将在会议结束后生效")
-            self._apply_immediate_preferences()
-            self._sync_models_dir()
-            self._update_tray_models()
-            return
-        if self._recorder.is_recording or self._hold_open_pending:
-            # Rebuilding the segmenter under an open hold resets the audio
-            # anchor mid-sentence. Keep this utterance, apply once it is done.
-            log.info("单次录音进行中，音频与引擎设置将在本次录音结束后生效")
-            self._deferred_audio_settings = True
-            self._apply_immediate_preferences()
-            return
-        self._commit_audio_settings(clear_queue=True)
+        self._reload_coordinator().on_settings_changed()
 
     def _apply_immediate_preferences(self) -> None:
-        self._sound.enabled = self._config.get("sound_enabled", True)
-        self._tray.set_auto_start(self._config.get("auto_start", False))
-        self._paster.restore_clipboard = self._config.get("output.restore_clipboard", False)
+        self._reload_coordinator().apply_immediate_preferences()
 
     def _commit_audio_settings(self, *, clear_queue: bool) -> None:
-        if clear_queue:
-            if self._segment_queue:
-                log.warning("设置已保存，丢弃 %d 段待识别语音", len(self._segment_queue))
-            self._clear_queued_audio()
-            was_continuous = self._recorder.is_continuous
-            if was_continuous:
-                self._stop_continuous_listening()
-            self._continuous_user_stopped = False
-            self._keep_unsaved_continuous_text = False
-        self._apply_immediate_preferences()
-        # A trigger-mode click used to re-open the recognizer, rescan every
-        # audio device and restyle the window. Only the pieces that changed
-        # are applied; theme has its own signal.
-        if self._audio_runtime_key() != getattr(self, "_applied_audio_key", None):
-            self._apply_audio_config()
-        if self._recognition_runtime_key() != getattr(self, "_applied_recognition_key", None):
-            self._sync_models_dir()
-            self._configure_stt()
-            self._update_tray_models()
-        self._sync_hotkey_trigger_mode()
+        self._reload_coordinator().commit_audio_settings(clear_queue=clear_queue)
+
+    def _has_active_transcribe_workers(self) -> bool:
+        transcribe_workers = getattr(self._recognizer, "running_transcribe_workers", None)
+        if isinstance(transcribe_workers, (list, tuple)):
+            return any(w.isRunning() for w in transcribe_workers)
+        if getattr(self._recognizer, "is_silent_loading", False) is True:
+            return False
+        return any(w.isRunning() for w in getattr(self._recognizer, "running_workers", ()))
 
     def _show_audio_recovery(self):
+        silent_unready = (
+            getattr(self._recognizer, "is_silent_loading", False) is True
+            and not self._recognizer.is_ready
+        )
         if (self._recorder.is_recording or self._hold_open_pending or self._pipeline_busy() or self._segment_queue or self._meeting_active()
                 or getattr(self._recorder, "storage_busy", False) is True
-                or self._recognizer.is_loading or any(w.isRunning() for w in self._recognizer.running_workers)):
+                or self._recognizer.is_loading or silent_unready or self._has_active_transcribe_workers()):
             self._tray.showMessage("SayInk", "请先结束当前录音，并等待已录内容处理完成。",
                                    QSystemTrayIcon.MessageIcon.Information, 5000)
             return
@@ -3433,8 +3058,13 @@ class App(QObject):
                 self._config.config_dir / "audio-recovery",
                 recognizer=self._recognizer._recognizer if self._recognizer.is_ready else None,
                 vad=self._applied_recognition_settings.vad,
-                vad_path=aux_model_path(AUX_MODEL_SILERO_VAD),
+                vad_path=self._aux_model_path(AUX_MODEL_SILERO_VAD),
                 quiet=self._applied_recognition_settings.quiet_speech_enabled,
+                glossary=self._applied_recognition_settings.glossary,
+                decode_lock=getattr(self._recognizer, "_decode_lock", None),
+                recognizer_getter=lambda: (
+                    self._recognizer._recognizer if self._recognizer.is_ready else None
+                ),
                 parent=self._settings_widget(),
             )
             self._recovery_dialog = dialog
@@ -3443,24 +3073,13 @@ class App(QObject):
             self._recovery_dialog = None
             self._recovery_busy = False
             if not self._exit_started:
-                if getattr(self, "_settings_after_recovery", False):
-                    self._settings_after_recovery = False
-                    self._on_settings_changed()
-                self._apply_pending_recognition_settings()
+                self._reload_coordinator().resume_after_recovery()
 
     def _on_tray_model_switch(self, model_id: str):
-        current = self._config.get("stt.model_id", "")
-        if model_id == current:
-            return
-        self._config.set("stt.model_id", model_id)
-        self._on_models_changed()
+        self._reload_coordinator().on_tray_model_switch(model_id)
 
     def _update_tray_models(self):
-        from sayink.speech_recognizer import MODEL_REGISTRY, is_model_downloaded
-        downloaded = [m for m in MODEL_REGISTRY if is_model_downloaded(m["id"])]
-        active = self._config.get("stt.model_id", "")
-        self._tray.update_models(downloaded, active)
-        self._sync_tray_status_summary()
+        self._reload_coordinator().update_tray_models()
 
     def _on_auto_start_toggled(self, enabled: bool):
         self._config.set("auto_start", enabled)
@@ -3575,11 +3194,26 @@ class App(QObject):
         finally:
             self._exit_dialog_open = False
 
+    def set_instance_lock_releaser(self, callback: Callable[[], None] | None) -> None:
+        self._on_release_instance_lock = callback
+
+    def _release_instance_lock_once(self) -> None:
+        if self._safe_attr("_instance_lock_released", False):
+            return
+        self._instance_lock_released = True
+        releaser = self._safe_attr("_on_release_instance_lock")
+        if callable(releaser):
+            try:
+                releaser()
+            except Exception:
+                log.exception("提前释放单实例锁失败")
+
     def _finish_quit(self):
         """Release resources after the user has accepted any pending loss."""
         if self._exit_started:
             return
         self._exit_started = True
+        self._quit_drain_deadline = None
         from sayink.ui.theme import unwatch_system_color_scheme
 
         unwatch_system_color_scheme()
@@ -3620,28 +3254,50 @@ class App(QObject):
         self._paster.cancel()
         self._updates.shutdown()
         self._tray.hide()
-        # Queued history writes finish before the process goes away; the
-        # writer is a daemon thread, so this wait is their only chance.
+        # Queued history writes and debounced config edits finish immediately,
+        # before any external installer (taskkill /F) or native worker drain.
         self._history.close()
+        self._config.save_immediate()
         self._complete_quit_when_idle()
 
     def _complete_quit_when_idle(self):
         if getattr(self._recorder, "storage_busy", False) is True:
             self._later(QUIT_POLL_MS, self._complete_quit_when_idle)
             return
+        save_timer = getattr(self._config, "_save_timer", None)
+        if getattr(save_timer, "isActive", lambda: False)() is True:
+            self._config.save_immediate()
+        self._release_instance_lock_once()
         owners = [self._recognizer, self._polisher, self._meeting, self._updates, self._settings_widget()]
         owners.append(getattr(self, "_recovery_dialog", None))
         if self._main is not None:
             owners.append(self._main.meeting_panel)
         # Native model loading cannot safely be force-terminated. Keep the Qt
-        # event loop and each owner's worker references alive until it exits.
+        # event loop and each owner's worker references alive until it exits,
+        # up to a bounded drain deadline so a wedged C++ call cannot linger forever.
         pending = [worker for owner in owners if owner is not None
                    for worker in getattr(owner, "running_workers", ())
                    if isinstance(worker, QThread) and worker.isRunning()]
         if pending:
-            self._later(QUIT_POLL_MS, self._complete_quit_when_idle)
+            now = time.monotonic()
+            timeout_s = float(
+                self._safe_attr("_quit_drain_timeout_s", QUIT_NATIVE_DRAIN_TIMEOUT_S)
+            )
+            deadline = self._safe_attr("_quit_drain_deadline")
+            if deadline is None:
+                deadline = now + max(0.0, timeout_s)
+                self._quit_drain_deadline = deadline
+            if now < deadline:
+                self._later(QUIT_POLL_MS, self._complete_quit_when_idle)
+                return
+            log.warning(
+                "退出等待后台工作线程超时（%.1fs，仍有 %d 个线程运行中），强制结束进程",
+                timeout_s,
+                len(pending),
+            )
+            QApplication.quit()
+            _force_process_exit(0)
             return
-        self._config.save_immediate()
         QApplication.quit()
 
     def start(self):

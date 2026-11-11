@@ -27,6 +27,74 @@ MIN_FREE_BYTES = 128 * 1024**2
 RETENTION_SECONDS = 7 * 86400
 
 
+def _dir_f32_bytes(folder: Path) -> int:
+    if not folder.is_dir() or folder.is_symlink():
+        return 0
+    total = 0
+    for item in folder.glob("*.f32"):
+        try:
+            if not item.is_symlink():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _tree_f32_bytes(folder: Path) -> int:
+    if not folder.is_dir() or folder.is_symlink():
+        return 0
+    total = 0
+    for item in folder.rglob("*.f32"):
+        try:
+            if not item.is_symlink():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def sweep_orphan_pending(root: Path, *, exclude_journal: Path | None = None) -> int:
+    """Remove stale queued-segment spill files (``pending/*.f32``) left by a dead session.
+
+    Leaves non-``.f32`` files untouched and never touches raw journal tracks
+    (``audio.f32`` / ``microphone.f32`` / ``system.f32``).
+    """
+    if not root.is_dir() or root.is_symlink():
+        return 0
+    removed = 0
+    excluded = exclude_journal.resolve() if exclude_journal is not None else None
+    candidates: list[Path] = [root / "pending"]
+    try:
+        for child in root.iterdir():
+            if not child.is_dir() or child.is_symlink() or len(child.name) != 32:
+                continue
+            try:
+                int(child.name, 16)
+            except ValueError:
+                continue
+            if excluded is not None and child.resolve() == excluded:
+                continue
+            candidates.append(child / "pending")
+    except OSError:
+        pass
+    for pending in candidates:
+        if not pending.is_dir() or pending.is_symlink():
+            continue
+        for item in list(pending.glob("*.f32")):
+            try:
+                if not item.is_symlink():
+                    item.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                continue
+        try:
+            if not any(pending.iterdir()):
+                pending.rmdir()
+        except OSError:
+            pass
+    return removed
+
+
 @dataclass(frozen=True)
 class RecoveryRecording:
     path: Path
@@ -61,10 +129,12 @@ class RecoveryRecording:
                 if usable:
                     yield np.frombuffer(data[:usable], dtype="<f4").copy()
 
-    def export_wav(self, target: Path, *, cancelled=None) -> None:
+    def export_wav(self, target: Path, *, cancelled=None, on_progress=None) -> None:
         if target.resolve().is_relative_to(self.path.parent.resolve()):
             raise ValueError("请选择缓存目录之外的导出位置")
         temporary = target.with_name(target.name + ".partial")
+        total = max(1, self.samples)
+        done = 0
         try:
             with wave.open(str(temporary), "wb") as out:
                 out.setnchannels(1)
@@ -75,6 +145,9 @@ class RecoveryRecording:
                         raise InterruptedError("已取消导出")
                     pcm = (np.clip(np.nan_to_num(block), -1, 1) * 32767).astype("<i2")
                     out.writeframesraw(pcm.tobytes())
+                    done += len(block)
+                    if on_progress is not None:
+                        on_progress(min(done, total), total)
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
@@ -130,7 +203,9 @@ class RecordingJournal:
         self._stop = threading.Event()
         self._meta = {**(metadata or {}), "sample_rate": TARGET_SAMPLE_RATE,
                       "started_at": time.time(), "complete": False}
+        self._written_bytes = 0
         root.mkdir(parents=True, exist_ok=True)
+        sweep_orphan_pending(root)
         # One directory scan. Completed recordings older than the retention
         # window are the only ones removed automatically.
         existing = recordings(root)
@@ -172,6 +247,11 @@ class RecordingJournal:
     def is_writing(self) -> bool:
         return self._thread.is_alive()
 
+    @property
+    def total_recovery_bytes(self) -> int:
+        pending = _dir_f32_bytes(self.path / "pending") + _dir_f32_bytes(self.root / "pending")
+        return self._existing_bytes + self._written_bytes + pending
+
     def _fail(self, message: str):
         if not self._error:
             self._error = message
@@ -204,7 +284,8 @@ class RecordingJournal:
                         data = self._queue.get(timeout=0.1)
                     except queue.Empty:
                         continue
-                    if self._existing_bytes + size + sum(map(len, data.values())) > self._max_bytes:
+                    chunk_bytes = sum(map(len, data.values()))
+                    if self.total_recovery_bytes + chunk_bytes > self._max_bytes:
                         self._fail("录音缓存已达到 2 GB 上限；请导出或删除旧录音")
                         break
                     if time.monotonic() - last_sync >= 1:
@@ -223,7 +304,8 @@ class RecordingJournal:
                             if not written:
                                 raise OSError("录音缓存写入不完整")
                             remaining = remaining[written:]
-                    size += sum(map(len, data.values()))
+                    size += chunk_bytes
+                    self._written_bytes = size
                 for handle in handles.values():
                     os.fsync(handle.fileno())
             self._meta.update(complete=self._closed and not self._error,
@@ -261,11 +343,35 @@ class StoredAudio:
             pass  # The journal still owns this cache; it remains removable there.
 
 
-def store_pending(root: Path, audio: np.ndarray) -> StoredAudio:
+def _infer_recovery_root_for_pending(pending_dir: Path) -> Path | None:
+    if pending_dir.name != "pending":
+        return None
+    parent = pending_dir.parent
+    if len(parent.name) == 32:
+        try:
+            int(parent.name, 16)
+            if parent.parent.is_dir():
+                return parent.parent
+        except ValueError:
+            pass
+    if parent.is_dir():
+        return parent
+    return None
+
+
+def store_pending(
+    root: Path,
+    audio: np.ndarray,
+    *,
+    max_bytes: int = MAX_RECOVERY_BYTES,
+    recovery_root: Path | None = None,
+) -> StoredAudio:
     root.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(root).free < MIN_FREE_BYTES + audio.nbytes:
         raise OSError("磁盘空间不足，无法继续缓存排队语音")
-    if sum(path.stat().st_size for path in root.glob("*.f32")) + audio.nbytes > MAX_RECOVERY_BYTES:
+    quota_root = recovery_root if recovery_root is not None else _infer_recovery_root_for_pending(root)
+    used_bytes = _tree_f32_bytes(quota_root) if quota_root is not None else _dir_f32_bytes(root)
+    if used_bytes + audio.nbytes > max_bytes:
         raise OSError("待识别录音已达到 2 GB 上限，请等待识别完成")
     path = root / (uuid4().hex + ".f32")
     try:

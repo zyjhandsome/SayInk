@@ -97,16 +97,16 @@ def check_single_instance() -> bool:
 
 
 def cleanup_lock():
-    """清理单实例锁"""
-    global _win_mutex, _crash_file
+    """清理单实例锁（幂等，可在退出排空前提前调用）"""
+    global _win_mutex, _lock_file_path, _crash_file
 
     # Windows: 关闭互斥锁句柄
     if _win_mutex:
         try:
             ctypes.windll.kernel32.CloseHandle(_win_mutex)
-            _win_mutex = None
         except Exception:
             pass
+        _win_mutex = None
 
     # 文件锁: 删除锁文件
     if _lock_file_path:
@@ -114,6 +114,7 @@ def cleanup_lock():
             os.remove(_lock_file_path)
         except OSError:
             pass
+        _lock_file_path = None
 
     if _crash_file is not None:
         try:
@@ -124,6 +125,16 @@ def cleanup_lock():
         except Exception:
             pass
         _crash_file = None
+
+
+def release_instance_lock(activation_server=None) -> None:
+    """Close the activation pipe and release the single-instance lock idempotently."""
+    if activation_server is not None:
+        try:
+            activation_server.close()
+        except Exception:
+            pass
+    cleanup_lock()
 
 
 def _install_exception_hooks(log: logging.Logger):
@@ -310,14 +321,26 @@ def main():
     apply_theme(app, mode=_boot_config.get("appearance.theme_mode", "dark"))
 
     from sayink.app import App
+
+    _activation_server = None
+    _instance_released = False
+
+    def _release_once() -> None:
+        nonlocal _activation_server, _instance_released
+        if _instance_released:
+            return
+        _instance_released = True
+        srv, _activation_server = _activation_server, None
+        release_instance_lock(srv)
+
     # Reuse it: a second Config would not see a plaintext API key the first one
     # already moved out of config.json when Credential Manager was unreadable.
-    say_ink = App(_boot_config)
+    say_ink = App(_boot_config, on_release_instance_lock=_release_once)
     say_ink.start()
     _activation_server = start_activation_server(say_ink.show_main_window)
 
     exit_code = app.exec()
-    cleanup_lock()
+    _release_once()
     sys.exit(exit_code)
 
 

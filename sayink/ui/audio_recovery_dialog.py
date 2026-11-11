@@ -8,9 +8,14 @@ from PyQt6.QtGui import QFont, QColor, QPalette
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
                             QPushButton, QPlainTextEdit, QFileDialog, QComboBox)
 
+from sayink.asr_correction import apply_glossary_variants
 from sayink.audio_recovery import recordings, delete_recording
 from sayink.audio_utils import TARGET_SAMPLE_RATE
-from sayink.speech_recognizer import decode_asr_slice
+from sayink.speech_recognizer import (
+    decode_asr_slice,
+    normalize_asr_output,
+    restore_glossary_case,
+)
 from sayink.vad_segmenter import SpeechSegmenter, make_speech_gate
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles
@@ -19,9 +24,22 @@ from sayink.ui.prompts import confirm
 
 class RecoveryWorker(QThread):
     text_ready = pyqtSignal(str)
+    progress = pyqtSignal(int, int)
     failed = pyqtSignal(str)
 
-    def __init__(self, recording, *, target=None, recognizer=None, vad="energy", vad_path=None, quiet=False):
+    def __init__(
+        self,
+        recording,
+        *,
+        target=None,
+        recognizer=None,
+        vad="energy",
+        vad_path=None,
+        quiet=False,
+        glossary=None,
+        decode_lock=None,
+        recognizer_getter=None,
+    ):
         super().__init__()
         self.recording = recording
         self.target = target
@@ -29,13 +47,30 @@ class RecoveryWorker(QThread):
         self.vad = vad
         self.vad_path = vad_path
         self.quiet = quiet
+        self.glossary = list(glossary) if glossary else []
+        self.decode_lock = decode_lock
+        self.recognizer_getter = recognizer_getter
         self.cancelled = False
         self._active_quiet = False
+        self._last_pct = -1
+
+    def _report_progress(self, done: int, total: int) -> None:
+        if total <= 0:
+            return
+        pct = min(100, int(done * 100 // total))
+        if pct != self._last_pct:
+            self._last_pct = pct
+            self.progress.emit(min(done, total), total)
 
     def run(self):
         try:
+            total = max(1, int(self.recording.samples))
             if self.target is not None:
-                self.recording.export_wav(self.target, cancelled=lambda: self.cancelled)
+                self.recording.export_wav(
+                    self.target,
+                    cancelled=lambda: self.cancelled,
+                    on_progress=self._report_progress,
+                )
                 return
             seg = SpeechSegmenter()
             seg.set_gate(make_speech_gate(self.vad, seg, model_path=self.vad_path))
@@ -43,27 +78,79 @@ class RecoveryWorker(QThread):
             self._active_quiet = seg.quiet_speech
             if seg.gate_name == "silero":
                 seg.gate.input_gain = 4.0 if self.quiet else 1.0
+            done = 0
             # Same 100 ms blocks as live capture; bounded to one ASR slice.
             for block in self.recording.blocks(TARGET_SAMPLE_RATE // 10):
                 if self.cancelled:
                     return
+                done += len(block)
                 audio = seg.feed(block)
                 if audio is not None:
                     self._decode(audio)
+                self._report_progress(done, total)
             if not self.cancelled and (audio := seg.flush()) is not None:
                 self._decode(audio)
+            if not self.cancelled:
+                self._report_progress(total, total)
         except Exception as exc:
             self.failed.emit(str(exc))
 
     def _decode(self, audio):
-        text = decode_asr_slice(self.recognizer, audio, retry_empty=True,
-                                cancelled=lambda: self.cancelled, quiet_speech=self._active_quiet)
-        if not self.cancelled and text:
-            self.text_ready.emit(text)
+        if self.decode_lock is not None:
+            with self.decode_lock:
+                active = (
+                    self.recognizer_getter()
+                    if callable(self.recognizer_getter)
+                    else self.recognizer
+                ) or self.recognizer
+                text = decode_asr_slice(
+                    active,
+                    audio,
+                    retry_empty=True,
+                    cancelled=lambda: self.cancelled,
+                    quiet_speech=self._active_quiet,
+                )
+        else:
+            active = (
+                self.recognizer_getter()
+                if callable(self.recognizer_getter)
+                else self.recognizer
+            ) or self.recognizer
+            text = decode_asr_slice(
+                active,
+                audio,
+                retry_empty=True,
+                cancelled=lambda: self.cancelled,
+                quiet_speech=self._active_quiet,
+            )
+        if self.cancelled or not text:
+            return
+        raw_text = normalize_asr_output(text)
+        if self.glossary:
+            final_text = apply_glossary_variants(
+                restore_glossary_case(raw_text, self.glossary),
+                self.glossary,
+            )
+        else:
+            final_text = raw_text
+        if final_text:
+            self.text_ready.emit(final_text)
 
 
 class AudioRecoveryDialog(QDialog):
-    def __init__(self, root, *, recognizer=None, vad="energy", vad_path=None, quiet=False, parent=None):
+    def __init__(
+        self,
+        root,
+        *,
+        recognizer=None,
+        vad="energy",
+        vad_path=None,
+        quiet=False,
+        glossary=None,
+        decode_lock=None,
+        recognizer_getter=None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("本地录音恢复")
         font = QFont(tok.UI_FONT_FAMILY)
@@ -75,7 +162,11 @@ class AudioRecoveryDialog(QDialog):
         self.vad = vad
         self.vad_path = vad_path
         self.quiet = quiet
+        self.glossary = list(glossary) if glossary else []
+        self.decode_lock = decode_lock
+        self.recognizer_getter = recognizer_getter
         self.worker = None
+        self._worker_failed = False
         layout = QVBoxLayout(self)
         note = QLabel("录音仅保存在本机。正常结束的缓存保留 7 天，异常中断的缓存需手动删除；录音上限 2 GB。\n"
                       "可导出录音或重新识别。恢复文字显示在这里，可另存为文本。")
@@ -90,8 +181,9 @@ class AudioRecoveryDialog(QDialog):
         actions = QHBoxLayout()
         self.export_btn = QPushButton("导出 WAV")
         self.transcribe_btn = QPushButton("重新识别")
+        self.stop_btn = QPushButton("停止")
         self.delete_btn = QPushButton("删除所选录音")
-        for button in (self.export_btn, self.transcribe_btn, self.delete_btn):
+        for button in (self.export_btn, self.transcribe_btn, self.stop_btn, self.delete_btn):
             button.setMinimumHeight(36)
             button.setStyleSheet(settings_styles.BTN_GHOST_SM)
             actions.addWidget(button)
@@ -112,6 +204,7 @@ class AudioRecoveryDialog(QDialog):
         layout.addWidget(self.save_btn)
         self.export_btn.clicked.connect(self._export)
         self.transcribe_btn.clicked.connect(self._transcribe)
+        self.stop_btn.clicked.connect(self.cancel_processing)
         self.delete_btn.clicked.connect(self._delete)
         self.save_btn.clicked.connect(self._save_text)
         self._refresh()
@@ -123,6 +216,9 @@ class AudioRecoveryDialog(QDialog):
     def cancel_processing(self):
         if self.worker is not None:
             self.worker.cancelled = True
+            self.stop_btn.setEnabled(False)
+            if self.worker.isRunning():
+                self.status.setText("正在停止，请等待当前识别片段完成…")
 
     def _refresh(self):
         self.recordings = recordings(self.root)
@@ -155,21 +251,36 @@ class AudioRecoveryDialog(QDialog):
         for button in (self.export_btn, self.delete_btn):
             button.setEnabled(not busy and bool(self.recordings))
         self.transcribe_btn.setEnabled(not busy and bool(self.recordings) and self.recognizer is not None)
+        self.stop_btn.setEnabled(bool(busy))
         self.items.setEnabled(not busy)
         self.track.setEnabled(not busy)
         self.save_btn.setEnabled(not busy)
 
+    def _on_progress(self, done: int, total: int) -> None:
+        if self.worker is None or self.worker.cancelled or self._worker_failed:
+            return
+        pct = min(100, int(done * 100 // max(1, total)))
+        done_min = done / TARGET_SAMPLE_RATE / 60.0
+        total_min = total / TARGET_SAMPLE_RATE / 60.0
+        self.status.setText(f"正在本机处理… {pct}%（{done_min:.1f} / {total_min:.1f} 分钟）")
+
+    def _on_failed(self, message: str) -> None:
+        self._worker_failed = True
+        self.status.setText(f"处理失败：{message}")
+
     def _start(self, worker):
         self.worker = worker
+        self._worker_failed = False
         self._set_busy(True)
         self.status.setText("正在本机处理…")
         worker.text_ready.connect(self.output.appendPlainText)
-        worker.failed.connect(lambda message: self.status.setText(f"处理失败：{message}"))
+        worker.progress.connect(self._on_progress)
+        worker.failed.connect(self._on_failed)
         worker.finished.connect(self._finished)
         worker.start()
 
     def _finished(self):
-        if self.status.text() == "正在本机处理…":
+        if not self._worker_failed and self.worker is not None:
             self.status.setText("处理完成" if not self.worker.cancelled else "已停止，已有恢复文字保留")
         self._set_busy(False)
         self.worker = None
@@ -183,8 +294,18 @@ class AudioRecoveryDialog(QDialog):
     def _transcribe(self):
         if (item := self._selected()) and self.recognizer is not None:
             self.output.clear()
-            self._start(RecoveryWorker(item, recognizer=self.recognizer, vad=self.vad,
-                                       vad_path=self.vad_path, quiet=self.quiet))
+            self._start(
+                RecoveryWorker(
+                    item,
+                    recognizer=self.recognizer,
+                    vad=self.vad,
+                    vad_path=self.vad_path,
+                    quiet=self.quiet,
+                    glossary=self.glossary,
+                    decode_lock=self.decode_lock,
+                    recognizer_getter=self.recognizer_getter,
+                )
+            )
 
     def _delete(self):
         if (item := self._selected()) and confirm(

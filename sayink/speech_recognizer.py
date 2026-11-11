@@ -2,6 +2,7 @@ import hashlib
 import logging
 import re
 import shutil
+import sys
 import threading
 from pathlib import Path
 
@@ -1124,6 +1125,26 @@ def _create_recognizer(model_id: str, num_threads: int, *, hotwords: str = "", l
 LoadTarget = tuple[str, int, str, str]
 
 
+def _corrupt_model_hint(model_id: str) -> str:
+    """Zero-startup-cost integrity check run ONLY after a model load fails."""
+    try:
+        info = get_model_info(model_id)
+        if not info or "sha256" not in info:
+            return ""
+        folder = get_model_dir(model_id)
+        if not folder.is_dir() or not any((folder / name).exists() for name in info.get("files", ())):
+            return ""
+        bad = mismatched_model_files(info, folder)
+        if not bad:
+            return ""
+        preview = "、".join(bad[:3])
+        if len(bad) > 3:
+            preview += f" 等 {len(bad)} 个文件"
+        return f"检测到模型文件损坏或不完整：{preview}；请在「设置 → 引擎」重新下载该模型"
+    except Exception:
+        return ""
+
+
 class ModelLoadWorker(QThread):
     """Loads an ASR model in a background thread."""
     loaded = pyqtSignal(object)
@@ -1148,8 +1169,10 @@ class ModelLoadWorker(QThread):
             log.info("语音识别模型加载完成: %s", name)
             self.loaded.emit(recognizer)
         except Exception as e:
-            log.error("模型加载失败: %s", e)
-            self.error.emit(f"模型加载失败: {e}")
+            hint = _corrupt_model_hint(self._model_id)
+            detail = f"{e}（{hint}）" if hint else str(e)
+            log.error("模型加载失败: %s", detail)
+            self.error.emit(f"模型加载失败: {detail}")
 
 
 def short_retry_audio(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray | None:
@@ -1400,6 +1423,51 @@ class TranscribeWorker(QThread):
 
 # ── Main Recognizer ──────────────────────────────────────────────
 
+WARM_SWAP_RAM_MULTIPLIER = 2.2
+
+
+def available_physical_ram_bytes() -> int | None:
+    """Return available physical RAM in bytes on Windows, or ``None`` if unknown."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_uint32),
+                ("dwMemoryLoad", ctypes.c_uint32),
+                ("ullTotalPhys", ctypes.c_uint64),
+                ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64),
+                ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64),
+                ("ullAvailVirtual", ctypes.c_uint64),
+                ("ullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+
+        stat = _MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return None
+        return int(stat.ullAvailPhys)
+    except Exception:
+        return None
+
+
+def has_ram_for_warm_swap(model_id: str) -> bool:
+    """True when physical RAM can hold both the resident and replacement decoders."""
+    avail = available_physical_ram_bytes()
+    if avail is None:
+        return True
+    info = get_model_info(model_id)
+    size_mb = int(info.get("size_mb", 0) or 0) if info else 0
+    if size_mb <= 0:
+        return True
+    required = int(WARM_SWAP_RAM_MULTIPLIER * size_mb * 1024 * 1024)
+    return avail >= required
+
+
 class SpeechRecognizer(QObject):
     """Offline speech recognizer supporting multiple sherpa-onnx models."""
     supports_prefetch = True
@@ -1418,6 +1486,8 @@ class SpeechRecognizer(QObject):
         self._load_worker = None
         self._reload_after_current = False
         self._loaded_target: LoadTarget | None = None
+        self._silent_reload = False
+        self._last_ready_silent = False
         self._is_ready = False
         self._model_id = ""
         self._num_threads = 4
@@ -1433,6 +1503,31 @@ class SpeechRecognizer(QObject):
 
     def _target(self) -> LoadTarget:
         return (self._model_id, self._num_threads, self._hotwords, self._language)
+
+    @staticmethod
+    def _non_hotword_target(target: LoadTarget) -> tuple[str, int, str]:
+        return (target[0], target[1], target[3])
+
+    def _load_worker_running(self) -> bool:
+        return self._load_worker is not None and self._load_worker.isRunning()
+
+    def _effective_loaded_target(self) -> LoadTarget | None:
+        if not self._is_ready or self._recognizer is None:
+            return None
+        if self._loaded_target is not None:
+            return self._loaded_target
+        return self._target()
+
+    def _is_hotword_only_change(self, wanted: LoadTarget) -> bool:
+        loaded = self._effective_loaded_target()
+        if loaded is None or wanted == loaded:
+            return False
+        return self._non_hotword_target(wanted) == self._non_hotword_target(loaded)
+
+    def _can_warm_swap_hotwords(self, wanted: LoadTarget) -> bool:
+        if not self._is_hotword_only_change(wanted):
+            return False
+        return has_ram_for_warm_swap(wanted[0])
 
     def configure(
         self,
@@ -1455,11 +1550,19 @@ class SpeechRecognizer(QObject):
         language = language_argument(model_id, language) if language else ""
         wanted: LoadTarget = (model_id, num_threads, hotwords or "", language)
 
-        if wanted == self._target() and self._is_ready and self._recognizer is not None:
+        loaded = self._effective_loaded_target()
+        if self._loaded_target is None and loaded is not None:
+            self._loaded_target = loaded
+
+        if wanted == loaded:
+            # Matches the resident recognizer (including reverting hotwords back
+            # to the currently loaded target while a warm hot-swap is running).
+            self._model_id, self._num_threads, self._hotwords, self._language = wanted
+            self._reload_after_current = False
             log.debug("语音模型已驻留内存，跳过重复加载: %s", model_id)
             return
 
-        if wanted == self._target() and self.is_loading:
+        if wanted == self._target() and self._load_worker_running():
             log.debug("语音模型正在加载中，跳过重复请求: %s", model_id)
             return
 
@@ -1471,16 +1574,40 @@ class SpeechRecognizer(QObject):
             log.warning("语音模型 %s 未下载", model_id)
 
     def _load_model(self):
-        if self._load_worker and self._load_worker.isRunning():
+        wanted = self._target()
+        silent = self._can_warm_swap_hotwords(wanted)
+        if self._load_worker_running():
             # A load thread cannot be interrupted; load the newer choice after it.
             self._reload_after_current = True
+            if not silent and (self._silent_reload or self._is_ready):
+                # Non-hotword fields changed (or RAM is too low for warm-swap)
+                # mid warm-swap: degrade immediately to a visible blocking load
+                # and release the resident decoder so peak RAM stays bounded.
+                info = get_model_info(self._model_id)
+                name = info["name"] if info else self._model_id
+                self._silent_reload = False
+                self._last_ready_silent = False
+                self._is_ready = False
+                self._recognizer = None
+                self._loaded_target = None
+                self.model_load_progress.emit(ModelLoadPhase.LOADING, f"正在加载 {name}…")
             return
 
         info = get_model_info(self._model_id)
         name = info["name"] if info else self._model_id
-        self._is_ready = False
         self._reload_after_current = False
-        self.model_load_progress.emit(ModelLoadPhase.LOADING, f"正在加载 {name}…")
+        if silent:
+            self._silent_reload = True
+            log.info("正在后台静默刷新语音模型热词 (%s)...", name)
+        else:
+            if self._is_hotword_only_change(wanted):
+                log.info("可用物理内存不足，先释放当前语音模型再重新加载热词 (%s)...", name)
+            self._silent_reload = False
+            self._last_ready_silent = False
+            self._is_ready = False
+            self._recognizer = None
+            self._loaded_target = None
+            self.model_load_progress.emit(ModelLoadPhase.LOADING, f"正在加载 {name}…")
         worker = ModelLoadWorker(
             self._model_id, self._num_threads,
             hotwords=self._hotwords, language=self._language,
@@ -1499,16 +1626,29 @@ class SpeechRecognizer(QObject):
         if not self._is_current_target(target):
             log.info("丢弃已过时的模型加载结果: %s", target[0])
             return
-        self._recognizer = recognizer
-        self._loaded_target = self._target()
-        self._is_ready = True
-        self.model_load_progress.emit(ModelLoadPhase.READY, "模型已就绪")
+        was_silent = self._silent_reload
+        self._silent_reload = False
+        self._last_ready_silent = was_silent
+        resolved_target = target if target is not None else self._target()
+        with self._decode_lock:
+            self._recognizer = recognizer
+            self._loaded_target = resolved_target
+            self._is_ready = True
+        if not was_silent:
+            self.model_load_progress.emit(ModelLoadPhase.READY, "模型已就绪")
         self.ready.emit()
 
     def _on_model_load_error(self, msg: str, target: LoadTarget | None = None):
         if not self._is_current_target(target):
             log.info("忽略已过时的模型加载错误: %s", msg)
             return
+        if self._silent_reload and self._recognizer is not None and self._is_ready:
+            log.warning("后台刷新热词失败，保留当前已就绪的语音模型: %s", msg)
+            self._silent_reload = False
+            if not self._reload_after_current and self._loaded_target is not None:
+                self._model_id, self._num_threads, self._hotwords, self._language = self._loaded_target
+            return
+        self._silent_reload = False
         self._is_ready = False
         # The App handles a failed load from this one signal; no separate error.
         self.model_load_progress.emit(ModelLoadPhase.FAILED, msg)
@@ -1519,12 +1659,16 @@ class SpeechRecognizer(QObject):
             worker.wait(2000)
             self._load_worker = None
         if not self._reload_after_current:
+            self._silent_reload = False
             return
         self._reload_after_current = False
-        if self._is_ready and self._loaded_target == self._target():
+        if self._is_ready and self._effective_loaded_target() == self._target():
+            self._silent_reload = False
             return
         if is_model_downloaded(self._model_id):
             self._load_model()
+        else:
+            self._silent_reload = False
 
     def prefetch_final(self, audio: np.ndarray, *, on_text, on_turns, on_error, turn_analyzer=None):
         """Decode the next queued segment without publishing it as current output.
@@ -1557,7 +1701,12 @@ class SpeechRecognizer(QObject):
         seq = self._request_seq
         self._active_seq = seq
 
-        info = get_model_info(self._model_id)
+        loaded_model_id = (
+            self._loaded_target[0]
+            if self._loaded_target is not None
+            else self._model_id
+        )
+        info = get_model_info(loaded_model_id)
         loader = info.get("loader", "") if info else ""
         window = slice_window_for_loader(loader)
         if window is None:
@@ -1637,9 +1786,16 @@ class SpeechRecognizer(QObject):
         return tuple(worker for worker in [self._load_worker, *self._workers]
                      if worker is not None and worker.isRunning())
 
+    @property
+    def running_transcribe_workers(self):
+        return tuple(worker for worker in self._workers
+                     if worker is not None and worker.isRunning())
+
     def shutdown(self, *, wait_ms: int = 1000):
         """Stop all running workers for clean app exit."""
         self._reload_after_current = False
+        self._silent_reload = False
+        self._last_ready_silent = False
         if self._load_worker:
             try:
                 self._load_worker.disconnect()
@@ -1662,7 +1818,19 @@ class SpeechRecognizer(QObject):
 
     @property
     def is_loading(self) -> bool:
-        return self._load_worker is not None and self._load_worker.isRunning()
+        return self._load_worker_running() and not self._silent_reload
+
+    @property
+    def is_silent_loading(self) -> bool:
+        return self._load_worker_running() and self._silent_reload
+
+    @property
+    def last_ready_silent(self) -> bool:
+        return self._last_ready_silent
+
+    @property
+    def loaded_target(self) -> LoadTarget | None:
+        return self._effective_loaded_target()
 
     @property
     def current_model_id(self) -> str:
