@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -113,10 +114,24 @@ def is_transient_failure(exc: BaseException) -> bool:
     return False
 
 
+_PREVIEW_FIELD_RE = re.compile(r'"(?:summary|text|task)"\s*:\s*"((?:\\.|[^"\\])*)(?:"|$)')
+
+
+def _estimate_text_tokens(text: str) -> float:
+    if not text:
+        return 0.0
+    chars = len(text)
+    utf8_bytes = len(text.encode("utf-8"))
+    # ASCII (1B) ≈ 1 / 3.5 tok/char; 3-byte BMP/CJK ≈ 1.2 tok/char;
+    # 2-byte / 4-byte UTF-8 interpolate smoothly without per-character loops.
+    non_ascii_units = (utf8_bytes - chars) / 2.0
+    ascii_equiv = max(0.0, chars - non_ascii_units)
+    return non_ascii_units * 1.2 + ascii_equiv / 3.5
+
+
 def estimate_prompt_tokens(system: str, user: str) -> int:
-    # Unknown compatible models need a conservative, tokenizer-independent
-    # budget. UTF-8 bytes bound byte-token counts; reserve message overhead too.
-    return len(system.encode("utf-8")) + len(user.encode("utf-8")) + 64
+    # CJK-aware, tokenizer-independent upper bound plus message framing overhead.
+    return int(math.ceil(_estimate_text_tokens(system) + _estimate_text_tokens(user))) + 64
 
 
 @dataclass(frozen=True)
@@ -141,6 +156,10 @@ class MinutesWorker(QThread):
         self._cancelled = False
         self._cancellation = Cancellation()
         self._preview_raw = ""
+        self._preview_scan_pos = 0
+        self._preview_anchor = ""
+        self._preview_completed: list[str] = []
+        self._preview_emitted = ""
         self._last_preview_at = 0.0
         self._stage = ""
         self._split_occurred = False
@@ -179,29 +198,50 @@ class MinutesWorker(QThread):
 
     def _reset_preview(self):
         self._preview_raw = ""
+        self._preview_scan_pos = 0
+        self._preview_anchor = ""
+        self._preview_completed = []
+        self._preview_emitted = ""
         self._last_preview_at = 0
         self.preview.emit("")
 
     def _on_delta(self, delta):
         self._preview_raw += delta
-        if len(self._preview_raw) > self._req.max_output_tokens * 32:
+        raw_len = len(self._preview_raw)
+        if raw_len > self._req.max_output_tokens * 32:
             raise LLMResponseError("模型输出异常过长，本次结果未保存")
-        if time.monotonic() - self._last_preview_at >= 0.15:
+        interval = 0.15 if raw_len < 4096 else (0.30 if raw_len < 16384 else 0.50)
+        if time.monotonic() - self._last_preview_at >= interval:
             self._publish_preview()
 
     def _publish_preview(self):
         raw = strip_model_thinking(self._preview_raw).lstrip()
-        readable = []
-        for match in re.finditer(r'"(?:summary|text|task)"\s*:\s*"((?:\\.|[^"\\])*)(?:"|$)', raw):
+        pos = self._preview_scan_pos
+        if pos > len(raw) or (pos and raw[max(0, pos - 16):pos] != self._preview_anchor):
+            pos = 0
+            self._preview_completed = []
+        tail_readable: list[str] = []
+        for match in _PREVIEW_FIELD_RE.finditer(raw, pos):
             value = match.group(1)
             try:
-                readable.append(json.loads('"' + value + '"'))
+                decoded = json.loads('"' + value + '"')
             except ValueError:
                 continue  # A split escape sequence is completed in the next event.
+            if match.group(0).endswith('"'):
+                self._preview_completed.append(decoded)
+                pos = match.end()
+            else:
+                tail_readable.append(decoded)
+        self._preview_scan_pos = pos
+        self._preview_anchor = raw[max(0, pos - 16):pos] if pos else ""
+        readable = self._preview_completed + tail_readable
         if not readable and self._preview_markdown and not raw.startswith(("{", "[", "```")):
             readable = [raw]
         if readable:
-            self.preview.emit("生成预览 · 尚未保存\n\n" + self._stage + "\n\n" + "\n\n".join(readable)[-24000:])
+            text = "生成预览 · 尚未保存\n\n" + self._stage + "\n\n" + "\n\n".join(readable)[-24000:]
+            if text != self._preview_emitted:
+                self._preview_emitted = text
+                self.preview.emit(text)
         self._last_preview_at = time.monotonic()
 
     async def _chat(self, client, httpx, system_prompt: str, user_prompt: str) -> str:
@@ -241,7 +281,7 @@ class MinutesWorker(QThread):
 
     async def _refine(self, client, httpx) -> tuple[dict, bool]:
         req = self._req
-        size = min(req.chunk_chars, max(200, req.max_output_tokens // 3))
+        size = min(req.chunk_chars, max(200, req.max_output_tokens * 2 // 3))
         while True:
             chunks = refinement_chunks(req.lines, max_chars=size)
             if all(self._fits(REFINE_SYSTEM_PROMPT, refinement_user_prompt(
@@ -419,7 +459,10 @@ class MinutesWorker(QThread):
         try:
             import httpx
 
-            problem = api_url_error(req.api_url)
+            problem = api_url_error(
+                req.api_url,
+                proxy_bypass_suffixes=req.proxy_bypass_suffixes,
+            )
             if problem:
                 self.error.emit(problem)
                 return

@@ -427,10 +427,25 @@ class TestGeneration:
 
     def test_remote_host_confirmation_is_remembered(self, controller, config):
         config.set("llm.api_url", "https://api.example.com/v1")
-        assert controller.remote_host_needing_confirmation() == "api.example.com"
-        controller.confirm_remote_host("api.example.com")
+        assert controller.remote_host_needing_confirmation() == "https://api.example.com"
+        controller.confirm_remote_host("https://api.example.com")
         assert controller.remote_host_needing_confirmation() == ""
+        assert config.get("meeting.confirmed_remote_hosts") == ["https://api.example.com"]
+        # Downgrading https -> http on the same host must require fresh confirmation.
+        config.set("llm.api_url", "http://api.example.com/v1")
+        assert controller.remote_host_needing_confirmation() == "http://api.example.com"
         config.set("llm.api_url", "http://127.0.0.1:11434/v1")
+        assert controller.remote_host_needing_confirmation() == ""
+        config.set("llm.api_url", "http://ollama:11434/v1")
+        assert controller.remote_host_needing_confirmation() == ""
+
+    def test_legacy_bare_confirmed_host_stays_valid_for_https_only(self, controller, config):
+        config.set("meeting.confirmed_remote_hosts", ["api.example.com"])
+        config.set("llm.api_url", "https://api.example.com/v1")
+        assert controller.remote_host_needing_confirmation() == ""
+        config.set("llm.api_url", "http://api.example.com/v1")
+        assert controller.remote_host_needing_confirmation() == "http://api.example.com"
+        controller.confirm_remote_host("http://api.example.com")
         assert controller.remote_host_needing_confirmation() == ""
 
     def test_cancel_generation_is_not_reported_as_a_failure(self, controller):

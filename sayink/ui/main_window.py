@@ -674,7 +674,7 @@ class MainWindow(QWidget):
     def show_page(self, key: str) -> None:
         if key not in PAGE_KEYS:
             return
-        if key != self._page and self._page == "meeting" and not self._meeting_can_leave():
+        if key != self._page and not self._current_page_can_leave():
             self._check_nav(self._page)
             return
         self._page = key
@@ -696,6 +696,19 @@ class MainWindow(QWidget):
             self._stack.setCurrentIndex(_STACK_SETTINGS)
             self._settings.show_page(settings_index[key])
         self._check_nav(key)
+
+    def _current_page_can_leave(self) -> bool:
+        if self._page == "meeting":
+            return self._meeting_can_leave()
+        if self._page == "history":
+            return self._history_can_leave()
+        return True
+
+    def _history_can_leave(self) -> bool:
+        leave = getattr(self._history, "try_leave", None)
+        if not callable(leave):
+            return True
+        return bool(leave())
 
     def _meeting_can_leave(self) -> bool:
         leave = getattr(self._meeting, "try_leave", None)

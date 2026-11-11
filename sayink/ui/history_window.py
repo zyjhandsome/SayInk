@@ -5,7 +5,6 @@ from __future__ import annotations
 import html
 import logging
 import re
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +33,31 @@ from PyQt6.QtWidgets import (
 )
 
 from sayink.history_store import SegmentRecord, SessionSummary
+from sayink.ui.history_export import (
+    _SUPPRESSED_POLISHED_MARKER,
+    _day_label,
+    _effective_text,
+    _filename_dt as _filename_dt,
+    _format_dt,
+    _format_duration,
+    _highlight_html,
+    _labeled_text,
+    _route_caption as _route_caption,
+    _segment_clock_ms,
+    _segments_in_order,
+    _session_body,
+    _session_duration_ms,
+    _session_model as _session_model,
+    _session_title,
+    _speaker_heading,
+    _yaml_value as _yaml_value,
+    build_batch_export_markdown,
+    build_single_session_markdown,
+    build_single_session_plain,
+    history_shows_speakers,
+    suggest_batch_export_filename,
+    suggest_single_export_filename,
+)
 from sayink.ui import settings_styles as _settings_styles
 from sayink.ui import design_tokens as tok
 from sayink.ui.clipboard import copy_text
@@ -289,97 +313,6 @@ class _DetailTextEdit(QTextEdit):
         super().keyPressEvent(event)
 
 
-def _format_dt(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _day_label(ms: int) -> str:
-    day = datetime.fromtimestamp(ms / 1000).date()
-    today = datetime.now().date()
-    delta = (today - day).days
-    if delta == 0:
-        return "今天"
-    if delta == 1:
-        return "昨天"
-    return day.strftime("%Y-%m-%d")
-
-
-def _filename_dt(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000).strftime("%Y%m%d-%H%M%S")
-
-
-_SUPPRESSED_POLISHED_MARKER = "\u200b"
-
-
-def _effective_text(segment: SegmentRecord) -> str:
-    if segment.polished_text == _SUPPRESSED_POLISHED_MARKER:
-        return ""
-    return segment.polished_text or segment.raw_text
-
-
-def _yaml_value(value: object) -> str:
-    return str(value).replace("\n", " ").strip()
-
-
-def _segments_in_order(segments: list[SegmentRecord]) -> list[SegmentRecord]:
-    return sorted(segments, key=lambda s: s.seq)
-
-
-def _session_duration_ms(segments: list[SegmentRecord]) -> int:
-    return sum(max(0, int(s.duration_ms)) for s in segments)
-
-
-def _session_model(segments: list[SegmentRecord]) -> str:
-    return next((s.model for s in segments if s.model), "")
-
-
-def history_shows_speakers(segments: list[SegmentRecord]) -> bool:
-    """Label multiple voices, or uncertainty alongside an identified voice."""
-    ids = {int(segment.speaker_id) for segment in segments if int(segment.speaker_id) > 0}
-    return len(ids) >= 2 or bool(ids) and any(
-        segment.trigger_mode == "continuous" and int(segment.speaker_id) == 0 for segment in segments
-    )
-
-
-def _segment_clock_ms(segment: SegmentRecord) -> int:
-    """When the person spoke, or when the line was saved if that is unknown."""
-    captured = int(getattr(segment, "captured_at", 0) or 0)
-    if captured > 0:
-        return captured
-    return int(segment.created_at)
-
-
-def _route_caption(route: str) -> str:
-    return {"mic": "麦克风", "system": "电脑声音"}.get((route or "").strip(), "")
-
-
-def _speaker_heading(segment: SegmentRecord) -> str:
-    heading = f"说话人 {int(segment.speaker_id)}" if int(segment.speaker_id) > 0 else "说话人待确认"
-    route = _route_caption(segment.speaker_route)
-    if route:
-        return f"{heading} · {route}"
-    return heading
-
-
-def _labeled_text(segment: SegmentRecord, text: str, *, show_speakers: bool) -> str:
-    body = text.strip()
-    if not body:
-        return ""
-    if show_speakers:
-        return f"{_speaker_heading(segment)}\n{body}"
-    return body
-
-
-def _session_body(segments: list[SegmentRecord]) -> str:
-    ordered = _segments_in_order(segments)
-    show_speakers = history_shows_speakers(ordered)
-    chunks = [
-        _labeled_text(segment, _effective_text(segment), show_speakers=show_speakers)
-        for segment in ordered
-    ]
-    return "\n\n".join(chunk for chunk in chunks if chunk)
-
-
 _SOURCE_CHIP = {
     "mic": "麦克风",
     "microphone": "麦克风",
@@ -431,94 +364,6 @@ def _chip_qss() -> str:
         f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_CAPTION}px;"
         " background: transparent; padding: 2px 0;"
     )
-
-
-def suggest_single_export_filename(session: SessionSummary) -> str:
-    return f"sayink-{_filename_dt(session.created_at)}.md"
-
-
-def suggest_batch_export_filename(*, now_ms: int | None = None) -> str:
-    stamp = int(time.time() * 1000) if now_ms is None else now_ms
-    return f"sayink-export-{_filename_dt(stamp)}.md"
-
-
-def build_single_session_plain(
-    session: SessionSummary,
-    segments: list[SegmentRecord],
-) -> str:
-    del session
-    return _session_body(segments).rstrip() + "\n"
-
-
-def build_single_session_markdown(
-    session: SessionSummary,
-    segments: list[SegmentRecord],
-) -> str:
-    frontmatter = [
-        "---",
-        f"created_at: {_yaml_value(_format_dt(session.created_at))}",
-        f"source: {_yaml_value(session.source)}",
-        f"target_app: {_yaml_value(session.target_app)}",
-        f"duration_ms: {_session_duration_ms(segments)}",
-        f"model: {_yaml_value(_session_model(segments))}",
-        f"segment_count: {session.segment_count}",
-        "---",
-        "",
-    ]
-    return "\n".join(frontmatter) + _session_body(segments).rstrip() + "\n"
-
-
-def build_batch_export_markdown(
-    sessions: list[SessionSummary],
-    segments_by_session: dict[str, list[SegmentRecord]],
-) -> str:
-    lines = [
-        "---",
-        f"exported_at: {_yaml_value(_format_dt(int(time.time() * 1000)))}",
-        f"session_count: {len(sessions)}",
-        "---",
-        "",
-    ]
-    for session in sorted(sessions, key=lambda s: s.created_at):
-        segments = segments_by_session.get(session.session_id, [])
-        lines.extend(
-            [
-                f"## {_format_dt(session.created_at)} · {session.preview}",
-                "",
-                f"- source: {session.source}",
-                f"- target_app: {session.target_app}",
-                f"- duration_ms: {_session_duration_ms(segments)}",
-                f"- model: {_session_model(segments)}",
-                f"- segment_count: {session.segment_count}",
-                "",
-                _session_body(segments).rstrip(),
-                "",
-            ]
-        )
-    return "\n".join(lines).rstrip() + "\n"
-
-def _format_duration(ms: int) -> str:
-    seconds = max(0, int(ms)) // 1000
-    if seconds < 60:
-        return f"{seconds} 秒"
-    minutes, seconds = divmod(seconds, 60)
-    if minutes < 60:
-        return f"{minutes} 分 {seconds:02d} 秒"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours} 时 {minutes:02d} 分"
-
-
-def _session_title(created_at: int) -> str:
-    return f"{_day_label(created_at)} {datetime.fromtimestamp(created_at / 1000).strftime('%H:%M')}"
-
-
-def _highlight_html(text: str, query: str, mark_css: str) -> str:
-    escaped = html.escape(text)
-    q = (query or "").strip()
-    if not q:
-        return escaped
-    pattern = re.compile(re.escape(html.escape(q)), re.IGNORECASE)
-    return pattern.sub(lambda m: f'<span style="{mark_css}">{m.group(0)}</span>', escaped)
 
 
 class _Toast(QFrame):
@@ -1733,7 +1578,18 @@ class HistoryWindow(QWidget):
         selected = self._selected_session_ids()
         count = len(selected)
         if self._editing_session and (self._selection_mode or count != 1 or selected[0] != self._editing_session_id):
-            self._leave_inline_edit_on_row_change()
+            if not self._leave_inline_edit_on_row_change():
+                self._session_list.blockSignals(True)
+                try:
+                    for item in self.session_items():
+                        match = item.data(Qt.ItemDataRole.UserRole) == self._editing_session_id
+                        item.setSelected(match)
+                        if match:
+                            self._session_list.setCurrentItem(item)
+                finally:
+                    self._session_list.blockSignals(False)
+                self._sync_row_selection()
+                return
         if count > 1 and not self._selection_mode:
             self._set_selection_mode(True)
             return
@@ -1916,15 +1772,17 @@ class HistoryWindow(QWidget):
         self._details.setReadOnly(True)
         self._paint_history_styles()
 
-    def _leave_inline_edit_on_row_change(self) -> None:
+    def _leave_inline_edit_on_row_change(self) -> bool:
         """The user clicked another row mid-edit: keep what they typed (like
         the meeting page's draft autosave) instead of discarding it silently."""
         changed = self._details.toPlainText().strip() != self._editing_original_text.strip()
         if changed and self._details.toPlainText().strip():
-            self._save_inline_edit(refresh=False)
+            if not self._save_inline_edit(refresh=False):
+                return False
             QTimer.singleShot(0, self.refresh)
-        else:
-            self._exit_inline_edit_state()
+            return True
+        self._exit_inline_edit_state()
+        return True
 
     def _cancel_inline_edit(self) -> None:
         if not self._editing_session:
@@ -1932,9 +1790,9 @@ class HistoryWindow(QWidget):
         self._exit_inline_edit_state()
         self._on_selection_changed()
 
-    def _save_inline_edit(self, *, refresh: bool = True) -> None:
+    def _save_inline_edit(self, *, refresh: bool = True) -> bool:
         if not self._editing_session or not self._editing_session_id:
-            return
+            return True
         session_id = self._editing_session_id
         new_text = self._details.toPlainText().strip()
         segments = _segments_in_order(self._get_session_segments_effective(session_id))
@@ -1944,7 +1802,10 @@ class HistoryWindow(QWidget):
             mapping = self._map_edited_text_to_segments(segments, new_text)
             if mapping is None:
                 self._show_feedback("空行比段落多，修改未保存。请去掉多余空行后再保存。")
-                return
+                return False
+            if getattr(self._store, "disabled", False):
+                self._show_feedback("未能保存修改")
+                return False
             updater = getattr(self._store, "enqueue_update_polished", None)
             if callable(updater):
                 updater(session_id, mapping)
@@ -1952,7 +1813,7 @@ class HistoryWindow(QWidget):
             saved = flush(timeout=2.0) if callable(flush) else True
             if saved is False:
                 self._show_feedback("未能保存修改")
-                return
+                return False
             self._exit_inline_edit_state()
             self._view_polished = True
             self._view_polished_btn.blockSignals(True)
@@ -1962,6 +1823,27 @@ class HistoryWindow(QWidget):
             self._show_feedback("已保存修改")
         if refresh:
             self.refresh()
+        return True
+
+    def try_leave(self) -> bool:
+        """Save or close an open inline session edit before switching sidebar pages.
+
+        Returns False when the edit cannot be mapped or written, keeping the
+        inline editor, draft text, and feedback toast visible on History.
+        """
+        if not getattr(self, "_editing_session", False) or not self._editing_session_id:
+            return True
+        current_text = self._details.toPlainText().strip()
+        if not current_text or current_text == self._editing_original_text.strip():
+            self._exit_inline_edit_state()
+            self._on_selection_changed()
+            return True
+        return self._save_inline_edit()
+
+    def hideEvent(self, event) -> None:
+        if getattr(self, "_editing_session", False):
+            self.try_leave()
+        super().hideEvent(event)
 
     def _ensure_polisher(self):
         if self._polisher is None:

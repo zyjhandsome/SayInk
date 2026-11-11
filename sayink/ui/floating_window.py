@@ -5,11 +5,13 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, QPoint, QEvent, pyqtSignal
 from PyQt6.QtGui import QFontMetrics, QPainter, QColor, QFont, QCursor
 import math
+import weakref
 from sayink.runtime_status import MEETING_STATE_LABELS
 from sayink.ui import design_tokens as tok
 from sayink.ui.island_chrome import (
     clamp_top_left,
     coerce_saved_positions,
+    is_screen_alive,
     island_window_flags,
     normalize_listen_bar_placement,
     placement_anchor,
@@ -67,6 +69,8 @@ class _DotIndicator(QWidget):
         # value that happened to be active when this module was imported.
         self._color = QColor(color or tok.STATE_RECORD)
         self._pulse = 0.0
+        self._pulsing = False
+        self._suspended = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self.setFixedSize(16, 16)
@@ -76,15 +80,24 @@ class _DotIndicator(QWidget):
         self.update()
 
     def start_pulse(self):
-        if self._timer.isActive():
+        self._pulsing = True
+        if self._suspended or self._timer.isActive():
             return
         self._pulse = 0.0
         self._timer.start(50)
 
     def stop_pulse(self):
+        self._pulsing = False
         self._timer.stop()
         self._pulse = 0.0
         self.update()
+
+    def set_suspended(self, suspended: bool) -> None:
+        self._suspended = bool(suspended)
+        if self._suspended:
+            self._timer.stop()
+        elif self._pulsing and not self._timer.isActive():
+            self._timer.start(50)
 
     def _tick(self):
         self._pulse += 0.15
@@ -119,6 +132,8 @@ class _DotIndicator(QWidget):
 class WaveformWidget(QWidget):
 
     NUM_BARS = 14
+    _SILENT_VOLUME_EPS = 0.005
+    _SILENT_BAR_EPS = 0.01
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -127,6 +142,8 @@ class WaveformWidget(QWidget):
         self._phase = 0.0
         self._accent = QColor(tok.FLOAT_TEXT)
         self._visible_bars = self.NUM_BARS
+        self._running = False
+        self._suspended = False
         self.setFixedHeight(18)
         self.setFixedWidth(72)
 
@@ -137,29 +154,47 @@ class WaveformWidget(QWidget):
         self._accent = QColor(color)
 
     def start(self):
-        if self._timer.isActive():
+        self._running = True
+        if self._suspended or self._timer.isActive():
             return
         self._phase = 0.0
         self._timer.start(50)
 
     def stop(self):
+        self._running = False
         self._timer.stop()
         self._bar_heights = [0.0] * self.NUM_BARS
         self.update()
+
+    def set_suspended(self, suspended: bool) -> None:
+        self._suspended = bool(suspended)
+        if self._suspended:
+            self._timer.stop()
+        elif self._running and not self._timer.isActive():
+            self._timer.start(50)
 
     def set_compact(self, compact: bool) -> None:
         self._visible_bars = 5 if compact else self.NUM_BARS
         self.setFixedWidth(28 if compact else 72)
 
     def set_volume(self, volume: float):
-        self._volume = min(volume * 8, 1.0)
+        self._volume = min(max(0.0, float(volume)) * 8, 1.0)
+        if self._running and not self._suspended and self._volume >= self._SILENT_VOLUME_EPS and not self._timer.isActive():
+            self._timer.start(50)
 
     def _animate(self):
         self._phase += 0.3
+        peak = 0.0
         for i in range(self.NUM_BARS):
             wave = math.sin(self._phase + i * 0.5) * 0.5 + 0.5
             target = wave * self._volume
-            self._bar_heights[i] += (target - self._bar_heights[i]) * 0.4
+            height = self._bar_heights[i] + (target - self._bar_heights[i]) * 0.4
+            self._bar_heights[i] = height
+            if height > peak:
+                peak = height
+        if self._volume < self._SILENT_VOLUME_EPS and peak < self._SILENT_BAR_EPS:
+            self._bar_heights = [0.0] * self.NUM_BARS
+            self._timer.stop()
         self.update()
 
     def paintEvent(self, event):
@@ -250,6 +285,14 @@ class FloatingWindow(QWidget):
         self._meeting_click_timer = QTimer(self)
         self._meeting_click_timer.setSingleShot(True)
         self._meeting_click_timer.timeout.connect(self._open_meeting_from_click)
+        self._screen_removed_slot = None
+        app = QApplication.instance()
+        if app is not None and hasattr(app, "screenRemoved"):
+            weak_self = weakref.ref(self)
+            self._screen_removed_slot = lambda removed: (
+                (w := weak_self()) is not None and w._on_screen_removed(removed)
+            )
+            app.screenRemoved.connect(self._screen_removed_slot)
 
     def call_when_painted(self, fn) -> None:
         """Run ``fn`` once the bar's current state is on screen.
@@ -477,8 +520,28 @@ class FloatingWindow(QWidget):
 
     def _screen_for_placement(self):
         if self._position_pinned and self._pin_screen is not None:
-            return self._pin_screen
-        return QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+            if is_screen_alive(self._pin_screen):
+                return self._pin_screen
+            self._pin_screen = None
+            self._position_pinned = False
+            self._pinned_token = ""
+            self._user_moved = False
+        cursor_screen = QApplication.screenAt(QCursor.pos())
+        if is_screen_alive(cursor_screen):
+            return cursor_screen
+        primary = QApplication.primaryScreen()
+        return primary if is_screen_alive(primary) else None
+
+    def _on_screen_removed(self, removed_screen=None) -> None:
+        if self._pin_screen is not None and (
+            removed_screen is self._pin_screen or not is_screen_alive(self._pin_screen)
+        ):
+            self._pin_screen = None
+            self._position_pinned = False
+            self._pinned_token = ""
+            self._user_moved = False
+            if self.isVisible():
+                self._place_initial(self._is_long_session())
 
     def _token_for(self, long_session: bool, screen) -> tuple[str, dict | None]:
         pref = normalize_listen_bar_placement(self._placement_pref)
@@ -533,12 +596,21 @@ class FloatingWindow(QWidget):
             self._pin_edge = self.y()
 
     def _hold_pinned_edges(self) -> None:
-        screen = self._pin_screen or QApplication.primaryScreen()
-        if screen is None:
+        if self._pin_screen is not None and not is_screen_alive(self._pin_screen):
+            self._pin_screen = None
+            self._position_pinned = False
+            self._pinned_token = ""
+            self._user_moved = False
+            self._place_initial(self._is_long_session())
+            return
+        screen = self._pin_screen if is_screen_alive(self._pin_screen) else QApplication.primaryScreen()
+        if not is_screen_alive(screen):
             return
         try:
             geo = screen.availableGeometry()
         except RuntimeError:
+            self._pin_screen = None
+            self._position_pinned = False
             return
         width = max(1, self.width())
         height = max(1, self.height())
@@ -553,6 +625,8 @@ class FloatingWindow(QWidget):
         self._hide_timer.stop()
         self._end_btn.setVisible(self._listening_active)
         self._mark_btn.setVisible(self._meeting_active)
+        self._dot.set_suspended(False)
+        self._waveform.set_suspended(False)
         self._ensure_position()
         self.show()
         self._note_bar_activity()
@@ -619,8 +693,11 @@ class FloatingWindow(QWidget):
 
     def _commit_drag(self) -> None:
         center = self.frameGeometry().center()
-        screen = QApplication.screenAt(center) or self._pin_screen or QApplication.primaryScreen()
-        if screen is None:
+        candidate = QApplication.screenAt(center)
+        if not is_screen_alive(candidate):
+            candidate = self._pin_screen if is_screen_alive(self._pin_screen) else QApplication.primaryScreen()
+        screen = candidate
+        if not is_screen_alive(screen):
             return
         try:
             geo = screen.availableGeometry()
@@ -1167,13 +1244,34 @@ class FloatingWindow(QWidget):
     def clear_model_loading_lock(self) -> None:
         self._model_loading_active = False
 
+    def showEvent(self, event):
+        self._dot.set_suspended(False)
+        self._waveform.set_suspended(False)
+        super().showEvent(event)
+
     def hideEvent(self, event):
         self._position_pinned = False
         self._user_moved = False
         self._pinned_token = ""
         self._idle_timer.stop()
         self._meeting_click_timer.stop()
+        self._dot.set_suspended(True)
+        self._waveform.set_suspended(True)
         super().hideEvent(event)
+
+    def closeEvent(self, event):
+        slot = getattr(self, "_screen_removed_slot", None)
+        if slot is not None:
+            self._screen_removed_slot = None
+            app = QApplication.instance()
+            if app is not None and hasattr(app, "screenRemoved"):
+                try:
+                    app.screenRemoved.disconnect(slot)
+                except TypeError:
+                    pass
+        self._dot.stop_pulse()
+        self._waveform.stop()
+        super().closeEvent(event)
 
     def enterEvent(self, event):
         self._restore_idle_excerpt()

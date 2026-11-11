@@ -777,10 +777,12 @@ class MeetingStore:
 
         return int(self._history.read(_q, default=0) or 0)
 
-    def search_meetings(self, q: str) -> list[MeetingRecord]:
+    def search_meetings(self, q: str, limit: int = 200) -> list[MeetingRecord]:
         q = q.strip()
         if not q:
-            return self.list_meetings()
+            return self.list_meetings(limit=limit)
+        if limit <= 0:
+            return []
 
         pattern = f"%{escape_like(q)}%"
 
@@ -801,8 +803,15 @@ class MeetingStore:
                     OR m.id IN (SELECT meeting_id FROM meeting_marks WHERE note LIKE ? ESCAPE '\\')
                   )
                 ORDER BY m.started_at DESC
+                LIMIT ?
                 """,
-                (STATUS_DELETED, pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern),
+                (
+                    STATUS_DELETED,
+                    pattern, pattern, pattern, pattern,
+                    pattern, pattern, pattern,
+                    pattern, pattern,
+                    int(limit),
+                ),
             ).fetchall()
             return [_row_to_meeting(r) for r in rows]
 
@@ -833,6 +842,43 @@ class MeetingStore:
             return [row_to_segment(r) for r in rows]
 
         return self._history.read(_q, default=[]) or []
+
+    def get_segment(self, meeting_id: str, seq: int) -> SegmentRecord | None:
+        def _q(conn: sqlite3.Connection) -> SegmentRecord | None:
+            row = conn.execute(
+                """
+                SELECT session_id, seq, created_at, raw_text, polished_text,
+                       source, duration_ms, target_app, trigger_mode, model,
+                       speaker_id, speaker_route, captured_at, corrected_text, speaker_locked
+                FROM history
+                WHERE session_id = ? AND seq = ? AND trigger_mode = ?
+                LIMIT 1
+                """,
+                (meeting_id, int(seq), MEETING_TRIGGER_MODE),
+            ).fetchone()
+            return row_to_segment(row) if row else None
+
+        return self._history.read(_q, default=None)
+
+    def has_speaker(self, meeting_id: str, speaker_id: int) -> bool:
+        def _q(conn: sqlite3.Connection) -> bool:
+            row = conn.execute(
+                "SELECT 1 FROM history WHERE session_id = ? AND trigger_mode = ? AND speaker_id = ? LIMIT 1",
+                (meeting_id, MEETING_TRIGGER_MODE, int(speaker_id)),
+            ).fetchone()
+            return row is not None
+
+        return bool(self._history.read(_q, default=False))
+
+    def speaker_ids_in_segments(self, meeting_id: str) -> set[int]:
+        def _q(conn: sqlite3.Connection) -> set[int]:
+            rows = conn.execute(
+                "SELECT DISTINCT speaker_id FROM history WHERE session_id = ? AND trigger_mode = ?",
+                (meeting_id, MEETING_TRIGGER_MODE),
+            ).fetchall()
+            return {int(r[0]) for r in rows if r[0] is not None}
+
+        return self._history.read(_q, default=set()) or set()
 
     def get_marks(self, meeting_id: str) -> list[MeetingMark]:
         def _q(conn: sqlite3.Connection) -> list[MeetingMark]:

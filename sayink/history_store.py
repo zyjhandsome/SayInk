@@ -7,9 +7,10 @@ import queue
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS history (
   speaker_locked INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_history_session ON history(session_id);
+CREATE INDEX IF NOT EXISTS idx_history_session_seq ON history(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_history_created ON history(created_at);
 
 -- Meetings (docs/meeting-notes-design.md §5.2). Transcript rows stay in
@@ -60,6 +62,7 @@ CREATE TABLE IF NOT EXISTS meeting_marks (
   offset_ms  INTEGER NOT NULL,
   note       TEXT    NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS idx_meeting_marks_meeting_offset ON meeting_marks(meeting_id, offset_ms);
 CREATE TABLE IF NOT EXISTS meeting_speakers (
   meeting_id     TEXT    NOT NULL,
   speaker_id     INTEGER NOT NULL,
@@ -276,6 +279,10 @@ class HistoryStore:
         self._failed_callbacks: list[Callable[[str], None]] = []
         self._fail_lock = threading.Lock()
         self._write_failures = 0
+        self._closed = False
+        self._read_local = threading.local()
+        self._read_lock = threading.Lock()
+        self._read_conns: dict[int, sqlite3.Connection] = {}
 
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -333,6 +340,7 @@ class HistoryStore:
     def _quarantine_corrupt_db(self) -> Path | None:
         """Rename ``history.db`` (plus WAL/SHM side files) like config does for
         a corrupt ``config.json``, so the data is kept for manual recovery."""
+        self._close_read_connections()
         stamp = time.strftime("%Y%m%d-%H%M%S")
         backup = self.db_path.with_name(f"{self.db_path.stem}.corrupt-{stamp}{self.db_path.suffix}")
         try:
@@ -350,6 +358,7 @@ class HistoryStore:
         return backup
 
     def _disable(self) -> None:
+        self._close_read_connections()
         self.disabled = True
         self.startup_notice = DISABLED_NOTICE
 
@@ -567,20 +576,19 @@ class HistoryStore:
             return self._write_failures == before
 
     def read(self, fn: Callable[[sqlite3.Connection], Any], default: Any = None) -> Any:
-        """Run ``fn(conn)`` on a short-lived read-only connection."""
+        """Run ``fn(conn)`` on a cached thread-local read-only connection."""
         if self.disabled:
             return default
         try:
-            conn = self._readonly_conn()
-            try:
+            with self._read_conn() as conn:
                 return fn(conn)
-            finally:
-                conn.close()
         except Exception:
             logger.exception("HistoryStore read failed")
             return default
 
     def close(self, timeout: float = CLOSE_TIMEOUT_SEC) -> None:
+        self._closed = True
+        self._close_read_connections()
         if self.disabled:
             return
         thread = self._thread
@@ -596,12 +604,13 @@ class HistoryStore:
                 "leaving connection with writer thread",
                 timeout, pending,
             )
+        self._close_read_connections()
 
     def list_sessions(self, limit: int = 50, offset: int = 0) -> list[SessionSummary]:
         if self.disabled:
             return []
         try:
-            with self._readonly_conn() as conn:
+            with self._read_conn() as conn:
                 rows = conn.execute(
                     _SESSION_SUMMARY_SQL
                     + f"""
@@ -633,7 +642,7 @@ class HistoryStore:
             limit_sql = "LIMIT ?"
             params += (max(0, int(limit)),)
         try:
-            with self._readonly_conn() as conn:
+            with self._read_conn() as conn:
                 rows = conn.execute(
                     f"""
                     WITH matching AS (
@@ -671,7 +680,7 @@ class HistoryStore:
         if self.disabled:
             return None
         try:
-            with self._readonly_conn() as conn:
+            with self._read_conn() as conn:
                 return conn.execute(
                     "SELECT COUNT(DISTINCT session_id) FROM history WHERE trigger_mode != ?",
                     (MEETING_TRIGGER_MODE,),
@@ -684,7 +693,7 @@ class HistoryStore:
         if self.disabled:
             return []
         try:
-            with self._readonly_conn() as conn:
+            with self._read_conn() as conn:
                 rows = conn.execute(
                     """
                     SELECT session_id, seq, created_at, raw_text, polished_text,
@@ -701,12 +710,74 @@ class HistoryStore:
             logger.exception("HistoryStore get_session_segments failed")
             return []
 
+    def _close_conn_quietly(self, conn: sqlite3.Connection) -> None:
+        with self._read_lock:
+            self._read_conns.pop(id(conn), None)
+        try:
+            conn.close()
+        except Exception:
+            logger.debug("HistoryStore read connection close ignored", exc_info=True)
+
+    def _close_read_connections(self) -> None:
+        self._read_local.entry = None
+        with self._read_lock:
+            conns = list(self._read_conns.values())
+            self._read_conns.clear()
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:
+                logger.debug("HistoryStore read connection close ignored", exc_info=True)
+
+    @contextmanager
+    def _read_conn(self):
+        if self._closed or self._thread is None:
+            conn = self._readonly_conn()
+            try:
+                yield conn
+            finally:
+                self._close_conn_quietly(conn)
+            return
+        key = str(self.db_path)
+        entry = getattr(self._read_local, "entry", None)
+        conn: sqlite3.Connection | None = None
+        if entry is not None and entry[0] == key:
+            candidate = entry[1]
+            with self._read_lock:
+                if id(candidate) in self._read_conns:
+                    conn = candidate
+        if conn is None:
+            conn = self._readonly_conn()
+            if self._closed:
+                try:
+                    yield conn
+                finally:
+                    self._close_conn_quietly(conn)
+                return
+            self._read_local.entry = (key, conn)
+        try:
+            yield conn
+        except sqlite3.DatabaseError:
+            if getattr(self._read_local, "entry", None) == (key, conn):
+                self._read_local.entry = None
+            self._close_conn_quietly(conn)
+            raise
+        finally:
+            try:
+                if conn.in_transaction:
+                    conn.rollback()
+            except Exception:
+                pass
+
     def _readonly_conn(self) -> sqlite3.Connection:
-        # Short-lived read-only URI connection (WAL allows concurrent readers).
+        # Read-only URI connection (WAL allows concurrent readers).
         uri = self.db_path.resolve().as_uri() + "?mode=ro"
         conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000)
         conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
         conn.execute("PRAGMA query_only=ON;")
+        if not self._closed:
+            with self._read_lock:
+                self._read_conns[id(conn)] = conn
         return conn
 
     def _writer_loop(self) -> None:
@@ -734,6 +805,11 @@ class HistoryStore:
                         if more is self._stop:
                             continue
                         self._dispatch(conn, more)
+                    try:
+                        conn.execute("PRAGMA optimize;")
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    except Exception:
+                        logger.debug("HistoryStore shutdown WAL checkpoint skipped", exc_info=True)
                     return
                 self._dispatch(conn, item)
         finally:

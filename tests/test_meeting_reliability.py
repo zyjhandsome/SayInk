@@ -7,9 +7,15 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QLabel
 
 from sayink.history_store import HistoryStore, SegmentRecord
-from sayink.meeting_session import MeetingController, MeetingOptions, resolve_capabilities
+from sayink.meeting_session import MeetingController, MeetingOptions, MeetingState, resolve_capabilities
 from sayink.ui import settings_styles as ss
-from sayink.ui.meeting_page import MeetingPage, _SegmentTextDialog, _TranscriptView
+from sayink.ui.meeting_page import (
+    PAGE_BROWSE,
+    PAGE_LIVE,
+    MeetingPage,
+    _SegmentTextDialog,
+    _TranscriptView,
+)
 from sayink.ui.minutes_templates import TemplateEditorDialog
 from sayink.minutes_prompts import get_template
 
@@ -512,6 +518,264 @@ def test_exit_reports_a_minutes_draft_that_could_not_be_saved(config, tmp_path, 
         assert page.unsaved_exit_draft() == "不能丢的草稿"
         assert page._editing_notes
     finally:
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_external_end_with_failed_live_note_save_lands_on_browse_with_visible_warning(
+    config, tmp_path, monkeypatch
+):
+    page, controller, history, _record = _page(config, tmp_path)
+    try:
+        live = _live(page, controller, history)
+        QApplication.processEvents()
+        assert page._stack.currentIndex() == PAGE_LIVE
+        page._user_notes.setPlainText("托盘结束前的随手笔记")
+        monkeypatch.setattr(controller, "update_meeting", lambda *args, **kwargs: None)
+        monkeypatch.setattr(controller.store, "flush", lambda timeout=10: False)
+        controller.request_end()
+        QApplication.processEvents()
+
+        assert controller.state == MeetingState.IDLE
+        assert page._stack.currentIndex() == PAGE_BROWSE
+        assert page.current_meeting_id == live.id
+        assert page._materials.isVisible()
+        assert page._record_notes.toPlainText() == "托盘结束前的随手笔记"
+        assert page._status_label.isVisible()
+        assert "笔记尚未保存" in page._status_label.text()
+    finally:
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_failed_record_note_save_blocks_start_card_search_and_external_clobber(
+    config, tmp_path, monkeypatch
+):
+    page, controller, history, record = _page(config, tmp_path)
+    try:
+        orig_update = controller.update_meeting
+        orig_flush = controller.store.flush
+        page._record_notes.setPlainText("会后未落盘笔记")
+        page._record_notes.clearFocus()
+        monkeypatch.setattr(controller, "update_meeting", lambda *args, **kwargs: None)
+        monkeypatch.setattr(controller.store, "flush", lambda timeout=10: False)
+
+        page.show_start_card()
+        assert page._stack.currentIndex() == PAGE_BROWSE
+        assert page.current_meeting_id == record.id
+        assert page._record_notes.toPlainText() == "会后未落盘笔记"
+        assert "笔记尚未保存" in page._status_label.text()
+
+        page._search_edit.setText("过滤词")
+        page._perform_search()
+        assert page._search_query == ""
+        assert page._search_edit.text() == ""
+        assert page.current_meeting_id == record.id
+        assert page._record_notes.toPlainText() == "会后未落盘笔记"
+
+        live = _live(page, controller, history)
+        QApplication.processEvents()
+        page._user_notes.setPlainText("第二场实时笔记")
+        controller.request_end()
+        QApplication.processEvents()
+
+        assert page._unsaved_live_notes.get(live.id) == "第二场实时笔记"
+        assert page._record_notes_meeting_id == record.id
+        page.show_meeting(record.id)
+        assert page._record_notes.toPlainText() == "会后未落盘笔记"
+        assert page.unsaved_exit_draft() is not None
+
+        monkeypatch.setattr(controller, "update_meeting", orig_update)
+        monkeypatch.setattr(controller.store, "flush", orig_flush)
+        assert page.try_leave() is True
+        assert controller.store.get_meeting(record.id).notes_user == "会后未落盘笔记"
+        assert controller.store.get_meeting(live.id).notes_user == "第二场实时笔记"
+        assert not page._unsaved_live_notes
+    finally:
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_save_title_is_optimistic_without_blocking_ui_on_store_flush(
+    config, tmp_path, monkeypatch
+):
+    page, controller, history, record = _page(config, tmp_path)
+    try:
+        def _forbid_flush(*_args, **_kwargs):
+            raise AssertionError("UI thread must not call store.flush during _save_title")
+
+        monkeypatch.setattr(controller.store, "flush", _forbid_flush)
+        page._detail_title.setText("异步不阻塞新标题")
+        page._save_title()
+
+        assert page._detail_title.text() == "异步不阻塞新标题"
+        page.refresh()
+        assert page._detail_title.text() == "异步不阻塞新标题"
+
+        assert history.flush(timeout=5.0)
+        QApplication.processEvents()
+        assert controller.store.get_meeting(record.id).title == "异步不阻塞新标题"
+        assert page._pending_title is None
+    finally:
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_single_segment_edit_patches_paragraph_in_place_and_keeps_anchors(
+    config, tmp_path, monkeypatch
+):
+    page, controller, history, record = _page(config, tmp_path)
+    try:
+        long_rec = controller.store.create_meeting(
+            title="长文字稿局部修补", started_at=record.started_at + 50_000
+        )
+        for i in range(320):
+            history.enqueue(SegmentRecord(
+                long_rec.id,
+                i,
+                long_rec.started_at + i * 1000,
+                raw_text=f"核对第{i}段，这里是一句用于局部修补验证的示例发言。",
+                speaker_id=(i % 2) + 1,
+                trigger_mode="meeting",
+                captured_at=long_rec.started_at + i * 1000,
+            ))
+        controller.store.end_meeting(long_rec.id, ended_at=long_rec.started_at + 400_000)
+        controller.store.flush()
+
+        page.show_meeting(long_rec.id)
+        page._switch_tab(1)
+        QApplication.processEvents()
+
+        cursor = page._transcript_view.document().find("核对第5段")
+        page._transcript_view.setTextCursor(cursor)
+        assert page._transcript_view.textCursor().selectedText() == "核对第5段"
+
+        orig_set_html = page._transcript_view.setHtml
+        full_rebuilds = []
+
+        def _counted_set_html(html):
+            full_rebuilds.append(len(html))
+            return orig_set_html(html)
+
+        monkeypatch.setattr(page._transcript_view, "setHtml", _counted_set_html)
+        assert controller.save_segment_text(long_rec.id, 180, "第180段已原地修补")
+        page._render_detail()
+        QApplication.processEvents()
+
+        assert full_rebuilds == []
+        plain = page._transcript_view.toPlainText()
+        assert "第180段已原地修补" in plain
+        assert "已编辑" in plain
+        assert page._transcript_view.textCursor().selectedText() == "核对第5段"
+
+        patched_block = page._transcript_view.document().find("第180段已原地修补").block()
+        assert patched_block.isValid()
+        assert patched_block.layout() is not None
+        assert patched_block.layout().boundingRect().height() > 0
+        it = patched_block.begin()
+        action_alphas = []
+        while not it.atEnd():
+            frag = it.fragment()
+            if frag.isValid():
+                fmt = frag.charFormat()
+                href = fmt.anchorHref()
+                if fmt.isAnchor() and href.startswith(("edit-segment:", "details-segment:")):
+                    action_alphas.append(fmt.foreground().color().alpha())
+            it += 1
+        assert action_alphas and all(alpha == 0 for alpha in action_alphas)
+
+        page._transcript_view.scrollToAnchor("seg180")
+        page._transcript_view.place_cursor_at_segment(180)
+        assert page._transcript_view.textCursor().position() >= patched_block.position()
+    finally:
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_meeting_page_reexports_views_and_draft_buffer_state(tmp_path):
+    from sayink.ui import meeting_page, meeting_views
+    from sayink.ui.meeting_drafts import MeetingDraftBuffer
+
+    assert meeting_page._ReadingView is meeting_views._ReadingView
+    assert meeting_page._TranscriptView is meeting_views._TranscriptView
+    assert meeting_page._SegmentSpeakerDialog is meeting_views._SegmentSpeakerDialog
+    assert meeting_page._SegmentTextDialog is meeting_views._SegmentTextDialog
+    assert meeting_page._CurrentPageStack is meeting_views._CurrentPageStack
+    assert meeting_page.speaker_color is meeting_views.speaker_color
+
+    history = HistoryStore(db_path=tmp_path / "drafts.db")
+    try:
+        from sayink.meeting_store import MeetingStore
+
+        store = MeetingStore(history)
+        rec = store.create_meeting(title="原名")
+        store.flush()
+
+        buf = MeetingDraftBuffer()
+        buf.set_pending_template(rec.id, "refinement")
+        assert buf.effective_template_id(rec.id, "general") == "refinement"
+        assert buf.pop_pending_template(rec.id) == "refinement"
+        assert buf.effective_template_id(rec.id, "general") == "general"
+
+        tok_id = buf.begin_title_save(rec.id, "乐观新名")
+        assert buf.matches_pending_title(rec.id, "乐观新名", tok_id)
+        updated = buf.apply_optimistic_titles([rec])
+        assert updated[0].title == "乐观新名"
+
+        assert buf.enter_live_session(rec.id) is True
+        buf.live_html = "<p>live</p>"
+        assert buf.enter_live_session(rec.id) is False
+        assert buf.live_html == "<p>live</p>"
+        assert buf.enter_live_session("other-live") is True
+        assert buf.live_html == ""
+
+        buf.stash_live_note_for_other_meeting(store, rec.id, "暂存实时笔记")
+        assert buf.pop_promotable_live_note(store, rec.id, "") == "暂存实时笔记"
+        assert buf.record_notes_dirty is True
+    finally:
+        history.close(timeout=2)
+
+
+def test_record_notes_autosave_and_clean_leave_do_not_block_on_store_flush(
+    config, tmp_path, monkeypatch
+):
+    page, controller, history, record = _page(config, tmp_path)
+    real_flush = controller.store.flush
+    try:
+        def _forbid_flush(*_args, **_kwargs):
+            raise AssertionError("Routine autosave / already-synced leave must not call store.flush")
+
+        monkeypatch.setattr(controller.store, "flush", _forbid_flush)
+        page._record_notes.setPlainText("异步自动保存且不卡界面")
+        assert page._record_notes_timer.isActive()
+        page._record_notes_timer.stop()
+        page._autosave_record_notes()
+
+        assert history.flush(timeout=5.0)
+        QApplication.processEvents()
+        assert controller.store.get_meeting(record.id).notes_user == "异步自动保存且不卡界面"
+        assert page._drafts.record_notes_dirty is False
+
+        # Because SQLite already holds the latest notes, leaving never calls store.flush().
+        assert page.try_leave() is True
+
+        # Same non-blocking fast path for live notes once autosave has landed.
+        monkeypatch.setattr(controller.store, "flush", real_flush)
+        live = _live(page, controller, history)
+        monkeypatch.setattr(controller.store, "flush", _forbid_flush)
+        page._user_notes.setPlainText("实时已落盘笔记")
+        page._user_notes_timer.stop()
+        page._save_user_notes()
+        assert history.flush(timeout=5.0)
+        assert controller.store.get_meeting(live.id).notes_user == "实时已落盘笔记"
+        assert page.flush_pending_user_notes() is True
+    finally:
+        monkeypatch.setattr(controller.store, "flush", real_flush)
         page.deleteLater()
         controller.shutdown()
         history.close(timeout=2)

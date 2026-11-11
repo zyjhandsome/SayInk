@@ -33,12 +33,37 @@ LISTEN_BAR_PLACEMENT_LABELS = (
 )
 
 
+def is_screen_alive(screen) -> bool:
+    """True when ``screen`` is a live, currently attached screen."""
+    if screen is None:
+        return False
+    try:
+        _ = screen.availableGeometry()
+        screens = QApplication.screens()
+        return (screen in screens) if screens else True
+    except RuntimeError:
+        return False
+
+
+def _resolve_live_screen(screen=None):
+    if is_screen_alive(screen):
+        return screen
+    cursor_screen = QApplication.screenAt(QCursor.pos())
+    if is_screen_alive(cursor_screen):
+        return cursor_screen
+    primary = QApplication.primaryScreen()
+    return primary if is_screen_alive(primary) else None
+
+
 def position_island(widget: QWidget, width: int | None = None) -> None:
     """Place a surface as a top-center island on the screen under the cursor."""
-    screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+    screen = _resolve_live_screen()
     if screen is None:
         return
-    geo = screen.availableGeometry()
+    try:
+        geo = screen.availableGeometry()
+    except RuntimeError:
+        return
     w = width if width is not None else widget.width()
     x = geo.x() + (geo.width() - w) // 2
     y = geo.y() + ISLAND_TOP_MARGIN
@@ -91,11 +116,16 @@ def default_listen_bar_origin(
 
 
 def screen_storage_key(screen) -> str:
-    name = (screen.name() or "").strip()
-    if name:
-        return name
-    geo = screen.geometry()
-    return f"{geo.x()},{geo.y()},{geo.width()}x{geo.height()}"
+    if screen is None:
+        return ""
+    try:
+        name = (screen.name() or "").strip()
+        if name:
+            return name
+        geo = screen.geometry()
+        return f"{geo.x()},{geo.y()},{geo.width()}x{geo.height()}"
+    except RuntimeError:
+        return ""
 
 
 def relative_listen_position(
@@ -162,10 +192,13 @@ def position_listen_bar(
     screen=None,
 ) -> None:
     """Place the listen bar. Pass ``screen`` so a later state does not follow the cursor."""
-    screen = screen or QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+    screen = _resolve_live_screen(screen)
     if screen is None:
         return
-    geo = screen.availableGeometry()
+    try:
+        geo = screen.availableGeometry()
+    except RuntimeError:
+        return
     w = width if width is not None else widget.width()
     h = max(1, widget.height())
     if saved:

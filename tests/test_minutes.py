@@ -566,6 +566,26 @@ class TestMinutesWorker:
         assert results == [] and "http://" in errors[0]
         assert fake_httpx.calls == []
 
+    def test_public_http_rejected_while_bypass_suffix_allows_intranet_http(self, fake_httpx):
+        from sayink.text_polisher import PUBLIC_HTTP_ERROR
+
+        results, errors, _ = _run(MinutesWorker(_request(api_url="http://api.example.com/v1")))
+        assert results == [] and errors == [PUBLIC_HTTP_ERROR]
+        assert fake_httpx.calls == []
+
+        fake_httpx.script.append(json.dumps({"title": "内网纪要", "summary": "内网成功"}))
+        results, errors, _ = _run(
+            MinutesWorker(
+                _request(
+                    api_url="http://llm.corp.internal/v1",
+                    proxy_bypass_suffixes=".corp.internal",
+                )
+            )
+        )
+        assert errors == []
+        assert len(results) == 1 and "内网成功" in results[0].markdown
+        assert len(fake_httpx.calls) == 1
+
     def test_empty_transcript(self, fake_httpx):
         results, errors, _ = _run(MinutesWorker(_request(lines=[])))
         assert results == [] and "文字稿为空" in errors[0]

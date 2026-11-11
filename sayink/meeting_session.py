@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from sayink.config import Config
-from sayink.history_store import HistoryStore
+from sayink.history_store import HistoryStore, SegmentRecord
 from sayink.meeting_store import (
     QUEUE_PRIORITY_AUTO,
     QUEUE_PRIORITY_USER,
@@ -71,6 +71,7 @@ from sayink.speaker_naming import infer_speaker_names
 from sayink.speech_recognizer import (
     AUX_MODEL_SILERO_VAD,
     AUX_MODEL_SPEAKER,
+    AUX_MODEL_SPEAKER_ACTIVITY,
 )
 from sayink.text_polisher import is_local_endpoint, polish_settings_complete
 from sayink.vad_segmenter import VAD_ENERGY, VAD_SILERO
@@ -198,20 +199,65 @@ def minutes_settings_complete(config: Config) -> bool:
     return polish_settings_complete(*minutes_settings(config))
 
 
+def _format_remote_origin(scheme: str, host: str) -> str:
+    bracketed = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{bracketed}"
+
+
+def _confirmed_remote_origins(entries) -> set[tuple[str, str]]:
+    origins: set[tuple[str, str]] = set()
+    for raw in entries or ():
+        item = str(raw or "").strip().lower()
+        if not item:
+            continue
+        if "://" in item:
+            parsed = urlparse(item)
+            host = (parsed.hostname or "").strip("[]").lower()
+            if parsed.scheme in {"http", "https"} and host:
+                origins.add((parsed.scheme, host))
+        else:
+            # Backward-compatible with legacy bare-hostname entries, scoped to
+            # HTTPS so downgrading https://host -> http://host requires confirmation.
+            origins.add(("https", item.strip("[]")))
+    return origins
+
+
 def remote_host_needing_confirmation(config: Config) -> str:
-    """Hostname when the minutes endpoint is remote and not yet confirmed."""
+    """``scheme://host`` when the minutes endpoint is remote and not yet confirmed."""
     api_url, _key, _model = minutes_settings(config)
     if not api_url or is_local_endpoint(api_url):
         return ""
-    host = (urlparse(api_url).hostname or "").lower()
-    confirmed = {str(h).lower() for h in (config.get("meeting.confirmed_remote_hosts", []) or [])}
-    return "" if not host or host in confirmed else host
+    parsed = urlparse(api_url.strip())
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").strip("[]").lower()
+    if not host or scheme not in {"http", "https"}:
+        return ""
+    confirmed = _confirmed_remote_origins(config.get("meeting.confirmed_remote_hosts", []))
+    return "" if (scheme, host) in confirmed else _format_remote_origin(scheme, host)
 
 
 def confirm_remote_host(config: Config, host: str) -> None:
+    item = (host or "").strip().lower()
+    if not item:
+        return
+    if "://" in item:
+        parsed = urlparse(item)
+        scheme = (parsed.scheme or "").lower()
+        hostname = (parsed.hostname or "").strip("[]").lower()
+        if scheme not in {"http", "https"} or not hostname:
+            return
+        canonical = _format_remote_origin(scheme, hostname)
+    else:
+        api_url, _key, _model = minutes_settings(config)
+        parsed_api = urlparse((api_url or "").strip())
+        api_host = (parsed_api.hostname or "").strip("[]").lower()
+        api_scheme = (parsed_api.scheme or "").lower()
+        hostname = item.strip("[]")
+        scheme = api_scheme if api_host == hostname and api_scheme in {"http", "https"} else "https"
+        canonical = _format_remote_origin(scheme, hostname)
     hosts = list(config.get("meeting.confirmed_remote_hosts", []) or [])
-    if host and host not in hosts:
-        hosts.append(host)
+    if canonical not in {str(h).strip().lower() for h in hosts}:
+        hosts.append(canonical)
         config.set("meeting.confirmed_remote_hosts", hosts)
 
 
@@ -258,6 +304,7 @@ class MeetingController(QObject):
         self._options: MeetingOptions | None = None
         self._capabilities: MeetingCapabilities | None = None
         self._embedder: SpeakerEmbedder | None = None
+        self._cached_embedder: tuple[tuple[Any, ...], SpeakerEmbedder] | None = None
         self._speakers: SpeakerSession | None = None
         self._started_wall_ms = 0
         self._paused_detail = ""
@@ -347,8 +394,33 @@ class MeetingController(QObject):
             raise RuntimeError("历史数据库不可用，会议文字稿无法保存")
         self._options = options
         speaker_path = aux_model_path(AUX_MODEL_SPEAKER) if capabilities.speaker_model_available else None
-        self._embedder = make_embedder(speaker_path, enabled=capabilities.speaker_model_available,
-                                      activity_enabled=capabilities.speaker_activity_enabled)
+        activity_path = (
+            aux_model_path(AUX_MODEL_SPEAKER_ACTIVITY)
+            if capabilities.speaker_model_available and capabilities.speaker_activity_enabled
+            else None
+        )
+        embedder_key = (
+            make_embedder,
+            str(speaker_path or ""),
+            bool(capabilities.speaker_model_available),
+            bool(capabilities.speaker_activity_enabled),
+            str(activity_path or ""),
+        )
+        if self._cached_embedder is not None and self._cached_embedder[0] == embedder_key:
+            self._embedder = self._cached_embedder[1]
+        else:
+            self._embedder = make_embedder(
+                speaker_path,
+                enabled=capabilities.speaker_model_available,
+                activity_enabled=capabilities.speaker_activity_enabled,
+            )
+            if (
+                not (capabilities.speaker_model_available and self._embedder.name != "campplus")
+                and not getattr(self._embedder, "activity_guard_error", "")
+            ):
+                self._cached_embedder = (embedder_key, self._embedder)
+            else:
+                self._cached_embedder = None
         self._capabilities = replace(
             capabilities,
             speaker_model_available=self._embedder.name == "campplus",
@@ -444,8 +516,8 @@ class MeetingController(QObject):
         # reads the table, so they must be committed first or they keep
         # their greedy live label.
         self._store.flush()
-        self._apply_recluster(meeting_id)
-        self._store.flush()
+        if self._apply_recluster(meeting_id) is not False:
+            self._store.flush()
         self.auto_name_speakers(meeting_id)
         self._enqueue_automatic(meeting_id)
         self._speakers = None
@@ -464,7 +536,7 @@ class MeetingController(QObject):
         self._set_state(MeetingState.IDLE)
         self._pump_queue()
 
-    def _apply_recluster(self, meeting_id: str) -> None:
+    def _apply_recluster(self, meeting_id: str) -> bool:
         """End-of-meeting pass: cluster every turn and re-assign each segment.
 
         Named or manually corrected speakers keep their numbers and locked
@@ -473,7 +545,7 @@ class MeetingController(QObject):
         """
         speakers = self._speakers
         if speakers is None:
-            return
+            return False
         embedder = self._embedder
         protected = {s.speaker_id for s in self._store.get_speakers(meeting_id) if s.name_locked or s.display_name}
         segments = self._store.get_segments(meeting_id)
@@ -487,16 +559,17 @@ class MeetingController(QObject):
             if changed:
                 log.info("会议 %s 说话人重新归属 %d 段", meeting_id[:8], len(changed))
                 self._store.set_segment_speakers(meeting_id, changed)
-                self._store.flush()
-            return
+                return True
+            return False
         if speakers.speaker_count < 2:
-            return
+            return False
         threshold = embedder.recluster_threshold if embedder is not None else speakers.threshold
         mapping = recluster(speakers.history, threshold=threshold, protected_ids=protected)
         if mapping and any(old != new for old, new in mapping.items()):
             log.info("会议 %s 说话人重聚类: %s", meeting_id[:8], mapping)
             self._store.relabel_segments(meeting_id, mapping)
-            self._store.flush()
+            return True
+        return False
 
     def abandon_on_exit(self) -> None:
         """App is quitting mid-meeting: close the record without waiting."""
@@ -556,20 +629,49 @@ class MeetingController(QObject):
             return None
         if record.status == STATUS_LIVE and (self.current_id != meeting_id or self._state is MeetingState.DRAINING):
             return None
-        if speaker_id not in {s.speaker_id for s in self._store.get_segments(meeting_id)}:
+        if not self._store.has_speaker(meeting_id, speaker_id):
             return None
         name = (name or "").strip()
         existing = {s.speaker_id: s for s in self._store.get_speakers(meeting_id)}
         old_label = existing[speaker_id].label if speaker_id in existing else speaker_label(speaker_id)
-        self._store.set_speaker(meeting_id, speaker_id, display_name=name)
-        if not self._store.flush():
-            return None
-        saved = next((s for s in self._store.get_speakers(meeting_id) if s.speaker_id == speaker_id), None)
-        if saved is None or saved.display_name != name or not saved.name_locked:
-            return None
-        replaced = 0
         notes = self._store.get_notes(meeting_id)
-        if notes is not None and notes.markdown:
+        has_notes = notes is not None and bool(notes.markdown)
+        needs_segments = record.status != STATUS_LIVE or (
+            has_notes and not notes.user_edited and bool(notes.json_payload)
+        )
+        segments = self._store.get_segments(meeting_id) if needs_segments else None
+
+        manual = {
+            s.speaker_id: s.display_name
+            for s in existing.values()
+            if s.speaker_id != speaker_id and (s.display_name or s.name_locked)
+        }
+        manual[speaker_id] = name
+        previous = {
+            s.speaker_id: s.suggested_name
+            for s in existing.values()
+            if s.speaker_id != speaker_id and s.suggested_name and not s.display_name and not s.name_locked
+        }
+        inferred = previous
+        if record.status != STATUS_LIVE and segments is not None:
+            inferred = infer_speaker_names(
+                transcript_lines(segments, record.started_at, prefer_polished=False),
+                manual_names=manual,
+            )
+            names_after = {**inferred, **{sid: label for sid, label in manual.items() if label}}
+        else:
+            names_after = {
+                s.speaker_id: s.label
+                for s in existing.values()
+                if s.speaker_id != speaker_id and (s.display_name or (s.suggested_name and not s.name_locked))
+            }
+            if name:
+                names_after[speaker_id] = name
+
+        self._store.set_speaker(meeting_id, speaker_id, display_name=name)
+        replaced = 0
+        inferred_markdown: str | None = None
+        if has_notes and notes is not None:
             new_label = name or speaker_label(speaker_id)
             markdown = None
             payload_json = notes.json_payload
@@ -577,7 +679,13 @@ class MeetingController(QObject):
                 payload = notes.payload()
                 payload.setdefault("_speaker_names", {str(sid): row.label for sid, row in existing.items()})
                 payload_json = json.dumps(payload, ensure_ascii=False)
-                markdown = self._render_notes(meeting_id, replace(notes, json_payload=payload_json))
+                markdown = self._render_notes(
+                    meeting_id,
+                    replace(notes, json_payload=payload_json),
+                    names=names_after,
+                    record=record,
+                    segments=segments,
+                )
             if markdown is not None:
                 self._save_rendered_notes(meeting_id, notes, markdown, json_payload=payload_json)
             else:
@@ -588,8 +696,19 @@ class MeetingController(QObject):
                     self._store.save_user_markdown(meeting_id, new_md)
                 elif replaced:
                     self._save_rendered_notes(meeting_id, notes, new_md, json_payload=notes.json_payload)
-            self._store.flush()
-        self.auto_name_speakers(meeting_id)
+                if record.status != STATUS_LIVE and inferred != previous:
+                    inferred_markdown = new_md if replaced else notes.markdown
+                    for sid in previous.keys() | inferred.keys():
+                        old_s = previous.get(sid) or speaker_label(sid)
+                        new_s = names_after.get(sid) or speaker_label(sid)
+                        inferred_markdown, _ = replace_names_in_markdown(inferred_markdown, old_s, new_s)
+        if record.status != STATUS_LIVE and inferred != previous:
+            self._store.save_inferred_names(meeting_id, inferred, markdown=inferred_markdown)
+        if not self._store.flush():
+            return None
+        saved = next((s for s in self._store.get_speakers(meeting_id) if s.speaker_id == speaker_id), None)
+        if saved is None or saved.display_name != name or not saved.name_locked:
+            return None
         self.meeting_changed.emit(meeting_id)
         return replaced
 
@@ -599,7 +718,7 @@ class MeetingController(QObject):
             if s.display_name or (s.suggested_name and not s.name_locked)
         }
 
-    def auto_name_speakers(self, meeting_id: str) -> bool:
+    def auto_name_speakers(self, meeting_id: str, *, _emit: bool = True) -> bool:
         """Resolve only explicit introductions in raw speech, after clustering.
 
         Polished/model-generated text is never evidence for a person's name.
@@ -622,7 +741,9 @@ class MeetingController(QObject):
         markdown = None
         if notes is not None and notes.markdown:
             if not notes.user_edited and notes.json_payload:
-                markdown = self._render_notes(meeting_id, notes, names=names)
+                markdown = self._render_notes(
+                    meeting_id, notes, names=names, record=record, segments=segments
+                )
             if markdown is None:
                 markdown = notes.markdown
                 for sid in previous.keys() | inferred.keys():
@@ -637,7 +758,8 @@ class MeetingController(QObject):
         saved = self._store.get_notes(meeting_id) if markdown is not None else None
         if markdown is not None and (saved is None or saved.markdown != markdown):
             return False
-        self.meeting_changed.emit(meeting_id)
+        if _emit:
+            self.meeting_changed.emit(meeting_id)
         return True
 
     def save_segment_text(self, meeting_id: str, seq: int, text: str | None) -> bool:
@@ -650,7 +772,7 @@ class MeetingController(QObject):
                 return False
         elif record.status not in (STATUS_ENDED, STATUS_INTERRUPTED):
             return False
-        segment = next((s for s in self._store.get_segments(meeting_id) if s.seq == seq), None)
+        segment = self._store.get_segment(meeting_id, seq)
         if segment is None:
             return False
         original = (segment.polished_text or segment.raw_text).strip()
@@ -662,7 +784,7 @@ class MeetingController(QObject):
         self._store.set_segment_text(meeting_id, seq, corrected or None)
         if not self._store.flush():
             return False
-        saved = next((s for s in self._store.get_segments(meeting_id) if s.seq == seq), None)
+        saved = self._store.get_segment(meeting_id, seq)
         if saved is None or saved.corrected_text != corrected:
             return False
         self.meeting_changed.emit(meeting_id)
@@ -677,11 +799,12 @@ class MeetingController(QObject):
         live = record.status == STATUS_LIVE
         if live and (self.current_id != meeting_id or self._state is MeetingState.DRAINING):
             return False
-        segments = self._store.get_segments(meeting_id)
-        segment = next((s for s in segments if s.seq == seq), None)
+        segment = self._store.get_segment(meeting_id, seq)
         if segment is None:
             return False
-        used_ids = {s.speaker_id for s in segments} | {s.speaker_id for s in self._store.get_speakers(meeting_id)}
+        used_ids = self._store.speaker_ids_in_segments(meeting_id) | {
+            s.speaker_id for s in self._store.get_speakers(meeting_id)
+        }
         if speaker_id is None:
             minimum = max(used_ids, default=0) + 1
             speaker_id = self._speakers.reserve_speaker_id(minimum) if live and self._speakers else minimum
@@ -690,12 +813,12 @@ class MeetingController(QObject):
         self._store.set_segment_speaker(meeting_id, seq, speaker_id)
         if not self._store.flush():
             return False
-        saved = next((s for s in self._store.get_segments(meeting_id) if s.seq == seq), None)
+        saved = self._store.get_segment(meeting_id, seq)
         if saved is None or saved.speaker_id != speaker_id or not saved.speaker_locked:
             return False
         if live and isinstance(self._speakers, MeetingSpeakerSession):
             self._speakers.confirm(seq, speaker_id)
-        self.auto_name_speakers(meeting_id)
+        self.auto_name_speakers(meeting_id, _emit=False)
         self.meeting_changed.emit(meeting_id)
         return True
 
@@ -748,15 +871,24 @@ class MeetingController(QObject):
         # Refinement prose renders the same through any refinement template.
         return get_template(REFINE_TEMPLATE_ID) if refine_payload else None
 
-    def _render_notes(self, meeting_id: str, notes: MeetingNotes, *, names: dict[int, str] | None = None) -> str | None:
-        record = self._store.get_meeting(meeting_id)
+    def _render_notes(
+        self,
+        meeting_id: str,
+        notes: MeetingNotes,
+        *,
+        names: dict[int, str] | None = None,
+        record: MeetingRecord | None = None,
+        segments: list[SegmentRecord] | None = None,
+    ) -> str | None:
+        record = record if record is not None else self._store.get_meeting(meeting_id)
         if record is None:
             return None
         payload = notes.payload()
         template = self._notes_template(notes, payload)
         if template is None:
             return None
-        lines = transcript_lines(self._store.get_segments(meeting_id), record.started_at)
+        segs = segments if segments is not None else self._store.get_segments(meeting_id)
+        lines = transcript_lines(segs, record.started_at)
         names = self.speaker_names(meeting_id) if names is None else names
         return render_markdown(
             payload,
@@ -833,15 +965,17 @@ class MeetingController(QObject):
             parts.append("## 标记\n\n" + "\n".join(lines))
         return "\n\n".join(parts)
 
-    def delete_meeting(self, meeting_id: str) -> None:
+    def delete_meeting(self, meeting_id: str) -> bool:
         if self._generating_for == meeting_id:
             self._generator.cancel()
             self._generating_for = ""
             self.generation_preview_text = ""
         self._store.delete_meeting(meeting_id)
-        self._store.flush()
-        self.meeting_changed.emit(meeting_id)
+        deleted = self._store.flush() and self._store.get_meeting(meeting_id) is None
+        if deleted:
+            self.meeting_changed.emit(meeting_id)
         self._pump_queue()
+        return deleted
 
     # -- export ----------------------------------------------------------------
 
@@ -1144,6 +1278,7 @@ class MeetingController(QObject):
         self._clock.stop()
         self._drain_timer.stop()
         self._retry_timer.stop()
+        self._cached_embedder = None
         self._generator.shutdown(wait_ms=wait_ms)
 
 
