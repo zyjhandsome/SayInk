@@ -109,9 +109,6 @@ DEFAULT_CONFIG = {
         "glossary": [],            # [{"term": "张鑫", "variants": ["张新"]}] → 热词
         "language": "auto",        # 语种锁定；auto → zh（支持 language 的模型）
         "vad": "silero",           # silero / energy；Silero 未下载时自动退回 energy
-        "speaker_model_enabled": True,
-        "speaker_activity_enabled": False,
-        "quiet_speech_enabled": False,
         "boundary_context_enabled": False,
     },
     "llm": {
@@ -259,7 +256,18 @@ def _coerce_known_value(default_value, value):
         return copy.deepcopy(default_value), True
     return value, False
 # Keys that moved from the meeting section to stt (shared by dictation).
-SHARED_RECOGNITION_KEYS = ("glossary", "language", "vad", "speaker_model_enabled")
+SHARED_RECOGNITION_KEYS = ("glossary", "language", "vad")
+# Retired manual recognition switches replaced by automatic mode/source policies.
+# Stripped on load so stale True/False values in older config.json files neither
+# error nor override automatic quiet-speech / speaker diarization behavior.
+RETIRED_RECOGNITION_SWITCH_KEYS = frozenset({
+    "speaker_model_enabled",
+    "speaker_activity_enabled",
+    "quiet_speech_enabled",
+    "quiet_boost",
+    "enhanced_diarization",
+    "speaker_activity",
+})
 # Run-key value name written by VoiceInk ≤ 2.1.0; removed once on first start.
 LEGACY_AUTO_START_VALUE = "VoiceInk"
 
@@ -332,6 +340,7 @@ class Config:
                 raw = {}
         self._extra_keys = {k: v for k, v in raw.items() if k not in DEFAULT_CONFIG}
         moved = self._migrate_recognition_settings(raw)
+        retired_cleaned = self._strip_retired_recognition_switches(raw)
         self._type_repairs = False
         self._config = self._merge_defaults(DEFAULT_CONFIG, raw)
         # True = 不写欢迎弹窗（升级用户或未配置时用默认 True）；首次本无配置文件时单独打开欢迎。
@@ -344,7 +353,13 @@ class Config:
         output_migrated = self._migrate_output_by_mode()
         if (
             not self._persist_blocked
-            and (self._strip_test_pollution() or moved or output_migrated or self._type_repairs)
+            and (
+                self._strip_test_pollution()
+                or moved
+                or retired_cleaned
+                or output_migrated
+                or self._type_repairs
+            )
         ):
             self.save_immediate()
         self._migrate_stt_model()
@@ -427,11 +442,30 @@ class Config:
             del self._extra_keys[k]
         return bool(dirty)
 
+    def _strip_retired_recognition_switches(self, raw: dict) -> bool:
+        """Drop retired manual switches from sections and top-level extras."""
+        removed = False
+        for section_name in ("stt", "meeting", "audio"):
+            section = raw.get(section_name)
+            if not isinstance(section, dict):
+                continue
+            for key in tuple(section.keys()):
+                if key in RETIRED_RECOGNITION_SWITCH_KEYS:
+                    section.pop(key, None)
+                    log.info("升级清理：已移除废弃手动开关 %s.%s（现按模式与音源自动启用）", section_name, key)
+                    removed = True
+        for key in tuple(self._extra_keys.keys()):
+            if key in RETIRED_RECOGNITION_SWITCH_KEYS:
+                self._extra_keys.pop(key, None)
+                log.info("升级清理：已移除顶层废弃手动开关 %s", key)
+                removed = True
+        return removed
+
     @staticmethod
     def _migrate_recognition_settings(raw: dict) -> bool:
-        """Glossary / language / VAD / speaker model used to be meeting-only
-        (``meeting.*``); dictation shares them now under ``stt.*``. Move the
-        values once so nobody loses their term list. Returns True on change."""
+        """Glossary / language / VAD used to be meeting-only (``meeting.*``);
+        dictation shares them now under ``stt.*``. Move the values once so
+        nobody loses their term list. Returns True on change."""
         meeting = raw.get("meeting")
         if not isinstance(meeting, dict):
             return False

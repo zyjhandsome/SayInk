@@ -376,6 +376,7 @@ class App(QObject):
         self._prefetch_segment: _QueuedSegment | None = None
         self._failed_cached_audio = []
         self._embedder: SpeakerEmbedder | None = None
+        self._embedder_policy_key: tuple[bool, bool] | None = None
         self._reload_coord = self._build_reload_coordinator()
         self._output_pipe = self._build_output_pipeline()
         self._reload_coord.init_models_dir_notice()
@@ -524,7 +525,10 @@ class App(QObject):
 
     def _rebuild_speaker_embedder(self) -> None:
         self._embedder = None
+        self._embedder_policy_key = None
         self._speaker_embedder()
+        if not self._meeting_active() and self._safe_attr("_current_session_id") is None:
+            self._speakers = self._new_speaker_session()
 
     def _build_reload_coordinator(self) -> ReloadCoordinator:
         modules = self._safe_attr("_modules")
@@ -1592,19 +1596,23 @@ class App(QObject):
     # ── Speaker numbering (shared with meetings) ──────
 
     def _speaker_embedder(self) -> SpeakerEmbedder:
-        """CAM++ when downloaded and enabled, else the mel summary; built once
-        and dropped when the speaker preferences or aux models change."""
+        """CAM++ when downloaded and enabled by mode/source policy, else the mel
+        summary; built once and dropped when the policy or aux models change."""
+        shared = RecognitionSettings.from_config(self._config)
+        policy_key = shared.speaker_key
         embedder = self._embedder
-        if embedder is None:
-            enabled = bool(self._config.get("stt.speaker_model_enabled", True))
-            activity_enabled = bool(self._config.get("stt.speaker_activity_enabled", False))
+        if embedder is None or self._safe_attr("_embedder_policy_key") != policy_key:
+            enabled = shared.speaker_model_enabled
+            activity_enabled = shared.speaker_activity_enabled
             speaker_path = self._aux_model_path(AUX_MODEL_SPEAKER) if enabled else None
             activity_path = self._aux_model_path(AUX_MODEL_SPEAKER_ACTIVITY) if activity_enabled else None
             embedder = make_embedder(
-                speaker_path, enabled=enabled,
+                speaker_path,
+                enabled=enabled,
                 activity_enabled=activity_enabled,
             )
             self._embedder = embedder
+            self._embedder_policy_key = policy_key
             self._applied_speaker_aux = (speaker_path, activity_path)
         return embedder
 
@@ -2549,6 +2557,9 @@ class App(QObject):
             self._recorder.stop_continuous()
             self._enqueue_history_cleanup()
         dictation_model = str(self._config.get("stt.model_id", DEFAULT_MODEL_ID) or DEFAULT_MODEL_ID)
+        meeting_settings = RecognitionSettings.from_config(
+            self._config, meeting=True, input_source=options.input_source,
+        )
         caps = resolve_capabilities(self._config, options, dictation_model_id=dictation_model)
         # A file on disk can still fail to load. Publish a live meeting only
         # after resolving the actual recorder gate.
@@ -2557,6 +2568,7 @@ class App(QObject):
             mic_device_index=int(self._config.get("audio.mic_device_index", -1)),
             system_device_index=int(self._config.get("audio.system_device_index", -1)),
         )
+        self._recorder.set_quiet_speech(meeting_settings.quiet_speech_mode)
         self._recorder.set_segmenter_profile(
             vad=options.vad,
             vad_model_path=self._aux_model_path(AUX_MODEL_SILERO_VAD) if options.vad == VAD_SILERO else None,
@@ -2588,8 +2600,9 @@ class App(QObject):
             hotwords=caps.hotwords,
             language=caps.language,
         )
-        self._recognizer.quiet_speech = (self._applied_recognition_settings.quiet_speech_enabled
-                                         and caps.vad == VAD_SILERO)
+        self._recognizer.quiet_speech = (
+            meeting_settings.quiet_speech_mode if caps.vad == VAD_SILERO else False
+        )
         self._tray.set_meeting_in_progress(True)
         self._tray.set_activity_tooltip("meeting")
         self._sound.play_start()
@@ -2694,6 +2707,7 @@ class App(QObject):
         self._floating.end_meeting_state(dropped)
         # Hand the pipeline back to dictation (segmenter profile included).
         self._embedder = None
+        self._embedder_policy_key = None
         self._reload_coordinator().reset_for_meeting_end()
         self._current_session_id = None
         self._current_seq = 0

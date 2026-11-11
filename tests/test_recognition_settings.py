@@ -42,20 +42,25 @@ def test_shared_settings_are_snapshots_and_match_meeting_parameters(config, monk
     assert shared.hotwords == "SayInk"
 
 
-def test_experimental_activity_is_off_by_default_and_is_a_shared_snapshot(config, monkeypatch):
+def test_activity_guard_tracks_automatic_speaker_policy_and_is_a_snapshot(config, monkeypatch):
+    # Default hotkey + microphone: speaker separation & activity guard are off.
     assert not RecognitionSettings.from_config(config).speaker_activity_enabled
-    config.set("stt.speaker_activity_enabled", True)
+    # Continuous + mixed loopback: CAM++ & on-demand activity guard auto-enable.
+    config.set("audio.trigger_mode", "continuous")
+    config.set("audio.input_source", "mixed")
     shared = RecognitionSettings.from_config(config)
     monkeypatch.setattr("sayink.meeting_session.aux_model_path", lambda _mid: None)
     caps = resolve_capabilities(config, MeetingOptions.from_config(config), dictation_model_id=shared.model_id)
-    assert shared.speaker_activity_enabled and caps.speaker_activity_enabled
-    config.set("stt.speaker_activity_enabled", False)
+    assert shared.speaker_model_enabled and shared.speaker_activity_enabled
+    assert caps.speaker_enabled and caps.speaker_activity_enabled
+    # Snapshot stays immutable even if config changes back to microphone.
+    config.set("audio.input_source", "microphone")
     assert shared.speaker_activity_enabled and caps.speaker_activity_enabled
 
 
 @pytest.mark.parametrize("failed", [False, True])
 def test_runtime_status_distinguishes_loaded_activity_from_load_failure(failed):
-    with app_harness({"stt.speaker_activity_enabled": True}) as h:
+    with app_harness({"audio.trigger_mode": "continuous", "audio.input_source": "mixed"}) as h:
         app = h["app"]
         h["recorder"].segmentation_status = SegmentationStatus("energy", "energy")
         app._embedder = SimpleNamespace(name="campplus", activity_guard=None if failed else object(),
@@ -64,20 +69,21 @@ def test_runtime_status_distinguishes_loaded_activity_from_load_failure(failed):
         with patch.object(app, "_settings_widget", return_value=settings):
             app._sync_recognition_runtime_status()
         label = settings.set_recognition_runtime_status.call_args.kwargs["speaker_status"]
-        assert ("检测加载失败" in label) if failed else ("检测（实验性）已加载" in label)
+        assert ("检测加载失败" in label) if failed else ("按需护档" in label and "已加载" in label)
 
 
-def test_activity_preference_waits_until_capture_and_existing_work_are_finished():
+def test_speaker_policy_change_waits_until_capture_and_existing_work_are_finished():
     with app_harness() as h:
         app, recorder = h["app"], h["recorder"]
         recorder.is_recording, recorder.is_continuous = True, False
-        app._config.set("stt.speaker_activity_enabled", True)
+        app._config.set("stt.debug_force_speaker_model", True)
         app._on_recognition_settings_changed()
         assert app._recognition_change_pending
         assert not app._applied_recognition_settings.speaker_activity_enabled
         recorder.is_recording = False
         app._apply_pending_recognition_settings()
         assert not app._recognition_change_pending
+        assert app._applied_recognition_settings.speaker_model_enabled
         assert app._applied_recognition_settings.speaker_activity_enabled
 
 
@@ -238,3 +244,99 @@ def test_meeting_rows_follow_the_meetings_own_glossary():
         rows = [call.args[0] for call in h["history"].enqueue.call_args_list]
         assert rows[-1].raw_text == "提交到GITHUB"
         assert rows[-1].polished_text == "提交到GitHub"
+
+
+@pytest.mark.parametrize(
+    "mode,source,expected_speaker",
+    [
+        ("hotkey", "microphone", False),
+        ("hotkey", "system", False),
+        ("hotkey", "mixed", False),
+        ("continuous", "microphone", False),
+        ("continuous", "system", True),
+        ("continuous", "mixed", True),
+        ("meeting", "microphone", True),
+        ("meeting", "system", True),
+        ("meeting", "mixed", True),
+    ],
+)
+@pytest.mark.parametrize("legacy_flag", [None, False, True])
+def test_three_modes_by_three_sources_matrix_ignores_legacy_manual_switches(
+    tmp_path, mode, source, expected_speaker, legacy_flag
+):
+    """3 modes × 3 sources × legacy config.json migration matrix."""
+    import json
+    from sayink.config import Config
+    from sayink.recognition_settings import resolve_mode_recognition_policy
+
+    cfg_dir = tmp_path / f"{mode}-{source}-{legacy_flag}"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    raw: dict = {
+        "audio": {"trigger_mode": "hotkey" if mode == "meeting" else mode, "input_source": source},
+        "meeting": {"input_source": source},
+        "stt": {},
+    }
+    if legacy_flag is not None:
+        raw["quiet_boost"] = legacy_flag
+        raw["enhanced_diarization"] = legacy_flag
+        raw["speaker_activity"] = legacy_flag
+        raw["stt"].update(
+            {
+                "quiet_speech_enabled": legacy_flag,
+                "quiet_boost": legacy_flag,
+                "speaker_model_enabled": legacy_flag,
+                "enhanced_diarization": legacy_flag,
+                "speaker_activity_enabled": legacy_flag,
+                "speaker_activity": legacy_flag,
+            }
+        )
+        raw["meeting"].update(
+            {
+                "speaker_model_enabled": legacy_flag,
+                "speaker_activity_enabled": legacy_flag,
+                "quiet_speech_enabled": legacy_flag,
+            }
+        )
+    (cfg_dir / "config.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = Config(config_dir=cfg_dir)
+    # Even if an old caller writes retired stt.* keys in memory, policy must ignore them.
+    if legacy_flag is not None:
+        loaded.set("stt.speaker_model_enabled", legacy_flag)
+        loaded.set("stt.speaker_activity_enabled", legacy_flag)
+        loaded.set("stt.quiet_speech_enabled", legacy_flag)
+
+    policy = resolve_mode_recognition_policy(mode, source, loaded)
+    assert policy.speaker_model_enabled is expected_speaker
+    assert policy.diarization_enabled is expected_speaker
+    assert policy.turn_splitting_enabled is expected_speaker
+    assert policy.speaker_activity_enabled is expected_speaker
+    assert policy.quiet_speech_mode is None
+
+    settings = RecognitionSettings.from_config(
+        loaded, meeting=(mode == "meeting"), input_source=source
+    )
+    assert settings.speaker_model_enabled is expected_speaker
+    assert settings.speaker_activity_enabled is expected_speaker
+    assert settings.quiet_speech_mode is None
+    assert settings.quiet_speech_enabled is True
+    assert not any("轻声增强需要实际加载 Silero" in n for n in settings.notes)
+
+
+def test_internal_debug_force_keys_override_automatic_policy_when_explicit(config):
+    config.set("audio.trigger_mode", "continuous")
+    config.set("audio.input_source", "mixed")
+    config.set("stt.debug_force_speaker_model", False)
+    config.set("stt.debug_force_quiet_speech", False)
+    settings = RecognitionSettings.from_config(config)
+    assert settings.speaker_model_enabled is False
+    assert settings.speaker_activity_enabled is False
+    assert settings.quiet_speech_mode is False
+    assert settings.quiet_speech_enabled is False
+
+    config.set("stt.debug_force_speaker_activity", True)
+    config.set("stt.debug_force_quiet_speech", True)
+    settings_forced = RecognitionSettings.from_config(config)
+    assert settings_forced.speaker_activity_enabled is True
+    assert settings_forced.quiet_speech_mode is True
+    assert settings_forced.quiet_speech_enabled is True
