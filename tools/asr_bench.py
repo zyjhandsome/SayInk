@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import wave
@@ -129,24 +130,50 @@ def cer(reference: str, hypothesis: str) -> float:
     return edit_distance(ref, hyp) / len(ref)
 
 
+def _count_hotword_occurrences(text: str, term: str, *, exact_case: bool = False) -> int:
+    cleaned = term.strip()
+    if not cleaned:
+        return 0
+    has_ascii_alnum = any(ch.isascii() and ch.isalnum() for ch in cleaned)
+    if has_ascii_alnum and (
+        (cleaned[0].isascii() and cleaned[0].isalnum())
+        or (cleaned[-1].isascii() and cleaned[-1].isalnum())
+    ):
+        haystack = re.sub(r"\s+", " ", text if exact_case else text.lower())
+        needle = re.sub(r"\s+", " ", cleaned if exact_case else cleaned.lower())
+        parts = [re.escape(part) for part in needle.split(" ") if part]
+        if not parts:
+            return 0
+        body = r"\s+".join(parts)
+        prefix = r"(?<![A-Za-z0-9])" if (needle[0].isascii() and needle[0].isalnum()) else ""
+        if needle[-1].isascii() and needle[-1].isalnum():
+            suffix = r"(?![A-Za-z0-9])"
+        elif needle[-1] in "+#":
+            suffix = rf"(?!{re.escape(needle[-1])})"
+        else:
+            suffix = ""
+        return len(re.findall(f"{prefix}{body}{suffix}", haystack))
+    norm_text = normalize_for_cer(text, keep_case=exact_case)
+    norm_term = normalize_for_cer(cleaned, keep_case=exact_case)
+    if not norm_term:
+        return 0
+    return norm_text.count(norm_term)
+
+
 def hotword_hits(terms: list[str], reference: str, hypothesis: str, *, exact_case: bool = False) -> tuple[int, int]:
     """(hits, expected): a term counts once per reference occurrence.
 
     ``exact_case`` only counts a hit spelled exactly as the glossary does,
     so ``GITHUB`` for ``GitHub`` is a miss.
     """
-    ref = normalize_for_cer(reference)
-    hyp = normalize_for_cer(hypothesis, keep_case=exact_case)
     expected = hits = 0
     for term in terms:
-        key = normalize_for_cer(term)
-        if not key:
-            continue
-        n_ref = ref.count(key)
+        n_ref = _count_hotword_occurrences(reference, term, exact_case=False)
         if n_ref == 0:
             continue
         expected += n_ref
-        hits += min(n_ref, hyp.count(normalize_for_cer(term, keep_case=exact_case)))
+        n_hyp = _count_hotword_occurrences(hypothesis, term, exact_case=exact_case)
+        hits += min(n_ref, n_hyp)
     return hits, expected
 
 

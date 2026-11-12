@@ -1,7 +1,5 @@
 # Island UI Redesign Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Reconstruct SayInk's four UI surfaces into one Spatial Island system while keeping brand tokens, IA page order, and the transcription pipeline unchanged.
 
 **Architecture:** Shared chrome lives in `island_chrome.py` and `design_tokens.py`. `FloatingWindow` is the capsule/expanded HUD. `SettingsWindow` and `HistoryWindow` are top-center sheets. `TrayIcon` speaks the same status words. `app.py` orchestration stays; only tooltip string maps and UI wiring change.

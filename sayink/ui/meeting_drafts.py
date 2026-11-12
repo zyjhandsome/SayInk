@@ -16,6 +16,8 @@ class MeetingDraftBuffer:
     pending_templates: dict[str, str] = field(default_factory=dict)
     pending_title: tuple[str, str] | None = None
     title_save_token: int = 0
+    title_meeting_id: str = ""
+    user_markdown_backups: dict[str, str] = field(default_factory=dict)
     record_notes_meeting_id: str = ""
     record_notes_dirty: bool = False
     record_notes_save_token: int = 0
@@ -24,6 +26,7 @@ class MeetingDraftBuffer:
     live_marks_html: str | None = None
     live_html: str = ""
     live_meeting_id: str = ""
+    live_segment_count: int = 0
 
     # ── optimistic templates ──────────────────────────────────────
 
@@ -93,6 +96,7 @@ class MeetingDraftBuffer:
         self.live_meeting_id = meeting_id
         self.live_html = ""
         self.live_marks_html = None
+        self.live_segment_count = 0
         return True
 
     # ── post-meeting record notes & stashed live notes ────────────

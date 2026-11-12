@@ -39,13 +39,13 @@ P1：常规或可预期输入造成崩溃、长时间无响应，或静默丢失
 | QA-07 | P2 · 音轨与视频错位 | MP4 视频从 0 秒开始，音轨从 **2.95356 秒**开始（ffprobe 确认）。延迟版与原版解出的音频长度同为 11.099125 秒，首个有声明显窗口都在 **0.2 秒**。解码忽略 Source Reader 的时间戳，字幕和会议引用对不上视频。[媒体读取循环](../sayink/media_foundation.py#L163) | 保存原文件时间基准，处理前导空档和音轨间断；回归延迟音轨、插空和 SRT 对原视频的逐点对照 |
 | QA-08 | P2 · 后段故障丢前段成果 | 注入第 2 段识别失败，第 1 段已返回有效文字；函数抛异常而没有返回已完成段，worker 只发失败消息，导入不会留下可恢复文字稿。主动取消另有部分保存路径。[段落循环](../sayink/media_import.py#L84) / [worker](../sayink/meeting_session.py#L284) | 第 N 段失败后保留前 N−1 段并标记中断及原因；给重试或重新开始入口，避免重复段落。零结果与主动取消保持区别 |
 | QA-09 | P2 · 写入失败误报没识别到 | 用真实 SQLite 触发器拒绝写入已有文字的媒体导入。事务回滚且会议数不变，控制器却报「没有识别到文字」。文字稿导入相似分支静态上也把保存失败折叠成「没有可导入的文字」。[媒体提交](../sayink/meeting_session.py#L941) / [文字稿导入提示](../sayink/ui/meeting_page.py#L1631) | 分别报告空结果、取消、写盘失败；模拟数据库忙、空间不足或只读时保留可重试结果，不出现半条会议或假成功 |
-| QA-10 | P2 · 首次导入反馈不可见 | 空会议库导入音视频，后台已识别 1/10 段；「取消导入」可见，但进度、文件名和错误/取消文案所属详情面板被隐藏，仍显示空库引导。取消后 QLabel 的文字是「已取消导入。」，实际不可见。[空态渲染](../sayink/ui/meeting_page.py#L1238) / [导入状态](../sayink/ui/meeting_page.py#L1673) · [截图](../build/qa-20261112/first-media-import-880.png) | 零条记录、搜索零结果、数据库不可用时都能看到当前文件、进度及结果。识别前和未就绪错误也应在可见区域解释下一步 |
+| QA-10 | P2 · 首次导入反馈不可见 | 空会议库导入音视频，后台已识别 1/10 段；「取消导入」可见，但进度、文件名和错误/取消文案所属详情面板被隐藏，仍显示空库引导。取消后 QLabel 的文字是「已取消导入。」，实际不可见。[空态渲染](../sayink/ui/meeting_page.py#L1238) / [导入状态](../sayink/ui/meeting_page.py#L1673) · 离线采样：`build/qa-20261112/first-media-import-880.png`（本地临时目录，不入库） | 零条记录、搜索零结果、数据库不可用时都能看到当前文件、进度及结果。识别前和未就绪错误也应在可见区域解释下一步 |
 | QA-11 | P2 · 长音频内存无边界 | 用独立进程读 16 kHz 单声道 PCM WAV 并完成静音切段，2／10／30 分钟的进程峰值工作集为 **75.0／148.2／331.3 MiB**，基线约 56.6 MiB，尚未载入 ASR。完整 WAV、浮点数组和整批切片先于识别；WAV 读帧期间不检查取消。[WAV 全量读](../sayink/audio_file_decoder.py#L46) / [整批切段](../sayink/media_import.py#L48) | 流式解码与有界队列，把首段输出和取消延迟纳入长文件验收；单独测压缩、立体声和 1～2 小时有声媒体。上述数值只用于当前条件，不外推 OOM 阈值 |
 | QA-12 | P2 · 同主机不同端口沿用发送授权 | 确认 `https://example.invalid:9443/v1` 后改为 `:8443/v1`，应用没有要求重新确认，提示也不显示端口。符合 README 目前按协议和主机记录的规则，但同主机不同端口可以是不同服务；本次未发送任何请求。[确认键](../sayink/meeting_session.py#L211) | 确认时展示实际目标，以协议、主机和有效端口为授权范围；验证端口、协议切换及旧授权迁移。批量和单场走相同边界 |
 | QA-13 | P2 · 自动结构识别改写普通文本 | 粘贴两行 `https://…`，两条 URL 被识别为 `https` 发言人的两段文字，段落正文只剩 `//…`。带时钟正文中的 `[00:01] 注意：必须保留` 则把「注意：」静默丢掉。预览只有格式、数量，没有转换前后样例。[对话匹配](../sayink/transcript_import.py#L289) | URL、键值对、议程标签不应当做人名；匹配失败不得吞掉前缀。默认展示前几段解析结果、允许对照原文或一键按纯文本导入 |
-| QA-14 | P2 · 批量和单场操作同时可见 | Ctrl 多选后同时出现「导出 N 场」和单场「导出」，还有单场「纪要 / 文字稿」标签；批量正文隐藏。窄窗选择 13 场时批量说明需要 342px、分得 316px，清单尾部和省略提示被切掉，无独立滚动。[批量显隐](../sayink/ui/meeting_page.py#L1462) / [单场导出](../sayink/ui/meeting_page.py#L387) · [截图](../build/qa-20261112/batch-selected-dark-880.png) | 批量模式只显示作用于当前选择的操作；列表摘要截断要可察觉，查看完整选择有入口。验证长标题、键盘与 150% 缩放，避免单场／多场误操作 |
+| QA-14 | P2 · 批量和单场操作同时可见 | Ctrl 多选后同时出现「导出 N 场」和单场「导出」，还有单场「纪要 / 文字稿」标签；批量正文隐藏。窄窗选择 13 场时批量说明需要 342px、分得 316px，清单尾部和省略提示被切掉，无独立滚动。[批量显隐](../sayink/ui/meeting_page.py#L1462) / [单场导出](../sayink/ui/meeting_page.py#L387) · 离线采样：`build/qa-20261112/batch-selected-dark-880.png`（本地临时目录，不入库） | 批量模式只显示作用于当前选择的操作；列表摘要截断要可察觉，查看完整选择有入口。验证长标题、键盘与 150% 缩放，避免单场／多场误操作 |
 | QA-15 | P3 · 选中行测试门禁退化 | 已有 `test_selected_meeting_row_is_highlighted_inside_main_window` 在当前快照两次失败（两个像素都为 `#2865eb`），干净 HEAD 通过。单独探针显示 `setCurrentRow(1)` 保留原选中项，页面因此进入批量模式；实际 Qt 鼠标点击只选一行，Ctrl 多选和「完成」恢复正常。[失败用例](../tests/test_main_window.py#L564) | 统一程序选中与用户点击的选择语义；单选测试明确清除原选区，多选测试断言集合和可见高亮，再验证主窗口导航联动 |
-| QA-16 | P3 · AI 接口说明与限制不一致 | AI 服务页写「地址以 http:// 或 https:// 开头即可」，实际拒绝普通公网 HTTP。看完说明仍可能按示例错误配置。 [文案](../sayink/ui/settings_pages/polish.py#L131) · [截图](../build/qa-20261112/ui100/polish-880x580-light.png) | 写清公网必须 HTTPS，以及何时允许本机／局域网 HTTP；共用校验和说明来源，确保保存、测试连接与 README 一致 |
+| QA-16 | P3 · AI 接口说明与限制不一致 | AI 服务页写「地址以 http:// 或 https:// 开头即可」，实际拒绝普通公网 HTTP。看完说明仍可能按示例错误配置。 [文案](../sayink/ui/settings_pages/polish.py#L131) · 离线采样：`build/qa-20261112/ui100/polish-880x580-light.png`（本地临时目录，不入库） | 写清公网必须 HTTPS，以及何时允许本机／局域网 HTTP；共用校验和说明来源，确保保存、测试连接与 README 一致 |
 | QA-17 | P3 · 重复导入保留结束线程对象 | 依次完成 100 次极轻量的导入，控制器下仍有 **100 个 QThread 子对象**；`_media_job` 只覆盖引用，旧 worker 没有在 finished 后销毁。这证明对象累积，未证明模型音频泄漏或长期卡顿。[线程创建](../sayink/meeting_session.py#L920) | 完成、失败、取消后统一清理已结束线程和引用；100 次循环后线程对象数量应回到基线，退出仍可等候活跃任务 |
 | QA-18 | P3 · UI 证据工具失效 | `tools/capture_meeting_ui.py` 访问已删除的 `_pending_templates` 后中止，清理时又报临时库占用。另一个采样工具仍断言下载模型前不能测麦克风，与现行 README 和回归要求相反；本次在隔离运行中更新该断言后成功采样。[会议采样](../tools/capture_meeting_ui.py#L217) / [首次准备采样](../tools/capture_mode_defaults_ui.py#L89) | 用公开操作搭建样本，维护现行状态断言；异常时也关闭 SQLite。给采样工具做冒烟，确保工件齐全，退出码不会被清理异常盖掉 |
 
@@ -71,7 +71,9 @@ py -3.10 build/qa-20261112/selection_probe.py
 py -3.10 build/qa-20261112/media_probe.py
 ~~~
 
-- [对抗输入、SQLite 拒写和 UI 结果](../build/qa-20261112/adversarial-results.json) · [压力与异常退出结果](../build/qa-20261112/stress-results.json) · [选中态日志](../build/qa-20261112/selection-results.txt)
-- [真实解码和模型归档日志](../build/qa-20261112/media-results.txt) · [延迟音轨对照](../build/qa-20261112/media-timeline.txt) · [100% UI 测量](../build/qa-20261112/ui100/measurements.json) · [150% UI 测量](../build/qa-20261112/ui150/measurements.json)
-- [首次准备页](../build/qa-20261112/mode-states/v1-setup-pending.png) · [窄窗会中编辑](../build/qa-20261112/mode-states/v5-live-edit-narrow.png) · [窄屏暂停状态](../build/qa-20261112/meeting-states/small-paused-dark.png)
+本地复跑临时输出路径说明（`build/qa-20261112/` 为本机离屏探针临时产物目录，不纳入版本库）：
+
+- 对抗输入、SQLite 拒写和 UI 结果：`build/qa-20261112/adversarial-results.json` · 压力与异常退出结果：`build/qa-20261112/stress-results.json` · 选中态日志：`build/qa-20261112/selection-results.txt`
+- 真实解码和模型归档日志：`build/qa-20261112/media-results.txt` · 延迟音轨对照：`build/qa-20261112/media-timeline.txt` · 100% UI 测量：`build/qa-20261112/ui100/measurements.json` · 150% UI 测量：`build/qa-20261112/ui150/measurements.json`
+- 首次准备页：`build/qa-20261112/mode-states/v1-setup-pending.png` · 窄窗会中编辑：`build/qa-20261112/mode-states/v5-live-edit-narrow.png` · 窄屏暂停状态：`build/qa-20261112/meeting-states/small-paused-dark.png`
 

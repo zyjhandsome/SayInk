@@ -20,6 +20,7 @@ from PyQt6.QtGui import (
     QTextFormat,
 )
 from PyQt6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QHBoxLayout,
@@ -28,6 +29,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QStackedWidget,
     QTextBrowser,
+    QTextEdit,
     QVBoxLayout,
 )
 
@@ -205,6 +207,7 @@ def build_transcript_html(
     show_speakers: bool = True,
     show_times: bool = True,
     label_unknown: bool = True,
+    playable: bool = False,
 ) -> str:
     """Build transcript HTML paragraphs for post-meeting or live views."""
     from sayink.ui import design_tokens as tok
@@ -221,7 +224,15 @@ def build_transcript_html(
         speaker_tip = html.escape(source + "；点击为这一组发言命名", quote=True)
         head = f"<a name='seg{index}'></a>"
         if show_times:
-            head += f"<span style='color:{tok.TEXT_DIM}'>[{_position_label(line.offset_ms)}]</span>"
+            pos_str = _position_label(line.offset_ms)
+            if playable and not live:
+                seek_ms = max(0, int(line.offset_ms))
+                head += (
+                    f"<a href='seek-ms:{seek_ms}' title='点击从 {pos_str} 处回放录音' "
+                    f"style='color:{tok.ACCENT_TEXT}; text-decoration:none'>[{pos_str}]</a>"
+                )
+            else:
+                head += f"<span style='color:{tok.TEXT_DIM}'>[{pos_str}]</span>"
         if show_speakers and line.speaker_id <= 0 and label_unknown:
             head += f" <span style='color:{tok.TEXT_DIM}'>说话人待确认</span>"
         elif show_speakers and label and links and not live:
@@ -253,18 +264,18 @@ def build_transcript_html(
             elif not live and editable:
                 correction = (
                     f" <a href='edit-segment:{seq}' title='编辑这一段文字稿' "
-                    "style='color:transparent; text-decoration:none'>编辑</a>"
+                    f"style='color:{tok.TEXT_DIM}; text-decoration:none'>编辑</a>"
                 )
             elif live and live_editable:
                 correction = (
                     f" <a href='live-edit:{seq}' title='编辑这一段文字稿' "
-                    "style='color:transparent; text-decoration:none'>编辑</a>"
+                    f"style='color:{tok.TEXT_DIM}; text-decoration:none'>编辑</a>"
                 )
             if seq in locked_sequences and (live or seq not in corrected_sequences):
                 detail_link = "live-details" if live else "details-segment"
                 correction += (
                     f" <a href='{detail_link}:{seq}' title='查看姓名来源与归属更正' "
-                    "style='color:transparent; text-decoration:none'>修改详情</a>"
+                    f"style='color:{tok.TEXT_DIM}; text-decoration:none'>修改详情</a>"
                 )
         text = _segment_body_html(line.text, correction)
         parts.append(f"<p style='margin:0 0 6px 0;{background}'>{head}&nbsp; {text}</p>")
@@ -298,7 +309,7 @@ class _ReadingView(QTextBrowser):
     def _set_reading(self, text: str, *, markdown: bool, plain: bool = False) -> None:
         from sayink.ui import design_tokens as tok
 
-        key = (markdown, plain, text, tok.ACCENT_TEXT, tok.TEXT_SEC)
+        key = (markdown, plain, text, tok.ACCENT_TEXT, tok.TEXT_SEC, tok.TEXT_DIM)
         if self._reading_key == key:
             return
         previous = self._reading_key
@@ -306,6 +317,7 @@ class _ReadingView(QTextBrowser):
             not plain and not markdown and previous
             and previous[0] is False and previous[1] is False
             and previous[3] == tok.ACCENT_TEXT and previous[4] == tok.TEXT_SEC
+            and len(previous) >= 6 and previous[5] == tok.TEXT_DIM
             and (
                 self.retarget_speaker_labels(previous[2], text)
                 or self.retarget_paragraphs(previous[2], text, polish_line_height=True)
@@ -527,7 +539,7 @@ class _ReadingView(QTextBrowser):
         while not it.atEnd():
             fragment = it.fragment()
             fmt = fragment.charFormat()
-            if fmt.isAnchor() and fmt.anchorHref().startswith("ts:"):
+            if fmt.isAnchor() and fmt.anchorHref().startswith(("ts:", "seek-ms:")):
                 ranges.append((fragment.position(), fragment.position() + fragment.length()))
             it += 1
         if not ranges:
@@ -625,13 +637,15 @@ class _TranscriptView(_ReadingView):
         """UTF-16 units of non-link text before ``position``.
 
         Speaker names and hover actions are links, so a longer name does not
-        move this offset. The timestamp and the spoken text are not links.
+        move this offset. Timestamps (even when playable ``seek-ms:``) and
+        spoken text count identically.
         """
         count = 0
         it = block.begin()
         while not it.atEnd():
             fragment = it.fragment()
-            if not fragment.isValid() or fragment.charFormat().anchorHref():
+            href = fragment.charFormat().anchorHref() if fragment.isValid() else ""
+            if not fragment.isValid() or (href and not href.startswith("seek-ms:")):
                 it += 1
                 continue
             start = fragment.position()
@@ -649,7 +663,8 @@ class _TranscriptView(_ReadingView):
         it = block.begin()
         while not it.atEnd():
             fragment = it.fragment()
-            if not fragment.isValid() or fragment.charFormat().anchorHref():
+            href = fragment.charFormat().anchorHref() if fragment.isValid() else ""
+            if not fragment.isValid() or (href and not href.startswith("seek-ms:")):
                 it += 1
                 continue
             last = fragment.position() + fragment.length()
@@ -713,6 +728,8 @@ class _TranscriptView(_ReadingView):
         self.ensureCursorVisible()
 
     def _hide_all_actions(self) -> None:
+        from sayink.ui import design_tokens as tok
+
         doc = self.document()
         ranges: list[tuple[int, int]] = []
         block = doc.begin()
@@ -726,7 +743,7 @@ class _TranscriptView(_ReadingView):
             block = block.next()
         if ranges:
             fmt = QTextCharFormat()
-            fmt.setForeground(QColor(Qt.GlobalColor.transparent))
+            fmt.setForeground(QColor(tok.TEXT_DIM))
             cursor = QTextCursor(doc)
             cursor.beginEditBlock()
             try:
@@ -762,7 +779,7 @@ class _TranscriptView(_ReadingView):
         if not ranges:
             return
         fmt = QTextCharFormat()
-        fmt.setForeground(QColor(tok.ACCENT_TEXT) if visible else QColor(Qt.GlobalColor.transparent))
+        fmt.setForeground(QColor(tok.ACCENT_TEXT) if visible else QColor(tok.TEXT_DIM))
         for start, length in ranges:
             cursor.setPosition(start)
             cursor.setPosition(start + length, QTextCursor.MoveMode.KeepAnchor)
@@ -846,7 +863,10 @@ class _TranscriptView(_ReadingView):
                     right = min(end, frag_start + fragment.length())
                     if left < right:
                         href = fragment.charFormat().anchorHref()
-                        if not href.startswith(skip):
+                        if href.startswith(skip):
+                            if pieces and pieces[-1].endswith(" "):
+                                pieces[-1] = pieces[-1][:-1]
+                        else:
                             # Qt positions count UTF-16 units; slice the fragment
                             # with a cursor so an emoji does not shift the text.
                             piece = QTextCursor(self.document())
@@ -859,6 +879,129 @@ class _TranscriptView(_ReadingView):
         mime = QMimeData()
         mime.setText("\n".join(lines).strip("\n"))
         return mime
+
+
+def clear_reading_search(view) -> None:
+    """Clear in-view search highlights on a QTextBrowser or QPlainTextEdit."""
+    if view is not None and callable(getattr(view, "setExtraSelections", None)):
+        view.setExtraSelections([])
+
+
+def find_in_reading_view(
+    view,
+    query: str,
+    *,
+    backward: bool = False,
+    step: bool = True,
+) -> tuple[int, int]:
+    """Find ``query`` inside ``view`` while skipping transcript action anchors.
+
+    Returns ``(active_1based_index, total_matches)`` and highlights all matches.
+    """
+    from sayink.ui import design_tokens as tok
+
+    if view is None:
+        return 0, 0
+    needle = (query or "").strip()
+    if not needle:
+        clear_reading_search(view)
+        return 0, 0
+
+    skip_prefixes = _TranscriptView._SEGMENT_LINKS
+    needle_cf = needle.casefold()
+    n_len = len(needle)
+    doc = view.document()
+    matches: list[tuple[int, int]] = []
+
+    block = doc.begin()
+    while block.isValid():
+        buf_chars: list[str] = []
+        pos_map: list[tuple[int, int]] = []
+        it = block.begin()
+        while not it.atEnd():
+            fragment = it.fragment()
+            if fragment.isValid():
+                href = fragment.charFormat().anchorHref()
+                if not (href and href.startswith(skip_prefixes)):
+                    u16_pos = fragment.position()
+                    frag_text = fragment.text()
+                    for ch in frag_text:
+                        step_u16 = 2 if ord(ch) > 0xFFFF else 1
+                        buf_chars.append(ch)
+                        pos_map.append((u16_pos, u16_pos + step_u16))
+                        u16_pos += step_u16
+            it += 1
+        if buf_chars:
+            hay = "".join(buf_chars)
+            hay_cf = hay.casefold()
+            # Keep 1-to-1 UTF-16 index safety when casefold preserves length;
+            # fall back to re.IGNORECASE when rare ligatures expand length.
+            if len(hay_cf) == len(hay) and len(needle_cf) == n_len:
+                pos = 0
+                while True:
+                    found = hay_cf.find(needle_cf, pos)
+                    if found < 0:
+                        break
+                    end_idx = found + n_len - 1
+                    if end_idx < len(pos_map):
+                        matches.append((pos_map[found][0], pos_map[end_idx][1]))
+                    pos = found + 1
+            else:
+                for m in re.finditer(re.escape(needle), hay, flags=re.IGNORECASE):
+                    s_i, e_i = m.start(), m.end() - 1
+                    if s_i < len(pos_map) and e_i < len(pos_map) and e_i >= s_i:
+                        matches.append((pos_map[s_i][0], pos_map[e_i][1]))
+        block = block.next()
+
+    if not matches:
+        clear_reading_search(view)
+        return 0, 0
+
+    cur = view.textCursor()
+    cur_start = min(cur.selectionStart(), cur.selectionEnd()) if cur.hasSelection() else cur.position()
+
+    if backward:
+        chosen_idx = len(matches) - 1
+        for i in range(len(matches) - 1, -1, -1):
+            if matches[i][0] < cur_start:
+                chosen_idx = i
+                break
+    elif step:
+        chosen_idx = 0
+        for i, (m_start, _m_end) in enumerate(matches):
+            if m_start > cur_start or (not cur.hasSelection() and m_start >= cur_start):
+                chosen_idx = i
+                break
+    else:
+        chosen_idx = 0
+        for i, (m_start, _m_end) in enumerate(matches):
+            if m_start >= cur_start:
+                chosen_idx = i
+                break
+
+    extra: list[QTextEdit.ExtraSelection] = []
+    passive_bg = QColor(tok.AMBER_SOFT)
+    active_bg = QColor(tok.ACCENT_SOFT)
+    text_fg = QColor(tok.TEXT)
+    for i, (m_start, m_end) in enumerate(matches):
+        sel = QTextEdit.ExtraSelection()
+        c = QTextCursor(doc)
+        c.setPosition(m_start)
+        c.setPosition(m_end, QTextCursor.MoveMode.KeepAnchor)
+        sel.cursor = c
+        fmt = QTextCharFormat()
+        fmt.setBackground(active_bg if i == chosen_idx else passive_bg)
+        fmt.setForeground(text_fg)
+        sel.format = fmt
+        extra.append(sel)
+    view.setExtraSelections(extra)
+
+    active_cursor = QTextCursor(doc)
+    active_cursor.setPosition(matches[chosen_idx][0])
+    active_cursor.setPosition(matches[chosen_idx][1], QTextCursor.MoveMode.KeepAnchor)
+    view.setTextCursor(active_cursor)
+    view.ensureCursorVisible()
+    return chosen_idx + 1, len(matches)
 
 
 class _SegmentSpeakerDialog(QDialog):
@@ -897,6 +1040,7 @@ class _SegmentSpeakerDialog(QDialog):
         lay.addWidget(hint)
         self.error = QLabel()
         self.error.setWordWrap(True)
+        self.error.setStyleSheet(f"color: {tok.RED}; font-weight: 700; background: transparent;")
         self.error.hide()
         lay.addWidget(self.error)
         buttons = QHBoxLayout()
@@ -961,8 +1105,15 @@ class _SegmentTextDialog(QDialog):
                 selection-background-color: {tok.ACCENT_SOFT}; selection-color: {tok.TEXT}; }}
         """)
         self.setMinimumSize(320, 300)
-        available = self.screen().availableGeometry()
-        self.resize(min(600, available.width() - 48), min(500, available.height() - 64))
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            self.resize(
+                min(600, max(320, available.width() - 48)),
+                min(500, max(300, available.height() - 64)),
+            )
+        else:
+            self.resize(600, 500)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 16, 20, 16)
         lay.setSpacing(12)
@@ -996,6 +1147,7 @@ class _SegmentTextDialog(QDialog):
         self.error = QLabel()
         self.error.setWordWrap(True)
         self.error.setAccessibleName("文字稿保存状态")
+        self.error.setStyleSheet(f"color: {tok.RED}; font-weight: 700; background: transparent;")
         self.error.hide()
         lay.addWidget(self.error)
         buttons = QHBoxLayout()
@@ -1147,12 +1299,17 @@ def _export_kind(path: str, selected: str) -> str:
     return "md"
 
 
+_KNOWN_MEETING_EXPORT_SUFFIXES = {".md", ".txt", ".srt", ".json", ".csv"}
+
+
 def _with_export_suffix(path: str, kind: str) -> str:
     suffix = {"md": ".md", "txt": ".txt", "srt": ".srt"}[kind]
     target = Path(path)
     if target.suffix.lower() == suffix:
         return str(target)
-    return str(target.with_suffix(suffix))
+    if target.suffix.lower() in _KNOWN_MEETING_EXPORT_SUFFIXES:
+        return str(target.with_suffix(suffix))
+    return f"{target}{suffix}"
 
 
 __all__ = [
@@ -1174,6 +1331,8 @@ __all__ = [
     "_split_top_paragraphs",
     "_with_export_suffix",
     "build_transcript_html",
+    "clear_reading_search",
+    "find_in_reading_view",
     "link_citations",
     "notes_for_display",
     "speaker_color",
