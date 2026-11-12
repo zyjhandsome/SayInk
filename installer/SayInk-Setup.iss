@@ -17,6 +17,9 @@
 #ifndef OutputSuffix
 #define OutputSuffix ""
 #endif
+#ifndef SayInkStagingDir
+#define SayInkStagingDir "..\dist\SayInk"
+#endif
 
 [Setup]
 ; Fixed id: upgrades replace earlier SayInk installs instead of stacking.
@@ -44,7 +47,7 @@ ShowLanguageDialog=no
 PrivilegesRequired=admin
 UninstallDisplayIcon={app}\SayInk.exe
 UninstallDisplayName=SayInk
-DirExistsWarning=no
+DirExistsWarning=auto
 ; 确保显示安装路径选择界面
 DisableDirPage=no
 #ifdef UseSignTool
@@ -75,18 +78,18 @@ Name: "autostart"; Description: "开机自动启动"; GroupDescription: "启动�
 Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
-; Paths match build.py PyInstaller output: dist\SayInk\
-Source: "..\dist\SayInk\SayInk.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\dist\SayInk\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Paths match build_installer.py SayInkStagingDir (default ..\dist\SayInk)
+Source: "{#SayInkStagingDir}\SayInk.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SayInkStagingDir}\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Lite and full both ship models\. Upgrade does not delete {app}\models, so a
 ; previously installed Fun-ASR-Nano stays when a lite package is applied.
-Source: "..\dist\SayInk\models\*"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SayInkStagingDir}\models\*"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\SayInk"; Filename: "{app}\SayInk.exe"
+Name: "{group}\SayInk"; Filename: "{app}\SayInk.exe"; AppUserModelID: "SayInk.SayInkApp"
 Name: "{group}\访问官网"; Filename: "https://github.com/zyjhandsome/SayInk"
 Name: "{group}\卸载 SayInk"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\SayInk"; Filename: "{app}\SayInk.exe"; Tasks: desktopicon
+Name: "{autodesktop}\SayInk"; Filename: "{app}\SayInk.exe"; AppUserModelID: "SayInk.SayInkApp"; Tasks: desktopicon
 
 [Registry]
 ; The autostart task is written in [Code] for the signed-in user: HKCU here
@@ -101,12 +104,30 @@ Filename: "{app}\SayInk.exe"; Description: "立即运行 SayInk"; Flags: nowait 
 Filename: "taskkill"; Parameters: "/F /IM SayInk.exe"; Flags: runhidden waituntilterminated
 
 [UninstallDelete]
-Type: filesandordirs; Name: "{app}"
+; Never delete {app} recursively with wildcards: if a user installed into a
+; shared parent directory, filesandordirs on {app} would destroy unrelated files.
+Type: filesandordirs; Name: "{app}\__pycache__"
+Type: filesandordirs; Name: "{app}\_internal\__pycache__"
+Type: dirifempty; Name: "{app}\_internal"
+Type: dirifempty; Name: "{app}"
 
 [Code]
 const
   LegacyUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\VoiceInk_is1';
   RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+  ProfileListKey = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList';
+  SingleInstanceMutexName = 'Local\SayInk_Single_Instance_Mutex';
+  SYNCHRONIZE_ACCESS = $00100000;
+  CRED_TYPE_GENERIC = 1;
+
+function OpenProcess(dwDesiredAccess: DWORD; bInheritHandle: BOOL; dwProcessId: DWORD): THandle;
+  external 'OpenProcess@kernel32.dll stdcall';
+function WaitForSingleObject(hHandle: THandle; dwMilliseconds: DWORD): DWORD;
+  external 'WaitForSingleObject@kernel32.dll stdcall';
+function CloseHandle(hObject: THandle): BOOL;
+  external 'CloseHandle@kernel32.dll stdcall';
+function CredDeleteW(TargetName: string; CredType: DWORD; Flags: DWORD): BOOL;
+  external 'CredDeleteW@advapi32.dll stdcall';
 
 // Setup runs elevated, possibly as another account (a standard user typing an
 // admin password). Per-user data, the Run key and Start Menu entries belong
@@ -205,33 +226,214 @@ begin
   end;
 end;
 
+function DirectoryHasEntries(const DirPath: string): Boolean;
+var
+  FindRec: TFindRec;
+begin
+  Result := False;
+  if not DirExists(DirPath) then
+    Exit;
+  if FindFirst(AddBackslash(DirPath) + '*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          Result := True;
+          Break;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  SelectedDir, SafeDir, LeafName: string;
+begin
+  Result := True;
+  if CurPageID = wpSelectDir then
+  begin
+    SelectedDir := RemoveBackslashUnlessRoot(Trim(WizardDirValue));
+    LeafName := Lowercase(ExtractFileName(SelectedDir));
+    if DirExists(SelectedDir)
+      and DirectoryHasEntries(SelectedDir)
+      and (not FileExists(AddBackslash(SelectedDir) + 'SayInk.exe'))
+      and (LeafName <> 'sayink') then
+    begin
+      SafeDir := AddBackslash(SelectedDir) + 'SayInk';
+      WizardForm.DirEdit.Text := SafeDir;
+      if not WizardSilent() then
+      begin
+        if SuppressibleMsgBox(
+          '所选目录已包含其他文件，为防止污染现有目录，已自动追加子目录：' + #13#10 +
+          SafeDir + #13#10#13#10 + '是否使用该目录继续安装？',
+          mbConfirmation,
+          MB_YESNO,
+          IDYES
+        ) <> IDYES then
+          Result := False;
+      end;
+    end;
+  end;
+end;
+
+procedure WaitForGracefulAppExit();
+var
+  WaitPidStr: string;
+  WaitPid, I, ErrorCode: Integer;
+  ProcHandle: THandle;
+begin
+  WaitPidStr := Trim(GetEnv('SAYINK_UPDATE_WAIT_PID'));
+  WaitPid := StrToIntDef(WaitPidStr, 0);
+  if WaitPid > 0 then
+  begin
+    ProcHandle := OpenProcess(SYNCHRONIZE_ACCESS, False, WaitPid);
+    if ProcHandle <> 0 then
+    begin
+      Log('Waiting for updating SayInk PID ' + IntToStr(WaitPid) + ' to exit cleanly');
+      WaitForSingleObject(ProcHandle, 12000);
+      CloseHandle(ProcHandle);
+    end;
+  end;
+
+  if CheckForMutexes(SingleInstanceMutexName) then
+  begin
+    // Request polite exit first before forceful termination so SQLite/Config flush cleanly.
+    Exec('taskkill', '/IM SayInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+    for I := 1 to 25 do
+    begin
+      if not CheckForMutexes(SingleInstanceMutexName) then
+        Break;
+      Sleep(200);
+    end;
+  end;
+
+  // Final safety fallback if any SayInk.exe process is still hung.
+  Exec('taskkill', '/F /IM SayInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+end;
+
 function InitializeSetup(): Boolean;
 var
   ErrorCode: Integer;
 begin
-  // Kill any running SayInk process before installing
-  Exec('taskkill', '/F /IM SayInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+  WaitForGracefulAppExit();
   // A running VoiceInk holds files in ~\.voiceink open and the rename fails.
   Exec('taskkill', '/F /IM VoiceInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
-  Sleep(1000);
+  Sleep(500);
   MigrateLegacyDataDir();
   UninstallLegacyVoiceInk();
   Result := True;
 end;
 
+function IsRealUserSid(const Sid: string): Boolean;
+begin
+  Result := (Pos('S-1-5-21-', Sid) = 1) and (Pos('_Classes', Sid) = 0);
+end;
+
+procedure AppendUniqueDir(var List: TArrayOfString; const Candidate: string);
+var
+  I, Len: Integer;
+  Norm: string;
+begin
+  if (Candidate = '') or (not DirExists(Candidate)) then
+    Exit;
+  Norm := RemoveBackslashUnlessRoot(Candidate);
+  Len := GetArrayLength(List);
+  for I := 0 to Len - 1 do
+  begin
+    if CompareText(List[I], Norm) = 0 then
+      Exit;
+  end;
+  SetArrayLength(List, Len + 1);
+  List[Len] := Norm;
+end;
+
+procedure CollectUserDataDirs(var DataDirs: TArrayOfString);
+var
+  Sids: TArrayOfString;
+  I: Integer;
+  HomeDir, AppDataDir: string;
+begin
+  SetArrayLength(DataDirs, 0);
+
+  if RegGetSubkeyNames(HKU, '', Sids) then
+  begin
+    for I := 0 to GetArrayLength(Sids) - 1 do
+    begin
+      if IsRealUserSid(Sids[I]) then
+      begin
+        if RegQueryStringValue(HKU, Sids[I] + '\Volatile Environment', 'USERPROFILE', HomeDir) then
+        begin
+          AppendUniqueDir(DataDirs, AddBackslash(HomeDir) + '.sayink');
+          AppendUniqueDir(DataDirs, AddBackslash(HomeDir) + '.voiceink');
+        end
+        else if RegQueryStringValue(
+          HKU,
+          Sids[I] + '\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders',
+          'AppData',
+          AppDataDir
+        ) then
+        begin
+          HomeDir := ExtractFileDir(ExtractFileDir(RemoveBackslashUnlessRoot(AppDataDir)));
+          AppendUniqueDir(DataDirs, AddBackslash(HomeDir) + '.sayink');
+          AppendUniqueDir(DataDirs, AddBackslash(HomeDir) + '.voiceink');
+        end;
+      end;
+    end;
+  end;
+
+  if RegGetSubkeyNames(HKLM, ProfileListKey, Sids) then
+  begin
+    for I := 0 to GetArrayLength(Sids) - 1 do
+    begin
+      if IsRealUserSid(Sids[I]) and RegQueryStringValue(
+        HKLM, ProfileListKey + '\' + Sids[I], 'ProfileImagePath', HomeDir
+      ) then
+      begin
+        AppendUniqueDir(DataDirs, AddBackslash(HomeDir) + '.sayink');
+        AppendUniqueDir(DataDirs, AddBackslash(HomeDir) + '.voiceink');
+      end;
+    end;
+  end;
+end;
+
+procedure DeleteStoredApiCredentials();
+var
+  ErrorCode: Integer;
+begin
+  CredDeleteW('SayInk/llm.api_key', CRED_TYPE_GENERIC, 0);
+  CredDeleteW('VoiceInk/llm.api_key', CRED_TYPE_GENERIC, 0);
+  Exec(ExpandConstant('{sys}\cmdkey.exe'), '/delete:SayInk/llm.api_key', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+  Exec(ExpandConstant('{sys}\cmdkey.exe'), '/delete:VoiceInk/llm.api_key', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  SayInkDataDir: string;
+  DataDirs: TArrayOfString;
+  I: Integer;
 begin
   if CurUninstallStep = usUninstall then
   begin
     RemovePerUserLeftovers();
-    // Ask user if they want to delete user data
-    SayInkDataDir := ExpandConstant('{%USERPROFILE}\.sayink');
-    if DirExists(SayInkDataDir) then
+    CollectUserDataDirs(DataDirs);
+    AppendUniqueDir(DataDirs, ExpandConstant('{%USERPROFILE}\.sayink'));
+    AppendUniqueDir(DataDirs, ExpandConstant('{%USERPROFILE}\.voiceink'));
+    if GetArrayLength(DataDirs) > 0 then
     begin
-      if MsgBox('是否删除用户配置和模型数据？', mbConfirmation, MB_YESNO) = IDYES then
-        DelTree(SayInkDataDir, True, True, True);
+      if SuppressibleMsgBox(
+        '是否删除用户配置、历史记录和模型数据？',
+        mbConfirmation,
+        MB_YESNO or MB_DEFBUTTON2,
+        IDNO
+      ) = IDYES then
+      begin
+        for I := 0 to GetArrayLength(DataDirs) - 1 do
+          DelTree(DataDirs[I], True, True, True);
+        DeleteStoredApiCredentials();
+      end;
     end;
   end;
 end;

@@ -7,16 +7,22 @@ anyio==4.15.1
 certifi==2026.7.22
 cffi==2.1.1
 colorama==0.4.6
+coloredlogs==15.0.1
 exceptiongroup==1.3.1
+flatbuffers==25.12.19
 h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
+humanfriendly==10.0
 idna==3.20
 iniconfig==2.3.1
+mpmath==1.3.0
 numpy==2.2.6
+onnxruntime==1.23.2
 packaging==26.3
 pefile==2024.8.26
 pluggy==1.6.0
+protobuf==7.36.2
 PyAudioWPatch==0.2.12.9
 pycparser==3.0
 Pygments==2.21.0
@@ -27,6 +33,7 @@ pyperclip==1.11.0
 PyQt6==6.11.0
 PyQt6-Qt6==6.11.2
 PyQt6_sip==13.13.0
+pyreadline3==3.5.6
 pytest==9.1.1
 pywin32==312
 pywin32-ctypes==0.2.3
@@ -36,5 +43,6 @@ sherpa-onnx==1.13.8
 sherpa-onnx-core==1.13.8
 six==1.17.0
 sounddevice==0.5.6
+sympy==1.14.0
 tomli==2.5.0
 typing_extensions==4.16.0

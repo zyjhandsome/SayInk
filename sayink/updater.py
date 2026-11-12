@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
-from urllib.request import Request
+from urllib.request import ProxyHandler, Request, build_opener
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -31,8 +33,24 @@ CHECK_INTERVAL_SEC = 24 * 60 * 60
 RELEASE_SIGNING_PUBLIC_KEY = ""
 PUBLIC_KEY_ENV_VAR = "SAYINK_UPDATE_PUBLIC_KEY"
 _MAX_SIGNATURE_BYTES = 4096
-# Accept "x.y.z" and "x.y" (a two-part tag counts as patch 0).
-_VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
+# Accept "x.y.z" / "x.y" and optional pre-release tags (-alpha/-beta/-rc/-dev).
+_VERSION_RE = re.compile(
+    r"(\d+)\.(\d+)(?:\.(\d+))?(?:[-._]?(alpha|a|beta|b|rc|pre|preview|dev)[.-]?(\d*))?(?![\d.])",
+    re.IGNORECASE,
+)
+_PRERELEASE_STAGE_RANK = {
+    "dev": 0,
+    "alpha": 1,
+    "a": 1,
+    "beta": 2,
+    "b": 2,
+    "pre": 2,
+    "preview": 2,
+    "rc": 3,
+}
+_FINAL_STAGE_RANK = 4
+_PROGRESS_THROTTLE_SEC = 0.1
+_PROGRESS_THROTTLE_BYTES = 1024 * 1024
 _TRUSTED_HOSTS = frozenset(
     {
         "github.com",
@@ -224,11 +242,27 @@ def asset_sha256(asset: dict) -> str:
     return ""
 
 
-def version_key(text: str) -> tuple[int, int, int]:
-    match = _VERSION_RE.search((text or "").strip())
+def version_key(text: str) -> tuple[int, int, int, int, int]:
+    raw = (text or "").strip()
+    match = _VERSION_RE.search(raw)
     if not match:
-        return (0, 0, 0)
-    return int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
+        return (0, 0, 0, 0, 0)
+    major = int(match.group(1))
+    minor = int(match.group(2))
+    patch = int(match.group(3) or 0)
+    stage_raw = (match.group(4) or "").lower()
+    stage_num = int(match.group(5) or 0)
+    if stage_raw:
+        stage_rank = _PRERELEASE_STAGE_RANK.get(stage_raw, 0)
+    else:
+        trailing = raw[match.end():].strip()
+        # Any other "-suffix" (except build metadata "+...") is treated as pre-release
+        # unless it is empty, so 2.3.0 > 2.3.0-custom.
+        if trailing.startswith("-"):
+            stage_rank = 0
+        else:
+            stage_rank = _FINAL_STAGE_RANK
+    return (major, minor, patch, stage_rank, stage_num)
 
 
 def is_newer(remote: str, current: str) -> bool:
@@ -348,15 +382,60 @@ def _request(url: str) -> Request:
     )
 
 
+def build_update_urlopen(proxy_mode: str = "system"):
+    """Build a ``urlopen(request, timeout=...)`` callable honoring ``llm.proxy_mode``."""
+    mode = (proxy_mode or "system").strip().lower()
+
+    def _open(req, timeout: float = 30):
+        from urllib.request import urlopen as stdlib_urlopen
+
+        if mode in ("direct", "none", "off", "bypass"):
+            opener = build_opener(ProxyHandler({}))
+            return opener.open(req, timeout=timeout)
+        return stdlib_urlopen(req, timeout=timeout)
+
+    return _open
+
+
+def cleanup_stale_installers(cache_dir: Path, *, keep_asset_name: str = "") -> int:
+    """Remove outdated ``SayInk-Setup-*`` installers/signatures/parts in ``%TEMP%\\SayInk``."""
+    if not cache_dir.is_dir():
+        return 0
+    keep: set[str] = set()
+    if keep_asset_name:
+        keep.add(keep_asset_name)
+        keep.add(f"{keep_asset_name}.sig")
+    removed = 0
+    try:
+        entries = list(cache_dir.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        name = entry.name
+        if name in keep or not name.startswith("SayInk-Setup-"):
+            continue
+        if not name.endswith((".exe", ".exe.sig", ".exe.part")):
+            continue
+        try:
+            if entry.is_file():
+                entry.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def fetch_latest_release(urlopen, *, current: str) -> ReleaseInfo | None:
     with urlopen(_request(LATEST_RELEASE_URL), timeout=15) as response:
         payload = json.loads(response.read().decode("utf-8"))
     return release_from_payload(payload, current=current)
 
 
-def launch_installer(path: str) -> None:
-    """Start the setup program so it outlives this process."""
-    kwargs: dict = {}
+def launch_installer(path: str, *, wait_pid: int | None = None) -> None:
+    """Start the setup program with PID handshake so it waits for clean exit."""
+    env = os.environ.copy()
+    env["SAYINK_UPDATE_WAIT_PID"] = str(os.getpid() if wait_pid is None else wait_pid)
+    kwargs: dict = {"env": env}
     if sys.platform == "win32":
         kwargs["creationflags"] = (
             subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
@@ -535,12 +614,19 @@ class UpdateCheckWorker(QThread):
     result_ready = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, current: str, parent=None):
+    def __init__(
+        self,
+        current: str,
+        parent=None,
+        *,
+        proxy_mode: str = "system",
+    ):
         super().__init__(parent)
         self._current = current
+        self._proxy_mode = proxy_mode
 
     def run(self) -> None:
-        from urllib.request import urlopen
+        urlopen = build_update_urlopen(self._proxy_mode)
 
         try:
             self.result_ready.emit(fetch_latest_release(urlopen, current=self._current))
@@ -564,6 +650,7 @@ class UpdateDownloadWorker(QThread):
         sha256: str = "",
         signature_url: str = "",
         public_key_hex: str | None = None,
+        proxy_mode: str = "system",
     ):
         super().__init__(parent)
         self._url = url
@@ -572,7 +659,10 @@ class UpdateDownloadWorker(QThread):
         self._sha256 = sha256
         self._signature_url = signature_url
         self._public_key_hex = public_key_hex
+        self._proxy_mode = proxy_mode
         self._cancelled = False
+        self._last_progress_at = 0.0
+        self._last_progress_got = -1
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -580,10 +670,22 @@ class UpdateDownloadWorker(QThread):
     def _on_progress(self, got: int, total: int) -> None:
         if self._cancelled:
             raise RuntimeError("更新下载已取消")
-        self.progress.emit(got, total)
+        now = time.monotonic()
+        is_first = self._last_progress_got < 0
+        is_done = total > 0 and got >= total
+        if (
+            is_first
+            or is_done
+            or got <= 0
+            or (now - self._last_progress_at) >= _PROGRESS_THROTTLE_SEC
+            or (got - self._last_progress_got) >= _PROGRESS_THROTTLE_BYTES
+        ):
+            self._last_progress_at = now
+            self._last_progress_got = got
+            self.progress.emit(got, total)
 
     def run(self) -> None:
-        from urllib.request import urlopen
+        urlopen = build_update_urlopen(self._proxy_mode)
 
         if self._cancelled:
             return

@@ -10,9 +10,10 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from PyQt6.QtCore import QObject, Qt, QTimer
+from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer
 from PyQt6.QtWidgets import (
     QDialog,
+    QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -83,11 +84,54 @@ class OnboardingController(QObject):
         self._setup_mode = ""
         self._setup_recorder_obj = None
         self._setup_watch: QTimer | None = None
+        self._countdown_timer: QTimer | None = None
+        self._trial_remaining_sec = 0
+        self._capture_gen = 0
         self._probe_peak = 0.0
         self._trial_audio = None
         self._trial_worker = None
         self._download_worker = None
         self._mic_heard = False
+        self._paused_hotkey_for_setup = False
+
+    @property
+    def running_workers(self):
+        workers = []
+        for candidate in (self._download_worker, self._trial_worker, *self.findChildren(QThread)):
+            if candidate is not None and candidate not in workers:
+                is_running = getattr(candidate, "isRunning", None)
+                if callable(is_running) and is_running():
+                    workers.append(candidate)
+        return tuple(workers)
+
+    def shutdown(self) -> None:
+        self._stop_setup_audio()
+
+    def refresh_theme(self) -> None:
+        if self._setup_dialog is not None:
+            self._setup_dialog.apply_theme_styles()
+
+    def _pause_global_hotkey(self) -> None:
+        if self._paused_hotkey_for_setup:
+            return
+        hotkey_mgr = getattr(self.parent(), "_hotkey_mgr", None)
+        if hotkey_mgr is None:
+            return
+        if getattr(hotkey_mgr, "_paused", False):
+            return
+        pause_fn = getattr(hotkey_mgr, "pause", None)
+        if callable(pause_fn):
+            pause_fn()
+            self._paused_hotkey_for_setup = True
+
+    def _resume_global_hotkey(self) -> None:
+        if not self._paused_hotkey_for_setup:
+            return
+        self._paused_hotkey_for_setup = False
+        hotkey_mgr = getattr(self.parent(), "_hotkey_mgr", None)
+        resume_fn = getattr(hotkey_mgr, "resume", None) if hotkey_mgr is not None else None
+        if callable(resume_fn):
+            resume_fn()
 
     # ── Scheduling ─────────────────────────────────────
 
@@ -226,6 +270,7 @@ class OnboardingController(QObject):
         self._setup_watch.setInterval(WELCOME_DELAY_MS)
         self._setup_watch.timeout.connect(self._refresh_setup_steps)
         self._setup_watch.start()
+        self._refresh_setup_steps()
         dialog.finished.connect(self._on_setup_finished)
         code = dialog.exec()
         if self._setup_reopened or self._setup_closed:
@@ -237,7 +282,7 @@ class OnboardingController(QObject):
 
     def _recognizer_ready(self) -> bool:
         speech = getattr(self.parent(), "_recognizer", None)
-        return bool(getattr(speech, "_is_ready", False))
+        return bool(getattr(speech, "is_ready", False) or getattr(speech, "_is_ready", False))
 
     def _trial_ready(self) -> bool:
         return bool(self._model_installed() and self._recognizer_ready())
@@ -255,12 +300,15 @@ class OnboardingController(QObject):
             dialog.mic_status.setText("没有听到声音。可以重试，或稍后继续。")
         dialog.mic_btn.setEnabled(True)
         dialog.close_btn.setEnabled(True)
-        dialog.trial_btn.setEnabled(bool(self._mic_heard and self._trial_ready() and not self._setup_mode))
+        dialog.trial_btn.setEnabled(bool(self._trial_ready() and not self._setup_mode))
 
     def submit_trial(self, text: str) -> None:
+        self._resume_global_hotkey()
         dialog = self._setup_dialog
         if dialog is None:
             return
+        dialog.trial_btn.setText("试说一句")
+        dialog.trial_btn.setEnabled(bool(self._trial_ready() and not self._setup_mode))
         cleaned = (text or "").strip()
         dialog.trial_result.setText(cleaned or "没有识别到文字。可以再试说一句。")
 
@@ -293,8 +341,13 @@ class OnboardingController(QObject):
         dialog = self._setup_dialog
         if dialog is None:
             return
+        anchor = self._dialog_parent()
+        if anchor is not None and dialog.parentWidget() is not anchor:
+            dialog.setParent(anchor, Qt.WindowType.Dialog)
         dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
         dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        dialog.apply_theme_styles()
         dialog.show()
 
     def _open_engine_from_setup(self) -> None:
@@ -305,13 +358,32 @@ class OnboardingController(QObject):
 
     def _refresh_setup_steps(self) -> None:
         dialog = self._setup_dialog
-        if dialog is None or self._setup_mode:
+        if dialog is None:
             return
-        dialog.mic_btn.setEnabled(self._setup_mode != "probe")
-        dialog.trial_btn.setEnabled(bool(self._mic_heard and self._trial_ready() and not self._setup_mode))
-        if self._model_installed() and not self._recognizer_ready() and self._download_worker is None:
-            dialog.download_btn.setText("模型正在载入…")
-            dialog.download_btn.setEnabled(False)
+        installed = self._model_installed()
+        ready = self._recognizer_ready()
+        dialog.finish_btn.setEnabled(bool(installed))
+        if self._download_worker is not None:
+            dialog.cancel_download_btn.setVisible(True)
+            dialog.cancel_download_btn.setEnabled(True)
+        else:
+            dialog.cancel_download_btn.setVisible(False)
+            dialog.cancel_download_btn.setEnabled(False)
+            if installed and ready:
+                dialog.download_btn.setText("模型已就绪")
+                dialog.download_btn.setEnabled(False)
+                if not dialog.download_status.text() or "正在载入" in dialog.download_status.text():
+                    dialog.download_status.setText("语音模型已就绪，可以试说一句或直接完成。")
+                    dialog.download_status.setVisible(True)
+            elif installed:
+                dialog.download_btn.setText("模型正在载入…")
+                dialog.download_btn.setEnabled(False)
+        if self._setup_mode:
+            return
+        dialog.mic_btn.setEnabled(True)
+        trial_busy = self._trial_worker is not None and self._trial_worker.isRunning()
+        dialog.trial_btn.setText("正在识别…" if trial_busy else "试说一句")
+        dialog.trial_btn.setEnabled(bool(self._trial_ready() and not trial_busy))
 
     def _finish_setup(self) -> None:
         if self._setup_closed:
@@ -321,27 +393,53 @@ class OnboardingController(QObject):
         if self._setup_watch is not None:
             self._setup_watch.stop()
             self._setup_watch = None
-        self._config.set("first_run_welcome_seen", True)
         dialog = self._setup_dialog
         self._setup_dialog = None
         if dialog is not None:
             dialog.hide()
-        if not self._config.get("history.onboarded", False):
+        if not self._config.get("first_run_welcome_seen", False):
+            self._welcome_scheduled = False
+            QTimer.singleShot(WELCOME_DELAY_MS, self.show_welcome)
+        elif not self._config.get("history.onboarded", False):
             QTimer.singleShot(HISTORY_AFTER_WELCOME_MS, self.show_history_onboarding)
+
+    def _stop_countdown(self) -> None:
+        if self._countdown_timer is not None:
+            self._countdown_timer.stop()
+            self._countdown_timer = None
+
+    def _tick_trial_countdown(self) -> None:
+        dialog = self._setup_dialog
+        if dialog is None or self._setup_mode != "trial":
+            self._stop_countdown()
+            return
+        self._trial_remaining_sec = max(0, self._trial_remaining_sec - 1)
+        if self._trial_remaining_sec > 0:
+            dialog.trial_result.setText(
+                f"正在听（剩余 {self._trial_remaining_sec} 秒）…请说一句短话，说完可点「提前完成」。"
+            )
+
+    def _on_trial_btn_clicked(self) -> None:
+        if self._setup_mode == "trial":
+            self._finish_setup_trial()
+            return
+        self._start_setup_trial()
 
     def _start_setup_mic_test(self) -> None:
         dialog = self._setup_dialog
-        if dialog is None:
+        if dialog is None or self._setup_mode:
             return
+        dialog.mic_status.setText("正在准备麦克风…")
+        dialog.mic_btn.setEnabled(False)
         if not self._begin_setup_capture("probe"):
             return
+        gen = self._capture_gen
         dialog.mic_status.setText("正在听…请对着麦克风说一句话。")
-        dialog.mic_btn.setEnabled(False)
-        QTimer.singleShot(_SETUP_PROBE_MS, self._finish_setup_mic_test)
+        QTimer.singleShot(_SETUP_PROBE_MS, lambda g=gen: self._finish_setup_mic_test(g))
 
     def _start_setup_trial(self) -> None:
         dialog = self._setup_dialog
-        if dialog is None:
+        if dialog is None or self._setup_mode:
             return
         if not self._model_installed():
             dialog.trial_result.setText("请先下载模型，再试说一句。")
@@ -349,11 +447,23 @@ class OnboardingController(QObject):
         if not self._recognizer_ready():
             dialog.trial_result.setText("模型正在载入内存，请稍候…")
             return
+        dialog.trial_result.setText("正在准备录音…")
+        dialog.trial_btn.setEnabled(False)
         if not self._begin_setup_capture("trial"):
             return
-        dialog.trial_result.setText("正在听…请说一句短话。这句话只留在本页。")
-        dialog.trial_btn.setEnabled(False)
-        QTimer.singleShot(_SETUP_TRIAL_MS, self._finish_setup_trial)
+        gen = self._capture_gen
+        self._trial_remaining_sec = max(1, _SETUP_TRIAL_MS // 1000)
+        dialog.trial_result.setText(
+            f"正在听（剩余 {self._trial_remaining_sec} 秒）…请说一句短话，说完可点「提前完成」。"
+        )
+        dialog.trial_btn.setText("提前完成")
+        dialog.trial_btn.setEnabled(True)
+        self._stop_countdown()
+        self._countdown_timer = QTimer(dialog)
+        self._countdown_timer.setInterval(1000)
+        self._countdown_timer.timeout.connect(self._tick_trial_countdown)
+        self._countdown_timer.start()
+        QTimer.singleShot(_SETUP_TRIAL_MS, lambda g=gen: self._finish_setup_trial(g))
 
     def _begin_setup_capture(self, mode: str) -> bool:
         if self._setup_mode:
@@ -364,12 +474,15 @@ class OnboardingController(QObject):
             log.debug("准备页无法配置录音", exc_info=True)
             self._on_setup_audio_error("无法准备麦克风")
             return False
+        self._capture_gen += 1
         self._setup_mode = mode
         self._probe_peak = 0.0
         if mode == "trial":
             self._trial_audio = None
+        self._pause_global_hotkey()
         recorder.start()
         if self._setup_mode != mode or not recorder.is_recording:
+            self._resume_global_hotkey()
             return False
         return True
 
@@ -420,8 +533,11 @@ class OnboardingController(QObject):
 
     def _on_setup_audio_error(self, msg: str) -> None:
         mode = self._setup_mode
+        self._capture_gen += 1
         self._setup_mode = ""
+        self._stop_countdown()
         self._stop_setup_recorder(flush=False)
+        self._resume_global_hotkey()
         dialog = self._setup_dialog
         if dialog is None:
             return
@@ -429,22 +545,31 @@ class OnboardingController(QObject):
         dialog.close_btn.setEnabled(True)
         detail = f"{msg} " if msg else ""
         if mode == "trial":
-            dialog.trial_btn.setEnabled(True)
+            dialog.trial_btn.setText("试说一句")
+            dialog.trial_btn.setEnabled(bool(self._trial_ready()))
             dialog.trial_result.setText(f"没有听清。{detail}可以重试，或稍后继续。".strip())
             return
         dialog.mic_status.setText(f"没有听到声音。{detail}可以重试，或稍后继续。".strip())
 
-    def _finish_setup_mic_test(self) -> None:
+    def _finish_setup_mic_test(self, gen: int | None = None) -> None:
+        if gen is not None and gen != self._capture_gen:
+            return
         if self._setup_mode != "probe":
             return
+        self._capture_gen += 1
         peak = self._probe_peak
         self._setup_mode = ""
         self._stop_setup_recorder(flush=False)
+        self._resume_global_hotkey()
         self.note_mic_level(peak)
 
-    def _finish_setup_trial(self) -> None:
+    def _finish_setup_trial(self, gen: int | None = None) -> None:
+        if gen is not None and gen != self._capture_gen:
+            return
         if self._setup_mode != "trial":
             return
+        self._capture_gen += 1
+        self._stop_countdown()
         self._setup_mode = "closing"
         self._stop_setup_recorder(flush=True)
         audio = self._trial_audio
@@ -452,38 +577,57 @@ class OnboardingController(QObject):
         self._setup_mode = ""
         dialog = self._setup_dialog
         if dialog is not None:
-            dialog.trial_btn.setEnabled(True)
+            dialog.trial_btn.setText("试说一句")
+            dialog.trial_btn.setEnabled(bool(self._trial_ready()))
         if audio is None or getattr(audio, "size", 0) == 0:
+            self._resume_global_hotkey()
             self.submit_trial("")
             return
         self._transcribe_setup_trial(audio)
 
+    def _on_trial_worker_finished(self, worker) -> None:
+        if self._trial_worker is worker:
+            self._trial_worker = None
+        self._resume_global_hotkey()
+        self._refresh_setup_steps()
+
     def _transcribe_setup_trial(self, audio) -> None:
         dialog = self._setup_dialog
         if dialog is None:
+            self._resume_global_hotkey()
             return
         speech = getattr(self.parent(), "_recognizer", None)
         engine = getattr(speech, "_recognizer", None)
-        ready = bool(getattr(speech, "_is_ready", False))
+        ready = bool(getattr(speech, "is_ready", False) or getattr(speech, "_is_ready", False))
         busy = tuple(getattr(speech, "running_workers", ()) or ())
         if engine is None or not ready:
+            self._resume_global_hotkey()
             dialog.trial_result.setText("模型还没准备好。请先下载，并等到引擎可用后再试说一句。")
             return
         if busy:
+            self._resume_global_hotkey()
             dialog.trial_result.setText("识别正忙。请稍后再试说一句。")
             return
         from sayink.speech_recognizer import TranscribeWorker
 
-        worker = TranscribeWorker(engine, audio, retry_empty=True)
+        worker = TranscribeWorker(engine, audio, retry_empty=True, parent=self)
+        worker.native_lock = getattr(speech, "_decode_lock", None)
         worker.result_ready.connect(self.submit_trial)
         worker.error.connect(self._on_setup_trial_error)
+        worker.finished.connect(lambda w=worker: self._on_trial_worker_finished(w))
         self._trial_worker = worker
+        dialog.trial_btn.setText("正在识别…")
+        dialog.trial_btn.setEnabled(False)
+        dialog.trial_result.setText("正在识别试说语音…")
         worker.start()
 
     def _on_setup_trial_error(self, message: str) -> None:
+        self._resume_global_hotkey()
         dialog = self._setup_dialog
         if dialog is None:
             return
+        dialog.trial_btn.setText("试说一句")
+        dialog.trial_btn.setEnabled(bool(self._trial_ready() and not self._setup_mode))
         dialog.trial_result.setText(f"试说没有完成。{message} 可以再试一次，或稍后继续。".strip())
 
     def _start_inline_model_download(self) -> None:
@@ -500,14 +644,33 @@ class OnboardingController(QObject):
         self._download_worker = worker
         dialog.download_btn.setEnabled(False)
         dialog.download_btn.setText("正在下载… 0%")
+        dialog.cancel_download_btn.setVisible(True)
+        dialog.cancel_download_btn.setEnabled(True)
+        dialog.download_status.setText("正在后台下载模型，您可以先测试下方麦克风。")
+        dialog.download_status.setVisible(True)
         worker.progress.connect(self._on_setup_download_progress)
         worker.finished_ok.connect(self._on_setup_download_done)
         worker.error.connect(self._on_setup_download_error)
         worker.start()
 
-    def _on_setup_download_progress(self, pct: int) -> None:
+    def _cancel_inline_model_download(self) -> None:
+        worker = self._download_worker
+        self._download_worker = None
+        if worker is not None and hasattr(worker, "cancel"):
+            worker.cancel()
         dialog = self._setup_dialog
         if dialog is None:
+            return
+        dialog.cancel_download_btn.setVisible(False)
+        dialog.cancel_download_btn.setEnabled(False)
+        dialog.download_btn.setEnabled(True)
+        dialog.download_btn.setText("下载模型")
+        dialog.download_status.setText("已取消模型下载。需要时可随时重新下载。")
+        dialog.download_status.setVisible(True)
+
+    def _on_setup_download_progress(self, pct: int) -> None:
+        dialog = self._setup_dialog
+        if dialog is None or self._download_worker is None:
             return
         dialog.download_btn.setText(f"正在下载… {int(pct)}%")
 
@@ -516,8 +679,12 @@ class OnboardingController(QObject):
         self._config.set("stt.model_id", model_id)
         dialog = self._setup_dialog
         if dialog is not None:
+            dialog.cancel_download_btn.setVisible(False)
+            dialog.cancel_download_btn.setEnabled(False)
             dialog.download_btn.setText("模型已下载，正在载入…")
             dialog.download_btn.setEnabled(False)
+            dialog.download_status.setText("模型下载完成，正在载入内存…")
+            dialog.download_status.setVisible(True)
         parent = self.parent()
         if parent is not None and hasattr(parent, "_on_models_changed"):
             parent._on_models_changed()
@@ -528,12 +695,17 @@ class OnboardingController(QObject):
         dialog = self._setup_dialog
         if dialog is None:
             return
+        dialog.cancel_download_btn.setVisible(False)
+        dialog.cancel_download_btn.setEnabled(False)
         dialog.download_btn.setEnabled(True)
         dialog.download_btn.setText("下载模型")
-        dialog.mic_status.setText(f"模型下载没有完成。{message} 可以重试，或稍后继续。".strip())
+        dialog.download_status.setText(f"模型下载没有完成。{message} 可以重试，或稍后继续。".strip())
+        dialog.download_status.setVisible(True)
 
     def _stop_setup_audio(self) -> None:
+        self._capture_gen += 1
         self._setup_mode = ""
+        self._stop_countdown()
         download = self._download_worker
         if download is not None and hasattr(download, "cancel"):
             download.cancel()
@@ -542,6 +714,7 @@ class OnboardingController(QObject):
         if worker is not None and worker.isRunning():
             worker.cancel()
         self._stop_setup_recorder(flush=False)
+        self._resume_global_hotkey()
 
     def _stop_setup_recorder(self, *, flush: bool) -> None:
         recorder = self._setup_recorder_obj
@@ -565,53 +738,63 @@ class _SetupDialog(QDialog):
 
     def __init__(self, controller: OnboardingController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        from sayink.ui import design_tokens as tok
-        from sayink.ui import settings_styles as ss
-
+        self._controller = controller
         self.setObjectName("setupDialog")
         self.setWindowTitle("准备 SayInk")
         self.setModal(True)
         if parent is None:
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        self.setMinimumWidth(420)
-        self.setStyleSheet(
-            ss.WINDOW_CSS
-            + f"""
-            QDialog#setupDialog {{ background: {tok.SURFACE}; color: {tok.TEXT}; }}
-            QLabel {{ background: transparent; color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; }}
-            QLabel#setupMicStatus, QLabel#setupTrial {{ color: {tok.TEXT_DIM}; }}
-            """
-        )
+        self.setMinimumWidth(440)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(12)
         intro = QLabel(
-            "本机还没有语音模型。按顺序完成这三步，就可以在这里试说一句。"
-            "试说的文字只留在这一页。"
+            "本机还没有语音模型。完成模型下载后即可开始语音输入；"
+            "也可以在这里测试麦克风并试说一句（试说文字只留在本页）。"
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        download_step = QLabel("1. 下载模型")
-        layout.addWidget(download_step)
+        model_id = controller._config.get("stt.model_id", "") or DEFAULT_MODEL_ID
+        info = get_model_info(model_id) or get_model_info(DEFAULT_MODEL_ID) or {}
+        size_mb = info.get("size_mb", 950)
+        self.download_step = QLabel(f"1. 下载语音模型（约 {size_mb} MB，仅需一次）")
+        layout.addWidget(self.download_step)
+
+        dl_row = QHBoxLayout()
+        dl_row.setSpacing(8)
         self.download_btn = QPushButton("下载模型")
         self.download_btn.setAccessibleName("下载模型")
-        self.download_btn.setStyleSheet(ss.BTN_PRIMARY)
         self.download_btn.setDefault(True)
         self.download_btn.setAutoDefault(True)
         self.download_btn.clicked.connect(controller._start_inline_model_download)
-        layout.addWidget(self.download_btn)
+        dl_row.addWidget(self.download_btn, 1)
+
+        self.cancel_download_btn = QPushButton("取消下载")
+        self.cancel_download_btn.setAccessibleName("取消下载")
+        self.cancel_download_btn.setVisible(False)
+        self.cancel_download_btn.setEnabled(False)
+        self.cancel_download_btn.clicked.connect(controller._cancel_inline_model_download)
+        dl_row.addWidget(self.cancel_download_btn)
+        layout.addLayout(dl_row)
+
+        self.download_status = QLabel("")
+        self.download_status.setObjectName("setupDownloadStatus")
+        self.download_status.setAccessibleName("模型下载状态")
+        self.download_status.setWordWrap(True)
+        self.download_status.setVisible(False)
+        layout.addWidget(self.download_status)
+
         self.engine_btn = QPushButton("在引擎页查看其他模型")
         self.engine_btn.setAccessibleName("在引擎页查看其他模型")
-        self.engine_btn.setStyleSheet(ss.BTN_GHOST)
         self.engine_btn.clicked.connect(controller._open_engine_from_setup)
         layout.addWidget(self.engine_btn)
 
-        mic_step = QLabel("2. 测试麦克风")
+        mic_step = QLabel("2. 测试麦克风（可选）")
         layout.addWidget(mic_step)
         self.mic_btn = QPushButton("测试麦克风")
         self.mic_btn.setAccessibleName("测试麦克风")
-        self.mic_btn.setStyleSheet(ss.BTN_GHOST)
         self.mic_btn.setEnabled(True)
         self.mic_btn.clicked.connect(controller._start_setup_mic_test)
         layout.addWidget(self.mic_btn)
@@ -621,13 +804,12 @@ class _SetupDialog(QDialog):
         self.mic_status.setWordWrap(True)
         layout.addWidget(self.mic_status)
 
-        trial_step = QLabel("3. 试说一句")
+        trial_step = QLabel("3. 试说一句（可选）")
         layout.addWidget(trial_step)
         self.trial_btn = QPushButton("试说一句")
         self.trial_btn.setAccessibleName("试说一句")
-        self.trial_btn.setStyleSheet(ss.BTN_GHOST)
         self.trial_btn.setEnabled(False)
-        self.trial_btn.clicked.connect(controller._start_setup_trial)
+        self.trial_btn.clicked.connect(controller._on_trial_btn_clicked)
         layout.addWidget(self.trial_btn)
         self.trial_result = QLabel("试说结果会留在这里。")
         self.trial_result.setObjectName("setupTrial")
@@ -636,10 +818,69 @@ class _SetupDialog(QDialog):
         self.trial_result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.trial_result)
 
+        hotkey_label = format_hotkey(controller._config.get("hotkey", DEFAULT_HOTKEY))
+        self.usage_hint = QLabel(
+            f"使用提示：先把光标放到要输入文字的位置，按住 {hotkey_label} 说话、松开上屏；"
+            "双击托盘图标可打开主窗口。"
+        )
+        self.usage_hint.setObjectName("setupUsageHint")
+        self.usage_hint.setWordWrap(True)
+        layout.addWidget(self.usage_hint)
+
         layout.addStretch(1)
+        footer_row = QHBoxLayout()
+        footer_row.setSpacing(8)
         self.close_btn = QPushButton("稍后继续")
         self.close_btn.setAccessibleName("稍后继续")
-        self.close_btn.setStyleSheet(ss.BTN_GHOST)
         self.close_btn.clicked.connect(self.reject)
-        layout.addWidget(self.close_btn)
+        footer_row.addWidget(self.close_btn)
+
+        self.finish_btn = QPushButton("完成并开始使用")
+        self.finish_btn.setAccessibleName("完成并开始使用")
+        self.finish_btn.setEnabled(bool(controller._model_installed()))
+        self.finish_btn.clicked.connect(self.accept)
+        footer_row.addWidget(self.finish_btn, 1)
+        layout.addLayout(footer_row)
+
+        self.apply_theme_styles()
         self.download_btn.setFocus()
+
+    def apply_theme_styles(self) -> None:
+        if getattr(self, "_applying_theme", False):
+            return
+        self._applying_theme = True
+        try:
+            from sayink.ui import design_tokens as tok
+            from sayink.ui import settings_styles as ss
+
+            dialog_css = (
+                ss.WINDOW_CSS
+                + f"""
+                QDialog#setupDialog {{ background: {tok.SURFACE}; color: {tok.TEXT}; }}
+                QLabel {{ background: transparent; color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; }}
+                QLabel#setupDownloadStatus, QLabel#setupMicStatus, QLabel#setupTrial, QLabel#setupUsageHint {{
+                    color: {tok.TEXT_DIM};
+                }}
+                """
+            )
+            if self.styleSheet() != dialog_css:
+                self.setStyleSheet(dialog_css)
+            self.download_btn.setStyleSheet(ss.BTN_PRIMARY)
+            self.cancel_download_btn.setStyleSheet(ss.BTN_GHOST)
+            self.engine_btn.setStyleSheet(ss.BTN_GHOST)
+            self.mic_btn.setStyleSheet(ss.BTN_GHOST)
+            self.trial_btn.setStyleSheet(ss.BTN_GHOST)
+            self.close_btn.setStyleSheet(ss.BTN_GHOST)
+            self.finish_btn.setStyleSheet(ss.BTN_PRIMARY)
+        finally:
+            self._applying_theme = False
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if getattr(self, "_applying_theme", False):
+            return
+        if event.type() in (
+            QEvent.Type.PaletteChange,
+            QEvent.Type.ApplicationPaletteChange,
+        ):
+            self.apply_theme_styles()

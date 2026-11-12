@@ -28,7 +28,8 @@ def test_setup_never_touches_the_elevated_accounts_profile_or_hive():
 def test_model_files_are_packed_into_every_installer():
     text = _text()
     files = text.split("[Files]", 1)[1].split("\n[", 1)[0]
-    assert 'Source: "..\\dist\\SayInk\\models\\*"' in files
+    assert '#define SayInkStagingDir "..\\dist\\SayInk"' in text
+    assert 'Source: "{#SayInkStagingDir}\\models\\*"' in files
     assert "#ifdef BundleModel" not in files
     assert "skipifsourcedoesntexist" not in files
     assert "OutputBaseFilename=SayInk-Setup-{#AppVersionStr}{#OutputSuffix}" in text

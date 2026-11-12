@@ -170,11 +170,13 @@ def build_installer(*, keep_staging: bool = False, with_model: bool = False):
 
     inno_path = find_inno_setup()
     installer_script = SCRIPT_DIR / "SayInk-Setup.iss"
+    staging_dir = resolve_staging_dir()
     iscc_cmd = [
         str(inno_path),
         f"/DAppVersionStr={__version__}",
         f"/DAppVersionQuad={file_version_quad()}",
         f"/DOutputSuffix={FULL_SUFFIX if with_model else ''}",
+        f"/DSayInkStagingDir={staging_dir}",
     ]
     signtool_template = (os.environ.get(SIGNTOOL_ENV_VAR) or "").strip()
     use_inno_signtool = bool(signtool_template) and (

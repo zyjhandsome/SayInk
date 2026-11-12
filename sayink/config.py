@@ -4,9 +4,10 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QCoreApplication, QObject, QThread, QTimer, pyqtSignal
 
 from sayink.secret_store import default_secret_store
 from sayink.speech_recognizer import (
@@ -81,7 +82,7 @@ DEFAULT_CONFIG = {
     "auto_start": False,
     "sound_enabled": True,
     "output": {
-        "restore_clipboard": False,
+        "restore_clipboard": True,
         "mode": OUTPUT_MODE_PASTE,
         # True while the mode was picked by the app (input source changed),
         # so returning to the microphone can undo it; a manual choice sticks.
@@ -140,9 +141,9 @@ DEFAULT_CONFIG = {
     "meeting": {
         "input_source": "mixed",   # 新会议默认麦克风 + 电脑声音；空 = 跟随转写音源
         "model_id": "",            # 空 = 沿用 stt.model_id
-        "hotkey": "",              # 空 = 未设置
         "show_start_card": True,
         "polish_segments": False,
+        "save_audio": True,        # 会议录音保存开关（默认保存）
         "model_name": "",          # 纪要模型；空 = 沿用 llm.model_name
         "template_id": "general",
         # 会议结束后按默认模板在后台排队生成纪要；会把文字稿发给 AI 服务，故默认关闭。
@@ -156,7 +157,6 @@ DEFAULT_CONFIG = {
         "single_request_char_limit": 8000,
         "context_window_tokens": 32768,
         "max_output_tokens": 4096,
-        "separate_lanes": False,
     },
     "update": {
         "auto_check": True,
@@ -268,8 +268,25 @@ RETIRED_RECOGNITION_SWITCH_KEYS = frozenset({
     "enhanced_diarization",
     "speaker_activity",
 })
+RETIRED_MEETING_KEYS = frozenset({
+    "hotkey",
+    "separate_lanes",
+})
 # Run-key value name written by VoiceInk ≤ 2.1.0; removed once on first start.
 LEGACY_AUTO_START_VALUE = "VoiceInk"
+STARTUP_APPROVED_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+
+
+class _SaveTimerRelay(QObject):
+    request_start = pyqtSignal(int)
+
+    def __init__(self, timer: QTimer) -> None:
+        super().__init__()
+        self._timer = timer
+        self.request_start.connect(self._on_start)
+
+    def _on_start(self, delay_ms: int) -> None:
+        self._timer.start(delay_ms)
 
 
 class Config:
@@ -298,17 +315,21 @@ class Config:
         self._secret_value: str | None = None
         self._secret_persist_failed = False
         self._secret_read_failed = False
+        self._preserve_legacy_file_key = False
         # Unreadable config whose backup also failed. Saving would replace it
         # with defaults and drop hotkeys, glossary and templates.
         self._persist_blocked = False
+        self.corrupt_recovered = False
+        self.last_save_failed = False
         self._config_file = self._config_dir / "config.json"
         self._models_dir = _get_default_models_dir()
         self._config: dict = {}
         self._extra_keys: dict = {}
-        # 延迟保存机制：避免频繁写入文件
+        # 延迟保存机制：避免频繁写入文件（支持跨线程安全触发）
         self._save_timer = QTimer()
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._do_save)
+        self._save_relay = _SaveTimerRelay(self._save_timer)
         self._ensure_dirs()
         self._load()
         self._sync_registry_auto_start()
@@ -332,6 +353,7 @@ class Config:
                     raise ValueError("顶层不是对象")
             except (json.JSONDecodeError, ValueError, OSError, RecursionError) as e:
                 backup = self._backup_unreadable_config()
+                self.corrupt_recovered = True
                 if backup is None:
                     self._persist_blocked = True
                 log.warning(
@@ -370,44 +392,42 @@ class Config:
         if store is None:
             if in_file and not self._file_secrets:
                 self._secret_value = in_file
-                self._scrub_plaintext_key(
-                    "没有可用的凭据存储，配置文件中的 API Key 已移除，仅本次运行有效"
-                )
+                self._secret_persist_failed = True
+                self._preserve_legacy_file_key = True
+                log.warning("没有可用的凭据存储，已保留配置文件中的 API Key 以免重启丢失")
             return
         stored = store.read()
         if stored is None:
-            # Credential Manager unreadable: an older plaintext key still works
-            # this run, but it may not stay on disk (README P0: never written
-            # in plaintext). The settings page tells the user to re-enter it.
             self._secret_value = in_file
             self._secret_read_failed = not in_file
             if not in_file:
                 log.warning("凭据管理器不可读，已保存的 API Key 本次无法读取")
             elif store.write(in_file):
-                # Reading can fail where writing works (e.g. a missing helper
-                # module); then the key is safe and the plaintext copy can go.
+                self._preserve_legacy_file_key = False
                 self._config.setdefault("llm", {})["api_key"] = ""
                 self.save_immediate()
                 log.info("凭据管理器读取失败但写入成功，API Key 已迁移")
             else:
-                self._scrub_plaintext_key(
-                    "凭据管理器不可读，配置文件中的 API Key 已移除，仅本次运行有效"
-                )
+                self._secret_persist_failed = True
+                self._preserve_legacy_file_key = True
+                log.warning("凭据管理器不可读写，已保留配置文件中的 API Key 以免重启丢失")
             return
         if in_file and store.write(in_file):
             log.info("已将 API Key 从配置文件迁移到 Windows 凭据管理器")
             stored = in_file
+            self._preserve_legacy_file_key = False
             self._config.setdefault("llm", {})["api_key"] = ""
             self.save_immediate()
         elif in_file:
             stored = in_file
-            self._scrub_plaintext_key(
-                "API Key 未能迁移到凭据管理器，已从配置文件移除，仅本次运行有效"
-            )
+            self._secret_persist_failed = True
+            self._preserve_legacy_file_key = True
+            log.warning("API Key 未能迁移到凭据管理器，已保留配置文件中的 API Key 以免重启丢失")
         self._secret_value = stored
 
     def _scrub_plaintext_key(self, reason: str) -> None:
-        """Drop a legacy plaintext key from config.json; keep it in memory only."""
+        """Drop a legacy plaintext key from config.json only when explicitly requested."""
+        self._preserve_legacy_file_key = False
         self._config.setdefault("llm", {})["api_key"] = ""
         self._secret_persist_failed = True
         self.save_immediate()
@@ -450,9 +470,11 @@ class Config:
             if not isinstance(section, dict):
                 continue
             for key in tuple(section.keys()):
-                if key in RETIRED_RECOGNITION_SWITCH_KEYS:
+                if key in RETIRED_RECOGNITION_SWITCH_KEYS or (
+                    section_name == "meeting" and key in RETIRED_MEETING_KEYS
+                ):
                     section.pop(key, None)
-                    log.info("升级清理：已移除废弃手动开关 %s.%s（现按模式与音源自动启用）", section_name, key)
+                    log.info("升级清理：已移除废弃配置项 %s.%s", section_name, key)
                     removed = True
         for key in tuple(self._extra_keys.keys()):
             if key in RETIRED_RECOGNITION_SWITCH_KEYS:
@@ -497,29 +519,83 @@ class Config:
         stt["migration_version"] = STT_MODEL_MIGRATION_VERSION
         self.save_immediate()
 
+    @staticmethod
+    def _is_startup_disabled_by_windows(winreg) -> bool:
+        """True when Windows Task Manager / Startup Apps explicitly disabled SayInk."""
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY, 0, winreg.KEY_READ
+            ) as key:
+                data, _ = winreg.QueryValueEx(key, "SayInk")
+                if isinstance(data, (bytes, bytearray)) and len(data) >= 1:
+                    # Windows writes odd status byte (e.g. 0x03, 0x01) when disabled.
+                    return (data[0] & 1) == 1
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _extract_command_exe(command: str) -> str:
+        text = (command or "").strip()
+        if not text:
+            return ""
+        if text.startswith('"'):
+            end = text.find('"', 1)
+            if end > 1:
+                return text[1:end].strip()
+        return text.split()[0].strip('"')
+
     def _sync_registry_auto_start(self):
-        """Sync auto_start setting with Windows registry (installer may have set it)."""
+        """Sync auto_start setting with Windows registry, respecting EXE path & StartupApproved."""
         if sys.platform != "win32":
             return
         try:
             import winreg
+            from sayink.app import auto_start_command
+
             key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            expected_cmd = auto_start_command()
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
             registered = False
+            reg_value = ""
             try:
-                winreg.QueryValueEx(key, "SayInk")
-                registered = True
+                raw_val, _ = winreg.QueryValueEx(key, "SayInk")
+                reg_value = str(raw_val or "").strip()
+                registered = bool(reg_value)
             except FileNotFoundError:
-                # Registry entry doesn't exist - nothing to sync
                 pass
             winreg.CloseKey(key)
-            # VoiceInk ≤ 2.1.0 wrote its own Run value. Its uninstaller does
-            # not remove it, so it would keep pointing at a deleted EXE (or
-            # start the app twice). Carry the intent over and drop the value.
+
             if self._drop_legacy_auto_start_value(winreg, key_path):
                 if not registered:
                     self._write_auto_start_value(winreg, key_path)
+                    reg_value = expected_cmd
                 registered = True
+
+            if self._is_startup_disabled_by_windows(winreg):
+                if self._config.get("auto_start", False):
+                    self._config["auto_start"] = False
+                    self.save_immediate()
+                    log.info("检测到系统启动项管理中已禁用 SayInk 开机自启，已同步关闭配置")
+                return
+
+            if registered:
+                norm_reg = os.path.normcase(reg_value)
+                norm_expected = os.path.normcase(expected_cmd.strip())
+                if norm_reg != norm_expected:
+                    reg_exe = self._extract_command_exe(reg_value)
+                    if self._config.get("auto_start", False):
+                        self._write_auto_start_value(winreg, key_path)
+                        log.info("已修复注册表开机自启路径为当前可执行文件")
+                    elif getattr(sys, "frozen", False):
+                        # Frozen build: ignore a Run entry pointing at another/deleted install.
+                        if not reg_exe or os.path.normcase(reg_exe) != os.path.normcase(sys.executable):
+                            registered = False
+                    elif reg_exe and os.path.isabs(reg_exe) and not os.path.exists(reg_exe):
+                        registered = False
+
             if registered and not self._config.get("auto_start", False):
                 self._config["auto_start"] = True
                 self.save_immediate()
@@ -627,31 +703,57 @@ class Config:
                     result[key] = copy.deepcopy(value)
         return result
 
+    def _schedule_save(self, delay_ms: int = 500) -> None:
+        timer = getattr(self, "_save_timer", None)
+        if timer is None:
+            return
+        app = QCoreApplication.instance()
+        relay = getattr(self, "_save_relay", None)
+        if app is not None and relay is not None and QThread.currentThread() is not timer.thread():
+            relay.request_start.emit(delay_ms)
+            return
+        timer.start(delay_ms)
+
+    def _stop_save_timer(self) -> None:
+        timer = getattr(self, "_save_timer", None)
+        if timer is None:
+            return
+        app = QCoreApplication.instance()
+        if app is None or QThread.currentThread() is timer.thread():
+            timer.stop()
+
     def _do_save(self):
         """实际执行保存操作"""
         self.save()
 
-    def save_immediate(self):
+    def save_immediate(self) -> bool:
         """立即保存配置，用于应用退出前。失败时返回 False。"""
-        self._save_timer.stop()
+        self._stop_save_timer()
         return self.save()
 
-    def save(self):
+    def save(self) -> bool:
         """Atomic write: write to temp file then rename to prevent corruption.
 
         Returns False when the file on disk was left unchanged.
         """
-        if self._persist_blocked:
+        if getattr(self, "_persist_blocked", False):
+            self.last_save_failed = True
             log.error("配置未能读出且无法备份，已停止写回以免覆盖原文件")
             return False
         llm = self._config.get("llm")
-        if isinstance(llm, dict) and llm.get("api_key") and not self._file_secrets:
+        if (
+            isinstance(llm, dict)
+            and llm.get("api_key")
+            and not getattr(self, "_file_secrets", False)
+            and not getattr(self, "_preserve_legacy_file_key", False)
+        ):
             leaked = str(llm.get("api_key") or "")
-            if leaked and not (self._secret_value or ""):
+            if leaked and not (getattr(self, "_secret_value", None) or ""):
                 self._secret_value = leaked
                 self._secret_persist_failed = True
             llm["api_key"] = ""
-        data = {**self._config, **self._extra_keys}
+        extra = getattr(self, "_extra_keys", {})
+        data = {**self._config, **extra}
         tmp_path = None
         try:
             fd, tmp_path = tempfile.mkstemp(
@@ -659,8 +761,17 @@ class Config:
             )
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            os.replace(tmp_path, str(self._config_file))
+            target_path = str(self._config_file)
+            for attempt in range(4):
+                try:
+                    os.replace(tmp_path, target_path)
+                    break
+                except PermissionError:
+                    if attempt >= 3:
+                        raise
+                    time.sleep(0.03 * (attempt + 1))
         except OSError as e:
+            self.last_save_failed = True
             log.error("配置文件保存失败: %s", e)
             if tmp_path is not None:
                 try:
@@ -668,6 +779,7 @@ class Config:
                 except OSError:
                     pass
             return False
+        self.last_save_failed = False
         return True
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -693,45 +805,52 @@ class Config:
 
     def set(self, key: str, value: Any):
         store = getattr(self, "_secrets", None)
-        if key == SECRET_KEY and store is None and not self._file_secrets:
+        if key == SECRET_KEY and store is None and not getattr(self, "_file_secrets", False):
             secret = str(value or "")
             llm = self._config.setdefault("llm", {})
             leaked = bool(llm.get("api_key"))
             if not secret:
                 self._secret_value = ""
                 self._secret_persist_failed = False
+                self._preserve_legacy_file_key = False
                 if leaked:
                     llm["api_key"] = ""
-                    self._save_timer.start(500)
+                    self._schedule_save(500)
                 return
-            if secret == (self._secret_value or "") and self._secret_persist_failed and not leaked:
+            if secret == (self._secret_value or "") and self._secret_persist_failed:
                 return
             self._secret_value = secret
             self._secret_persist_failed = True
-            if leaked:
-                llm["api_key"] = ""
-                self._save_timer.start(500)
-            log.warning("没有可用的凭据存储，API Key 仅在本次运行中有效，未写入配置文件")
+            if self._preserve_legacy_file_key:
+                llm["api_key"] = secret
+                self._schedule_save(500)
+            log.warning("没有可用的凭据存储，API Key 尚未能存入系统凭据管理器")
             return
         if key == SECRET_KEY and store is not None:
             secret = str(value or "")
             if secret == (self._secret_value or "") and not self._secret_persist_failed:
                 return
             self._secret_value = secret
+            if not secret:
+                self._preserve_legacy_file_key = False
             self._secret_persist_failed = not store.write(secret)
             if secret and not self._secret_persist_failed:
                 self._secret_read_failed = False
+                self._preserve_legacy_file_key = False
             if self._secret_persist_failed:
-                log.warning("API Key 未能存入凭据管理器，仅在本次运行中有效，未写入配置文件")
-            llm = self._config.setdefault("llm", {})
-            if llm.get("api_key"):
-                # A replaced legacy plaintext key must not outlive the change.
-                llm["api_key"] = ""
-                self._save_timer.start(500)
+                if self._preserve_legacy_file_key:
+                    self._config.setdefault("llm", {})["api_key"] = secret
+                    self._schedule_save(500)
+                log.warning("API Key 未能存入凭据管理器，已保留现有配置备份以免丢失")
+            else:
+                llm = self._config.setdefault("llm", {})
+                if llm.get("api_key"):
+                    llm["api_key"] = ""
+                    self._schedule_save(500)
             return
         if "." not in key and key not in DEFAULT_CONFIG:
             self._extra_keys[key] = value
-            self._save_timer.start(500)
+            self._schedule_save(500)
             return
         keys = key.split(".")
         config = self._config
@@ -745,10 +864,10 @@ class Config:
         elif key in ("output.mode", "output.follow_input_source"):
             self._sync_active_output_slot(key, value)
         # 延迟保存：500ms 后写入，多次 set 只触发一次写入
-        self._save_timer.start(500)
+        self._schedule_save(500)
 
     def get_all(self) -> dict:
-        return self._config.copy()
+        return copy.deepcopy(self._config)
 
     # ── Output mode ───────────────────────────────────
 

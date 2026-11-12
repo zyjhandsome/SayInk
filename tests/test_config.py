@@ -505,8 +505,8 @@ def test_unreadable_store_keeps_file_key(config_home):
     assert cfg.get("llm.api_key") == "sk-file"
 
 
-def test_unreadable_store_scrubs_plaintext_key_from_file(config_home):
-    """README P0: the key is never left in config.json, even when migration fails."""
+def test_unreadable_store_preserves_plaintext_key_when_write_fails(config_home):
+    """H-03: never wipe config.json's api_key when Credential Manager read & write both fail."""
     from sayink.config import Config
 
     _write_config(config_home, {"llm": {"api_key": "sk-file"}})
@@ -517,10 +517,10 @@ def test_unreadable_store_scrubs_plaintext_key_from_file(config_home):
 
     assert cfg.get("llm.api_key") == "sk-file"
     assert cfg.secret_persist_failed is True
-    assert _key_on_disk(config_home) == ""
+    assert _key_on_disk(config_home) == "sk-file"
     cfg.set("sound_enabled", False)
     cfg.save_immediate()
-    assert "sk-file" not in (config_home / "config.json").read_text(encoding="utf-8")
+    assert _key_on_disk(config_home) == "sk-file"
 
 
 def test_unreadable_but_writable_store_still_takes_the_file_key(config_home):
@@ -537,7 +537,8 @@ def test_unreadable_but_writable_store_still_takes_the_file_key(config_home):
     assert _key_on_disk(config_home) == ""
 
 
-def test_failed_migration_scrubs_plaintext_key_from_file(config_home):
+def test_failed_migration_preserves_plaintext_key_in_file(config_home):
+    """H-03: failed migration to Credential Manager must NOT wipe config.json."""
     from sayink.config import Config
 
     _write_config(config_home, {"llm": {"api_key": "sk-legacy"}})
@@ -545,7 +546,7 @@ def test_failed_migration_scrubs_plaintext_key_from_file(config_home):
 
     assert cfg.get("llm.api_key") == "sk-legacy"
     assert cfg.secret_persist_failed is True
-    assert _key_on_disk(config_home) == ""
+    assert _key_on_disk(config_home) == "sk-legacy"
 
 
 def test_unreadable_store_never_writes_new_key_to_file(config_home):
@@ -560,18 +561,25 @@ def test_unreadable_store_never_writes_new_key_to_file(config_home):
     assert _key_on_disk(config_home) == ""
 
 
-def test_replacing_legacy_file_key_removes_plaintext_even_if_store_fails(config_home):
+def test_replacing_legacy_file_key_scrubs_file_only_when_store_succeeds(config_home):
     from sayink.config import Config
 
+    secrets = _FakeSecrets(fail_write=True)
     _write_config(config_home, {"llm": {"api_key": "sk-legacy"}})
-    cfg = Config(config_dir=config_home, secret_store=_FakeSecrets(fail_write=True))
+    cfg = Config(config_dir=config_home, secret_store=secrets)
     assert cfg.get("llm.api_key") == "sk-legacy"
+    assert _key_on_disk(config_home) == "sk-legacy"
 
     cfg.set("llm.api_key", "sk-replacement")
     cfg.save_immediate()
-
     assert cfg.get("llm.api_key") == "sk-replacement"
+    assert _key_on_disk(config_home) == "sk-replacement"
+
+    secrets.fail_write = False
+    cfg.set("llm.api_key", "sk-replacement")
+    cfg.save_immediate()
     assert _key_on_disk(config_home) == ""
+    assert secrets.value == "sk-replacement"
 
 
 def test_missing_secret_store_keeps_a_new_key_in_memory_only(config_home):
@@ -587,7 +595,8 @@ def test_missing_secret_store_keeps_a_new_key_in_memory_only(config_home):
     assert "sk-plaintext" not in (config_home / "config.json").read_text(encoding="utf-8")
 
 
-def test_missing_secret_store_scrubs_a_legacy_file_key(config_home):
+def test_missing_secret_store_preserves_a_legacy_file_key(config_home):
+    """H-03: missing secret store must NOT wipe an existing api_key in config.json."""
     from sayink.config import Config
 
     _write_config(config_home, {"llm": {"api_key": "sk-file"}})
@@ -595,8 +604,7 @@ def test_missing_secret_store_scrubs_a_legacy_file_key(config_home):
 
     assert cfg.get("llm.api_key") == "sk-file"
     assert cfg.secret_persist_failed is True
-    assert _key_on_disk(config_home) == ""
-    assert "sk-file" not in (config_home / "config.json").read_text(encoding="utf-8")
+    assert _key_on_disk(config_home) == "sk-file"
 
 
 def test_isolated_config_dir_does_not_use_credential_store(config_home, monkeypatch):
