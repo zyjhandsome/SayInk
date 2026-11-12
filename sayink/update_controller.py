@@ -117,14 +117,22 @@ class UpdateController(QObject):
         self.state = UpdateState.CHECKING
         if interactive:
             self.sync_status()
-        worker = UpdateCheckWorker(__version__, self)
+        worker = UpdateCheckWorker(
+            __version__,
+            self,
+            proxy_mode=str(self._config.get("llm.proxy_mode", "system") or "system"),
+        )
         worker.result_ready.connect(self.on_check_result)
         worker.failed.connect(self.on_check_failed)
         self._check_worker = worker
         worker.start()
 
     def install(self) -> None:
-        from sayink.updater import MISSING_DIGEST_MESSAGE, UpdateDownloadWorker
+        from sayink.updater import (
+            MISSING_DIGEST_MESSAGE,
+            UpdateDownloadWorker,
+            cleanup_stale_installers,
+        )
 
         release = self.pending_release
         if release is None:
@@ -135,7 +143,9 @@ class UpdateController(QObject):
         if not release.sha256:
             self._set_download_status(MISSING_DIGEST_MESSAGE, action="check")
             return
-        dest = Path(tempfile.gettempdir()) / "SayInk" / release.asset_name
+        cache_dir = Path(tempfile.gettempdir()) / "SayInk"
+        cleanup_stale_installers(cache_dir, keep_asset_name=release.asset_name)
+        dest = cache_dir / release.asset_name
         self.state = UpdateState.DOWNLOADING
         self._set_download_status("正在下载…", action="busy")
         worker = UpdateDownloadWorker(
@@ -144,6 +154,8 @@ class UpdateController(QObject):
             self,
             expected_size=release.size,
             sha256=release.sha256,
+            signature_url=getattr(release, "signature_url", ""),
+            proxy_mode=str(self._config.get("llm.proxy_mode", "system") or "system"),
         )
         worker.progress.connect(self.on_download_progress)
         worker.finished_path.connect(self.on_downloaded)
@@ -225,6 +237,39 @@ class UpdateController(QObject):
         self.state = UpdateState.AVAILABLE
         self._set_download_status(message, action="install")
 
+    def _flush_before_installer_handoff(self) -> None:
+        """Persist drafts, SQLite WAL, and config non-destructively before spawning Setup."""
+        parent = self.parent()
+        if parent is not None:
+            mw = getattr(parent, "_main_window", None)
+            if mw is not None:
+                flush_notes = getattr(mw, "flush_pending_user_notes", None)
+                if callable(flush_notes):
+                    try:
+                        flush_notes()
+                    except Exception:
+                        log.debug("更新前刷新会议笔记草稿失败", exc_info=True)
+                hp = getattr(mw, "_history_page", None)
+                flush_del = getattr(hp, "flush_pending_delete", None) if hp is not None else None
+                if callable(flush_del):
+                    try:
+                        flush_del()
+                    except Exception:
+                        log.debug("更新前提交待删除历史记录失败", exc_info=True)
+            history = getattr(parent, "_history", None)
+            conn = getattr(history, "_conn", None) if history is not None else None
+            if conn is not None:
+                try:
+                    conn.commit()
+                except Exception:
+                    log.debug("更新前提交 SQLite 事务失败", exc_info=True)
+        save_now = getattr(self._config, "save_immediate", None)
+        if callable(save_now):
+            try:
+                save_now()
+            except Exception:
+                log.debug("更新前立即保存配置失败", exc_info=True)
+
     def on_downloaded(self, path: str) -> None:
         from sayink.updater import launch_installer
 
@@ -236,6 +281,7 @@ class UpdateController(QObject):
                 "下载完成。请结束监听并等待处理完成，再安装更新。", action="install"
             )
             return
+        self._flush_before_installer_handoff()
         try:
             launch_installer(path)
         except Exception as exc:

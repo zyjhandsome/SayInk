@@ -34,9 +34,28 @@ KEY_MAP = {
     "win": keyboard.Key.cmd,
     "cmd": keyboard.Key.cmd,
 }
-# The settings capture box offers F1–F12; a name parse_hotkey does not know
+# The settings capture box offers function keys; a name parse_hotkey does not know
 # would silently drop the main key and leave a modifier-only hotkey behind.
-KEY_MAP.update({f"f{n}": getattr(keyboard.Key, f"f{n}") for n in range(1, 13)})
+KEY_MAP.update(
+    {f"f{n}": getattr(keyboard.Key, f"f{n}") for n in range(1, 25) if hasattr(keyboard.Key, f"f{n}")}
+)
+
+_ASCII_OEM_VK_FALLBACK = {
+    "`": 0xC0,
+    "-": 0xBD,
+    "=": 0xBB,
+    "[": 0xDB,
+    "]": 0xDD,
+    "\\": 0xDC,
+    ";": 0xBA,
+    "'": 0xDE,
+    ",": 0xBC,
+    ".": 0xBE,
+    "/": 0xBF,
+}
+_HOLD_WATCH_POLL_MS = 100
+_HEALTH_CHECK_INTERVAL_MS = 5000
+_SLEEP_WAKE_GAP_S = 20.0
 
 
 _WM_KEYDOWN = 0x0100
@@ -73,17 +92,27 @@ def _main_key_vk(key) -> int | None:
     if vk:
         return int(vk)
     char = getattr(key, "char", None)
-    if not char or sys.platform != "win32":
+    if not char:
         return None
-    import ctypes
+    ch = char[0]
+    if "a" <= ch <= "z" or "A" <= ch <= "Z":
+        return ord(ch.upper())
+    if "0" <= ch <= "9":
+        return ord(ch)
+    if sys.platform != "win32":
+        return _ASCII_OEM_VK_FALLBACK.get(ch)
+    try:
+        import ctypes
 
-    vk_key_scan = ctypes.windll.user32.VkKeyScanW
-    vk_key_scan.argtypes = [ctypes.c_wchar]
-    vk_key_scan.restype = ctypes.c_short
-    scan = vk_key_scan(char[0])
-    if scan == -1:
-        return None
-    return scan & 0xFF
+        vk_key_scan = ctypes.windll.user32.VkKeyScanW
+        vk_key_scan.argtypes = [ctypes.c_wchar]
+        vk_key_scan.restype = ctypes.c_short
+        scan = vk_key_scan(ch)
+        if scan != -1:
+            return scan & 0xFF
+    except Exception:
+        pass
+    return _ASCII_OEM_VK_FALLBACK.get(ch)
 
 
 def parse_hotkey(hotkey_str: str) -> set:
@@ -132,22 +161,33 @@ class HotKeyManager(QObject):
         self._is_recording = False
         self._continuous_trigger_mode = False
         self._paused = False
+        self._stopped = False
         self._listener = None
         self._verify_async_state: bool | None = None
         self._lock = threading.Lock()
         self._hold_timer = QTimer(self)
         self._hold_timer.setSingleShot(True)
         self._hold_timer.timeout.connect(self._on_hold_timeout)
+        self._hold_watch_timer = QTimer(self)
+        self._hold_watch_timer.setInterval(_HOLD_WATCH_POLL_MS)
+        self._hold_watch_timer.timeout.connect(self._poll_recording_keys_held)
+        self._health_timer = QTimer(self)
+        self._health_timer.setInterval(_HEALTH_CHECK_INTERVAL_MS)
+        self._health_timer.timeout.connect(self._on_health_tick)
+        self._last_health_wall = time.time()
+        self._last_health_mono = time.monotonic()
         self._hold_pending = False
         self._hold_activated = False
         self._hold_started_at = 0.0
         self._suppressed_vks: set[int] = set()
         self._suppressed_vk_at: dict[int, float] = {}
+        self._suppressed_vk_async_visible: set[int] = set()
         self._main_keys_by_vk: dict[int, object] = {}
         self._hotkey_modifiers: tuple = ()
         self._rebuild_suppress_plan()
         self._arm_hold_on_main.connect(self._start_hold_timer_on_main_thread)
         self._hook_log.connect(self._emit_hook_log, Qt.ConnectionType.QueuedConnection)
+        self.destroyed.connect(self._stop_listener_quietly)
 
     @staticmethod
     def _emit_hook_log(level: int, message: str) -> None:
@@ -163,17 +203,17 @@ class HotKeyManager(QObject):
         """Caller holds ``self._lock`` or is still in __init__."""
         modifiers = tuple(k for k in self._hotkey_keys if k in _MODIFIER_VKS)
         mains: dict[int, object] = {}
-        if modifiers:
-            for key in self._hotkey_keys:
-                if key in _MODIFIER_VKS:
-                    continue
-                vk = _main_key_vk(key)
-                if vk:
-                    mains[vk] = key
+        for key in self._hotkey_keys:
+            if key in _MODIFIER_VKS:
+                continue
+            vk = _main_key_vk(key)
+            if vk:
+                mains[vk] = key
         self._hotkey_modifiers = modifiers
         self._main_keys_by_vk = mains
         self._suppressed_vks = set()
         self._suppressed_vk_at = {}
+        self._suppressed_vk_async_visible = set()
 
     @staticmethod
     def _async_key_down(vk: int) -> bool:
@@ -332,6 +372,8 @@ class HotKeyManager(QObject):
                 with self._lock:
                     self._suppressed_vks.add(vk)
                     self._suppressed_vk_at[vk] = now
+                    if self._async_key_down(vk):
+                        self._suppressed_vk_async_visible.add(vk)
                 # Auto-repeat of the main key keeps arriving after the user
                 # let go of the modifier; feeding the modifier then would
                 # re-arm a hold the user is not making.
@@ -347,6 +389,7 @@ class HotKeyManager(QObject):
                 with self._lock:
                     self._suppressed_vks.discard(vk)
                     self._suppressed_vk_at.pop(vk, None)
+                    self._suppressed_vk_async_visible.discard(vk)
                 # A tap that gets typed into the app is plain typing, not a
                 # failed hold: no 「录音过短」 hint for it.
                 replayable = self._tap_is_typing(modifiers)
@@ -369,9 +412,135 @@ class HotKeyManager(QObject):
             listener.suppress_event()
         return True
 
-    def start(self):
-        if self._listener is not None:
+    def _stop_listener_quietly(self, *_args) -> None:
+        listener = getattr(self, "_listener", None)
+        if listener is not None and isinstance(listener, keyboard.Listener):
+            try:
+                listener.stop()
+            except Exception:
+                pass
+            self._listener = None
+
+    def __del__(self):
+        try:
+            self._stop_listener_quietly()
+        except Exception:
+            pass
+
+    def _start_health_timer_if_possible(self) -> None:
+        from PyQt6.QtCore import QCoreApplication, QThread
+
+        app = QCoreApplication.instance()
+        if app is not None and QThread.currentThread() is self._health_timer.thread():
+            self._last_health_wall = time.time()
+            self._last_health_mono = time.monotonic()
+            if not self._health_timer.isActive():
+                self._health_timer.start(_HEALTH_CHECK_INTERVAL_MS)
+
+    def _stop_timers_if_possible(self) -> None:
+        from PyQt6.QtCore import QCoreApplication, QThread
+
+        app = QCoreApplication.instance()
+        if app is None or QThread.currentThread() is self._hold_watch_timer.thread():
+            self._hold_watch_timer.stop()
+            self._health_timer.stop()
+
+    def _restart_listener(self) -> None:
+        old = self._listener
+        self._listener = None
+        if old is not None:
+            try:
+                old.stop()
+                old.join(timeout=1.0)
+            except Exception:
+                pass
+        with self._lock:
+            self._pressed_keys.clear()
+            self._suppressed_vks.clear()
+            self._suppressed_vk_at.clear()
+            self._suppressed_vk_async_visible.clear()
+        self.start()
+
+    def _on_health_tick(self) -> None:
+        if self._stopped:
+            self._health_timer.stop()
             return
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        wall_delta = now_wall - self._last_health_wall
+        self._last_health_wall = now_wall
+        self._last_health_mono = now_mono
+
+        woke_from_sleep = wall_delta >= _SLEEP_WAKE_GAP_S
+        listener = self._listener
+        is_alive_fn = getattr(listener, "is_alive", None) if listener is not None else None
+        listener_dead = listener is None or (callable(is_alive_fn) and not is_alive_fn())
+
+        if woke_from_sleep:
+            log.info("检测到系统睡眠唤醒 (间隔 %.1fs)，正在自愈全局热键监听", wall_delta)
+            self._poll_recording_keys_held()
+            self._restart_listener()
+        elif listener_dead:
+            log.warning("检测到全局热键监听线程已停止，正在自动恢复")
+            self._restart_listener()
+
+    def _poll_recording_keys_held(self) -> None:
+        """100ms GetAsyncKeyState fallback while recording in hold-to-talk mode.
+
+        Ensures releasing the hotkey inside an elevated Administrator window
+        (where Windows UIPI drops WM_KEYUP to our low-level hook) stops recording
+        immediately instead of latching the microphone open.
+        """
+        if not self._should_reconcile_async_state():
+            self._hold_watch_timer.stop()
+            return
+        emit_stop = False
+        now = time.monotonic()
+        with self._lock:
+            if not self._is_recording or self._continuous_trigger_mode or self._paused:
+                self._hold_watch_timer.stop()
+                return
+            released = False
+            if self._hotkey_modifiers and not self._modifiers_held(self._hotkey_modifiers):
+                released = True
+            if not released:
+                for key in self._hotkey_keys:
+                    if key in _MODIFIER_VKS:
+                        continue
+                    vk = _main_key_vk(key)
+                    if not vk:
+                        continue
+                    if vk not in self._suppressed_vks or vk in self._suppressed_vk_async_visible:
+                        if not self._async_key_down(vk):
+                            released = True
+                            break
+                    elif not self._hotkey_modifiers:
+                        # Single-key suppressed hotkey (e.g. F8): hardware typematic
+                        # repeat stops arriving once UIPI / lock screen eats events.
+                        last_at = self._suppressed_vk_at.get(vk, now)
+                        if (now - last_at) > _SUPPRESSED_REPEAT_MAX_GAP_S:
+                            released = True
+                            break
+            if released:
+                self._is_recording = False
+                self._hold_pending = False
+                self._pressed_keys.clear()
+                self._suppressed_vks.clear()
+                self._suppressed_vk_at.clear()
+                self._suppressed_vk_async_visible.clear()
+                emit_stop = True
+        if emit_stop:
+            self._hold_watch_timer.stop()
+            log.debug("GetAsyncKeyState 轮询检测到热键已松开（可能位于提权窗口），立即停止录音")
+            self.recording_stop.emit()
+
+    def start(self):
+        self._stopped = False
+        if self._listener is not None:
+            is_alive_fn = getattr(self._listener, "is_alive", None)
+            if not callable(is_alive_fn) or is_alive_fn():
+                return
+            self._stop_listener_quietly()
         kwargs = {}
         if sys.platform == "win32":
             kwargs["win32_event_filter"] = self._win32_event_filter
@@ -399,6 +568,7 @@ class HotKeyManager(QObject):
             return
         if self._listener.is_alive():
             log.info("全局快捷键监听已启动: %s", self._hotkey_str)
+            self._start_health_timer_if_possible()
             self.listener_status.emit(True, "")
         else:
             log.error("全局快捷键监听未运行: %s", self._hotkey_str)
@@ -409,7 +579,9 @@ class HotKeyManager(QObject):
             )
 
     def stop(self):
+        self._stopped = True
         self._cancel_hold_pending()
+        self._stop_timers_if_possible()
         if self._listener:
             self._listener.stop()
             try:
@@ -421,14 +593,18 @@ class HotKeyManager(QObject):
             self._pressed_keys.clear()
             self._suppressed_vks.clear()
             self._suppressed_vk_at.clear()
+            self._suppressed_vk_async_visible.clear()
 
     def pause(self):
         self._cancel_hold_pending()
+        if self._hold_watch_timer.isActive():
+            self._hold_watch_timer.stop()
         with self._lock:
             self._paused = True
             self._pressed_keys.clear()
             self._suppressed_vks.clear()
             self._suppressed_vk_at.clear()
+            self._suppressed_vk_async_visible.clear()
 
     def resume(self):
         self._cancel_hold_pending()
@@ -437,6 +613,7 @@ class HotKeyManager(QObject):
             self._pressed_keys.clear()
             self._suppressed_vks.clear()
             self._suppressed_vk_at.clear()
+            self._suppressed_vk_async_visible.clear()
 
     def update_hotkey(self, hotkey_str: str):
         self._cancel_hold_pending()
@@ -446,6 +623,12 @@ class HotKeyManager(QObject):
             self._rebuild_suppress_plan()
             self._pressed_keys.clear()
         log.info("快捷键已更新: %s", hotkey_str)
+        listener = self._listener
+        is_alive_fn = getattr(listener, "is_alive", None) if listener is not None else None
+        if listener is None and not self._stopped:
+            self.start()
+        elif listener is not None and callable(is_alive_fn) and not is_alive_fn() and not self._stopped:
+            self._restart_listener()
 
     def set_continuous_trigger_mode(self, enabled: bool) -> None:
         """When True, hold hotkey starts continuous listening (release does not stop)."""
@@ -501,6 +684,8 @@ class HotKeyManager(QObject):
             self.continuous_listen_start.emit()
         elif start_recording:
             log.debug("快捷键按住达标，开始录音")
+            if reconcile:
+                self._hold_watch_timer.start(_HOLD_WATCH_POLL_MS)
             self.recording_start.emit()
 
     def _normalize_key(self, key):
@@ -519,6 +704,17 @@ class HotKeyManager(QObject):
             if keyboard.Key.shift_r in self._hotkey_keys:
                 return key
             return keyboard.Key.shift_l
+        if isinstance(key, keyboard.KeyCode) and key not in self._hotkey_keys:
+            vk = getattr(key, "vk", None)
+            if vk is not None:
+                mapped = self._main_keys_by_vk.get(int(vk))
+                if mapped is not None:
+                    return mapped
+            char = getattr(key, "char", None)
+            if char and len(char) == 1:
+                lower_kc = keyboard.KeyCode.from_char(char.lower())
+                if lower_kc in self._hotkey_keys:
+                    return lower_kc
         return key
 
     @staticmethod
@@ -625,6 +821,9 @@ class HotKeyManager(QObject):
         if sync_hold_timer:
             self._arm_hold_on_main.emit()
         if emit_stop:
+            if self._hold_watch_timer.isActive():
+                self._stop_timers_if_possible()
+                self._start_health_timer_if_possible()
             self._defer_hook_log(logging.DEBUG, "快捷键松开，停止录音")
             self.recording_stop.emit()
         return tapped

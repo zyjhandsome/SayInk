@@ -291,6 +291,9 @@ def build():
     dist_dir = dist_parent / app_name
     exe_path = dist_dir / "SayInk.exe"
     if app_name != "SayInk":
+        alt_exe = dist_dir / f"{app_name}.exe"
+        if alt_exe.is_file() and not exe_path.exists():
+            alt_exe.replace(exe_path)
         marker = dist_parent / "SAYINK_STAGING_DIR.txt"
         marker.write_text(app_name, encoding="utf-8")
     elif (dist_parent / "SAYINK_STAGING_DIR.txt").exists():

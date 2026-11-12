@@ -12,6 +12,50 @@ CREDENTIAL_TARGET = "SayInk/llm.api_key"
 LEGACY_CREDENTIAL_TARGET = "VoiceInk/llm.api_key"
 
 
+def decode_credential_blob(blob: bytes | bytearray | memoryview | str | None) -> str:
+    """Decode a Windows CredentialBlob stored as UTF-16LE or raw UTF-8/ASCII."""
+    if not blob:
+        return ""
+    if isinstance(blob, str):
+        return blob
+    raw = bytes(blob)
+    if raw.startswith(b"\xff\xfe"):
+        return raw[2:].decode("utf-16-le", errors="replace").rstrip("\x00")
+    if raw.startswith(b"\xfe\xff"):
+        return raw[2:].decode("utf-16-be", errors="replace").rstrip("\x00")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", errors="replace").rstrip("\x00")
+
+    # C-string null-terminated single-byte ASCII/UTF-8 (only trailing NULs, no interior NULs)
+    stripped_trailing_nul = raw.rstrip(b"\x00")
+    if stripped_trailing_nul and len(stripped_trailing_nul) < len(raw) and b"\x00" not in stripped_trailing_nul:
+        if all(0x20 <= b <= 0x7E or b in (9, 10, 13) for b in stripped_trailing_nul):
+            return stripped_trailing_nul.decode("ascii")
+        try:
+            text = stripped_trailing_nul.decode("utf-8", errors="strict")
+            if all(ch.isprintable() or ch in "\t\r\n" for ch in text):
+                return text
+        except UnicodeDecodeError:
+            pass
+
+    if b"\x00" in raw and len(raw) % 2 == 0:
+        return raw.decode("utf-16-le", errors="replace").rstrip("\x00")
+
+    if b"\x00" not in raw:
+        if all(0x20 <= b <= 0x7E or b in (9, 10, 13) for b in raw):
+            return raw.decode("ascii")
+        try:
+            text = raw.decode("utf-8", errors="strict")
+            if all(ch.isprintable() or ch in "\t\r\n" for ch in text):
+                return text
+        except UnicodeDecodeError:
+            pass
+
+    if len(raw) % 2 == 0:
+        return raw.decode("utf-16-le", errors="replace").rstrip("\x00")
+    return raw.decode("utf-8", errors="replace").rstrip("\x00")
+
+
 class WindowsCredentialStore:
     """Generic credential scoped to the current Windows user."""
 
@@ -31,9 +75,7 @@ class WindowsCredentialStore:
             log.warning("读取凭据管理器失败: %s", exc)
             return None
         blob = cred.get("CredentialBlob") or b""
-        if isinstance(blob, bytes):
-            return blob.decode("utf-16-le", errors="ignore")
-        return str(blob)
+        return decode_credential_blob(blob)
 
     def read(self) -> str | None:
         value = self._read_target(self._target)

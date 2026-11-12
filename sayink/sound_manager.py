@@ -1,4 +1,6 @@
+import atexit
 import logging
+import threading
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
@@ -10,9 +12,40 @@ class SoundManager:
 
     SAMPLE_RATE = 44100
     _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sound")
+    _executor_lock = threading.Lock()
+    _play_lock = threading.Lock()
+    _executor_shutdown = False
 
     def __init__(self, enabled: bool = True):
         self._enabled = enabled
+        self._closed = False
+        self._ensure_executor()
+
+    @classmethod
+    def _ensure_executor(cls) -> ThreadPoolExecutor:
+        with cls._executor_lock:
+            if cls._executor_shutdown or cls._executor is None:
+                cls._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sound")
+                cls._executor_shutdown = False
+            return cls._executor
+
+    @classmethod
+    def shutdown_executor(cls, wait: bool = False) -> None:
+        """Shut down the shared audio cue worker pool idempotently on exit."""
+        with cls._executor_lock:
+            if cls._executor_shutdown:
+                return
+            cls._executor_shutdown = True
+            executor = cls._executor
+        try:
+            executor.shutdown(wait=wait, cancel_futures=True)
+        except Exception:
+            pass
+
+    def shutdown(self, wait: bool = False) -> None:
+        """Stop accepting cues for this manager and release the background pool."""
+        self._closed = True
+        self.shutdown_executor(wait=wait)
 
     @property
     def enabled(self) -> bool:
@@ -33,33 +66,48 @@ class SoundManager:
         return tone.astype(np.float32)
 
     def _play_async(self, audio_data: np.ndarray):
-        def _play():
-            try:
-                import sounddevice as sd
-                sd.play(audio_data, self.SAMPLE_RATE, blocking=True)
-            except Exception as e:
-                log.warning("播放声音失败: %s", e)
+        if self._closed:
+            return
 
-        # 使用线程池，避免频繁创建线程
-        self._executor.submit(_play)
+        def _play():
+            if self._closed or self._executor_shutdown:
+                return
+            with self._play_lock:
+                if self._closed or self._executor_shutdown:
+                    return
+                try:
+                    import sounddevice as sd
+                    sd.play(audio_data, self.SAMPLE_RATE, blocking=True)
+                except Exception as e:
+                    log.warning("播放声音失败: %s", e)
+
+        # 使用线程池串行化提交，避免并发调用 PortAudio 全局流及解释器退出时报 RuntimeError
+        executor = self._ensure_executor()
+        try:
+            executor.submit(_play)
+        except RuntimeError:
+            log.debug("提示音线程池已关闭，跳过播放")
 
     def play_start(self):
-        if not self._enabled:
+        if not self._enabled or self._closed:
             return
         tone = self._generate_tone(880, 0.1, 0.25)
         self._play_async(tone)
 
     def play_stop(self):
-        if not self._enabled:
+        if not self._enabled or self._closed:
             return
         tone = self._generate_tone(660, 0.12, 0.25)
         self._play_async(tone)
 
     def play_error(self):
-        if not self._enabled:
+        if not self._enabled or self._closed:
             return
         t1 = self._generate_tone(400, 0.1, 0.2)
         silence = np.zeros(int(self.SAMPLE_RATE * 0.05), dtype=np.float32)
         t2 = self._generate_tone(300, 0.15, 0.2)
         tone = np.concatenate([t1, silence, t2])
         self._play_async(tone)
+
+
+atexit.register(SoundManager.shutdown_executor)

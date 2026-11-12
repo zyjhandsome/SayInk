@@ -90,10 +90,15 @@ class TestReleaseSelection:
     def test_two_part_tag_is_compared_as_patch_zero(self):
         from sayink.updater import version_key
 
-        assert version_key("v1.2") == (1, 2, 0)
+        assert version_key("v1.2")[:3] == (1, 2, 0)
+        assert version_key("v1.2") == version_key("1.2.0")
         assert is_newer("1.2", "1.1.9")
         assert not is_newer("v1.2", "1.2.0")
         assert is_newer("1.2.1", "v1.2")
+        assert is_newer("2.3.0", "2.3.0-rc1")
+        assert not is_newer("2.3.0-rc1", "2.3.0")
+        assert is_newer("2.3.0-rc2", "2.3.0-rc1")
+        assert is_newer("2.3.0-rc1", "2.3.0-beta2")
 
     def test_fallback_installer_must_carry_the_release_version(self):
         from sayink.updater import pick_installer_asset
