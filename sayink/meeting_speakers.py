@@ -105,6 +105,7 @@ class MeetingSpeakerSession(SpeakerSession):
         self._profiles: dict[int, _Profile] = {}
         self._observations: OrderedDict[int, _Observation] = OrderedDict()
         self._turns: list[TurnObservation] = []
+        self._turn_index: dict[int, int] = {}
         self._serial = 0
         self._dimension = 0
 
@@ -133,6 +134,15 @@ class MeetingSpeakerSession(SpeakerSession):
             return len(self._profiles)
 
     @property
+    def confirmed(self) -> dict[int, int]:
+        with self._lock:
+            return {
+                int(key): int(p.speaker_id)
+                for p in self._profiles.values()
+                for key in p.confirmed
+            }
+
+    @property
     def history(self) -> list[tuple[int, np.ndarray]]:
         with self._lock:
             return [(p.speaker_id, vector.copy()) for p in self._profiles.values()
@@ -156,8 +166,26 @@ class MeetingSpeakerSession(SpeakerSession):
             self._profiles.clear()
             self._observations.clear()
             self._turns.clear()
+            self._turn_index.clear()
             self._serial = 0
             self._dimension = 0
+
+    def _evict_observations(self) -> None:
+        if len(self._observations) <= MAX_RECENT_OBSERVATIONS:
+            return
+        protected_keys: set[int] = set()
+        for prof in self._profiles.values():
+            protected_keys.update(prof.confirmed)
+        excess = len(self._observations) - MAX_RECENT_OBSERVATIONS
+        for obs_key in list(self._observations):
+            if excess <= 0:
+                break
+            if obs_key in protected_keys:
+                continue
+            del self._observations[obs_key]
+            excess -= 1
+        while len(self._observations) > MAX_RECENT_OBSERVATIONS:
+            self._observations.popitem(last=False)
 
     def assign(self, embedding: np.ndarray, route: str = "", *, start_ms: int = 0,
                end_ms: int = 0, sample_key: int | None = None, learnable: bool = True) -> int:
@@ -175,12 +203,18 @@ class MeetingSpeakerSession(SpeakerSession):
                 profile = self._profiles.setdefault(speaker_id, _Profile(speaker_id, route))
                 profile.add(key, vector)
             self._observations[key] = _Observation(speaker_id, vector, route, bool(learnable))
-            while len(self._observations) > MAX_RECENT_OBSERVATIONS:
-                self._observations.popitem(last=False)
+            self._evict_observations()
             if self._keep_history:
                 duration = int(end_ms - start_ms) if end_ms and end_ms >= start_ms >= 0 else 0
-                self._turns.append(TurnObservation(key, speaker_id, None if vector is None else vector.copy(),
-                                                   duration, bool(learnable)))
+                obs_turn = TurnObservation(
+                    key, speaker_id, None if vector is None else vector.copy(), duration, bool(learnable)
+                )
+                existing_idx = self._turn_index.get(key)
+                if existing_idx is not None and 0 <= existing_idx < len(self._turns):
+                    self._turns[existing_idx] = obs_turn
+                else:
+                    self._turn_index[key] = len(self._turns)
+                    self._turns.append(obs_turn)
             # Uncertain turns break the continuity chain.
             self._last_id = speaker_id
             self._last_end_ms = int(end_ms or start_ms or 0)
@@ -256,24 +290,34 @@ class MeetingSpeakerSession(SpeakerSession):
         automatic assignment does not keep influencing subsequent turns.
         """
         with self._lock:
-            observation = self._observations.get(int(sample_key))
+            key = int(sample_key)
+            observation = self._observations.get(key)
             if speaker_id <= 0 or observation is None:
                 return False
+            turn_idx = self._turn_index.get(key)
             for sid, profile in list(self._profiles.items()):
-                profile.samples.pop(int(sample_key), None)
-                profile.confirmed.discard(int(sample_key))
+                profile.samples.pop(key, None)
+                profile.confirmed.discard(key)
                 if not profile.samples:
                     del self._profiles[sid]
             observation.speaker_id = speaker_id
-            self._turns = [TurnObservation(t.key, speaker_id, t.vector, t.duration_ms, t.learnable) if t.key == int(sample_key) else t
-                           for t in self._turns]
-            if next(reversed(self._observations)) == int(sample_key):
+            if turn_idx is not None and 0 <= turn_idx < len(self._turns):
+                t = self._turns[turn_idx]
+                self._turns[turn_idx] = TurnObservation(t.key, speaker_id, t.vector, t.duration_ms, t.learnable)
+            elif self._turns:
+                self._turns = [
+                    TurnObservation(t.key, speaker_id, t.vector, t.duration_ms, t.learnable) if t.key == key else t
+                    for t in self._turns
+                ]
+            if self._observations and next(reversed(self._observations)) == key:
                 self._last_id = speaker_id
             if not observation.learnable or observation.vector is None:
+                self._evict_observations()
                 return False
             profile = self._profiles.setdefault(speaker_id, _Profile(speaker_id, observation.route))
             if profile.route and observation.route and profile.route != observation.route:
                 profile.route = ""  # An explicit correction can link capture lanes.
-            profile.add(int(sample_key), observation.vector, confirmed=True)
+            profile.add(key, observation.vector, confirmed=True)
+            self._evict_observations()
             self._next_id = max(self._next_id, speaker_id + 1)
             return True

@@ -569,7 +569,7 @@ class TestMinutesWorker:
 
     def test_chunk_returning_non_json_is_an_error(self, fake_httpx):
         lines = [TranscriptLine(i * 1000, 1, "内容" * 30) for i in range(40)]
-        fake_httpx.script.extend([json.dumps({"summary": "A"}), "坏掉了"])
+        fake_httpx.script.extend([json.dumps({"summary": "A"}), "坏掉了", "坏掉了"])
         results, errors, _ = _run(MinutesWorker(_request(lines, chunk_chars=1000)))
         assert results == [] and "第 2/" in errors[0]
 

@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
+import shutil
 import sqlite3
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -60,6 +63,7 @@ class MeetingRecord:
     ended_at: int | None = None
     status: str = STATUS_LIVE
     deleted_at: int | None = None
+    audio_path: str = ""
 
     @property
     def duration_ms(self) -> int:
@@ -111,6 +115,13 @@ class MeetingNotes:
     transcript_changed: bool = False
     previous_transcript_changed: bool = False
     previous_metadata: str = ""
+    user_markdown: str = ""
+    user_metadata: str = ""
+    user_transcript_changed: bool = False
+
+    @property
+    def has_user_backup(self) -> bool:
+        return bool(self.user_markdown)
 
     def payload(self) -> dict[str, Any]:
         if not self.json_payload:
@@ -154,10 +165,85 @@ def _row_to_queued(r: tuple) -> QueuedGeneration:
 
 _MEETING_COLUMNS = (
     "id, title, participants, agenda, notes_user, source, model_id, vad, glossary, "
-    "started_at, ended_at, status, deleted_at"
+    "started_at, ended_at, status, deleted_at, audio_path"
 )
 
 _NOTE_METADATA_COLUMNS = ("template_id", "model", "json_payload", "generated_at", "duration_ms", "chunked", "user_edited")
+_OWNED_AUDIO_SUFFIXES = frozenset({
+    ".wav", ".f32", ".pcm", ".raw", ".ogg", ".opus", ".m4a", ".mp3", ".flac", ".aac", ".webm", ".tmp",
+})
+_CACHE_DIR_NAMES = frozenset({
+    "audio-recovery",
+    "meeting-audio",
+    "meeting_audio",
+    "recordings",
+    "audio_cache",
+    "sayink_audio_cache",
+    "cache",
+})
+
+
+def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, audio_path: str) -> None:
+    """Best-effort removal of SayInk-owned cached audio for a deleted meeting.
+
+    External user media/transcript files and symlinks are never touched.
+    """
+    try:
+        db_resolved = db_path.resolve()
+        db_root = db_resolved.parent
+    except OSError:
+        return
+
+    allowed_roots: list[Path] = [db_root]
+    temp_root = Path(tempfile.gettempdir())
+    for extra in (Path.home() / ".sayink", temp_root / "SayInk", temp_root / "sayink"):
+        try:
+            allowed_roots.append(extra.resolve())
+        except OSError:
+            continue
+
+    raw = (audio_path or "").strip()
+    if raw:
+        try:
+            candidate = Path(raw)
+            if not candidate.is_symlink():
+                resolved = candidate.resolve()
+                in_allowed = any(
+                    resolved != root and resolved.is_relative_to(root)
+                    for root in allowed_roots
+                )
+                in_named_cache = any(part.lower() in _CACHE_DIR_NAMES for part in resolved.parts)
+                # Never delete user-imported media files unless explicitly stored in an owned cache folder.
+                owned_source = source not in (MEDIA_SOURCE, IMPORT_SOURCE) or in_named_cache
+                if in_allowed and owned_source and resolved != db_resolved:
+                    if candidate.is_file() and candidate.suffix.lower() in _OWNED_AUDIO_SUFFIXES:
+                        candidate.unlink(missing_ok=True)
+                    elif candidate.is_dir():
+                        markers = ("audio.f32", "microphone.f32", "system.f32", "session.json")
+                        if any((candidate / m).exists() for m in markers):
+                            shutil.rmtree(candidate, ignore_errors=True)
+        except OSError:
+            pass
+
+    recovery_root = db_root / "audio-recovery"
+    try:
+        if recovery_root.is_dir() and not recovery_root.is_symlink():
+            for child in recovery_root.iterdir():
+                if not child.is_dir() or child.is_symlink() or len(child.name) != 32:
+                    continue
+                meta_file = child / "session.json"
+                if not meta_file.is_file() or meta_file.is_symlink():
+                    continue
+                try:
+                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(meta, dict) and (
+                    meta.get("meeting_id") == meeting_id or meta.get("session_id") == meeting_id
+                ):
+                    shutil.rmtree(child, ignore_errors=True)
+    except OSError:
+        pass
 
 
 def _note_metadata(conn: sqlite3.Connection, meeting_id: str) -> dict[str, Any]:
@@ -186,6 +272,7 @@ def _row_to_meeting(r: tuple) -> MeetingRecord:
         ended_at=int(r[10]) if r[10] is not None else None,
         status=r[11] or STATUS_LIVE,
         deleted_at=int(r[12]) if r[12] is not None else None,
+        audio_path=(r[13] or "") if len(r) > 13 else "",
     )
 
 
@@ -219,6 +306,7 @@ class MeetingStore:
         glossary: list[dict[str, Any]] | None = None,
         started_at: int | None = None,
         meeting_id: str | None = None,
+        audio_path: str = "",
     ) -> MeetingRecord:
         record = MeetingRecord(
             id=meeting_id or uuid.uuid4().hex,
@@ -231,16 +319,17 @@ class MeetingStore:
             glossary=list(glossary or []),
             started_at=now_ms() if started_at is None else int(started_at),
             status=STATUS_LIVE,
+            audio_path=str(audio_path or ""),
         )
 
         def _insert(conn: sqlite3.Connection) -> None:
             conn.execute(
-                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.id, record.title, record.participants, record.agenda,
                     record.notes_user, record.source, record.model_id, record.vad,
                     json.dumps(record.glossary, ensure_ascii=False),
-                    record.started_at, None, record.status, None,
+                    record.started_at, None, record.status, None, record.audio_path,
                 ),
             )
 
@@ -294,12 +383,12 @@ class MeetingStore:
 
         def _promote(conn: sqlite3.Connection) -> None:
             conn.execute(
-                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.id, record.title, record.participants, record.agenda,
                     record.notes_user, record.source, record.model_id, record.vad,
                     json.dumps(record.glossary, ensure_ascii=False),
-                    record.started_at, record.ended_at, record.status, None,
+                    record.started_at, record.ended_at, record.status, None, record.audio_path,
                 ),
             )
             conn.executemany(
@@ -377,12 +466,12 @@ class MeetingStore:
 
         def _insert(conn: sqlite3.Connection) -> None:
             conn.execute(
-                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.id, record.title, record.participants, record.agenda,
                     record.notes_user, record.source, record.model_id, record.vad,
                     json.dumps(record.glossary, ensure_ascii=False),
-                    record.started_at, record.ended_at, record.status, None,
+                    record.started_at, record.ended_at, record.status, None, record.audio_path,
                 ),
             )
             rows = []
@@ -434,6 +523,9 @@ class MeetingStore:
         audio_ms: int = 0,
         model_id: str = "",
         vad: str = "",
+        glossary: list[dict[str, Any]] | None = None,
+        meeting_id: str | None = None,
+        audio_path: str = "",
     ) -> MeetingRecord | None:
         """Save recognized file turns. The source media itself is not stored.
 
@@ -452,24 +544,28 @@ class MeetingStore:
         if status == STATUS_ENDED:
             span = max(span, int(audio_ms or 0))
         record = MeetingRecord(
-            id=uuid.uuid4().hex,
+            id=meeting_id or uuid.uuid4().hex,
             title=title.strip(),
             source=MEDIA_SOURCE,
             model_id=model_id,
             vad=vad,
+            glossary=list(glossary or []),
             started_at=started,
             ended_at=started + span,
             status=status,
+            audio_path=str(audio_path or ""),
         )
 
         def _insert(conn: sqlite3.Connection) -> None:
+            if conn.execute("SELECT 1 FROM meetings WHERE id = ?", (record.id,)).fetchone() is not None:
+                return
             conn.execute(
-                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.id, record.title, record.participants, record.agenda,
                     record.notes_user, record.source, record.model_id, record.vad,
                     json.dumps(record.glossary, ensure_ascii=False),
-                    record.started_at, record.ended_at, record.status, None,
+                    record.started_at, record.ended_at, record.status, None, record.audio_path,
                 ),
             )
             rows = []
@@ -520,14 +616,26 @@ class MeetingStore:
                 """
                 UPDATE meetings
                 SET status = ?,
-                    ended_at = COALESCE(
-                        ended_at,
-                        (SELECT MAX(created_at) FROM history WHERE history.session_id = meetings.id),
-                        started_at
+                    ended_at = MAX(
+                        started_at,
+                        COALESCE(
+                            ended_at,
+                            (
+                                SELECT MAX(
+                                    CASE
+                                        WHEN captured_at > 0 THEN captured_at + CASE WHEN duration_ms > 0 THEN duration_ms ELSE 0 END
+                                        ELSE created_at
+                                    END
+                                )
+                                FROM history
+                                WHERE history.session_id = meetings.id AND history.trigger_mode = ?
+                            ),
+                            started_at
+                        )
                     )
                 WHERE status = ?
                 """,
-                (STATUS_INTERRUPTED, STATUS_LIVE),
+                (STATUS_INTERRUPTED, MEETING_TRIGGER_MODE, STATUS_LIVE),
             )
 
         self._write(_fix)
@@ -540,6 +648,7 @@ class MeetingStore:
         participants: str | None = None,
         agenda: str | None = None,
         notes_user: str | None = None,
+        audio_path: str | None = None,
     ) -> None:
         fields: dict[str, str] = {}
         if title is not None:
@@ -550,6 +659,8 @@ class MeetingStore:
             fields["agenda"] = agenda
         if notes_user is not None:
             fields["notes_user"] = notes_user
+        if audio_path is not None:
+            fields["audio_path"] = audio_path
         if not fields:
             return
         assignments = ", ".join(f"{k} = ?" for k in fields)
@@ -561,9 +672,11 @@ class MeetingStore:
         self._write(_update)
 
     def delete_meeting(self, meeting_id: str) -> None:
-        """Hard-delete the meeting: metadata, transcript rows, marks, speakers, notes."""
+        """Hard-delete the meeting: metadata, transcript rows, marks, speakers, notes, and owned cached audio."""
+        db_path = self._history.db_path
 
         def _delete(conn: sqlite3.Connection) -> None:
+            row = conn.execute("SELECT source, audio_path FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
             conn.execute("DELETE FROM history WHERE session_id = ?", (meeting_id,))
             conn.execute("DELETE FROM meeting_marks WHERE meeting_id = ?", (meeting_id,))
             conn.execute("DELETE FROM meeting_speakers WHERE meeting_id = ?", (meeting_id,))
@@ -571,6 +684,9 @@ class MeetingStore:
             conn.execute("DELETE FROM meeting_generation_cache WHERE meeting_id = ?", (meeting_id,))
             conn.execute("DELETE FROM meeting_generation_queue WHERE meeting_id = ?", (meeting_id,))
             conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+            source = str(row[0] or "") if row else ""
+            audio_path = str(row[1] or "") if row else ""
+            _cleanup_owned_meeting_audio(db_path, meeting_id, source, audio_path)
 
         self._write(_delete)
 
@@ -583,9 +699,16 @@ class MeetingStore:
         ids = list(dict.fromkeys(meeting_id for meeting_id in meeting_ids if meeting_id))
         if not ids or self.disabled:
             return
+        db_path = self._history.db_path
 
         def _delete_all(conn: sqlite3.Connection) -> None:
+            audio_rows: list[tuple[str, str, str]] = []
             for meeting_id in ids:
+                row = conn.execute("SELECT source, audio_path FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+                if row is not None:
+                    audio_rows.append((meeting_id, str(row[0] or ""), str(row[1] or "")))
+                else:
+                    audio_rows.append((meeting_id, "", ""))
                 conn.execute("DELETE FROM history WHERE session_id = ?", (meeting_id,))
                 conn.execute("DELETE FROM meeting_marks WHERE meeting_id = ?", (meeting_id,))
                 conn.execute("DELETE FROM meeting_speakers WHERE meeting_id = ?", (meeting_id,))
@@ -593,6 +716,8 @@ class MeetingStore:
                 conn.execute("DELETE FROM meeting_generation_cache WHERE meeting_id = ?", (meeting_id,))
                 conn.execute("DELETE FROM meeting_generation_queue WHERE meeting_id = ?", (meeting_id,))
                 conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+            for meeting_id, source, audio_path in audio_rows:
+                _cleanup_owned_meeting_audio(db_path, meeting_id, source, audio_path)
 
         self._write(_delete_all)
 
@@ -656,7 +781,12 @@ class MeetingStore:
                     (meeting_id, sid, name),
                 )
             if markdown is not None:
-                conn.execute("UPDATE meeting_notes SET markdown = ? WHERE meeting_id = ?", (markdown, meeting_id))
+                conn.execute(
+                    "UPDATE meeting_notes SET markdown = ?, "
+                    "user_markdown = CASE WHEN user_edited = 1 THEN ? ELSE user_markdown END "
+                    "WHERE meeting_id = ?",
+                    (markdown, markdown, meeting_id),
+                )
         self._write(_save)
 
     def relabel_segments(self, meeting_id: str, mapping: dict[int, int]) -> None:
@@ -694,7 +824,11 @@ class MeetingStore:
                 conn.execute(
                     "UPDATE meeting_notes SET transcript_changed = 1, "
                     "previous_transcript_changed = CASE WHEN previous_markdown != '' THEN 1 "
-                    "ELSE previous_transcript_changed END WHERE meeting_id = ?", (meeting_id,),
+                    "ELSE previous_transcript_changed END, "
+                    "user_transcript_changed = CASE WHEN user_markdown != '' THEN 1 "
+                    "ELSE user_transcript_changed END "
+                    "WHERE meeting_id = ?",
+                    (meeting_id,),
                 )
 
         self._write(_update)
@@ -719,7 +853,11 @@ class MeetingStore:
                 conn.execute(
                     "UPDATE meeting_notes SET transcript_changed = 1, "
                     "previous_transcript_changed = CASE WHEN previous_markdown != '' THEN 1 "
-                    "ELSE previous_transcript_changed END WHERE meeting_id = ?", (meeting_id,),
+                    "ELSE previous_transcript_changed END, "
+                    "user_transcript_changed = CASE WHEN user_markdown != '' THEN 1 "
+                    "ELSE user_transcript_changed END "
+                    "WHERE meeting_id = ?",
+                    (meeting_id,),
                 )
 
         self._write(_update)
@@ -828,13 +966,35 @@ class MeetingStore:
         chunked: bool = False,
         generated_at: int | None = None,
         keep_previous: bool = False,
+        user_markdown: str | None = None,
     ) -> None:
         """Upsert the notes. The replaced markdown becomes ``previous_markdown``
         unless ``keep_previous`` (a re-render of the same version, e.g. after a
-        speaker rename, must not push the real previous version out)."""
+        speaker rename, must not push the real previous version out) or a
+        protected hand-edited backup already sits in ``previous_markdown``."""
         stamp = now_ms() if generated_at is None else int(generated_at)
 
         def _upsert(conn: sqlite3.Connection) -> None:
+            existing_row = conn.execute(
+                "SELECT markdown, previous_markdown, user_edited, transcript_changed, "
+                "previous_transcript_changed, previous_metadata, user_markdown "
+                "FROM meeting_notes WHERE meeting_id = ?",
+                (meeting_id,),
+            ).fetchone()
+            preserve_prev = bool(keep_previous)
+            if not preserve_prev and existing_row is not None:
+                ex_user_edited = bool(existing_row[2])
+                ex_prev_md = existing_row[1] or ""
+                ex_user_md = existing_row[6] or ""
+                if not ex_user_edited and ex_user_md and ex_prev_md:
+                    try:
+                        prev_meta = json.loads(existing_row[5] or "{}")
+                    except (ValueError, TypeError):
+                        prev_meta = {}
+                    if isinstance(prev_meta, dict) and prev_meta.get("user_edited"):
+                        # Keep the user's hand-edited draft in previous_markdown across
+                        # multiple consecutive template trials so 恢复上一版 never loses it.
+                        preserve_prev = True
             previous_metadata = json.dumps(_note_metadata(conn, meeting_id), ensure_ascii=False)
             conn.execute(
                 """
@@ -849,6 +1009,7 @@ class MeetingStore:
                                                      ELSE meeting_notes.transcript_changed END,
                   previous_metadata = CASE WHEN ? THEN meeting_notes.previous_metadata ELSE ? END,
                   transcript_changed = CASE WHEN ? THEN meeting_notes.transcript_changed ELSE 0 END,
+                  user_markdown = COALESCE(?, meeting_notes.user_markdown),
                   template_id = excluded.template_id,
                   model = excluded.model,
                   json_payload = excluded.json_payload,
@@ -861,10 +1022,11 @@ class MeetingStore:
                 (
                     meeting_id, template_id, model, json_payload, markdown,
                     stamp, int(duration_ms), 1 if chunked else 0,
+                    1 if preserve_prev else 0,
+                    1 if preserve_prev else 0,
+                    1 if preserve_prev else 0, previous_metadata,
                     1 if keep_previous else 0,
-                    1 if keep_previous else 0,
-                    1 if keep_previous else 0, previous_metadata,
-                    1 if keep_previous else 0,
+                    user_markdown,
                 ),
             )
 
@@ -910,24 +1072,149 @@ class MeetingStore:
 
         self._write(_swap)
 
-    def save_user_markdown(self, meeting_id: str, markdown: str) -> None:
-        """The user edited the rendered notes; keep the edit, mark it as such."""
+    def save_user_markdown(self, meeting_id: str, markdown: str, *, keep_backup: bool = False) -> None:
+        """The user edited the rendered notes; keep the edit, mark it as such,
+        and back up an unbacked-up initial AI draft before overwriting it."""
 
         def _update(conn: sqlite3.Connection) -> None:
-            cur = conn.execute(
-                "UPDATE meeting_notes SET markdown = ?, user_edited = 1 WHERE meeting_id = ?",
-                (markdown, meeting_id),
-            )
-            if cur.rowcount == 0:
+            row = conn.execute(
+                "SELECT markdown, previous_markdown, user_edited, transcript_changed "
+                "FROM meeting_notes WHERE meeting_id = ?",
+                (meeting_id,),
+            ).fetchone()
+            stamp = now_ms()
+            if row is None:
+                user_meta = json.dumps(
+                    {
+                        "template_id": "", "model": "", "json_payload": "",
+                        "generated_at": stamp, "duration_ms": 0, "chunked": 0, "user_edited": 1,
+                    },
+                    ensure_ascii=False,
+                )
                 conn.execute(
                     """
-                    INSERT INTO meeting_notes (meeting_id, markdown, user_edited, generated_at)
-                    VALUES (?, ?, 1, ?)
+                    INSERT INTO meeting_notes (
+                      meeting_id, markdown, user_edited, generated_at,
+                      user_markdown, user_metadata, user_transcript_changed
+                    ) VALUES (?, ?, 1, ?, ?, ?, 0)
                     """,
-                    (meeting_id, markdown, now_ms()),
+                    (meeting_id, markdown, stamp, markdown, user_meta),
+                )
+                return
+
+            ex_markdown, ex_prev_markdown, ex_user_edited, ex_tx_changed = (
+                row[0] or "", row[1] or "", bool(row[2]), int(row[3] or 0)
+            )
+            current_meta = _note_metadata(conn, meeting_id)
+            user_meta = json.dumps({**current_meta, "user_edited": 1}, ensure_ascii=False)
+            if not keep_backup and not ex_prev_markdown and ex_markdown and not ex_user_edited:
+                conn.execute(
+                    """
+                    UPDATE meeting_notes
+                    SET previous_markdown = ?,
+                        previous_metadata = ?,
+                        previous_transcript_changed = ?,
+                        markdown = ?,
+                        user_edited = 1,
+                        user_markdown = ?,
+                        user_metadata = ?,
+                        user_transcript_changed = ?
+                    WHERE meeting_id = ?
+                    """,
+                    (
+                        ex_markdown,
+                        json.dumps(current_meta, ensure_ascii=False),
+                        ex_tx_changed,
+                        markdown,
+                        markdown,
+                        user_meta,
+                        ex_tx_changed,
+                        meeting_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE meeting_notes
+                    SET markdown = ?,
+                        user_edited = 1,
+                        user_markdown = ?,
+                        user_metadata = ?,
+                        user_transcript_changed = ?
+                    WHERE meeting_id = ?
+                    """,
+                    (markdown, markdown, user_meta, ex_tx_changed, meeting_id),
                 )
 
         self._write(_update)
+
+    def restore_user_markdown(self, meeting_id: str) -> None:
+        """Restore the dedicated hand-edited minutes slot regardless of how many
+        AI template regenerations occurred afterwards."""
+
+        def _restore(conn: sqlite3.Connection) -> None:
+            row = conn.execute(
+                "SELECT markdown, user_edited, transcript_changed, "
+                "user_markdown, user_metadata, user_transcript_changed "
+                "FROM meeting_notes WHERE meeting_id = ?",
+                (meeting_id,),
+            ).fetchone()
+            if row is None or not (row[3] or ""):
+                return
+            cur_md, cur_edited, cur_tx_changed, user_md, raw_user_meta, user_tx_changed = (
+                row[0] or "", bool(row[1]), int(row[2] or 0),
+                row[3] or "", row[4] or "", int(row[5] or 0),
+            )
+            if cur_edited and cur_md == user_md:
+                return
+            current_meta = _note_metadata(conn, meeting_id)
+            try:
+                parsed_user_meta = json.loads(raw_user_meta or "{}")
+            except (ValueError, TypeError):
+                parsed_user_meta = {}
+            if not isinstance(parsed_user_meta, dict):
+                parsed_user_meta = {}
+            restored = {key: parsed_user_meta.get(key, current_meta.get(key)) for key in _NOTE_METADATA_COLUMNS}
+            restored["user_edited"] = 1
+            if cur_md:
+                conn.execute(
+                    """
+                    UPDATE meeting_notes
+                    SET previous_markdown = ?,
+                        previous_transcript_changed = ?,
+                        previous_metadata = ?,
+                        markdown = ?,
+                        transcript_changed = ?,
+                        template_id = ?, model = ?, json_payload = ?, generated_at = ?, duration_ms = ?, chunked = ?,
+                        user_edited = ?
+                    WHERE meeting_id = ?
+                    """,
+                    (
+                        cur_md,
+                        cur_tx_changed,
+                        json.dumps(current_meta, ensure_ascii=False),
+                        user_md,
+                        user_tx_changed,
+                        *restored.values(),
+                        meeting_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE meeting_notes
+                    SET markdown = ?,
+                        transcript_changed = ?,
+                        template_id = ?, model = ?, json_payload = ?, generated_at = ?, duration_ms = ?, chunked = ?,
+                        user_edited = ?
+                    WHERE meeting_id = ?
+                    """,
+                    (user_md, user_tx_changed, *restored.values(), meeting_id),
+                )
+
+        self._write(_restore)
+
+    restore_user_notes = restore_user_markdown
 
     # -- reads -------------------------------------------------------------
 
@@ -977,11 +1264,23 @@ class MeetingStore:
                     OR m.notes_user LIKE ? ESCAPE '\\'
                     OR m.id IN (
                       SELECT session_id FROM history
-                      WHERE corrected_text LIKE ? ESCAPE '\\' OR (corrected_text = '' AND
-                            (raw_text LIKE ? ESCAPE '\\' OR polished_text LIKE ? ESCAPE '\\'))
+                      WHERE trigger_mode = ?
+                        AND polished_text != '\u200b'
+                        AND (
+                          corrected_text LIKE ? ESCAPE '\\'
+                          OR (
+                            corrected_text = ''
+                            AND (raw_text LIKE ? ESCAPE '\\' OR polished_text LIKE ? ESCAPE '\\')
+                          )
+                        )
                     )
                     OR m.id IN (SELECT meeting_id FROM meeting_notes WHERE markdown LIKE ? ESCAPE '\\')
                     OR m.id IN (SELECT meeting_id FROM meeting_marks WHERE note LIKE ? ESCAPE '\\')
+                    OR m.id IN (
+                      SELECT meeting_id FROM meeting_speakers
+                      WHERE display_name LIKE ? ESCAPE '\\'
+                         OR (display_name = '' AND name_locked = 0 AND suggested_name LIKE ? ESCAPE '\\')
+                    )
                   )
                 ORDER BY m.started_at DESC
                 LIMIT ?
@@ -989,7 +1288,8 @@ class MeetingStore:
                 (
                     STATUS_DELETED,
                     pattern, pattern, pattern, pattern,
-                    pattern, pattern, pattern,
+                    MEETING_TRIGGER_MODE, pattern, pattern, pattern,
+                    pattern, pattern,
                     pattern, pattern,
                     int(limit),
                 ),
@@ -1089,7 +1389,8 @@ class MeetingStore:
                 """
                 SELECT meeting_id, template_id, model, json_payload, markdown,
                        previous_markdown, user_edited, generated_at, duration_ms, chunked,
-                       transcript_changed, previous_transcript_changed, previous_metadata
+                       transcript_changed, previous_transcript_changed, previous_metadata,
+                       user_markdown, user_metadata, user_transcript_changed
                 FROM meeting_notes WHERE meeting_id = ?
                 """,
                 (meeting_id,),
@@ -1110,6 +1411,9 @@ class MeetingStore:
                 transcript_changed=bool(r[10]),
                 previous_transcript_changed=bool(r[11]),
                 previous_metadata=r[12] or "",
+                user_markdown=r[13] or "",
+                user_metadata=r[14] or "",
+                user_transcript_changed=bool(r[15]),
             )
 
         return self._history.read(_q, default=None)

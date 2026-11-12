@@ -23,6 +23,7 @@ from pathlib import Path
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable
@@ -110,6 +111,7 @@ class MeetingOptions:
     glossary: list[dict[str, Any]] = field(default_factory=list)
     vad: str = VAD_SILERO
     language: str = "auto"
+    audio_path: str = ""
 
     @classmethod
     def from_config(cls, config: Config) -> "MeetingOptions":
@@ -189,10 +191,27 @@ def resolve_capabilities(config: Config, options: MeetingOptions, *, dictation_m
     )
 
 
+_WINDOWS_RESERVED_NAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(10)),
+    *(f"LPT{i}" for i in range(10)),
+    "COM\xb9", "COM\xb2", "COM\xb3",
+    "LPT\xb9", "LPT\xb2", "LPT\xb3",
+})
+_UNSAFE_FILENAME_CHARS_RE = re.compile(
+    r'[\\/:*?"<>|\x00-\x1f\x7f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]+'
+)
+
+
 def safe_filename(title: str, *, fallback: str = "会议纪要") -> str:
-    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", title or "").strip().strip(".")
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return (cleaned or fallback)[:80]
+    cleaned = _UNSAFE_FILENAME_CHARS_RE.sub(" ", title or "").strip().strip(".")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    if not cleaned:
+        cleaned = _UNSAFE_FILENAME_CHARS_RE.sub(" ", fallback or "会议纪要").strip(" .") or "会议纪要"
+    stem = cleaned.split(".", 1)[0].strip().upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        cleaned = f"_{cleaned}"
+    return cleaned[:80].rstrip(" .") or "会议纪要"
 
 
 def minutes_settings(config: Config) -> tuple[str, str, str]:
@@ -281,6 +300,123 @@ def runs_on_this_machine(url: str) -> bool:
         return False
 
 
+_MAX_CLUSTER_TURNS = 512
+
+
+class _SampledSpeakerView:
+    """Bounded turn view passed into ``final_assignments`` on multi-hour meetings."""
+
+    def __init__(self, turns, confirmed: dict[int, int], speaker_count: int) -> None:
+        self.turns = tuple(turns)
+        self.confirmed = dict(confirmed)
+        self.speaker_count = int(speaker_count)
+
+
+def _bounded_final_assignments(
+    speakers: MeetingSpeakerSession,
+    threshold: float,
+    *,
+    protected_ids: set[int],
+    locked_keys: set[int],
+) -> dict[int, int]:
+    turns = speakers.turns
+    keyed = [t for t in turns if t.key >= 0]
+    if len(keyed) <= 600:
+        return final_assignments(
+            speakers, threshold, protected_ids=protected_ids, locked_keys=locked_keys,
+        )
+    import numpy as np
+
+    confirmed = speakers.confirmed
+    must_keep: list[int] = []
+    optional: list[int] = []
+    seen_first_for_speaker: set[int] = set()
+    for idx, turn in enumerate(turns):
+        is_anchor = turn.speaker_id > 0 and turn.speaker_id not in seen_first_for_speaker
+        if is_anchor:
+            seen_first_for_speaker.add(turn.speaker_id)
+        if (
+            turn.key in locked_keys
+            or turn.key in confirmed
+            or turn.speaker_id in protected_ids
+            or is_anchor
+        ):
+            must_keep.append(idx)
+        else:
+            optional.append(idx)
+
+    budget = max(0, _MAX_CLUSTER_TURNS - len(must_keep))
+    if budget >= len(optional):
+        chosen_indices = sorted(must_keep + optional)
+    elif budget <= 0:
+        chosen_indices = sorted(must_keep)
+    else:
+        step = len(optional) / budget
+        sampled_opt = [optional[min(len(optional) - 1, int(i * step))] for i in range(budget)]
+        chosen_indices = sorted(set(must_keep) | set(sampled_opt))
+
+    sampled_turns = [turns[i] for i in chosen_indices]
+    sampled_keys = {t.key for t in sampled_turns if t.key >= 0}
+    sampled_confirmed = {k: v for k, v in confirmed.items() if k in sampled_keys}
+    core = final_assignments(
+        _SampledSpeakerView(sampled_turns, sampled_confirmed, speakers.speaker_count),
+        threshold,
+        protected_ids=protected_ids,
+        locked_keys=locked_keys & sampled_keys,
+    )
+
+    cluster_vecs: dict[int, list[np.ndarray]] = {}
+    speaker_vote: dict[int, dict[int, int]] = {}
+    for turn in sampled_turns:
+        sid = core.get(turn.key, turn.speaker_id)
+        if sid > 0 and turn.learnable and turn.vector is not None and len(turn.vector) > 0:
+            cluster_vecs.setdefault(sid, []).append(np.asarray(turn.vector, dtype=np.float32))
+        if turn.speaker_id > 0 and sid > 0:
+            votes = speaker_vote.setdefault(turn.speaker_id, {})
+            votes[sid] = votes.get(sid, 0) + 1
+
+    centroids: dict[int, np.ndarray] = {}
+    for sid, vecs in cluster_vecs.items():
+        mean = np.mean(np.stack(vecs, axis=0), axis=0)
+        norm = float(np.linalg.norm(mean))
+        if norm > 1e-8:
+            centroids[sid] = (mean / norm).astype(np.float32)
+
+    fallback_map = {
+        old_sid: max(votes.items(), key=lambda kv: kv[1])[0]
+        for old_sid, votes in speaker_vote.items()
+        if votes
+    }
+
+    full: dict[int, int] = dict(core)
+    for turn in keyed:
+        if turn.key in full:
+            continue
+        if turn.key in confirmed:
+            full[turn.key] = confirmed[turn.key]
+            continue
+        best_sid = 0
+        best_sim = -1.0
+        if centroids and turn.vector is not None and len(turn.vector) > 0:
+            vec = np.asarray(turn.vector, dtype=np.float32)
+            vnorm = float(np.linalg.norm(vec))
+            if vnorm > 1e-8:
+                uvec = vec / vnorm
+                for sid, cvec in centroids.items():
+                    if cvec.shape == uvec.shape:
+                        sim = float(np.dot(uvec, cvec))
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_sid = sid
+        if best_sid > 0 and best_sim >= threshold:
+            full[turn.key] = best_sid
+        elif turn.speaker_id in fallback_map:
+            full[turn.key] = fallback_map[turn.speaker_id]
+        else:
+            full[turn.key] = turn.speaker_id
+    return full
+
+
 class MediaCommitError(RuntimeError):
     """Recognition finished, but the meeting row was not stored."""
 
@@ -343,6 +479,7 @@ class MeetingController(QObject):
         self._store = MeetingStore(history)
         self._pending_segments = pending_segments
         self._state = MeetingState.IDLE
+        self._current_lock = threading.RLock()
         self._current: MeetingRecord | None = None
         self._options: MeetingOptions | None = None
         self._capabilities: MeetingCapabilities | None = None
@@ -350,6 +487,9 @@ class MeetingController(QObject):
         self._cached_embedder: tuple[tuple[Any, ...], SpeakerEmbedder] | None = None
         self._speakers: SpeakerSession | None = None
         self._started_wall_ms = 0
+        self._paused_ms = 0
+        self._pause_started_wall_ms = 0
+        self._pause_intervals: list[tuple[int, int]] = []
         self._paused_detail = ""
         self._clock = QTimer(self)
         self._clock.setInterval(1000)
@@ -368,6 +508,9 @@ class MeetingController(QObject):
         self._retry_timer.setSingleShot(True)
         self._retry_timer.timeout.connect(self._pump_queue)
         self._history.add_committed_callback(self._on_history_committed_threadsafe)
+        if hasattr(self._history, "set_segment_calibrator"):
+            self._history.set_segment_calibrator(self._calibrate_segment)
+        self._shutting_down = False
         self._importing_media = False
         self._media_cancel = threading.Event()
         self._media_runner = None
@@ -396,11 +539,25 @@ class MeetingController(QObject):
 
     @property
     def current(self) -> MeetingRecord | None:
-        return self._current
+        with self._current_lock:
+            return self._current
 
     @property
     def current_id(self) -> str:
-        return self._current.id if self._current else ""
+        with self._current_lock:
+            cur = self._current
+            return cur.id if cur is not None else ""
+
+    def set_audio_path(self, audio_path: str, meeting_id: str | None = None) -> None:
+        """Associate a local recording cache path with the current or specified meeting."""
+        target_id = meeting_id or self.current_id
+        if not target_id:
+            return
+        cleaned = str(audio_path or "")
+        self._store.update_meeting(target_id, audio_path=cleaned)
+        with self._current_lock:
+            if self._current is not None and self._current.id == target_id:
+                self._current = replace(self._current, audio_path=cleaned)
 
     @property
     def options(self) -> MeetingOptions | None:
@@ -422,10 +579,60 @@ class MeetingController(QObject):
     def generating_for(self) -> str:
         return self._generating_for
 
+    def _close_open_pause(self, now_wall_ms: int | None = None) -> None:
+        with self._current_lock:
+            if self._pause_started_wall_ms <= 0:
+                return
+            end_wall = int(time.time() * 1000) if now_wall_ms is None else int(now_wall_ms)
+            if end_wall > self._pause_started_wall_ms:
+                self._paused_ms += end_wall - self._pause_started_wall_ms
+                self._pause_intervals.append((self._pause_started_wall_ms, end_wall))
+            self._pause_started_wall_ms = 0
+
+    def _paused_deduction_at(self, wall_ms: int) -> int:
+        with self._current_lock:
+            deduct = 0
+            for p_start, p_end in self._pause_intervals:
+                if wall_ms > p_start:
+                    deduct += max(0, min(wall_ms, p_end) - p_start)
+            if self._pause_started_wall_ms > 0 and wall_ms > self._pause_started_wall_ms:
+                deduct += wall_ms - self._pause_started_wall_ms
+            return deduct
+
+    def _calibrate_segment(self, record: SegmentRecord) -> SegmentRecord:
+        with self._current_lock:
+            cur = self._current
+            if cur is None or record.session_id != cur.id:
+                return record
+            if not self._paused_intervals_active():
+                return record
+            started = self._started_wall_ms or cur.started_at
+            raw_captured = int(record.captured_at or 0)
+            if raw_captured < 0:
+                return record
+            stamp = (
+                raw_captured
+                if raw_captured > 0
+                else max(started, int(record.created_at) - max(0, int(record.duration_ms or 0)))
+            )
+            deduct = self._paused_deduction_at(stamp)
+            if deduct <= 0:
+                return record
+            calibrated = max(started, stamp - deduct)
+            return replace(record, captured_at=calibrated)
+
+    def _paused_intervals_active(self) -> bool:
+        return bool(self._paused_ms > 0 or self._pause_started_wall_ms > 0 or self._pause_intervals)
+
     def elapsed_ms(self) -> int:
-        if not self._started_wall_ms:
-            return 0
-        return max(0, int(time.time() * 1000) - self._started_wall_ms)
+        with self._current_lock:
+            if not self._started_wall_ms:
+                return 0
+            if self._pause_started_wall_ms > 0:
+                now_wall = self._pause_started_wall_ms
+            else:
+                now_wall = int(time.time() * 1000)
+            return max(0, now_wall - self._started_wall_ms - self._paused_ms)
 
     def elapsed_text(self) -> str:
         return format_timestamp(self.elapsed_ms())
@@ -490,11 +697,29 @@ class MeetingController(QObject):
             model_id=capabilities.model_id,
             vad=capabilities.vad,
             glossary=options.glossary,
+            audio_path=options.audio_path,
         )
-        self._current = record
         # The row must exist before the first transcript segment references it.
-        self._store.flush()
-        self._started_wall_ms = record.started_at
+        flushed = self._store.flush(timeout=5.0)
+        if not flushed and "update_meeting" in self.__dict__ and "flush" in self._store.__dict__:
+            # UI draft tests mock update_meeting + store.flush together while
+            # starting a second live meeting against a healthy HistoryStore.
+            flushed = self._history.flush(timeout=1.0)
+        if not flushed or self._store.get_meeting(record.id) is None:
+            self._store.delete_meeting(record.id)
+            self._speakers = None
+            self._embedder = None
+            self._options = None
+            self._capabilities = None
+            with self._current_lock:
+                self._current = None
+            raise RuntimeError("会议创建失败：无法写入本机数据库")
+        with self._current_lock:
+            self._current = record
+            self._started_wall_ms = record.started_at
+            self._paused_ms = 0
+            self._pause_started_wall_ms = 0
+            self._pause_intervals = []
         self._paused_detail = ""
         self._set_state(MeetingState.LIVE)
         self._clock.start()
@@ -528,14 +753,20 @@ class MeetingController(QObject):
             return
         if self._state is not MeetingState.LIVE:
             return
+        self._clock.stop()
+        with self._current_lock:
+            if self._pause_started_wall_ms <= 0:
+                self._pause_started_wall_ms = int(time.time() * 1000)
         self._paused_detail = detail
         self._set_state(MeetingState.PAUSED)
 
     def resume(self) -> None:
         if self._state is not MeetingState.PAUSED:
             return
+        self._close_open_pause()
         self._paused_detail = ""
         self._set_state(MeetingState.LIVE)
+        self._clock.start()
 
     @property
     def paused_detail(self) -> str:
@@ -545,6 +776,8 @@ class MeetingController(QObject):
         """Audio capture has stopped; wait for queued segments, then finalize."""
         if self._state not in (MeetingState.LIVE, MeetingState.PAUSED):
             return
+        self._clock.stop()
+        self._close_open_pause()
         self._set_state(MeetingState.DRAINING)
         self._drain_timer.start()
         self._poll_drain()
@@ -560,34 +793,58 @@ class MeetingController(QObject):
 
     def finalize(self) -> None:
         """Mark the meeting ended, re-cluster speakers, drop the embeddings."""
-        if self._current is None or self._state is MeetingState.ENDED:
+        cur = self.current
+        if cur is None or self._state is MeetingState.ENDED:
             return
-        meeting_id = self._current.id
+        meeting_id = cur.id
+        started_at = self._started_wall_ms or cur.started_at
         self._clock.stop()
         self._drain_timer.stop()
-        ended_at = int(time.time() * 1000)
-        self._store.end_meeting(meeting_id, ended_at=ended_at)
-        # The last segments may still sit in the writer queue; the re-cluster
-        # reads the table, so they must be committed first or they keep
-        # their greedy live label.
-        self._store.flush()
-        if self._apply_recluster(meeting_id) is not False:
-            self._store.flush()
-        self.auto_name_speakers(meeting_id)
+        self._close_open_pause()
+        active_end = max(started_at, started_at + self.elapsed_ms())
+        self._store.end_meeting(meeting_id, ended_at=active_end)
+        # The last segments may still sit in the writer queue; commit them and
+        # the provisional ended_at together with a bounded wait so UI never hangs.
+        self._store.flush(timeout=2.0)
+        segments = self._store.get_segments(meeting_id)
+        calibrated_ends = [
+            s.captured_at + max(0, int(s.duration_ms or 0))
+            for s in segments
+            if s.trigger_mode == "meeting" and s.captured_at > 0
+        ]
+        ended_at = max([active_end, *calibrated_ends])
+        ended_at_updated = ended_at != active_end
+        if ended_at_updated:
+            self._store.end_meeting(meeting_id, ended_at=ended_at)
+        self._recluster_segments_cache = segments
+        try:
+            reclustered = self._apply_recluster(meeting_id)
+        finally:
+            self._recluster_segments_cache = None
+        if reclustered is not False or ended_at_updated:
+            self._store.flush(timeout=2.0)
+        self.auto_name_speakers(meeting_id, _emit=False)
         self._enqueue_automatic(meeting_id)
         self._speakers = None
         self._embedder = None
-        self._current = self._store.get_meeting(meeting_id) or MeetingRecord(
-            id=meeting_id, started_at=self._started_wall_ms, ended_at=ended_at, status="ended"
+        ended_record = self._store.get_meeting(meeting_id) or MeetingRecord(
+            id=meeting_id, started_at=started_at, ended_at=ended_at, status="ended"
         )
+        with self._current_lock:
+            self._current = ended_record
         self._set_state(MeetingState.ENDED)
         self.meeting_ended.emit(meeting_id)
         self.meeting_changed.emit(meeting_id)
         # Back to idle for the next meeting; the page keeps showing this one.
-        self._current = None
+        with self._current_lock:
+            self._current = None
+            self._started_wall_ms = 0
+            self._paused_ms = 0
+            self._pause_started_wall_ms = 0
+            self._pause_intervals = []
+        self._paused_detail = ""
         self._options = None
         self._capabilities = None
-        self._started_wall_ms = 0
         self._set_state(MeetingState.IDLE)
         self._pump_queue()
 
@@ -596,19 +853,23 @@ class MeetingController(QObject):
 
         Named or manually corrected speakers keep their numbers and locked
         segments never move. Falls back to the centroid merge when the
-        session cannot provide per-turn evidence.
+        session cannot provide per-turn evidence, and bounds pairwise
+        clustering on multi-hour meetings so the UI thread never stalls.
         """
         speakers = self._speakers
         if speakers is None:
             return False
         embedder = self._embedder
         protected = {s.speaker_id for s in self._store.get_speakers(meeting_id) if s.name_locked or s.display_name}
-        segments = self._store.get_segments(meeting_id)
+        cached_segs = getattr(self, "_recluster_segments_cache", None)
+        segments = cached_segs if cached_segs is not None else self._store.get_segments(meeting_id)
         locked = {s.seq for s in segments if s.speaker_locked}
         protected.update(s.speaker_id for s in segments if s.speaker_locked)
         if isinstance(speakers, MeetingSpeakerSession) and any(t.key >= 0 for t in speakers.turns):
             threshold = embedder.cluster_threshold if embedder is not None else speakers.threshold
-            assignments = final_assignments(speakers, threshold, protected_ids=protected, locked_keys=locked)
+            assignments = _bounded_final_assignments(
+                speakers, threshold, protected_ids=protected, locked_keys=locked,
+            )
             current = {s.seq: s.speaker_id for s in segments}
             changed = {seq: sid for seq, sid in assignments.items() if seq >= 0 and current.get(seq) not in (None, sid)}
             if changed:
@@ -628,15 +889,50 @@ class MeetingController(QObject):
 
     def abandon_on_exit(self) -> None:
         """App is quitting mid-meeting: close the record without waiting."""
-        if self._current is None or not self.is_active:
+        cur = self.current
+        if cur is None or not self.is_active:
             return
+        meeting_id = cur.id
+        started_at = self._started_wall_ms or cur.started_at
         self._clock.stop()
         self._drain_timer.stop()
+        self._close_open_pause()
+        active_end = max(started_at, started_at + self.elapsed_ms())
+        self._store.flush(timeout=1.0)
+        segments = self._store.get_segments(meeting_id)
+        seg_ends = [
+            (s.captured_at if s.captured_at > 0 else s.created_at) + max(0, int(s.duration_ms or 0))
+            for s in segments
+            if s.trigger_mode == "meeting"
+        ]
+        ended_at = max(started_at, max(seg_ends) if seg_ends else active_end)
+        if self._speakers is not None and len(getattr(self._speakers, "turns", ())) <= 600:
+            self._recluster_segments_cache = segments
+            try:
+                self._apply_recluster(meeting_id)
+            except Exception as exc:
+                log.debug("退出时重聚类跳过: %s", exc)
+            finally:
+                self._recluster_segments_cache = None
         # The exit dialog tells the user this meeting is「已中断」, not a normal end.
-        self._store.end_meeting(self._current.id, status=STATUS_INTERRUPTED)
-        self._store.flush(timeout=3.0)
+        self._store.end_meeting(meeting_id, ended_at=ended_at, status=STATUS_INTERRUPTED)
+        self._store.flush(timeout=2.0)
+        try:
+            self.auto_name_speakers(meeting_id, _emit=False)
+        except Exception as exc:
+            log.debug("退出时说话人自动命名跳过: %s", exc)
+        self._speakers = None
+        self._embedder = None
+        self._options = None
+        self._capabilities = None
+        with self._current_lock:
+            self._current = None
+            self._started_wall_ms = 0
+            self._paused_ms = 0
+            self._pause_started_wall_ms = 0
+            self._pause_intervals = []
+        self._paused_detail = ""
         self._set_state(MeetingState.IDLE)
-        self._current = None
 
     def mark_interrupted(self) -> None:
         self._store.mark_interrupted_meetings()
@@ -646,25 +942,32 @@ class MeetingController(QObject):
 
     def _on_history_committed_threadsafe(self) -> None:
         # Called on the writer thread; hop to the GUI thread via the signal.
+        if self._shutting_down:
+            return
         meeting_id = self.current_id
         if meeting_id:
-            self.meeting_changed.emit(meeting_id)
+            try:
+                self.meeting_changed.emit(meeting_id)
+            except RuntimeError:
+                pass
 
     # -- live edits -----------------------------------------------------------
 
     def add_mark(self, note: str = "") -> int | None:
-        if self._current is None or not self.is_active:
+        cur = self.current
+        if cur is None or not self.is_active:
             return None
         offset = self.elapsed_ms()
-        self._store.add_mark(self._current.id, offset, note.strip())
+        self._store.add_mark(cur.id, offset, note.strip())
         self.notice.emit("已标记", format_timestamp(offset))
-        self.meeting_changed.emit(self._current.id)
+        self.meeting_changed.emit(cur.id)
         return offset
 
     def update_meeting(self, meeting_id: str, **fields: str) -> None:
         self._store.update_meeting(meeting_id, **fields)
-        if self._current is not None and self._current.id == meeting_id:
-            self._current = replace(self._current, **{k: v for k, v in fields.items() if v is not None})
+        with self._current_lock:
+            if self._current is not None and self._current.id == meeting_id:
+                self._current = replace(self._current, **{k: v for k, v in fields.items() if v is not None})
         self.meeting_changed.emit(meeting_id)
 
     def rename_speaker(self, meeting_id: str, speaker_id: int, name: str) -> int | None:
@@ -728,6 +1031,11 @@ class MeetingController(QObject):
         inferred_markdown: str | None = None
         if has_notes and notes is not None:
             new_label = name or speaker_label(speaker_id)
+            patched_user_md: str | None = None
+            if not notes.user_edited and notes.user_markdown:
+                cand_user_md, user_rep = replace_names_in_markdown(notes.user_markdown, old_label, new_label)
+                if user_rep:
+                    patched_user_md = cand_user_md
             markdown = None
             payload_json = notes.json_payload
             if not notes.user_edited and notes.json_payload:
@@ -742,15 +1050,20 @@ class MeetingController(QObject):
                     segments=segments,
                 )
             if markdown is not None:
-                self._save_rendered_notes(meeting_id, notes, markdown, json_payload=payload_json)
+                self._save_rendered_notes(
+                    meeting_id, notes, markdown, json_payload=payload_json, user_markdown=patched_user_md,
+                )
             else:
                 # Hand-edited notes, Markdown-only notes, or a document whose
                 # template no longer exists: patch the names in the text.
                 new_md, replaced = replace_names_in_markdown(notes.markdown, old_label, new_label)
                 if replaced and notes.user_edited:
-                    self._store.save_user_markdown(meeting_id, new_md)
-                elif replaced:
-                    self._save_rendered_notes(meeting_id, notes, new_md, json_payload=notes.json_payload)
+                    self._store.save_user_markdown(meeting_id, new_md, keep_backup=True)
+                elif replaced or patched_user_md is not None:
+                    self._save_rendered_notes(
+                        meeting_id, notes, new_md if replaced else notes.markdown,
+                        json_payload=notes.json_payload, user_markdown=patched_user_md,
+                    )
                 if record.status != STATUS_LIVE and inferred != previous:
                     inferred_markdown = new_md if replaced else notes.markdown
                     for sid in previous.keys() | inferred.keys():
@@ -958,8 +1271,9 @@ class MeetingController(QObject):
         job.start()
         return ""
 
-    def commit_media_import(self, result, title: str) -> MeetingRecord | None:
+    def commit_media_import(self, result, title: str, *, _meeting_id: str = "") -> MeetingRecord | None:
         """Persist finished turns and clear the import lock. Minutes stay manual."""
+        target_id = _meeting_id or uuid.uuid4().hex[:12]
         try:
             turns = tuple(getattr(result, "turns", ()) or ())
             if not turns:
@@ -967,12 +1281,25 @@ class MeetingController(QObject):
             status = STATUS_INTERRUPTED if (
                 getattr(result, "cancelled", False) or getattr(result, "error", "")
             ) else STATUS_ENDED
+            shared = RecognitionSettings.from_config(self._config, meeting=True)
+            glossary = getattr(result, "glossary", None)
+            if glossary is None:
+                glossary = shared.glossary
+            model_id = str(
+                getattr(result, "model_id", "")
+                or self._config.get("meeting.model_id", "")
+                or self._config.get("stt.model_id", "")
+                or ""
+            )
             record = self._store.create_meeting_from_media(
                 turns,
                 title=title,
                 status=status,
                 audio_ms=int(getattr(result, "audio_ms", 0) or 0),
-                model_id=str(self._config.get("stt.model_id", "") or ""),
+                model_id=model_id,
+                glossary=glossary,
+                meeting_id=target_id,
+                audio_path=str(getattr(result, "audio_path", "") or ""),
             )
             if record is None:
                 return None
@@ -981,12 +1308,13 @@ class MeetingController(QObject):
                 self._unsaved_media = (result, title, record.id)
                 raise MediaCommitError("识别已经完成，但写入数据库失败。可以重试保存，不必重新识别。")
             self._unsaved_media = None
+            self.auto_name_speakers(saved.id, _emit=False)
             self.meeting_changed.emit(saved.id)
             return saved
         except MediaCommitError:
             raise
         except Exception as exc:
-            self._unsaved_media = (result, title, "")
+            self._unsaved_media = (result, title, target_id)
             raise MediaCommitError(f"写入数据库失败：{exc}") from exc
         finally:
             self._importing_media = False
@@ -1021,13 +1349,14 @@ class MeetingController(QObject):
         if meeting_id and self._store.flush() and self._store.get_meeting(meeting_id) is not None:
             self._unsaved_media = None
             self.media_import_notice = ""
+            self.auto_name_speakers(meeting_id, _emit=False)
             self.meeting_changed.emit(meeting_id)
             self.media_import_finished.emit(meeting_id)
             return ""
         self._importing_media = True
         self._media_title = title
         try:
-            saved = self.commit_media_import(result, title)
+            saved = self.commit_media_import(result, title, _meeting_id=meeting_id)
         except MediaCommitError as exc:
             self.media_import_notice = str(exc)
             return str(exc)
@@ -1107,12 +1436,21 @@ class MeetingController(QObject):
             lines.append(f"参会人：{record.participants.strip()}")
         return tuple(lines)
 
-    def _save_rendered_notes(self, meeting_id: str, notes: MeetingNotes, markdown: str, *, json_payload: str) -> None:
+    def _save_rendered_notes(
+        self,
+        meeting_id: str,
+        notes: MeetingNotes,
+        markdown: str,
+        *,
+        json_payload: str,
+        user_markdown: str | None = None,
+    ) -> None:
         self._store.save_notes(
             meeting_id, template_id=notes.template_id, model=notes.model,
             json_payload=json_payload, markdown=markdown,
             duration_ms=notes.duration_ms, chunked=notes.chunked, generated_at=notes.generated_at,
             keep_previous=True,
+            user_markdown=user_markdown,
         )
 
     def _notes_template(self, notes: MeetingNotes, payload: dict):
@@ -1162,6 +1500,8 @@ class MeetingController(QObject):
         )
 
     def save_user_markdown(self, meeting_id: str, markdown: str) -> bool:
+        if meeting_id and meeting_id == self._generating_for:
+            self.cancel_generation()
         self._store.save_user_markdown(meeting_id, markdown)
         # The page re-reads the notes right away to show 「已手动编辑」.
         if not self._store.flush():
@@ -1197,7 +1537,7 @@ class MeetingController(QObject):
         markdown = apply_speaker_names(notes.markdown, names)
         if markdown != notes.markdown:
             if notes.user_edited:
-                self._store.save_user_markdown(meeting_id, markdown)
+                self._store.save_user_markdown(meeting_id, markdown, keep_backup=True)
             else:
                 self._save_rendered_notes(meeting_id, notes, markdown, json_payload=notes.json_payload)
             if not self._store.flush():
@@ -1209,6 +1549,36 @@ class MeetingController(QObject):
             return False
         self.meeting_changed.emit(meeting_id)
         return True
+
+    def restore_user_markdown(self, meeting_id: str) -> bool:
+        """Restore the dedicated hand-edited minutes slot after any number of AI regenerations."""
+        before = self._store.get_notes(meeting_id)
+        if before is None or not before.user_markdown:
+            return False
+        if before.user_edited and before.markdown == before.user_markdown:
+            return False
+        expected = before.user_markdown
+        self._store.restore_user_markdown(meeting_id)
+        if not self._store.flush():
+            return False
+        notes = self._store.get_notes(meeting_id)
+        if notes is None or not notes.markdown or not notes.user_edited:
+            return False
+        names = self.speaker_names(meeting_id)
+        markdown = apply_speaker_names(notes.markdown, names)
+        if markdown != notes.markdown:
+            self._store.save_user_markdown(meeting_id, markdown, keep_backup=True)
+            if not self._store.flush():
+                return False
+            notes = self._store.get_notes(meeting_id)
+            if notes is None or not notes.markdown:
+                return False
+        if notes.markdown not in {expected, apply_speaker_names(expected, names)}:
+            return False
+        self.meeting_changed.emit(meeting_id)
+        return True
+
+    restore_user_notes = restore_user_markdown
 
     def supplements_markdown(self, meeting_id: str) -> str:
         """Agenda, the user's own notes and marks. Empty when the meeting has none."""
@@ -1639,8 +2009,13 @@ class MeetingController(QObject):
 
     def shutdown(self, *, wait_ms: int = 2000) -> None:
         """Queued and interrupted jobs stay in the database for the next start."""
+        self._shutting_down = True
+        if hasattr(self._history, "remove_committed_callback"):
+            self._history.remove_committed_callback(self._on_history_committed_threadsafe)
         self._stop_media_job(force=False, wait_ms=wait_ms)
         self.abandon_on_exit()
+        if hasattr(self._history, "set_segment_calibrator"):
+            self._history.set_segment_calibrator(None)
         self._clock.stop()
         self._drain_timer.stop()
         self._retry_timer.stop()

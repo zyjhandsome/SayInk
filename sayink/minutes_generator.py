@@ -19,6 +19,14 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from sayink.minutes_prompts import (
     DEFAULT_CHUNK_CHARS,
+    SECTION_ACTION_ITEMS,
+    SECTION_CHAPTERS,
+    SECTION_DECISIONS,
+    SECTION_OPEN_QUESTIONS,
+    SECTION_SPEAKERS,
+    SECTION_SUMMARY,
+    SECTION_TITLES,
+    SECTION_TOPICS,
     MeetingContext,
     MinutesTemplate,
     TranscriptLine,
@@ -27,8 +35,10 @@ from sayink.minutes_prompts import (
     build_merge_system_prompt,
     build_system_prompt,
     build_user_prompt,
-    chunk_transcript,
+    chunk_transcript_with_spans,
+    parse_timestamp,
     render_transcript,
+    section_title,
 )
 from sayink.minutes_render import (
     apply_speaker_names, clear_timeline, extract_json, render_markdown, strip_clock_citations,
@@ -89,7 +99,7 @@ class MinutesRequest:
 def request_fingerprint(request: MinutesRequest) -> str:
     """Invalidate checkpoints whenever any generation input or contract changes."""
     data = {
-        "version": 3, "api_url": request.api_url.rstrip("/"),
+        "version": 4, "api_url": request.api_url.rstrip("/"),
         "credential": hashlib.sha256(request.api_key.encode()).hexdigest(),
         "model": request.model_name, "template": asdict(request.template),
         "context": asdict(request.context), "lines": [asdict(line) for line in request.lines],
@@ -188,6 +198,7 @@ class MinutesWorker(QThread):
         self._stage = ""
         self._split_occurred = False
         self._preview_markdown = False
+        self._chunk_spans: list[tuple[int, int]] = []
         self._capabilities = {}
         # Set before ``error`` is emitted: whether retrying later can help.
         self.transient_failure = False
@@ -393,30 +404,70 @@ class MinutesWorker(QThread):
 
     # -- pipeline ----------------------------------------------------------
 
-    def _chunk_prompt(self, chunks, index):
+    def _chunk_context(self, index: int, total: int, *, spans: list[tuple[int, int]] | None = None) -> MeetingContext:
+        if total <= 1:
+            return self._req.context
+        span_list = spans if spans is not None else self._chunk_spans
+        if index < len(span_list):
+            start_ms, end_ms = span_list[index]
+        else:
+            start_ms, end_ms = 0, 10**12
+        return _slice_context_for_span(self._req.context, start_ms, end_ms, chunked=True)
+
+    def _chunk_prompt(self, chunks, index, *, spans: list[tuple[int, int]] | None = None):
         context = ""
         if index:
             context += "前文（仅供理解，不重复整理）：\n" + chunks[index - 1][-200:] + "\n"
         if index + 1 < len(chunks):
             context += "后文（仅供理解，不提前整理）：\n" + chunks[index + 1][:200] + "\n"
-        return context + build_user_prompt(self._req.context, chunks[index],
-                                          chunk_label=f"第 {index + 1}/{len(chunks)} 段" if len(chunks) > 1 else "")
+        chunk_ctx = self._chunk_context(index, len(chunks), spans=spans)
+        return context + build_user_prompt(
+            chunk_ctx,
+            chunks[index],
+            chunk_label=f"第 {index + 1}/{len(chunks)} 段" if len(chunks) > 1 else "",
+        )
 
     def _plan_chunks(self, system):
         size = max(64, int(self._req.chunk_chars))
+        merge_system: str | None = None
         while True:
-            chunks = chunk_transcript(
+            chunk_items = chunk_transcript_with_spans(
                 self._req.lines, self._req.speaker_names, max_chars=size,
                 show_speakers=self._req.speakers_distinguished, show_times=self._req.timestamps_available,
                 label_unknown=self._req.label_unknown,
             )
-            if all(self._fits(system, self._chunk_prompt(chunks, i)) for i in range(len(chunks))):
+            chunks = [item[0] for item in chunk_items]
+            spans = [(item[1], item[2]) for item in chunk_items]
+            if len(chunks) > 1:
+                if merge_system is None:
+                    merge_system = build_merge_system_prompt(
+                        self._req.template,
+                        output_language=self._req.output_language,
+                        speakers_distinguished=self._req.speakers_distinguished,
+                        timestamps_available=self._req.timestamps_available,
+                    )
+                if not self._fits(merge_system, build_merge_prompt(self._req.context, [{"summary": ""}])):
+                    raise LLMContextError("提示词、笔记或术语表过长，请缩短内容或调整模型上下文设置")
+            if all(self._fits(system, self._chunk_prompt(chunks, i, spans=spans)) for i in range(len(chunks))):
+                self._chunk_spans = spans
                 return chunks
             if size <= 64:
                 raise LLMContextError("提示词、笔记或术语表过长，请缩短内容或调整模型上下文设置")
             size = max(64, size // 2)
 
-    async def _summarize(self, client, httpx, system, text, prompt, depth=0):
+    async def _summarize(
+        self,
+        client,
+        httpx,
+        system,
+        text,
+        prompt,
+        depth=0,
+        *,
+        allow_markdown_fallback: bool = False,
+        chunk_context: MeetingContext | None = None,
+    ):
+        active_ctx = chunk_context if chunk_context is not None else self._req.context
         try:
             raw = await self._chat(client, httpx, system, prompt)
         except (LLMContextError, LLMTruncatedError):
@@ -425,21 +476,64 @@ class MinutesWorker(QThread):
             self._split_occurred = True
             self.progress.emit(self._stage + " · 内容较长，正在细分处理…")
             left_text, right_text = _split_chunk(text)
-            left = await self._summarize(client, httpx, system, left_text,
-                                         build_user_prompt(self._req.context, left_text), depth + 1)
-            right = await self._summarize(client, httpx, system, right_text,
-                                          build_user_prompt(self._req.context, right_text), depth + 1)
-            payload = await self._merge(client, httpx, [left, right])
+            left_start, left_end, right_start, right_end = _split_text_spans(left_text, right_text)
+            left_ctx = _slice_context_for_span(active_ctx, left_start, left_end, chunked=True)
+            right_ctx = _slice_context_for_span(active_ctx, right_start, right_end, chunked=True)
+            left = await self._summarize(
+                client, httpx, system, left_text,
+                build_user_prompt(left_ctx, left_text), depth + 1,
+                allow_markdown_fallback=True, chunk_context=left_ctx,
+            )
+            right = await self._summarize(
+                client, httpx, system, right_text,
+                build_user_prompt(right_ctx, right_text), depth + 1,
+                allow_markdown_fallback=True, chunk_context=right_ctx,
+            )
+            merge_ctx = active_ctx if chunk_context is not None else self._req.context
+            payload = await self._merge(client, httpx, [left, right], merge_context=merge_ctx)
             self._remember(system, prompt, json.dumps(payload, ensure_ascii=False))
             return payload
         payload = extract_json(raw)
         if payload is None:
-            raise LLMResponseError(self._stage + "返回的不是 JSON")
+            if not allow_markdown_fallback:
+                raise LLMResponseError(self._stage + "返回的不是 JSON")
+            payload = await self._markdown_chunk_fallback(client, httpx, raw, text, active_ctx)
+            self._remember(system, prompt, json.dumps(payload, ensure_ascii=False))
+            return payload
         validate_minutes(payload)
         self._remember(system, prompt, raw)
         return payload
 
-    async def _merge(self, client, httpx, partials):
+    async def _markdown_chunk_fallback(
+        self,
+        client,
+        httpx,
+        initial_raw: str,
+        chunk_text: str,
+        chunk_ctx: MeetingContext,
+    ) -> dict[str, Any]:
+        """Recover a structured partial when a model answers a chunk in Markdown."""
+        try:
+            md_text = validate_markdown(initial_raw)
+        except LLMResponseError:
+            log.warning("%s未返回 JSON，改用 Markdown 兜底重试", self._stage)
+            self.progress.emit(self._stage + " · 改用 Markdown 兜底重试…")
+            md_system = build_markdown_system_prompt(
+                self._req.template,
+                output_language=self._req.output_language,
+                speakers_distinguished=self._req.speakers_distinguished,
+                timestamps_available=self._req.timestamps_available,
+            )
+            md_user = build_user_prompt(chunk_ctx, chunk_text)
+            md_raw = await self._chat(client, httpx, md_system, md_user)
+            try:
+                md_text = validate_markdown(md_raw)
+            except LLMResponseError as exc:
+                raise LLMResponseError(f"{self._stage}返回的不是 JSON") from exc
+        return validate_minutes(_markdown_to_partial(md_text, self._req.template))
+
+    async def _merge(self, client, httpx, partials, *, merge_context: MeetingContext | None = None):
+        ctx = merge_context if merge_context is not None else self._req.context
         system = build_merge_system_prompt(
             self._req.template, output_language=self._req.output_language,
             speakers_distinguished=self._req.speakers_distinguished,
@@ -450,7 +544,7 @@ class MinutesWorker(QThread):
             level += 1
             groups, current = [], []
             for part in partials:
-                if current and not self._fits(system, build_merge_prompt(self._req.context, current + [part])):
+                if current and not self._fits(system, build_merge_prompt(ctx, current + [part])):
                     groups.append(current)
                     current = []
                 current.append(part)
@@ -467,7 +561,7 @@ class MinutesWorker(QThread):
                     continue
                 self._stage = f"正在合并各段纪要… 第 {level} 轮 {index + 1}/{len(groups)} 组"
                 self.progress.emit(self._stage)
-                prompt = build_merge_prompt(self._req.context, group)
+                prompt = build_merge_prompt(ctx, group)
                 try:
                     raw = await self._chat(client, httpx, system, prompt)
                     payload = validate_minutes(extract_json(raw))
@@ -476,8 +570,8 @@ class MinutesWorker(QThread):
                 except (LLMContextError, LLMTruncatedError):
                     if len(group) > 2:
                         mid = len(group) // 2
-                        merged.extend([await self._merge(client, httpx, group[:mid]),
-                                       await self._merge(client, httpx, group[mid:])])
+                        merged.extend([await self._merge(client, httpx, group[:mid], merge_context=ctx),
+                                       await self._merge(client, httpx, group[mid:], merge_context=ctx)])
                     else:
                         merged.append(_concat_partials(group))
                 except LLMResponseError:
@@ -580,7 +674,16 @@ class MinutesWorker(QThread):
                 for index, chunk in enumerate(chunks, start=1):
                     self._stage = f"正在生成纪要… 第 {index}/{len(chunks)} 段"
                     self.progress.emit(self._stage)
-                    part = await self._summarize(client, httpx, system_prompt, chunk, self._chunk_prompt(chunks, index - 1))
+                    chunk_ctx = self._chunk_context(index - 1, len(chunks))
+                    part = await self._summarize(
+                        client,
+                        httpx,
+                        system_prompt,
+                        chunk,
+                        self._chunk_prompt(chunks, index - 1),
+                        allow_markdown_fallback=True,
+                        chunk_context=chunk_ctx,
+                    )
                     partials.append(part)
                 payload = await self._merge(client, httpx, partials)
 
@@ -620,18 +723,210 @@ class MinutesWorker(QThread):
         )
 
 
+_FACT_NORM_RE = re.compile(r"[\s,，。；;：:！!？?、\-—·()（）\[\]\"'“”‘’]+")
+_MD_TS_TRAIL_RE = re.compile(r"\s*\[(\d{1,}:\d{2}:\d{2})\]\s*$")
+_MD_ACTION_RE = re.compile(
+    r"^(?:-\s*(?:\[[ xX]\]\s*)?)?(?P<task>.+?)"
+    r"(?:\s+[—\-]+\s*@?(?P<owner>[^·\[\n]+?))?"
+    r"(?:\s*·\s*(?P<due>[^\[\n]+?))?"
+    r"(?:\s*\[(?P<ts>\d{1,}:\d{2}:\d{2})\])?\s*$"
+)
+_INLINE_TS_RE = re.compile(r"\[(\d{1,}:\d{2}:\d{2})\]")
+
+
+def _slice_context_for_span(
+    context: MeetingContext, start_ms: int, end_ms: int, *, chunked: bool
+) -> MeetingContext:
+    if not chunked:
+        return context
+    sliced_marks = [
+        (offset_ms, note)
+        for offset_ms, note in context.marks
+        if start_ms <= int(offset_ms) <= end_ms
+    ]
+    return MeetingContext(
+        title=context.title,
+        started_at_text=context.started_at_text,
+        participants=context.participants,
+        agenda=context.agenda,
+        notes_user="",
+        marks=sliced_marks,
+        glossary_terms=list(context.glossary_terms),
+    )
+
+
+def _split_text_spans(left_text: str, right_text: str) -> tuple[int, int, int, int]:
+    left_ts = [t for m in _INLINE_TS_RE.finditer(left_text) if (t := parse_timestamp(m.group(1))) is not None]
+    right_ts = [t for m in _INLINE_TS_RE.finditer(right_text) if (t := parse_timestamp(m.group(1))) is not None]
+    left_start = min(left_ts) if left_ts else 0
+    if right_ts:
+        right_start = min(right_ts)
+        left_end = max(max(left_ts) if left_ts else 0, right_start - 1) if right_start > left_start else max(left_ts or [0])
+        right_end = max(max(right_ts), 10**12)
+    else:
+        left_end = max(left_ts) if left_ts else 10**12
+        right_start = left_end + 1 if left_ts else 0
+        right_end = 10**12
+    return left_start, left_end, right_start, right_end
+
+
+def _markdown_to_partial(markdown_text: str, template: MinutesTemplate) -> dict[str, Any]:
+    """Parse a fallback Markdown chunk summary into the canonical minutes dict."""
+    partial: dict[str, Any] = {
+        "title": "",
+        "summary": "",
+        "topics": [],
+        "decisions": [],
+        "action_items": [],
+        "open_questions": [],
+        "chapters": [],
+        "speakers": [],
+    }
+    heading_map: dict[str, str] = {}
+    for sec_key, default_title in SECTION_TITLES.items():
+        heading_map[default_title] = sec_key
+        heading_map[section_title(template, sec_key)] = sec_key
+
+    current_sec = ""
+    current_topic: dict[str, Any] | None = None
+    summary_lines: list[str] = []
+    fallback_body: list[str] = []
+
+    for raw_line in markdown_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("```"):
+            continue
+        if line.startswith("# ") and not partial["title"]:
+            partial["title"] = line[2:].strip()
+            continue
+        if line.startswith("## "):
+            heading = line[3:].strip()
+            current_sec = heading_map.get(heading, "")
+            current_topic = None
+            continue
+        if line == "本场未识别到":
+            continue
+        if current_sec == SECTION_SUMMARY:
+            summary_lines.append(re.sub(r"^[-*+]\s+", "", line))
+        elif current_sec == SECTION_TOPICS:
+            if line.startswith("### "):
+                current_topic = {"title": line[4:].strip(), "points": []}
+                partial["topics"].append(current_topic)
+            else:
+                bullet = re.sub(r"^[-*+]\s+", "", line)
+                ts_match = _MD_TS_TRAIL_RE.search(bullet)
+                ts = ts_match.group(1) if ts_match else ""
+                text = bullet[:ts_match.start()].strip() if ts_match else bullet.strip()
+                if text:
+                    if current_topic is None:
+                        current_topic = {"title": "讨论要点", "points": []}
+                        partial["topics"].append(current_topic)
+                    current_topic["points"].append({"text": text, "ts": ts})
+        elif current_sec in (SECTION_DECISIONS, SECTION_OPEN_QUESTIONS):
+            bullet = re.sub(r"^[-*+]\s+", "", line)
+            ts_match = _MD_TS_TRAIL_RE.search(bullet)
+            ts = ts_match.group(1) if ts_match else ""
+            text = bullet[:ts_match.start()].strip() if ts_match else bullet.strip()
+            if text:
+                partial[current_sec].append({"text": text, "ts": ts})
+        elif current_sec == SECTION_ACTION_ITEMS:
+            m = _MD_ACTION_RE.match(line)
+            if m and m.group("task").strip():
+                owner = (m.group("owner") or "").strip()
+                due = (m.group("due") or "").strip()
+                partial["action_items"].append({
+                    "task": m.group("task").strip(),
+                    "owner": "" if owner == "未指定" else owner,
+                    "due": "" if due == "未提及" else due,
+                    "ts": (m.group("ts") or "").strip(),
+                })
+        elif current_sec == SECTION_CHAPTERS:
+            bullet = re.sub(r"^[-*+]\s+", "", line).replace("**", "")
+            if bullet:
+                partial["chapters"].append({"title": bullet, "start": "", "end": "", "summary": ""})
+        elif current_sec == SECTION_SPEAKERS:
+            bullet = re.sub(r"^[-*+]\s+", "", line).replace("**", "")
+            if "：" in bullet:
+                sp_label, sp_sum = bullet.split("：", 1)
+            elif ":" in bullet:
+                sp_label, sp_sum = bullet.split(":", 1)
+            else:
+                sp_label, sp_sum = bullet, ""
+            sp_label = re.sub(r"（可能是.*?）", "", sp_label).strip()
+            if sp_label:
+                partial["speakers"].append({"label": sp_label, "summary": sp_sum.strip()})
+        else:
+            if not line.startswith("#"):
+                fallback_body.append(re.sub(r"^[-*+]\s+", "", line))
+
+    if summary_lines:
+        partial["summary"] = "\n".join(summary_lines).strip()
+    elif not any(partial[k] for k in ("topics", "decisions", "action_items", "open_questions", "chapters", "speakers")):
+        partial["summary"] = "\n".join(fallback_body).strip()
+    return partial
+
+
+def _fact_signature(item: Any, key: str) -> str:
+    if not isinstance(item, dict):
+        return _FACT_NORM_RE.sub("", str(item or "")).lower()
+    primary_field = "task" if key == "action_items" else "text"
+    primary = _FACT_NORM_RE.sub("", str(item.get(primary_field, "") or "")).lower()
+    if key == "action_items":
+        owner = _FACT_NORM_RE.sub("", str(item.get("owner", "") or "")).lower()
+        return f"{primary}@{owner}" if owner else primary
+    return primary
+
+
+def _dedup_fact_items(items: Sequence[Any], key: str, source_lookup: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    pos_by_sig: dict[str, int] = {}
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        entry = dict(raw)
+        sig = _fact_signature(entry, key)
+        if not sig:
+            continue
+        if source_lookup and sig in source_lookup:
+            src = source_lookup[sig]
+            for attr in ("ts", "owner", "due"):
+                if attr in src and not str(entry.get(attr, "") or "").strip() and str(src.get(attr, "") or "").strip():
+                    entry[attr] = src[attr]
+        if sig in pos_by_sig:
+            existing = deduped[pos_by_sig[sig]]
+            for attr in ("ts", "owner", "due"):
+                if not str(existing.get(attr, "") or "").strip() and str(entry.get(attr, "") or "").strip():
+                    existing[attr] = entry[attr]
+            continue
+        pos_by_sig[sig] = len(deduped)
+        deduped.append(entry)
+    return deduped
+
+
 def _preserve_facts(payload, partials):
-    """Keep source decisions and tasks verbatim; let the model unify prose."""
+    """Respect the merge model's consolidated conclusions (so overturned early
+    items stay dropped), deduplicate paraphrased/repeated entries, and only
+    backfill from source chunks when a section was accidentally omitted."""
+    multi_chunk = len(partials) > 1
     for key in ("decisions", "action_items", "open_questions"):
-        originals = []
-        seen = set()
+        source_items: list[dict[str, Any]] = []
         for part in partials:
-            for item in part.get(key, []):
-                identity = json.dumps(item, sort_keys=True, ensure_ascii=False)
-                if identity not in seen:
-                    seen.add(identity)
-                    originals.append(item)
-        payload[key] = originals
+            if isinstance(part, dict):
+                for item in part.get(key) or []:
+                    if isinstance(item, dict):
+                        source_items.append(item)
+        deduped_sources = _dedup_fact_items(source_items, key)
+        source_by_sig = {_fact_signature(it, key): it for it in deduped_sources}
+        merged_items = payload.get(key) if isinstance(payload.get(key), list) else None
+        if merged_items:
+            payload[key] = _dedup_fact_items(merged_items, key, source_lookup=source_by_sig)
+        elif key == "action_items":
+            # Keep tasks when a merge model omits action_items altogether.
+            payload[key] = deduped_sources
+        elif merged_items is None or not multi_chunk:
+            payload[key] = deduped_sources
+        else:
+            payload[key] = []
     return payload
 
 

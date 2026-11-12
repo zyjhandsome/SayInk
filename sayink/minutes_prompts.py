@@ -234,7 +234,7 @@ def render_srt(
         if duration > 0:
             end = start + duration
         elif index + 1 < len(usable):
-            end = max(start + 1000, int(usable[index + 1].offset_ms))
+            end = min(max(start + 1000, int(usable[index + 1].offset_ms)), start + 10_000)
         else:
             end = start + 3000
         if end <= start:
@@ -249,7 +249,7 @@ def render_srt(
     return ("\n\n".join(blocks) + "\n") if blocks else ""
 
 
-_TS_RE = re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})$")
+_TS_RE = re.compile(r"^(\d{1,}):(\d{2}):(\d{2})$")
 
 
 def parse_timestamp(text: str | None) -> int | None:
@@ -587,6 +587,67 @@ def build_merge_prompt(context: MeetingContext, partials: Sequence[dict[str, Any
 DEFAULT_CHUNK_CHARS = 8000
 
 
+def chunk_transcript_with_spans(
+    lines: Sequence[TranscriptLine],
+    names: dict[int, str] | None,
+    *,
+    max_chars: int,
+    show_speakers: bool = True,
+    show_times: bool = True,
+    label_unknown: bool = True,
+) -> list[tuple[str, int, int]]:
+    """Return ``[(chunk_text, start_ms, end_ms), ...]`` with contiguous time bounds."""
+    max_chars = max(64, int(max_chars))
+    raw_chunks: list[tuple[str, int, int]] = []
+    current: list[str] = []
+    cur_min_ms: int | None = None
+    cur_max_ms: int = 0
+    size = 0
+    for line in lines:
+        prefix = transcript_prefix(
+            line, names, show_speakers=show_speakers, show_times=show_times, label_unknown=label_unknown,
+        )
+        if len(prefix) >= max_chars:
+            raise ValueError("发言人名称过长，无法在分段预算内处理")
+        line_start = max(0, int(line.offset_ms)) if line.time_known else None
+        line_end = (line_start + max(0, int(line.duration_ms or 0))) if line_start is not None else 0
+        remaining = line.text
+        while remaining:
+            end = min(len(remaining), max_chars - len(prefix))
+            if end < len(remaining):
+                boundaries = list(re.finditer(r"[。！？；.!?;\n，, ]", remaining[:end]))
+                if boundaries and boundaries[-1].end() >= end // 2:
+                    end = boundaries[-1].end()
+            rendered = prefix + remaining[:end]
+            remaining = remaining[end:]
+            extra = len(rendered) + (1 if current else 0)
+            if current and size + extra > max_chars:
+                raw_chunks.append(("\n".join(current), cur_min_ms or 0, cur_max_ms))
+                current, size = [], 0
+                cur_min_ms, cur_max_ms = None, 0
+                extra = len(rendered)
+            current.append(rendered)
+            if line_start is not None:
+                cur_min_ms = line_start if cur_min_ms is None else min(cur_min_ms, line_start)
+                cur_max_ms = max(cur_max_ms, line_end)
+            size += extra
+    if current:
+        raw_chunks.append(("\n".join(current), cur_min_ms or 0, cur_max_ms))
+    total = len(raw_chunks)
+    if total <= 1:
+        return [(text, 0, 10**12) for text, _s, _e in raw_chunks]
+    out: list[tuple[str, int, int]] = []
+    for idx, (text, first_ms, max_end_ms) in enumerate(raw_chunks):
+        span_start = 0 if idx == 0 else first_ms
+        if idx + 1 < total:
+            next_start = raw_chunks[idx + 1][1]
+            span_end = max(max_end_ms, next_start - 1) if next_start > span_start else max(span_start, max_end_ms)
+        else:
+            span_end = max(max_end_ms, 10**12)
+        out.append((text, span_start, span_end))
+    return out
+
+
 def chunk_transcript(
     lines: Sequence[TranscriptLine],
     names: dict[int, str] | None,
@@ -601,32 +662,14 @@ def chunk_transcript(
     Split pieces retain their speaker and actual source timestamp. No
     artificial timestamps are inferred for fragments of the same utterance.
     """
-    max_chars = max(64, int(max_chars))
-    chunks: list[str] = []
-    current: list[str] = []
-    size = 0
-    for line in lines:
-        prefix = transcript_prefix(
-            line, names, show_speakers=show_speakers, show_times=show_times, label_unknown=label_unknown,
+    return [
+        text
+        for text, _start, _end in chunk_transcript_with_spans(
+            lines,
+            names,
+            max_chars=max_chars,
+            show_speakers=show_speakers,
+            show_times=show_times,
+            label_unknown=label_unknown,
         )
-        if len(prefix) >= max_chars:
-            raise ValueError("发言人名称过长，无法在分段预算内处理")
-        remaining = line.text
-        while remaining:
-            end = min(len(remaining), max_chars - len(prefix))
-            if end < len(remaining):
-                boundaries = list(re.finditer(r"[。！？；.!?;\n，, ]", remaining[:end]))
-                if boundaries and boundaries[-1].end() >= end // 2:
-                    end = boundaries[-1].end()
-            rendered = prefix + remaining[:end]
-            remaining = remaining[end:]
-            extra = len(rendered) + (1 if current else 0)
-            if current and size + extra > max_chars:
-                chunks.append("\n".join(current))
-                current, size = [], 0
-                extra = len(rendered)
-            current.append(rendered)
-            size += extra
-    if current:
-        chunks.append("\n".join(current))
-    return chunks
+    ]
