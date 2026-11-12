@@ -40,6 +40,7 @@ class RecognitionResult:
     cancelled: bool
     audio_ms: int = 0
     error: str = ""
+    audio_path: str = ""
 
 
 def file_dialog_filter() -> str:
@@ -223,6 +224,10 @@ def recognize_file(
     if cancel is not None and cancel():
         return RecognitionResult((), True)
     source = Path(path)
+    try:
+        resolved_audio_path = str(source.resolve())
+    except OSError:
+        resolved_audio_path = str(source)
     audio_ms = 0
     if progress_cb is not None:
         progress_cb(0, "正在解码音频...")
@@ -244,7 +249,7 @@ def recognize_file(
                 chunks = segment_blocks(blocks, vad=vad, vad_path=vad_path, cancel=cancel)
             except AudioDecodeError as exc:
                 if "已取消" in str(exc):
-                    return RecognitionResult((), True)
+                    return RecognitionResult((), True, audio_path=resolved_audio_path)
                 raise
         finally:
             blocks.close()
@@ -255,7 +260,7 @@ def recognize_file(
         if progress_cb is not None:
             progress_cb(30, read_msg)
         if cancel is not None and cancel():
-            return RecognitionResult((), True, audio_ms=audio_ms)
+            return RecognitionResult((), True, audio_ms=audio_ms, audio_path=resolved_audio_path)
     else:
         try:
             if progress_cb is not None:
@@ -268,7 +273,7 @@ def recognize_file(
                 audio = decode_audio_file(path, cancel=cancel)
         except AudioDecodeError as exc:
             if "已取消" in str(exc):
-                return RecognitionResult((), True)
+                return RecognitionResult((), True, audio_path=resolved_audio_path)
             raise
         read_msg = f"已读取 {audio.size / TARGET_SAMPLE_RATE:.0f} 秒音频"
         if progress is not None:
@@ -309,7 +314,7 @@ def recognize_file(
     )
     if result.error and not result.turns:
         raise AudioDecodeError(result.error)
-    result = replace(result, audio_ms=audio_ms)
+    result = replace(result, audio_ms=audio_ms, audio_path=resolved_audio_path)
     if glossary:
         from sayink.asr_correction import apply_glossary_variants
         from sayink.speech_recognizer import restore_glossary_case

@@ -1021,14 +1021,40 @@ class HistoryStore:
         )
         conn.commit()
 
+    def _cleanup_session_recovery_audio(self, session_ids: list[str]) -> None:
+        ids = list(dict.fromkeys(str(s or "").strip() for s in session_ids if s))
+        if not ids:
+            return
+        try:
+            recovery_root = self.db_path.parent / "audio-recovery"
+            if not recovery_root.is_dir() or recovery_root.is_symlink():
+                return
+            if not any(recovery_root.iterdir()):
+                return
+            from sayink.audio_recovery import delete_session_recovery_files
+
+            for sid in ids:
+                delete_session_recovery_files(sid, base_dir=recovery_root)
+        except OSError:
+            pass
+
     def _do_delete_sessions(self, conn: sqlite3.Connection, session_ids: list[str]) -> None:
         if not session_ids:
             return
         # Meeting transcripts share this table. A history delete must not orphan
         # a meeting by removing its rows, even if a caller passes the meeting id.
+        eligible: list[str] = []
         for start in range(0, len(session_ids), 500):
             chunk = session_ids[start:start + 500]
             placeholders = ",".join("?" for _ in chunk)
+            protected = {
+                r[0]
+                for r in conn.execute(
+                    f"SELECT id FROM meetings WHERE id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+            }
+            eligible.extend(sid for sid in chunk if sid not in protected)
             conn.execute(
                 f"""
                 DELETE FROM history
@@ -1039,14 +1065,22 @@ class HistoryStore:
                 (*chunk, MEETING_TRIGGER_MODE),
             )
         conn.commit()
+        self._cleanup_session_recovery_audio(eligible)
 
     def _do_delete_all(self, conn: sqlite3.Connection) -> None:
         # 「清空历史」 is the dictation history's button; meetings have their own
         # delete action on the meeting page.
+        deleted_ids = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT DISTINCT session_id FROM history WHERE session_id NOT IN ({_PROTECTED_SESSIONS_SQL})"
+            ).fetchall()
+        ]
         conn.execute(
             f"DELETE FROM history WHERE session_id NOT IN ({_PROTECTED_SESSIONS_SQL})"
         )
         conn.commit()
+        self._cleanup_session_recovery_audio(deleted_ids)
 
     def _do_cleanup(
         self,
@@ -1056,6 +1090,7 @@ class HistoryStore:
         active_session_id: str | None,
     ) -> None:
         deleted_any = False
+        purged_ids: list[str] = []
         if retention_days > 0:
             cutoff_ms = int(time.time() * 1000 - retention_days * 86_400_000)
             rows = conn.execute(
@@ -1071,6 +1106,7 @@ class HistoryStore:
             to_delete = [r[0] for r in rows if r[0] != active_session_id]
             if to_delete:
                 self._delete_sessions(conn, to_delete)
+                purged_ids.extend(to_delete)
                 deleted_any = True
 
         if max_entries > 0:
@@ -1091,10 +1127,12 @@ class HistoryStore:
                 victims = [s for s in session_ids if s != active_session_id][:overflow]
                 if victims:
                     self._delete_sessions(conn, victims)
+                    purged_ids.extend(victims)
                     deleted_any = True
 
         if deleted_any:
             conn.commit()
+            self._cleanup_session_recovery_audio(purged_ids)
 
     def _delete_sessions(self, conn: sqlite3.Connection, session_ids: list[str]) -> None:
         # SQLite binds at most 32766 variables. Delete in chunks within caller's transaction.

@@ -1018,3 +1018,128 @@ def test_m15_l01_l03_safe_filename_yaml_prefer_raw_timestamps_and_csv(tmp_path):
     finally:
         controller.shutdown()
         history.close(timeout=2)
+
+
+def test_cross_backend_recovery_cleanup_and_media_audio_path(tmp_path) -> None:
+    """Cross-backend seam: HistoryStore/MeetingStore recovery cleanup & media audio_path."""
+    from pathlib import Path
+    import wave
+
+    from sayink.media_import import MediaTurn, RecognitionResult, recognize_file
+
+    _cfg, history, controller = _make_controller(tmp_path / "cross")
+    try:
+        recovery_root = history.db_path.parent / "audio-recovery"
+        recovery_root.mkdir(parents=True, exist_ok=True)
+
+        # 1) Dictation session recovery journal cleaned on enqueue_delete_sessions,
+        #    while meeting recovery journal is protected from dictation delete.
+        dict_journal = recovery_root / ("a" * 32)
+        dict_journal.mkdir()
+        (dict_journal / "session.json").write_text(
+            json.dumps({"session_id": "dict-sess-1", "complete": True}),
+            encoding="utf-8",
+        )
+        (dict_journal / "audio.f32").write_bytes(b"\x00" * 64)
+
+        mtg = controller.store.create_meeting(title="受保护会议")
+        assert history.flush()
+        mtg_journal = recovery_root / ("b" * 32)
+        mtg_journal.mkdir()
+        (mtg_journal / "session.json").write_text(
+            json.dumps({"session_id": mtg.id, "complete": True}),
+            encoding="utf-8",
+        )
+        (mtg_journal / "audio.f32").write_bytes(b"\x00" * 64)
+
+        history.enqueue(
+            SegmentRecord(
+                session_id="dict-sess-1",
+                seq=0,
+                created_at=1_700_000_000_000,
+                raw_text="口述内容",
+                polished_text="口述内容",
+                source="microphone",
+                duration_ms=1000,
+                target_app="notepad.exe",
+                trigger_mode="hold",
+                model="funasr-nano",
+            )
+        )
+        assert history.flush()
+
+        # Passing both dictation session and meeting ID to dictation delete:
+        history.enqueue_delete_sessions(["dict-sess-1", mtg.id])
+        assert history.flush()
+        assert not dict_journal.exists()
+        assert mtg_journal.exists()
+
+        # Deleting the meeting via MeetingStore cleans up its recovery journal:
+        controller.store.end_meeting(mtg.id, ended_at=mtg.started_at + 5000)
+        controller.store.delete_meeting(mtg.id)
+        assert history.flush()
+        assert not mtg_journal.exists()
+
+        # 2) recognize_file & commit_media_import persist resolved audio_path:
+        wav_path = tmp_path / "sample_import.wav"
+        with wave.open(str(wav_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x10\x00" * 16000)
+
+        class _StubRecognizer:
+            def decode_meeting_blocking(self, audio, *, turn_analyzer=None, cancelled=None):
+                import numpy as np
+
+                return [
+                    type(
+                        "_DecodedTurn",
+                        (),
+                        {
+                            "text": "我是周敏，确认导入回放路径。",
+                            "start": 0,
+                            "stop": len(audio),
+                            "embedding": np.ones(8, dtype=np.float32),
+                            "learnable": True,
+                        },
+                    )()
+                ], ""
+
+        # Force non-silent chunk by feeding synthetic chunk directly via recognize_file
+        import numpy as np
+
+        tone = (0.25 * np.sin(np.linspace(0, 400 * np.pi, 16000, dtype=np.float32)) * 32767).astype("<i2")
+        with wave.open(str(wav_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(tone.tobytes() + b"\x00\x00" * 12000)
+
+        res = recognize_file(
+            wav_path,
+            recognizer=_StubRecognizer(),
+            speaker_path=None,
+            vad="energy",
+            vad_path=None,
+            cancel=lambda: False,
+        )
+        assert Path(res.audio_path) == wav_path.resolve()
+        saved = controller.commit_media_import(
+            res if res.turns else RecognitionResult(
+                turns=(MediaTurn(1, 0, 1000, "我是周敏"),),
+                cancelled=False,
+                audio_ms=1000,
+                audio_path=res.audio_path,
+            ),
+            "导入回放验证",
+        )
+        assert saved is not None
+        assert Path(saved.audio_path) == wav_path.resolve()
+        # Deleting imported media meeting never deletes user's external WAV file!
+        controller.store.delete_meeting(saved.id)
+        assert history.flush()
+        assert wav_path.exists()
+    finally:
+        controller.shutdown()
+        history.close(timeout=2)

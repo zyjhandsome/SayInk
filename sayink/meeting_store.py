@@ -22,6 +22,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from sayink.audio_recovery import delete_session_recovery_files
 from sayink.history_store import MEETING_TRIGGER_MODE, HistoryStore, SegmentRecord, escape_like, row_to_segment
 from sayink.media_import import MEDIA_SOURCE
 from sayink.transcript_import import IMPORT_SOURCE, ImportedTranscript, assign_speakers
@@ -227,21 +228,7 @@ def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, au
 
     recovery_root = db_root / "audio-recovery"
     try:
-        if recovery_root.is_dir() and not recovery_root.is_symlink():
-            for child in recovery_root.iterdir():
-                if not child.is_dir() or child.is_symlink() or len(child.name) != 32:
-                    continue
-                meta_file = child / "session.json"
-                if not meta_file.is_file() or meta_file.is_symlink():
-                    continue
-                try:
-                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    continue
-                if isinstance(meta, dict) and (
-                    meta.get("meeting_id") == meeting_id or meta.get("session_id") == meeting_id
-                ):
-                    shutil.rmtree(child, ignore_errors=True)
+        delete_session_recovery_files(meeting_id, base_dir=recovery_root)
     except OSError:
         pass
 

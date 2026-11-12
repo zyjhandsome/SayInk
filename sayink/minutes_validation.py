@@ -21,6 +21,7 @@ _STRING_ITEM_PRIMARY_FIELD = {
     "speakers": "label",
 }
 _STRICT_TEXT_KEYS = ("title", "label", "text", "task", "summary")
+_KNOWN_OPTIONAL_KEYS = ("owner", "due", "ts", "evidence_ts", "start", "end")
 
 
 def _coerce_item(raw_item, key: str) -> dict:
@@ -47,10 +48,13 @@ def _coerce_text_fields(item: dict, key: str) -> None:
         elif isinstance(value, str):
             continue
         elif name not in ITEM_FIELDS.get(key, ()) and name not in _STRICT_TEXT_KEYS:
-            if isinstance(value, list) and all(isinstance(v, str) for v in value):
-                item[name] = "、".join(v.strip() for v in value if v.strip())
-            elif isinstance(value, (int, float)) and not isinstance(value, bool):
-                item[name] = str(value)
+            if name in _KNOWN_OPTIONAL_KEYS:
+                if isinstance(value, list) and all(isinstance(v, str) for v in value):
+                    item[name] = "、".join(v.strip() for v in value if v.strip())
+                elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                    item[name] = str(value)
+                else:
+                    item.pop(name, None)
             else:
                 item.pop(name, None)
         else:

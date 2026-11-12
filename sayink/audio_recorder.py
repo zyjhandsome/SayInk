@@ -352,6 +352,10 @@ class AudioRecorder(QObject):
         return self._journal is not None and self._journal.healthy
 
     @property
+    def recovery_journal_path(self):
+        return self._journal.path if self._journal is not None else None
+
+    @property
     def recovery_pending_dir(self):
         return self._journal.path / "pending" if self._journal is not None else None
 

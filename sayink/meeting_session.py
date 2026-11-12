@@ -517,6 +517,7 @@ class MeetingController(QObject):
         self._external_block: Callable[[], str] | None = None
         self._media_job: _MediaImportJob | None = None
         self._media_title = ""
+        self._media_source_path = ""
         self._unsaved_media: tuple | None = None
         self.media_import_notice = ""
         self.transcript_import_notice = ""
@@ -1262,6 +1263,7 @@ class MeetingController(QObject):
             self._importing_media = False
             return "语音模型未就绪，请等待模型加载完成后再导入音视频"
         self._media_title = (title or Path(path).stem).strip()
+        self._media_source_path = str(path or "")
         job = _MediaImportJob(path, self._media_runner, self._media_cancel, None)
         job.progressed.connect(self.media_import_progress)
         job.succeeded.connect(self._on_media_job_done)
@@ -1271,9 +1273,22 @@ class MeetingController(QObject):
         job.start()
         return ""
 
-    def commit_media_import(self, result, title: str, *, _meeting_id: str = "") -> MeetingRecord | None:
+    def commit_media_import(
+        self,
+        result,
+        title: str,
+        *,
+        _meeting_id: str = "",
+        _audio_path: str = "",
+    ) -> MeetingRecord | None:
         """Persist finished turns and clear the import lock. Minutes stay manual."""
         target_id = _meeting_id or uuid.uuid4().hex[:12]
+        resolved_audio_path = str(
+            getattr(result, "audio_path", "")
+            or _audio_path
+            or getattr(self, "_media_source_path", "")
+            or ""
+        )
         try:
             turns = tuple(getattr(result, "turns", ()) or ())
             if not turns:
@@ -1299,13 +1314,13 @@ class MeetingController(QObject):
                 model_id=model_id,
                 glossary=glossary,
                 meeting_id=target_id,
-                audio_path=str(getattr(result, "audio_path", "") or ""),
+                audio_path=resolved_audio_path,
             )
             if record is None:
                 return None
             saved = self._store.get_meeting(record.id) if self._store.flush() else None
             if saved is None:
-                self._unsaved_media = (result, title, record.id)
+                self._unsaved_media = (result, title, record.id, resolved_audio_path)
                 raise MediaCommitError("识别已经完成，但写入数据库失败。可以重试保存，不必重新识别。")
             self._unsaved_media = None
             self.auto_name_speakers(saved.id, _emit=False)
@@ -1314,10 +1329,11 @@ class MeetingController(QObject):
         except MediaCommitError:
             raise
         except Exception as exc:
-            self._unsaved_media = (result, title, target_id)
+            self._unsaved_media = (result, title, target_id, resolved_audio_path)
             raise MediaCommitError(f"写入数据库失败：{exc}") from exc
         finally:
             self._importing_media = False
+            self._media_source_path = ""
             self._media_cancel.clear()
 
     def _on_media_job_done(self, result) -> None:
@@ -1345,7 +1361,11 @@ class MeetingController(QObject):
         pending = self._unsaved_media
         if not pending:
             return "没有可重试的导入结果"
-        result, title, meeting_id = pending
+        if len(pending) >= 4:
+            result, title, meeting_id, audio_path = pending[:4]
+        else:
+            result, title, meeting_id = pending
+            audio_path = ""
         if meeting_id and self._store.flush() and self._store.get_meeting(meeting_id) is not None:
             self._unsaved_media = None
             self.media_import_notice = ""
@@ -1356,7 +1376,9 @@ class MeetingController(QObject):
         self._importing_media = True
         self._media_title = title
         try:
-            saved = self.commit_media_import(result, title, _meeting_id=meeting_id)
+            saved = self.commit_media_import(
+                result, title, _meeting_id=meeting_id, _audio_path=audio_path
+            )
         except MediaCommitError as exc:
             self.media_import_notice = str(exc)
             return str(exc)
