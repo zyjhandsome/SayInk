@@ -7,6 +7,7 @@ import queue
 import sqlite3
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -14,6 +15,9 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 2
+_SUPPRESSED_POLISHED_MARKER = "\u200b"
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS history (
@@ -53,7 +57,8 @@ CREATE TABLE IF NOT EXISTS meetings (
   started_at    INTEGER NOT NULL,
   ended_at      INTEGER,
   status        TEXT NOT NULL DEFAULT 'live',
-  deleted_at    INTEGER
+  deleted_at    INTEGER,
+  audio_path    TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_meetings_started ON meetings(started_at);
 CREATE TABLE IF NOT EXISTS meeting_marks (
@@ -84,7 +89,10 @@ CREATE TABLE IF NOT EXISTS meeting_notes (
   chunked           INTEGER NOT NULL DEFAULT 0,
   transcript_changed INTEGER NOT NULL DEFAULT 0,
   previous_transcript_changed INTEGER NOT NULL DEFAULT 0,
-  previous_metadata TEXT NOT NULL DEFAULT ''
+  previous_metadata TEXT NOT NULL DEFAULT '',
+  user_markdown     TEXT NOT NULL DEFAULT '',
+  user_metadata     TEXT NOT NULL DEFAULT '',
+  user_transcript_changed INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS meeting_generation_cache (
   meeting_id TEXT NOT NULL,
@@ -129,16 +137,32 @@ def _ensure_speaker_columns(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_meeting_note_columns(conn: sqlite3.Connection) -> None:
+    meeting_columns = {row[1] for row in conn.execute("PRAGMA table_info(meetings)")}
+    if meeting_columns and "audio_path" not in meeting_columns:
+        conn.execute("ALTER TABLE meetings ADD COLUMN audio_path TEXT NOT NULL DEFAULT ''")
     speaker_columns = {row[1] for row in conn.execute("PRAGMA table_info(meeting_speakers)")}
-    if "name_locked" not in speaker_columns:
+    if speaker_columns and "name_locked" not in speaker_columns:
         conn.execute("ALTER TABLE meeting_speakers ADD COLUMN name_locked INTEGER NOT NULL DEFAULT 0")
         conn.execute("UPDATE meeting_speakers SET name_locked = 1 WHERE display_name != ''")
     present = {row[1] for row in conn.execute("PRAGMA table_info(meeting_notes)")}
-    for name in ("transcript_changed", "previous_transcript_changed"):
+    if not present:
+        return
+    for name in ("transcript_changed", "previous_transcript_changed", "user_transcript_changed"):
         if name not in present:
             conn.execute(f"ALTER TABLE meeting_notes ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
-    if "previous_metadata" not in present:
-        conn.execute("ALTER TABLE meeting_notes ADD COLUMN previous_metadata TEXT NOT NULL DEFAULT ''")
+    for name in ("previous_metadata", "user_markdown", "user_metadata"):
+        if name not in present:
+            conn.execute(f"ALTER TABLE meeting_notes ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+    if "user_markdown" not in present:
+        conn.execute(
+            """
+            UPDATE meeting_notes
+            SET user_markdown = markdown,
+                user_transcript_changed = transcript_changed
+            WHERE user_edited = 1 AND markdown != '' AND user_markdown = ''
+            """
+        )
+
 
 _SESSION_SUMMARY_SQL = """
 SELECT
@@ -155,15 +179,16 @@ SELECT
     WHERE h2.session_id = h.session_id
     ORDER BY h2.seq ASC LIMIT 1
   ) AS target_app,
-  (
+  COALESCE((
     SELECT CASE
       WHEN polished_text != '' THEN polished_text
       ELSE raw_text
     END
     FROM history h2
     WHERE h2.session_id = h.session_id
+      AND h2.polished_text != '\u200b'
     ORDER BY h2.seq ASC LIMIT 1
-  ) AS preview
+  ), '') AS preview
 FROM history h
 """
 
@@ -277,12 +302,15 @@ class HistoryStore:
         self._init_error: BaseException | None = None
         self._committed_callbacks: list[Callable[[], None]] = []
         self._failed_callbacks: list[Callable[[str], None]] = []
+        self._segment_calibrator: Callable[[SegmentRecord], SegmentRecord] | None = None
         self._fail_lock = threading.Lock()
         self._write_failures = 0
+        self._unflushed_failures = 0
         self._closed = False
         self._read_local = threading.local()
         self._read_lock = threading.Lock()
         self._read_conns: dict[int, sqlite3.Connection] = {}
+        self._read_conn_threads: dict[int, weakref.ReferenceType[threading.Thread]] = {}
 
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -329,10 +357,12 @@ class HistoryStore:
         try:
             conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
             conn.execute("PRAGMA journal_mode=WAL;")
+            current_version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
             conn.executescript(_DDL)
             _ensure_speaker_columns(conn)
             _ensure_meeting_note_columns(conn)
-            conn.execute("PRAGMA user_version=1;")
+            if current_version < SCHEMA_VERSION:
+                conn.execute(f"PRAGMA user_version={SCHEMA_VERSION};")
             conn.commit()
         finally:
             conn.close()
@@ -365,6 +395,12 @@ class HistoryStore:
     def add_committed_callback(self, callback: Callable[[], None]) -> None:
         self._committed_callbacks.append(callback)
 
+    def remove_committed_callback(self, callback: Callable[[], None]) -> None:
+        try:
+            self._committed_callbacks.remove(callback)
+        except ValueError:
+            pass
+
     def add_failed_callback(self, callback: Callable[[str], None]) -> None:
         """Called from the writer thread with a user-facing message when a
         queued write could not be committed."""
@@ -384,9 +420,22 @@ class HistoryStore:
             except Exception:
                 logger.exception("HistoryStore failed callback failed")
 
+    def set_segment_calibrator(
+        self, calibrator: Callable[[SegmentRecord], SegmentRecord] | None
+    ) -> None:
+        """Optional hook (registered by MeetingController) to calibrate segment
+        wall-clock timestamps against active meeting pause intervals."""
+        self._segment_calibrator = calibrator
+
     def enqueue(self, record: SegmentRecord) -> None:
         if self.disabled:
             return
+        calibrator = self._segment_calibrator
+        if calibrator is not None and record.trigger_mode == MEETING_TRIGGER_MODE:
+            try:
+                record = calibrator(record)
+            except Exception:
+                logger.exception("HistoryStore segment calibrator failed")
         self._queue.put(("insert", record))
 
     def enqueue_delete_sessions(self, session_ids: list[str]) -> None:
@@ -507,11 +556,14 @@ class HistoryStore:
         without touching ``raw_text``."""
         if self.disabled or not session_id or not polished_by_seq:
             return
-        rows = [(str(text), session_id, int(seq)) for seq, text in polished_by_seq.items()]
+        rows = [
+            (str(text), str(text), session_id, int(seq))
+            for seq, text in polished_by_seq.items()
+        ]
 
         def _update(conn: sqlite3.Connection) -> None:
             conn.executemany(
-                "UPDATE history SET polished_text = ? WHERE session_id = ? AND seq = ?",
+                "UPDATE history SET polished_text = ?, corrected_text = ? WHERE session_id = ? AND seq = ?",
                 rows,
             )
 
@@ -563,17 +615,19 @@ class HistoryStore:
 
         Readers use a separate connection; a caller that reads right after
         enqueueing (meeting end → render transcript) needs this barrier.
+        Returns True iff the barrier completed within ``timeout`` and every
+        operation processed since the previous barrier succeeded.
         """
+        self._reap_dead_read_connections()
         if self.disabled or self._thread is None:
             return True
         done = threading.Event()
-        with self._fail_lock:
-            before = self._write_failures
-        self._queue.put(("barrier", done))
+        result_box = [True]
+        self._queue.put(("barrier", (done, result_box)))
         if not done.wait(timeout=timeout):
             return False
-        with self._fail_lock:
-            return self._write_failures == before
+        self._reap_dead_read_connections()
+        return bool(result_box[0])
 
     def read(self, fn: Callable[[sqlite3.Connection], Any], default: Any = None) -> Any:
         """Run ``fn(conn)`` on a cached thread-local read-only connection."""
@@ -626,17 +680,61 @@ class HistoryStore:
             logger.exception("HistoryStore list_sessions failed")
             return []
 
-    def search_sessions(self, q: str, limit: int | None = None) -> list[SessionSummary]:
+    def search_sessions(
+        self,
+        q: str,
+        limit: int | None = None,
+        *,
+        prefer_raw: bool | None = None,
+        include_raw: bool | None = None,
+    ) -> list[SessionSummary]:
         """Newest-first sessions whose text contains ``q``.
 
         ``limit`` bounds the result like ``list_sessions`` does: the history
         page renders a widget per row, so a common word matching thousands of
         sessions must not be rendered in one go.
+        Suppressed ``\\u200b`` rows and stale ``raw_text`` superseded by user
+        edits (``corrected_text != ''``) are never matched unless ``prefer_raw=True``.
         """
-        if self.disabled or not q:
+        if self.disabled or not q or q == _SUPPRESSED_POLISHED_MARKER:
             return []
-        pattern = f"%{escape_like(q)}%"
-        params: tuple[Any, ...] = (pattern, pattern, pattern)
+        cleaned_q = q.replace(_SUPPRESSED_POLISHED_MARKER, "")
+        if not cleaned_q:
+            return []
+        pattern = f"%{escape_like(cleaned_q)}%"
+        if prefer_raw is True:
+            match_cte = f"""
+                SELECT session_id, seq, raw_text AS matched_text
+                FROM history
+                WHERE trigger_mode != '{MEETING_TRIGGER_MODE}'
+                  AND polished_text != ?
+                  AND raw_text LIKE ? ESCAPE '\\'
+            """
+            params: tuple[Any, ...] = (_SUPPRESSED_POLISHED_MARKER, pattern)
+        elif prefer_raw is False or include_raw is False:
+            match_cte = f"""
+                SELECT session_id, seq,
+                       CASE WHEN polished_text != '' THEN polished_text ELSE raw_text END AS matched_text
+                FROM history
+                WHERE trigger_mode != '{MEETING_TRIGGER_MODE}'
+                  AND polished_text != ?
+                  AND (CASE WHEN polished_text != '' THEN polished_text ELSE raw_text END) LIKE ? ESCAPE '\\'
+            """
+            params = (_SUPPRESSED_POLISHED_MARKER, pattern)
+        else:
+            match_cte = f"""
+                SELECT session_id, seq,
+                       CASE WHEN polished_text LIKE ? ESCAPE '\\'
+                            THEN polished_text ELSE raw_text END AS matched_text
+                FROM history
+                WHERE trigger_mode != '{MEETING_TRIGGER_MODE}'
+                  AND polished_text != ?
+                  AND (
+                    (corrected_text != '' AND polished_text LIKE ? ESCAPE '\\')
+                    OR (corrected_text = '' AND (raw_text LIKE ? ESCAPE '\\' OR polished_text LIKE ? ESCAPE '\\'))
+                  )
+            """
+            params = (pattern, _SUPPRESSED_POLISHED_MARKER, pattern, pattern, pattern)
         limit_sql = ""
         if limit is not None:
             limit_sql = "LIMIT ?"
@@ -646,12 +744,7 @@ class HistoryStore:
                 rows = conn.execute(
                     f"""
                     WITH matching AS (
-                        SELECT session_id, seq,
-                               CASE WHEN polished_text LIKE ? ESCAPE '\\'
-                                    THEN polished_text ELSE raw_text END AS matched_text
-                        FROM history
-                        WHERE trigger_mode != '{MEETING_TRIGGER_MODE}'
-                          AND (raw_text LIKE ? ESCAPE '\\' OR polished_text LIKE ? ESCAPE '\\')
+                        {match_cte}
                     )
                     SELECT summaries.session_id, summaries.session_created, summaries.segment_count,
                            summaries.source, summaries.target_app,
@@ -710,9 +803,28 @@ class HistoryStore:
             logger.exception("HistoryStore get_session_segments failed")
             return []
 
+    def _reap_dead_read_connections(self) -> int:
+        """Close cached read-only connections owned by threads that have exited."""
+        dead_conns: list[sqlite3.Connection] = []
+        with self._read_lock:
+            for conn_id, thread_ref in list(self._read_conn_threads.items()):
+                owner = thread_ref()
+                if owner is None or not owner.is_alive():
+                    self._read_conn_threads.pop(conn_id, None)
+                    conn = self._read_conns.pop(conn_id, None)
+                    if conn is not None:
+                        dead_conns.append(conn)
+        for conn in dead_conns:
+            try:
+                conn.close()
+            except Exception:
+                logger.debug("HistoryStore dead-thread read connection close ignored", exc_info=True)
+        return len(dead_conns)
+
     def _close_conn_quietly(self, conn: sqlite3.Connection) -> None:
         with self._read_lock:
             self._read_conns.pop(id(conn), None)
+            self._read_conn_threads.pop(id(conn), None)
         try:
             conn.close()
         except Exception:
@@ -723,6 +835,7 @@ class HistoryStore:
         with self._read_lock:
             conns = list(self._read_conns.values())
             self._read_conns.clear()
+            self._read_conn_threads.clear()
         for conn in conns:
             try:
                 conn.close()
@@ -731,6 +844,7 @@ class HistoryStore:
 
     @contextmanager
     def _read_conn(self):
+        self._reap_dead_read_connections()
         if self._closed or self._thread is None:
             conn = self._readonly_conn()
             try:
@@ -770,14 +884,17 @@ class HistoryStore:
                 pass
 
     def _readonly_conn(self) -> sqlite3.Connection:
+        self._reap_dead_read_connections()
         # Read-only URI connection (WAL allows concurrent readers).
         uri = self.db_path.resolve().as_uri() + "?mode=ro"
         conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000)
         conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
         conn.execute("PRAGMA query_only=ON;")
         if not self._closed:
+            owner_ref = weakref.ref(threading.current_thread())
             with self._read_lock:
                 self._read_conns[id(conn)] = conn
+                self._read_conn_threads[id(conn)] = owner_ref
         return conn
 
     def _writer_loop(self) -> None:
@@ -818,6 +935,11 @@ class HistoryStore:
             except Exception:
                 logger.exception("HistoryStore writer connection close failed")
 
+    def _record_write_failure(self) -> None:
+        with self._fail_lock:
+            self._write_failures += 1
+            self._unflushed_failures += 1
+
     def _dispatch(self, conn: sqlite3.Connection, item: Any) -> None:
         op = ""
         try:
@@ -832,7 +954,15 @@ class HistoryStore:
                 retention_days, max_entries, active_session_id = payload
                 self._do_cleanup(conn, retention_days, max_entries, active_session_id)
             elif op == "barrier":
-                payload.set()
+                with self._fail_lock:
+                    ok = self._unflushed_failures == 0
+                    self._unflushed_failures = 0
+                if isinstance(payload, tuple) and len(payload) == 2:
+                    done_evt, result_box = payload
+                    result_box[0] = ok
+                    done_evt.set()
+                else:
+                    payload.set()
                 return
             elif op == "write":
                 fn, notice = payload
@@ -845,9 +975,8 @@ class HistoryStore:
                         conn.rollback()
                     except Exception:
                         logger.exception("HistoryStore rollback after custom write failed")
+                    self._record_write_failure()
                     self._notify_failed(notice)
-                    with self._fail_lock:
-                        self._write_failures += 1
                     return
             else:
                 return
@@ -858,6 +987,7 @@ class HistoryStore:
                 conn.rollback()
             except Exception:
                 logger.exception("HistoryStore rollback after writer failure failed")
+            self._record_write_failure()
             self._notify_failed(
                 WRITE_FAILED_NOTICE if op == "insert" else DELETE_FAILED_NOTICE
             )
@@ -894,18 +1024,20 @@ class HistoryStore:
     def _do_delete_sessions(self, conn: sqlite3.Connection, session_ids: list[str]) -> None:
         if not session_ids:
             return
-        placeholders = ",".join("?" for _ in session_ids)
         # Meeting transcripts share this table. A history delete must not orphan
         # a meeting by removing its rows, even if a caller passes the meeting id.
-        conn.execute(
-            f"""
-            DELETE FROM history
-            WHERE session_id IN ({placeholders})
-              AND trigger_mode != ?
-              AND session_id NOT IN ({_PROTECTED_SESSIONS_SQL})
-            """,
-            (*session_ids, MEETING_TRIGGER_MODE),
-        )
+        for start in range(0, len(session_ids), 500):
+            chunk = session_ids[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(
+                f"""
+                DELETE FROM history
+                WHERE session_id IN ({placeholders})
+                  AND trigger_mode != ?
+                  AND session_id NOT IN ({_PROTECTED_SESSIONS_SQL})
+                """,
+                (*chunk, MEETING_TRIGGER_MODE),
+            )
         conn.commit()
 
     def _do_delete_all(self, conn: sqlite3.Connection) -> None:
@@ -923,6 +1055,7 @@ class HistoryStore:
         max_entries: int,
         active_session_id: str | None,
     ) -> None:
+        deleted_any = False
         if retention_days > 0:
             cutoff_ms = int(time.time() * 1000 - retention_days * 86_400_000)
             rows = conn.execute(
@@ -936,7 +1069,9 @@ class HistoryStore:
                 (cutoff_ms,),
             ).fetchall()
             to_delete = [r[0] for r in rows if r[0] != active_session_id]
-            self._delete_sessions(conn, to_delete)
+            if to_delete:
+                self._delete_sessions(conn, to_delete)
+                deleted_any = True
 
         if max_entries > 0:
             # One pass: drop the oldest sessions beyond the cap. The active
@@ -954,10 +1089,15 @@ class HistoryStore:
             overflow = len(session_ids) - max_entries
             if overflow > 0:
                 victims = [s for s in session_ids if s != active_session_id][:overflow]
-                self._delete_sessions(conn, victims)
+                if victims:
+                    self._delete_sessions(conn, victims)
+                    deleted_any = True
+
+        if deleted_any:
+            conn.commit()
 
     def _delete_sessions(self, conn: sqlite3.Connection, session_ids: list[str]) -> None:
-        # SQLite binds at most 32766 variables. Delete in chunks either way.
+        # SQLite binds at most 32766 variables. Delete in chunks within caller's transaction.
         for start in range(0, len(session_ids), 500):
             chunk = session_ids[start:start + 500]
             placeholders = ",".join("?" for _ in chunk)
@@ -965,4 +1105,3 @@ class HistoryStore:
                 f"DELETE FROM history WHERE session_id IN ({placeholders})",
                 chunk,
             )
-            conn.commit()

@@ -408,14 +408,26 @@ class TestFailureIsolation:
         assert s.get_session_segments("s") == []
         s.close(timeout=1.0)
 
-    def test_user_version_is_one(self, store, tmp_path):
+    def test_user_version_is_upgraded_and_never_downgraded(self, store, tmp_path):
+        from sayink.history_store import SCHEMA_VERSION
+
         store.close(timeout=2.0)
         conn = sqlite3.connect(tmp_path / "history.db")
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
+            assert version == SCHEMA_VERSION
+            conn.execute("PRAGMA user_version=99;")
+            conn.commit()
         finally:
             conn.close()
-        assert version == 1
+
+        reopened = HistoryStore(db_path=tmp_path / "history.db")
+        reopened.close(timeout=2.0)
+        conn = sqlite3.connect(tmp_path / "history.db")
+        try:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 99
+        finally:
+            conn.close()
 
     def test_schema_has_no_summary_column(self, store, tmp_path):
         store.close(timeout=2.0)

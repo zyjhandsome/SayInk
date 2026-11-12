@@ -27,10 +27,12 @@ from sayink.minutes_prompts import (
     parse_timestamp,
     speaker_label,
 )
+from sayink.text_polisher import strip_model_thinking
 
 EMPTY_SECTION_TEXT = "本场未识别到"
 UNVERIFIED_MARK = "（待核对）"
 _SPEAKER_LABEL_RE = re.compile(r"说话人\s*(\d+)")
+_SPEAKER_LABEL_FULL_RE = re.compile(r"^说话人\s*(\d+)$")
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
 
 
@@ -38,7 +40,10 @@ def extract_json(text: str) -> dict[str, Any] | None:
     """``json.loads`` first; else the first balanced ``{…}`` in the text."""
     if not text:
         return None
-    candidate = _FENCE_RE.sub("", text.strip())
+    stripped = strip_model_thinking(text).strip()
+    if not stripped:
+        return None
+    candidate = _FENCE_RE.sub("", stripped)
     # RecursionError: absurdly nested brackets from a broken endpoint must not
     # take the minutes worker down with them; they are simply "not JSON".
     try:
@@ -183,15 +188,27 @@ def _canonical_speaker_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     aliases = {name: speaker_label(next(iter(ids))) for name, ids in owners.items() if len(ids) == 1}
     if not aliases:
         return payload
-    patterns = []
+    patterns: list[tuple[re.Pattern[str], str]] = []
     for name in sorted(aliases, key=len, reverse=True):
-        head, tail = _name_bounds(name)
-        patterns.append(head + re.escape(name) + tail)
-    pattern = re.compile("|".join(patterns))
+        patterns.append((_label_pattern(name), aliases[name]))
+
+    def _replace_text(text: str) -> str:
+        # Simultaneous single-pass match so swapping 张三 <-> 李四 never collides.
+        combined = re.compile(
+            "|".join(f"(?P<_g{i}>{pat.pattern})" for i, (pat, _) in enumerate(patterns))
+        )
+
+        def _sub(match: re.Match[str]) -> str:
+            group_name = match.lastgroup
+            if group_name and group_name.startswith("_g"):
+                return patterns[int(group_name[2:])][1]
+            return aliases.get(match.group(), match.group())
+
+        return combined.sub(_sub, text)
 
     def canonical(value):
         if isinstance(value, str):
-            return pattern.sub(lambda match: aliases[match.group()], value)
+            return _replace_text(value)
         if isinstance(value, list):
             return [canonical(item) for item in value]
         if isinstance(value, dict):
@@ -212,14 +229,11 @@ def render_markdown(
     meta_lines: Sequence[str] = (),
 ) -> str:
     """Render the structured minutes; missing sections become placeholders."""
+    payload = _canonical_speaker_payload(payload or {})
     if template.is_refinement:
         from sayink.transcript_refiner import render_refinement
 
-        # Refined prose is near-verbatim speech: a name in it is content
-        # (「张强这个月回款才38万」), not a speaker label, so it must not be
-        # rewritten when a speaker who happens to share the name is renamed.
-        return apply_speaker_names(render_refinement(payload or {}), speaker_names)
-    payload = _canonical_speaker_payload(payload or {})
+        return apply_speaker_names(render_refinement(dict(payload)), speaker_names)
     title = _as_text(payload.get("title")) or title_fallback
     out: list[str] = [f"# {apply_speaker_names(title, speaker_names)}"]
     if meta_lines:
@@ -374,23 +388,54 @@ def _render_section(
     return ""
 
 
+_CJK_ALLOWED_BEFORE = (
+    "由请和与及跟同向给对让叫找被把从替为据按听等派约邀帮陪拉连除在是有或但而并"
+    "因待经如若当即含属系将就才都也还又再先后问看见归使令转交推选定点知醒排托助合持谢询复馈接"
+)
+_CJK_ALLOWED_AFTER_SINGLE = (
+    "负责审核补充确认说明汇报参加记录整理总结提出建议决定安排介绍解释指出表示问道说讲"
+    "的了着过和与及并而把被在从对向给跟同推落完交沟协评复准牵主配支处排修验测核拍签"
+    "反更调优拆合发移承运转联通邀出列认觉希预计回答追询展演判担关需已将会要应可能先再后也都还又未没不于就等"
+)
+_CJK_ALLOWED_AFTER_PHRASES = (
+    "强调|跟进|同步|推进|落实|提交|完成|交付|对接|沟通|协调|评审|复盘|准备|牵头|主导|"
+    "协助|配合|支持|处理|解决|排查|修复|验证|测试|核对|核实|审批|拍板|签字|反馈|更新|"
+    "修改|调整|优化|拆分|合并|提供|发送|移交|承接|承担|认领|转交|联系|通知|提醒|邀请|"
+    "主持|出席|列席|发言|提到|认为|觉得|同意|反对|质疑|要求|希望|预计|计划|承诺|回应|"
+    "回答|答复|回复|追问|询问|提问|分享|展示|演示|分析|评估|判断|担忧|担心|关注|关心|"
+    "这边|那边|已经"
+)
+_TITLE_EXTENSION_GUARD = r"(?!(?:监|经理|裁|工|管|助|编|师|长))"
+
+
 def _name_bounds(label: str) -> tuple[str, str]:
     """Don't let a short label rewrite a longer token.
 
-    ``说话人2`` stops before ``说话人21``. A Chinese name may be followed by
-    a verb (负责、审核) but not by another character that lengthens the name
-    (``王总`` must not hit ``王总监``).
+    ``说话人2`` stops before ``说话人21``. A Chinese name may be preceded by
+    common prepositions/conjunctions (由/请/和/与/让/给/跟/找/向…) and followed
+    by verbs/particles (确认/跟进/负责/同步/汇报/提出…), while blocking title
+    extensions (``王总`` must not hit ``王总监`` / ``王总经理``).
     """
     head = r"(?<![0-9A-Za-z])" if re.match(r"[0-9A-Za-z]", label) else ""
-    tail = r"(?![0-9A-Za-z])" if re.search(r"[0-9A-Za-z]$", label) else ""
+    tail = r"(?![0-9A-Za-z0-9])" if re.search(r"[0-9A-Za-z]$", label) else ""
     if re.search(r"[\u4e00-\u9fff]", label):
-        head = head or r"(?<![\u4e00-\u9fff])"
+        cjk_head = rf"(?:(?<![\u4e00-\u9fff])|(?<=[{_CJK_ALLOWED_BEFORE}]))"
+        head = head or cjk_head
+        title_guard = _TITLE_EXTENSION_GUARD if label.endswith(("总", "工", "师", "长", "导")) else ""
         following = (
-            r"(?:(?![\u4e00-\u9fff])|(?=[负责审核补充确认说明汇报参加记录整理总结"
-            r"提出建议决定安排介绍解释指出表示问道说讲的了着过和与及并而把被在从对向给]))"
+            rf"{title_guard}(?:(?![\u4e00-\u9fff])|(?=(?:{_CJK_ALLOWED_AFTER_PHRASES}|[{_CJK_ALLOWED_AFTER_SINGLE}])))"
         )
         tail = f"(?![0-9A-Za-z]){following}" if tail else following
     return head, tail
+
+
+def _label_pattern(label: str) -> re.Pattern[str]:
+    generic = _SPEAKER_LABEL_FULL_RE.match(label.strip())
+    head, tail = _name_bounds(label.strip())
+    if generic is not None:
+        num = int(generic.group(1))
+        return re.compile(rf"{head}说话人\s*0*{num}(?!\d)")
+    return re.compile(head + re.escape(label) + tail)
 
 
 def replace_names_in_markdown(markdown: str, old_label: str, new_label: str) -> tuple[str, int]:
@@ -398,7 +443,4 @@ def replace_names_in_markdown(markdown: str, old_label: str, new_label: str) -> 
     new text and how many places changed."""
     if not old_label or not new_label or old_label == new_label:
         return markdown, 0
-    head, tail = _name_bounds(old_label)
-    pattern = re.compile(head + re.escape(old_label) + tail)
-    new_text, count = pattern.subn(new_label, markdown)
-    return new_text, count
+    return _label_pattern(old_label).subn(lambda _: new_label, markdown)
