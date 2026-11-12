@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
+import os
+import sys
 from typing import Iterable, Literal, Optional, Protocol, runtime_checkable, cast
 
 from PyQt6.QtCore import QSettings
@@ -13,6 +16,31 @@ from sayink.ui import design_tokens as dt
 from sayink.ui.app_styles import build_global_stylesheet
 
 log = logging.getLogger("sayink")
+
+_SPI_GETCLIENTAREAANIMATION = 0x1042
+
+
+def prefers_reduced_motion() -> bool:
+    """Return True when OS or SAYINK_REDUCED_MOTION disables UI animations."""
+    env = os.environ.get("SAYINK_REDUCED_MOTION")
+    if env is not None:
+        return env.strip().lower() in {"1", "true", "yes", "on"}
+    if os.environ.get("QT_QPA_PLATFORM", "").strip().lower() == "offscreen":
+        return False
+    if sys.platform == "win32":
+        try:
+            enabled = ctypes.c_int(1)
+            ok = ctypes.windll.user32.SystemParametersInfoW(
+                _SPI_GETCLIENTAREAANIMATION,
+                0,
+                ctypes.byref(enabled),
+                0,
+            )
+            if ok:
+                return not bool(enabled.value)
+        except Exception:
+            return False
+    return False
 
 ThemeMode = Literal["light", "dark", "system"]
 EffectiveTheme = Literal["light", "dark"]
@@ -135,7 +163,7 @@ def _application_palette(effective: EffectiveTheme) -> QPalette:
     set_color(QPalette.ColorRole.ButtonText, "TEXT")
     set_color(QPalette.ColorRole.ToolTipBase, "SURFACE")
     set_color(QPalette.ColorRole.ToolTipText, "TEXT")
-    set_color(QPalette.ColorRole.Highlight, "ACCENT")
+    set_color(QPalette.ColorRole.Highlight, "ACCENT_SOLID")
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
     palette.setColor(
         QPalette.ColorGroup.Disabled,
@@ -173,16 +201,19 @@ def apply_theme(
     qt_app = app or QApplication.instance()
     if qt_app is not None:
         qt_app.setPalette(_application_palette(effective))
-        # Rebuild when missing or when the resolved UI font family changed.
+        # Rebuild when missing, when the effective theme changed, or when UI font changed.
         prev_font = qt_app.property("sayinkUiFontFamily")
+        prev_effective = qt_app.property("sayinkEffectiveTheme")
         need_style = (
             not qt_app.property("sayinkStaticStyleApplied")
             or prev_font != dt.UI_FONT_FAMILY
+            or prev_effective != effective
         )
         if need_style:
             qt_app.setStyleSheet(build_global_stylesheet(effective))
             qt_app.setProperty("sayinkStaticStyleApplied", True)
             qt_app.setProperty("sayinkUiFontFamily", dt.UI_FONT_FAMILY)
+            qt_app.setProperty("sayinkEffectiveTheme", effective)
 
     for surface in surfaces:
         reapply = getattr(surface, "reapply_theme", None)

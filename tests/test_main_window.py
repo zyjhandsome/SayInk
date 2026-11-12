@@ -113,7 +113,7 @@ def test_meeting_sidebar_tracks_session_and_restores_dictation(qapp, tmp_path, m
         options = MeetingOptions(input_source="mixed")
         controller.begin(options, resolve_capabilities(win._config, options, dictation_model_id="funasr-nano"))
         assert win._runtime_label.text() == "会议记录中"
-        assert win._status_tone() == "GREEN"
+        assert win._status_tone() == "STATE_RECORD"
         # Same source name as the dictation hints / source picker.
         assert win._mode_label.text() == "麦克风 + 电脑声音"
         assert win._output_label.text() == "仅保存会议记录"

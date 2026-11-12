@@ -20,10 +20,12 @@ from PyQt6.QtWidgets import (
 from sayink.config import Config, DEFAULT_HOTKEY, VERSION, format_hotkey
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles
+from sayink.ui.clipboard import copy_text
 from sayink.ui.dictation_hints import dictation_hints
 from sayink.ui.settings_components import (
     SettingsPage,
     ToggleOptionRow,
+    chain_tab_order,
     footnote,
     group_divider,
     page_header,
@@ -226,7 +228,7 @@ class AboutSettingsPage(SettingsPage):
         self.about_feedback_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.about_feedback_btn.setAccessibleName("在 GitHub 提交反馈")
         self.about_feedback_btn.setToolTip(ISSUES_URL)
-        self.about_feedback_btn.clicked.connect(open_feedback_page)
+        self.about_feedback_btn.clicked.connect(self._handle_feedback_button)
         feedback_layout.addWidget(self.about_feedback_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         if SHOW_FEEDBACK_ENTRY:
             self.add(self.about_feedback_group)
@@ -236,6 +238,27 @@ class AboutSettingsPage(SettingsPage):
         self.paint_update_row()
         self.set_compact()
         self.set_spacing(16)
+        chain_tab_order([
+            self.about_update_btn,
+            self.about_auto_update_row,
+            *(
+                row.action_button
+                for row in self.about_summary_rows.values()
+                if row.action_button is not None
+            ),
+            self.about_paths_toggle,
+            self.about_feedback_btn,
+        ])
+
+    def _handle_feedback_button(self) -> None:
+        if not open_feedback_page():
+            copy_text(ISSUES_URL)
+            self.about_feedback_hint.setText(
+                f"未能打开默认浏览器，已将反馈地址复制到剪贴板：{ISSUES_URL}"
+            )
+            self.about_update_status.setText(
+                "未能打开默认浏览器，已将 GitHub 反馈地址复制到剪贴板。"
+            )
 
     def _handle_update_button(self) -> None:
         if self.about_update_btn.text() == "下载并安装":
@@ -326,8 +349,10 @@ class AboutSettingsPage(SettingsPage):
     def refresh_runtime_rows(self, config: Config) -> None:
         """Update source / mode / output on About without rescanning models."""
         hints = dictation_hints(config)
+        raw_hotkey = str(config.get("hotkey", DEFAULT_HOTKEY) or "")
+        hotkey_display = format_hotkey(raw_hotkey) if raw_hotkey else "未绑定"
         for key, value in (
-            ("录音快捷键", format_hotkey(config.get("hotkey", DEFAULT_HOTKEY))),
+            ("录音快捷键", hotkey_display),
             ("音频来源", hints.source),
             ("录制方式", hints.mode),
             ("输出去向", hints.output),
@@ -341,14 +366,25 @@ class AboutSettingsPage(SettingsPage):
             output_row.reapply_styles()
 
     def refresh_info(self, config: Config) -> None:
-        from sayink.speech_recognizer import MODEL_REGISTRY, get_model_info, is_model_downloaded
+        from sayink.speech_recognizer import (
+            AUX_MODEL_REGISTRY,
+            MODEL_REGISTRY,
+            get_model_info,
+            is_model_downloaded,
+        )
         from sayink.text_polisher import polish_settings_complete
 
         active_id = config.get("stt.model_id", "")
         ai = get_model_info(active_id)
         active_name = ai["name"] if ai else "未选择"
 
-        downloaded = [m for m in MODEL_REGISTRY if is_model_downloaded(m["id"])]
+        seen_ids: set[str] = set()
+        downloaded = []
+        for m in (*MODEL_REGISTRY, *AUX_MODEL_REGISTRY):
+            mid = m["id"]
+            if mid not in seen_ids and is_model_downloaded(mid):
+                seen_ids.add(mid)
+                downloaded.append(m)
         total_mb = sum(m["size_mb"] for m in downloaded)
 
         llm_enabled = config.get("llm.enabled", False)
@@ -358,9 +394,11 @@ class AboutSettingsPage(SettingsPage):
             config.get("llm.model_name", ""),
         )
         hints = dictation_hints(config)
+        raw_hotkey = str(config.get("hotkey", DEFAULT_HOTKEY) or "")
+        hotkey_display = format_hotkey(raw_hotkey) if raw_hotkey else "未绑定"
         runtime_items = [
             ("语音识别模型", active_name),
-            ("录音快捷键", format_hotkey(config.get("hotkey", DEFAULT_HOTKEY))),
+            ("录音快捷键", hotkey_display),
             ("音频来源", hints.source),
             ("录制方式", hints.mode),
             ("输出去向", hints.output),

@@ -47,6 +47,7 @@ class ModelCard(QFrame):
         self._delete_btn = None
         self._cancel_btn = None
         self._badge = None
+        self._bundled_lbl = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -131,6 +132,7 @@ class ModelCard(QFrame):
             if is_bundled_model(self._model_id):
                 bundled = QLabel("随安装包提供")
                 bundled.setToolTip("安装包自带的模型由安装程序管理。")
+                self._bundled_lbl = bundled
                 actions.addWidget(bundled)
             else:
                 self._delete_btn = QPushButton("删除")
@@ -172,9 +174,11 @@ class ModelCard(QFrame):
             if self._is_active
             else f"1px solid {tok.HAIRLINE}"
         )
+        hover_ring = tok.ACCENT if self._is_active else tok.CONTROL_BORDER_HOVER
         self.setStyleSheet(
             f"ModelCard {{ background: {tok.SURFACE}; border: {ring};"
             f" border-radius: {tok.RADIUS_MD}px; }}"
+            f"ModelCard:hover {{ border: 1px solid {hover_ring}; }}"
         )
         self._name_lbl.setStyleSheet(
             f"color: {tok.TEXT}; font-size: {tok.TYPE_TITLE_SM}px; font-weight: 700;"
@@ -207,6 +211,10 @@ class ModelCard(QFrame):
         self._progress_lbl.setStyleSheet(
             f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
         )
+        if self._bundled_lbl is not None:
+            self._bundled_lbl.setStyleSheet(
+                f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
+            )
         if self._cancel_btn is not None:
             self._cancel_btn.setStyleSheet(ss.BTN_GHOST_SM)
         if self._select_btn is not None:
@@ -216,7 +224,7 @@ class ModelCard(QFrame):
             self._delete_btn.setStyleSheet(ss.BTN_DANGER_SM)
         if self._action_btn is not None:
             self._action_btn.setStyleSheet(ss.BTN_ACCENT_SM)
-        self._error_label.setStyleSheet(f"color: {tok.RED}; font-size: {tok.TYPE_FOOTNOTE}px; padding-top: 8px;")
+        self._error_label.setStyleSheet(f"color: {tok.RED_TEXT}; font-size: {tok.TYPE_FOOTNOTE}px; padding-top: 8px;")
 
     def set_download_progress(self, pct: int):
         self._error_label.hide()
@@ -248,6 +256,10 @@ class ModelCard(QFrame):
         self._end_download("下载")
 
     def set_download_error(self, msg: str):
-        self._error_label.setText(f"下载失败：{msg}")
+        cleaned = (msg or "").strip()
+        for prefix in ("下载失败：", "下载失败:"):
+            while cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix):].strip()
+        self._error_label.setText(f"下载失败：{cleaned}" if cleaned else "下载失败")
         self._error_label.show()
         self._end_download("重试")

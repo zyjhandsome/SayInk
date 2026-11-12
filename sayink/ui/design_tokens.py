@@ -187,6 +187,8 @@ TRAY_MENU_FONT = TYPE_FOOTNOTE
 _LIGHT: dict[str, Any] = {
     "ACCENT": "#2563EB",
     "ACCENT_HV": "#1D4ED8",
+    "ACCENT_SOLID": "#2563EB",
+    "ACCENT_SOLID_HV": "#1D4ED8",
     "ACCENT_FOCUS": "#2563EB",
     "ACCENT_TEXT": "#2563EB",
     "ACCENT_TEXT_HOVER": "#1D4ED8",
@@ -210,7 +212,7 @@ _LIGHT: dict[str, Any] = {
     "INPUT_BG": "#FFFFFF",
     "BAR_OFF": "#E5E7EB",
     "SETTINGS_SIDEBAR_BG": "#FFFFFF",
-    "NAV_SELECTED_BG": "rgba(13,13,13,0.06)",
+    "NAV_SELECTED_BG": "rgba(255, 255, 255, 0.92)",
     "TEXT": "#111827",
     "TEXT_SEC": "#4B5563",
     "TEXT_DIM": "#667085",
@@ -220,6 +222,7 @@ _LIGHT: dict[str, Any] = {
     "GREEN_TEXT": "#166534",
     "GREEN_BG": "#DCFCE7",
     "RED": "#C81E1E",
+    "RED_TEXT": "#991B1B",
     "RED_BG": "#FEE2E2",
     "AMBER": "#D97706",
     "AMBER_TEXT": "#92400E",
@@ -250,6 +253,14 @@ _LIGHT: dict[str, Any] = {
     "FLOAT_TEXT": "#111827",
     "FLOAT_TEXT_SEC": "#4B5563",
     "STATE_RECORD": "#DC2626",
+    "STATE_ICON_RECORD": "#DC2626",
+    "STATE_ICON_LISTEN": "#15803D",
+    "STATE_ICON_RECOGNIZE": "#2563EB",
+    "STATE_ICON_POLISH": "#0F766E",
+    "STATE_ICON_SUCCESS": "#15803D",
+    "STATE_ICON_WARN": "#D97706",
+    "STATE_ICON_ERROR": "#DC2626",
+    "STATE_ICON_MUTED": "#667085",
     # Transcript speaker names, by speaker id. Each stays >= 4.5:1 on
     # SURFACE_PEARL and HIGHLIGHT_BG (tests/test_ui_styles.py checks).
     "SPEAKER_COLORS": ("#2563EB", "#15803D", "#7C3AED", "#B45309", "#BE185D", "#0F766E"),
@@ -259,10 +270,12 @@ _LIGHT: dict[str, Any] = {
 _DARK: dict[str, Any] = {
     "ACCENT": "#3B82F6",
     "ACCENT_HV": "#60A5FA",
+    "ACCENT_SOLID": "#2563EB",
+    "ACCENT_SOLID_HV": "#1D4ED8",
     "ACCENT_FOCUS": "#3B82F6",
     "ACCENT_TEXT": "#60A5FA",
     "ACCENT_TEXT_HOVER": "#93C5FD",
-    "ACCENT_ON_DARK": "#FFFFFF",
+    "ACCENT_ON_DARK": "#0D0D0D",
     "ACCENT_BG": "#1E3A5F",
     "ACCENT_SOFT": "rgba(59, 130, 246, 0.16)",
     "PRIMARY_CONTAINER": "#FFFFFF",
@@ -291,6 +304,7 @@ _DARK: dict[str, Any] = {
     "GREEN_TEXT": "#86EFAC",
     "GREEN_BG": "#14532D",
     "RED": "#F87171",
+    "RED_TEXT": "#FECACA",
     "RED_BG": "#7F1D1D",
     "AMBER": "#FBBF24",
     "AMBER_TEXT": "#FCD34D",
@@ -319,6 +333,14 @@ _DARK: dict[str, Any] = {
     "FLOAT_TEXT": "#FFFFFF",
     "FLOAT_TEXT_SEC": "rgba(235, 235, 245, 0.72)",
     "STATE_RECORD": "#F87171",
+    "STATE_ICON_RECORD": "#F87171",
+    "STATE_ICON_LISTEN": "#4ADE80",
+    "STATE_ICON_RECOGNIZE": "#60A5FA",
+    "STATE_ICON_POLISH": "#5EEAD4",
+    "STATE_ICON_SUCCESS": "#4ADE80",
+    "STATE_ICON_WARN": "#FBBF24",
+    "STATE_ICON_ERROR": "#F87171",
+    "STATE_ICON_MUTED": "#9CA3AF",
     "SPEAKER_COLORS": ("#60A5FA", "#4ADE80", "#C4B5FD", "#FBBF24", "#F9A8D4", "#5EEAD4"),
     "HIGHLIGHT_BG": "#1E3A5F",
 }
@@ -356,13 +378,15 @@ def activate(effective: str) -> None:
         return
     vals = tokens_for(effective)
     g = globals()
+    g["ACTIVE_THEME"] = axis
     for key in _COLOR_KEYS:
         g[key] = vals[key]
-    # Float state aliases: listen uses semantic green; others follow float text
+    # Float state aliases: text stays calm while STATE_SUCCESS & STATE_ICON_*
+    # provide distinct color + shape dual-channel encoding on the island.
     g["STATE_LISTEN"] = vals["GREEN"]
     g["STATE_RECOGNIZE"] = vals["FLOAT_TEXT"]
-    g["STATE_POLISH"] = vals["FLOAT_TEXT"]
-    g["STATE_SUCCESS"] = vals["FLOAT_TEXT"]
+    g["STATE_POLISH"] = vals["FLOAT_TEXT_SEC"]
+    g["STATE_SUCCESS"] = vals["GREEN_TEXT"]
     # Warnings get the semantic amber so they read as warnings; stopped /
     # cancelled stay quiet grey on purpose.
     g["STATE_WARN"] = vals["AMBER"]

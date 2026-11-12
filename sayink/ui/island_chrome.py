@@ -16,6 +16,7 @@ ISLAND_TOP_MARGIN = 72
 # availableGeometry. Long sessions use this instead of the ribbon band.
 ISLAND_BOTTOM_MARGIN = 36
 ISLAND_EDGE_MARGIN = 16
+ISLAND_SHADOW_BLUR = 14
 
 LISTEN_BAR_PLACEMENTS = (
     "auto",

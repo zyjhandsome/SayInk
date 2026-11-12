@@ -572,10 +572,6 @@ class TestListenBarPlacement:
         click = start + QPoint(30, 16)
         _mouse(win, QEvent.Type.MouseButtonPress, click, Qt.MouseButton.LeftButton)
         _mouse(win, QEvent.Type.MouseButtonRelease, click, Qt.MouseButton.NoButton)
-        assert opened == []
-        assert win._meeting_click_timer.isActive()
-        win._meeting_click_timer.stop()
-        win._open_meeting_from_click()
         assert opened == [1]
 
     def test_double_click_restores_the_default_and_does_not_open_the_meeting(self, win, qapp):
@@ -590,14 +586,18 @@ class TestListenBarPlacement:
         press = start + QPoint(24, 12)
         _drag(win, press, press + QPoint(0, -160))
         assert win.y() < start.y() - 100
-        _mouse(win, QEvent.Type.MouseButtonPress, press, Qt.MouseButton.LeftButton)
-        _mouse(win, QEvent.Type.MouseButtonRelease, press, Qt.MouseButton.NoButton)
+        moved_y = win.y()
         _mouse(win, QEvent.Type.MouseButtonDblClick, press, Qt.MouseButton.LeftButton)
         qapp.processEvents()
-        assert opened == []
+        # H-40: double-click no longer resets island coordinates; context menu handles reset.
+        assert reset == []
+        assert win.y() == moved_y
+        menu_actions = [a for a in win._position_menu().actions() if not a.isSeparator()]
+        assert [a.text() for a in menu_actions] == ["打开历史记录", "打开设置", "重置悬浮窗位置"]
+        menu_actions[-1].trigger()
+        qapp.processEvents()
         assert reset == [1]
         assert abs(win.y() - start.y()) <= 2
-        assert [action.text() for action in win._position_menu().actions()] == ["恢复默认位置"]
 
     def test_saved_position_is_reused_for_the_next_session(self, win, qapp):
         from PyQt6.QtGui import QCursor

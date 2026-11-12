@@ -30,16 +30,19 @@ def dictation_hints(config) -> DictationHints:
     if continuous:
         esc_stops = config.get("audio.esc_stops_continuous", True)
         stop = (
-            "Esc 或转写条「结束」结束录音，已录内容继续识别。"
-            if esc_stops else "点转写条「结束」结束录音，已录内容继续识别。"
+            "Esc 或转写条「结束」结束录音，已录内容继续识别；"
+            if esc_stops else "点转写条「结束」结束录音，已录内容继续识别；"
         )
         output_clause = "；历史已关闭，结果不会保存或输入" if warning else f"并{destination}"
-        detail = f"按住快捷键启动，松开后继续录制；停顿后识别{output_clause}，不用一直按住。{stop}"
+        detail = (
+            f"按住快捷键启动，松开后继续录制；停顿后识别{output_clause}，不用一直按住。"
+            f"{stop}说话时可点转写条「放弃本句」丢弃当前句。"
+        )
         shortcut = f"按住 {hotkey}\n松开后继续录制\n" + (
             "Esc 结束并保留" if esc_stops else "点「结束」并保留"
         )
     else:
         output_clause = "；历史已关闭，结果不会保存或输入" if warning else f"并{destination}"
-        detail = f"按住快捷键录音，松开后识别{output_clause}；Esc 取消本次录音，不保留本次内容。"
+        detail = f"按住快捷键录音，松开后识别{output_clause}；Esc 或转写条「取消」取消本次录音，不保留本次内容。"
         shortcut = f"按住 {hotkey}，松开识别\nEsc 取消本次录音"
     return DictationHints(source, mode, output, shortcut, detail, warning)

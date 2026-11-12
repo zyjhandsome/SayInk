@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import logging
 
 from PyQt6.QtCore import QEvent, QPoint, QSignalBlocker, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -42,8 +43,9 @@ from sayink.recognition_settings import RecognitionSettings
 from sayink.runtime_status import SegmentationStatus
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles
+from sayink.ui.app_styles import install_spinbox_wheel_guard
 from sayink.ui.dictation_hints import dictation_hints
-from sayink.ui.hotkey_edit import HotkeyEdit
+from sayink.ui.hotkey_edit import HotkeyEdit, hotkey_conflict_warning
 from sayink.ui.settings_components import (
     AudioSourcePicker,
     SettingsPage,
@@ -64,6 +66,8 @@ from sayink.ui.settings_components import (
     sync_group_tab_stop,
 )
 from sayink.ui.theme import normalize_theme_mode
+
+log = logging.getLogger(__name__)
 
 MIXED_AUDIO_NOTE = (
     "音频来源：麦克风 + 电脑声音。线上会议可同时记录双方；外放时建议佩戴耳机，避免重复收音。"
@@ -91,6 +95,7 @@ def configure_numeric_spin(spin: QSpinBox) -> None:
     spin.setFixedWidth(tok.CONTROL_NUMERIC_WIDTH)
     spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
     spin.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    install_spinbox_wheel_guard(spin)
 
 
 def set_combo_by_data(combo: QComboBox, value: object) -> bool:
@@ -289,6 +294,7 @@ class GeneralSettingsPage(SettingsPage):
     recognition_setting_changed = pyqtSignal()
     glossary_text_changed = pyqtSignal()
     glossary_editing_finished = pyqtSignal()
+    glossary_clear_requested = pyqtSignal()
     vad_download_requested = pyqtSignal()
     meeting_setting_changed = pyqtSignal()
     meeting_start_card_reset_requested = pyqtSignal()
@@ -302,6 +308,7 @@ class GeneralSettingsPage(SettingsPage):
     restore_clipboard_toggled = pyqtSignal(bool)
     history_enabled_toggled = pyqtSignal(bool)
     history_limits_changed = pyqtSignal(int)
+    history_limits_editing_finished = pyqtSignal()
     recovery_toggled = pyqtSignal(bool)
     audio_recovery_requested = pyqtSignal()
 
@@ -311,10 +318,13 @@ class GeneralSettingsPage(SettingsPage):
     trigger_hotkey_rb: QRadioButton
     hotkey_edit: HotkeyEdit
     hotkey_hint: QLabel
+    hotkey_conflict_label: QLabel
     hotkey_reset_btn: QPushButton
     esc_stop_divider: QWidget
     esc_stop_row: ToggleOptionRow
     audio_device_buttons: tuple[QPushButton, QPushButton]
+    advanced_mixing_btn: QPushButton
+    advanced_mixing_panel: QWidget
     separate_lanes_row: ToggleOptionRow
     source_group: QButtonGroup
     src_mic_rb: QRadioButton
@@ -322,6 +332,7 @@ class GeneralSettingsPage(SettingsPage):
     src_mixed_rb: QRadioButton
     mixed_audio_callout: QLabel
     mixed_audio_callout_wrap: QWidget
+    output_mode_row_title: QLabel
     output_mode_combo: QComboBox
     output_mode_hint: QLabel
     enable_history_btn: QPushButton
@@ -329,7 +340,12 @@ class GeneralSettingsPage(SettingsPage):
     mic_test_btn: QPushButton
     audio_device_summary: QLabel
     mic_reset_btn: QPushButton
+    mic_level_label: QLabel
     mic_level_bar: QProgressBar
+    mic_level_wrap: QWidget
+    system_level_label: QLabel
+    system_level_bar: QProgressBar
+    system_level_wrap: QWidget
     mic_test_status: QLabel
     advanced_audio_btn: QPushButton
     advanced_audio_panel: QWidget
@@ -351,13 +367,19 @@ class GeneralSettingsPage(SettingsPage):
     history_cleanup_hint: QLabel
     history_cleanup_hint_wrap: QWidget
     listen_bar_combo: QComboBox
+    advanced_network_btn: QPushButton
+    advanced_network_panel: QWidget
     llm_proxy_combo: QComboBox
     llm_proxy_suffix_edit: QLineEdit
     listen_bar_autohide_row: ToggleOptionRow
+    advanced_recovery_btn: QPushButton
+    advanced_recovery_panel: QWidget
     recovery_row: ToggleOptionRow
     recovery_btn: QPushButton
     meeting_language_combo: QComboBox
     meeting_glossary_edit: GlossaryPlainTextEdit
+    glossary_count_label: QLabel
+    glossary_clear_btn: QPushButton
     recognition_capability_label: QLabel
     recognition_capability_row: QWidget
     recognition_apply_label: QLabel
@@ -382,9 +404,11 @@ class GeneralSettingsPage(SettingsPage):
     general_section_jumps: list[QPushButton]
     general_footer_note: QLabel
     general_tab_chain: list[QWidget]
+    audio_enum_warning: str
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.audio_enum_warning = ""
         self.add(page_header("通用", "设置录音、识别和历史记录。更改自动保存，生效时间在对应设置旁显示。"))
         recording = self._build_recording_section()
         refresh_btn, reset_btn = self.audio_device_buttons
@@ -434,6 +458,7 @@ class GeneralSettingsPage(SettingsPage):
             self.separate_lanes_row,
             self.meeting_language_combo,
             self.meeting_glossary_edit,
+            self.glossary_clear_btn,
             self.advanced_recognition_btn,
             self.vad_download_btn,
             self.meeting_source_combo,
@@ -455,6 +480,26 @@ class GeneralSettingsPage(SettingsPage):
             self.recovery_btn,
         ]
         chain_tab_order(self.general_tab_chain)
+
+    def prepare_tab_navigation(self, next_focus: bool) -> None:
+        if not next_focus:
+            return
+        fw = QApplication.focusWidget()
+        refresh_btn, reset_btn = self.audio_device_buttons
+        if fw in (self.advanced_audio_btn, reset_btn, refresh_btn) and not self.advanced_mixing_panel.isVisible():
+            self.set_advanced_mixing_expanded(True)
+        elif fw is self.meeting_start_card_reset_btn and not self.advanced_network_panel.isVisible():
+            self.set_advanced_network_expanded(True)
+        elif (
+            fw is not None
+            and (fw is self.history_max_entries_spin or self.history_max_entries_spin.isAncestorOf(fw))
+            and not self.advanced_recovery_panel.isVisible()
+        ):
+            self.set_advanced_recovery_expanded(True)
+
+    def focusNextPrevChild(self, next: bool) -> bool:
+        self.prepare_tab_navigation(next)
+        return super().focusNextPrevChild(next)
 
     # ── Section builders ──────────────────────────────────
 
@@ -481,8 +526,14 @@ class GeneralSettingsPage(SettingsPage):
             f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
             f" background: transparent; padding: 0 16px 12px 16px;"
         )
+        self.hotkey_conflict_label = QLabel()
+        self.hotkey_conflict_label.setWordWrap(True)
+        self.hotkey_conflict_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self.hotkey_conflict_label.setProperty("viTone", "idle")
+        self.hotkey_conflict_label.hide()
         lay.addWidget(stacked_field_row("录音快捷键", self.hotkey_edit))
         lay.addWidget(self.hotkey_hint)
+        lay.addWidget(self.hotkey_conflict_label)
         self.hotkey_reset_btn = _ghost_button(
             "快捷键恢复默认",
             self.hotkey_reset_requested.emit,
@@ -507,12 +558,23 @@ class GeneralSettingsPage(SettingsPage):
         lay.addWidget(self._build_mic_test_row())
         self.audio_device_buttons = self._build_advanced_audio(lay)
         lay.addWidget(group_divider())
+        self.advanced_mixing_btn = device_selection_link("实验性混音选项")
+        self.advanced_mixing_btn.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.advanced_mixing_btn.toggled.connect(self.set_advanced_mixing_expanded)
+        lay.addWidget(inline_action_row(self.advanced_mixing_btn, margins=(16, 8, 16, 8)))
+        self.advanced_mixing_panel = QWidget()
+        self.advanced_mixing_panel.setVisible(False)
+        self.advanced_mixing_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        mixing_lay = QVBoxLayout(self.advanced_mixing_panel)
+        mixing_lay.setContentsMargins(0, 0, 0, 0)
+        mixing_lay.setSpacing(0)
         self.separate_lanes_row = ToggleOptionRow(
             "混合音源分别识别（实验性）",
             "分别识别麦克风和电脑声音，减少同时说话时的互相遮盖；可能增加处理耗时。下次录音生效。",
         )
         self.separate_lanes_row.toggled.connect(self.separate_lanes_toggled.emit)
-        lay.addWidget(self.separate_lanes_row)
+        mixing_lay.addWidget(self.separate_lanes_row)
+        lay.addWidget(self.advanced_mixing_panel)
         section = settings_section("录音与输入", card)
         section.setObjectName("recordingInputSection")
         return section
@@ -542,7 +604,10 @@ class GeneralSettingsPage(SettingsPage):
         self.output_mode_combo.addItem("输入当前光标", OUTPUT_MODE_PASTE)
         self.output_mode_combo.addItem("仅保存到历史", OUTPUT_MODE_HISTORY)
         self.output_mode_combo.currentIndexChanged.connect(self.output_mode_changed.emit)
-        lay.addWidget(labeled_row("结果去向", self.output_mode_combo))
+        output_row = labeled_row("结果去向", self.output_mode_combo)
+        title_labels = [lb for lb in output_row.findChildren(QLabel) if lb.property("viRole") == "rowTitle"]
+        self.output_mode_row_title = title_labels[0] if title_labels else QLabel("结果去向")
+        lay.addWidget(output_row)
         self.output_mode_hint = footnote("")
         self.output_mode_hint.setAccessibleName("当前结果去向说明")
         lay.addWidget(inline_action_row(self.output_mode_hint, margins=(16, 0, 16, 10)))
@@ -583,13 +648,42 @@ class GeneralSettingsPage(SettingsPage):
         actions.addWidget(self.mic_reset_btn)
         actions.addStretch(1)
         row_lay.addLayout(actions)
+
+        self.mic_level_wrap = QWidget()
+        mic_meter_lay = QHBoxLayout(self.mic_level_wrap)
+        mic_meter_lay.setContentsMargins(0, 0, 0, 0)
+        mic_meter_lay.setSpacing(8)
+        self.mic_level_label = footnote("麦克风")
+        self.mic_level_label.setFixedWidth(48)
+        self.mic_level_label.hide()
         self.mic_level_bar = QProgressBar()
         self.mic_level_bar.setRange(0, 100)
         self.mic_level_bar.setTextVisible(False)
         self.mic_level_bar.setFixedHeight(6)
         self.mic_level_bar.setAccessibleName("测试输入音量")
         self.mic_level_bar.hide()
-        row_lay.addWidget(self.mic_level_bar)
+        mic_meter_lay.addWidget(self.mic_level_label)
+        mic_meter_lay.addWidget(self.mic_level_bar, 1)
+        self.mic_level_wrap.hide()
+        row_lay.addWidget(self.mic_level_wrap)
+
+        self.system_level_wrap = QWidget()
+        sys_meter_lay = QHBoxLayout(self.system_level_wrap)
+        sys_meter_lay.setContentsMargins(0, 0, 0, 0)
+        sys_meter_lay.setSpacing(8)
+        self.system_level_label = footnote("电脑声")
+        self.system_level_label.setFixedWidth(48)
+        self.system_level_bar = QProgressBar()
+        self.system_level_bar.setRange(0, 100)
+        self.system_level_bar.setTextVisible(False)
+        self.system_level_bar.setFixedHeight(6)
+        self.system_level_bar.setAccessibleName("测试电脑声音量")
+        self.system_level_bar.hide()
+        sys_meter_lay.addWidget(self.system_level_label)
+        sys_meter_lay.addWidget(self.system_level_bar, 1)
+        self.system_level_wrap.hide()
+        row_lay.addWidget(self.system_level_wrap)
+
         self.mic_test_status = QLabel("测试会临时采集约 2 秒声音，不保存音频或转写文本。")
         self.mic_test_status.setProperty("viRole", "importantHint")
         self.mic_test_status.setStyleSheet(
@@ -708,6 +802,8 @@ class GeneralSettingsPage(SettingsPage):
         self.history_enabled_row.toggled.connect(self.history_enabled_toggled.emit)
         self.history_retention_days_spin.valueChanged.connect(self.history_limits_changed.emit)
         self.history_max_entries_spin.valueChanged.connect(self.history_limits_changed.emit)
+        self.history_retention_days_spin.editingFinished.connect(self.history_limits_editing_finished.emit)
+        self.history_max_entries_spin.editingFinished.connect(self.history_limits_editing_finished.emit)
         lay.addWidget(self.history_enabled_row)
         self.history_retention_divider = group_divider()
         lay.addWidget(self.history_retention_divider)
@@ -738,12 +834,22 @@ class GeneralSettingsPage(SettingsPage):
 
     def _build_preferences_section(self) -> QWidget:
         card, lay = _card()
+        self.advanced_network_btn = device_selection_link("网络代理与内网直连")
+        self.advanced_network_btn.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.advanced_network_btn.toggled.connect(self.set_advanced_network_expanded)
+        lay.addWidget(inline_action_row(self.advanced_network_btn, margins=(16, 10, 16, 8)))
+        self.advanced_network_panel = QWidget()
+        self.advanced_network_panel.setVisible(False)
+        self.advanced_network_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        net_lay = QVBoxLayout(self.advanced_network_panel)
+        net_lay.setContentsMargins(0, 0, 0, 0)
+        net_lay.setSpacing(0)
         self.llm_proxy_combo = QComboBox()
         self.llm_proxy_combo.setAccessibleName("AI 服务代理模式")
         self.llm_proxy_combo.addItem("使用系统 / 环境代理", "system")
         self.llm_proxy_combo.addItem("直连（不使用代理）", "direct")
         self.llm_proxy_combo.currentIndexChanged.connect(self.llm_proxy_changed.emit)
-        lay.addWidget(labeled_row(
+        net_lay.addWidget(labeled_row(
             "AI 服务代理", self.llm_proxy_combo,
             "适用于连接测试、文字处理和会议纪要；内网接口超时可尝试直连。更新不受此设置影响。",
         ))
@@ -752,11 +858,12 @@ class GeneralSettingsPage(SettingsPage):
         self.llm_proxy_suffix_edit.setPlaceholderText(".example.internal")
         self.llm_proxy_suffix_edit.setClearButtonEnabled(True)
         self.llm_proxy_suffix_edit.textChanged.connect(self.llm_proxy_suffix_changed.emit)
-        lay.addWidget(labeled_row(
+        net_lay.addWidget(labeled_row(
             "额外直连域名",
             self.llm_proxy_suffix_edit,
             "仅在「使用系统 / 环境代理」时生效。每项是域名后缀，用逗号或空格分隔。本地和私网地址不用填写。",
         ))
+        lay.addWidget(self.advanced_network_panel)
         lay.addWidget(group_divider())
         lay.addWidget(self._build_theme_row())
         lay.addWidget(group_divider())
@@ -772,14 +879,25 @@ class GeneralSettingsPage(SettingsPage):
         self._build_toggle_rows(lay)
         self._build_history_rows(lay)
         lay.addWidget(group_divider())
+        self.advanced_recovery_btn = device_selection_link("本机录音恢复缓存")
+        self.advanced_recovery_btn.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.advanced_recovery_btn.toggled.connect(self.set_advanced_recovery_expanded)
+        lay.addWidget(inline_action_row(self.advanced_recovery_btn, margins=(16, 8, 16, 8)))
+        self.advanced_recovery_panel = QWidget()
+        self.advanced_recovery_panel.setVisible(False)
+        self.advanced_recovery_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        rec_lay = QVBoxLayout(self.advanced_recovery_panel)
+        rec_lay.setContentsMargins(0, 0, 0, 0)
+        rec_lay.setSpacing(0)
         self.recovery_row = ToggleOptionRow(
             "录音恢复（本机缓存）",
             "默认关闭；开启后保存完整录音，正常结束保留 7 天，总量上限 2 GB。下次录音生效。",
         )
         self.recovery_row.toggled.connect(self.recovery_toggled.emit)
-        lay.addWidget(self.recovery_row)
+        rec_lay.addWidget(self.recovery_row)
         self.recovery_btn = _ghost_button("查看 / 恢复录音", self.audio_recovery_requested.emit)
-        lay.addWidget(inline_action_row(self.recovery_btn))
+        rec_lay.addWidget(inline_action_row(self.recovery_btn))
+        lay.addWidget(self.advanced_recovery_panel)
         bottom = QWidget()
         bottom.setFixedHeight(4)
         lay.addWidget(bottom)
@@ -815,8 +933,20 @@ class GeneralSettingsPage(SettingsPage):
             "最多 50 个词；正确词和每个误写各不超过 20 字，每个词最多 5 个误写。离开输入框、切换页面或关闭设置时保存。",
         ))
         self.glossary_count_label = footnote("")
+        self.glossary_clear_btn = _ghost_button(
+            "清空词汇",
+            self.glossary_clear_requested.emit,
+            tooltip="清空全部自定义词汇（弹出确认）",
+        )
+        self.glossary_clear_btn.setAccessibleName("清空自定义词汇")
+        glossary_meta_wrap = QWidget()
+        glossary_meta_lay = QHBoxLayout(glossary_meta_wrap)
+        glossary_meta_lay.setContentsMargins(16, 0, 16, 8)
+        glossary_meta_lay.setSpacing(8)
+        glossary_meta_lay.addWidget(self.glossary_count_label, 1)
+        glossary_meta_lay.addWidget(self.glossary_clear_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         self.meeting_glossary_edit.textChanged.connect(self.update_glossary_count)
-        lay.addWidget(inline_action_row(self.glossary_count_label, margins=(16, 0, 16, 8)))
+        lay.addWidget(glossary_meta_wrap)
         self.update_glossary_count()
         self.recognition_capability_label = footnote("")
         self.recognition_capability_row = inline_action_row(self.recognition_capability_label, margins=(16, 0, 16, 10))
@@ -939,20 +1069,50 @@ class GeneralSettingsPage(SettingsPage):
             }}
         """)
 
+    def paint_hotkey_conflict_label(self) -> None:
+        tone = self.hotkey_conflict_label.property("viTone") or "idle"
+        color = tok.RED_TEXT if tone == "error" else tok.AMBER_TEXT
+        weight = 700 if tone == "error" else 400
+        self.hotkey_conflict_label.setStyleSheet(
+            f"color: {color}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: {weight};"
+            f" line-height: 1.4; background: transparent; padding: 0 16px 10px 16px;"
+        )
+
+    def show_hotkey_feedback(self, text: str, *, error: bool = False) -> None:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            self.hotkey_conflict_label.setProperty("viTone", "idle")
+            self.hotkey_conflict_label.clear()
+            self.hotkey_conflict_label.hide()
+            return
+        self.hotkey_conflict_label.setProperty("viTone", "error" if error else "warn")
+        self.hotkey_conflict_label.setText(cleaned)
+        self.paint_hotkey_conflict_label()
+        self.hotkey_conflict_label.show()
+
     def apply_theme(self) -> None:
         self.hotkey_hint.setStyleSheet(
             f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
             f" background: transparent; padding: 0 16px 12px 16px;"
         )
+        self.paint_hotkey_conflict_label()
         for button in self.general_section_jumps:
             button.setStyleSheet(settings_styles.BTN_GHOST_SM)
-        paint_device_selection_link(self.advanced_audio_btn)
-        paint_device_selection_link(self.advanced_recognition_btn)
+        for btn in (
+            self.advanced_audio_btn,
+            self.advanced_mixing_btn,
+            self.advanced_recognition_btn,
+            self.advanced_network_btn,
+            self.advanced_recovery_btn,
+        ):
+            paint_device_selection_link(btn)
         self.paint_glossary_edit()
-        self.mic_level_bar.setStyleSheet(
+        meter_css = (
             f"QProgressBar {{ border: none; background: {tok.SURFACE_PEARL}; border-radius: 3px; }}"
             f"QProgressBar::chunk {{ background: {tok.ACCENT}; border-radius: 3px; }}"
         )
+        self.mic_level_bar.setStyleSheet(meter_css)
+        self.system_level_bar.setStyleSheet(meter_css)
 
     def selected_input_source(self) -> str:
         if self.src_sys_rb.isChecked():
@@ -1015,6 +1175,7 @@ class GeneralSettingsPage(SettingsPage):
     ) -> None:
         mic_sel = self.mic_device_combo.currentData() if self.mic_device_combo.count() else -1
         sys_sel = self.system_device_combo.currentData() if self.system_device_combo.count() else -1
+        enum_failed: list[str] = []
 
         mic_blocker = QSignalBlocker(self.mic_device_combo)
         sys_blocker = QSignalBlocker(self.system_device_combo)
@@ -1025,7 +1186,8 @@ class GeneralSettingsPage(SettingsPage):
             for dev in mic_devices_fn():
                 self.mic_device_combo.addItem(dev.label, dev.index)
         except Exception as exc:
-            self.mic_device_combo.addItem(f"枚举失败: {exc}", -1)
+            log.warning("枚举麦克风设备失败: %s", exc)
+            enum_failed.append("麦克风")
 
         self.system_device_combo.clear()
         self.system_device_combo.addItem("自动选择", -1)
@@ -1033,7 +1195,14 @@ class GeneralSettingsPage(SettingsPage):
             for dev in system_devices_fn():
                 self.system_device_combo.addItem(dev.label, dev.index)
         except Exception as exc:
-            self.system_device_combo.addItem(f"枚举失败: {exc}", -1)
+            log.warning("枚举电脑声音设备失败: %s", exc)
+            enum_failed.append("电脑声音")
+
+        self.audio_enum_warning = (
+            f"{'、'.join(enum_failed)}列表读取受限，已保持自动选择；可点击「刷新列表」重试"
+            if enum_failed
+            else ""
+        )
 
         for combo, selected in ((self.mic_device_combo, mic_sel), (self.system_device_combo, sys_sel)):
             if selected is None:
@@ -1062,10 +1231,32 @@ class GeneralSettingsPage(SettingsPage):
             automatic = device_index(combo.currentData()) < 0
             device = "自动选择（测试或录音时确定设备）" if automatic else combo.currentText()
             lines.append(f"{title}：{device}")
+        if self.audio_enum_warning:
+            lines.append(self.audio_enum_warning)
         self.audio_device_summary.setText("\n".join(lines))
         summary_height = self.audio_device_summary.fontMetrics().lineSpacing() * 2 + 2
         if self.audio_device_summary.minimumHeight() < summary_height:
             self.audio_device_summary.setMinimumHeight(summary_height)
+
+    def show_probe_meters(self, *, mixed: bool) -> None:
+        self.mic_level_bar.setValue(0)
+        self.system_level_bar.setValue(0)
+        self.mic_level_label.setVisible(mixed)
+        self.mic_level_bar.show()
+        self.mic_level_wrap.show()
+        if mixed:
+            self.system_level_bar.show()
+            self.system_level_wrap.show()
+        else:
+            self.system_level_bar.hide()
+            self.system_level_wrap.hide()
+
+    def hide_probe_meters(self) -> None:
+        self.mic_level_label.hide()
+        self.mic_level_bar.hide()
+        self.mic_level_wrap.hide()
+        self.system_level_bar.hide()
+        self.system_level_wrap.hide()
 
     def set_probe_controls_enabled(self, enabled: bool) -> None:
         for widget in (
@@ -1100,6 +1291,50 @@ class GeneralSettingsPage(SettingsPage):
 
         without_scroll_jump(self.advanced_audio_btn, change)
 
+    def set_advanced_mixing_expanded(self, visible: bool) -> None:
+        def change() -> None:
+            set_section_visible(self.advanced_mixing_panel, visible)
+            self.advanced_mixing_btn.setText(
+                "收起实验性混音选项" if visible else "实验性混音选项"
+            )
+            self.advanced_mixing_btn.setAccessibleName(
+                "收起实验性混音选项" if visible else "展开实验性混音选项"
+            )
+            set_checked_link(self.advanced_mixing_btn, visible)
+
+        without_scroll_jump(self.advanced_mixing_btn, change)
+
+    def set_advanced_network_expanded(self, visible: bool) -> None:
+        def change() -> None:
+            set_section_visible(self.advanced_network_panel, visible)
+            self.advanced_network_btn.setText(
+                "收起网络代理与内网直连" if visible else "网络代理与内网直连"
+            )
+            self.advanced_network_btn.setAccessibleName(
+                "收起网络代理与内网直连" if visible else "展开网络代理与内网直连"
+            )
+            set_checked_link(self.advanced_network_btn, visible)
+
+        without_scroll_jump(self.advanced_network_btn, change)
+
+    def set_advanced_recovery_expanded(self, visible: bool) -> None:
+        def change() -> None:
+            set_section_visible(self.advanced_recovery_panel, visible)
+            self.advanced_recovery_btn.setText(
+                "收起本机录音恢复缓存" if visible else "本机录音恢复缓存"
+            )
+            self.advanced_recovery_btn.setAccessibleName(
+                "收起本机录音恢复缓存" if visible else "展开本机录音恢复缓存"
+            )
+            set_checked_link(self.advanced_recovery_btn, visible)
+
+        without_scroll_jump(self.advanced_recovery_btn, change)
+
+    def reveal_proxy_settings(self) -> None:
+        self.set_advanced_network_expanded(True)
+        _reveal_section(self, self.advanced_network_btn)
+        self.llm_proxy_combo.setFocus()
+
     def set_advanced_recognition_expanded(self, visible: bool) -> None:
         def change() -> None:
             set_section_visible(self.advanced_recognition_panel, visible)
@@ -1120,9 +1355,17 @@ class GeneralSettingsPage(SettingsPage):
         )
 
     def refresh_hotkey_hint(self, config: Config) -> None:
-        self.hotkey_hint.setText(dictation_hints(config).detail)
+        raw_hotkey = str(config.get("hotkey", DEFAULT_HOTKEY) or "")
+        if not raw_hotkey:
+            self.hotkey_hint.setText(
+                "当前未绑定录音快捷键。点击上方输入框后按下组合键即可重新绑定，或点击下方「快捷键恢复默认」。"
+            )
+            self.show_hotkey_feedback("", error=False)
+        else:
+            self.hotkey_hint.setText(dictation_hints(config).detail)
+            self.show_hotkey_feedback(hotkey_conflict_warning(raw_hotkey), error=False)
         self.hotkey_hint.setToolTip("启动阈值：单次转写按住约 0.18 秒；持续转写按住约 0.30 秒，避免误触。")
-        is_default = config.get("hotkey", DEFAULT_HOTKEY) == DEFAULT_HOTKEY
+        is_default = raw_hotkey == DEFAULT_HOTKEY
         self.hotkey_reset_btn.setEnabled(True)
         self.hotkey_reset_btn.setToolTip(
             "当前已是 Alt+X。点此只会再次确认，不改变转写模式、Esc、音频来源和结果去向。"
@@ -1146,9 +1389,21 @@ class GeneralSettingsPage(SettingsPage):
             "自动规则：麦克风输入当前光标，电脑声音和混合音源仅保存到历史"
             if automatic else "固定选择，切换音源后保持不变"
         )
-        mode_name = "持续转写" if self.selected_trigger_mode() == TRIGGER_MODE_CONTINUOUS else "单次转写"
-        other_name = "单次转写" if mode_name == "持续转写" else "持续转写"
-        text = f"当前是{mode_name}：{destination}。{rule}。{other_name}沿用自己的选择。"
+        is_cont = self.selected_trigger_mode() == TRIGGER_MODE_CONTINUOUS
+        mode_name = "持续转写" if is_cont else "单次转写"
+        other_name = "单次转写" if is_cont else "持续转写"
+        other_trigger = TRIGGER_MODE_HOTKEY if is_cont else TRIGGER_MODE_CONTINUOUS
+        other_mode, other_follows = Config._destination_for(config, other_trigger)
+        if other_follows:
+            other_dest = (
+                "自动随音源（当前仅保存到历史）"
+                if self.selected_input_source() != INPUT_SOURCE_MICROPHONE
+                else "自动随音源（当前输入光标）"
+            )
+        else:
+            other_dest = "仅保存到历史" if other_mode == OUTPUT_MODE_HISTORY else "输入当前光标"
+        self.output_mode_row_title.setText(f"结果去向（{mode_name}）")
+        text = f"当前是{mode_name}：{destination}。{rule}。{other_name}独立配置为：{other_dest}。"
         color = tok.TEXT_SEC
         if hints.output_warning:
             text = "历史已关闭：结果不会保存或输入其他应用。请开启转写历史，或改为输入当前光标。"
@@ -1197,6 +1452,7 @@ class GeneralSettingsPage(SettingsPage):
         recognition_pending: bool,
         glossary_skip_note: str = "",
         vad_downloading: bool = False,
+        save_failed: bool = False,
     ) -> None:
         from sayink.speech_recognizer import AUX_MODEL_SILERO_VAD, is_model_downloaded
 
@@ -1230,16 +1486,20 @@ class GeneralSettingsPage(SettingsPage):
         self.vad_runtime_label.setStyleSheet(
             f"color: {fg}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
         )
+        apply_fg = tok.RED_TEXT if save_failed else (tok.AMBER_TEXT if recognition_pending else tok.TEXT_SEC)
+        apply_weight = 700 if save_failed else 400
         self.recognition_apply_label.setStyleSheet(
-            f"color: {tok.AMBER_TEXT if recognition_pending else tok.TEXT_SEC};"
-            f" font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
+            f"color: {apply_fg}; font-size: {tok.TYPE_FOOTNOTE}px;"
+            f" font-weight: {apply_weight}; background: transparent;"
         )
         self.speaker_runtime_label.setText(speaker_runtime_text)
         self.recognition_capability_label.setText("\n".join(shared.notes))
         self.recognition_capability_label.setVisible(bool(shared.notes))
         set_section_visible(self.recognition_capability_row, bool(shared.notes))
         apply_parts: list[str] = []
-        if recognition_pending:
+        if save_failed:
+            apply_parts.append("配置写入磁盘失败，请检查配置文件目录权限。")
+        elif recognition_pending:
             apply_parts.append("已保存 · 待本场结束且已录语音处理完成后生效。")
         if glossary_skip_note:
             apply_parts.append(glossary_skip_note)
@@ -1271,8 +1531,10 @@ class GeneralSettingsPage(SettingsPage):
         from sayink.ui.island_chrome import normalize_listen_bar_placement
 
         proxy_mode = config.get("llm.proxy_mode", "system")
-        set_combo_by_data(self.llm_proxy_combo, proxy_mode if proxy_mode in ("system", "direct") else "system")
-        self.llm_proxy_suffix_edit.setText(str(config.get("llm.proxy_bypass_suffixes", "") or ""))
+        resolved_proxy = proxy_mode if proxy_mode in ("system", "direct") else "system"
+        set_combo_by_data(self.llm_proxy_combo, resolved_proxy)
+        proxy_suffix = str(config.get("llm.proxy_bypass_suffixes", "") or "")
+        self.llm_proxy_suffix_edit.setText(proxy_suffix)
         self.hotkey_edit.set_value(config.get("hotkey", DEFAULT_HOTKEY))
         self.auto_start_row.setChecked(config.get("auto_start", False))
         self.sound_row.setChecked(config.get("sound_enabled", True))
@@ -1281,8 +1543,16 @@ class GeneralSettingsPage(SettingsPage):
         set_combo_by_data(self.output_mode_combo, output_choice)
         self.esc_stop_row.setChecked(bool(config.get("audio.esc_stops_continuous", True)))
         self.history_enabled_row.setChecked(config.get("history.enabled", True))
-        self.recovery_row.setChecked(bool(config.get("audio.recovery_enabled", False)))
-        self.separate_lanes_row.setChecked(bool(config.get("audio.separate_lanes", False)))
+        recovery_on = bool(config.get("audio.recovery_enabled", False))
+        separate_on = bool(config.get("audio.separate_lanes", False))
+        self.recovery_row.setChecked(recovery_on)
+        self.separate_lanes_row.setChecked(separate_on)
+        if separate_on:
+            self.set_advanced_mixing_expanded(True)
+        if resolved_proxy != "system" or bool(proxy_suffix.strip()):
+            self.set_advanced_network_expanded(True)
+        if recovery_on:
+            self.set_advanced_recovery_expanded(True)
         self.history_retention_days_spin.setValue(
             int_or(config.get("history.retention_days", 90), 90)
         )
@@ -1329,6 +1599,7 @@ class GeneralSettingsPage(SettingsPage):
     def update_glossary_count(self) -> None:
         count = sum(bool(line.strip()) for line in self.meeting_glossary_edit.toPlainText().splitlines())
         self.glossary_count_label.setText(f"已填写 {count} 行 / 最多 50 个词")
+        self.glossary_clear_btn.setEnabled(count > 0)
 
     def parse_glossary_editor(self) -> tuple[list[dict], str]:
         from sayink.asr_correction import parse_glossary_line_with_warnings

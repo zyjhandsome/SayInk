@@ -824,9 +824,10 @@ class TestToggles:
     def test_restore_clipboard_toggle_emits_runtime_update(self, settings_window, config):
         signals = []
         settings_window.restore_clipboard_changed.connect(signals.append)
-        settings_window._restore_clipboard_row.setChecked(True)
-        assert config.get("output.restore_clipboard") is True
-        assert signals == [True]
+        target = not settings_window._restore_clipboard_row.isChecked()
+        settings_window._restore_clipboard_row.setChecked(target)
+        assert config.get("output.restore_clipboard") is target
+        assert signals == [target]
 
 
 class TestConfirmDialogs:
@@ -903,7 +904,10 @@ class TestHotkeyBinding:
             lambda *args, **kwargs: warnings.append(args[2]),
         )
         settings_window._apply_hotkey_setting("space")
-        assert warnings
+        assert warnings == []
+        assert not settings_window.general_page.hotkey_conflict_label.isHidden()
+        assert settings_window.general_page.hotkey_conflict_label.property("viTone") == "error"
+        assert "修饰键" in settings_window.general_page.hotkey_conflict_label.text()
         assert config.get("hotkey") != "space"
 
     def test_accepts_valid_hotkey(self, settings_window, config):
@@ -1056,7 +1060,9 @@ class TestPolishConfigurationStatus:
         settings_window._llm_enable_row.setChecked(False)
         settings_window._llm_url_edit.setText("ftp://api.example.com/v1")
         settings_window._flush_llm_fields()
-        assert warnings
+        assert warnings == []
+        assert settings_window._llm_url_edit.text() == "ftp://api.example.com/v1"
+        assert settings_window._llm_test_status.property("viTone") == "error"
         assert config.get("llm.api_url", "") != "ftp://api.example.com/v1"
 
     def test_public_http_url_rejected_unless_bypass_suffix_matches(self, settings_window, config, monkeypatch):
@@ -1067,7 +1073,9 @@ class TestPolishConfigurationStatus:
         settings_window._llm_key_edit.setText("sk-x")
         settings_window._llm_model_edit.setText("m")
         settings_window._flush_llm_fields()
-        assert warnings and "https://" in warnings[0][2]
+        assert warnings == []
+        assert settings_window._llm_test_status.property("viTone") == "error"
+        assert "https://" in settings_window._llm_test_status.text()
         assert config.get("llm.api_url", "") != "http://api.example.com/v1"
 
         warnings.clear()
@@ -1092,14 +1100,18 @@ class TestPolishConfigurationStatus:
         assert "sk-secret" not in settings_window._llm_url_edit.text()
         assert config.get("llm.api_key") == "sk-field"
         assert config.get("llm.model_name") == "deepseek-flash"
-        assert warnings and "API 密钥" in warnings[0][2]
+        assert warnings == []
+        assert settings_window._llm_test_status.property("viTone") == "error"
+        assert "API 密钥" in settings_window._llm_test_status.text()
 
     def test_fullwidth_url_is_rejected_with_a_specific_warning(self, settings_window, config, monkeypatch):
         warnings = []
         monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warnings.append(a)))
         settings_window._llm_url_edit.setText("https：//api.deepseek.com")
         settings_window._flush_llm_fields()
-        assert warnings and "全角" in warnings[0][2]
+        assert warnings == []
+        assert settings_window._llm_test_status.property("viTone") == "error"
+        assert "全角" in settings_window._llm_test_status.text()
         assert config.get("llm.api_url", "") != "https：//api.deepseek.com"
 
     def test_prompt_edit_keeps_a_successful_connection_result(self, settings_window, qapp, monkeypatch):
@@ -1258,9 +1270,11 @@ class TestModelDownloadDone:
     @pytest.fixture
     def done_env(self, settings_window, config, monkeypatch):
         shown = []
+        modals = []
         monkeypatch.setattr(
-            QMessageBox, "information", lambda *args, **kwargs: shown.append(args[2])
+            QMessageBox, "information", lambda *args, **kwargs: modals.append(args[2])
         )
+        settings_window.download_completed_notice.connect(shown.append)
         monkeypatch.setattr(
             "sayink.speech_recognizer.get_model_info",
             lambda model_id: {"name": f"模型 {model_id}"},
@@ -1460,7 +1474,7 @@ class TestMeetingSettings:
         win.reload_settings()
         assert win._meeting_glossary_edit.toPlainText().splitlines() == ["SayInk", "张鑫=张新"]
 
-    def test_llm_mode_round_trips_and_each_mode_keeps_its_own_prompt(self, settings_window, config):
+    def test_llm_mode_round_trips_and_each_mode_keeps_its_own_prompt(self, settings_window, config, monkeypatch):
         from sayink.text_polisher import CORRECTION_PROMPT, POLISH_PROMPT
 
         win = settings_window
@@ -1486,8 +1500,11 @@ class TestMeetingSettings:
         assert win._llm_prompt_edit.toPlainText() == "纠错专用提示词"
         assert "纠错" in [lbl.text() for lbl in win._llm_preview_card.findChildren(QLabel)]
 
-        # 恢复默认 means "use the built-in": the editor is cleared, nothing is
-        # pinned, and the built-in prompt of the selected mode is what runs.
+        # 恢复默认 asks for confirmation when custom prompt text exists, then clears.
+        monkeypatch.setattr(win, "_confirm", lambda *a, **k: False)
+        win._reset_prompt()
+        assert win._llm_prompt_edit.toPlainText() == "纠错专用提示词"
+        monkeypatch.setattr(win, "_confirm", lambda *a, **k: True)
         win._reset_prompt()
         assert win._llm_prompt_edit.toPlainText() == ""
         assert config.get("llm.prompt_correct") == ""
@@ -1506,13 +1523,17 @@ class TestMeetingSettings:
     def test_invalid_llm_url_only_reverts_the_url(self, settings_window, config, monkeypatch):
         from PyQt6.QtWidgets import QMessageBox
 
-        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: None)
+        warnings = []
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a))
         win = settings_window
         win._llm_enable_row.setChecked(True)
         win._llm_url_edit.setText("ftp://nope")
         win._llm_model_edit.setText("my-model")
         win._llm_mode_combo.setCurrentIndex(win._llm_mode_combo.findData("correct"))
-        assert win._llm_url_edit.text() == config.get("llm.api_url", "")
+        assert warnings == []
+        assert win._llm_url_edit.text() == "ftp://nope"
+        assert config.get("llm.api_url", "") == ""
+        assert win._llm_test_status.property("viTone") == "error"
         assert config.get("llm.model_name") == "my-model"
         assert config.get("llm.mode") == "correct"
 
@@ -1565,11 +1586,14 @@ class TestMeetingSettings:
         assert config.get("meeting.auto_generate") is True
 
     def test_aux_model_download_message_does_not_touch_dictation_model(self, settings_window, config, monkeypatch):
+        modals = []
         shown = []
-        monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: shown.append(args[2]))
+        monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: modals.append(args[2]))
+        settings_window.download_completed_notice.connect(shown.append)
         monkeypatch.setattr("sayink.speech_recognizer.get_downloaded_models", list)
         config.set("stt.model_id", "funasr-nano")
         settings_window._on_dl_done("speaker-campplus")
+        assert modals == []
         assert config.get("stt.model_id") == "funasr-nano"
         assert "通用 → 识别 → 高级识别设置" in shown[0]
 

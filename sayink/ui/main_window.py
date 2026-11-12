@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import sys
+import weakref
 
-from PyQt6.QtCore import QEvent, QLineF, QPoint, QRect, QRectF, Qt
+from PyQt6.QtCore import QEvent, QLineF, QPoint, QRect, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QCursor,
@@ -17,12 +18,14 @@ from PyQt6.QtGui import (
     QShortcut,
 )
 from PyQt6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QStackedWidget,
     QSizeGrip,
+    QSizePolicy,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -176,6 +179,8 @@ class _FrameEdge(QWidget):
 
 
 class MainWindow(QWidget):
+    closed_to_tray_first_time = pyqtSignal()
+
     def __init__(self, config, history_store, parent=None, *, meeting=None) -> None:
         super().__init__(parent)
         self._config = config
@@ -189,12 +194,104 @@ class MainWindow(QWidget):
         self._model_runtime_state = RuntimeState.LOADING
         # A live meeting owns the dot while it runs (see _refresh_usage_summary).
         self._status_tone_override = ""
+        self._screen_watchers: list[tuple[object, object, object]] = []
         self._setup_window()
         self._setup_ui()
+        self._connect_screen_watchers()
         self.reapply_theme()
         self.show_page("general")
         # No programmatic focus on a nav button: the focus ring must only
         # appear for keyboard navigation, never as a second "selected" state.
+
+    @property
+    def running_workers(self) -> tuple:
+        workers: list = []
+        for owner in (self._settings, self._meeting, self._history):
+            workers.extend(getattr(owner, "running_workers", ()) or ())
+        return tuple(workers)
+
+    def _connect_screen_watchers(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        weak_self = weakref.ref(self)
+
+        def _on_metrics(*_args) -> None:
+            win = weak_self()
+            if win is not None:
+                win._on_screen_metrics_changed()
+
+        def _on_screen_added(scr) -> None:
+            win = weak_self()
+            if win is not None:
+                win._watch_screen_signals(scr)
+                win._on_screen_metrics_changed()
+
+        for sig_name, handler in (
+            ("screenAdded", _on_screen_added),
+            ("screenRemoved", _on_metrics),
+            ("primaryScreenChanged", _on_metrics),
+        ):
+            sig = getattr(app, sig_name, None)
+            if sig is not None:
+                sig.connect(handler)
+                self._screen_watchers.append((app, sig_name, handler))
+        self._screen_metric_handler = _on_metrics
+        for scr in app.screens():
+            self._watch_screen_signals(scr)
+        self.destroyed.connect(self._disconnect_screen_watchers)
+
+    def _watch_screen_signals(self, scr) -> None:
+        if scr is None:
+            return
+        handler = getattr(self, "_screen_metric_handler", None)
+        if handler is None:
+            return
+        for sig_name in ("availableGeometryChanged", "logicalDotsPerInchChanged"):
+            sig = getattr(scr, sig_name, None)
+            if sig is not None:
+                try:
+                    sig.connect(handler)
+                    self._screen_watchers.append((scr, sig_name, handler))
+                except (RuntimeError, TypeError):
+                    pass
+
+    def _disconnect_screen_watchers(self, *_args) -> None:
+        watchers = getattr(self, "_screen_watchers", ())
+        self._screen_watchers = []
+        for obj, sig_name, handler in watchers:
+            try:
+                sig = getattr(obj, sig_name, None)
+                if sig is not None:
+                    sig.disconnect(handler)
+            except (RuntimeError, TypeError):
+                pass
+
+    def _on_screen_metrics_changed(self) -> None:
+        self._fit_to_available_screen()
+        if self.isVisible() and not self.isMaximized() and not self.isMinimized():
+            self._clamp_into_visible_screen()
+
+    def _clamp_into_visible_screen(self) -> None:
+        from sayink.ui.island_chrome import clamp_top_left, is_screen_alive
+
+        screen = self.screen()
+        if not is_screen_alive(screen):
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        try:
+            avail = screen.availableGeometry()
+        except RuntimeError:
+            return
+        if avail.isEmpty():
+            return
+        frame = self.frameGeometry()
+        # Re-clamp whenever any screen boundary clips the window or leaves <64px visible.
+        if not avail.contains(frame):
+            cx, cy = clamp_top_left(self.x(), self.y(), self.width(), self.height(), avail)
+            if (cx, cy) != (self.x(), self.y()):
+                self.move(cx, cy)
 
     def _setup_window(self) -> None:
         self.setWindowTitle("SayInk")
@@ -218,17 +315,21 @@ class MainWindow(QWidget):
         screen = self.screen()
         if screen is None:
             return
-        avail = screen.availableGeometry()
+        try:
+            avail = screen.availableGeometry()
+        except RuntimeError:
+            return
         if avail.isEmpty():
             return
-        # Never below what the pages need, or controls get clipped instead.
+        # Never below what the pages need when the screen can hold them, and
+        # never wider/taller than the available desktop work area (C-09).
         layout = self.layout()
         floor = layout.minimumSize() if layout is not None else None
         floor_w = floor.width() if floor is not None else 0
         floor_h = floor.height() if floor is not None else 0
         self.setMinimumSize(
-            min(_MIN_W, max(avail.width(), floor_w)),
-            min(_MIN_H, max(avail.height(), floor_h)),
+            min(avail.width(), max(_MIN_W, floor_w)),
+            min(avail.height(), max(_MIN_H, floor_h)),
         )
         if self.isMaximized():
             return
@@ -350,12 +451,16 @@ class MainWindow(QWidget):
 
         self._stack = QStackedWidget()
         self._stack.setObjectName("mainStack")
+        self._stack.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self._history = HistoryWindow(self._history_store, self, config=self._config)
         self._history.setObjectName(PAGE_OBJECT_NAMES[0])
         self._meeting = self._build_meeting_page()
         self._meeting.setObjectName(PAGE_OBJECT_NAMES[1])
         self._settings = SettingsWindow(self._config, self)
         self._settings.setObjectName(PAGE_OBJECT_NAMES[2])
+        set_history_store = getattr(self._settings, "set_history_store", None)
+        if callable(set_history_store):
+            set_history_store(self._history_store)
         self._stack.addWidget(self._history)
         self._stack.addWidget(self._meeting)
         self._stack.addWidget(self._settings)
@@ -482,7 +587,7 @@ class MainWindow(QWidget):
             source = input_source_label(record.source) if record is not None else "会议音频"
             self._runtime_label.setText(label)
             self._runtime_label.setToolTip(meeting.paused_detail if state is MeetingState.PAUSED else self._model_runtime_text)
-            self._status_tone_override = "GREEN" if state is MeetingState.LIVE else "AMBER"
+            self._status_tone_override = "STATE_RECORD" if state is MeetingState.LIVE else "AMBER"
             self._mode_label.setText(source)
             self._output_label.setText("仅保存会议记录")
             self._output_label.setProperty("outputWarning", False)
@@ -530,6 +635,8 @@ class MainWindow(QWidget):
         self._enable_native_snap()
         self._apply_dwm_theme_colors()
         self._fit_to_available_screen()
+        if not self.isMaximized() and not self.isMinimized():
+            self._clamp_into_visible_screen()
         self._sync_frame_margin()
         self._position_frame_edges()
         self._apply_window_shape()
@@ -789,9 +896,12 @@ class MainWindow(QWidget):
     def eventFilter(self, obj, event):
         if self._caption_drag_target(obj) and event.type() == QEvent.Type.MouseButtonDblClick:
             if event.button() == Qt.MouseButton.LeftButton:
+                self._drag_offset = None
                 self._toggle_maximized()
                 return True
         if not self._caption_drag_target(obj) or self.isMaximized():
+            if self.isMaximized():
+                self._drag_offset = None
             return super().eventFilter(obj, event)
         etype = event.type()
         if (
@@ -802,13 +912,11 @@ class MainWindow(QWidget):
                 event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             )
             return False
-        if (
-            etype == QEvent.Type.MouseMove
-            and self._drag_offset is not None
-            and event.buttons() & Qt.MouseButton.LeftButton
-        ):
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
-            return True
+        if etype == QEvent.Type.MouseMove and self._drag_offset is not None:
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                self.move(event.globalPosition().toPoint() - self._drag_offset)
+                return True
+            self._drag_offset = None
         if (
             etype == QEvent.Type.MouseButtonRelease
             and event.button() == Qt.MouseButton.LeftButton
@@ -826,8 +934,10 @@ class MainWindow(QWidget):
         if getattr(self, "_hiding", False):
             return
         self._hiding = True
+        self._drag_offset = None
+        was_visible = self.isVisible()
         try:
-            if sys.platform == "win32" and self.isVisible():
+            if sys.platform == "win32" and was_visible:
                 try:
                     from ctypes import windll
 
@@ -840,6 +950,9 @@ class MainWindow(QWidget):
             on_hidden = getattr(self._settings, "on_window_hidden", None)
             if callable(on_hidden):
                 on_hidden()
+            if was_visible and not bool(self._config.get("tray_close_hint_shown", False)):
+                self._config.set("tray_close_hint_shown", True)
+                self.closed_to_tray_first_time.emit()
         finally:
             self._hiding = False
 
@@ -1110,11 +1223,13 @@ class MainWindow(QWidget):
                     # Caption moves and edge resizes both enter here. Dropping
                     # the region now repaints every pixel and shows the system
                     # fill. Wait until the size actually changes.
+                    self._drag_offset = None
                     self._live_resizing = True
                 elif msg.message == _WM_SIZING:
                     self._live_resizing = True
                     self._clear_round_mask()
                 elif msg.message == _WM_EXITSIZEMOVE:
+                    self._drag_offset = None
                     self._live_resizing = False
                     self._apply_window_shape()
                 if msg.message == _WM_NCHITTEST and self.windowHandle() is not None:
@@ -1127,3 +1242,8 @@ class MainWindow(QWidget):
             except Exception:
                 pass
         return False, 0
+
+    def focusNextPrevChild(self, next: bool) -> bool:
+        if self.current_page() == "general":
+            self._settings.general_page.prepare_tab_navigation(next)
+        return super().focusNextPrevChild(next)

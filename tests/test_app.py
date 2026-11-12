@@ -553,27 +553,26 @@ class TestFinalResultFlow:
         return painted
 
     def test_device_opens_only_after_the_bar_painted_recording(self):
-        """Opening the device blocks ~0.5 s; before 「录音中」 is painted the bar
-        would keep showing the previous 「已发送」."""
+        """H-18: Hold-to-talk opens the audio stream immediately without waiting on
+        floating bar first-frame paint, preventing clipped initial syllables."""
         with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
             app = h["app"]
-            painted = self._defer_paint(h)
+            order = []
+            h["recorder"].start.side_effect = lambda **_kw: order.append("recorder.start")
+            h["floating"].show_recording.side_effect = lambda *_a, **_kw: order.append("floating.show_recording")
 
             app._on_recording_start()
 
-            h["floating"].show_recording.assert_called_once()
-            h["recorder"].start.assert_not_called()
-            painted.pop()()
             h["recorder"].start.assert_called_once_with(continuous=False)
+            h["floating"].show_recording.assert_called_once()
+            assert order == ["recorder.start", "floating.show_recording"]
 
     def test_release_before_the_device_opened_never_opens_it(self):
         with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
             app = h["app"]
-            painted = self._defer_paint(h)
-            app._on_recording_start()
+            app._hold_open_pending = True
 
             app._on_recording_stop()
-            painted.pop()()
 
             h["recorder"].start.assert_not_called()
             h["recorder"].stop.assert_not_called()
@@ -657,11 +656,9 @@ class TestFinalResultFlow:
     def test_esc_before_the_device_opened_cancels_the_hold(self):
         with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
             app = h["app"]
-            painted = self._defer_paint(h)
-            app._on_recording_start()
+            app._hold_open_pending = True
 
             app._on_recording_cancel()
-            painted.pop()()
 
             h["recorder"].start.assert_not_called()
             h["floating"].show_cancelled.assert_called_once()

@@ -1,13 +1,14 @@
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QMenu,
-    QApplication,
+    QApplication, QSizePolicy,
 )
-from PyQt6.QtCore import Qt, QTimer, QPoint, QEvent, pyqtSignal
-from PyQt6.QtGui import QFontMetrics, QPainter, QColor, QFont, QCursor
+from PyQt6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, QEvent, pyqtSignal
+from PyQt6.QtGui import QFontMetrics, QPainter, QPainterPath, QPen, QPolygonF, QColor, QFont, QCursor
 import math
 import weakref
 from sayink.runtime_status import MEETING_STATE_LABELS
 from sayink.ui import design_tokens as tok
+from sayink.ui.theme import prefers_reduced_motion
 from sayink.ui.island_chrome import (
     clamp_top_left,
     coerce_saved_positions,
@@ -30,7 +31,8 @@ BAR_HEIGHT = 44
 BAR_EXCERPT_HEIGHT = 68
 # One width for both modes: the bar used to jump 360 ↔ 420 (and re-center)
 # every time an excerpt appeared or cleared (U-12). Only the height grows.
-BAR_WIDTH = 420
+MIN_BAR_WIDTH = 420
+BAR_WIDTH = 480
 BAR_EXCERPT_WIDTH = BAR_WIDTH
 COMPACT_HEIGHT = BAR_HEIGHT
 MODEL_LOADING_TITLE = "模型载入中 · 请勿录音"
@@ -60,14 +62,27 @@ def _error_headline(first_line: str) -> tuple[str, str]:
     return first_line[:index].strip(), first_line[index + len(mark):].strip()
 
 
+_STATE_GLYPH_MAP = {
+    "STATE_RECORD": "record",
+    "STATE_LISTEN": "listen",
+    "STATE_RECOGNIZE": "recognize",
+    "STATE_POLISH": "polish",
+    "STATE_SUCCESS": "success",
+    "STATE_WARN": "warn",
+    "STATE_ERROR": "error",
+    "STATE_MUTED": "muted",
+}
+
+
 class _DotIndicator(QWidget):
-    """Listening ring that pulses while a session is active."""
+    """Dual-channel status glyph (color + distinct geometric form) for the island."""
 
     def __init__(self, color: str = "", parent=None):
         super().__init__(parent)
         # Resolve at construction time so the live theme axis wins over the
         # value that happened to be active when this module was imported.
         self._color = QColor(color or tok.STATE_RECORD)
+        self._state_token = "STATE_RECORD"
         self._pulse = 0.0
         self._pulsing = False
         self._suspended = False
@@ -79,8 +94,20 @@ class _DotIndicator(QWidget):
         self._color = QColor(color)
         self.update()
 
+    def set_state_token(self, token: str) -> None:
+        self._state_token = token or "STATE_RECORD"
+        self.update()
+
+    def state_glyph_kind(self) -> str:
+        return _STATE_GLYPH_MAP.get(self._state_token, "record")
+
     def start_pulse(self):
         self._pulsing = True
+        if prefers_reduced_motion():
+            self._timer.stop()
+            self._pulse = 0.0
+            self.update()
+            return
         if self._suspended or self._timer.isActive():
             return
         self._pulse = 0.0
@@ -94,12 +121,16 @@ class _DotIndicator(QWidget):
 
     def set_suspended(self, suspended: bool) -> None:
         self._suspended = bool(suspended)
-        if self._suspended:
+        if self._suspended or prefers_reduced_motion():
             self._timer.stop()
         elif self._pulsing and not self._timer.isActive():
             self._timer.start(50)
 
     def _tick(self):
+        if prefers_reduced_motion():
+            self._timer.stop()
+            self.update()
+            return
         self._pulse += 0.15
         self.update()
 
@@ -115,17 +146,76 @@ class _DotIndicator(QWidget):
             p.setBrush(outer)
             p.drawEllipse(0, 0, 16, 16)
 
-        pen = self._color
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        from PyQt6.QtGui import QPen
-        ring = QPen(self._color)
-        ring.setWidth(2)
-        p.setPen(ring)
-        p.drawEllipse(2, 2, 12, 12)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(self._color)
-        p.drawEllipse(6, 6, 4, 4)
+        kind = self.state_glyph_kind()
+        stroke = QPen(self._color)
+        stroke.setWidthF(1.8)
+        stroke.setCapStyle(Qt.PenCapStyle.RoundCap)
+        stroke.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+
+        if kind == "record":
+            p.setPen(stroke)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QRectF(2.0, 2.0, 12.0, 12.0))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(self._color)
+            p.drawEllipse(QRectF(5.2, 5.2, 5.6, 5.6))
+        elif kind == "listen":
+            p.setPen(stroke)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QRectF(2.0, 2.0, 12.0, 12.0))
+            p.drawLine(QPointF(6.3, 5.6), QPointF(6.3, 10.4))
+            p.drawLine(QPointF(9.7, 5.6), QPointF(9.7, 10.4))
+        elif kind == "recognize":
+            p.setPen(stroke)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawArc(QRectF(2.2, 2.2, 11.6, 11.6), 45 * 16, 270 * 16)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(self._color)
+            p.drawEllipse(QRectF(6.5, 6.5, 3.0, 3.0))
+        elif kind == "polish":
+            diamond = QPolygonF([
+                QPointF(8.0, 2.0),
+                QPointF(13.5, 8.0),
+                QPointF(8.0, 14.0),
+                QPointF(2.5, 8.0),
+            ])
+            p.setPen(stroke)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPolygon(diamond)
+        elif kind == "success":
+            p.setPen(stroke)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QRectF(2.0, 2.0, 12.0, 12.0))
+            check = QPainterPath()
+            check.moveTo(5.0, 8.2)
+            check.lineTo(7.1, 10.4)
+            check.lineTo(11.1, 5.8)
+            p.drawPath(check)
+        elif kind == "warn":
+            tri = QPolygonF([
+                QPointF(8.0, 2.3),
+                QPointF(13.8, 13.0),
+                QPointF(2.2, 13.0),
+            ])
+            p.setPen(stroke)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPolygon(tri)
+            p.drawLine(QPointF(8.0, 6.4), QPointF(8.0, 9.4))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(self._color)
+            p.drawEllipse(QRectF(7.2, 10.6, 1.6, 1.6))
+        elif kind == "error":
+            p.setPen(stroke)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QRectF(2.0, 2.0, 12.0, 12.0))
+            p.drawLine(QPointF(5.5, 5.5), QPointF(10.5, 10.5))
+            p.drawLine(QPointF(10.5, 5.5), QPointF(5.5, 10.5))
+        else:
+            muted_pen = QPen(self._color)
+            muted_pen.setWidthF(1.6)
+            p.setPen(muted_pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QRectF(2.5, 2.5, 11.0, 11.0))
         p.end()
 
 
@@ -155,6 +245,10 @@ class WaveformWidget(QWidget):
 
     def start(self):
         self._running = True
+        if prefers_reduced_motion():
+            self._timer.stop()
+            self.update()
+            return
         if self._suspended or self._timer.isActive():
             return
         self._phase = 0.0
@@ -168,7 +262,7 @@ class WaveformWidget(QWidget):
 
     def set_suspended(self, suspended: bool) -> None:
         self._suspended = bool(suspended)
-        if self._suspended:
+        if self._suspended or prefers_reduced_motion():
             self._timer.stop()
         elif self._running and not self._timer.isActive():
             self._timer.start(50)
@@ -179,10 +273,20 @@ class WaveformWidget(QWidget):
 
     def set_volume(self, volume: float):
         self._volume = min(max(0.0, float(volume)) * 8, 1.0)
+        if prefers_reduced_motion():
+            self._timer.stop()
+            level = self._volume if self._running else 0.0
+            self._bar_heights = [level * 0.7] * self.NUM_BARS
+            self.update()
+            return
         if self._running and not self._suspended and self._volume >= self._SILENT_VOLUME_EPS and not self._timer.isActive():
             self._timer.start(50)
 
     def _animate(self):
+        if prefers_reduced_motion():
+            self._timer.stop()
+            self.update()
+            return
         self._phase += 0.3
         peak = 0.0
         for i in range(self.NUM_BARS):
@@ -226,6 +330,7 @@ class WaveformWidget(QWidget):
 class FloatingWindow(QWidget):
 
     continuous_stop_requested = pyqtSignal()
+    cancel_requested = pyqtSignal()
     settings_requested = pyqtSignal()
     history_requested = pyqtSignal()
     # Meeting state: 「标记」 button and a click on the bar body.
@@ -233,7 +338,7 @@ class FloatingWindow(QWidget):
     meeting_open_requested = pyqtSignal()
     # Drag committed a screen-relative spot. Payload: screen, rel_x, rel_y, anchor.
     position_committed = pyqtSignal(dict)
-    # Double-click or the context menu asked for the automatic spot again.
+    # Context menu asked for the automatic spot again.
     placement_reset = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -250,13 +355,19 @@ class FloatingWindow(QWidget):
         self._capture_released = False
         self._model_loading_active = False
         self._live_text = ""
+        self._full_status_text = "准备中..."
+        self._pre_collapse_tooltip = ""
+        self._active_context_menu: QMenu | None = None
         self._current_accent = tok.FLOAT_TEXT
         self._mode = "compact"
         self._setup_window()
         self._setup_ui()
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
-        self._hide_timer.timeout.connect(self.hide)
+        self._hide_timer.timeout.connect(self._on_hide_timer_timeout)
+        self._transient_restore_timer = QTimer(self)
+        self._transient_restore_timer.setSingleShot(True)
+        self._transient_restore_timer.timeout.connect(self._restore_after_transient_meeting_notice)
         self._after_paint: list = []
         self._after_paint_timer = QTimer(self)
         self._after_paint_timer.setSingleShot(True)
@@ -285,14 +396,85 @@ class FloatingWindow(QWidget):
         self._meeting_click_timer = QTimer(self)
         self._meeting_click_timer.setSingleShot(True)
         self._meeting_click_timer.timeout.connect(self._open_meeting_from_click)
-        self._screen_removed_slot = None
+        self._screen_watchers: list[tuple[object, str, object]] = []
+        self._connect_screen_watchers()
+
+    def _connect_screen_watchers(self) -> None:
         app = QApplication.instance()
-        if app is not None and hasattr(app, "screenRemoved"):
-            weak_self = weakref.ref(self)
-            self._screen_removed_slot = lambda removed: (
-                (w := weak_self()) is not None and w._on_screen_removed(removed)
-            )
-            app.screenRemoved.connect(self._screen_removed_slot)
+        if app is None:
+            return
+        weak_self = weakref.ref(self)
+
+        def _on_removed(removed=None) -> None:
+            w = weak_self()
+            if w is not None:
+                w._on_screen_removed(removed)
+
+        def _on_metrics(*_args) -> None:
+            w = weak_self()
+            if w is not None:
+                w._on_screen_metrics_changed()
+
+        def _on_added(scr) -> None:
+            w = weak_self()
+            if w is not None:
+                w._watch_screen_signals(scr)
+                w._on_screen_metrics_changed()
+
+        self._screen_metric_handler = _on_metrics
+        for sig_name, handler in (
+            ("screenRemoved", _on_removed),
+            ("screenAdded", _on_added),
+            ("primaryScreenChanged", _on_metrics),
+        ):
+            sig = getattr(app, sig_name, None)
+            if sig is not None:
+                sig.connect(handler)
+                self._screen_watchers.append((app, sig_name, handler))
+        for scr in app.screens():
+            self._watch_screen_signals(scr)
+        self.destroyed.connect(self._disconnect_screen_watchers)
+
+    def _watch_screen_signals(self, scr) -> None:
+        if scr is None:
+            return
+        handler = getattr(self, "_screen_metric_handler", None)
+        if handler is None:
+            return
+        for sig_name in ("availableGeometryChanged", "logicalDotsPerInchChanged"):
+            sig = getattr(scr, sig_name, None)
+            if sig is not None:
+                try:
+                    sig.connect(handler)
+                    self._screen_watchers.append((scr, sig_name, handler))
+                except (RuntimeError, TypeError):
+                    pass
+
+    def _disconnect_screen_watchers(self, *_args) -> None:
+        watchers = getattr(self, "_screen_watchers", ())
+        self._screen_watchers = []
+        for obj, sig_name, handler in watchers:
+            try:
+                sig = getattr(obj, sig_name, None)
+                if sig is not None:
+                    sig.disconnect(handler)
+            except (RuntimeError, TypeError):
+                pass
+
+    def _on_screen_metrics_changed(self) -> None:
+        self._sync_text_line_height()
+        if not self.isVisible():
+            return
+        if self._position_pinned:
+            self._hold_pinned_edges()
+        else:
+            self._place_initial(self._is_long_session())
+
+    def _on_hide_timer_timeout(self) -> None:
+        if self._is_long_session() or self._hold_capture():
+            self._note_bar_activity()
+            return
+        self.hide()
 
     def call_when_painted(self, fn) -> None:
         """Run ``fn`` once the bar's current state is on screen.
@@ -330,6 +512,80 @@ class FloatingWindow(QWidget):
         shortcut = " · Esc" if enabled else ""
         self._end_btn.setToolTip(f"结束录音，已录内容继续识别{shortcut}")
 
+    def _apply_action_button_styles(self) -> None:
+        from sayink.ui import design_tokens as tok
+
+        self._cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {tok.CHIP_BG};
+                color: {tok.FLOAT_TEXT_SEC};
+                border: 1px solid {tok.FLOAT_BORDER};
+                font-size: {tok.TYPE_CAPTION}px;
+                font-weight: 700;
+                border-radius: 14px;
+                padding: 0px 10px;
+            }}
+            QPushButton:hover {{
+                background: {tok.ROW_HOVER};
+                color: {tok.FLOAT_TEXT};
+            }}
+        """)
+        if self._meeting_active:
+            rec_color = QColor(tok.STATE_RECORD)
+            end_fg = "#0D0D0D" if rec_color.lightness() > 145 else "#FFFFFF"
+            end_hover = rec_color.lighter(108).name() if rec_color.lightness() > 145 else rec_color.darker(112).name()
+            self._mark_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {tok.CHIP_BG};
+                    color: {tok.FLOAT_TEXT};
+                    border: 1px solid {tok.FLOAT_BORDER};
+                    font-size: {tok.TYPE_CAPTION}px;
+                    font-weight: 700;
+                    border-radius: 15px;
+                    padding: 0px 12px;
+                }}
+                QPushButton:hover {{
+                    background: {tok.ROW_HOVER};
+                    color: {tok.FLOAT_TEXT};
+                    border-color: {tok.FLOAT_TEXT_SEC};
+                }}
+            """)
+            self._end_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {tok.STATE_RECORD};
+                    color: {end_fg};
+                    border: none;
+                    font-size: {tok.TYPE_CAPTION}px;
+                    font-weight: 700;
+                    border-radius: 15px;
+                    padding: 0px 12px;
+                }}
+                QPushButton:hover {{
+                    background: {end_hover};
+                    color: {end_fg};
+                }}
+            """)
+        else:
+            self._end_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {tok.PRIMARY_CONTAINER};
+                    color: {tok.PRIMARY_ON};
+                    border: none;
+                    font-size: {tok.TYPE_CAPTION}px;
+                    font-weight: 700;
+                    border-radius: 15px;
+                    padding: 0px 12px;
+                }}
+                QPushButton:hover {{
+                    background: {tok.PRIMARY_CONTAINER_HOVER};
+                    color: {tok.PRIMARY_ON};
+                }}
+                QPushButton:pressed {{
+                    background: {tok.PRIMARY_CONTAINER_PRESSED};
+                }}
+            """)
+            self._mark_btn.setStyleSheet(self._end_btn.styleSheet())
+
     def reapply_theme(self) -> None:
         from sayink.ui import design_tokens as tok
 
@@ -341,33 +597,16 @@ class FloatingWindow(QWidget):
             f"color: {tok.FLOAT_TEXT}; background: transparent;"
             f" font-family: {tok.FONT_DISPLAY};"
         )
-        self._end_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {tok.PRIMARY_CONTAINER};
-                color: {tok.PRIMARY_ON};
-                border: none;
-                font-size: {tok.TYPE_CAPTION}px;
-                font-weight: 700;
-                border-radius: 15px;
-                padding: 0px 12px;
-            }}
-            QPushButton:hover {{
-                background: {tok.PRIMARY_CONTAINER_HOVER};
-                color: {tok.PRIMARY_ON};
-            }}
-            QPushButton:pressed {{
-                background: {tok.PRIMARY_CONTAINER_PRESSED};
-            }}
-        """)
-        self._mark_btn.setStyleSheet(self._end_btn.styleSheet())
+        self._apply_action_button_styles()
         self._text_label.setFont(_ui_font(tok.UI_FONT_FAMILY, tok.TYPE_BODY_SM))
         self._text_label.setStyleSheet(
             f"color: {tok.FLOAT_TEXT}; background: transparent;"
             f" font-family: {tok.FONT};"
         )
+        self._sync_text_line_height()
         if hasattr(self, "_state_token"):
-            self._set_state(self._status_label.text(), self._state_token,
-                            pulse=self._dot._timer.isActive())
+            self._set_state(self._full_status_text or self._status_label.text(), self._state_token,
+                            pulse=self._dot._pulsing)
         else:
             self._current_accent = tok.FLOAT_TEXT
 
@@ -381,7 +620,7 @@ class FloatingWindow(QWidget):
         self.setWindowFlags(island_window_flags() | Qt.WindowType.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setMinimumSize(BAR_WIDTH, BAR_HEIGHT)
+        self.setMinimumSize(MIN_BAR_WIDTH, BAR_HEIGHT)
         self.resize(BAR_WIDTH, BAR_HEIGHT)
 
     def _setup_ui(self):
@@ -412,14 +651,31 @@ class FloatingWindow(QWidget):
         self._status_label.setFont(
             _ui_font(tok.UI_FONT_FAMILY, tok.TYPE_BODY_SM, QFont.Weight.Bold)
         )
-        header_row.addWidget(self._status_label)
+        self._status_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        self._status_label.setMinimumWidth(40)
+        header_row.addWidget(self._status_label, 1)
         self._source = "microphone"
-        header_row.addStretch()
+
+        actions_row = QHBoxLayout()
+        actions_row.setContentsMargins(2, 0, 0, 0)
+        actions_row.setSpacing(14)
+
+        self._cancel_btn = QPushButton("取消")
+        self._cancel_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._cancel_btn.setFixedHeight(28)
+        self._cancel_btn.setMinimumWidth(46)
+        self._cancel_btn.setAccessibleName("取消本次转写")
+        self._cancel_btn.setToolTip("取消本次转写 · Esc")
+        self._cancel_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._cancel_btn.clicked.connect(self._on_close_clicked)
+        self._cancel_btn.hide()
 
         self._end_btn = QPushButton("结束")
         self._end_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._end_btn.setFixedHeight(30)
-        self._end_btn.setMinimumWidth(64)
+        self._end_btn.setMinimumWidth(50)
         self._end_btn.setAccessibleName("结束持续转写并保留已录内容")
         self._end_btn.setToolTip("结束录音，已录内容继续识别 · Esc")
         self._end_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -427,21 +683,23 @@ class FloatingWindow(QWidget):
         self._mark_btn = QPushButton("标记")
         self._mark_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._mark_btn.setFixedHeight(30)
-        self._mark_btn.setMinimumWidth(56)
+        self._mark_btn.setMinimumWidth(46)
         self._mark_btn.setAccessibleName("标记会议时刻")
         self._mark_btn.setToolTip("记下当前时刻，纪要会重点覆盖")
         self._mark_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._mark_btn.clicked.connect(self.meeting_mark_requested.emit)
         self._mark_btn.hide()
-        header_row.addWidget(self._mark_btn)
-        header_row.addWidget(self._end_btn)
+        actions_row.addWidget(self._cancel_btn)
+        actions_row.addWidget(self._mark_btn)
+        actions_row.addWidget(self._end_btn)
+        header_row.addLayout(actions_row)
         container_layout.addLayout(header_row)
 
         self._text_label = QLabel("")
         self._text_label.setFont(_ui_font(tok.UI_FONT_FAMILY, tok.TYPE_BODY_SM))
         self._text_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self._text_label.setWordWrap(False)
-        self._text_label.setMaximumHeight(18)
+        self._sync_text_line_height()
         self._text_label.hide()
         container_layout.addWidget(self._text_label)
 
@@ -452,20 +710,78 @@ class FloatingWindow(QWidget):
         self._use_drag_cursor()
         self._install_position_menu()
 
+    def _sync_text_line_height(self) -> int:
+        line_h = max(18, QFontMetrics(self._text_label.font()).height())
+        self._text_label.setMaximumHeight(line_h)
+        return line_h
+
+    def _available_status_width(self) -> int:
+        used = 10 + 8 + self._dot.width() + 8
+        if not self._waveform.isHidden():
+            used += self._waveform.width() + 8
+        visible_btns = [
+            btn for btn in (self._cancel_btn, self._mark_btn, self._end_btn)
+            if not btn.isHidden()
+        ]
+        if visible_btns:
+            used += 8 + 2 + sum(
+                max(btn.minimumWidth(), QFontMetrics(btn.font()).horizontalAdvance(btn.text()) + 20)
+                for btn in visible_btns
+            )
+            used += 14 * max(0, len(visible_btns) - 1)
+        return max(88, BAR_WIDTH - used)
+
+    def _update_status_elision(self) -> None:
+        raw = self._full_status_text or ""
+        if not raw:
+            self._status_label.setText("")
+            return
+        metrics = QFontMetrics(self._status_label.font())
+        avail = self._available_status_width()
+        if metrics.horizontalAdvance(raw) <= avail:
+            self._status_label.setText(raw)
+        else:
+            self._status_label.setText(
+                metrics.elidedText(raw, Qt.TextElideMode.ElideRight, avail)
+            )
+            if raw not in (self._status_label.toolTip() or ""):
+                tip = self._status_label.toolTip().strip()
+                self._status_label.setToolTip(f"{raw} · {tip}" if tip else raw)
+
+    def _sync_cancel_button(self) -> None:
+        if self._meeting_active or self._model_loading_active:
+            self._cancel_btn.hide()
+            return
+        if self._capture_active and not self._listening_active:
+            self._cancel_btn.setText("取消")
+            self._cancel_btn.setAccessibleName("取消本次转写")
+            self._cancel_btn.setToolTip("取消本次转写 · Esc")
+            self._cancel_btn.show()
+            return
+        if self._listening_active and bool(self._live_text):
+            self._cancel_btn.setText("放弃本句")
+            self._cancel_btn.setAccessibleName("放弃当前句")
+            self._cancel_btn.setToolTip("放弃当前正在说的这一句，继续监听")
+            self._cancel_btn.show()
+            return
+        self._cancel_btn.hide()
+
     def _set_mode(self, mode: str) -> None:
         self._mode = mode
         self._paint_container()
+        line_h = self._sync_text_line_height()
+        extra_h = max(0, line_h - 18)
         excerpt = mode == "excerpt"
         if excerpt:
-            self._text_label.setMaximumHeight(18)
-            self.setMinimumWidth(BAR_WIDTH)
-            self.setFixedHeight(BAR_EXCERPT_HEIGHT)
-            self.resize(BAR_EXCERPT_WIDTH, BAR_EXCERPT_HEIGHT)
+            target_h = BAR_EXCERPT_HEIGHT + extra_h
+            self.setMinimumWidth(MIN_BAR_WIDTH)
+            self.setFixedHeight(target_h)
+            self.resize(BAR_EXCERPT_WIDTH, target_h)
         else:
-            self._text_label.setMaximumHeight(18)
-            self.setMinimumWidth(BAR_WIDTH)
-            self.setFixedHeight(BAR_HEIGHT)
-            self.resize(BAR_WIDTH, BAR_HEIGHT)
+            target_h = BAR_HEIGHT + extra_h
+            self.setMinimumWidth(MIN_BAR_WIDTH)
+            self.setFixedHeight(target_h)
+            self.resize(BAR_WIDTH, target_h)
 
     def expand_live(self, text: str = "") -> None:
         self._hide_timer.stop()
@@ -484,7 +800,11 @@ class FloatingWindow(QWidget):
         self._present()
 
     def _on_close_clicked(self) -> None:
-        if self._listening_active:
+        if self._capture_active and not self._listening_active:
+            self.cancel_requested.emit()
+        elif self._listening_active and not self._meeting_active and self._live_text:
+            self.cancel_requested.emit()
+        elif self._listening_active:
             self.continuous_stop_requested.emit()
         else:
             self.dismiss_if_idle()
@@ -625,6 +945,9 @@ class FloatingWindow(QWidget):
         self._hide_timer.stop()
         self._end_btn.setVisible(self._listening_active)
         self._mark_btn.setVisible(self._meeting_active)
+        self._sync_cancel_button()
+        self._apply_action_button_styles()
+        self._update_status_elision()
         self._dot.set_suspended(False)
         self._waveform.set_suspended(False)
         self._ensure_position()
@@ -646,6 +969,11 @@ class FloatingWindow(QWidget):
         if self._mode != "excerpt" or not self._text_label.isVisible():
             return
         self._idle_collapsed = True
+        self._pre_collapse_tooltip = self.toolTip()
+        self.setToolTip("字幕已自动收起，鼠标移入展开")
+        if " · 悬停展开" not in self._full_status_text:
+            self._full_status_text = f"{self._full_status_text} · 悬停展开"
+            self._update_status_elision()
         self._text_label.hide()
         self._set_mode("compact")
         self._hold_pinned_edges()
@@ -654,6 +982,10 @@ class FloatingWindow(QWidget):
         if not self._idle_collapsed:
             return
         self._idle_collapsed = False
+        if self._full_status_text.endswith(" · 悬停展开"):
+            self._full_status_text = self._full_status_text[: -len(" · 悬停展开")]
+            self._update_status_elision()
+        self.setToolTip(self._pre_collapse_tooltip)
         if self._text_label.text():
             self._text_label.show()
             self._set_mode("excerpt")
@@ -663,7 +995,7 @@ class FloatingWindow(QWidget):
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     def _remember_move_hint(self) -> None:
-        hint = "拖动可挪开。双击或右键恢复默认位置。"
+        hint = "拖动可挪开，右键可打开菜单或重置位置。"
         current = self._status_label.toolTip()
         if hint in current:
             return
@@ -674,13 +1006,30 @@ class FloatingWindow(QWidget):
             widget.installEventFilter(self)
 
     def _position_menu(self) -> QMenu:
+        from sayink.ui.tray_icon import _paint_menu
+
         menu = QMenu(self)
-        action = menu.addAction("恢复默认位置")
-        action.triggered.connect(self.reset_to_default_position)
+        menu.setWindowFlags(
+            menu.windowFlags()
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        menu.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        menu.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        _paint_menu(menu)
+        hist_action = menu.addAction("打开历史记录")
+        hist_action.triggered.connect(self.history_requested.emit)
+        settings_action = menu.addAction("打开设置")
+        settings_action.triggered.connect(self.settings_requested.emit)
+        menu.addSeparator()
+        reset_action = menu.addAction("重置悬浮窗位置")
+        reset_action.triggered.connect(self.reset_to_default_position)
         return menu
 
     def _show_position_menu(self, global_pos: QPoint) -> None:
-        self._position_menu().exec(global_pos)
+        menu = self._position_menu()
+        self._active_context_menu = menu
+        menu.popup(global_pos)
 
     def reset_to_default_position(self) -> None:
         self._placement_pref = "auto"
@@ -738,6 +1087,7 @@ class FloatingWindow(QWidget):
         """Red-dot meeting bar: 「会议中 · hh:mm:ss」 + 标记 + 结束."""
         if elapsed is not None:
             self._meeting_elapsed = elapsed
+        self._transient_restore_timer.stop()
         self._meeting_active = True
         self._meeting_paused_detail = ""
         self._model_loading_active = False
@@ -766,15 +1116,20 @@ class FloatingWindow(QWidget):
         self._meeting_elapsed = elapsed
         if not self._meeting_active:
             return
-        current = self._status_label.text()
-        _prefix, sep, rest = current.partition(" · ")
+        suffix = " · 悬停展开" if self._idle_collapsed else ""
+        base = self._full_status_text
+        if suffix and base.endswith(suffix):
+            base = base[: -len(suffix)]
+        _prefix, sep, rest = base.partition(" · ")
         # Only the clock changes; other feedback (「正在听 · 已记录」) keeps its text.
-        if current.startswith(_MEETING_SHORT) and sep and rest.count(":") == 2 and len(rest) == 8:
-            self._status_label.setText(f"{_MEETING_SHORT} · {elapsed}")
+        if base.startswith(_MEETING_SHORT) and sep and rest.count(":") == 2 and len(rest) == 8:
+            self._full_status_text = f"{_MEETING_SHORT} · {elapsed}{suffix}"
+            self._update_status_elision()
 
     def show_meeting_paused(
         self, detail: str = "", *, title: str = MEETING_STATE_LABELS["paused"]
     ) -> None:
+        self._transient_restore_timer.stop()
         self._meeting_active = True
         self._listening_active = True
         self._meeting_paused_detail = detail
@@ -785,6 +1140,7 @@ class FloatingWindow(QWidget):
         self._present()
 
     def end_meeting_state(self, detail: str = "") -> None:
+        self._transient_restore_timer.stop()
         self._meeting_active = False
         self._meeting_paused_detail = ""
         self._meeting_source = ""
@@ -797,22 +1153,24 @@ class FloatingWindow(QWidget):
 
     def _set_state(self, text: str, color: str, pulse: bool = False):
         self._state_token = color
-        color = getattr(tok, color, color)
-        self._current_accent = color
+        resolved = getattr(tok, color, color)
+        self._current_accent = resolved
         # AMBER on white is about 3.2:1. Warning text uses the darker text
         # token; the dot keeps the brighter amber so it still reads as a warning.
-        label_color = tok.AMBER_TEXT if self._state_token == "STATE_WARN" else color
-        self._status_label.setText(text)
+        label_color = tok.AMBER_TEXT if self._state_token == "STATE_WARN" else resolved
+        self._full_status_text = text
         self._status_label.setStyleSheet(
             f"color: {label_color}; background: transparent;"
             f" font-family: {tok.FONT_DISPLAY};"
         )
-        self._dot.set_color(color)
-        self._waveform.set_accent(color)
+        self._dot.set_state_token(self._state_token)
+        self._dot.set_color(resolved)
+        self._waveform.set_accent(resolved)
         if pulse:
             self._dot.start_pulse()
         else:
             self._dot.stop_pulse()
+        self._update_status_elision()
 
     def _apply_excerpt(self, text: str, *, keep_tail: bool = False) -> None:
         stripped = " ".join((text or "").split())
@@ -892,14 +1250,22 @@ class FloatingWindow(QWidget):
         self._remember_move_hint()
         if target_app is not None:
             self._listen_target = target_app
-        label = "正在听" if self._live_text else "正在听 · 停顿后出字"
-        if self._listen_target:
-            label = f"{label} · {self._listen_target}"
-        self._set_state(label, "STATE_LISTEN", pulse=False)
-        self._use_drag_cursor()
-        self._waveform.set_compact(bool(self._live_text))
+        self._waveform.set_compact(bool(self._live_text or self._listen_target))
         self._waveform.show()
         self._waveform.start()
+        if self._live_text:
+            label = f"正在听 · {self._listen_target}" if self._listen_target else "正在听"
+        elif self._listen_target:
+            full_candidate = f"正在听 · 停顿后出字 · {self._listen_target}"
+            metrics = QFontMetrics(self._status_label.font())
+            if metrics.horizontalAdvance(full_candidate) <= self._available_status_width():
+                label = full_candidate
+            else:
+                label = f"正在听 · {self._listen_target}"
+        else:
+            label = "正在听 · 停顿后出字"
+        self._set_state(label, "STATE_LISTEN", pulse=False)
+        self._use_drag_cursor()
         if self._live_text:
             self._apply_excerpt(self._live_text, keep_tail=True)
         else:
@@ -943,6 +1309,8 @@ class FloatingWindow(QWidget):
         self._present()
 
     def show_continuous_stopped(self, detail: str = ""):
+        if self._meeting_bar_stays(detail, title="已停止监听", transient=True):
+            return
         self._restore_compact_height()
         self._listening_active = False
         self._set_state("已停止监听", "STATE_MUTED", pulse=False)
@@ -1007,14 +1375,47 @@ class FloatingWindow(QWidget):
         self._hide_timer.stop()
         self.hide()
 
-    def _meeting_bar_stays(self, excerpt: str = "") -> bool:
-        """A meeting keeps 「会议中」 and the clock. Other states only update the line of text."""
+    def _restore_after_transient_meeting_notice(self) -> None:
+        if not self._meeting_active:
+            return
+        if self._live_text:
+            self._apply_excerpt(self._live_text, keep_tail=True)
+        elif self._meeting_paused_detail:
+            self._apply_excerpt(self._meeting_paused_detail, keep_tail=False)
+        elif self._meeting_source:
+            self._apply_excerpt(f"音频来源：{self._meeting_source} · 点此打开会议页")
+        else:
+            self._apply_excerpt("点此打开会议页 · 停顿后出字")
+
+    def _meeting_bar_stays(
+        self,
+        excerpt: str = "",
+        *,
+        title: str = "",
+        transient: bool = False,
+        duration_ms: int = 3500,
+    ) -> bool:
+        """A meeting keeps 「会议中」 and the clock. Transient notices do not pollute _live_text."""
         if not self._meeting_active:
             return False
         cleaned = " ".join((excerpt or "").split())
-        if cleaned:
-            self._live_text = cleaned
-            self._apply_excerpt(cleaned, keep_tail=True)
+        clean_title = " ".join((title or "").split())
+        if transient:
+            if clean_title and cleaned and cleaned != clean_title:
+                notice = f"{clean_title} · {cleaned}"
+            else:
+                notice = clean_title or cleaned
+            if notice:
+                self._apply_excerpt(notice, keep_tail=False)
+                if duration_ms > 0:
+                    self._transient_restore_timer.start(duration_ms)
+                else:
+                    self._transient_restore_timer.stop()
+        else:
+            self._transient_restore_timer.stop()
+            if cleaned:
+                self._live_text = cleaned
+                self._apply_excerpt(cleaned, keep_tail=True)
         self._hide_timer.stop()
         self._present()
         return True
@@ -1123,7 +1524,7 @@ class FloatingWindow(QWidget):
             self._hide_timer.start(dur)
 
     def show_info(self, message: str, subtitle: str = ""):
-        if self._meeting_bar_stays(subtitle or self._live_text):
+        if self._meeting_bar_stays(subtitle, title=message, transient=True):
             return
         if (self._listening_active or self._capture_active) and self._live_text:
             if self._listening_active:
@@ -1153,13 +1554,13 @@ class FloatingWindow(QWidget):
     def show_warning(self, message: str, subtitle: str = ""):
         if self._model_loading_active:
             return
-        if self._meeting_bar_stays(subtitle or message):
+        if self._meeting_bar_stays(subtitle, title=message, transient=True, duration_ms=5000):
             return
         self._restore_compact_height()
         self._waveform.stop()
         self._waveform.hide()
         self._set_state(message, "STATE_WARN", pulse=False)
-        self._apply_excerpt(subtitle)
+        self._apply_excerpt(subtitle, keep_tail=False)
         self._present()
         self._hide_timer.start(5000)
 
@@ -1178,7 +1579,7 @@ class FloatingWindow(QWidget):
     def show_error(self, message: str, *, auto_dismiss_ms: int = 5000):
         if self._model_loading_active:
             return
-        if self._meeting_bar_stays(message):
+        if self._meeting_bar_stays(message, transient=True, duration_ms=max(0, int(auto_dismiss_ms or 0))):
             return
         self._set_mode("compact")
         self._waveform.stop()
@@ -1229,6 +1630,15 @@ class FloatingWindow(QWidget):
         self._present()
 
     def show_model_loading(self, detail: str = ""):
+        if self._meeting_active:
+            self._model_loading_active = True
+            self._meeting_bar_stays(
+                detail or "正在切换识别模型，请稍候…",
+                title=MODEL_LOADING_TITLE,
+                transient=True,
+                duration_ms=0,
+            )
+            return
         self._listening_active = False
         self._restore_compact_height()
         self._model_loading_active = True
@@ -1243,6 +1653,8 @@ class FloatingWindow(QWidget):
 
     def clear_model_loading_lock(self) -> None:
         self._model_loading_active = False
+        if self._meeting_active:
+            self._restore_after_transient_meeting_notice()
 
     def showEvent(self, event):
         self._dot.set_suspended(False)
@@ -1254,21 +1666,14 @@ class FloatingWindow(QWidget):
         self._user_moved = False
         self._pinned_token = ""
         self._idle_timer.stop()
+        self._transient_restore_timer.stop()
         self._meeting_click_timer.stop()
         self._dot.set_suspended(True)
         self._waveform.set_suspended(True)
         super().hideEvent(event)
 
     def closeEvent(self, event):
-        slot = getattr(self, "_screen_removed_slot", None)
-        if slot is not None:
-            self._screen_removed_slot = None
-            app = QApplication.instance()
-            if app is not None and hasattr(app, "screenRemoved"):
-                try:
-                    app.screenRemoved.disconnect(slot)
-                except TypeError:
-                    pass
+        self._disconnect_screen_watchers()
         self._dot.stop_pulse()
         self._waveform.stop()
         super().closeEvent(event)
@@ -1336,8 +1741,7 @@ class FloatingWindow(QWidget):
             event.accept()
             return
         if tracking and self._meeting_active:
-            delay = QApplication.doubleClickInterval()
-            self._meeting_click_timer.start(delay if delay > 0 else 250)
+            self._open_meeting_from_click()
         event.accept()
 
     def mouseDoubleClickEvent(self, event):
@@ -1346,7 +1750,6 @@ class FloatingWindow(QWidget):
             self._meeting_click_timer.stop()
             self._drag_tracking = False
             self._moved_past_threshold = False
-            self.reset_to_default_position()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)

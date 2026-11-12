@@ -1219,7 +1219,7 @@ def test_enabling_history_lets_the_hold_start(monkeypatch):
         h["app"]._on_recording_start()
         assert h["app"]._config.get("history.enabled") is True
         assert h["app"]._config.history_only_output()
-        assert h["floating"].call_when_painted.call_count == 1
+        h["recorder"].start.assert_called_once_with(continuous=False)
         slots = h["app"]._config.get("output.by_mode") or {}
         assert "continuous" not in slots
 
@@ -1230,7 +1230,7 @@ def test_paste_choice_changes_only_the_active_mode_and_then_starts(monkeypatch):
         h["app"]._on_recording_start()
         assert h["app"]._config.output_mode() == "paste"
         assert h["app"]._config.get("history.enabled") is False
-        assert h["floating"].call_when_painted.call_count == 1
+        h["recorder"].start.assert_called_once_with(continuous=False)
         slots = h["app"]._config.get("output.by_mode") or {}
         assert "continuous" not in slots
 

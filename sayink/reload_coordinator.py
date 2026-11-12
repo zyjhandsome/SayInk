@@ -562,16 +562,22 @@ class ReloadCoordinator:
         old_settings = self.applied_recognition_settings
         new_settings = RecognitionSettings.from_config(self.config)
         speaker_changed = new_settings.speaker_key != old_settings.speaker_key
+        segmenter_changed = new_settings.segmenter_key != old_settings.segmenter_key
         if self.audio_runtime_key() != self.applied_audio_key:
             self.apply_audio_config()
+        elif segmenter_changed:
+            self.apply_dictation_segmenter_profile()
         else:
             self.applied_recognition_settings = new_settings
+            self.sync_recognizer_quiet_speech(new_settings)
         if speaker_changed:
             self.rebuild_speaker_embedder()
         if self.recognition_runtime_key(new_settings) != self.applied_recognition_key:
             self.sync_models_dir()
             self.configure_stt()
             self.update_tray_models()
+        self.recognition_change_pending = False
+        self.models_reload_pending = False
         self.sync_recognition_runtime_status()
         self.sync_hotkey_trigger_mode()
 
