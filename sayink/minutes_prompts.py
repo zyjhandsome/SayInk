@@ -218,9 +218,15 @@ def format_srt_timestamp(ms: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milli:03d}"
 
 
-def render_srt(lines: Sequence[TranscriptLine], names: dict[int, str] | None = None) -> str:
+def render_srt(
+    lines: Sequence[TranscriptLine],
+    names: dict[int, str] | None = None,
+    *,
+    show_speakers: bool = True,
+    label_unknown: bool = True,
+) -> str:
     """SubRip cues from transcript lines. End time uses duration, else the next cue."""
-    usable = [line for line in lines if (line.text or "").strip()]
+    usable = [line for line in lines if (line.text or "").strip() and line.time_known]
     blocks = []
     for index, line in enumerate(usable):
         start = max(0, int(line.offset_ms))
@@ -233,7 +239,10 @@ def render_srt(lines: Sequence[TranscriptLine], names: dict[int, str] | None = N
             end = start + 3000
         if end <= start:
             end = start + 1000
-        body = f"{speaker_label(line.speaker_id, names)}：{line.text.strip()}"
+        if show_speakers and (label_unknown or int(line.speaker_id) > 0):
+            body = f"{speaker_label(line.speaker_id, names)}：{line.text.strip()}"
+        else:
+            body = line.text.strip()
         blocks.append(
             f"{index + 1}\n{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n{body}"
         )
@@ -256,12 +265,18 @@ def parse_timestamp(text: str | None) -> int | None:
     return (h * 3600 + m * 60 + s) * 1000
 
 
-def segment_offset_ms(segment: SegmentRecord, meeting_started_at: int) -> int:
+def segment_offset_ms(segment: SegmentRecord, meeting_started_at: int) -> int | None:
     """Offset of a segment into the meeting. ``captured_at`` is when speech
     started; rows written by older versions only know ``created_at`` (when
-    recognition finished), so subtract the clip length for those."""
-    if segment.captured_at:
-        return max(0, int(segment.captured_at) - int(meeting_started_at))
+    recognition finished), so subtract the clip length for those.
+
+    A negative ``captured_at`` is an imported paragraph with no clock of its own.
+    """
+    captured = int(segment.captured_at or 0)
+    if captured < 0:
+        return None
+    if captured:
+        return max(0, captured - int(meeting_started_at))
     return max(0, int(segment.created_at) - int(segment.duration_ms or 0) - int(meeting_started_at))
 
 
@@ -282,9 +297,19 @@ class TranscriptLine:
     text: str
     route: str = ""
     duration_ms: int = 0
+    time_known: bool = True
 
-    def render(self, names: dict[int, str] | None = None) -> str:
-        return f"[{format_timestamp(self.offset_ms)}] {speaker_label(self.speaker_id, names)}：{self.text}"
+    def render(
+        self,
+        names: dict[int, str] | None = None,
+        *,
+        show_speakers: bool = True,
+        show_times: bool = True,
+        label_unknown: bool = True,
+    ) -> str:
+        return transcript_prefix(
+            self, names, show_speakers=show_speakers, show_times=show_times, label_unknown=label_unknown,
+        ) + self.text
 
 
 def transcript_lines(
@@ -298,20 +323,60 @@ def transcript_lines(
         text = (seg.corrected_text or (seg.polished_text if prefer_polished and seg.polished_text else seg.raw_text)).strip()
         if not text:
             continue
+        offset = segment_offset_ms(seg, meeting_started_at)
         lines.append(
             TranscriptLine(
-                offset_ms=segment_offset_ms(seg, meeting_started_at),
+                offset_ms=0 if offset is None else offset,
                 speaker_id=int(seg.speaker_id),
                 text=text,
                 route=seg.speaker_route or "",
                 duration_ms=max(0, int(seg.duration_ms or 0)),
+                time_known=offset is not None,
             )
         )
     return lines
 
 
-def render_transcript(lines: Sequence[TranscriptLine], names: dict[int, str] | None = None) -> str:
-    return "\n".join(line.render(names) for line in lines)
+def transcript_prefix(
+    line: TranscriptLine,
+    names: dict[int, str] | None = None,
+    *,
+    show_speakers: bool = True,
+    show_times: bool = True,
+    label_unknown: bool = True,
+) -> str:
+    """The default is the live-meeting line: ``[hh:mm:ss] 说话人N：``.
+
+    Imported text that never named a line passes ``label_unknown=False`` so a
+    later correction of one paragraph does not label every other paragraph
+    「说话人待确认」.
+    """
+    named = show_speakers and (label_unknown or int(line.speaker_id) > 0)
+    speaker = speaker_label(line.speaker_id, names) if named else ""
+    show_clock = show_times and line.time_known
+    if show_clock and speaker:
+        return f"[{format_timestamp(line.offset_ms)}] {speaker}："
+    if show_clock:
+        return f"[{format_timestamp(line.offset_ms)}] "
+    if speaker:
+        return f"{speaker}："
+    return ""
+
+
+def render_transcript(
+    lines: Sequence[TranscriptLine],
+    names: dict[int, str] | None = None,
+    *,
+    show_speakers: bool = True,
+    show_times: bool = True,
+    label_unknown: bool = True,
+) -> str:
+    return "\n".join(
+        transcript_prefix(
+            line, names, show_speakers=show_speakers, show_times=show_times, label_unknown=label_unknown,
+        ) + line.text
+        for line in lines
+    )
 
 
 # ── prompts ──────────────────────────────────────────────────────────────
@@ -357,14 +422,65 @@ def _language_rule(output_language: str) -> str:
     return _LANGUAGE_RULES.get((output_language or "auto").strip().lower(), _LANGUAGE_RULES["auto"])
 
 
-def build_system_prompt(template: MinutesTemplate, *, output_language: str = "auto") -> str:
+def _rules(speakers_distinguished: bool, timestamps_available: bool) -> str:
+    """Default meetings keep ``_SYSTEM_RULES`` byte for byte.
+
+    An imported transcript opts out only when it actually lacks speakers or
+    timestamps. A live meeting whose ids are still 0 must not take this path:
+    those rows really are unconfirmed voices.
+    """
+    if speakers_distinguished and timestamps_available:
+        return _SYSTEM_RULES
+    if speakers_distinguished:
+        return (
+            "你是会议纪要撰写助手。只依据给定文字稿与用户笔记写纪要，不编造任何文字稿中没有的事实。\n"
+            "- 文字稿每行格式为「称呼：内容」或「说话人N：内容」，没有时间戳。称呼来自导入的文字，不是声纹聚类。\n"
+            "- 标为「说话人待确认」的各段可能来自不同的人，不得将它们合成一个人的发言，"
+            "也不得沿用上一位说话人的姓名或推断待办负责人。\n"
+            "- 显示姓名来自原文或用户命名，不是声纹实名验证。不得把被提及者直接对应到说话人；"
+            "无法明确对应时保留原称呼，suggested_name 和 evidence_ts 输出 null。\n"
+            "- 待办必须包含：事项、负责人（用文字稿中的称呼或说话人编号）、时间（原话中有才写，没有写「未提及」）。"
+            "不要填写出处时间戳。\n"
+            "- 所有 ts、start、end、evidence_ts 必须输出空字符串。不要写 00:00:00，也不要根据段落顺序编造时间。\n"
+            "- 用户笔记里写明的事项必须覆盖；没有时间戳就不要为笔记编造时间。\n"
+        )
+    if timestamps_available:
+        return (
+            "你是会议纪要撰写助手。只依据给定文字稿与用户笔记写纪要，不编造任何文字稿中没有的事实。\n"
+            "- 文字稿每行格式为 [hh:mm:ss] 内容，行内没有说话人标签。\n"
+            "- 这份文字稿没有区分说话人。不要把相邻段落合成同一个人的发言，不要猜测姓名或说话人编号，"
+            "不要输出「说话人待确认」。发言人摘要只列出原文明确写出的姓名；没有姓名时该区块留空。"
+            "待办负责人只在原文明确写出姓名时填写，否则写「未提及」。\n"
+            "- 待办必须包含事项、负责人、时间（原话中有才写，没有写「未提及」）和出处时间戳。\n"
+            "- 每条要点和决策末尾附最相关的一个时间戳（取自文字稿行首）。\n"
+            "- 用户标记与笔记是用户认为重要的时刻，必须覆盖。\n"
+        )
+    return (
+        "你是会议纪要撰写助手。只依据给定文字稿与用户笔记写纪要，不编造任何文字稿中没有的事实。\n"
+        "- 文字稿是按段排列的正文，没有说话人标签，也没有时间戳。\n"
+        "- 这份文字稿没有区分说话人。不要把相邻段落合成同一个人的发言，不要猜测姓名或说话人编号，"
+        "不要输出「说话人待确认」。发言人摘要只列出原文明确写出的姓名；没有姓名时该区块留空。"
+        "待办负责人只在原文明确写出姓名时填写，否则写「未提及」。\n"
+        "- 所有 ts、start、end、evidence_ts 必须输出空字符串。不要写 00:00:00，也不要根据段落顺序编造时间。\n"
+        "- 待办的时间只在原话写明时填写，没有则写「未提及」；不要填写出处时间戳。\n"
+        "- 用户笔记里写明的事项必须覆盖；没有时间戳就不要为笔记编造时间。\n"
+    )
+
+
+def build_system_prompt(
+    template: MinutesTemplate,
+    *,
+    output_language: str = "auto",
+    speakers_distinguished: bool = True,
+    timestamps_available: bool = True,
+) -> str:
     if template.is_refinement:
         from sayink.transcript_refiner import REFINE_SYSTEM_PROMPT
 
         return REFINE_SYSTEM_PROMPT
     sections = "、".join(section_title(template, s) for s in template.sections)
     return (
-        _SYSTEM_RULES
+        _rules(speakers_distinguished, timestamps_available)
         + _language_rule(output_language)
         + f"- 侧重：{template.focus}\n"
         + f"- 需要输出的区块：{sections}；未要求的区块输出空数组或空字符串。\n"
@@ -375,11 +491,17 @@ def build_system_prompt(template: MinutesTemplate, *, output_language: str = "au
     )
 
 
-def build_markdown_system_prompt(template: MinutesTemplate, *, output_language: str = "auto") -> str:
+def build_markdown_system_prompt(
+    template: MinutesTemplate,
+    *,
+    output_language: str = "auto",
+    speakers_distinguished: bool = True,
+    timestamps_available: bool = True,
+) -> str:
     """Fallback prompt when the model will not produce valid JSON."""
     sections = "\n".join(f"## {section_title(template, s)}" for s in template.sections)
     return (
-        _SYSTEM_RULES
+        _rules(speakers_distinguished, timestamps_available)
         + _language_rule(output_language)
         + f"- 侧重：{template.focus}\n"
         + "- 以 Markdown 输出，第一行是「# 标题」，然后按下面的区块顺序用二级标题组织；"
@@ -397,10 +519,27 @@ MERGE_SYSTEM_PROMPT = (
 )
 
 
-def build_merge_system_prompt(template: MinutesTemplate, *, output_language: str = "auto") -> str:
-    return (build_system_prompt(template, output_language=output_language) + "\n" + MERGE_SYSTEM_PROMPT
-            + "\n分段纪要按时间顺序提供。明确纠正保留纠正关系；存在冲突时保留分歧，不自行裁决。"
-            "合并时完整保留决策、待办、负责人、截止时间和未解决问题，保持原时间戳。")
+def build_merge_system_prompt(
+    template: MinutesTemplate,
+    *,
+    output_language: str = "auto",
+    speakers_distinguished: bool = True,
+    timestamps_available: bool = True,
+) -> str:
+    prompt = (
+        build_system_prompt(
+            template,
+            output_language=output_language,
+            speakers_distinguished=speakers_distinguished,
+            timestamps_available=timestamps_available,
+        )
+        + "\n" + MERGE_SYSTEM_PROMPT
+        + "\n分段纪要按时间顺序提供。明确纠正保留纠正关系；存在冲突时保留分歧，不自行裁决。"
+        "合并时完整保留决策、待办、负责人、截止时间和未解决问题，保持原时间戳。"
+    )
+    if not timestamps_available:
+        prompt += "各段都没有可用时间戳，合并后时间字段仍全部留空，不要补写 00:00:00。"
+    return prompt
 
 
 @dataclass
@@ -448,7 +587,15 @@ def build_merge_prompt(context: MeetingContext, partials: Sequence[dict[str, Any
 DEFAULT_CHUNK_CHARS = 8000
 
 
-def chunk_transcript(lines: Sequence[TranscriptLine], names: dict[int, str] | None, *, max_chars: int) -> list[str]:
+def chunk_transcript(
+    lines: Sequence[TranscriptLine],
+    names: dict[int, str] | None,
+    *,
+    max_chars: int,
+    show_speakers: bool = True,
+    show_times: bool = True,
+    label_unknown: bool = True,
+) -> list[str]:
     """Bound every chunk, including an unusually long individual ASR line.
 
     Split pieces retain their speaker and actual source timestamp. No
@@ -459,7 +606,9 @@ def chunk_transcript(lines: Sequence[TranscriptLine], names: dict[int, str] | No
     current: list[str] = []
     size = 0
     for line in lines:
-        prefix = f"[{format_timestamp(line.offset_ms)}] {speaker_label(line.speaker_id, names)}："
+        prefix = transcript_prefix(
+            line, names, show_speakers=show_speakers, show_times=show_times, label_unknown=label_unknown,
+        )
         if len(prefix) >= max_chars:
             raise ValueError("发言人名称过长，无法在分段预算内处理")
         remaining = line.text

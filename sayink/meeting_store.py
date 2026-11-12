@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sayink.history_store import MEETING_TRIGGER_MODE, HistoryStore, SegmentRecord, escape_like, row_to_segment
+from sayink.media_import import MEDIA_SOURCE
+from sayink.transcript_import import IMPORT_SOURCE, ImportedTranscript, assign_speakers
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +336,163 @@ class MeetingStore:
         self._write(_promote)
         return record
 
+    def create_meeting_from_transcript(
+        self,
+        transcript: ImportedTranscript,
+        *,
+        title: str = "",
+        meeting_id: str | None = None,
+    ) -> MeetingRecord | None:
+        """Create an ended meeting from parsed text. One write covers rows and names.
+
+        Timestamps are stored as ``captured_at``. A transcript without them
+        still uses ``captured_at = started_at`` so the old offset fallback
+        cannot invent a clock from ``created_at``. ``ended_at`` stays null
+        in that case, which is how the UI knows not to show a duration.
+        """
+        if self.disabled or transcript is None:
+            return None
+        assigned, names = assign_speakers(tuple(turn for turn in transcript.turns if turn.text.strip()))
+        if not assigned:
+            return None
+        started = now_ms()
+        if transcript.has_timestamps:
+            span = 0
+            for _speaker_id, turn in assigned:
+                if turn.offset_ms is None:
+                    continue
+                span = max(span, int(turn.offset_ms) + int(turn.duration_ms or 0))
+            ended: int | None = started + span
+        else:
+            ended = None
+        meeting_title = title.strip() if title and title.strip() else transcript.title.strip()
+        record = MeetingRecord(
+            id=meeting_id or uuid.uuid4().hex,
+            title=meeting_title,
+            source=IMPORT_SOURCE,
+            started_at=started,
+            ended_at=ended,
+            status=STATUS_ENDED,
+        )
+
+        def _insert(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    record.id, record.title, record.participants, record.agenda,
+                    record.notes_user, record.source, record.model_id, record.vad,
+                    json.dumps(record.glossary, ensure_ascii=False),
+                    record.started_at, record.ended_at, record.status, None,
+                ),
+            )
+            rows = []
+            for seq, (speaker_id, turn) in enumerate(assigned):
+                if transcript.has_timestamps and turn.offset_ms is not None:
+                    captured = started + int(turn.offset_ms)
+                    duration = int(turn.duration_ms or 0)
+                elif transcript.has_timestamps:
+                    # Negative captured_at means this paragraph has no clock.
+                    # Zero would fall back to created_at and invent one.
+                    captured = -1
+                    duration = 0
+                else:
+                    captured = started
+                    duration = 0
+                rows.append((
+                    record.id, seq, started + seq, turn.text.strip(), "", IMPORT_SOURCE, duration, "",
+                    MEETING_TRIGGER_MODE, "", int(speaker_id), "", captured,
+                ))
+            conn.executemany(
+                """
+                INSERT INTO history (
+                  session_id, seq, created_at, raw_text, polished_text,
+                  source, duration_ms, target_app, trigger_mode, model,
+                  speaker_id, speaker_route, captured_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            if names:
+                conn.executemany(
+                    """
+                    INSERT INTO meeting_speakers
+                      (meeting_id, speaker_id, display_name, suggested_name, name_locked)
+                    VALUES (?, ?, ?, '', 1)
+                    """,
+                    [(record.id, speaker_id, display_name) for speaker_id, display_name in names.items()],
+                )
+
+        self._write(_insert)
+        return record
+
+    def create_meeting_from_media(
+        self,
+        turns,
+        *,
+        title: str = "",
+        status: str = STATUS_ENDED,
+        audio_ms: int = 0,
+        model_id: str = "",
+        vad: str = "",
+    ) -> MeetingRecord | None:
+        """Save recognized file turns. The source media itself is not stored.
+
+        A cancelled import is ``interrupted`` and its duration stops at the
+        last kept turn. A finished import can extend that to the file length.
+        """
+        usable = [turn for turn in turns or [] if str(getattr(turn, "text", "") or "").strip()]
+        if self.disabled or not usable:
+            return None
+        if status not in (STATUS_ENDED, STATUS_INTERRUPTED):
+            status = STATUS_ENDED
+        started = now_ms()
+        span = 0
+        for turn in usable:
+            span = max(span, int(turn.offset_ms) + int(turn.duration_ms or 0))
+        if status == STATUS_ENDED:
+            span = max(span, int(audio_ms or 0))
+        record = MeetingRecord(
+            id=uuid.uuid4().hex,
+            title=title.strip(),
+            source=MEDIA_SOURCE,
+            model_id=model_id,
+            vad=vad,
+            started_at=started,
+            ended_at=started + span,
+            status=status,
+        )
+
+        def _insert(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    record.id, record.title, record.participants, record.agenda,
+                    record.notes_user, record.source, record.model_id, record.vad,
+                    json.dumps(record.glossary, ensure_ascii=False),
+                    record.started_at, record.ended_at, record.status, None,
+                ),
+            )
+            rows = []
+            for seq, turn in enumerate(usable):
+                rows.append((
+                    record.id, seq, started + seq, str(turn.text).strip(), "", MEDIA_SOURCE,
+                    int(turn.duration_ms or 0), "", MEETING_TRIGGER_MODE, model_id,
+                    int(turn.speaker_id), "", started + int(turn.offset_ms),
+                ))
+            conn.executemany(
+                """
+                INSERT INTO history (
+                  session_id, seq, created_at, raw_text, polished_text,
+                  source, duration_ms, target_app, trigger_mode, model,
+                  speaker_id, speaker_route, captured_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+        self._write(_insert)
+        return record
+
     def end_meeting(
         self,
         meeting_id: str,
@@ -414,6 +573,28 @@ class MeetingStore:
             conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
 
         self._write(_delete)
+
+    def delete_meetings(self, meeting_ids: list[str]) -> None:
+        """Hard-delete every id in one writer transaction.
+
+        A per-meeting delete would commit and pump the minutes queue between
+        rows, so removing one meeting could start generation of the next.
+        """
+        ids = list(dict.fromkeys(meeting_id for meeting_id in meeting_ids if meeting_id))
+        if not ids or self.disabled:
+            return
+
+        def _delete_all(conn: sqlite3.Connection) -> None:
+            for meeting_id in ids:
+                conn.execute("DELETE FROM history WHERE session_id = ?", (meeting_id,))
+                conn.execute("DELETE FROM meeting_marks WHERE meeting_id = ?", (meeting_id,))
+                conn.execute("DELETE FROM meeting_speakers WHERE meeting_id = ?", (meeting_id,))
+                conn.execute("DELETE FROM meeting_notes WHERE meeting_id = ?", (meeting_id,))
+                conn.execute("DELETE FROM meeting_generation_cache WHERE meeting_id = ?", (meeting_id,))
+                conn.execute("DELETE FROM meeting_generation_queue WHERE meeting_id = ?", (meeting_id,))
+                conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+
+        self._write(_delete_all)
 
     # -- marks / speakers --------------------------------------------------
 

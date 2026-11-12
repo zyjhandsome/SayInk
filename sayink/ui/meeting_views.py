@@ -33,6 +33,8 @@ from PyQt6.QtWidgets import (
 
 from sayink.meeting_store import STATUS_ENDED, STATUS_INTERRUPTED, STATUS_LIVE, MeetingRecord
 from sayink.minutes_prompts import format_timestamp
+from sayink.media_import import MEDIA_SOURCE
+from sayink.transcript_import import IMPORT_SOURCE
 from sayink.ui.reading import fit_reading_width
 
 _STATUS_TEXT = {STATUS_LIVE: "进行中", STATUS_INTERRUPTED: "已中断", STATUS_ENDED: "已结束"}
@@ -63,7 +65,12 @@ def _format_dt(ms: int) -> str:
 
 
 def _meeting_row_meta(record: MeetingRecord, minutes: str = "") -> str:
-    status = _STATUS_TEXT.get(record.status, "")
+    if record.source == IMPORT_SOURCE:
+        status = "导入文字稿"
+    elif record.source == MEDIA_SOURCE:
+        status = "导入音视频 · 已中断" if record.status == STATUS_INTERRUPTED else "导入音视频"
+    else:
+        status = _STATUS_TEXT.get(record.status, "")
     duration = _duration_label(record.duration_ms) if record.ended_at else ""
     stamp = time.localtime(record.started_at / 1000)
     today = time.localtime()
@@ -168,6 +175,19 @@ def _speaker_source(speaker_id: int, names: dict[int, str], auto_names: set[int]
     return "按声音自动区分，尚未命名"
 
 
+def _segment_body_html(text: str, correction: str) -> str:
+    """Keep the edit action on every line of a segment.
+
+    Qt turns ``<br>`` into a line break inside one paragraph, and a single
+    trailing action then sits only on the last line. The lines above look
+    like they cannot be edited.
+    """
+    parts = [html.escape(part) for part in (text or "").split("\n")] or [""]
+    if not correction or len(parts) == 1:
+        return "<br>".join(parts) + correction
+    return (correction + "<br>").join(parts) + correction
+
+
 def build_transcript_html(
     lines,
     names: dict[int, str],
@@ -182,6 +202,9 @@ def build_transcript_html(
     editable: bool = False,
     live_editable: bool = False,
     auto_names: set[int] | frozenset[int] = frozenset(),
+    show_speakers: bool = True,
+    show_times: bool = True,
+    label_unknown: bool = True,
 ) -> str:
     """Build transcript HTML paragraphs for post-meeting or live views."""
     from sayink.ui import design_tokens as tok
@@ -196,17 +219,19 @@ def build_transcript_html(
         color = speaker_color(line.speaker_id)
         source = _speaker_source(line.speaker_id, names, auto_set)
         speaker_tip = html.escape(source + "；点击为这一组发言命名", quote=True)
-        head = f"<a name='seg{index}'></a><span style='color:{tok.TEXT_DIM}'>[{_position_label(line.offset_ms)}]</span>"
-        if line.speaker_id <= 0:
+        head = f"<a name='seg{index}'></a>"
+        if show_times:
+            head += f"<span style='color:{tok.TEXT_DIM}'>[{_position_label(line.offset_ms)}]</span>"
+        if show_speakers and line.speaker_id <= 0 and label_unknown:
             head += f" <span style='color:{tok.TEXT_DIM}'>说话人待确认</span>"
-        elif label and links and not live:
+        elif show_speakers and label and links and not live:
             if line.speaker_id != previous_speaker:
                 parts.append(
                     f"<p style='margin:10px 0 2px 0'><a href='{speaker_link}:{line.speaker_id}' "
                     f"title='{speaker_tip}' style='color:{color}; text-decoration:none'>"
                     f"<b>{html.escape(label)}</b></a></p>"
                 )
-        elif label:
+        elif show_speakers and label:
             if live and links:
                 head += (
                     f" <a href='{speaker_link}:{line.speaker_id}' title='{speaker_tip}' "
@@ -241,8 +266,8 @@ def build_transcript_html(
                     f" <a href='{detail_link}:{seq}' title='查看姓名来源与归属更正' "
                     "style='color:transparent; text-decoration:none'>修改详情</a>"
                 )
-        text = html.escape(line.text).replace("\n", "<br>")
-        parts.append(f"<p style='margin:0 0 6px 0;{background}'>{head}&nbsp; {text}{correction}</p>")
+        text = _segment_body_html(line.text, correction)
+        parts.append(f"<p style='margin:0 0 6px 0;{background}'>{head}&nbsp; {text}</p>")
         previous_speaker = line.speaker_id
     return "".join(parts)
 
@@ -941,7 +966,7 @@ class _SegmentTextDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 16, 20, 16)
         lay.setSpacing(12)
-        context = QLabel(f"[{position}]  {speaker}")
+        context = QLabel(f"[{position}]  {speaker}" if position else speaker)
         context.setTextFormat(Qt.TextFormat.PlainText)
         context.setWordWrap(True)
         lay.addWidget(context)

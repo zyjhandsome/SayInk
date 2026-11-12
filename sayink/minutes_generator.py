@@ -30,7 +30,9 @@ from sayink.minutes_prompts import (
     chunk_transcript,
     render_transcript,
 )
-from sayink.minutes_render import apply_speaker_names, extract_json, render_markdown
+from sayink.minutes_render import (
+    apply_speaker_names, clear_timeline, extract_json, render_markdown, strip_clock_citations,
+)
 from sayink.text_polisher import (
     LLMCancelled, LLMResponseError, LLMTruncatedError, api_url_error, strip_model_thinking, http_client_options,
 )
@@ -79,6 +81,9 @@ class MinutesRequest:
     save_checkpoint: Callable[[str, str], None] | None = None
     proxy_mode: str = "system"
     proxy_bypass_suffixes: str = ""
+    speakers_distinguished: bool = True
+    timestamps_available: bool = True
+    label_unknown: bool = True
 
 
 def request_fingerprint(request: MinutesRequest) -> str:
@@ -91,10 +96,29 @@ def request_fingerprint(request: MinutesRequest) -> str:
         "names": request.speaker_names, "language": request.output_language,
         "chunk_chars": request.chunk_chars, "context_tokens": request.context_window_tokens,
         "output_tokens": request.max_output_tokens,
-        "prompts": [build_system_prompt(request.template, output_language=request.output_language),
-                    build_merge_system_prompt(request.template, output_language=request.output_language),
-                    REFINE_SYSTEM_PROMPT],
+        "prompts": [
+            build_system_prompt(
+                request.template, output_language=request.output_language,
+                speakers_distinguished=request.speakers_distinguished,
+                timestamps_available=request.timestamps_available,
+            ),
+            build_merge_system_prompt(
+                request.template, output_language=request.output_language,
+                speakers_distinguished=request.speakers_distinguished,
+                timestamps_available=request.timestamps_available,
+            ),
+            REFINE_SYSTEM_PROMPT,
+        ],
     }
+    if (
+        not request.speakers_distinguished
+        or not request.timestamps_available
+        or (request.speakers_distinguished and not request.label_unknown)
+    ):
+        shape = [request.speakers_distinguished, request.timestamps_available]
+        if request.speakers_distinguished and not request.label_unknown:
+            shape.append(False)
+        data["transcript_shape"] = shape
     return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -279,13 +303,18 @@ class MinutesWorker(QThread):
         self._publish_preview()
         return raw
 
+    def _refine_prompt(self, chunks, index, *, retry_reason: str = ""):
+        return refinement_user_prompt(
+            chunks, index, self._req.speaker_names, self._req.context.glossary_terms,
+            retry_reason=retry_reason, anonymous_speakers=not self._req.speakers_distinguished,
+        )
+
     async def _refine(self, client, httpx) -> tuple[dict, bool]:
         req = self._req
         size = min(req.chunk_chars, max(200, req.max_output_tokens * 2 // 3))
         while True:
             chunks = refinement_chunks(req.lines, max_chars=size)
-            if all(self._fits(REFINE_SYSTEM_PROMPT, refinement_user_prompt(
-                chunks, i, req.speaker_names, req.context.glossary_terms)) for i in range(len(chunks))):
+            if all(self._fits(REFINE_SYSTEM_PROMPT, self._refine_prompt(chunks, i)) for i in range(len(chunks))):
                 break
             if size <= 200:
                 raise LLMContextError("原文精整提示词或术语表超过输入预算，请调整模型上下文设置")
@@ -301,7 +330,7 @@ class MinutesWorker(QThread):
 
     async def _refine_group(self, client, httpx, chunks, index, label, progress_label, depth=0):
         req, units = self._req, chunks[index]
-        base_prompt = refinement_user_prompt(chunks, index, req.speaker_names, req.context.glossary_terms)
+        base_prompt = self._refine_prompt(chunks, index)
         split_prompt = "refinement-split-v1\n" + base_prompt
         split_key = self._step_key(REFINE_SYSTEM_PROMPT, split_prompt)
         # A failed parent should not be sent again when resuming its children.
@@ -315,8 +344,7 @@ class MinutesWorker(QThread):
             self._stage = "正在整理原文… " + progress_label
             self.progress.emit(self._stage + (" · 正在重新核对" if attempt else ""))
             try:
-                prompt = refinement_user_prompt(chunks, index, req.speaker_names, req.context.glossary_terms,
-                                                retry_reason=reason)
+                prompt = self._refine_prompt(chunks, index, retry_reason=reason)
                 raw = await self._chat(client, httpx, REFINE_SYSTEM_PROMPT, prompt)
                 paragraphs = validate_refinement(extract_json(raw), units)
                 self._remember(REFINE_SYSTEM_PROMPT, base_prompt, raw)
@@ -359,7 +387,7 @@ class MinutesWorker(QThread):
             paragraphs = [{"source_ids": [units[0].source_id],
                            "text": "\n\n".join(p["text"] for p in paragraphs if p["text"])}]
         paragraphs = validate_refinement({"paragraphs": paragraphs}, units)
-        base_prompt = refinement_user_prompt(chunks, index, self._req.speaker_names, self._req.context.glossary_terms)
+        base_prompt = self._refine_prompt(chunks, index)
         self._remember(REFINE_SYSTEM_PROMPT, base_prompt, json.dumps({"paragraphs": paragraphs}, ensure_ascii=False))
         return paragraphs
 
@@ -377,7 +405,11 @@ class MinutesWorker(QThread):
     def _plan_chunks(self, system):
         size = max(64, int(self._req.chunk_chars))
         while True:
-            chunks = chunk_transcript(self._req.lines, self._req.speaker_names, max_chars=size)
+            chunks = chunk_transcript(
+                self._req.lines, self._req.speaker_names, max_chars=size,
+                show_speakers=self._req.speakers_distinguished, show_times=self._req.timestamps_available,
+                label_unknown=self._req.label_unknown,
+            )
             if all(self._fits(system, self._chunk_prompt(chunks, i)) for i in range(len(chunks))):
                 return chunks
             if size <= 64:
@@ -408,7 +440,11 @@ class MinutesWorker(QThread):
         return payload
 
     async def _merge(self, client, httpx, partials):
-        system = build_merge_system_prompt(self._req.template, output_language=self._req.output_language)
+        system = build_merge_system_prompt(
+            self._req.template, output_language=self._req.output_language,
+            speakers_distinguished=self._req.speakers_distinguished,
+            timestamps_available=self._req.timestamps_available,
+        )
         level = 0
         while len(partials) > 1:
             level += 1
@@ -497,8 +533,15 @@ class MinutesWorker(QThread):
 
     async def _run_pipeline(self, httpx, started):
         req = self._req
-        transcript_text = render_transcript(req.lines, req.speaker_names)
-        system_prompt = build_system_prompt(req.template, output_language=req.output_language)
+        transcript_text = render_transcript(
+            req.lines, req.speaker_names,
+            show_speakers=req.speakers_distinguished, show_times=req.timestamps_available,
+            label_unknown=req.label_unknown,
+        )
+        system_prompt = build_system_prompt(
+            req.template, output_language=req.output_language,
+            speakers_distinguished=req.speakers_distinguished, timestamps_available=req.timestamps_available,
+        )
         chunks = self._plan_chunks(system_prompt) if not req.template.is_refinement else []
         chunked = len(chunks) > 1
         timeout = httpx.Timeout(req.timeout_sec, connect=min(10, req.timeout_sec), write=30, pool=10)
@@ -524,7 +567,11 @@ class MinutesWorker(QThread):
                     self._preview_markdown = True
                     markdown_text = await self._chat(
                         client, httpx,
-                        build_markdown_system_prompt(req.template, output_language=req.output_language),
+                        build_markdown_system_prompt(
+                            req.template, output_language=req.output_language,
+                            speakers_distinguished=req.speakers_distinguished,
+                            timestamps_available=req.timestamps_available,
+                        ),
                         build_user_prompt(req.context, chunks[0]),
                     )
                     markdown_text = validate_markdown(markdown_text)
@@ -542,6 +589,8 @@ class MinutesWorker(QThread):
         if payload is not None:
             # Owned metadata: do not accept a name map supplied by the model.
             payload.pop("_speaker_names", None)
+            if not req.timestamps_available:
+                clear_timeline(payload)
             if req.speaker_names:
                 payload["_speaker_names"] = {str(sid): name for sid, name in req.speaker_names.items()}
             markdown = render_markdown(
@@ -555,6 +604,8 @@ class MinutesWorker(QThread):
             )
             json_payload = json.dumps(payload, ensure_ascii=False)
         else:
+            if not req.timestamps_available:
+                markdown_text = strip_clock_citations(markdown_text)
             markdown = apply_speaker_names(markdown_text.strip(), req.speaker_names) + "\n"
             json_payload = ""
         self.finished_ok.emit(
@@ -585,7 +636,7 @@ def _preserve_facts(payload, partials):
 
 
 # Matched with ``match(text, pos)``: anchored at ``pos`` (a line start).
-_LINE_PREFIX_RE = re.compile(r"\[\d{2,}:\d{2}:\d{2}\][^\n：]*：")
+_LINE_PREFIX_RE = re.compile(r"(?:\[\d{2,}:\d{2}:\d{2}\][^\n：]*：|[^\n\[\]：]{1,24}：)")
 
 
 def _split_chunk(text):

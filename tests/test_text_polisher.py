@@ -243,6 +243,35 @@ class TestSecureOrLocalUrl:
         # Regression for SD-03: Ollama's default HTTP endpoint must be usable.
         assert is_secure_or_local_url("http://localhost:11434/v1") is True
 
+    def test_incomplete_ipv6_and_bad_port_stay_in_the_field_error(self):
+        from sayink.text_polisher import (
+            INVALID_IPV6_ERROR,
+            INVALID_PORT_ERROR,
+            PUBLIC_HTTP_ERROR,
+            api_url_error,
+        )
+
+        assert api_url_error("http://[::1") == INVALID_IPV6_ERROR
+        assert is_secure_or_local_url("http://[::1") is False
+        assert api_url_error("https://example.invalid:abc/v1") == INVALID_PORT_ERROR
+        assert is_secure_or_local_url("https://example.invalid:abc/v1") is False
+        assert api_url_error("http://[::1]/v1") is None
+        assert api_url_error("http://api.openai.com/v1") == PUBLIC_HTTP_ERROR
+
+    def test_settings_copy_uses_the_same_https_rule(self):
+        from PyQt6.QtWidgets import QLabel
+
+        from sayink.text_polisher import API_ADDRESS_HINT
+        from sayink.ui.settings_pages.polish import PolishSettingsPage
+
+        page = PolishSettingsPage()
+        try:
+            text = " ".join(label.text() for label in page.findChildren(QLabel))
+            assert API_ADDRESS_HINT in text
+            assert "开头即可" not in text
+        finally:
+            page.deleteLater()
+
 
 def _fake_httpx_module(response=None, raise_exc=None):
     """Build a fake ``httpx`` module usable as ``import httpx`` inside run()."""

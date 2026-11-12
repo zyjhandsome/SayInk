@@ -102,6 +102,32 @@ def _ts(value: Any, duration_ms: int | None) -> str:
     return f"[{text}]"
 
 
+def clear_timeline(payload: dict) -> dict:
+    """Blank clocks a model invented for a transcript that has none."""
+    for key in ("topics", "decisions", "action_items", "open_questions", "speakers"):
+        for item in payload.get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            for field in ("ts", "evidence_ts"):
+                if field in item:
+                    item[field] = ""
+            for point in item.get("points") or []:
+                if isinstance(point, dict) and "ts" in point:
+                    point["ts"] = ""
+    for chapter in payload.get("chapters") or []:
+        if isinstance(chapter, dict):
+            chapter["start"] = ""
+            chapter["end"] = ""
+    return payload
+
+
+_CLOCK_CITATION = re.compile(r"\[\d{1,2}:\d{2}:\d{2}\]")
+
+
+def strip_clock_citations(text: str) -> str:
+    return _CLOCK_CITATION.sub("", text)
+
+
 _CHECKABLE_RE = re.compile(
     r"\d{4}[-/年]\d{1,2}([-/月]\d{1,2}日?)?"       # 2026-03-01 / 2026年3月1日
     r"|\d{1,2}月\d{1,2}日"                         # 3月1日

@@ -1827,6 +1827,35 @@ class SpeechRecognizer(QObject):
         self._workers.append(worker)
         worker.start()
 
+    def decode_meeting_blocking(self, audio: np.ndarray, *, turn_analyzer, cancelled) -> tuple[list, str]:
+        """Decode one meeting slice on the caller thread.
+
+        Uses the resident decoder lock so a file import cannot start a second
+        native recognizer beside dictation.
+        """
+        if cancelled():
+            return [], ""
+        if not self._is_ready or self._recognizer is None:
+            return [], "语音模型未就绪，请等待模型加载完成"
+        current = self._current_worker
+        if current is not None and current.isRunning():
+            return [], "正在识别其它音频"
+        loaded = self._loaded_target[0] if self._loaded_target is not None else self._model_id
+        info = get_model_info(loaded) if loaded else None
+        window = slice_window_for_loader(info.get("loader", "") if info else "")
+        slice_args = {} if window is None else {"max_slice_sec": window[0], "overlap_sec": window[1]}
+        worker = TranscribeWorker(
+            self._recognizer, audio, retry_empty=True, turn_analyzer=turn_analyzer, **slice_args,
+        )
+        worker.native_lock = self._decode_lock
+        worker.quiet_speech = self.quiet_speech
+        turns: list = []
+        errors: list[str] = []
+        worker.meeting_ready.connect(turns.extend)
+        worker.error.connect(errors.append)
+        worker.run()
+        return turns, "" if cancelled() else "; ".join(errors)
+
     def cancel_current(self) -> bool:
         """Discard the in-flight transcription (the user pressed Esc).
 

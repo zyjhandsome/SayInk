@@ -100,15 +100,21 @@ def refinement_chunks(lines: Sequence[TranscriptLine], *, max_chars: int = REFIN
 def refinement_user_prompt(
     chunks: Sequence[Sequence[RefinementUnit]], index: int,
     names: dict[int, str], glossary: Sequence[str], *, retry_reason: str = "",
+    anonymous_speakers: bool = False,
 ) -> str:
+    def label(speaker_id: int) -> str:
+        if anonymous_speakers:
+            return ""
+        return speaker_label(speaker_id, names)
+
     def context(units, *, tail=False):
-        return [{"speaker": speaker_label(u.speaker_id, names), "text": u.text[-200:] if tail else u.text[:200]} for u in units]
+        return [{"speaker": label(unit.speaker_id), "text": unit.text[-200:] if tail else unit.text[:200]} for unit in units]
 
     data = {
         "glossary": list(glossary),
         "before_context": context(chunks[index - 1][-1:], tail=True) if index else [],
-        "units": [{"source_id": u.source_id, "speaker": speaker_label(u.speaker_id, names), "text": u.text}
-                  for u in chunks[index]],
+        "units": [{"source_id": unit.source_id, "speaker": label(unit.speaker_id), "text": unit.text}
+                  for unit in chunks[index]],
         "after_context": context(chunks[index + 1][:1]) if index + 1 < len(chunks) else [],
     }
     instruction = "仅将 units 融合为通顺的书面文章，保留个人语气；按话题细分段落，再按内部协议输出完整 JSON。"

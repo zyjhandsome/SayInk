@@ -19,14 +19,16 @@ from __future__ import annotations
 import ipaddress
 import logging
 import json
+from pathlib import Path
 import re
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QThread, QTimer, pyqtSignal
 
 from sayink.config import Config
 from sayink.history_store import HistoryStore, SegmentRecord
@@ -53,10 +55,12 @@ from sayink.minutes_prompts import (
     format_timestamp,
     get_template,
     render_srt,
+    render_transcript,
     speaker_label,
     transcript_lines,
 )
-from sayink.minutes_render import apply_speaker_names, render_markdown, replace_names_in_markdown
+from sayink.transcript_import import IMPORT_SOURCE, parse_transcript
+from sayink.minutes_render import apply_speaker_names, clear_timeline, render_markdown, replace_names_in_markdown
 from sayink.recognition_settings import (
     ADVANCED_RECOGNITION_PATH,
     HOTWORDS_UNSUPPORTED_NOTE,
@@ -277,6 +281,37 @@ def runs_on_this_machine(url: str) -> bool:
         return False
 
 
+class MediaCommitError(RuntimeError):
+    """Recognition finished, but the meeting row was not stored."""
+
+
+# A thread that could not be stopped stays here so deleting the controller
+# does not destroy it while it is still running.
+_ORPHAN_MEDIA_JOBS: list[QThread] = []
+
+
+class _MediaImportJob(QThread):
+    """Read and recognize one file away from the UI thread. The runner is injected."""
+
+    progressed = pyqtSignal(str)
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, path: str, runner, cancel_event: threading.Event, parent=None) -> None:
+        super().__init__(parent)
+        self._path = path
+        self._runner = runner
+        self._cancel = cancel_event
+
+    def run(self) -> None:
+        try:
+            result = self._runner(self._path, self._cancel.is_set, self.progressed.emit)
+            self.succeeded.emit(result)
+        except Exception as exc:
+            log.warning("导入音视频失败: %s", exc)
+            self.failed.emit(str(exc))
+
+
 class MeetingController(QObject):
     state_changed = pyqtSignal(object)          # MeetingState
     meeting_started = pyqtSignal(str)           # meeting_id
@@ -290,6 +325,9 @@ class MeetingController(QObject):
     generation_cancelled = pyqtSignal(str)      # meeting_id (user cancelled; not a failure)
     generation_queued = pyqtSignal(str)         # meeting_id waits in the queue (new, deferred or retrying)
     notice = pyqtSignal(str, str)               # title, detail (for bar / tray)
+    media_import_progress = pyqtSignal(str)
+    media_import_finished = pyqtSignal(str)     # meeting id, or "" when nothing was saved
+    media_import_failed = pyqtSignal(str)
 
     def __init__(
         self,
@@ -330,6 +368,16 @@ class MeetingController(QObject):
         self._retry_timer.setSingleShot(True)
         self._retry_timer.timeout.connect(self._pump_queue)
         self._history.add_committed_callback(self._on_history_committed_threadsafe)
+        self._importing_media = False
+        self._media_cancel = threading.Event()
+        self._media_runner = None
+        self._external_block: Callable[[], str] | None = None
+        self._media_job: _MediaImportJob | None = None
+        self._media_title = ""
+        self._unsaved_media: tuple | None = None
+        self.media_import_notice = ""
+        self.transcript_import_notice = ""
+        self.srt_skip_note = ""
 
     # -- accessors -----------------------------------------------------------
 
@@ -392,6 +440,8 @@ class MeetingController(QObject):
 
     def begin(self, options: MeetingOptions, capabilities: MeetingCapabilities) -> MeetingRecord:
         """Create the meeting row and the in-memory speaker session."""
+        if self._importing_media:
+            raise RuntimeError("正在导入音视频")
         if self.is_active:
             raise RuntimeError("已有会议在进行中")
         if self._store.disabled:
@@ -827,19 +877,220 @@ class MeetingController(QObject):
         self.meeting_changed.emit(meeting_id)
         return True
 
+    def import_transcript(
+        self,
+        text: str,
+        *,
+        title: str = "",
+        detect_structure: bool = True,
+    ) -> MeetingRecord | None:
+        """Save pasted text as an ended meeting. The user generates minutes later."""
+        parsed = parse_transcript(text or "", detect_structure=detect_structure)
+        if not parsed.turns:
+            self.transcript_import_notice = "没有可导入的文字"
+            return None
+        try:
+            record = self._store.create_meeting_from_transcript(parsed, title=title)
+        except Exception as exc:
+            self.transcript_import_notice = f"写入数据库失败：{exc}"
+            return None
+        if record is None or not self._store.flush() or self._store.get_meeting(record.id) is None:
+            self.transcript_import_notice = "文字已经整理好，但写入数据库失败。请再导入一次。"
+            return None
+        saved = self._store.get_meeting(record.id)
+        if saved is None:
+            return None
+        self.transcript_import_notice = ""
+        self.meeting_changed.emit(saved.id)
+        return saved
+
+    @property
+    def importing_media(self) -> bool:
+        return self._importing_media
+
+    def set_external_block(self, blocker: Callable[[], str] | None) -> None:
+        """App-owned reason a file import must wait, such as dictation or recovery."""
+        self._external_block = blocker
+
+    def set_media_runner(self, runner) -> None:
+        """``runner(path, cancel, progress) -> RecognitionResult``. The page does not decode."""
+        self._media_runner = runner
+
+    def media_block_reason(self) -> str:
+        if self._importing_media:
+            return "正在导入音视频，请完成或取消后再试"
+        if self.is_active:
+            return "已有会议在进行中"
+        if self._external_block is not None:
+            return self._external_block() or ""
+        return ""
+
+    def begin_media_import(self) -> str:
+        reason = self.media_block_reason()
+        if reason:
+            return reason
+        self._media_cancel.clear()
+        self._importing_media = True
+        return ""
+
+    def cancel_media_import(self) -> None:
+        self._media_cancel.set()
+
+    def start_media_import(self, path: str, *, title: str = "") -> str:
+        from sayink.audio_file_decoder import SUPPORTED_EXTENSIONS
+
+        suffix = Path(path).suffix.lower()
+        if suffix not in SUPPORTED_EXTENSIONS:
+            return f"不支持的文件类型：{suffix or '无扩展名'}"
+        reason = self.begin_media_import()
+        if reason:
+            return reason
+        if self._media_runner is None:
+            self._importing_media = False
+            return "语音模型未就绪，请等待模型加载完成后再导入音视频"
+        self._media_title = (title or Path(path).stem).strip()
+        job = _MediaImportJob(path, self._media_runner, self._media_cancel, None)
+        job.progressed.connect(self.media_import_progress)
+        job.succeeded.connect(self._on_media_job_done)
+        job.failed.connect(self._on_media_job_failed)
+        job.finished.connect(self._retire_media_job)
+        self._media_job = job
+        job.start()
+        return ""
+
+    def commit_media_import(self, result, title: str) -> MeetingRecord | None:
+        """Persist finished turns and clear the import lock. Minutes stay manual."""
+        try:
+            turns = tuple(getattr(result, "turns", ()) or ())
+            if not turns:
+                return None
+            status = STATUS_INTERRUPTED if (
+                getattr(result, "cancelled", False) or getattr(result, "error", "")
+            ) else STATUS_ENDED
+            record = self._store.create_meeting_from_media(
+                turns,
+                title=title,
+                status=status,
+                audio_ms=int(getattr(result, "audio_ms", 0) or 0),
+                model_id=str(self._config.get("stt.model_id", "") or ""),
+            )
+            if record is None:
+                return None
+            saved = self._store.get_meeting(record.id) if self._store.flush() else None
+            if saved is None:
+                self._unsaved_media = (result, title, record.id)
+                raise MediaCommitError("识别已经完成，但写入数据库失败。可以重试保存，不必重新识别。")
+            self._unsaved_media = None
+            self.meeting_changed.emit(saved.id)
+            return saved
+        except MediaCommitError:
+            raise
+        except Exception as exc:
+            self._unsaved_media = (result, title, "")
+            raise MediaCommitError(f"写入数据库失败：{exc}") from exc
+        finally:
+            self._importing_media = False
+            self._media_cancel.clear()
+
+    def _on_media_job_done(self, result) -> None:
+        try:
+            saved = self.commit_media_import(result, self._media_title)
+        except MediaCommitError as exc:
+            self.media_import_notice = str(exc)
+            self.media_import_finished.emit("")
+            return
+        error = str(getattr(result, "error", "") or "")
+        if saved is None and getattr(result, "cancelled", False):
+            self.media_import_notice = "已取消导入。"
+        elif saved is None and error:
+            self.media_import_notice = error
+        elif saved is None:
+            self.media_import_notice = "没有识别到文字"
+        elif error:
+            self.media_import_notice = f"已保留前面识别到的文字。后面识别失败：{error}"
+        else:
+            self.media_import_notice = ""
+        self.media_import_finished.emit(saved.id if saved is not None else "")
+
+    def retry_media_save(self) -> str:
+        """Write the last recognized file again after a database failure."""
+        pending = self._unsaved_media
+        if not pending:
+            return "没有可重试的导入结果"
+        result, title, meeting_id = pending
+        if meeting_id and self._store.flush() and self._store.get_meeting(meeting_id) is not None:
+            self._unsaved_media = None
+            self.media_import_notice = ""
+            self.meeting_changed.emit(meeting_id)
+            self.media_import_finished.emit(meeting_id)
+            return ""
+        self._importing_media = True
+        self._media_title = title
+        try:
+            saved = self.commit_media_import(result, title)
+        except MediaCommitError as exc:
+            self.media_import_notice = str(exc)
+            return str(exc)
+        if saved is None:
+            return self.media_import_notice or "没有识别到文字"
+        self.media_import_notice = ""
+        self.media_import_finished.emit(saved.id)
+        return ""
+
+    def _retire_media_job(self) -> None:
+        job = self.sender()
+        if not isinstance(job, _MediaImportJob) or job.isRunning():
+            return
+        if self._media_job is job:
+            self._media_job = None
+        job.deleteLater()
+
+    def _on_media_job_failed(self, message: str) -> None:
+        self._importing_media = False
+        self._media_cancel.clear()
+        self.media_import_failed.emit(message or "导入音视频失败")
+
+    def transcript_shape(self, record: MeetingRecord, lines: list[TranscriptLine] | None = None) -> tuple[bool, bool]:
+        """(speakers are real, timestamps are real).
+
+        Promoted and live meetings keep both even when every speaker id is 0.
+        Only ``import_text`` can say the file itself had neither.
+        """
+        if record.source != IMPORT_SOURCE:
+            return True, True
+        if lines is None:
+            lines = transcript_lines(self._store.get_segments(record.id), record.started_at)
+        return any(int(line.speaker_id) > 0 for line in lines), record.ended_at is not None
+
+    def _transcript_flags(self, record: MeetingRecord, lines: list[TranscriptLine]) -> tuple[bool, bool, bool]:
+        """Speakers, timestamps, and whether an unlabeled line may say 待确认."""
+        speakers, times = self.transcript_shape(record, lines)
+        return speakers, times, record.source != IMPORT_SOURCE
+
     def transcript_text(self, meeting_id: str) -> str:
         record = self._store.get_meeting(meeting_id)
         if record is None:
             return ""
         names = self.speaker_names(meeting_id)
-        return "\n".join(line.render(names) for line in transcript_lines(self._store.get_segments(meeting_id), record.started_at))
+        lines = transcript_lines(self._store.get_segments(meeting_id), record.started_at)
+        show_speakers, show_times, label_unknown = self._transcript_flags(record, lines)
+        return render_transcript(
+            lines, names, show_speakers=show_speakers, show_times=show_times, label_unknown=label_unknown,
+        )
 
     def export_transcript_srt(self, meeting_id: str) -> str:
         record = self._store.get_meeting(meeting_id)
         if record is None:
             return ""
         lines = transcript_lines(self._store.get_segments(meeting_id), record.started_at)
-        return render_srt(lines, self.speaker_names(meeting_id))
+        show_speakers, show_times, label_unknown = self._transcript_flags(record, lines)
+        skipped = sum(1 for line in lines if (line.text or "").strip() and not line.time_known)
+        self.srt_skip_note = f"有 {skipped} 段没有时间，已从字幕中跳过。" if skipped else ""
+        if not show_times:
+            return ""
+        return render_srt(
+            lines, self.speaker_names(meeting_id), show_speakers=show_speakers, label_unknown=label_unknown,
+        )
 
     def export_transcript_markdown(self, meeting_id: str) -> str:
         record = self._store.get_meeting(meeting_id)
@@ -895,12 +1146,17 @@ class MeetingController(QObject):
         segs = segments if segments is not None else self._store.get_segments(meeting_id)
         lines = transcript_lines(segs, record.started_at)
         names = self.speaker_names(meeting_id) if names is None else names
+        show_speakers, show_times, label_unknown = self._transcript_flags(record, lines)
+        if not show_times:
+            clear_timeline(payload)
         return render_markdown(
             payload,
             template=template,
             title_fallback=record.display_title,
             duration_ms=record.duration_ms,
-            transcript_text="\n".join(line.render(names) for line in lines),
+            transcript_text=render_transcript(
+                lines, names, show_speakers=show_speakers, show_times=show_times, label_unknown=label_unknown,
+            ),
             speaker_names=names,
             meta_lines=self._meeting_meta_lines(record),
         )
@@ -982,6 +1238,52 @@ class MeetingController(QObject):
         self._pump_queue()
         return deleted
 
+    def delete_meetings(self, meeting_ids: list[str]) -> bool:
+        """Delete many meetings, then pump the minutes queue once."""
+        ids = list(dict.fromkeys(meeting_id for meeting_id in meeting_ids if meeting_id))
+        if not ids:
+            return False
+        if self._generating_for in ids:
+            self._generator.cancel()
+            self._generating_for = ""
+            self.generation_preview_text = ""
+        self._store.delete_meetings(ids)
+        deleted = self._store.flush() and all(self._store.get_meeting(meeting_id) is None for meeting_id in ids)
+        for meeting_id in ids:
+            self.meeting_changed.emit(meeting_id)
+        self._pump_queue()
+        return deleted
+
+    def export_meetings_markdown(self, meeting_ids: list[str]) -> str:
+        parts = [self.export_markdown(meeting_id).rstrip() for meeting_id in meeting_ids]
+        parts = [part for part in parts if part]
+        return ("\n\n".join(parts) + "\n") if parts else ""
+
+    def enqueue_minutes(self, meeting_ids: list[str], *, template_id: str | None = None) -> tuple[int, int]:
+        """Queue minutes for meetings that do not already have them.
+
+        Returns ``(queued, skipped)``. Existing notes, a live meeting and an
+        empty transcript are skipped. One running job stays running; the rest wait.
+        """
+        template = template_id or str(self._config.get("meeting.template_id", GENERAL_TEMPLATE_ID) or GENERAL_TEMPLATE_ID)
+        queued = 0
+        skipped = 0
+        for meeting_id in list(dict.fromkeys(meeting_id for meeting_id in meeting_ids if meeting_id)):
+            record = self._store.get_meeting(meeting_id)
+            notes = self._store.get_notes(meeting_id)
+            if (
+                record is None
+                or (notes is not None and notes.markdown.strip())
+                or self._generation_problem(record, template, None)
+            ):
+                skipped += 1
+                continue
+            if self.generate(meeting_id, template_id=template):
+                queued += 1
+            else:
+                skipped += 1
+        return queued, skipped
+
     # -- export ----------------------------------------------------------------
 
     def export_markdown(self, meeting_id: str, *, include_transcript: bool = True) -> str:
@@ -1002,8 +1304,11 @@ class MeetingController(QObject):
         if include_transcript:
             lines = transcript_lines(self._store.get_segments(meeting_id), record.started_at)
             if lines:
+                show_speakers, show_times, label_unknown = self._transcript_flags(record, lines)
                 parts.append("\n## 文字稿\n")
-                parts.extend(line.render(names) for line in lines)
+                parts.append(render_transcript(
+                    lines, names, show_speakers=show_speakers, show_times=show_times, label_unknown=label_unknown,
+                ))
         return "\n".join(parts).rstrip() + "\n"
 
     # -- minutes generation ----------------------------------------------------
@@ -1153,6 +1458,7 @@ class MeetingController(QObject):
         template = get_template(template_id, self._custom_templates())
         segments = self._store.get_segments(meeting_id)
         lines: list[TranscriptLine] = transcript_lines(segments, record.started_at, prefer_polished=not template.is_refinement)
+        show_speakers, show_times, label_unknown = self._transcript_flags(record, lines)
         if not self.auto_name_speakers(meeting_id):
             return "说话人名称保存失败，请重试"
         names = self.speaker_names(meeting_id)
@@ -1188,6 +1494,9 @@ class MeetingController(QObject):
             context_window_tokens=int(self._config.get("meeting.context_window_tokens", 32768)),
             max_output_tokens=int(self._config.get("meeting.max_output_tokens", 4096)),
             meta_lines=self._meeting_meta_lines(record),
+            speakers_distinguished=show_speakers,
+            timestamps_available=show_times,
+            label_unknown=label_unknown,
         )
         fingerprint = request_fingerprint(request)
         request.checkpoints = self._store.generation_checkpoints(meeting_id, fingerprint)
@@ -1275,10 +1584,62 @@ class MeetingController(QObject):
 
     @property
     def running_workers(self):
-        return self._generator.running_workers
+        workers = tuple(self._generator.running_workers)
+        job = self._media_job
+        if job is not None and job.isRunning():
+            return workers + (job,)
+        return workers
+
+    def event(self, event) -> bool:
+        # Destroying this object must not destroy a QThread that is still inside
+        # a native decode. Stop that thread first; a zero wait on shutdown only
+        # asks it to cancel.
+        if event.type() == QEvent.Type.DeferredDelete:
+            self._stop_media_job(force=True)
+        return super().event(event)
+
+    def _stop_media_job(self, *, force: bool, wait_ms: int = 0) -> None:
+        self.cancel_media_import()
+        job = self._media_job
+        if job is None:
+            return
+        if job.isRunning() and wait_ms:
+            job.wait(wait_ms)
+        if job.isRunning() and force:
+            # Keep the QThread alive after this controller is destroyed. Terminating
+            # it here deadlocks a Python worker that still needs this thread.
+            for signal in (job.progressed, job.succeeded, job.failed, job.finished):
+                try:
+                    signal.disconnect()
+                except TypeError:
+                    pass
+            if job not in _ORPHAN_MEDIA_JOBS:
+                _ORPHAN_MEDIA_JOBS.append(job)
+
+            def _drop(finished=job) -> None:
+                try:
+                    _ORPHAN_MEDIA_JOBS.remove(finished)
+                except ValueError:
+                    pass
+                finished.deleteLater()
+
+            job.finished.connect(_drop)
+            self._media_job = None
+            return
+        if job.isRunning():
+            return
+        if self._media_job is job:
+            self._media_job = None
+        if force:
+            try:
+                job.finished.disconnect(self._retire_media_job)
+            except TypeError:
+                pass
+            job.deleteLater()
 
     def shutdown(self, *, wait_ms: int = 2000) -> None:
         """Queued and interrupted jobs stay in the database for the next start."""
+        self._stop_media_job(force=False, wait_ms=wait_ms)
         self.abandon_on_exit()
         self._clock.stop()
         self._drain_timer.stop()

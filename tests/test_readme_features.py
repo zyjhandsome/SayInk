@@ -766,6 +766,12 @@ class TestReadmeMeetingNotes:
         assert "docs/recognition-optimization-20261022.md" in text
         assert "27.37%" in text and "5.87%" in text
         assert "离开输入框" in text and "后台静默加载新热词" in text
+        assert "导入文字稿" in text and "GB18030" in text and ".vtt" in text
+        assert "不会自动开始生成" in text
+        assert "导入音视频" in text and "不会把原文件复制" in text and "声纹不写入磁盘" in text
+        assert "取消后已识别的部分会保留" in text
+        assert "全选只作用于已经加载出来的会议" in text
+        assert "无法撤销" in text and "8 秒撤销" in text
 
     def test_readme_says_dictation_shares_the_meeting_stack(self):
         """持续转写 reuses the meeting speaker / VAD / glossary stack

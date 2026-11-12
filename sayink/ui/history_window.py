@@ -70,6 +70,28 @@ logger = logging.getLogger(__name__)
 COPY_FAILED_TEXT = "复制失败，请再试一次"
 
 
+def release_list_item_widgets(list_widget: QListWidget, host: QWidget) -> None:
+    """Drop item widgets without promoting them to tiny top-level windows.
+
+    ``clear()`` destroys each row widget. One that is still visible when its
+    parent disappears is shown by Qt as its own window for a frame, and that
+    window is only the application icon. Hide the rows first.
+
+    Do not call ``removeItemWidget`` or reparent onto ``host``. Both clear the
+    parent while Qt still considers the widget visible, which is the same
+    one-frame window, and those windows stay alive long enough to take focus.
+    """
+    del host
+    for index in range(list_widget.count()):
+        item = list_widget.item(index)
+        widget = list_widget.itemWidget(item)
+        if widget is None:
+            continue
+        widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        widget.hide()
+    list_widget.clear()
+
+
 class _ElidedLabel(QLabel):
     """A single-line preview that keeps the full text available to assistive tools."""
     def __init__(self, text: str, parent=None):
@@ -235,6 +257,18 @@ class _SessionList(QListWidget):
     def updateGeometries(self):
         super().updateGeometries()
         self._place_focus_ring()
+
+    def setCurrentRow(self, row: int) -> None:
+        """A programmatic move matches a click: it does not keep the previous row.
+
+        Extended selection otherwise leaves the old row selected, and the
+        meeting page treats two selected rows as a batch.
+        """
+        if not self.batch_mode:
+            self.blockSignals(True)
+            self.clearSelection()
+            self.blockSignals(False)
+        super().setCurrentRow(row)
 
     def selectionCommand(self, index, event=None):
         mouse_or_key = event is not None and event.type() in (
@@ -1231,7 +1265,7 @@ class HistoryWindow(QWidget):
         # on the next paint. Restore selection, then refresh the detail once.
         self._session_list.blockSignals(True)
         try:
-            self._session_list.clear()
+            release_list_item_widgets(self._session_list, self)
             self._history_preferences_btn.setVisible(
                 not sessions and not self._search_query and not self._history_enabled
             )
@@ -1246,14 +1280,15 @@ class HistoryWindow(QWidget):
                     last_day = day
                 item = QListWidgetItem(self._session_item_text(session))
                 item.setData(Qt.ItemDataRole.UserRole, session.session_id)
-                item.setToolTip(
-                    f"来源：{_source_chip_text(session.source)} · "
-                    f"应用：{session.target_app or '未知应用'} · {session.segment_count} 段"
-                )
                 item.setForeground(Qt.GlobalColor.transparent)
                 item.setSizeHint(QSize(0, self.ROW_HEIGHT))
                 self._session_list.addItem(item)
-                self._session_list.setItemWidget(item, self._build_stream_row(session))
+                row = self._build_stream_row(session)
+                row.setToolTip(
+                    f"来源：{_source_chip_text(session.source)} · "
+                    f"应用：{session.target_app or '未知应用'} · {session.segment_count} 段"
+                )
+                self._session_list.setItemWidget(item, row)
             items = self.session_items()
             if items:
                 retained = [it for it in items if it.data(Qt.ItemDataRole.UserRole) in selected]

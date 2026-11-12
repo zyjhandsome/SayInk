@@ -166,8 +166,12 @@ def test_renders_sessions_as_reverse_order_group_rows(qapp):
     assert "2 段" in first.text()
     assert "mixed" not in first.text()
     assert "Code.exe" not in first.text()
-    assert "混合" in first.toolTip()
-    assert "Code.exe" in first.toolTip()
+    # The tip lives on the row widget. A QListWidgetItem tooltip on a
+    # setItemWidget row pops up at (0, 0) as a tiny window.
+    tip = window._session_list.itemWidget(first).toolTip()
+    assert "混合" in tip
+    assert "Code.exe" in tip
+    assert not first.toolTip()
     assert second.data(Qt.ItemDataRole.UserRole) == "older"
 
 

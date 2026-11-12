@@ -88,192 +88,192 @@ def main():
         config.set("stt.models_dir", str(Path(temp) / "models"))
         history = HistoryStore(db_path=Path(temp) / "history.db")
         controller = MeetingController(config, history, pending_segments=lambda: 0)
-        for index, title in enumerate(("产品方案评审（示例）", "每周进展同步（示例）", "客户需求讨论（示例）")):
-            stamp = int((datetime.now() - timedelta(hours=index * 6)).timestamp() * 1000)
-            record = controller.store.create_meeting(title=title, started_at=stamp, source="mixed")
-            controller.store.end_meeting(record.id, ended_at=stamp + 85_000)
-            if index:
-                continue
-            current = record
-            for offset, speaker, text in (
-                (1, 1, "今天先讨论会后的核对流程，减少反复切换。"),
-                (13, 1, "复制按钮应该区分纪要和文字稿，导出时让用户选择范围。"),
-                (27, 2, "同意。点击引用以后，也要能返回刚才阅读的位置。"),
-                (54, 2, "这里显示的名字是我们手动设置的，不代表系统验证了身份。"),
-                (64, 1, "如果只是一句话分错人，就只更正这一句。下次评审时间再确认。"),
-            ):
-                history.enqueue(SegmentRecord(record.id, offset, stamp + offset * 1000, raw_text=text,
-                                              trigger_mode="meeting", speaker_id=speaker, source="mixed",
-                                              captured_at=stamp + offset * 1000))
-            controller.store.set_speaker(record.id, 1, display_name="小林")
-            controller.store.set_speaker(record.id, 2, display_name="小周")
-        controller.store.flush()
-        win = MainWindow(config, history, meeting=controller)
-        from sayink.runtime_status import RuntimeState
-        win._settings.set_runtime_status(RuntimeState.READY, "就绪（示例）")
-        win.show_page("meeting")
-        win.show()
-        win.setMinimumWidth(880)
-        win.resize(1040, 720)
-        page = win._meeting
-
-        def capture(name):
-            settle(app)
-            win.grab().save(str(args.output / name))
-
-        def capture_details(dialog):
-            dialog.show()
-            settle(app)
-            dialog.grab().save(str(args.output / f"modification-details-{theme}.png"))
-            dialog.resize(360, 540)
-            settle(app)
-            dialog.grab().save(str(args.output / f"narrow-modification-details-{theme}.png"))
-            dialog.close()
-            return QDialog.DialogCode.Rejected
-
-        for theme in ("dark", "light"):
-            apply_theme(app, mode=theme, surfaces=[win, win._settings, win._history, page])
-            page.show_start_card()
-            capture(f"start-{theme}.png")
-            options = MeetingOptions(title="会议录制（示例）", input_source="mixed")
-            caps = resolve_capabilities(config, options, dictation_model_id="funasr-nano")
-            live = controller.begin(options, replace(caps, speaker_model_available=False))
-            history.enqueue(SegmentRecord(live.id, 0, live.started_at,
-                raw_text="这里是本场会议的实时文字稿，可核对、复制，或暂停采集。", trigger_mode="meeting", speaker_id=1))
-            history.enqueue(SegmentRecord(live.id, 4, live.started_at + 4000,
-                raw_text="这句话的发言人可以在录制中更正，不需要暂停会议。", trigger_mode="meeting", speaker_id=2))
-            history.enqueue(SegmentRecord(live.id, 9, live.started_at + 9000,
-                raw_text="好的，稍后再确认。", trigger_mode="meeting", speaker_id=0,
-                captured_at=live.started_at + 9000))
-            history.flush()
-            page._render_live()
-            capture(f"live-{theme}.png")
-            controller.rename_speaker(live.id, 1, "小林")
-            page._render_live()
-            capture(f"live-named-{theme}.png")
-            page._live_correct_speaker_btn.setChecked(True)
-            capture(f"live-speaker-correction-{theme}.png")
-            controller.correct_segment_speaker(live.id, 4, 1)
-            page._render_live()
-            capture(f"live-speaker-corrected-{theme}.png")
-            win.resize(880, 580)
-            capture(f"narrow-live-speaker-corrected-{theme}.png")
+        try:
+            for index, title in enumerate(("产品方案评审（示例）", "每周进展同步（示例）", "客户需求讨论（示例）")):
+                stamp = int((datetime.now() - timedelta(hours=index * 6)).timestamp() * 1000)
+                record = controller.store.create_meeting(title=title, started_at=stamp, source="mixed")
+                controller.store.end_meeting(record.id, ended_at=stamp + 85_000)
+                if index:
+                    continue
+                current = record
+                for offset, speaker, text in (
+                    (1, 1, "今天先讨论会后的核对流程，减少反复切换。"),
+                    (13, 1, "复制按钮应该区分纪要和文字稿，导出时让用户选择范围。"),
+                    (27, 2, "同意。点击引用以后，也要能返回刚才阅读的位置。"),
+                    (54, 2, "这里显示的名字是我们手动设置的，不代表系统验证了身份。"),
+                    (64, 1, "如果只是一句话分错人，就只更正这一句。下次评审时间再确认。"),
+                ):
+                    history.enqueue(SegmentRecord(record.id, offset, stamp + offset * 1000, raw_text=text,
+                                                  trigger_mode="meeting", speaker_id=speaker, source="mixed",
+                                                  captured_at=stamp + offset * 1000))
+                controller.store.set_speaker(record.id, 1, display_name="小林")
+                controller.store.set_speaker(record.id, 2, display_name="小周")
+            controller.store.flush()
+            win = MainWindow(config, history, meeting=controller)
+            from sayink.runtime_status import RuntimeState
+            win._settings.set_runtime_status(RuntimeState.READY, "就绪（示例）")
+            win.show_page("meeting")
+            win.show()
+            win.setMinimumWidth(880)
             win.resize(1040, 720)
-            live_segment = controller.store.get_segments(live.id)[1]
-            dialog = _SegmentSpeakerDialog(live_segment, [(1, "小林 · 说话人1"), (2, "说话人2")], win, live=True)
-            dialog.show()
-            settle(app)
-            dialog.grab().save(str(args.output / f"live-speaker-dialog-{theme}.png"))
-            dialog.close()
-            page._live_correct_speaker_btn.setChecked(False)
-            capture(f"live-quiet-{theme}.png")
-            page.focus_search()
-            page._live_find_edit.setText("核对")
-            capture(f"live-find-{theme}.png")
-            page._close_live_find()
-            controller.pause("你已暂停采集；暂停期间不采集新音频，已录内容继续识别。")
-            capture(f"paused-{theme}.png")
-            class CompactScreen:
-                def availableGeometry(self):
-                    return QRect(0, 0, 910, 472)
+            page = win._meeting
 
-            with patch.object(MainWindow, "screen", return_value=CompactScreen()):
+            def capture(name):
+                settle(app)
+                win.grab().save(str(args.output / name))
+
+            def capture_details(dialog):
+                dialog.show()
+                settle(app)
+                dialog.grab().save(str(args.output / f"modification-details-{theme}.png"))
+                dialog.resize(360, 540)
+                settle(app)
+                dialog.grab().save(str(args.output / f"narrow-modification-details-{theme}.png"))
+                dialog.close()
+                return QDialog.DialogCode.Rejected
+
+            for theme in ("dark", "light"):
+                apply_theme(app, mode=theme, surfaces=[win, win._settings, win._history, page])
+                page.show_start_card()
+                capture(f"start-{theme}.png")
+                options = MeetingOptions(title="会议录制（示例）", input_source="mixed")
+                caps = resolve_capabilities(config, options, dictation_model_id="funasr-nano")
+                live = controller.begin(options, replace(caps, speaker_model_available=False))
+                history.enqueue(SegmentRecord(live.id, 0, live.started_at,
+                    raw_text="这里是本场会议的实时文字稿，可核对、复制，或暂停采集。", trigger_mode="meeting", speaker_id=1))
+                history.enqueue(SegmentRecord(live.id, 4, live.started_at + 4000,
+                    raw_text="这句话的发言人可以在录制中更正，不需要暂停会议。", trigger_mode="meeting", speaker_id=2))
+                history.enqueue(SegmentRecord(live.id, 9, live.started_at + 9000,
+                    raw_text="好的，稍后再确认。", trigger_mode="meeting", speaker_id=0,
+                    captured_at=live.started_at + 9000))
+                history.flush()
+                page._render_live()
+                capture(f"live-{theme}.png")
+                controller.rename_speaker(live.id, 1, "小林")
+                page._render_live()
+                capture(f"live-named-{theme}.png")
+                page._live_correct_speaker_btn.setChecked(True)
+                capture(f"live-speaker-correction-{theme}.png")
+                controller.correct_segment_speaker(live.id, 4, 1)
+                page._render_live()
+                capture(f"live-speaker-corrected-{theme}.png")
+                win.resize(880, 580)
+                capture(f"narrow-live-speaker-corrected-{theme}.png")
+                win.resize(1040, 720)
+                live_segment = controller.store.get_segments(live.id)[1]
+                dialog = _SegmentSpeakerDialog(live_segment, [(1, "小林 · 说话人1"), (2, "说话人2")], win, live=True)
+                dialog.show()
+                settle(app)
+                dialog.grab().save(str(args.output / f"live-speaker-dialog-{theme}.png"))
+                dialog.close()
+                page._live_correct_speaker_btn.setChecked(False)
+                capture(f"live-quiet-{theme}.png")
+                page.focus_search()
+                page._live_find_edit.setText("核对")
+                capture(f"live-find-{theme}.png")
+                page._close_live_find()
+                controller.pause("你已暂停采集；暂停期间不采集新音频，已录内容继续识别。")
+                capture(f"paused-{theme}.png")
+                class CompactScreen:
+                    def availableGeometry(self):
+                        return QRect(0, 0, 910, 472)
+
+                with patch.object(MainWindow, "screen", return_value=CompactScreen()):
+                    win._fit_to_available_screen()
+                    capture(f"small-paused-{theme}.png")
+                    assert win.height() <= 472
+                controller.finalize()
                 win._fit_to_available_screen()
-                capture(f"small-paused-{theme}.png")
-                assert win.height() <= 472
-            controller.finalize()
-            win._fit_to_available_screen()
-            win.resize(1040, 720)
-            page._search_edit.setText("没有匹配的示例会议")
-            page._perform_search()
-            capture(f"no-results-{theme}.png")
-            page._search_edit.clear()
-            page._perform_search()
-            controller.store.save_notes(current.id, template_id="general", model="m", json_payload="", markdown=NOTES)
-            controller.store.flush()
-            page.show_meeting(current.id)
-            page._switch_tab(0)
-            apply_theme(app, mode=theme, surfaces=[win, win._settings, win._history, page])
-            page._status_label.hide()
-            capture(f"notes-{theme}.png")
-            page._switch_tab(1)
-            capture(f"transcript-{theme}.png")
-            page._correct_speaker_btn.setChecked(True)
-            capture(f"correction-{theme}.png")
-            segment = controller.store.get_segments(current.id)[0]
-            dialog = _SegmentSpeakerDialog(segment, [(1, "小林 · 说话人1"), (2, "小周 · 说话人2")], win)
-            dialog.show()
-            settle(app)
-            dialog.grab().save(str(args.output / f"correction-dialog-{theme}.png"))
-            dialog.close()
-            page._correct_speaker_btn.setChecked(False)
-            page._switch_tab(0)
-            page._toggle_edit()
-            capture(f"draft-{theme}.png")
-            page._toggle_edit()
-            page._status_label.hide()
-            page._template_combo.setCurrentIndex(page._template_combo.findData("standup"))
-            capture(f"template-{theme}.png")
-            page._pending_templates.clear()
-            page._render_detail()
-            page._jump_to_transcript(27_000)
-            capture(f"citation-{theme}.png")
-            page._return_to_notes()
-            win.resize(880, 580)
-            capture(f"narrow-notes-{theme}.png")
-            page._switch_tab(1)
-            capture(f"narrow-transcript-{theme}.png")
-            win.resize(1040, 720)
-            controller.store.save_notes(
-                current.id, template_id="refine", model="m", json_payload="",
-                markdown=(
-                    "今天先讨论会后的核对流程，减少反复切换。复制按钮应该区分纪要和文字稿，导出时让用户选择范围。"
-                    "这一点，我也同意。点击引用以后，也要能返回刚才阅读的位置。\n\n"
-                    "这里显示的名字是我们手动设置的，不代表系统验证了身份。\n\n"
-                    "如果只是一句话分错人，就只更正这一句。下次评审时间再确认。"
-                ),
-            )
-            controller.store.flush()
-            page._pending_templates.clear()
-            page.show_meeting(current.id)
-            page._switch_tab(0)
-            capture(f"refinement-{theme}.png")
-            win.resize(880, 580)
-            capture(f"narrow-refinement-{theme}.png")
-            win.resize(1040, 720)
-            controller.save_segment_text(current.id, 13, "复制按钮应区分纪要和文字稿；导出时可选择范围，周三开始验证。")
-            controller.correct_segment_speaker(current.id, 13, 1)
-            page._switch_tab(1)
-            page._render_detail()
-            capture(f"edited-transcript-{theme}.png")
-            win.resize(880, 580)
-            capture(f"narrow-edited-transcript-{theme}.png")
-            win.resize(1040, 720)
-            with patch.object(_SegmentTextDialog, "exec", capture_details):
-                page._on_transcript_link(QUrl("edited-segment:13"))
-            settle(app)
-            paragraph = page._transcript_view.document().find("复制按钮应区分")
-            QTest.mouseMove(page._transcript_view.viewport(), page._transcript_view.cursorRect(paragraph).center())
-            capture(f"hover-transcript-{theme}.png")
-            QTest.mouseMove(page._detail_title, QPoint(4, 4))
-            segment = controller.store.get_segments(current.id)[1]
-            dialog = _SegmentTextDialog(
-                segment, position="00:13", speaker="小林", save_text=lambda _text: True, parent=win,
-            )
-            dialog.show()
-            dialog.original_btn.setChecked(True)
-            settle(app)
-            dialog.grab().save(str(args.output / f"text-edit-dialog-{theme}.png"))
-            dialog.resize(360, 440)
-            settle(app)
-            dialog.grab().save(str(args.output / f"narrow-text-edit-dialog-{theme}.png"))
-            dialog.close()
-            controller.save_segment_text(current.id, 13, None)
-        win.hide()
-        controller.shutdown()
-        history.close(timeout=2)
-        config.save_immediate()
-    print(args.output.resolve())
+                win.resize(1040, 720)
+                page._search_edit.setText("没有匹配的示例会议")
+                page._perform_search()
+                capture(f"no-results-{theme}.png")
+                page._search_edit.clear()
+                page._perform_search()
+                controller.store.save_notes(current.id, template_id="general", model="m", json_payload="", markdown=NOTES)
+                controller.store.flush()
+                page.show_meeting(current.id)
+                page._switch_tab(0)
+                apply_theme(app, mode=theme, surfaces=[win, win._settings, win._history, page])
+                page._status_label.hide()
+                capture(f"notes-{theme}.png")
+                page._switch_tab(1)
+                capture(f"transcript-{theme}.png")
+                page._correct_speaker_btn.setChecked(True)
+                capture(f"correction-{theme}.png")
+                segment = controller.store.get_segments(current.id)[0]
+                dialog = _SegmentSpeakerDialog(segment, [(1, "小林 · 说话人1"), (2, "小周 · 说话人2")], win)
+                dialog.show()
+                settle(app)
+                dialog.grab().save(str(args.output / f"correction-dialog-{theme}.png"))
+                dialog.close()
+                page._correct_speaker_btn.setChecked(False)
+                page._switch_tab(0)
+                page._toggle_edit()
+                capture(f"draft-{theme}.png")
+                page._toggle_edit()
+                page._status_label.hide()
+                page._template_combo.setCurrentIndex(page._template_combo.findData("standup"))
+                capture(f"template-{theme}.png")
+                page._render_detail()
+                page._jump_to_transcript(27_000)
+                capture(f"citation-{theme}.png")
+                page._return_to_notes()
+                win.resize(880, 580)
+                capture(f"narrow-notes-{theme}.png")
+                page._switch_tab(1)
+                capture(f"narrow-transcript-{theme}.png")
+                win.resize(1040, 720)
+                controller.store.save_notes(
+                    current.id, template_id="refine", model="m", json_payload="",
+                    markdown=(
+                        "今天先讨论会后的核对流程，减少反复切换。复制按钮应该区分纪要和文字稿，导出时让用户选择范围。"
+                        "这一点，我也同意。点击引用以后，也要能返回刚才阅读的位置。\n\n"
+                        "这里显示的名字是我们手动设置的，不代表系统验证了身份。\n\n"
+                        "如果只是一句话分错人，就只更正这一句。下次评审时间再确认。"
+                    ),
+                )
+                controller.store.flush()
+                page.show_meeting(current.id)
+                page._switch_tab(0)
+                capture(f"refinement-{theme}.png")
+                win.resize(880, 580)
+                capture(f"narrow-refinement-{theme}.png")
+                win.resize(1040, 720)
+                controller.save_segment_text(current.id, 13, "复制按钮应区分纪要和文字稿；导出时可选择范围，周三开始验证。")
+                controller.correct_segment_speaker(current.id, 13, 1)
+                page._switch_tab(1)
+                page._render_detail()
+                capture(f"edited-transcript-{theme}.png")
+                win.resize(880, 580)
+                capture(f"narrow-edited-transcript-{theme}.png")
+                win.resize(1040, 720)
+                with patch.object(_SegmentTextDialog, "exec", capture_details):
+                    page._on_transcript_link(QUrl("edited-segment:13"))
+                settle(app)
+                paragraph = page._transcript_view.document().find("复制按钮应区分")
+                QTest.mouseMove(page._transcript_view.viewport(), page._transcript_view.cursorRect(paragraph).center())
+                capture(f"hover-transcript-{theme}.png")
+                QTest.mouseMove(page._detail_title, QPoint(4, 4))
+                segment = controller.store.get_segments(current.id)[1]
+                dialog = _SegmentTextDialog(
+                    segment, position="00:13", speaker="小林", save_text=lambda _text: True, parent=win,
+                )
+                dialog.show()
+                dialog.original_btn.setChecked(True)
+                settle(app)
+                dialog.grab().save(str(args.output / f"text-edit-dialog-{theme}.png"))
+                dialog.resize(360, 440)
+                settle(app)
+                dialog.grab().save(str(args.output / f"narrow-text-edit-dialog-{theme}.png"))
+                dialog.close()
+                controller.save_segment_text(current.id, 13, None)
+            win.hide()
+            config.save_immediate()
+            print(args.output.resolve())
+        finally:
+            controller.shutdown()
+            history.close(timeout=2)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QDesktopServices,
     QKeySequence,
+    QShortcut,
     QTextCursor,
 )
 from PyQt6.QtWidgets import (
@@ -73,13 +74,18 @@ from sayink.meeting_session import (
 )
 from sayink.meeting_store import STATUS_ENDED, STATUS_INTERRUPTED, STATUS_LIVE, MeetingRecord, QueuedGeneration, now_ms
 from sayink.minutes_prompts import describe_template, format_timestamp, get_template, list_templates, transcript_lines
+from sayink.media_import import MEDIA_SOURCE, file_dialog_filter
+from sayink.transcript_import import IMPORT_SOURCE
 from sayink.ui.history_export import export_save_path
 from sayink.recognition_settings import ADVANCED_RECOGNITION_PATH, audio_source
 from sayink.speech_recognizer import DEFAULT_MODEL_ID, MODEL_REGISTRY, is_model_downloaded
 from sayink.ui import design_tokens as tok
 from sayink.ui.clipboard import copy_text
-from sayink.ui.flow_layout import PairedToolBar
-from sayink.ui.history_window import _ElidedLabel, _SessionList, session_list_item_css
+from sayink.ui.flow_layout import PairedToolBar, WrappingToolBar
+from sayink.ui.history_window import (
+    _ElidedLabel, _SessionCheckBox, _SessionList, release_list_item_widgets, session_list_item_css,
+)
+from sayink.ui.meeting_batch import confirm_batch_delete, fit_action_button
 from sayink.ui.meeting_drafts import MeetingDraftBuffer
 from sayink.ui.meeting_views import (
     _STATUS_TEXT,
@@ -113,6 +119,33 @@ PAGE_LIVE = 2
 
 _SOURCE_LABELS = tuple((key, input_source_label(key)) for key in ("mixed", "microphone", "system"))
 _LANGUAGE_LABELS = (("auto", "自动（中文优先）"), ("zh", "中文"), ("en", "English"), ("ja", "日本語"))
+_EMPTY_MEETINGS = "还没有会议记录。\n点击右上角「导入文字稿」「导入音视频」或「开始会议」，也可以从托盘菜单开始。"
+
+
+class _MeetingStreamRow(QWidget):
+    """Row chrome matches 历史: the wash is painted here, clicks fall through."""
+
+    def mousePressEvent(self, event):
+        event.ignore()
+
+
+def _paint_meeting_row(row: QWidget, *, selected: bool) -> None:
+    from sayink.ui import design_tokens as tok
+
+    bg = tok.ACCENT_SOFT if selected else "transparent"
+    bar = tok.ACCENT if selected else "transparent"
+    css = (
+        "QWidget#meetingStreamRow {"
+        f" background: {bg};"
+        " border: none;"
+        f" border-left: {tok.NAV_SELECTED_BAR_PX}px solid {bar};"
+        " border-radius: 0;"
+        "}"
+        f"QLabel#meetingRowTitle {{ color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; background: transparent; }}"
+        f"QLabel#meetingRowMeta {{ color: {tok.TEXT_SEC}; font-size: {tok.TYPE_CAPTION}px; background: transparent; }}"
+    )
+    if row.styleSheet() != css:
+        row.setStyleSheet(css)
 
 
 class MeetingPage(QWidget):
@@ -139,6 +172,9 @@ class MeetingPage(QWidget):
         self._detail_id = ""
         self._search_query = ""
         self._transcript_offsets: list[int] = []
+        self._transcript_time_known: list[bool] = []
+        self._transcript_has_speakers = True
+        self._transcript_has_times = True
         self._transcript_highlight = -1
         self._transcript_sequences: list[int] = []
         self._corrected_sequences: set[int] = set()
@@ -156,6 +192,7 @@ class MeetingPage(QWidget):
         self._pending_refresh_id = ""
         self._listed_generating = ""
         self._list_limit = 100
+        self._batch_mode = False
         self._setup_ui()
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
@@ -181,6 +218,9 @@ class MeetingPage(QWidget):
         self._ctrl.generation_failed.connect(self._on_generation_failed)
         self._ctrl.generation_cancelled.connect(self._on_generation_cancelled)
         self._ctrl.generation_queued.connect(self._on_generation_queued)
+        self._ctrl.media_import_progress.connect(self._on_media_progress)
+        self._ctrl.media_import_finished.connect(self._on_media_finished)
+        self._ctrl.media_import_failed.connect(self._on_media_failed)
         self.reapply_theme()
         self.refresh()
         if self._ctrl.is_active:
@@ -229,6 +269,33 @@ class MeetingPage(QWidget):
 
         self._title_label = page_title_label("会议")
         top.addWidget(self._title_label, 1, Qt.AlignmentFlag.AlignVCenter)
+        self._import_btn = QPushButton("导入文字稿")
+        self._import_btn.setAccessibleName("导入文字稿")
+        self._import_btn.setToolTip("粘贴或打开已有文字稿，导入为一场会议")
+        self._import_btn.clicked.connect(self._import_transcript)
+        from sayink.ui import settings_styles as ss
+        self._import_btn.setStyleSheet(ss.BTN_GHOST_SM)
+        top.addWidget(self._import_btn, 0)
+        self._media_btn = QPushButton("导入音视频")
+        self._media_btn.setAccessibleName("导入音视频")
+        self._media_btn.setToolTip("打开本机音视频，识别成一场会议。不复制原文件。")
+        self._media_btn.clicked.connect(self._import_media)
+        self._media_btn.setStyleSheet(ss.BTN_GHOST_SM)
+        top.addWidget(self._media_btn, 0)
+        self._media_cancel_btn = QPushButton("取消导入")
+        self._media_cancel_btn.setAccessibleName("取消导入音视频")
+        self._media_cancel_btn.setToolTip("停在当前这段之后，已经识别的文字会留下")
+        self._media_cancel_btn.clicked.connect(self._cancel_media_import)
+        self._media_cancel_btn.setStyleSheet(ss.BTN_GHOST_SM)
+        self._media_cancel_btn.hide()
+        top.addWidget(self._media_cancel_btn, 0)
+        self._media_retry_btn = QPushButton("重试保存")
+        self._media_retry_btn.setAccessibleName("重试保存导入结果")
+        self._media_retry_btn.setToolTip("上次识别的文字还在，再写入一次数据库")
+        self._media_retry_btn.clicked.connect(self._retry_media_save)
+        self._media_retry_btn.setStyleSheet(ss.BTN_GHOST_SM)
+        self._media_retry_btn.hide()
+        top.addWidget(self._media_retry_btn, 0)
         self._start_btn = QPushButton("开始会议")
         self._start_btn.setAccessibleName("开始会议")
         self._start_btn.setToolTip("开始一场新的会议记录")
@@ -243,6 +310,7 @@ class MeetingPage(QWidget):
         outer.addWidget(self._stack, 1)
         for button in self.findChildren(QPushButton):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sync_media_buttons()
 
     def _build_browse(self) -> QWidget:
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -265,25 +333,37 @@ class MeetingPage(QWidget):
         self._search_timer.timeout.connect(self._perform_search)
         left_lay.addWidget(self._search_edit)
         left_lay.addSpacing(4)
+        self._summary_row = WrappingToolBar(spacing=8)
         self._list_summary = QLabel()
         self._list_summary.setContentsMargins(4, 0, 0, 0)
-        left_lay.addWidget(self._list_summary)
+        self._summary_row.add(self._list_summary, role="flex")
+        self._selection_mode_btn = QPushButton("选择")
+        self._selection_mode_btn.setCheckable(True)
+        self._selection_mode_btn.setAccessibleName("选择会议")
+        self._selection_mode_btn.setToolTip("勾选多场会议，一起导出、生成或删除；也可使用 Ctrl / Shift 多选，Delete 删除")
+        self._selection_mode_btn.toggled.connect(self._set_batch_mode)
+        self._summary_row.add(self._selection_mode_btn, role="right")
+        left_lay.addWidget(self._summary_row)
         self._list = _SessionList()
         self._list.setObjectName("meetingList")
         self._list.setAccessibleName("会议列表")
+        self._list.setToolTip("Ctrl 点选，Shift 连选。点「选择」后，单击一行即可勾选或取消。Delete 删除所选")
         self._list.setFrameShape(QFrame.Shape.NoFrame)
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self._list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self._list.setWordWrap(True)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
+        self._delete_shortcut = QShortcut(QKeySequence.StandardKey.Delete, self._list)
+        self._delete_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._delete_shortcut.activated.connect(self._delete_selected_meetings)
         left_lay.addWidget(self._list, 1)
         self._load_more_btn = QPushButton("加载更早的会议")
         self._load_more_btn.setAccessibleName("加载更早的会议")
         self._load_more_btn.clicked.connect(self._load_more)
         self._load_more_btn.hide()
         left_lay.addWidget(self._load_more_btn, 0, Qt.AlignmentFlag.AlignHCenter)
-        self._empty_label = QLabel("还没有会议记录。\n点击右上角「开始会议」，或从托盘菜单开始。")
+        self._empty_label = QLabel(_EMPTY_MEETINGS)
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_label.setWordWrap(True)
         left_lay.addWidget(self._empty_label, 1)
@@ -333,6 +413,46 @@ class MeetingPage(QWidget):
         self._more_btn.setMenu(self._more_menu)
         title_row.addWidget(self._more_btn)
         right_lay.addLayout(title_row)
+
+        self._batch_tools = WrappingToolBar(spacing=8)
+        self._batch_all_btn = QPushButton("全选已加载")
+        self._batch_all_btn.setAccessibleName("全选已加载的会议")
+        self._batch_all_btn.setToolTip("只选择当前列表里已经加载的会议。更早的要先点「加载更早的会议」")
+        self._batch_all_btn.clicked.connect(self._select_loaded_meetings)
+        self._batch_export_btn = QPushButton("导出")
+        self._batch_export_btn.setAccessibleName("导出选中的会议")
+        self._batch_export_btn.setToolTip("把所选会议写入一个 Markdown 文件")
+        self._batch_export_btn.clicked.connect(self._export_selected_meetings)
+        self._batch_generate_btn = QPushButton("生成纪要")
+        self._batch_generate_btn.setAccessibleName("为选中的会议生成纪要")
+        self._batch_generate_btn.setToolTip("只排队还没有纪要的会议。已有纪要的会跳过")
+        self._batch_generate_btn.clicked.connect(self._generate_selected_meetings)
+        self._batch_delete_btn = QPushButton("删除")
+        self._batch_delete_btn.setAccessibleName("删除选中的会议")
+        self._batch_delete_btn.setToolTip("删除勾选的已结束会议，无法撤销")
+        self._batch_delete_btn.clicked.connect(self._delete_selected_meetings)
+        for button in (self._batch_all_btn, self._batch_export_btn, self._batch_generate_btn, self._batch_delete_btn):
+            self._batch_tools.add(button)
+        self._batch_tools.hide()
+        right_lay.addWidget(self._batch_tools)
+        self._batch_notice = QLabel("选择要一起处理的会议。")
+        self._batch_notice.setWordWrap(True)
+        self._batch_notice.setAccessibleName("已选会议说明")
+        self._batch_notice.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._batch_notice_scroll = QScrollArea()
+        self._batch_notice_scroll.setWidgetResizable(True)
+        self._batch_notice_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._batch_notice_scroll.setWidget(self._batch_notice)
+        # Grow only to the notice's own height; the trailing stretch keeps the
+        # notice and any status line directly under the batch tools.
+        self._batch_notice_scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self._batch_notice_scroll.hide()
+        right_lay.addWidget(self._batch_notice_scroll)
+        self._import_progress = QLabel("")
+        self._import_progress.setWordWrap(True)
+        self._import_progress.setAccessibleName("导入进度")
+        self._import_progress.hide()
+        right_lay.addWidget(self._import_progress)
 
         self._detail_meta = QLabel("")
         self._detail_meta.setObjectName("meetingDetailMeta")
@@ -541,6 +661,9 @@ class MeetingPage(QWidget):
         self._transcript_view.anchorClicked.connect(self._on_transcript_link)
         self._content_stack.addWidget(self._transcript_view)
         right_lay.addWidget(self._content_stack, 1)
+        # Takes the spare height only when the content stack is hidden
+        # (batch selection, media import), so those views stay top-aligned.
+        right_lay.addStretch(0)
 
         self._detail_pane = right
         right.setMinimumWidth(tok.WORKSPACE_DETAIL_MIN_WIDTH)
@@ -822,6 +945,7 @@ class MeetingPage(QWidget):
             f" border: 1px solid {tok.HAIRLINE}; border-radius: {tok.RADIUS_MD}px; padding: 6px 10px;"
         )
         self._status_label.setStyleSheet(status_css)
+        self._import_progress.setStyleSheet(status_css)
         self._live_status.setStyleSheet(status_css)
         edit_css = f"""
             QLineEdit {{
@@ -894,8 +1018,16 @@ class MeetingPage(QWidget):
         for btn in (self._generate_btn, self._edit_btn, self._copy_btn, self._transcript_copy_btn, self._export_btn, self._card_cancel,
                     self._cancel_btn, self._correct_speaker_btn, self._return_notes_btn, self._clear_search_btn,
                     self._mark_btn, self._live_find_close_btn, self._manage_templates_btn, self._live_correct_speaker_btn,
-                    self._card_dl_btn, self._live_dl_btn, self._load_more_btn, self._materials_toggle):
+                    self._card_dl_btn, self._live_dl_btn, self._load_more_btn, self._materials_toggle,
+                    self._selection_mode_btn, self._batch_all_btn, self._batch_export_btn, self._batch_generate_btn,
+                    self._import_btn, self._media_btn, self._media_cancel_btn, self._media_retry_btn):
             btn.setStyleSheet(ss.BTN_GHOST_SM)
+        self._batch_delete_btn.setStyleSheet(ss.BTN_DANGER_SM)
+        for btn in (
+            self._selection_mode_btn, self._batch_all_btn, self._batch_export_btn,
+            self._batch_generate_btn, self._batch_delete_btn,
+        ):
+            fit_action_button(btn)
         # Match 导出's real box (style min-height plus its border) so the tab
         # capsule and the button share one line. Both labels use the same weight.
         tab_h = max(self._export_btn.sizeHint().height(), tok.CONTROL_BTN_SM_HEIGHT)
@@ -926,6 +1058,9 @@ class MeetingPage(QWidget):
             )
         if self._detail_id:
             self._render_detail()
+        if hasattr(self, "_list"):
+            self._sync_batch_checks()
+        self._sync_media_buttons()
 
     # ── list / browse ─────────────────────────────────────────────
 
@@ -1022,6 +1157,7 @@ class MeetingPage(QWidget):
             self._list_summary.setText("历史数据库不可用，会议记录无法保存")
             return
         keep = self._detail_id
+        batch_selected = set(self._selected_meeting_ids()) if self._batch_mode else set()
         has_more_search = False
         if self._search_query:
             matched = self._store.search_meetings(self._search_query, limit=self._list_limit + 1)
@@ -1040,18 +1176,20 @@ class MeetingPage(QWidget):
         records = self._drafts.apply_optimistic_titles(records)
         self._records = {r.id: r for r in records}
         minutes = self._minutes_markers()
-        rows_key = (tuple(records), tuple(_meeting_row_text(record, minutes.get(record.id, "")) for record in records),
-                    tok.FONT, tok.TEXT, tok.TEXT_SEC, tok.TEXT_DIM)
+        rows_key = (
+            tuple((record.id, record.title, record.status, record.source, record.started_at, record.ended_at) for record in records),
+            tok.FONT, tok.TEXT, tok.TEXT_SEC, tok.TEXT_DIM,
+        )
         self._list.blockSignals(True)
         try:
             if getattr(self, "_meeting_rows_key", None) != rows_key:
-                self._list.clear()
+                self._release_row_widgets()
                 for record in records:
                     item = QListWidgetItem()
                     item.setData(Qt.ItemDataRole.UserRole, record.id)
                     item.setData(Qt.ItemDataRole.AccessibleTextRole, _meeting_row_text(record, minutes.get(record.id, "")))
-                    item.setToolTip(record.display_title)
                     row = self._build_list_row(record, minutes.get(record.id, ""))
+                    row.setToolTip(record.display_title)
                     self._list.addItem(item)
                     self._list.setItemWidget(item, row)
                     row.ensurePolished()
@@ -1059,7 +1197,12 @@ class MeetingPage(QWidget):
                         label.ensurePolished()
                     item.setSizeHint(row.sizeHint())
                 self._meeting_rows_key = rows_key
-            if keep in self._records:
+            self._sync_row_minutes(records, minutes)
+            if self._batch_mode:
+                for index in range(self._list.count()):
+                    item = self._list.item(index)
+                    item.setSelected(str(item.data(Qt.ItemDataRole.UserRole) or "") in batch_selected)
+            elif keep in self._records:
                 for index in range(self._list.count()):
                     item = self._list.item(index)
                     if item.data(Qt.ItemDataRole.UserRole) == keep:
@@ -1081,23 +1224,68 @@ class MeetingPage(QWidget):
             else:
                 self._list_summary.setText(f"共 {total} 场会议")
             self._load_more_btn.setVisible(count < total and count > 0)
+        if self._batch_mode:
+            self._sync_batch_summary()
         self._empty_label.setText(
             "未找到匹配的会议。\n试试其他关键词，或清除搜索查看全部会议。" if self._search_query else
-            "还没有会议记录。\n点击右上角「开始会议」，或从托盘菜单开始。"
+            _EMPTY_MEETINGS
         )
         self._empty_label.setVisible(count == 0)
         self._list.setVisible(count > 0)
         self._clear_search_btn.setVisible(count == 0 and bool(self._search_query))
-        if keep and keep in self._records:
+        self._sync_batch_checks()
+        if self._batch_mode:
+            if not records:
+                if not self._save_notes_draft() or not self._save_record_notes():
+                    return
+                self._detail_id = ""
+                self._clear_detail()
+            elif keep and keep in self._records:
+                self._render_detail()
+            elif records:
+                self._detail_id = records[0].id
+                self._render_detail()
+        elif keep and keep in self._records:
             self._render_detail()
         elif records:
             self._list.setCurrentRow(0)
-        elif not records:
+        elif not records and not getattr(self._ctrl, "importing_media", False):
             if not self._save_notes_draft() or not self._save_record_notes():
                 return
             self._detail_id = ""
             self._clear_detail()
-        self._detail_pane.setVisible(bool(records) or self._editing_notes)
+        importing = bool(getattr(self._ctrl, "importing_media", False))
+        if importing:
+            self._show_import_detail()
+        self._detail_pane.setVisible(
+            bool(records) or self._editing_notes or importing or self._status_label.isVisible()
+        )
+
+    def _release_row_widgets(self) -> None:
+        """Drop row widgets before ``clear()``.
+
+        A visible row widget that loses its parent becomes a top-level window
+        for one frame and shows up as a flickering application icon.
+        """
+        release_list_item_widgets(self._list, self)
+
+    def _sync_row_minutes(self, records: list[MeetingRecord], minutes: dict[str, str]) -> None:
+        """Queue and generating labels change often. Update them without rebuilding rows."""
+        by_id = {record.id: record for record in records}
+        for index in range(self._list.count()):
+            item = self._list.item(index)
+            record = by_id.get(str(item.data(Qt.ItemDataRole.UserRole) or ""))
+            widget = self._list.itemWidget(item)
+            if record is None or widget is None:
+                continue
+            marker = minutes.get(record.id, "")
+            text = _meeting_row_meta(record, marker)
+            meta = widget.findChild(_ElidedLabel, "meetingRowMeta")
+            if meta is not None and meta._full_text != " ".join(text.split()):
+                meta.set_full_text(text)
+            accessible = _meeting_row_text(record, marker)
+            if item.data(Qt.ItemDataRole.AccessibleTextRole) != accessible:
+                item.setData(Qt.ItemDataRole.AccessibleTextRole, accessible)
 
     def _minutes_markers(self) -> dict[str, str]:
         """Meeting id → minutes job state shown in its list row."""
@@ -1109,10 +1297,21 @@ class MeetingPage(QWidget):
         return markers
 
     def _build_list_row(self, record: MeetingRecord, minutes: str = "") -> QWidget:
-        row = QWidget()
-        row.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        lay = QVBoxLayout(row)
-        lay.setContentsMargins(13, 8, 10, 8)
+        row = _MeetingStreamRow()
+        row.setObjectName("meetingStreamRow")
+        row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        outer = QHBoxLayout(row)
+        outer.setContentsMargins(10, 8, 10, 8)
+        outer.setSpacing(8)
+        box = _SessionCheckBox()
+        box.setFixedSize(24, 32)
+        box.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        box.setObjectName("meetingBatchCheck")
+        box.setAccessibleName(f"选择会议：{record.display_title}")
+        box.setVisible(self._batch_mode)
+        box.clicked.connect(lambda checked, meeting_id=record.id: self._toggle_meeting_selection(meeting_id, checked))
+        outer.addWidget(box, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay = QVBoxLayout()
         lay.setSpacing(2)
         title = _ElidedLabel(record.display_title)
         title.setObjectName("meetingRowTitle")
@@ -1120,7 +1319,18 @@ class MeetingPage(QWidget):
         meta = _ElidedLabel(_meeting_row_meta(record, minutes))
         meta.setObjectName("meetingRowMeta")
         lay.addWidget(meta)
+        outer.addLayout(lay, 1)
+        _paint_meeting_row(row, selected=False)
         return row
+
+    def _toggle_meeting_selection(self, meeting_id: str, checked: bool) -> None:
+        if not self._batch_mode:
+            self._set_batch_mode(True)
+        for index in range(self._list.count()):
+            item = self._list.item(index)
+            if str(item.data(Qt.ItemDataRole.UserRole) or "") == meeting_id:
+                item.setSelected(bool(checked))
+                break
 
     def _perform_search(self) -> None:
         if not self._save_notes_draft() or not self._save_record_notes():
@@ -1165,6 +1375,18 @@ class MeetingPage(QWidget):
         return self._list.count()
 
     def _on_selection_changed(self) -> None:
+        if getattr(self._ctrl, "importing_media", False):
+            return
+        ids = self._selected_meeting_ids()
+        if len(ids) > 1 and not self._batch_mode:
+            self._set_batch_mode(True)
+            return
+        self._sync_batch_checks()
+        if self._batch_mode:
+            self._sync_batch_checks()
+            self._sync_batch_summary()
+            self._sync_batch_actions()
+            return
         items = self._list.selectedItems()
         if not items:
             return
@@ -1196,6 +1418,201 @@ class MeetingPage(QWidget):
             self._notes_view.restore_reading_position(0)
             self._transcript_view.restore_reading_position(0)
             self._render_detail()
+
+    def _selected_meeting_ids(self) -> list[str]:
+        selected = {str(item.data(Qt.ItemDataRole.UserRole) or "") for item in self._list.selectedItems()}
+        ordered = []
+        for index in range(self._list.count()):
+            meeting_id = str(self._list.item(index).data(Qt.ItemDataRole.UserRole) or "")
+            if meeting_id and meeting_id in selected:
+                ordered.append(meeting_id)
+        return ordered
+
+    def _set_batch_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled and not self._batch_mode:
+            if not self._save_notes_draft() or not self._save_record_notes():
+                self._selection_mode_btn.blockSignals(True)
+                self._selection_mode_btn.setChecked(False)
+                self._selection_mode_btn.blockSignals(False)
+                return
+        if enabled == self._batch_mode and self._list.batch_mode == enabled:
+            self._sync_batch_actions()
+            return
+        self._batch_mode = enabled
+        self._list.batch_mode = enabled
+        # A status line belongs to the view that produced it: single-meeting
+        # notices make no sense over the batch tools, and vice versa.
+        self._set_status("")
+        self._selection_mode_btn.blockSignals(True)
+        self._selection_mode_btn.setChecked(enabled)
+        self._selection_mode_btn.blockSignals(False)
+        self._selection_mode_btn.setText("完成" if enabled else "选择")
+        self._selection_mode_btn.setAccessibleName("完成选择" if enabled else "选择会议")
+        fit_action_button(self._selection_mode_btn)
+        if not enabled:
+            self._list.blockSignals(True)
+            try:
+                self._list.clearSelection()
+                for index in range(self._list.count()):
+                    item = self._list.item(index)
+                    if item.data(Qt.ItemDataRole.UserRole) == self._detail_id:
+                        item.setSelected(True)
+                        self._list.setCurrentItem(item)
+                        break
+            finally:
+                self._list.blockSignals(False)
+        self.refresh()
+
+    def _sync_batch_checks(self) -> None:
+        selected = set(self._selected_meeting_ids())
+        for index in range(self._list.count()):
+            item = self._list.item(index)
+            widget = self._list.itemWidget(item)
+            box = widget.findChild(_SessionCheckBox, "meetingBatchCheck") if widget is not None else None
+            if box is not None:
+                meeting_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+                box.blockSignals(True)
+                box.setVisible(self._batch_mode)
+                box.setChecked(meeting_id in selected)
+                box.blockSignals(False)
+                box.update()
+            if widget is not None and widget.objectName() == "meetingStreamRow":
+                _paint_meeting_row(widget, selected=item.isSelected())
+
+    def _sync_batch_summary(self) -> None:
+        count = len(self._selected_meeting_ids())
+        if self._batch_mode:
+            self._list_summary.setText(f"已选 {count} 场")
+        self._list_summary.setToolTip("全选和多选都只包含当前已经加载的会议")
+
+    def _sync_batch_actions(self) -> None:
+        count = len(self._selected_meeting_ids())
+        self._batch_export_btn.setText(f"导出 {count} 场" if count else "导出")
+        self._batch_generate_btn.setText(f"生成 {count} 场" if count else "生成纪要")
+        self._batch_delete_btn.setText(f"删除 {count} 场" if count else "删除")
+        for button in (self._batch_export_btn, self._batch_generate_btn, self._batch_delete_btn):
+            button.setEnabled(count > 0)
+            fit_action_button(button)
+        fit_action_button(self._batch_all_btn)
+        fit_action_button(self._selection_mode_btn)
+        self._batch_tools.setVisible(self._batch_mode)
+        self._batch_notice_scroll.setVisible(self._batch_mode)
+        self._export_btn.setVisible(not self._batch_mode)
+        self._copy_btn.setVisible(not self._batch_mode)
+        if not self._batch_mode:
+            return
+        titles = []
+        for meeting_id in self._selected_meeting_ids():
+            record = self._records.get(meeting_id) or self._store.get_meeting(meeting_id)
+            if record is not None:
+                titles.append(record.display_title)
+        listed = "\n".join(titles[:12])
+        if len(titles) > 12:
+            listed += "\n…"
+        self._batch_notice.setText(
+            f"已选 {count} 场已加载的会议。\n"
+            "单击勾选或取消，Shift 连选，Ctrl 加选。\n"
+            "全选只包含当前列表里已经加载的会议。\n"
+            "导出会写成一个 Markdown。生成纪要只排队还没有纪要的会议。删除无法撤销。\n\n"
+            + listed
+        )
+        self._batch_notice_scroll.updateGeometry()
+
+    def _set_single_detail_visible(self, visible: bool) -> None:
+        for widget in (
+            self._detail_title, self._more_btn, self._detail_meta, self._state_row,
+            self._materials, self._tab_bar, self._tab_tools, self._content_stack,
+            self._copy_btn, self._export_btn,
+        ):
+            widget.setVisible(visible)
+        if visible:
+            self._batch_tools.hide()
+            self._batch_notice_scroll.hide()
+        else:
+            self._content_hint.hide()
+
+    def _select_loaded_meetings(self) -> None:
+        if not self._batch_mode:
+            self._set_batch_mode(True)
+        self._list.blockSignals(True)
+        try:
+            for index in range(self._list.count()):
+                self._list.item(index).setSelected(True)
+        finally:
+            self._list.blockSignals(False)
+        self._sync_batch_checks()
+        self._sync_batch_summary()
+        self._sync_batch_actions()
+
+    def _delete_selected_meetings(self) -> None:
+        ids = self._selected_meeting_ids()
+        records = [self._store.get_meeting(meeting_id) for meeting_id in ids]
+        live = [record for record in records if record is not None and record.status == STATUS_LIVE]
+        ended = [record.id for record in records if record is not None and record.status != STATUS_LIVE]
+        if not ended:
+            self._set_status("进行中的会议要先结束后再删除。")
+            return
+        if not confirm_batch_delete(self, len(ended), len(live)):
+            return
+        if not self._save_notes_draft() or not self._save_record_notes():
+            return
+        if self._detail_id in ended:
+            self._editing_notes = False
+            self._notes_edit.clear()
+            self._detail_id = ""
+        if not self._ctrl.delete_meetings(ended):
+            self._set_status("会议删除失败，请重试。")
+        else:
+            skipped = f"，{len(live)} 场进行中的未删除" if live else ""
+            self._set_status(f"已删除 {len(ended)} 场会议{skipped}")
+        self.refresh()
+
+    def _export_selected_meetings(self) -> None:
+        ids = self._selected_meeting_ids()
+        if not ids:
+            return
+        default = export_save_path(f"会议导出-{time.strftime('%Y%m%d')}.md")
+        path, _selected = QFileDialog.getSaveFileName(self, "导出选中的会议", default, "Markdown (*.md)")
+        if not path:
+            return
+        if not path.lower().endswith(".md"):
+            path += ".md"
+        try:
+            Path(path).write_text(self._ctrl.export_meetings_markdown(ids), encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", f"无法写入文件：{exc}")
+            return
+        self._set_status(f"已导出 {len(ids)} 场会议")
+
+    def _generate_selected_meetings(self) -> None:
+        ids = self._selected_meeting_ids()
+        if not ids:
+            return
+        if not minutes_settings_complete(self._config):
+            self.configure_requested.emit()
+            return
+        host = self._ctrl.remote_host_needing_confirmation()
+        if host:
+            box = QMessageBox(self)
+            box.setWindowTitle("发送到远端模型")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText(f"所选会议里还没有纪要的文字稿将发送到 {host}。")
+            box.setInformativeText("不会发送音频。确认后本机记住该地址，这次批量生成只问这一次。")
+            ok = box.addButton("发送并生成", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(ok)
+            box.exec()
+            if box.clickedButton() != ok:
+                return
+            self._ctrl.confirm_remote_host(host)
+        template_id = str(self._config.get("meeting.template_id", "general") or "general")
+        queued, skipped = self._ctrl.enqueue_minutes(ids, template_id=template_id)
+        if queued:
+            tail = f"，跳过 {skipped} 场" if skipped else ""
+            self._set_status(f"已排队生成 {queued} 场纪要{tail}")
+        else:
+            self._set_status("没有要生成的会议。已有纪要、正在进行或没有文字稿的会跳过。")
 
     def _load_more(self) -> None:
         self._list_limit += 100
@@ -1231,7 +1648,127 @@ class MeetingPage(QWidget):
         self._transcript_view.restore_reading_position(0)
         self._stack.setCurrentIndex(PAGE_BROWSE)
         self._start_btn.setVisible(True)
+        if self._batch_mode:
+            # Opening a specific meeting (import, notice) leaves batch selection,
+            # otherwise the batch view keeps covering the meeting just opened.
+            self._set_batch_mode(False)
         self.refresh()
+        self._sync_media_buttons()
+
+    def _ask_import(self) -> tuple[str, str, bool] | None:
+        from sayink.ui.transcript_import_dialog import TranscriptImportDialog
+
+        dialog = TranscriptImportDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.transcript_text(), dialog.meeting_title(), dialog.detect_structure()
+
+    def _import_transcript(self) -> None:
+        if self._ctrl.is_active:
+            self._set_status("会议进行中，请结束后再导入文字稿")
+            return
+        asked = self._ask_import()
+        if not asked:
+            return
+        text, title, detect = asked
+        record = self._ctrl.import_transcript(text, title=title, detect_structure=detect)
+        if record is None:
+            self._set_status(getattr(self._ctrl, "transcript_import_notice", "") or "没有可导入的文字")
+            self._detail_pane.setVisible(True)
+            return
+        self.show_meeting(record.id)
+        self._set_status("已导入文字稿。确认内容后，再点击「生成纪要」。")
+
+    def _sync_media_buttons(self) -> None:
+        busy = bool(getattr(self._ctrl, "importing_media", False))
+        browsing = self._stack.currentIndex() == PAGE_BROWSE
+        self._import_btn.setVisible(browsing)
+        self._media_btn.setVisible(browsing)
+        self._media_btn.setEnabled(not busy)
+        self._import_btn.setEnabled(not busy)
+        self._start_btn.setEnabled(not busy)
+        self._media_cancel_btn.setVisible(busy and browsing)
+        self._media_retry_btn.setVisible(
+            browsing and not busy and bool(getattr(self._ctrl, "_unsaved_media", None))
+        )
+
+    def _import_media(self) -> None:
+        reason = self._ctrl.media_block_reason()
+        if reason:
+            self._set_status(reason)
+            return
+        path, _selected = QFileDialog.getOpenFileName(self, "导入音视频", "", file_dialog_filter())
+        if not path:
+            return
+        message = self._ctrl.start_media_import(path, title=Path(path).stem)
+        if message:
+            self._set_status(message)
+            return
+        self._sync_media_buttons()
+        self._media_import_title = Path(path).stem
+        self._media_progress_text = "正在读取音频…"
+        self._show_import_detail()
+
+    def _show_import_detail(self) -> None:
+        """The open meeting stays put until recognition finishes."""
+        self._set_single_detail_visible(False)
+        self._batch_tools.hide()
+        self._batch_notice_scroll.hide()
+        self._status_label.hide()
+        self._detail_pane.setVisible(True)
+        self._detail_title.setVisible(True)
+        self._detail_title.setReadOnly(True)
+        self._detail_title.blockSignals(True)
+        self._detail_title.setText(getattr(self, "_media_import_title", "") or "正在导入音视频")
+        self._detail_title.blockSignals(False)
+        self._detail_meta.setVisible(True)
+        self._detail_meta.setText("识别完成后会打开这场新会议，当前这场先留在列表里。")
+        self._import_progress.setVisible(True)
+        self._import_progress.setText(getattr(self, "_media_progress_text", "") or "正在读取音频…")
+
+    def _cancel_media_import(self) -> None:
+        self._ctrl.cancel_media_import()
+        self._set_status("正在取消。当前这段识别完后，已识别的部分会保留。")
+
+    def _on_media_progress(self, text: str) -> None:
+        if not text:
+            return
+        self._media_progress_text = text
+        if getattr(self._ctrl, "importing_media", False):
+            self._show_import_detail()
+
+    def _on_media_finished(self, meeting_id: str) -> None:
+        self._sync_media_buttons()
+        if not meeting_id:
+            # Leave the import placeholder: show the open meeting or the batch
+            # tools again before the notice explains what happened.
+            self._render_detail()
+            self._set_status(getattr(self._ctrl, "media_import_notice", "") or "没有识别到文字")
+            self._detail_pane.setVisible(True)
+            self._import_progress.hide()
+            return
+        self.show_meeting(meeting_id)
+        notice = getattr(self._ctrl, "media_import_notice", "") or ""
+        if notice:
+            self._set_status(notice)
+            return
+        record = self._store.get_meeting(meeting_id)
+        if record is not None and record.status == STATUS_INTERRUPTED:
+            self._set_status("已取消导入。已识别的部分保留为已中断的会议。")
+        else:
+            self._set_status("已导入音视频。确认文字稿后，再点击「生成纪要」。")
+
+    def _retry_media_save(self) -> None:
+        message = self._ctrl.retry_media_save()
+        self._sync_media_buttons()
+        if message:
+            self._set_status(message)
+            self._detail_pane.setVisible(True)
+
+    def _on_media_failed(self, message: str) -> None:
+        self._sync_media_buttons()
+        self._render_detail()
+        self._set_status(message or "导入音视频失败")
 
     def _show_ended_meeting(self, meeting_id: str, *, unsaved_live: bool = False) -> None:
         """Leave the live page once recording ends, even when a note save failed."""
@@ -1269,6 +1806,8 @@ class MeetingPage(QWidget):
         self._transcript_view.restore_reading_position(0)
         self._stack.setCurrentIndex(PAGE_BROWSE)
         self._start_btn.setVisible(True)
+        if self._batch_mode:
+            self._set_batch_mode(False)
         self.refresh()
         if unsaved_live or self._has_unsaved_record_notes():
             self._set_status("笔记尚未保存，输入已保留。")
@@ -1306,6 +1845,16 @@ class MeetingPage(QWidget):
         self._start_btn.setStyleSheet(ss.BTN_ACCENT_SM)
 
     def _render_detail(self) -> None:
+        if getattr(self._ctrl, "importing_media", False):
+            self._show_import_detail()
+            return
+        self._import_progress.hide()
+        self._detail_title.setReadOnly(False)
+        if self._batch_mode:
+            self._set_single_detail_visible(False)
+            self._sync_batch_actions()
+            return
+        self._set_single_detail_visible(True)
         record = self._store.get_meeting(self._detail_id) if self._detail_id else None
         if record is None:
             self._clear_detail()
@@ -1324,7 +1873,13 @@ class MeetingPage(QWidget):
         meta = [_format_dt(record.started_at)]
         if record.ended_at:
             meta.append(_duration_label(record.duration_ms))
-        if record.status in _STATUS_TEXT:
+        if record.source == IMPORT_SOURCE:
+            meta.append("导入文字稿")
+        elif record.source == MEDIA_SOURCE:
+            meta.append("导入音视频")
+            if record.status == STATUS_INTERRUPTED:
+                meta.append("已中断")
+        elif record.status in _STATUS_TEXT:
             meta.append(_STATUS_TEXT[record.status])
         self._detail_meta.setText(" · ".join(meta))
         self._show_materials(record)
@@ -1415,7 +1970,9 @@ class MeetingPage(QWidget):
         segments = self._store.get_segments(self._detail_id)
         names = self._ctrl.speaker_names(self._detail_id)
         lines = transcript_lines(segments, record.started_at)
+        self._transcript_has_speakers, self._transcript_has_times = self._ctrl.transcript_shape(record, lines)
         self._transcript_offsets = [line.offset_ms for line in lines]
+        self._transcript_time_known = [line.time_known for line in lines]
         self._transcript_sequences = [s.seq for s in segments if (s.corrected_text or s.polished_text or s.raw_text).strip()]
         self._corrected_sequences = {s.seq for s in segments if s.corrected_text}
         self._speaker_locked_sequences = {s.seq for s in segments if s.speaker_locked}
@@ -1430,7 +1987,11 @@ class MeetingPage(QWidget):
         if self._transcript_highlight >= len(lines):
             self._transcript_highlight = -1
         self._transcript_view.set_reading_html(
-            self._transcript_html(lines, names, links=True, highlight=self._transcript_highlight)
+            self._transcript_html(
+                lines, names, links=True, highlight=self._transcript_highlight,
+                show_speakers=self._transcript_has_speakers, show_times=self._transcript_has_times,
+                label_unknown=record.source != IMPORT_SOURCE,
+            )
         )
         speaker_ids = sorted({int(s.speaker_id) for s in segments if int(s.speaker_id) > 0})
         self._speaker_menu.clear()
@@ -1559,6 +2120,10 @@ class MeetingPage(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
 
     def _sync_content_hint(self) -> None:
+        if self._batch_mode:
+            # The hint describes the open meeting, which batch mode hides.
+            self._content_hint.hide()
+            return
         transcript = self._content_stack.currentIndex() == 1
         self._return_notes_btn.setVisible(transcript and bool(self._citation_return and self._citation_return[0] == self._detail_id))
         if transcript:
@@ -1613,7 +2178,10 @@ class MeetingPage(QWidget):
         self._export_actions["transcript"].setEnabled(has_transcript)
         self._export_actions["all"].setEnabled(bool(self._detail_id))
 
-    def _transcript_html(self, lines, names: dict[int, str], *, links: bool = False, highlight: int = -1, live: bool = False) -> str:
+    def _transcript_html(
+        self, lines, names: dict[int, str], *, links: bool = False, highlight: int = -1, live: bool = False,
+        show_speakers: bool = True, show_times: bool = True, label_unknown: bool = True,
+    ) -> str:
         meeting_id = self._ctrl.current_id if live else self._detail_id
         sequences = self._live_transcript_sequences if live else self._transcript_sequences
         locked = self._live_locked_sequences if live else self._speaker_locked_sequences
@@ -1635,6 +2203,9 @@ class MeetingPage(QWidget):
             editable=self._transcript_editable,
             live_editable=self._ctrl.state in (MeetingState.LIVE, MeetingState.PAUSED),
             auto_names=auto_names,
+            show_speakers=show_speakers,
+            show_times=show_times,
+            label_unknown=label_unknown,
         )
 
     def _on_notes_link(self, url) -> None:
@@ -1645,11 +2216,17 @@ class MeetingPage(QWidget):
 
     def _jump_to_transcript(self, offset_ms: int) -> None:
         """Show the transcript line a minutes citation or mark points at."""
+        if not self._transcript_has_times:
+            self._set_status("这场文字稿没有时间戳，无法跳转", transient=True)
+            return
         if not self._transcript_offsets:
             return
         index = bisect.bisect_right(self._transcript_offsets, offset_ms + 999) - 1
         if index < 0:
             index = 0
+        if index < len(self._transcript_time_known) and not self._transcript_time_known[index]:
+            self._set_status("这一段没有时间戳，无法跳转", transient=True)
+            return
         if self._content_stack.currentIndex() == 0:
             self._citation_return = (self._detail_id, self._notes_view.verticalScrollBar().value())
         self._transcript_highlight = index
@@ -1828,6 +2405,10 @@ class MeetingPage(QWidget):
         else:
             self._set_status("修改尚未保存，请重试；可先复制草稿保留内容。")
 
+    def _shows_meeting(self, meeting_id: str) -> bool:
+        """True when this meeting's detail is on screen, not hidden by batch mode."""
+        return bool(meeting_id) and meeting_id == self._detail_id and not self._batch_mode
+
     def _on_generation_progress(self, meeting_id: str, text: str) -> None:
         if meeting_id == self._detail_id and self._editing_notes:
             self._keep_open_draft(meeting_id)
@@ -1835,7 +2416,7 @@ class MeetingPage(QWidget):
             if meeting_id != self._listed_generating:
                 self.refresh()
             return
-        if meeting_id == self._detail_id:
+        if self._shows_meeting(meeting_id):
             self._set_status(text)
         if meeting_id != self._listed_generating:
             # A queued job just started: its list row changes too.
@@ -1865,20 +2446,26 @@ class MeetingPage(QWidget):
             self._editing_notes = False
             self._switch_tab(0)
             self._render_detail()
-            self._set_status(
-                "原文已精整，可切换到文字稿核对重要内容。" if self._result_label() == "精整正文" else
-                "纪要已生成，可点击时间戳核对文字稿。"
-            )
+            if not self._batch_mode:
+                self._set_status(
+                    "原文已精整，可切换到文字稿核对重要内容。" if self._result_label() == "精整正文" else
+                    "纪要已生成，可点击时间戳核对文字稿。"
+                )
         self.refresh()
 
     def _on_generation_failed(self, meeting_id: str, message: str) -> None:
         self.refresh()
-        if meeting_id == self._detail_id:
+        if self._shows_meeting(meeting_id):
             self._set_status(f"{'原文整理' if self._is_refinement() else '纪要生成'}失败：{message}")
+        elif self._batch_mode:
+            # Batch view has no open meeting; name the one that failed.
+            record = self._records.get(meeting_id) or self._store.get_meeting(meeting_id)
+            title = record.display_title if record is not None else "一场会议"
+            self._set_status(f"「{title}」生成失败：{message}")
 
     def _on_generation_cancelled(self, meeting_id: str) -> None:
         self.refresh()
-        if meeting_id == self._detail_id:
+        if self._shows_meeting(meeting_id):
             label = self._result_label()
             action = "原文整理" if label == "精整正文" else "纪要生成"
             self._set_status(f"已取消{action}，上一版{label}保持不变。")
@@ -2133,17 +2720,25 @@ class MeetingPage(QWidget):
         default = export_save_path(
             f"{safe_filename(record.display_title)}-{label}-{time.strftime('%Y%m%d', time.localtime(record.started_at / 1000))}.md"
         )
+        filters = "Markdown (*.md);;纯文本 (*.txt)"
+        if self._transcript_has_times:
+            filters += ";;SRT 字幕 (*.srt)"
         path, selected = QFileDialog.getSaveFileName(
-            self, "导出" + label, default,
-            "Markdown (*.md);;纯文本 (*.txt);;SRT 字幕 (*.srt)",
+            self, "导出" + label, default, filters,
         )
         if not path:
             return
         kind = _export_kind(path, selected)
+        if kind == "srt" and not self._transcript_has_times:
+            self._set_status("这场文字稿没有时间戳，无法导出字幕")
+            return
         path = _with_export_suffix(path, kind)
         try:
             if kind == "srt":
                 text = self._ctrl.export_transcript_srt(record.id)
+                note = getattr(self._ctrl, "srt_skip_note", "") or ""
+                if note:
+                    self._set_status(note)
             elif kind == "txt":
                 if scope == "notes":
                     text = self._current_notes_text()
@@ -2240,6 +2835,11 @@ class MeetingPage(QWidget):
             return
         speaker = ((names.get(line[0].speaker_id) or f"说话人{line[0].speaker_id}")
                    if line[0].speaker_id > 0 else "说话人待确认")
+        position = _position_label(line[0].offset_ms)
+        if record.source == IMPORT_SOURCE and record.ended_at is None:
+            position = ""
+            if line[0].speaker_id <= 0:
+                speaker = "本段"
         detail_text = ""
         if details:
             auto_names = {s.speaker_id for s in self._store.get_speakers(record.id)
@@ -2250,7 +2850,7 @@ class MeetingPage(QWidget):
             if segment.corrected_text:
                 detail_text += "\n正文：已编辑，修改前的原文保留如下。"
         dialog = _SegmentTextDialog(
-            segment, position=_position_label(line[0].offset_ms), speaker=speaker,
+            segment, position=position, speaker=speaker,
             save_text=lambda text: self._ctrl.save_segment_text(record.id, seq, text), parent=self,
             details=detail_text, read_only=read_only,
         )
@@ -2428,6 +3028,7 @@ class MeetingPage(QWidget):
         self._update_card_notes()
         self._start_btn.setVisible(False)
         self._stack.setCurrentIndex(PAGE_START)
+        self._sync_media_buttons()
         self._opt_title.setFocus()
 
     def _follow_model_label(self) -> str:
@@ -2534,6 +3135,7 @@ class MeetingPage(QWidget):
     def _leave_start_card(self) -> None:
         self._start_btn.setVisible(True)
         self._stack.setCurrentIndex(PAGE_BROWSE)
+        self._sync_media_buttons()
 
     def _start_from_card(self) -> None:
         options = self._options_from_card()
@@ -2578,6 +3180,7 @@ class MeetingPage(QWidget):
         self._mark_note.clear()
         self._start_btn.setVisible(False)
         self._stack.setCurrentIndex(PAGE_LIVE)
+        self._sync_media_buttons()
         self._sync_live_state()
         self._render_live()
 

@@ -19,6 +19,7 @@ from sayink.config import Config
 from sayink.text_polisher import (
     LLM_MODE_CORRECT,
     LLM_MODE_POLISH,
+    API_ADDRESS_HINT,
     api_key_required,
     custom_prompt_or_empty,
     normalize_llm_mode,
@@ -128,7 +129,8 @@ class PolishSettingsPage(SettingsPage):
         self.add(self._build_connection_section())
         self.add(footnote(
             "支持 OpenAI、DeepSeek、通义千问、Ollama 等 OpenAI 兼容接口。"
-            "地址以 http:// 或 https:// 开头即可。只有地址本身是 http:// 时，密钥和转写内容才会明文传输。"
+            + API_ADDRESS_HINT
+            + "明文 HTTP 会传输密钥和转写内容。"
         ))
         self.add(self._build_polish_section())
         self.add(self._build_minutes_section(config))

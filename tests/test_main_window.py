@@ -332,6 +332,76 @@ def test_live_resize_keeps_the_round_mask_off(qapp, tmp_path, monkeypatch):
         store.close()
 
 
+def _post_native(win, message: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    msg = wintypes.MSG()
+    msg.hWnd = int(win.winId())
+    msg.message = message
+    win.nativeEvent(b"windows_generic_MSG", ctypes.addressof(msg))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 move loop")
+def test_caption_move_keeps_the_round_mask(qapp, tmp_path, monkeypatch):
+    """A title-bar drag must not drop the mask: that invalidates the whole window."""
+    from sayink.ui.main_window import _WM_ENTERSIZEMOVE, _WM_EXITSIZEMOVE, _WM_SIZING
+
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        win.show()
+        QApplication.processEvents()
+        assert not win.mask().isEmpty()
+        _post_native(win, _WM_ENTERSIZEMOVE)
+        assert win._live_resizing is True
+        assert not win.mask().isEmpty()
+        _post_native(win, _WM_EXITSIZEMOVE)
+        assert win._live_resizing is False
+        assert not win.mask().isEmpty()
+        _post_native(win, _WM_ENTERSIZEMOVE)
+        _post_native(win, _WM_SIZING)
+        assert win.mask().isEmpty()
+    finally:
+        win.close()
+        store.close()
+
+
+def test_dwm_frame_uses_the_theme_background(qapp, tmp_path, monkeypatch):
+    from PyQt6.QtGui import QColor, QPalette
+
+    from sayink.ui import design_tokens as tok
+
+    def colorref(value: str) -> int:
+        color = QColor(value)
+        return color.red() | (color.green() << 8) | (color.blue() << 16)
+
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        tok.activate("dark")
+        win.reapply_theme()
+        QApplication.processEvents()
+        attrs = win._dwm_frame_attributes()
+        assert attrs[20] == 1
+        assert attrs[19] == 1
+        assert attrs[35] == colorref(tok.BG)
+        assert attrs[34] == colorref(tok.BG)
+        assert attrs[38] == 1
+        assert win.palette().color(QPalette.ColorRole.Window) == QColor(tok.BG)
+        assert win.testAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        assert win.testAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        tok.activate("light")
+        win.reapply_theme()
+        QApplication.processEvents()
+        attrs = win._dwm_frame_attributes()
+        assert attrs[20] == 0
+        assert attrs[35] == colorref(tok.BG)
+        assert win.palette().color(QPalette.ColorRole.Window) == QColor(tok.BG)
+    finally:
+        tok.activate("light")
+        win.close()
+        store.close()
+
+
 def test_maximized_caption_uses_stacked_restore_glyph(qapp, tmp_path, monkeypatch):
     win, store = _make_main_window(tmp_path, monkeypatch)
     try:

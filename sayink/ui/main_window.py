@@ -11,6 +11,7 @@ from PyQt6.QtGui import (
     QKeySequence,
     QPainter,
     QPainterPath,
+    QPalette,
     QPen,
     QRegion,
     QShortcut,
@@ -67,6 +68,15 @@ _WM_NCCALCSIZE = 0x0083
 _WM_GETMINMAXINFO = 0x0024
 _WM_ENTERSIZEMOVE = 0x0231
 _WM_EXITSIZEMOVE = 0x0232
+_WM_SIZING = 0x0214
+# DWMWA_USE_IMMERSIVE_DARK_MODE (20) and the pre-20H1 value (19).
+_DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19
+_DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+_DWMWA_WINDOW_CORNER_PREFERENCE = 33
+_DWMWA_BORDER_COLOR = 34
+_DWMWA_CAPTION_COLOR = 35
+_DWMWA_SYSTEMBACKDROP_TYPE = 38
+_DWMSBT_NONE = 1
 _WVR_VALIDRECTS = 0x0400
 _MONITOR_DEFAULTTONEAREST = 2
 _HTLEFT, _HTRIGHT, _HTTOP, _HTTOPLEFT, _HTTOPRIGHT = 10, 11, 12, 13, 14
@@ -196,6 +206,10 @@ class MainWindow(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # The system brush is the light window color. Skip that erase so a
+        # drag that does repaint cannot flash it under the dark stylesheet.
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.resize(_WINDOW_W, _WINDOW_H)
         self._fit_to_available_screen()
 
@@ -514,6 +528,7 @@ class MainWindow(QWidget):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._enable_native_snap()
+        self._apply_dwm_theme_colors()
         self._fit_to_available_screen()
         self._sync_frame_margin()
         self._position_frame_edges()
@@ -558,7 +573,26 @@ class MainWindow(QWidget):
     def _chrome_radius(self) -> int:
         return 0 if self.isMaximized() else tok.WINDOW_RADIUS
 
-    def _apply_native_round_corners(self, radius: int) -> None:
+    def _dwm_frame_attributes(self) -> dict[int, int]:
+        """System frame colors sampled while the stylesheet is still painting.
+
+        Caption and border use the page background. A light-mode DWM window
+        otherwise fills the client with white for the first frames of a drag.
+        """
+        from sayink.ui import design_tokens as live
+
+        bg = QColor(live.BG)
+        dark = 1 if bg.lightness() < 128 else 0
+        colorref = bg.red() | (bg.green() << 8) | (bg.blue() << 16)
+        return {
+            _DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1: dark,
+            _DWMWA_USE_IMMERSIVE_DARK_MODE: dark,
+            _DWMWA_BORDER_COLOR: colorref,
+            _DWMWA_CAPTION_COLOR: colorref,
+            _DWMWA_SYSTEMBACKDROP_TYPE: _DWMSBT_NONE,
+        }
+
+    def _apply_dwm_attribute(self, attr: int, value: int) -> None:
         if sys.platform != "win32":
             return
         try:
@@ -567,12 +601,19 @@ class MainWindow(QWidget):
             hwnd = int(self.winId())
             if hwnd == 0:
                 return
-            preference = 1 if radius <= 0 else 2
             windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, 33, byref(c_int(preference)), sizeof(c_int)
+                hwnd, attr, byref(c_int(value)), sizeof(c_int)
             )
         except Exception:
-            pass
+            return
+
+    def _apply_dwm_theme_colors(self) -> None:
+        for attr, value in self._dwm_frame_attributes().items():
+            self._apply_dwm_attribute(attr, value)
+
+    def _apply_native_round_corners(self, radius: int) -> None:
+        preference = 1 if radius <= 0 else 2
+        self._apply_dwm_attribute(_DWMWA_WINDOW_CORNER_PREFERENCE, preference)
 
     def _clear_round_mask(self) -> None:
         self._mask_key = None
@@ -586,6 +627,13 @@ class MainWindow(QWidget):
         self.setStyleSheet(
             f"QWidget#mainWindow {{ background: {live.BG}; border: none; }}"
         )
+        # Keep the erase color on the same background. Stylesheet polish can
+        # leave Window on the light style default, which is the flash on drag.
+        bg = QColor(live.BG)
+        palette = self.palette()
+        if palette.color(QPalette.ColorRole.Window) != bg:
+            palette.setColor(QPalette.ColorRole.Window, bg)
+            self.setPalette(palette)
         self._caption.setStyleSheet(
             f"QWidget#mainCaption {{"
             f" background: {live.BG};"
@@ -606,6 +654,7 @@ class MainWindow(QWidget):
         self._sync_frame_margin()
         self._position_frame_edges()
         self._apply_window_shape()
+        self._apply_dwm_theme_colors()
 
     def _sync_frame_margin(self) -> None:
         """1px gutter while windowed so the border is not covered; flush when maximized.
@@ -1058,6 +1107,11 @@ class MainWindow(QWidget):
                     # client area equal to the window so that caption does not draw.
                     return True, 0
                 if msg.message == _WM_ENTERSIZEMOVE:
+                    # Caption moves and edge resizes both enter here. Dropping
+                    # the region now repaints every pixel and shows the system
+                    # fill. Wait until the size actually changes.
+                    self._live_resizing = True
+                elif msg.message == _WM_SIZING:
                     self._live_resizing = True
                     self._clear_round_mask()
                 elif msg.message == _WM_EXITSIZEMOVE:

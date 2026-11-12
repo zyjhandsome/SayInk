@@ -86,8 +86,10 @@ def capture_setup(config: Config) -> None:
         require(dialog.findChildren(QLineEdit) == [], "setup page has a text field")
         require("密钥" not in labels and "润色" not in labels and "API" not in labels, "setup page asks for an AI service")
         download = next(button for button in buttons(dialog) if button.text() == "下载模型")
-        require(download.isDefault() and not next(button for button in buttons(dialog) if button.text() == "测试麦克风").isEnabled(),
-                "setup is not waiting on the model download")
+        mic = next(button for button in buttons(dialog) if button.text() == "测试麦克风")
+        require(download.isDefault(), "setup is not waiting on the model download")
+        require(mic.isEnabled(), "microphone test stays available before the model download")
+        require("可以先测试麦克风" in labels, "setup does not say the microphone can be tested first")
         save_grab(dialog, "v1-setup-pending.png")
         controller.note_mic_level(0)
         settle(QApplication.instance())

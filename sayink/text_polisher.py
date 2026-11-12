@@ -18,9 +18,14 @@ log = logging.getLogger("SayInk")
 _LOCAL_HOSTNAMES = {"localhost", "127.0.0.1", "::1"}
 
 INSECURE_URL_ERROR = "接口地址须以 http:// 或 https:// 开头，并包含主机名"
+INVALID_IPV6_ERROR = "IPv6 地址不完整。请写成 http://[::1]:端口/路径，方括号要成对。"
+INVALID_PORT_ERROR = "端口必须是 1 到 65535 的数字。"
 PUBLIC_HTTP_ERROR = (
     "公网地址请使用 https://，避免明文传输密钥和转写内容；"
     "内网域名若确需 http://，请加入「额外直连域名」。"
+)
+API_ADDRESS_HINT = (
+    "公网地址必须使用 https://。本机、局域网，以及已加入「额外直连域名」的内网，可以使用 http://。"
 )
 FULLWIDTH_URL_ERROR = "接口地址含有全角冒号或斜杠，请改用半角的 http:// 或 https://，并包含主机名"
 HOST_GARBLED_ERROR = "接口地址的主机名含有空格或不可见字符。"
@@ -36,9 +41,36 @@ _CANONICAL_MODELS = {
 }
 
 
+def _url_parts(url: str):
+    """Return ``(parsed, host, error)``. ``error`` is user-facing; hostname and port are read here.
+
+    ``urlparse`` accepts an unclosed IPv6 literal and a non-numeric port, then raises
+    ``ValueError`` when those fields are touched. Callers must not read them again
+    on the error path.
+    """
+    text = (url or "").strip()
+    try:
+        parsed = urlparse(text)
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError as exc:
+        message = str(exc)
+        if "IPv6" in message:
+            return None, "", INVALID_IPV6_ERROR
+        if "port" in message.lower():
+            return None, "", INVALID_PORT_ERROR
+        return None, "", INSECURE_URL_ERROR
+    if port is not None and not 1 <= int(port) <= 65535:
+        return None, "", INVALID_PORT_ERROR
+    return parsed, host, None
+
+
 def is_local_endpoint(url: str) -> bool:
     """True for this machine or the home/office LAN (localhost, 192.168.x.x, *.local, single-label hosts…)."""
-    host = (urlparse((url or "").strip()).hostname or "").strip("[]").lower()
+    _parsed, host, error = _url_parts(url)
+    if error:
+        return False
+    host = host.strip("[]").lower()
     if not _host_is_clean(host):
         return False
     if host in _LOCAL_HOSTNAMES or host.endswith(".local") or ("." not in host and ":" not in host):
@@ -66,7 +98,10 @@ def _request_netloc(parsed) -> str:
 def _matches_bypass_suffixes(url: str, suffixes: str) -> bool:
     if not suffixes:
         return False
-    host = (urlparse((url or "").strip()).hostname or "").strip("[]").lower()
+    _parsed, host, error = _url_parts(url)
+    if error:
+        return False
+    host = host.strip("[]").lower()
     if not _host_is_clean(host):
         return False
     valid, _ignored = parse_proxy_bypass_suffixes(suffixes)
@@ -81,8 +116,9 @@ def is_secure_or_local_url(url: str, *, proxy_bypass_suffixes: str = "") -> bool
     in cleartext. Intranet FQDN endpoints that genuinely run plain HTTP can be
     listed under ``proxy_bypass_suffixes``.
     """
-    parsed = urlparse((url or "").strip())
-    host = parsed.hostname or ""
+    parsed, host, error = _url_parts(url)
+    if error or parsed is None:
+        return False
     if parsed.scheme not in {"http", "https"} or not _host_is_clean(host):
         return False
     if parsed.scheme == "https":
@@ -93,10 +129,12 @@ def is_secure_or_local_url(url: str, *, proxy_bypass_suffixes: str = "") -> bool
 def api_url_error(url: str, *, proxy_bypass_suffixes: str = "") -> str | None:
     """User-facing reason the address cannot be used, or ``None`` when it can."""
     text = (url or "").strip()
+    _parsed, host, error = _url_parts(text)
+    if error:
+        return error
     if is_secure_or_local_url(text, proxy_bypass_suffixes=proxy_bypass_suffixes):
         return None
-    parsed = urlparse(text)
-    host = parsed.hostname or ""
+    parsed = _parsed
     if parsed.scheme in {"http", "https"} and host and not _host_is_clean(host):
         return HOST_GARBLED_ERROR
     if parsed.scheme == "http" and _host_is_clean(host):
@@ -109,15 +147,17 @@ def api_url_error(url: str, *, proxy_bypass_suffixes: str = "") -> str | None:
 def redact_url_userinfo(url: str) -> tuple[str, bool]:
     """Drop ``user:password@`` so a secret is not stored in the address."""
     raw = (url or "").strip()
-    parsed = urlparse(raw)
-    if not parsed.hostname or (parsed.username is None and parsed.password is None):
+    parsed, host, error = _url_parts(raw)
+    if error or parsed is None or not host or (parsed.username is None and parsed.password is None):
         return raw, False
     cleaned = urlunparse((parsed.scheme, _request_netloc(parsed), parsed.path, "", parsed.query, parsed.fragment))
     return cleaned, True
 
 
 def public_cleartext_note(url: str) -> str:
-    parsed = urlparse((url or "").strip())
+    parsed, _host, error = _url_parts(url)
+    if error or parsed is None:
+        return ""
     if parsed.scheme == "http" and not is_local_endpoint(url):
         return PUBLIC_HTTP_NOTE
     return ""

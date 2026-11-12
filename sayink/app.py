@@ -634,6 +634,15 @@ class App(QObject):
                 parent=self,
             )
         )
+        if callable(getattr(self._meeting, "set_external_block", None)):
+            self._meeting.set_external_block(self._media_import_conflict)
+        if callable(getattr(self._meeting, "set_media_runner", None)):
+            self._meeting.set_media_runner(self._run_media_import)
+        finished = getattr(self._meeting, "media_import_finished", None)
+        failed = getattr(self._meeting, "media_import_failed", None)
+        if hasattr(finished, "connect") and hasattr(failed, "connect"):
+            finished.connect(lambda *_args: self._apply_pending_recognition_settings())
+            failed.connect(lambda *_args: self._apply_pending_recognition_settings())
         self._deferred_audio_settings = False
         self._meeting_idle_warned = False
         self._unrecognized_meeting_notice = ""
@@ -854,6 +863,7 @@ class App(QObject):
             or recorder.is_continuous
             or self._safe_attr("_hold_open_pending", False)
             or self._meeting_active()
+            or bool(getattr(self._meeting, "importing_media", False))
         )
 
     def _drop_unrecognized_meeting_audio(self, reason: str) -> int:
@@ -898,6 +908,7 @@ class App(QObject):
             or self._output_busy
             or self._safe_attr("_prefetch_segment") is not None
             or self._safe_attr("_recovery_busy", False)
+            or bool(getattr(self._meeting, "importing_media", False))
         )
 
     def _on_esc_pressed(self):
@@ -1035,6 +1046,9 @@ class App(QObject):
             self._floating.show_meeting(self._meeting.elapsed_text())
 
     def _on_recording_start(self):
+        if getattr(self._meeting, "importing_media", False):
+            self._floating.show_error("正在导入音视频，请完成或取消后再转写")
+            return
         if self._recovery_busy:
             return
         if self._safe_attr("_exit_started", False):
@@ -1175,6 +1189,9 @@ class App(QObject):
         self._later(0, self._apply_pending_recognition_settings)
 
     def _on_continuous_hotkey_start(self):
+        if getattr(self._meeting, "importing_media", False):
+            self._floating.show_error("正在导入音视频，请完成或取消后再转写")
+            return
         if self._recovery_busy:
             return
         if self._meeting_blocks_hotkey():
@@ -1308,6 +1325,9 @@ class App(QObject):
         self._pause_if_backlog_too_long()
 
     def _start_continuous_listening(self):
+        if getattr(self._meeting, "importing_media", False):
+            self._floating.show_error("正在导入音视频，请完成或取消后再转写")
+            return
         if self._recovery_busy:
             return
         if self._safe_attr("_exit_started", False):
@@ -2403,6 +2423,9 @@ class App(QObject):
             self._request_meeting_start(options)
 
     def _start_meeting_from_tray(self) -> None:
+        if getattr(self._meeting, "importing_media", False):
+            self._floating.show_error("正在导入音视频，请完成或取消后再开始会议")
+            return
         if self._meeting_active():
             self._show_meeting_window()
             return
@@ -2527,8 +2550,40 @@ class App(QObject):
             return
         dialog.show()
 
+    def _media_import_conflict(self) -> str:
+        """Why a file cannot be imported while dictation, a meeting, or recovery owns audio."""
+        if self._recovery_busy:
+            return "正在恢复录音，请完成后再导入音视频"
+        if self._meeting_active():
+            return "已有会议在进行中"
+        recording = bool(getattr(self._recorder, "is_recording", False))
+        if recording or self._safe_attr("_hold_open_pending", False) or self._pipeline_busy() or self._segment_queue:
+            return "正在转写，请完成后再导入音视频"
+        if not getattr(self._recognizer, "is_ready", False):
+            return "语音模型未就绪，请等待模型加载完成后再导入音视频"
+        return ""
+
+    def _run_media_import(self, path, cancel, progress):
+        from sayink.media_import import recognize_file
+
+        settings = self._applied_recognition_settings
+        vad = getattr(settings, "vad", "energy")
+        vad_path = self._aux_model_path(AUX_MODEL_SILERO_VAD) if vad == VAD_SILERO else None
+        return recognize_file(
+            path,
+            recognizer=self._recognizer,
+            speaker_path=self._aux_model_path(AUX_MODEL_SPEAKER),
+            vad=vad,
+            vad_path=vad_path,
+            cancel=cancel,
+            progress=progress,
+            glossary=getattr(settings, "glossary", ()) or (),
+        )
+
     def _meeting_refusal(self, options: MeetingOptions) -> str:
         """Why a meeting cannot start right now ("" when it can)."""
+        if getattr(self._meeting, "importing_media", False):
+            return "正在导入音视频，请完成或取消后再开始会议"
         if self._recovery_busy:
             return "正在恢复录音，请完成后再开始会议"
 

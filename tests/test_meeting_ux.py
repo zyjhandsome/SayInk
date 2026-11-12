@@ -1011,7 +1011,7 @@ def test_text_link_edits_sparse_sequence_and_keeps_multiline_plain_text(meeting,
     page._on_transcript_link(QUrl("edit-segment:7"))
     assert controller.store.get_segments(record.id)[2].corrected_text == "预算 <5000> 元\n下周三验证"
     rendered = page._transcript_view.toPlainText()
-    assert "预算 <5000> 元\n下周三验证" in rendered
+    assert rendered.index("预算 <5000> 元") < rendered.index("下周三验证")
     assert "已保存这一段" in page._status_label.text()
 
 
@@ -1504,3 +1504,91 @@ def test_renaming_a_long_transcript_does_not_rebuild_the_document(meeting, monke
     assert calls == []
     assert elapsed < 1.0, elapsed
     assert "小林" in page._transcript_view.toPlainText()
+
+
+def _second_meeting(controller, page, title="周会"):
+    other = controller.store.create_meeting(title=title)
+    controller.store.end_meeting(other.id, ended_at=other.started_at + 60_000)
+    controller.store.flush()
+    page.refresh()
+    return other
+
+
+def _enter_batch_with_all(page):
+    page._set_batch_mode(True)
+    page._select_loaded_meetings()
+
+
+def test_batch_mode_hides_every_single_meeting_control(meeting):
+    page, controller, _history, record = meeting
+    _second_meeting(controller, page)
+    page.show()
+    controller.store.save_notes(record.id, template_id="refine", model="m", json_payload="", markdown="精整正文。")
+    controller.store.flush()
+    page.refresh()
+    _enter_batch_with_all(page)
+    assert page._batch_tools.isVisible() and page._batch_notice_scroll.isVisible()
+    for widget in (page._tab_bar, page._tab_tools, page._content_stack, page._content_hint,
+                   page._detail_title, page._detail_meta, page._state_row, page._export_btn):
+        assert not widget.isVisible(), widget
+    # Tab switching paths (e.g. a finished generation) must not bring the hint back.
+    page._switch_tab(0)
+    assert not page._content_hint.isVisible()
+    # The notice sits right under the batch tools instead of floating mid-pane.
+    gap = page._batch_notice_scroll.geometry().top() - page._batch_tools.geometry().bottom()
+    assert gap <= 3 * page.layout().spacing() + 24
+    page._set_batch_mode(False)
+    assert page._tab_bar.isVisible() and page._content_stack.isVisible()
+
+
+def test_batch_mode_switch_clears_status_from_the_other_view(meeting):
+    page, controller, _history, _record = meeting
+    _second_meeting(controller, page)
+    page.show()
+    page._set_status("已导入文字稿。确认内容后，再点击「生成纪要」。")
+    _enter_batch_with_all(page)
+    assert not page._status_label.isVisible()
+    page._set_status("已导出 2 场会议")
+    page._set_batch_mode(False)
+    assert not page._status_label.isVisible()
+
+
+def test_opening_a_meeting_leaves_batch_mode(meeting):
+    page, controller, _history, record = meeting
+    other = _second_meeting(controller, page)
+    page.show()
+    _enter_batch_with_all(page)
+    page.show_meeting(other.id)
+    assert not page._batch_mode
+    assert page.current_meeting_id == other.id
+    assert page._detail_title.text() == "周会"
+    assert page._tab_bar.isVisible() and not page._batch_tools.isVisible()
+
+
+def test_single_meeting_generation_notices_stay_out_of_batch_view(meeting):
+    page, controller, _history, record = meeting
+    other = _second_meeting(controller, page)
+    page.show()
+    _enter_batch_with_all(page)
+    page._set_status("已排队生成 2 场纪要")
+    controller._generating_for = page.current_meeting_id
+    controller.generation_progress.emit(page.current_meeting_id, "正在生成纪要… 第 1/2 段")
+    assert page._status_label.text() == "已排队生成 2 场纪要"
+    controller._generating_for = ""
+    page._on_generation_failed(other.id, "接口超时")
+    assert "「周会」" in page._status_label.text() and "接口超时" in page._status_label.text()
+
+
+def test_failed_media_import_restores_the_open_meeting(meeting, monkeypatch):
+    page, controller, _history, record = meeting
+    page.show()
+    monkeypatch.setattr(type(controller), "importing_media", property(lambda _self: True), raising=False)
+    page._media_import_title = "录音"
+    page._show_import_detail()
+    assert page._detail_title.isReadOnly() and not page._tab_bar.isVisible()
+    monkeypatch.setattr(type(controller), "importing_media", property(lambda _self: False), raising=False)
+    page._on_media_failed("无法读取音频")
+    assert page._detail_title.text() == "设计评审"
+    assert not page._detail_title.isReadOnly()
+    assert page._tab_bar.isVisible() and page._content_stack.isVisible()
+    assert page._status_label.text() == "无法读取音频"
