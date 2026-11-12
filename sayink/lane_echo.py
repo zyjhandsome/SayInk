@@ -1,8 +1,9 @@
-"""Conservative duplicate playback removal before microphone/loopback mixing.
+"""Conservative duplicate & speakerphone playback removal before mic/loopback mixing.
 
-This only handles an almost identical, delayed waveform. It does not claim
-acoustic echo cancellation for reverberation or separation during double talk.
-Uncorrelated microphone audio is returned unchanged.
+Handles both pure delayed digital bleed and short-path acoustic speakerphone
+coloration/reflections across extended Bluetooth buffer delays (up to 600 ms),
+while immediately passing through uncorrelated local speech or double-talk
+bit-exact without harming user voice.
 """
 from __future__ import annotations
 
@@ -12,11 +13,19 @@ from sayink.audio_utils import TARGET_SAMPLE_RATE
 
 
 class DuplicateLaneSuppressor:
-    MAX_DELAY = TARGET_SAMPLE_RATE // 4
+    # Up to 600 ms covers Bluetooth A2DP/HFP + WASAPI loopback + USB mic chains.
+    MAX_DELAY = int(0.60 * TARGET_SAMPLE_RATE)
     PROBE = int(0.4 * TARGET_SAMPLE_RATE)
     MIN_PROBE = TARGET_SAMPLE_RATE // 4
     BLOCK = TARGET_SAMPLE_RATE // 10
     MIN_CORRELATION = 0.985
+    # Short multi-tap FIR fallback for laptop speakerphone acoustic echo
+    # (speaker EQ + desk reflection lowers 1-tap |r| below 0.985).
+    FIR_TAPS = 28
+    FIR_PRE_SAMPLES = 4
+    ACOUSTIC_PEAK_CORRELATION = 0.52
+    ACOUSTIC_MIN_CORRELATION = 0.88
+    ACOUSTIC_BLOCK_CORRELATION = 0.88
 
     def __init__(self):
         self.reset()
@@ -36,9 +45,51 @@ class DuplicateLaneSuppressor:
         xy = float(x @ y)
         return xy / np.sqrt(xx * yy), xy / xx
 
+    @classmethod
+    def _build_fir_matrix(cls, system_buf: np.ndarray, start: int, length: int) -> np.ndarray | None:
+        taps = cls.FIR_TAPS
+        # Row i predicts mic sample at (start + i) using system[start + i - k].
+        if start - (taps - 1) < 0 or start + length > len(system_buf):
+            return None
+        sys64 = system_buf.astype(np.float64)
+        cols = [sys64[start - k : start - k + length] for k in range(taps)]
+        return np.column_stack(cols)
+
+    def _fit_acoustic_fir(self, base_lag: int, size: int) -> tuple[int, np.ndarray, float] | None:
+        # Center the causal FIR slightly ahead of the peak lag so direct path +
+        # 1.5 ms of speaker coloration / desk bounce are captured together.
+        anchor_lag = max(0, base_lag - self.FIR_PRE_SAMPLES)
+        stop = len(self._system) - anchor_lag
+        start = stop - size
+        X = self._build_fir_matrix(self._system, start, size)
+        if X is None:
+            return None
+        y = self._mic[-size:].astype(np.float64)
+        y_centered = y - np.mean(y)
+        yy = float(y_centered @ y_centered)
+        if yy <= size * 0.004 ** 2:
+            return None
+        X_mean = np.mean(X, axis=0)
+        Xc = X - X_mean
+        gram = Xc.T @ Xc
+        energy_diag = float(np.trace(gram)) / max(1, self.FIR_TAPS)
+        if energy_diag <= size * 0.004 ** 2:
+            return None
+        reg = max(1e-8, 1e-3 * energy_diag)
+        weights = np.linalg.solve(gram + reg * np.eye(self.FIR_TAPS), Xc.T @ y_centered)
+        gain_norm = float(np.linalg.norm(weights))
+        if not 0.02 <= gain_norm <= 4.5:
+            return None
+        pred = Xc @ weights
+        fit = self._fit(pred, y_centered)
+        if fit is None or fit[0] < self.ACOUSTIC_MIN_CORRELATION:
+            return None
+        bias = float(np.mean(y) - X_mean @ weights)
+        return anchor_lag, weights, bias
+
     def _estimate(self):
         size = min(self.PROBE, len(self._mic))
-        if size < self.MIN_PROBE:
+        if size < self.MIN_PROBE or len(self._system) < size:
             return None
         delay = min(self.MAX_DELAY, len(self._system) - size)
         # FFT correlation keeps the exact capture sample grid (decimation
@@ -59,35 +110,59 @@ class DuplicateLaneSuppressor:
         correlations = np.abs(dots) / np.sqrt(np.maximum(variance * energy, 1e-20))
         correlations[variance < count * 0.004 ** 2] = 0.0
         best = int(np.argmax(correlations))
-        if correlations[best] < self.MIN_CORRELATION:
-            return None
+        peak_corr = float(correlations[best])
         lag = len(dots) - 1 - best
-        stop = len(self._system) - lag
-        fit = self._fit(self._system[stop - size:stop], self._mic[-size:])
-        if fit is None:
-            return None
-        correlation, gain = fit
-        if abs(correlation) < self.MIN_CORRELATION or not 0.02 <= abs(gain) <= 4.0:
-            return None
-        return lag, gain
+
+        if peak_corr >= self.MIN_CORRELATION:
+            stop = len(self._system) - lag
+            fit = self._fit(self._system[stop - size:stop], self._mic[-size:])
+            if fit is not None:
+                correlation, gain = fit
+                if abs(correlation) >= self.MIN_CORRELATION and 0.02 <= abs(gain) <= 4.0:
+                    return ("single", lag, gain)
+
+        if peak_corr >= self.ACOUSTIC_PEAK_CORRELATION:
+            fir = self._fit_acoustic_fir(lag, size)
+            if fir is not None:
+                anchor_lag, weights, bias = fir
+                return ("fir", anchor_lag, weights, bias)
+        return None
 
     def _process_block(self, microphone, system):
+        if len(microphone) == 0:
+            return microphone
         bound = self.PROBE + self.MAX_DELAY
         self._mic = np.concatenate((self._mic, microphone))[-bound:]
         self._system = np.concatenate((self._system, system))[-bound:]
         estimate = self._estimate()
         if estimate is None:
             return microphone
-        lag, gain = estimate
-        stop = len(self._system) - lag
-        reference = self._system[stop - len(microphone):stop]
-        fit = self._fit(reference, microphone)
-        # Recheck the newest audio: a local speaker can enter after a long
-        # stretch of echo. Historical correlation must not approve this block.
-        if fit is None or abs(fit[0]) < self.MIN_CORRELATION or abs(fit[1] - gain) > 0.15 * abs(gain):
+        if estimate[0] == "single":
+            _, lag, gain = estimate
+            stop = len(self._system) - lag
+            reference = self._system[stop - len(microphone):stop]
+            fit = self._fit(reference, microphone)
+            # Recheck the newest audio: a local speaker can enter after a long
+            # stretch of echo. Historical correlation must not approve this block.
+            if fit is None or abs(fit[0]) < self.MIN_CORRELATION or abs(fit[1] - gain) > 0.15 * abs(gain):
+                return microphone
+            self.suppressed_samples += len(microphone)
+            return (microphone - gain * reference).astype(np.float32)
+
+        _, anchor_lag, weights, bias = estimate
+        if len(microphone) < 64:
+            return microphone
+        stop = len(self._system) - anchor_lag
+        start = stop - len(microphone)
+        X = self._build_fir_matrix(self._system, start, len(microphone))
+        if X is None:
+            return microphone
+        predicted = X @ weights + bias
+        fit = self._fit(predicted, microphone)
+        if fit is None or fit[0] < self.ACOUSTIC_BLOCK_CORRELATION or abs(fit[1] - 1.0) > 0.22:
             return microphone
         self.suppressed_samples += len(microphone)
-        return (microphone - gain * reference).astype(np.float32)
+        return (microphone.astype(np.float64) - predicted).astype(np.float32)
 
     def process(self, microphone, system):
         mic = np.asarray(microphone, dtype=np.float32).reshape(-1)

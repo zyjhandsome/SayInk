@@ -207,25 +207,37 @@ class SileroGate(SpeechGate):
         self._carry = np.zeros(0, dtype=np.float32)
         self._last_verdict = False
         self.input_gain = 1.0
+        self._prev_gain = 1.0
 
     def is_speech(self, block: np.ndarray, rms: float, *, in_speech: bool) -> bool:
         source = np.asarray(block, dtype=np.float32).reshape(-1)
-        gain = min(self.input_gain, max(1.0, 0.9 / max(float(np.max(np.abs(source), initial=0)), 1e-8)))
-        samples = np.concatenate([self._carry, source * gain])
+        peak = float(np.max(np.abs(source), initial=0.0))
+        target_gain = min(self.input_gain, max(1.0, 0.9 / max(peak, 1e-8)))
+        raw_samples = np.concatenate([self._carry, source]) if self._carry.size else source
+        scored_end = (raw_samples.size // self._window) * self._window
+        if scored_end == 0:
+            # Block shorter than one window (a drained remainder): keep unscaled
+            # carry and the previous verdict so a trailing word is not cut off.
+            self._carry = raw_samples.copy()
+            return self._last_verdict
+        raw_chunk = raw_samples[:scored_end]
+        if abs(target_gain - self._prev_gain) > 1e-3:
+            ramp = np.linspace(self._prev_gain, target_gain, scored_end, dtype=np.float32)
+            samples = np.clip(raw_chunk * ramp, -1.0, 1.0)
+        elif target_gain != 1.0:
+            samples = np.clip(raw_chunk * np.float32(target_gain), -1.0, 1.0)
+        else:
+            samples = raw_chunk
+        self._prev_gain = float(target_gain)
+        self._carry = raw_samples[scored_end:].copy()
+
         verdict = False
         offset = 0
-        scored = False
         while offset + self._window <= samples.size:
             window = samples[offset:offset + self._window]
-            scored = True
             if self._model.is_speech(window):
                 verdict = True
             offset += self._window
-        self._carry = samples[offset:]
-        if not scored:
-            # Block shorter than one window (a drained remainder): keep the
-            # previous verdict so a trailing word is not cut off.
-            return self._last_verdict
         self._last_verdict = verdict
         return verdict
 
@@ -233,6 +245,7 @@ class SileroGate(SpeechGate):
         self._model.reset()
         self._carry = np.zeros(0, dtype=np.float32)
         self._last_verdict = False
+        self._prev_gain = 1.0
 
 
 def make_speech_gate(kind: str, segmenter: "SpeechSegmenter", *, model_path: str | Path | None = None) -> SpeechGate:
@@ -500,11 +513,13 @@ class SpeechSegmenter:
         self._input_samples = 0
         self._reset_buffer()
 
-    def _reset_buffer(self) -> None:
+    def _reset_buffer(self, *, reset_gate: bool = True) -> None:
         # The noise-floor window deliberately survives reset(): it describes
-        # the room, not the utterance.
+        # the room, not the utterance. On forced MAX_SPEECH_SEC cuts where speech
+        # is still ongoing, preserve Silero's LSTM hidden state so soft voiceless
+        # boundary consonants are not swallowed.
         gate = getattr(self, "_gate", None)
-        if gate is not None and not isinstance(gate, EnergyGate):
+        if reset_gate and gate is not None and not isinstance(gate, EnergyGate):
             gate.reset()
         self._buffer: list[np.ndarray] = []
         # (sample count, mic energy, system energy, block RMS) per buffered block.
@@ -759,7 +774,7 @@ class SpeechSegmenter:
         noise_floor = self.ambient_noise_floor
         quiet_level = self.quiet_level
         tail = audio[take:] if take < audio.size else None
-        self._reset_buffer()
+        self._reset_buffer(reset_gate=not tail_is_speech)
         self._continuation = tail_is_speech
         self._last_route = dominant_route(mic, system)
         self._last_bounds = (start, start + take)

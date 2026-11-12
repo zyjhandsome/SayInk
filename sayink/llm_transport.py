@@ -98,13 +98,16 @@ def _visible_text(text: str) -> str:
     return text
 
 
+_DONE_REASONS = ("stop", "eos", "end_turn")
+
+
 def _check_choice(choice, *, streamed=False):
     if not isinstance(choice, dict):
         raise LLMResponseError("API 响应格式异常")
     reason = choice.get("finish_reason")
     if reason in ("length", "max_tokens"):
         raise LLMTruncatedError("模型输出被截断")
-    if reason not in (None, "stop"):
+    if reason not in (None, *_DONE_REASONS):
         raise LLMResponseError("模型未正常完成输出（" + str(reason) + "）")
     message = choice.get("delta" if streamed else "message")
     if not isinstance(message, dict):
@@ -132,8 +135,9 @@ async def _stream_text(response, *, first_timeout, idle_timeout, on_delta, on_st
         raw = "\n".join(event_lines)
         event_lines.clear()
         if raw == "[DONE]":
-            if not finished:
+            if not finished and not pieces and not reasoning_chars:
                 raise LLMBrokenStream("流式连接提前结束，结果未保存，请重试")
+            finished = True
             return True
         try:
             data = json.loads(raw)
@@ -174,7 +178,7 @@ async def _stream_text(response, *, first_timeout, idle_timeout, on_delta, on_st
             pieces.append(content)
             if on_delta:
                 on_delta(content)
-        if reason == "stop":
+        if reason in _DONE_REASONS:
             finished = True
             return True
 

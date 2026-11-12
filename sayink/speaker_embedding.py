@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 
 from sayink.audio_utils import TARGET_SAMPLE_RATE
-from sayink.speaker_session import MATCH_THRESHOLD, voice_embedding
+from sayink.speaker_session import MATCH_THRESHOLD, normalize_far_field_voice, voice_embedding
 
 log = logging.getLogger("SayInk")
 
@@ -88,7 +88,7 @@ class MelEmbedder(SpeakerEmbedder):
         samples = np.asarray(audio, dtype=np.float32).reshape(-1)
         if samples.size < int(TARGET_SAMPLE_RATE * MEL_MIN_SEC):
             return np.zeros(1, dtype=np.float32)
-        return voice_embedding(samples)
+        return voice_embedding(audio)
 
 
 class ModelEmbedder(SpeakerEmbedder):
@@ -117,9 +117,10 @@ class ModelEmbedder(SpeakerEmbedder):
         self.dim = int(getattr(self._extractor, "dim", 0) or 0)
 
     def __call__(self, audio: np.ndarray) -> np.ndarray:
-        samples = np.asarray(audio, dtype=np.float32).reshape(-1)
-        if samples.size < int(TARGET_SAMPLE_RATE * MODEL_MIN_SEC):
+        raw = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if raw.size < int(TARGET_SAMPLE_RATE * MODEL_MIN_SEC):
             return np.zeros(self.dim or 1, dtype=np.float32)
+        samples = normalize_far_field_voice(audio)
         rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
         if rms < _QUIET_RMS:
             return np.zeros(self.dim or 1, dtype=np.float32)

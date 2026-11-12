@@ -30,15 +30,29 @@ def _lowpass_taps(source_rate: int, target_rate: int) -> np.ndarray:
 
 
 def to_mono(audio: np.ndarray) -> np.ndarray:
-    """Collapse multi-channel float audio to mono."""
+    """Collapse multi-channel float audio to mono without surround silent-channel attenuation."""
     if audio.size == 0:
         return audio.astype(np.float32, copy=False)
     arr = np.asarray(audio, dtype=np.float32)
     if arr.ndim == 1:
         return arr
     if arr.ndim == 2:
-        if arr.shape[1] == 1:
+        channels = arr.shape[1]
+        if channels == 1:
             return arr[:, 0]
+        if channels == 2:
+            return np.mean(arr, axis=1, dtype=np.float32)
+        # 5.1 / 7.1 WASAPI loopback often carries stereo speech on FL/FR (or FC)
+        # while the remaining surround/LFE channels are silent zeros; averaging
+        # all 8 channels attenuated speech by -12 dB (1/4). Average only the
+        # active channels when silent surround channels are present.
+        ch_rms = np.sqrt(np.mean(arr.astype(np.float64) ** 2, axis=0))
+        peak_rms = float(np.max(ch_rms)) if ch_rms.size else 0.0
+        if peak_rms <= 1e-7:
+            return np.zeros(arr.shape[0], dtype=np.float32)
+        active = ch_rms >= (0.05 * peak_rms)
+        if 0 < int(np.count_nonzero(active)) < channels:
+            return np.mean(arr[:, active], axis=1, dtype=np.float32)
         return np.mean(arr, axis=1, dtype=np.float32)
     return arr.reshape(-1).astype(np.float32)
 
@@ -66,17 +80,25 @@ class StreamResampler:
     input by half the filter length (~1.3 ms at 48 kHz).
     """
 
-    def __init__(self, source_rate: int, target_rate: int = TARGET_SAMPLE_RATE):
+    def __init__(
+        self,
+        source_rate: int,
+        target_rate: int = TARGET_SAMPLE_RATE,
+        *,
+        trim_delay: bool = False,
+    ):
         self.source_rate = int(source_rate)
         self.target_rate = int(target_rate)
+        self._trim_delay = bool(trim_delay)
         self._step = self.source_rate / self.target_rate
         self._taps = (
             _lowpass_taps(self.source_rate, self.target_rate)
             if self.source_rate > self.target_rate
             else None
         )
+        init_pad = (LOWPASS_TAPS - 1) // 2 if self._trim_delay else (LOWPASS_TAPS - 1)
         self._history = (
-            np.zeros(LOWPASS_TAPS - 1, dtype=np.float32) if self._taps is not None else None
+            np.zeros(init_pad, dtype=np.float32) if self._taps is not None else None
         )
         # Last filtered sample of the previous block, for interpolating across the seam.
         self._last: np.float32 | None = None
@@ -89,6 +111,9 @@ class StreamResampler:
             return block
         if self._taps is not None:
             padded = np.concatenate([self._history, block])
+            if padded.size < LOWPASS_TAPS:
+                self._history = padded
+                return np.zeros(0, dtype=np.float32)
             self._history = padded[-(LOWPASS_TAPS - 1):]
             filtered = np.convolve(padded, self._taps, mode="valid").astype(np.float32)
         else:
@@ -104,6 +129,21 @@ class StreamResampler:
         self._pos = positions[-1] + self._step - end
         self._last = filtered[-1]
         return out
+
+    def flush(self) -> np.ndarray:
+        """Drain remaining FIR filter delay at end-of-file for offline decoders."""
+        if self.source_rate <= 0 or self.source_rate == self.target_rate:
+            return np.zeros(0, dtype=np.float32)
+        tail = np.zeros(0, dtype=np.float32)
+        if self._taps is not None and self._last is not None:
+            half = (LOWPASS_TAPS - 1) // 2
+            tail = self.process(np.zeros(half, dtype=np.float32))
+        init_pad = (LOWPASS_TAPS - 1) // 2 if self._trim_delay else (LOWPASS_TAPS - 1)
+        if self._taps is not None:
+            self._history = np.zeros(init_pad, dtype=np.float32)
+        self._last = None
+        self._pos = 0.0
+        return tail
 
 
 def rms_volume(audio: np.ndarray) -> float:

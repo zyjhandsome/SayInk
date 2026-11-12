@@ -153,24 +153,67 @@ def reassign_turns(
         return max((float(vector @ reference), label) for label, reference in references.items())
 
     manual_rows = [t.key in locked or t.speaker_id in protected for t in usable]
+    counts = {int(l): int(np.sum(labels == l)) for l in np.unique(labels)}
+    seconds = {l: float(durations[labels == l].sum()) for l in counts}
+
+    def _recurring_subsecond_labels(base_founded: set[int]) -> set[int]:
+        # Short (<1s) interjections ("好"/"对"/"没问题") are marked learnable=False
+        # individually so a stray cough cannot seed an online profile, yet a real
+        # second participant who repeatedly answers in <1s clips forms a tight,
+        # distinct cluster over the session and must not stay speaker 0 forever.
+        promoted: set[int] = set()
+        base_refs = {l: centroid(l) for l in base_founded} if base_founded else {}
+        for label in counts:
+            if label in base_founded:
+                continue
+            sub_rows = [
+                i for i, t in enumerate(usable)
+                if int(labels[i]) == label and 0 < t.duration_ms < 1000 and t.speaker_id == 0
+            ]
+            if len(sub_rows) < min_turns:
+                continue
+            center = centroid(label)
+            cohesion = float(np.mean(vectors[sub_rows] @ center))
+            if cohesion < 0.80:
+                continue
+            if base_refs and nearest(center, base_refs)[0] >= DISTINCT_VOICE_SIMILARITY:
+                continue
+            promoted.add(label)
+        return promoted
 
     def established() -> set[int]:
         # A manual correction vouches for its voice even on uncertain audio.
-        return {int(labels[i]) for i, t in enumerate(usable) if t.learnable or manual_rows[i]}
+        base = {int(labels[i]) for i, t in enumerate(usable) if t.learnable or manual_rows[i]}
+        return base | _recurring_subsecond_labels(base)
 
-    counts = {int(l): int(np.sum(labels == l)) for l in np.unique(labels)}
-    seconds = {l: float(durations[labels == l].sum()) for l in counts}
     anchored = {int(labels[i]) for i in range(len(usable)) if manual_rows[i]}
     founded = established()
+    fallback_seed = False
     big = [l for l in counts if l in anchored
            or (l in founded and counts[l] >= min_turns and seconds[l] >= min_seconds)]
+    if not big and founded:
+        # Short meetings where no single cluster reached both min_turns and
+        # min_seconds still need small-cluster folding so one speaker split
+        # across noisy fragments merges instead of proliferating fake speakers.
+        big = [l for l in counts if l in founded and (counts[l] >= min_turns or seconds[l] >= min_seconds)]
+        if not big:
+            big = [max(founded, key=lambda l: (seconds[l], counts[l], -l))]
+            fallback_seed = True
     if big:
         references = {l: centroid(l) for l in big}
         small = sorted(set(counts) - set(big))
         # A recurring or long voice unlike every reference is someone else
         # (an interviewer's few long questions), not a fragment to fold away.
-        kept = [l for l in small if l in founded and (counts[l] >= min_turns or seconds[l] >= min_seconds)
-                and nearest(centroid(l), references)[0] < DISTINCT_VOICE_SIMILARITY]
+        kept = [
+            l for l in small
+            if l in founded
+            and (
+                counts[l] >= min_turns
+                or seconds[l] >= min_seconds
+                or (fallback_seed and (counts[l] >= 2 or seconds[l] >= 2.0))
+            )
+            and nearest(centroid(l), references)[0] < DISTINCT_VOICE_SIMILARITY
+        ]
         references.update({l: centroid(l) for l in kept})
         unlike: list[tuple[int, int]] = []
         for l in small:
@@ -261,11 +304,20 @@ def final_assignments(
 
     Meetings, continuous dictation and the benchmark tools all finish here. A
     session that only ever learned one voice may place its unknown turns with
-    that voice, but the end pass cannot discover new people in it.
+    that voice, unless a recurring sub-second responder spoke only in ``<1s``
+    clips that could not seed an online profile individually.
     """
     turns = [t for t in (getattr(session, "turns", None) or []) if t.key >= 0]
     if not turns:
         return {}
-    limit = MAX_SPEAKERS if int(getattr(session, "speaker_count", 0)) >= 2 else 1
+    subsecond_unknowns = sum(
+        1 for t in turns if 0 < t.duration_ms < 1000 and t.speaker_id == 0 and t.vector is not None
+    )
+    multi_voice_candidates = (
+        int(getattr(session, "speaker_count", 0)) >= 2
+        or len(protected_ids or ()) >= 2
+        or subsecond_unknowns >= MIN_CLUSTER_TURNS
+    )
+    limit = MAX_SPEAKERS if multi_voice_candidates else 1
     return reassign_turns(turns, threshold=threshold, max_speakers=limit,
                           protected_ids=protected_ids, locked_keys=locked_keys)

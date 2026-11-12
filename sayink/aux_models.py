@@ -1,4 +1,4 @@
-"""Meeting helper models (CAM++ speaker embedding, Silero VAD).
+"""Meeting helper models (CAM++ speaker embedding, Silero VAD, speaker-activity).
 
 Which of them are missing, and one sequential downloader shared by the
 会议 page buttons and the first-meeting prompt in :mod:`sayink.app`. The
@@ -9,6 +9,7 @@ its :class:`~sayink.speech_recognizer.ModelDownloadWorker`.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Callable
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
@@ -21,9 +22,10 @@ from sayink.speech_recognizer import (
 )
 
 log = logging.getLogger("SayInk")
+_LEADING_DOWNLOAD_FAIL_RE = re.compile(r"^\s*下载失败\s*[:：]\s*")
 
 
-def missing_aux_models(*, include_optional: bool = False) -> list[dict]:
+def missing_aux_models(*, include_optional: bool = True) -> list[dict]:
     """Registry entries of helper models not yet on disk, in registry order."""
     return [m for m in AUX_MODEL_REGISTRY if (include_optional or not m.get("optional"))
             and not is_model_downloaded(m["id"])]
@@ -92,7 +94,7 @@ class AuxModelDownloads(QObject):
         if self.running:
             return False
         wanted = set(model_ids) if model_ids is not None else None
-        missing = missing_aux_models() if wanted is None else missing_aux_models(include_optional=True)
+        missing = missing_aux_models(include_optional=True)
         self._queue = [m for m in missing if wanted is None or m["id"] in wanted]
         if not self._queue:
             return False
@@ -169,5 +171,6 @@ class AuxModelDownloads(QObject):
             self.finished.emit(False, "已取消")
             return
         name = str((current or {}).get("name") or "")
-        log.warning("会议辅助模型 %s 下载失败: %s", name, message)
-        self.finished.emit(False, f"{name} 下载失败：{message}" if name else str(message))
+        clean_msg = _LEADING_DOWNLOAD_FAIL_RE.sub("", str(message or "")).strip() or str(message or "")
+        log.warning("会议辅助模型 %s 下载失败: %s", name, clean_msg)
+        self.finished.emit(False, f"{name} 下载失败：{clean_msg}" if name else clean_msg)

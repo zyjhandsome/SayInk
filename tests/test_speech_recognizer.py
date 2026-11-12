@@ -1456,7 +1456,8 @@ class TestModelDownloadSources:
         assert done == []
         assert errors and "不完整" in errors[0]
         assert not (tmp_path / "tiny" / "a.bin").exists()
-        assert not (tmp_path / "tiny" / "a.bin.tmp").exists()
+        # .tmp is preserved so the next attempt can HTTP Range resume from byte 4.
+        assert (tmp_path / "tiny" / "a.bin.tmp").read_bytes() == b"half"
 
     def test_a_corrupt_leftover_is_replaced_instead_of_kept(self, monkeypatch, tmp_path):
         """An empty stub / wrong-content file in the models dir used to be

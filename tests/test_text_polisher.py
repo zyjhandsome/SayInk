@@ -1270,8 +1270,6 @@ class TestStreamRecovery:
         _resp, ctx = _stream_response((
             'data: {"choices":[{"delta":{"content":"半"},"finish_reason":null}]}',
             "",
-            "data: [DONE]",
-            "",
         ))
         return ctx
 
@@ -1285,6 +1283,16 @@ class TestStreamRecovery:
             "",
         ))
         return ctx
+
+    def test_done_without_stop_finish_reason_is_accepted(self):
+        fake, client = _fake_httpx_module()
+        _resp, ctx = _stream_response((
+            'data: {"choices":[{"delta":{"content":"正常完成"},"finish_reason":null}]}',
+            "",
+            "data: [DONE]",
+            "",
+        ))
+        assert _call_stream(client, fake, [ctx]) == "正常完成"
 
     def test_an_unfinished_stream_is_retried_once(self):
         from sayink.text_polisher import LLMBrokenStream

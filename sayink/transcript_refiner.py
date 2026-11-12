@@ -159,24 +159,53 @@ def split_refinement_units(units: Sequence[RefinementUnit]) -> tuple[list[Refine
 
 
 _ENGLISH = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:[._+#/-][A-Za-z0-9]+)*")
+_ENGLISH_SPOKEN_FILLERS = frozenset(
+    {"ok", "okay", "um", "uh", "hmm", "ah", "oh", "eh", "yeah", "yep", "well"}
+)
 _NEGATION = re.compile(r"不|没|未|无|别|\b(?:not|never|no|cannot)\b|n't", re.I)
 _NON_NEGATING = re.compile(
     r"不同意见|不同观点|不同看法|不同立场|不同声音|不过|不仅|不但|无论|未来|无线|"
-    r"特别|区别|分别|类别|级别|告别|识别|性别|别人|别的"
+    r"特别|区别|分别|类别|级别|告别|识别|性别|别人|别的|"
+    r"没事|没关系|不要紧|不客气|不用谢|不好意思|不得不|不禁|不妨|不免|不愧|不料|"
+    r"差不多|说不定|巴不得|怪不得|恨不得|怨不得|了不起|对不起|八九不离十|不三不四"
+)
+_A_NOT_A = re.compile(
+    r"有没有|可不可以|方不方便|清不清楚|明不明白|知不知道|高不高兴|满不满意|同不同意|愿不愿意|"
+    r"(?![不没别未无非勿莫])([\u4e00-\u9fff])不\1"
 )
 _QUALIFIER = re.compile(r"可能|也许|大概|暂时|建议|考虑|如果|除非")
 _FORMATTING = re.compile(r"(?m)^\s*(?:#{1,6}\s|[-*+]\s|\d+[.)、]\s|```|\||说话人\s*\d+\s*[:：]|\[\d\d:\d\d:\d\d\])")
 _FILLER = re.compile(r"(?:嗯|啊|呃|额|唔|哦|噢|那个|就是说|大家好|你好|谢谢|再见)+")
+_STUTTER_SEP = r"(?:[\s，,、…—-]|嗯+|啊+|呃+|额+|那个|就是说|就是)+"
+_QUALIFIER_STUTTER_RE = re.compile(rf"(可能|也许|大概|暂时|建议|考虑|如果|除非){_STUTTER_SEP}\1")
+_CN_PREFIX_STUTTER_RE = re.compile(r"([一二两三四五六七八九])(?:[\s，,、…—-])+\1([十百千万亿])")
+_NUM_UNIT_STUTTER_RE = re.compile(
+    rf"((?:[+-]?\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百千万亿]+)"
+    rf"(?:万|亿|千|百|十|元|块|个|人|天|月|年|点|%|％)?){_STUTTER_SEP}\1"
+)
 
 
 def _compact(text: str) -> str:
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
 
 
+def _collapse_spoken_stutters(text: str) -> str:
+    """Collapse immediate back-to-back spoken stutters while keeping distinct clauses intact."""
+    prev = None
+    out = text
+    while out != prev:
+        prev = out
+        out = _CN_PREFIX_STUTTER_RE.sub(r"\1\2", out)
+        out = _NUM_UNIT_STUTTER_RE.sub(r"\1", out)
+        out = _QUALIFIER_STUTTER_RE.sub(r"\1", out)
+    return out
+
+
 def _negation_count(text: str) -> int:
-    # Written transitions such as 不过 / 不同意见 do not negate a fact.
-    text = _NON_NEGATING.sub("", text)
-    text = re.sub(r"([不没未无别])(?:[、，,]*\1)+", r"\1", text)
+    # Written transitions, polite phrases, and A-not-A questions do not negate a fact.
+    text = _NON_NEGATING.sub(" ", text)
+    text = _A_NOT_A.sub(" ", text)
+    text = re.sub(r"([不没未无别])(?:[、，,\s]*\1)+", r"\1", text)
     return len(_NEGATION.findall(text))
 
 
@@ -198,7 +227,9 @@ def validate_refinement(payload: dict | None, units: Sequence[RefinementUnit]) -
         seen.extend(ids)
         original = unicodedata.normalize("NFKC", "\n".join(texts[i] for i in ids))
         rewritten = unicodedata.normalize("NFKC", text)
+        dedup_original = _collapse_spoken_stutters(original)
         source = _compact(original)
+        dedup_source = _compact(dedup_original)
         edited = _compact(text)
         if not edited:
             words = re.sub(r"[\W_]+", "", source)
@@ -208,30 +239,42 @@ def validate_refinement(payload: dict | None, units: Sequence[RefinementUnit]) -
             raise RefinementValidationError("正文包含标题、列表或对话标签")
         if any(len(_compact(p)) > 800 for p in re.split(r"\n\s*\n", text)):
             raise RefinementValidationError("段落过长，请按话题细分段落")
-        source_numbers = Counter(normalized_number_tokens(original))
+        raw_numbers = Counter(normalized_number_tokens(original))
+        dedup_numbers = Counter(normalized_number_tokens(dedup_original))
         edited_numbers = Counter(normalized_number_tokens(rewritten))
-        if source_numbers != edited_numbers:
-            missing = list((source_numbers - edited_numbers).elements())[:12]
-            extra = list((edited_numbers - source_numbers).elements())[:12]
+        numbers_valid = all(
+            dedup_numbers[tok] <= edited_numbers[tok] <= raw_numbers[tok]
+            for tok in (set(raw_numbers) | set(edited_numbers))
+        )
+        if not numbers_valid:
+            missing = list((dedup_numbers - edited_numbers).elements())[:12]
+            extra = list((edited_numbers - raw_numbers).elements())[:12]
             raise RefinementValidationError("数字或单位被改动", retry_hint=(
                 f"数字或单位被改动；必须恢复：{json.dumps(missing, ensure_ascii=False)}；"
-                f"不得新增：{json.dumps(extra, ensure_ascii=False)}。重复出现的数字也要按原话完整保留。"
+                f"不得新增：{json.dumps(extra, ensure_ascii=False)}。非口吃的独立数字需按原话完整保留。"
             ))
         source_names = {n.casefold() for n in _ENGLISH.findall(original)}
         edited_names = {n.casefold() for n in _ENGLISH.findall(rewritten)}
-        if source_names != edited_names:
+        missing_names = (source_names - edited_names) - _ENGLISH_SPOKEN_FILLERS
+        extra_names = edited_names - source_names
+        if missing_names or extra_names:
             raise RefinementValidationError("英文名称被改动")
         if _negation_count(original) != _negation_count(rewritten):
             raise RefinementValidationError("否定表达被改动")
-        source_qualifiers = Counter(_QUALIFIER.findall(source))
+        raw_qualifiers = Counter(_QUALIFIER.findall(source))
+        dedup_qualifiers = Counter(_QUALIFIER.findall(dedup_source))
         edited_qualifiers = Counter(_QUALIFIER.findall(edited))
-        if source_qualifiers != edited_qualifiers:
-            missing = list((source_qualifiers - edited_qualifiers).elements())[:12]
-            extra = list((edited_qualifiers - source_qualifiers).elements())[:12]
+        qualifiers_valid = all(
+            dedup_qualifiers[q] <= edited_qualifiers[q] <= raw_qualifiers[q]
+            for q in (set(raw_qualifiers) | set(edited_qualifiers))
+        )
+        if not qualifiers_valid:
+            missing = list((dedup_qualifiers - edited_qualifiers).elements())[:12]
+            extra = list((edited_qualifiers - raw_qualifiers).elements())[:12]
             raise RefinementValidationError("条件或不确定性表达被改动", retry_hint=(
                 "条件或不确定性表达被改动；必须恢复："
                 f"{json.dumps(missing, ensure_ascii=False)}；不得新增："
-                f"{json.dumps(extra, ensure_ascii=False)}。重复的限定词也要按原话保留。"
+                f"{json.dumps(extra, ensure_ascii=False)}。非口吃重复的限定词需按原话保留。"
             ))
         if len(source) >= 80 and len(edited) < len(source) * 0.65:
             raise RefinementValidationError("内容被大幅压缩")

@@ -21,6 +21,11 @@ import numpy as np
 
 from sayink.audio_utils import MAX_SEGMENT_SEC, TARGET_SAMPLE_RATE
 from sayink.meeting_speakers import voice_sample_is_clear
+from sayink.speaker_session import normalize_far_field_voice
+
+
+def _clear_voice(audio: np.ndarray) -> bool:
+    return voice_sample_is_clear(normalize_far_field_voice(audio))
 
 WINDOW_SEC = 1.2
 HOP_SEC = 0.4
@@ -83,7 +88,11 @@ def analyze_turns(audio: np.ndarray, analyzer, *, cancelled=None) -> list[Speake
         if valid:
             return turns
         log.warning("换人分段未完整覆盖原音频，退回完整片段")
+    except InterruptedError:
+        return []
     except Exception as exc:
+        if cancelled is not None and cancelled():
+            return []
         log.warning("换人检测失败，保留完整语音并暂不判断说话人: %s", exc)
     return [SpeakerTurn(0, len(audio), np.zeros(1, dtype=np.float32), False)]
 
@@ -254,6 +263,8 @@ class SpeakerTurnDetector:
     def _embed_or_none(self, audio):
         try:
             return _vector(self._embed(audio))
+        except InterruptedError:
+            raise
         except Exception as exc:
             now = time.monotonic()
             if now - self._embed_warned_at >= 30:
@@ -267,7 +278,11 @@ class SpeakerTurnDetector:
         self.activity_checks += 1
         try:
             return self._activity_guard.is_unsafe(audio, cancelled=cancelled)
+        except InterruptedError:
+            raise
         except Exception as exc:
+            if cancelled is not None and cancelled():
+                raise InterruptedError("speaker activity check cancelled") from exc
             # A failed configured check must not silently approve training.
             log.warning("多人发言检测失败，本段保留文字识别并阻止声纹入库: %s", exc)
             return True
@@ -283,7 +298,7 @@ class SpeakerTurnDetector:
         """
         vector = None if mixed else self._embed_or_none(audio)
         return [SpeakerTurn(0, len(audio), vector if vector is not None else np.zeros(1, dtype=np.float32),
-                            vector is not None and not uncertain and voice_sample_is_clear(audio))]
+                            vector is not None and not uncertain and _clear_voice(audio))]
 
     def _verified_sequential_turns(self, audio, cuts, *, cancelled=None) -> list[SpeakerTurn] | None:
         minimum = int(MIN_ACTIVITY_VERIFY_SEC * TARGET_SAMPLE_RATE)
@@ -318,7 +333,7 @@ class SpeakerTurnDetector:
     ):
         if not self._strict_activity:
             vector = self._embed_or_none(audio)
-            clear = vector is not None and voice_sample_is_clear(audio)
+            clear = vector is not None and _clear_voice(audio)
             if not clear:
                 return [
                     SpeakerTurn(
@@ -342,6 +357,8 @@ class SpeakerTurnDetector:
                 self.activity_checks += 1
                 try:
                     evidence = analyze(audio, cancelled=cancelled)
+                except InterruptedError:
+                    return []
                 except Exception as exc:
                     if cancelled is not None and cancelled():
                         return []
@@ -358,7 +375,10 @@ class SpeakerTurnDetector:
                     if verified is not None:
                         return verified
                 return [SpeakerTurn(0, len(audio), vector, not (uncertain or evidence.unsafe))]
-            unsafe = self._activity_unsafe(audio, cancelled=cancelled)
+            try:
+                unsafe = self._activity_unsafe(audio, cancelled=cancelled)
+            except InterruptedError:
+                return []
             return [SpeakerTurn(0, len(audio), vector, not (uncertain or unsafe))]
 
         analyze = getattr(self._activity_guard, "analyze", None)
@@ -371,13 +391,18 @@ class SpeakerTurnDetector:
                     return self._activity_turns(audio, evidence, cancelled=cancelled, allow_cuts=allow_cuts)
                 return self._plain_single(audio, uncertain=uncertain or evidence.unsafe,
                                           mixed=bool(evidence.overlaps))
+            except InterruptedError:
+                return []
             except Exception as exc:
                 if cancelled is not None and cancelled():
                     return []
                 log.warning("局部发言检测失败，本段说话人待确认: %s", exc)
                 return self._plain_single(audio, uncertain=True, mixed=True)
-        if self._activity_guard is not None and self._activity_unsafe(audio, cancelled=cancelled):
-            return self._plain_single(audio, uncertain=True, mixed=True)
+        try:
+            if self._activity_guard is not None and self._activity_unsafe(audio, cancelled=cancelled):
+                return self._plain_single(audio, uncertain=True, mixed=True)
+        except InterruptedError:
+            return []
         return self._plain_single(audio, uncertain=uncertain)
 
     def _activity_turns(self, audio, evidence, *, cancelled=None, allow_cuts=True):
@@ -503,7 +528,7 @@ class SpeakerTurnDetector:
         probe_size = int(MIN_TURN_SEC * rate)
         if (not first.learnable or first.stop < 2 * minimum
                 or first.stop > int(CONTEXT_HEAD_SEC * rate)
-                or not voice_sample_is_clear(prefix)):
+                or not _clear_voice(prefix)):
             return turns
 
         def vector(clip):
@@ -521,8 +546,11 @@ class SpeakerTurnDetector:
         tail = vector(samples[first.stop - minimum:first.stop])
         if tail is None or tail.size != old.size or float(tail @ following) < STABLE_SIMILARITY:
             return turns
-        if self._activity_unsafe(prefix, cancelled=cancelled):
-            return turns
+        try:
+            if self._activity_unsafe(prefix, cancelled=cancelled):
+                return turns
+        except InterruptedError:
+            return []
         step = int(SHORT_CONTEXT_STEP_SEC * rate)
         candidates = []
         previous = None
@@ -560,12 +588,17 @@ class SpeakerTurnDetector:
                         self.activity_checks += 1
                         try:
                             unsafe = analyze(samples[start:stop], cancelled=cancelled).unsafe
+                        except InterruptedError:
+                            return []
                         except Exception:
                             if cancelled is not None and cancelled():
                                 return []
                             unsafe = True
                     else:
-                        unsafe = self._activity_unsafe(samples[start:stop], cancelled=cancelled)
+                        try:
+                            unsafe = self._activity_unsafe(samples[start:stop], cancelled=cancelled)
+                        except InterruptedError:
+                            return []
                     if unsafe:
                         self.context_action = "short_abstain"
                         return [SpeakerTurn(0, first.stop, fallback_vec, False), *turns[1:]]
@@ -607,7 +640,7 @@ class SpeakerTurnDetector:
             if cancelled is not None and cancelled():
                 return []
             piece = samples[start:start + window]
-            vector = self._embed_or_none(piece) if voice_sample_is_clear(piece) else None
+            vector = self._embed_or_none(piece) if _clear_voice(piece) else None
             if vector is not None and anchors and vector.size != anchors[0].size:
                 vector = None
             vectors.append(vector)

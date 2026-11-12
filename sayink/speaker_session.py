@@ -62,6 +62,52 @@ def _mel_filterbank(sample_rate: int) -> np.ndarray:
 
 
 _MEL_BANK = _mel_filterbank(TARGET_SAMPLE_RATE)
+_FAR_FIELD_TARGET_P90 = 0.03
+_FAR_FIELD_MAX_GAIN = 32.0
+_FAR_FIELD_PEAK_CEIL = 0.90
+
+
+def normalize_far_field_voice(
+    audio: np.ndarray,
+    *,
+    sample_rate: int = TARGET_SAMPLE_RATE,
+) -> np.ndarray:
+    """Align quiet/far-field speech gain with VAD/ASR while leaving steady hum unboosted.
+
+    VAD and ASR boost quiet speech up to 32x, whereas raw far-field clips often
+    sit at 0.001–0.004 RMS. Requiring syllable-level envelope modulation
+    (``p90 >= max(p20 * 2.5, noise_floor * 2.0)``) lifts genuine quiet speech
+    above clarity thresholds without turning steady tones or fan noise into
+    speaker embeddings.
+    """
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if samples.size == 0 or not np.all(np.isfinite(samples)):
+        return samples
+    frame_len = max(1, int(sample_rate * 0.020))
+    n_frames = samples.size // frame_len
+    if n_frames < 4:
+        return samples
+    framed = samples[: n_frames * frame_len].reshape(n_frames, frame_len)
+    frame_rms = np.sqrt(np.mean(framed * framed, axis=1))
+    high = float(np.percentile(frame_rms, 90))
+    if not (0.00015 <= high < 0.018):
+        return samples
+    low = float(np.percentile(frame_rms, 20))
+    raw_floor = getattr(audio, "noise_floor", None)
+    eff_floor = (
+        max(0.0, float(raw_floor))
+        if raw_floor is not None and np.isfinite(raw_floor)
+        else low
+    )
+    if high < max(low * 2.5, eff_floor * 2.0, 0.00015):
+        return samples
+    peak = float(np.max(np.abs(samples)))
+    if peak <= 1e-7:
+        return samples
+    gain = min(_FAR_FIELD_MAX_GAIN, _FAR_FIELD_TARGET_P90 / high, _FAR_FIELD_PEAK_CEIL / peak)
+    if gain <= 1.05:
+        return samples
+    return (samples * np.float32(gain)).astype(np.float32, copy=False)
 
 
 def voice_embedding(audio: np.ndarray) -> np.ndarray:
@@ -73,7 +119,7 @@ def voice_embedding(audio: np.ndarray) -> np.ndarray:
     fixed 512-point FFT silently truncated their longer frames.
     """
     sample_rate = TARGET_SAMPLE_RATE
-    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    samples = normalize_far_field_voice(audio, sample_rate=sample_rate)
     empty = np.zeros(_EMBED_DIM, dtype=np.float32)
     if samples.size < sample_rate // 10:
         return empty
@@ -109,6 +155,7 @@ class _Cluster:
     def __init__(self, speaker_id: int, route: str, centroid: np.ndarray):
         self.speaker_id = speaker_id
         self.route = route
+        self.route_counts: dict[str, int] = {route: 1} if route in ("mic", "system") else {}
         self.centroid = centroid
         self.count = 1
 
@@ -143,6 +190,7 @@ class SpeakerSession:
         self._lock = threading.RLock()
         self._next_id = 1
         self._last_id = 0
+        self._last_id_by_route: dict[str, int] = {}
         self._last_end_ms = 0
         self._threshold = float(threshold)
         self._max_speakers = int(max_speakers)
@@ -177,6 +225,7 @@ class SpeakerSession:
             self._clusters.clear()
             self._next_id = 1
             self._last_id = 0
+            self._last_id_by_route.clear()
             self._last_end_ms = 0
             self._history.clear()
 
@@ -205,6 +254,14 @@ class SpeakerSession:
         route = route if route in ("mic", "system") else ""
         vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
         if vector.size == 0 or float(np.linalg.norm(vector)) < 1e-6:
+            if route:
+                if route in self._last_id_by_route:
+                    return self._last_id_by_route[route]
+                same_route = next((c.speaker_id for c in self._clusters if c.route == route), 0)
+                if same_route:
+                    return same_route
+                if self._clusters and all(c.route and c.route != route for c in self._clusters):
+                    return 0
             if self._last_id:
                 return self._last_id
             return 1
@@ -229,6 +286,8 @@ class SpeakerSession:
         speaker_id = self.reserve_speaker_id()
         self._clusters.append(_Cluster(speaker_id, route, vector.copy()))
         self._last_id = speaker_id
+        if route:
+            self._last_id_by_route[route] = speaker_id
         return speaker_id
 
     def _sticky_match(self, vector: np.ndarray, route: str, start_ms: int) -> _Cluster | None:
@@ -273,8 +332,19 @@ class SpeakerSession:
         norm = float(np.linalg.norm(mixed))
         cluster.centroid = mixed / norm if norm >= 1e-6 else vector
         cluster.count += 1
-        if route and not cluster.route:
-            cluster.route = route
+        if route in ("mic", "system"):
+            cluster.route_counts[route] = cluster.route_counts.get(route, 0) + 1
+            mic_n = cluster.route_counts.get("mic", 0)
+            sys_n = cluster.route_counts.get("system", 0)
+            if mic_n >= 2 and mic_n >= sys_n * 2:
+                cluster.route = "mic"
+            elif sys_n >= 2 and sys_n >= mic_n * 2:
+                cluster.route = "system"
+            elif mic_n > 0 and sys_n > 0:
+                cluster.route = ""
+            elif not cluster.route:
+                cluster.route = route
+            self._last_id_by_route[route] = cluster.speaker_id
         self._last_id = cluster.speaker_id
 
 

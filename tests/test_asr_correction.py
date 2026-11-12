@@ -143,7 +143,8 @@ class TestCorrectionGuard:
         # a milder expansion falls through to correction's own length budget.
         assert correction_rejection_reason("今天增送一套", "好的，今天赠送一套，还有什么需要帮忙的吗？") == "长度异常"
         assert correction_rejection_reason("今天增送一套房子给你", "今天赠送一套房子给你，请查收并确认。") == "长度变化过大"
-        assert correction_rejection_reason("这个问题怎么解决", "可以先重启试试") == "改动过多"
+        assert correction_rejection_reason("这个问题怎么解决", "可以先重启试试") == "疑似应答而非编辑"
+        assert correction_rejection_reason("今天天气真是好", "完全换了一句话") == "改动过多"
 
     def test_rejects_polish_style_filler_removal(self):
         # Removing 嗯/那个 is polish, not correction: the sentence must stay.
@@ -222,8 +223,11 @@ class TestCorrectionMode:
     def test_polish_request_is_unchanged(self):
         worker = PolishWorker("https://api.deepseek.com/v1", "k", "deepseek-flash", "文本")
         assert not worker.is_correction
-        assert worker.user_message() == "文本"
-        assert worker.request_options() == {"temperature": 0.3, "extra_payload": {}}
+        assert worker.user_message() == "<transcript>\n文本\n</transcript>"
+        assert worker.request_options() == {
+            "temperature": 0.3,
+            "extra_payload": {"thinking": {"type": "disabled"}},
+        }
         assert worker._action_label == "润色"
 
     def test_run_posts_the_correction_payload(self):

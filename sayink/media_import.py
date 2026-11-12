@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -206,18 +207,25 @@ def recognize_file(
     vad: str,
     vad_path,
     cancel,
-    progress,
+    progress=None,
     glossary=(),
+    progress_cb: Callable[[int, str], None] | None = None,
 ) -> RecognitionResult:
     """Read ``path`` in place and recognize it with the meeting segmenter."""
     from sayink.audio_file_decoder import AudioDecodeError
     from sayink.meeting_speakers import MeetingSpeakerSession
     from sayink.speaker_embedding import make_embedder
 
+    def _emit_decode_progress(pct: int, msg: str) -> None:
+        if progress_cb is not None:
+            progress_cb(min(30, max(0, int(pct * 30 // 100))), msg)
+
     if cancel is not None and cancel():
         return RecognitionResult((), True)
     source = Path(path)
     audio_ms = 0
+    if progress_cb is not None:
+        progress_cb(0, "正在解码音频...")
     if source.suffix.lower() == ".wav" and source.is_file():
         from sayink.audio_file_decoder import iter_wav_pcm
 
@@ -225,7 +233,8 @@ def recognize_file(
 
         def timed_blocks():
             nonlocal total
-            for block in iter_wav_pcm(source, cancel=cancel):
+            cb = _emit_decode_progress if progress_cb is not None else None
+            for block in iter_wav_pcm(source, cancel=cancel, progress_cb=cb):
                 total += int(block.size)
                 yield block
 
@@ -240,19 +249,32 @@ def recognize_file(
         finally:
             blocks.close()
         audio_ms = int(total * 1000 / TARGET_SAMPLE_RATE)
+        read_msg = f"已读取 {audio_ms / 1000:.0f} 秒音频"
         if progress is not None:
-            progress(f"已读取 {audio_ms / 1000:.0f} 秒音频")
+            progress(read_msg)
+        if progress_cb is not None:
+            progress_cb(30, read_msg)
         if cancel is not None and cancel():
             return RecognitionResult((), True, audio_ms=audio_ms)
     else:
         try:
-            audio = decode_audio_file(path, cancel=cancel)
+            if progress_cb is not None:
+                try:
+                    audio = decode_audio_file(path, cancel=cancel, progress_cb=_emit_decode_progress)
+                except TypeError:
+                    # Support 2-arg monkeypatched decode_audio_file stubs in unit tests.
+                    audio = decode_audio_file(path, cancel=cancel)
+            else:
+                audio = decode_audio_file(path, cancel=cancel)
         except AudioDecodeError as exc:
             if "已取消" in str(exc):
                 return RecognitionResult((), True)
             raise
+        read_msg = f"已读取 {audio.size / TARGET_SAMPLE_RATE:.0f} 秒音频"
         if progress is not None:
-            progress(f"已读取 {audio.size / TARGET_SAMPLE_RATE:.0f} 秒音频")
+            progress(read_msg)
+        if progress_cb is not None:
+            progress_cb(30, read_msg)
         chunks = segment_pcm(audio, vad=vad, vad_path=vad_path, cancel=cancel)
         audio_ms = int(audio.size * 1000 / TARGET_SAMPLE_RATE)
     available = bool(speaker_path and Path(speaker_path).is_file())
@@ -269,13 +291,21 @@ def recognize_file(
             raise AudioDecodeError(error)
         return turns
 
+    def _on_chunk_progress(done: int, total_chunks: int) -> None:
+        msg = f"正在识别 {done}/{total_chunks} 段"
+        if progress is not None:
+            progress(msg)
+        if progress_cb is not None:
+            pct = 30 + int(70 * done // max(1, total_chunks))
+            progress_cb(min(100, max(30, pct)), msg)
+
     result = recognize_with_session(
         chunks,
         decode_chunk,
         session,
         threshold=float(embedder.cluster_threshold),
         cancel=cancel,
-        progress=(lambda done, total: progress(f"正在识别 {done}/{total} 段")) if progress is not None else None,
+        progress=_on_chunk_progress if (progress is not None or progress_cb is not None) else None,
     )
     if result.error and not result.turns:
         raise AudioDecodeError(result.error)
@@ -288,4 +318,6 @@ def recognize_file(
             replace(turn, text=apply_glossary_variants(restore_glossary_case(turn.text, glossary), glossary))
             for turn in result.turns
         ))
+    if progress_cb is not None and not result.cancelled:
+        progress_cb(100, "识别完成")
     return result
