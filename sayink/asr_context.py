@@ -7,19 +7,50 @@ import numpy as np
 from sayink.audio_utils import TARGET_SAMPLE_RATE
 
 CONTEXT_SAMPLES = int(0.3 * TARGET_SAMPLE_RATE)
+CTC_BOUNDARY_EPSILON_SEC = 1e-4
+CTC_END_SLACK_SEC = 0.03
 
 
 class ContextAudio(np.ndarray):
     """The array owns only its original samples; padding is separate metadata."""
+
     def __array_finalize__(self, source):
-        self.prefix = np.zeros(0, np.float32)
-        self.suffix = np.zeros(0, np.float32)
+        if source is None:
+            self.prefix = np.zeros(0, np.float32)
+            self.suffix = np.zeros(0, np.float32)
+            self.noise_floor = None
+            self.quiet_level = 0.0
+            return
+        self.noise_floor = getattr(source, "noise_floor", None)
+        self.quiet_level = float(getattr(source, "quiet_level", 0.0) or 0.0)
+        if isinstance(source, ContextAudio) and self.shape == source.shape:
+            self.prefix = np.asarray(getattr(source, "prefix", ()), dtype=np.float32)
+            self.suffix = np.asarray(getattr(source, "suffix", ()), dtype=np.float32)
+        else:
+            self.prefix = np.zeros(0, np.float32)
+            self.suffix = np.zeros(0, np.float32)
+
+    def __getitem__(self, key):
+        item = super().__getitem__(key)
+        if isinstance(item, ContextAudio) and isinstance(key, slice) and self.ndim == 1:
+            start, stop, step = key.indices(len(self))
+            if step == 1:
+                item.prefix = self.prefix if start == 0 else np.zeros(0, np.float32)
+                item.suffix = self.suffix if stop == len(self) else np.zeros(0, np.float32)
+            else:
+                item.prefix = np.zeros(0, np.float32)
+                item.suffix = np.zeros(0, np.float32)
+        return item
 
 
 def with_context(audio, prefix=None, suffix=None):
+    noise_floor = getattr(audio, "noise_floor", None)
+    quiet_level = float(getattr(audio, "quiet_level", 0.0) or 0.0)
     result = np.asarray(audio, dtype=np.float32).view(ContextAudio)
     result.prefix = np.asarray(prefix, dtype=np.float32) if prefix is not None else np.zeros(0, np.float32)
     result.suffix = np.asarray(suffix, dtype=np.float32) if suffix is not None else np.zeros(0, np.float32)
+    result.noise_floor = noise_floor
+    result.quiet_level = quiet_level
     return result
 
 
@@ -75,6 +106,16 @@ class BoundaryContextBuffer:
         return ready
 
 
+def _is_ascii_word_continuation(prev_token: str, token: str) -> bool:
+    """True when ``token`` continues an ASCII word started in ``prev_token``."""
+    if not prev_token or not token or token[0].isspace():
+        return False
+    prev_tail = prev_token.rstrip()
+    if not prev_tail or prev_tail != prev_token:
+        return False
+    return prev_tail[-1].isascii() and prev_tail[-1].isalnum() and token[0].isascii() and token[0].isalnum()
+
+
 def decode_owned_context(recognizer, audio, normalize, *, sample_rate=TARGET_SAMPLE_RATE, prepare=None):
     """Return None on unsupported/invalid alignment, so original audio wins.
 
@@ -98,8 +139,10 @@ def decode_owned_context(recognizer, audio, normalize, *, sample_rate=TARGET_SAM
         times = np.asarray(getattr(result, "timestamps", ()), dtype=float)
     except (TypeError, ValueError):
         return None
+    window_dur = len(window) / sample_rate
     if (not tokens or times.ndim != 1 or len(tokens) != len(times) or not np.all(np.isfinite(times))
-            or np.any(np.diff(times) < 0) or times[0] < 0 or times[-1] > len(window) / sample_rate):
+            or np.any(np.diff(times) < -1e-6) or times[0] < -CTC_BOUNDARY_EPSILON_SEC
+            or times[-1] > window_dur + CTC_END_SLACK_SEC):
         return None
     clean_tokens = [str(token).replace("▁", " ").replace("Ġ", " ") for token in tokens]
     # Decimal points, minus signs and punctuation must also be covered.
@@ -107,6 +150,18 @@ def decode_owned_context(recognizer, audio, normalize, *, sample_rate=TARGET_SAM
     core = lambda text: "".join(ch.lower() for ch in normalize(text) if not ch.isspace())
     if core("".join(clean_tokens)) != core(result.text):
         return None
-    start, stop = len(prefix) / sample_rate, (len(prefix) + len(audio)) / sample_rate
-    owned = [token for token, timestamp in zip(clean_tokens, times, strict=True) if start <= timestamp < stop]
+    # Group ASCII BPE/SentencePiece continuation pieces with their word onset so
+    # a single Latin word straddling a forced-cut boundary is neither split nor duplicated.
+    effective_times = times.copy()
+    for idx in range(1, len(clean_tokens)):
+        if _is_ascii_word_continuation(clean_tokens[idx - 1], clean_tokens[idx]):
+            effective_times[idx] = effective_times[idx - 1]
+    start = len(prefix) / sample_rate
+    stop = (len(prefix) + len(audio)) / sample_rate
+    lo = start - CTC_BOUNDARY_EPSILON_SEC if len(prefix) else -CTC_END_SLACK_SEC
+    hi = stop - CTC_BOUNDARY_EPSILON_SEC if len(suffix) else stop + CTC_END_SLACK_SEC
+    if len(suffix):
+        owned = [token for token, ts in zip(clean_tokens, effective_times, strict=True) if lo <= ts < hi]
+    else:
+        owned = [token for token, ts in zip(clean_tokens, effective_times, strict=True) if lo <= ts <= hi]
     return normalize("".join(owned))

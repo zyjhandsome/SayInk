@@ -1,3 +1,4 @@
+import gc
 import hashlib
 import logging
 import re
@@ -37,8 +38,17 @@ _ASR_TAG_PATTERNS = (
 # is speech and stays.
 _ASR_META_TOKEN_PATTERN = re.compile(r"<\s*/?\s*(\|?)([A-Za-z_][A-Za-z0-9_\-]*)\|?\s*/?\s*>")
 _ASR_MARKER_WORDS = frozenset({
-    "sil", "unk", "blank", "pad", "eos", "sos", "bos", "s", "nospeech", "speech",
+    "sil", "unk", "blank", "pad", "eos", "sos", "bos", "nospeech", "speech",
     "noise", "music", "laughter", "event", "asr_text", "withitn", "woitn",
+})
+# Bare <tag> language markers actually emitted by FireRedASR2 / sherpa tokens.txt
+# without pipes. Ambiguous HTML/XML tag names like <tr>, <th>, <s>, <id>, <ms>,
+# <br>, <it>, <de> are intentionally excluded here so polished/dictated markup
+# survives intact (pipe-wrapped <|tr|> / <|id|> and hyphenated <tr-TR> / <id-ID>
+# locale tags are still stripped).
+_ASR_BARE_LANG_CODES = frozenset({
+    "zh", "en", "ja", "ko", "yue", "cmn", "wuu", "nan", "hak",
+    "jpn", "kor", "eng", "zho", "chi",
 })
 _ASR_LANG_CODES = frozenset({
     "zh", "en", "ja", "ko", "yue", "de", "fr", "es", "it", "pt", "ru", "ar", "hi",
@@ -75,7 +85,7 @@ def _is_asr_meta_token(match: re.Match) -> bool:
     if "-" in word or "_" in word:
         base = re.split(r"[-_]", word)[0].lower()
         return base in _ASR_LANG_CODES and bool(_ASR_LANG_TAG_RE.match(word))
-    return lowered in _ASR_LANG_CODES
+    return lowered in _ASR_BARE_LANG_CODES
 
 
 def _strip_meta_tokens(text: str) -> tuple[str, bool]:
@@ -188,7 +198,8 @@ def plan_audio_slices(
     With ``cut_at_quiet`` each boundary is pulled back to the quietest frame of
     the last SLICE_CUT_SEARCH_SEC so the joins fall between words.
     """
-    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if not (isinstance(audio, np.ndarray) and audio.dtype == np.float32 and audio.ndim == 1):
+        audio = np.asanyarray(audio, dtype=np.float32).reshape(-1)
     if audio.size == 0:
         return []
     slice_len = max(1, int(round(slice_sec * sample_rate)))
@@ -218,6 +229,13 @@ def plan_audio_slices(
 
 
 FUZZY_OVERLAP_MIN_CHARS = 6
+# Numerals, ordinals, directional/temporal contrasts and negations must match
+# verbatim in fuzzy overlap so parallel phrases like "2026年一月…" + "2026年二月…"
+# or "第一阶段任务" + "第二阶段任务" are never treated as duplicate overlap.
+_NO_FUZZY_MISMATCH_CHARS = frozenset(
+    "0123456789零一二两三四五六七八九十壹贰叁肆伍陆柒捌玖拾"
+    "甲乙丙丁戊己庚辛壬癸前后上下左右早晚初末男女是否不没无非"
+)
 
 
 def merge_slice_texts(parts: list[str], max_overlap_chars: int = 12) -> str:
@@ -240,11 +258,15 @@ def merge_slice_texts(parts: list[str], max_overlap_chars: int = 12) -> str:
                 break
             # The overlap is decoded twice and the two passes rarely agree
             # letter for letter (两百个 / 两白个). Tolerate one mismatch per
-            # five characters, but only for overlaps long enough that two
-            # genuinely different phrases (前十五秒 / 后十五秒) cannot collide.
-            if size >= FUZZY_OVERLAP_MIN_CHARS and sum(a != b for a, b in zip(head, tail, strict=True)) <= size // 5:
-                cut = size
-                break
+            # five characters, but never across contrasting numerals/ordinals.
+            if size >= FUZZY_OVERLAP_MIN_CHARS:
+                diffs = [(a, b) for a, b in zip(head, tail, strict=True) if a != b]
+                if (
+                    len(diffs) <= size // 5
+                    and not any(a in _NO_FUZZY_MISMATCH_CHARS or b in _NO_FUZZY_MISMATCH_CHARS for a, b in diffs)
+                ):
+                    cut = size
+                    break
         merged += piece[cut:]
     return merged
 
@@ -664,7 +686,10 @@ def restore_glossary_case(text: str, glossary) -> str:
     if not text or not spelling:
         return text
     alternatives = "|".join(re.escape(t) for t in sorted(spelling.values(), key=len, reverse=True))
-    pattern = re.compile(rf"(?<![A-Za-z])(?:{alternatives})(?![A-Za-z])", re.IGNORECASE)
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9])(?<![A-Za-z0-9][._-])(?:{alternatives})(?![A-Za-z0-9])(?![._-][A-Za-z0-9])",
+        re.IGNORECASE,
+    )
     return pattern.sub(lambda m: spelling.get(m.group(0).lower(), m.group(0)), text)
 
 
@@ -919,8 +944,34 @@ class ChecksumMismatchError(IOError):
     pass
 
 
+DOWNLOAD_FREE_MARGIN_BYTES = 64 * 1024 * 1024
+_CONTENT_RANGE_TOTAL_RE = re.compile(r"bytes\s+\d+-\d+/(\d+)", re.IGNORECASE)
+
+
+def _format_download_error(exc: Exception) -> str:
+    """Format network/filesystem exceptions into concise user-facing Chinese."""
+    raw = str(exc or "").strip()
+    raw = re.sub(r"^\s*下载失败\s*[:：]\s*", "", raw)
+    if isinstance(exc, (IncompleteDownloadError, ChecksumMismatchError)) and raw:
+        return raw
+    import httpx
+
+    if isinstance(exc, httpx.TimeoutException):
+        return "网络连接超时，请检查网络后重试（已下载进度会自动保留）"
+    if isinstance(exc, httpx.ConnectError):
+        return "无法连接模型服务器，请检查网络连接或代理设置"
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = getattr(exc.response, "status_code", 0)
+        return f"服务器返回异常状态（HTTP {code}）"
+    if isinstance(exc, httpx.HTTPError):
+        return f"网络传输中断（{raw or '连接异常'}），重试可继续断点续传"
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 28:
+        return "磁盘剩余空间不足，请清理空间或更换模型存储目录"
+    return raw or "网络异常，请稍后重试"
+
+
 class ModelDownloadWorker(QThread):
-    """Downloads model files from HuggingFace (or a mirror)."""
+    """Downloads model files from HuggingFace (or a mirror) with HTTP Range resume."""
     progress = pyqtSignal(int)
     finished_ok = pyqtSignal(str)  # model_id
     error = pyqtSignal(str)
@@ -953,48 +1004,128 @@ class ModelDownloadWorker(QThread):
         else:
             self._emit_pct(int((index + file_fraction) / total_files * 100))
 
+    @staticmethod
+    def _hash_existing_file(path: Path):
+        digest = hashlib.sha256()
+        total = 0
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                total += len(chunk)
+        return digest, total
+
     def _download_file(
         self, url: str, target: Path, index: int, total_files: int, expected_sha256: str
     ) -> None:
         import httpx
 
         tmp_path = target.with_name(target.name + ".tmp")
-        try:
-            digest = hashlib.sha256()
-            with httpx.stream("GET", url, timeout=60.0, follow_redirects=True) as resp:
-                resp.raise_for_status()
-                total = int(resp.headers.get("content-length", 0))
-                downloaded = 0
-                with open(tmp_path, "wb") as f:
-                    for chunk in resp.iter_bytes(chunk_size=1024 * 256):
-                        if self._cancelled:
-                            raise _DownloadCancelled()
-                        f.write(chunk)
-                        digest.update(chunk)
-                        downloaded += len(chunk)
-                        fraction = downloaded / total if total > 0 else 0.0
-                        self._emit_progress(index, total_files, fraction, downloaded)
-            if total > 0 and downloaded != total:
-                raise IncompleteDownloadError(
-                    f"{target.name} 不完整（{downloaded} / {total} 字节）"
-                )
-            if downloaded == 0:
-                raise IncompleteDownloadError(f"{target.name} 为空文件")
-            if digest.hexdigest() != expected_sha256:
-                raise ChecksumMismatchError(f"{target.name} 校验失败：内容与固定版本不一致")
-            tmp_path.replace(target)
-        finally:
-            if tmp_path.exists():
+        for attempt in range(2):
+            existing_bytes = 0
+            if tmp_path.is_file():
                 try:
-                    tmp_path.unlink()
+                    existing_bytes = tmp_path.stat().st_size
                 except OSError:
-                    pass
+                    existing_bytes = 0
+
+            stream_kwargs: dict = {"timeout": 60.0, "follow_redirects": True}
+            if existing_bytes > 0:
+                stream_kwargs["headers"] = {"Range": f"bytes={existing_bytes}-"}
+
+            try:
+                with httpx.stream("GET", url, **stream_kwargs) as resp:
+                    status_code = int(getattr(resp, "status_code", 200) or 200)
+                    if status_code == 416 and existing_bytes > 0 and attempt == 0:
+                        try:
+                            tmp_path.unlink()
+                        except OSError:
+                            pass
+                        continue
+                    resp.raise_for_status()
+
+                    resuming = status_code == 206 and existing_bytes > 0
+                    if resuming:
+                        digest, downloaded = self._hash_existing_file(tmp_path)
+                        cr_match = _CONTENT_RANGE_TOTAL_RE.search(
+                            str(resp.headers.get("content-range", "") or "")
+                        )
+                        if cr_match:
+                            total = int(cr_match.group(1))
+                        else:
+                            part_len = int(resp.headers.get("content-length", 0) or 0)
+                            total = (downloaded + part_len) if part_len > 0 else 0
+                        mode = "ab"
+                    else:
+                        digest = hashlib.sha256()
+                        downloaded = 0
+                        total = int(resp.headers.get("content-length", 0) or 0)
+                        mode = "wb"
+
+                    with open(tmp_path, mode) as f:
+                        for chunk in resp.iter_bytes(chunk_size=1024 * 256):
+                            if self._cancelled:
+                                raise _DownloadCancelled()
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            digest.update(chunk)
+                            downloaded += len(chunk)
+                            fraction = downloaded / total if total > 0 else 0.0
+                            self._emit_progress(index, total_files, fraction, downloaded)
+
+                if total > 0 and downloaded != total:
+                    raise IncompleteDownloadError(
+                        f"{target.name} 不完整（{downloaded} / {total} 字节）"
+                    )
+                if downloaded == 0:
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                    raise IncompleteDownloadError(f"{target.name} 为空文件")
+                if digest.hexdigest() != expected_sha256:
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                    raise ChecksumMismatchError(f"{target.name} 校验失败：内容与固定版本不一致")
+                tmp_path.replace(target)
+                return
+            except ChecksumMismatchError:
+                raise
+            except _DownloadCancelled:
+                raise
+
+    def _check_free_space(self, model_dir: Path, info: dict) -> str | None:
+        if self._expected_bytes <= 0:
+            return None
+        already_on_disk = 0
+        for filename in info.get("files", ()):
+            target = model_dir / filename
+            tmp_path = target.with_name(target.name + ".tmp")
+            try:
+                if target.is_file() and _is_usable_model_file(target):
+                    already_on_disk += target.stat().st_size
+                elif tmp_path.is_file():
+                    already_on_disk += tmp_path.stat().st_size
+            except OSError:
+                pass
+        needed = max(0, self._expected_bytes - already_on_disk) + DOWNLOAD_FREE_MARGIN_BYTES
+        try:
+            free = int(shutil.disk_usage(model_dir).free)
+        except OSError:
+            return None
+        if free < needed:
+            need_mb = max(1, (needed + 1024 * 1024 - 1) // (1024 * 1024))
+            free_mb = free // (1024 * 1024)
+            return f"磁盘剩余空间不足（至少需要约 {need_mb} MB，当前可用 {free_mb} MB）"
+        return None
 
     def run(self):
         try:
             info = get_model_info(self._model_id)
             if not info:
-                self.error.emit(f"未知模型: {self._model_id}")
+                self.error.emit(f"未知模型：{self._model_id}")
                 return
 
             # Silero's download action is also its repair action. With the
@@ -1008,6 +1139,12 @@ class ModelDownloadWorker(QThread):
             files = info["files"]
             total_files = len(files)
             self._expected_bytes = int(info.get("size_mb") or 0) * 1024 * 1024
+
+            space_err = self._check_free_space(model_dir, info)
+            if space_err:
+                log.error("模型下载前空间检查未通过: %s", space_err)
+                self.error.emit(space_err)
+                return
 
             for i, filename in enumerate(files):
                 if self._cancelled:
@@ -1062,8 +1199,9 @@ class ModelDownloadWorker(QThread):
             self.error.emit("下载已取消")
         except Exception as e:
             log.error("模型下载失败: %s", e)
+            detail = _format_download_error(e)
             hint = "" if len(self._endpoints) > 1 else "；可在「下载源」改用其他来源"
-            self.error.emit(f"下载失败: {e}{hint}")
+            self.error.emit(f"下载失败：{detail}{hint}")
 
 
 def _create_recognizer(model_id: str, num_threads: int, *, hotwords: str = "", language: str = ""):
@@ -1180,9 +1318,13 @@ class ModelLoadWorker(QThread):
         self._num_threads = num_threads
         self._hotwords = hotwords
         self._language = language
+        self._wait_lock: threading.Lock | None = None
 
     def run(self):
         try:
+            if self._wait_lock is not None:
+                with self._wait_lock:
+                    gc.collect()
             info = get_model_info(self._model_id)
             name = info["name"] if info else self._model_id
             log.info("正在加载语音识别模型 (%s)...", name)
@@ -1381,14 +1523,33 @@ class TranscribeWorker(QThread):
         self.native_lock = None
         self.quiet_speech: bool | None = None
         self._segment_noise_floor: float | None = getattr(audio_data, "noise_floor", None)
+        self._external_cancelled = None
+        self._blocking_active = False
+        self._blocking_done = threading.Event()
+        self._blocking_done.set()
+
+    def _is_cancelled(self) -> bool:
+        if self._cancelled:
+            return True
+        ext = self._external_cancelled
+        return bool(ext is not None and ext())
 
     def cancel(self):
         """Set cancellation flag."""
         self._cancelled = True
 
+    def isRunning(self) -> bool:
+        return self._blocking_active or super().isRunning()
+
+    def wait(self, msecs: int = -1) -> bool:
+        if self._blocking_active:
+            timeout = None if msecs is None or msecs < 0 else msecs / 1000.0
+            return self._blocking_done.wait(timeout)
+        return super().wait(msecs) if msecs is not None and msecs >= 0 else super().wait()
+
     def _decode_slice(self, audio: np.ndarray) -> str:
         from sayink.asr_context import decode_owned_context
-        if not self._cancelled and (len(getattr(audio, "prefix", ())) or len(getattr(audio, "suffix", ()))):
+        if not self._is_cancelled() and (len(getattr(audio, "prefix", ())) or len(getattr(audio, "suffix", ()))):
             try:
                 text = decode_owned_context(
                     self._recognizer,
@@ -1400,35 +1561,41 @@ class TranscribeWorker(QThread):
                         noise_floor=self._segment_noise_floor,
                     ),
                 )
-                if text:
+                if text is not None:
                     return text
             except Exception as exc:
                 log.warning("跨段时间对齐不可用，识别原始片段: %s", exc)
-        if self._cancelled:
+        if self._is_cancelled():
             return ""
         return decode_asr_slice(
             self._recognizer,
             audio,
             retry_empty=self._retry_empty,
-            cancelled=lambda: self._cancelled,
+            cancelled=self._is_cancelled,
             quiet_speech=self.quiet_speech,
             noise_floor=self._segment_noise_floor,
         )
 
     def run(self):
-        if self.native_lock is None:
-            self._run_locked()
-            return
-        while not self._cancelled:
-            if self.native_lock.acquire(timeout=0.1):
-                try:
-                    self._run_locked()
-                finally:
-                    self.native_lock.release()
+        try:
+            if self.native_lock is None:
+                self._run_locked()
                 return
+            while not self._is_cancelled():
+                if self.native_lock.acquire(timeout=0.1):
+                    try:
+                        self._run_locked()
+                    finally:
+                        self._recognizer = None
+                        self._audio_data = np.zeros(0, dtype=np.float32)
+                        self.native_lock.release()
+                    return
+        finally:
+            self._recognizer = None
+            self._audio_data = np.zeros(0, dtype=np.float32)
 
     def _run_locked(self):
-        if self._cancelled:
+        if self._is_cancelled():
             return
 
         try:
@@ -1457,7 +1624,7 @@ class TranscribeWorker(QThread):
 
             texts: list[str] = []
             for index, piece in enumerate(pieces, start=1):
-                if self._cancelled:
+                if self._is_cancelled():
                     return
                 if len(pieces) > 1:
                     log.info(
@@ -1471,7 +1638,7 @@ class TranscribeWorker(QThread):
                 if merged:
                     self.partial_ready.emit(merged)
 
-            if self._cancelled:
+            if self._is_cancelled():
                 return
 
             text = merge_slice_texts(texts) if len(pieces) > 1 else (texts[0] if texts else "")
@@ -1480,15 +1647,15 @@ class TranscribeWorker(QThread):
 
         except Exception as e:
             log.error("识别失败: %s", e)
-            self.error.emit(f"识别失败: {e}")
+            self.error.emit(f"识别失败：{e}")
 
     def _run_meeting(self, audio: np.ndarray) -> None:
-        turns = analyze_turns(audio, self._turn_analyzer, cancelled=lambda: self._cancelled)
-        if self._cancelled:
+        turns = analyze_turns(audio, self._turn_analyzer, cancelled=self._is_cancelled)
+        if self._is_cancelled():
             return
         results = []
         for turn in turns:
-            if self._cancelled:
+            if self._is_cancelled():
                 return
             part = audio[turn.start:turn.stop]
             from sayink.asr_context import with_context
@@ -1498,7 +1665,7 @@ class TranscribeWorker(QThread):
                       if self._max_slice_sec and len(part) > int(self._max_slice_sec * SAMPLE_RATE) else [part])
             texts = []
             for piece in pieces:
-                if self._cancelled:
+                if self._is_cancelled():
                     return
                 texts.append(self._decode_slice(piece))
             text = merge_slice_texts(texts) if len(texts) > 1 else texts[0]
@@ -1506,7 +1673,7 @@ class TranscribeWorker(QThread):
             preview = join_segment_texts([t.text for t in results])
             if preview:
                 self.partial_ready.emit(preview)
-        if not self._cancelled:
+        if not self._is_cancelled():
             self.meeting_ready.emit(results)
 
 
@@ -1587,6 +1754,8 @@ class SpeechRecognizer(QObject):
         self._request_seq = 0
         self._active_seq = 0
         self._workers: list[TranscribeWorker] = []
+        self._blocking_workers: list[TranscribeWorker] = []
+        self._blocking_lock = threading.Lock()
         self._decode_lock = threading.Lock()
         self.quiet_speech: bool | None = None
 
@@ -1677,8 +1846,12 @@ class SpeechRecognizer(QObject):
                 self._silent_reload = False
                 self._last_ready_silent = False
                 self._is_ready = False
+                self.cancel_current()
+                old_rec = self._recognizer
                 self._recognizer = None
                 self._loaded_target = None
+                del old_rec
+                gc.collect()
                 self.model_load_progress.emit(ModelLoadPhase.LOADING, f"正在加载 {name}…")
             return
 
@@ -1694,13 +1867,19 @@ class SpeechRecognizer(QObject):
             self._silent_reload = False
             self._last_ready_silent = False
             self._is_ready = False
+            self.cancel_current()
+            old_rec = self._recognizer
             self._recognizer = None
             self._loaded_target = None
+            del old_rec
+            gc.collect()
             self.model_load_progress.emit(ModelLoadPhase.LOADING, f"正在加载 {name}…")
         worker = ModelLoadWorker(
             self._model_id, self._num_threads,
             hotwords=self._hotwords, language=self._language,
         )
+        if not silent:
+            worker._wait_lock = self._decode_lock
         target = self._target()
         worker.loaded.connect(lambda rec, t=target: self._on_model_loaded(rec, t))
         worker.error.connect(lambda msg, t=target: self._on_model_load_error(msg, t))
@@ -1714,15 +1893,21 @@ class SpeechRecognizer(QObject):
     def _on_model_loaded(self, recognizer, target: LoadTarget | None = None):
         if not self._is_current_target(target):
             log.info("丢弃已过时的模型加载结果: %s", target[0])
+            del recognizer
+            gc.collect()
             return
         was_silent = self._silent_reload
         self._silent_reload = False
         self._last_ready_silent = was_silent
         resolved_target = target if target is not None else self._target()
         with self._decode_lock:
+            old_rec = self._recognizer
             self._recognizer = recognizer
             self._loaded_target = resolved_target
             self._is_ready = True
+        if old_rec is not None and old_rec is not recognizer:
+            del old_rec
+            gc.collect()
         if not was_silent:
             self.model_load_progress.emit(ModelLoadPhase.READY, "模型已就绪")
         self.ready.emit()
@@ -1831,14 +2016,16 @@ class SpeechRecognizer(QObject):
         """Decode one meeting slice on the caller thread.
 
         Uses the resident decoder lock so a file import cannot start a second
-        native recognizer beside dictation.
+        native recognizer beside dictation, and registers in ``running_workers``.
         """
         if cancelled():
             return [], ""
         if not self._is_ready or self._recognizer is None:
             return [], "语音模型未就绪，请等待模型加载完成"
         current = self._current_worker
-        if current is not None and current.isRunning():
+        with self._blocking_lock:
+            busy_blocking = any(w.isRunning() for w in self._blocking_workers)
+        if (current is not None and current.isRunning()) or busy_blocking:
             return [], "正在识别其它音频"
         loaded = self._loaded_target[0] if self._loaded_target is not None else self._model_id
         info = get_model_info(loaded) if loaded else None
@@ -1849,12 +2036,26 @@ class SpeechRecognizer(QObject):
         )
         worker.native_lock = self._decode_lock
         worker.quiet_speech = self.quiet_speech
+        worker._external_cancelled = cancelled
         turns: list = []
         errors: list[str] = []
         worker.meeting_ready.connect(turns.extend)
         worker.error.connect(errors.append)
-        worker.run()
-        return turns, "" if cancelled() else "; ".join(errors)
+        worker._blocking_done.clear()
+        worker._blocking_active = True
+        with self._blocking_lock:
+            self._blocking_workers.append(worker)
+        try:
+            worker.run()
+        finally:
+            worker._blocking_active = False
+            worker._blocking_done.set()
+            with self._blocking_lock:
+                try:
+                    self._blocking_workers.remove(worker)
+                except ValueError:
+                    pass
+        return turns, "" if (cancelled() or worker._cancelled) else "; ".join(errors)
 
     def cancel_current(self) -> bool:
         """Discard the in-flight transcription (the user pressed Esc).
@@ -1867,6 +2068,12 @@ class SpeechRecognizer(QObject):
         running = worker is not None and worker.isRunning()
         if running:
             worker.cancel()
+        with self._blocking_lock:
+            blocking = list(self._blocking_workers)
+        for bw in blocking:
+            if bw.isRunning():
+                bw.cancel()
+                running = True
         self._active_seq = -1
         return running
 
@@ -1901,12 +2108,16 @@ class SpeechRecognizer(QObject):
 
     @property
     def running_workers(self):
-        return tuple(worker for worker in [self._load_worker, *self._workers]
+        with self._blocking_lock:
+            blocking = list(self._blocking_workers)
+        return tuple(worker for worker in [self._load_worker, *self._workers, *blocking]
                      if worker is not None and worker.isRunning())
 
     @property
     def running_transcribe_workers(self):
-        return tuple(worker for worker in self._workers
+        with self._blocking_lock:
+            blocking = list(self._blocking_workers)
+        return tuple(worker for worker in [*self._workers, *blocking]
                      if worker is not None and worker.isRunning())
 
     def shutdown(self, *, wait_ms: int = 1000):
@@ -1924,7 +2135,9 @@ class SpeechRecognizer(QObject):
 
         # Ignore any pending results and let running workers finish cooperatively.
         self._active_seq = -1
-        for worker in list(self._workers):
+        with self._blocking_lock:
+            blocking = list(self._blocking_workers)
+        for worker in [*list(self._workers), *blocking]:
             if worker.isRunning():
                 worker.cancel()
                 if wait_ms:

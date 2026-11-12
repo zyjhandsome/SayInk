@@ -71,13 +71,14 @@ def test_unsuccessful_finish_is_rejected_even_for_valid_json(finish):
         run(lambda request: streaming([event('{"summary":"ok"}'), event(finish=finish)]))
 
 
-def test_done_without_finish_is_retried_then_rejected():
+def test_done_without_finish_is_accepted_while_empty_done_is_rejected():
+    assert run(lambda request: streaming([event("complete"), b"data: [DONE]\n\n"])) == "complete"
     calls = []
-    def handler(request):
+    def empty_done(request):
         calls.append(request)
-        return streaming([event("incomplete"), b"data: [DONE]\n\n"])
+        return streaming([b"data: [DONE]\n\n"])
     with pytest.raises(LLMResponseError, match="提前结束"):
-        run(handler)
+        run(empty_done)
     assert len(calls) == 2
 
 

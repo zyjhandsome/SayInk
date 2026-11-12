@@ -22,11 +22,14 @@ This module is pure Python so the benchmark can import it without Qt.
 """
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from collections.abc import Iterable
 
 from sayink.polish_fidelity import polish_rejection_reason
+
+log = logging.getLogger("SayInk")
 
 # ``术语=误写1、误写2``; full-width ＝ is what a Chinese IME produces.
 _GLOSSARY_SEPARATOR_RE = re.compile(r"\s*[=＝]\s*")
@@ -129,6 +132,74 @@ def format_glossary_line(entry) -> str:
 
 # ── deterministic replacement ────────────────────────────────────────────────
 
+# High-frequency everyday 2-character Chinese predicates/modifiers: when one of
+# these is listed as a homophone variant (e.g. ``通义=同意``), protect everyday
+# grammatical collocations like ``不同意`` / ``没同意`` / ``很同意`` / ``同意了`` / ``同意吗``.
+_COMMON_DAILY_CJK_WORDS = frozenset({
+    "同意", "明白", "清楚", "确定", "方便", "意思", "知道", "可能", "需要", "应该",
+    "可以", "问题", "关系", "希望", "理想", "自然", "正式", "正常", "显示", "消息",
+    "发现", "完全", "绝对", "一定", "一般", "一直", "一起", "一下", "一些", "一点",
+    "已经", "以为", "以后", "以前", "以上", "以下", "以外", "以内", "其实", "其他",
+    "其中", "非常", "特别", "比较", "觉得", "感觉", "认为", "表示", "进行", "通过",
+    "开始", "结束", "继续", "准备", "完成", "支持", "反对", "参加", "参与", "处理",
+    "解决", "讨论", "确认", "通知", "联系", "沟通", "安排", "计划", "方案", "结果",
+})
+_LOGGED_GLOSSARY_CONFLICTS: set[str] = set()
+
+
+def glossary_variant_map_with_conflicts(
+    glossary: Iterable,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Return ``(pairs, conflicts)`` where ``conflicts`` records shadowed rules."""
+    entries = [_entry_parts(e) for e in glossary or ()]
+    terms_orig = [term for term, _ in entries if term]
+    terms = [term.casefold() for term in terms_orig]
+    term_by_cf = {term.casefold(): term for term in terms_orig}
+    term_set = set(terms)
+    pairs: dict[str, str] = {}
+    conflicts: list[str] = []
+    for term, variants in entries:
+        if not term:
+            continue
+        for variant in variants:
+            key = variant.casefold()
+            if len(variant) == 1 and re.fullmatch(r"[\u4e00-\u9fff]", variant):
+                msg = f"单字误写「{variant}→{term}」已忽略（易误伤常用字）"
+                if msg not in conflicts:
+                    conflicts.append(msg)
+                continue
+            if key in term_set:
+                other = term_by_cf.get(key, variant)
+                msg = f"误写「{variant}→{term}」与术语「{other}」同名，已跳过"
+                if msg not in conflicts:
+                    conflicts.append(msg)
+                continue
+            if key in pairs:
+                msg = f"误写「{variant}」同时指向「{pairs[key]}」与「{term}」，保留「{pairs[key]}」"
+                if msg not in conflicts:
+                    conflicts.append(msg)
+                continue
+            containing = [orig for orig, cf in zip(terms_orig, terms, strict=True) if key in cf]
+            if containing:
+                msg = f"误写「{variant}→{term}」被术语「{containing[0]}」包含，已跳过以防重复替换"
+                if msg not in conflicts:
+                    conflicts.append(msg)
+                continue
+            pairs[key] = term
+    for msg in conflicts:
+        if msg not in _LOGGED_GLOSSARY_CONFLICTS:
+            if len(_LOGGED_GLOSSARY_CONFLICTS) > 512:
+                _LOGGED_GLOSSARY_CONFLICTS.clear()
+            _LOGGED_GLOSSARY_CONFLICTS.add(msg)
+            log.warning("词库冲突提示: %s", msg)
+    ordered = sorted(pairs.items(), key=lambda kv: (-len(kv[0]), kv[0]))
+    return [(variant, term) for variant, term in ordered], conflicts
+
+
+def glossary_conflicts(glossary: Iterable) -> list[str]:
+    """Return human-readable warnings for shadowed/conflicting glossary variants."""
+    return glossary_variant_map_with_conflicts(glossary)[1]
+
 
 def glossary_variant_map(glossary: Iterable) -> list[tuple[str, str]]:
     """``(variant, term)`` pairs, longest variant first.
@@ -139,32 +210,17 @@ def glossary_variant_map(glossary: Iterable) -> list[tuple[str, str]]:
     applying it to already-corrected text would turn 新盘 into 新盘点, and
     the correction guard relies on the replacement being idempotent.
     """
-    entries = [_entry_parts(e) for e in glossary or ()]
-    terms = [term.casefold() for term, _ in entries if term]
-    term_set = set(terms)
-    pairs: dict[str, str] = {}
-    for term, variants in entries:
-        if not term:
-            continue
-        for variant in variants:
-            key = variant.casefold()
-            if len(variant) == 1 and re.fullmatch(r"[\u4e00-\u9fff]", variant):
-                continue
-            if key in term_set or key in pairs:
-                continue
-            if any(key in other for other in terms):
-                continue
-            pairs[key] = term
-    ordered = sorted(pairs.items(), key=lambda kv: (-len(kv[0]), kv[0]))
-    return [(variant, term) for variant, term in ordered]
+    return glossary_variant_map_with_conflicts(glossary)[0]
 
 
 def _variant_pattern(variant: str) -> str:
     escaped = re.escape(variant)
     if re.search(r"[A-Za-z0-9]", variant):
-        # Latin variants only match whole words, like restore_glossary_case:
-        # ``git hub`` should not fire inside ``digit hubris``.
-        return rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])"
+        # Protect code identifiers (api_key, user-api, my.net) and version strings
+        # (v1.0.5) in addition to ASCII word boundaries.
+        return rf"(?<![A-Za-z0-9])(?<![A-Za-z0-9][._-]){escaped}(?![A-Za-z0-9])(?![._-][A-Za-z0-9])"
+    if len(variant) == 2 and variant in _COMMON_DAILY_CJK_WORDS:
+        return rf"(?<![不没未别莫很太更最无非]){escaped}(?![吗呢吧啊呀了着过])"
     return escaped
 
 

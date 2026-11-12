@@ -12,10 +12,19 @@ import unicodedata
 
 _THOUSANDS_SEP_RE = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
 _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
-# Words containing a negation character without negating anything.
+# Words and lexicalized patterns containing negation characters without negating a claim.
 _NON_NEGATING_WORDS = (
     "非常", "无论", "不过", "不仅", "不但", "未来", "无线",
     "特别", "区别", "分别", "类别", "级别", "告别", "识别", "性别", "别人", "别的",
+    "没事", "没关系", "不要紧", "不客气", "不用谢", "不好意思",
+    "不得不", "不禁", "不妨", "不免", "不愧", "不料",
+    "差不多", "说不定", "巴不得", "怪不得", "恨不得", "怨不得", "了不起", "对不起",
+    "八九不离十", "不三不四",
+)
+# Mandarin A-not-A neutral yes/no questions ("是不是" ≈ "…吗？", "有没有" ≈ "有…吗？").
+_A_NOT_A_RE = re.compile(
+    r"有没有|可不可以|方不方便|清不清楚|明不明白|知不知道|高不高兴|满不满意|同不同意|愿不愿意|"
+    r"(?![不没别未无非勿莫])([\u4e00-\u9fff])不\1"
 )
 _NEGATION_CHARS = frozenset("不没别未无非勿莫")
 _EN_NEGATION_RE = re.compile(
@@ -31,6 +40,19 @@ _CN_DIGITS = {
 }
 _CN_UNITS = {"十": 10, "百": 100, "千": 1000}
 _CN_BIG_UNITS = {"万": 10_000, "亿": 100_000_000}
+# Lexicalized Chinese idioms, degree adverbs, and vague spoken quantifiers
+# whose embedded number characters are rhetorical rather than numeric facts.
+_LEXICALIZED_CN_NUMBERS_RE = re.compile(
+    r"八九不离十|乱七八糟|七嘴八舌|七上八下|七零八落|七手八脚|七拼八凑|横七竖八|歪七扭八|"
+    r"十之八九|十有八九|十全十美|十拿九稳|九牛一毛|九死一生|九霄云外|"
+    r"三言两语|三心二意|三番五次|三令五申|三头六臂|三长两短|接二连三|说三道四|颠三倒四|"
+    r"朝三暮四|丢三落四|隔三差五|低三下四|不三不四|一清二楚|一干二净|一举两得|一石二鸟|"
+    r"一刀两断|一分为二|一模一样|一五一十|一丝一毫|一朝一夕|一言一行|一举一动|"
+    r"成千上万|千方百计|千辛万苦|千变万化|千差万别|千言万语|千军万马|千家万户|"
+    r"百发百中|百依百顺|四面八方|四平八稳|四通八达|四分五裂|五颜六色|五花八门|"
+    r"五湖四海|五体投地|六神无主|二话不说|一再|再三|万一|万分|百般|第一时间|"
+    r"十分(?![钟秒之])|一两(?:句|下|次|声|眼|步)"
+)
 # A numeral may contain an arabic chunk (一亿零500万). It still has to start
 # with a Chinese digit so version numbers and plain 100万 stay out of this pass.
 _CN_NUMERAL_RE = re.compile(
@@ -38,8 +60,9 @@ _CN_NUMERAL_RE = re.compile(
 )
 # A unary sign, not the hyphen in 3-5. The character before it must not be a digit.
 _UNARY_SIGN_RE = re.compile(r"(?<![\d.])([+-])(\d+(?:\.\d+)?)")
+# Exclude o'clock time expressions like "十点一到" / "八点一过" / "三点一刻" from decimal parsing.
 _CN_DECIMAL_RE = re.compile(
-    r"([零〇一二两三四五六七八九十百千万亿两]+)点([零〇一二三四五六七八九]+)"
+    r"([零〇一二两三四五六七八九十百千万亿两]+)点([零〇一二三四五六七八九]+)(?![到过开完始半刻钟左右前])"
 )
 # The amount has to start at a token boundary: 1.5亿 must not be read as 5亿.
 _SCALED_PAIR_RE = re.compile(r"(?<![\d.])(\d+)亿(\d+)万")
@@ -49,9 +72,17 @@ _REPEATED_NEGATION_RE = re.compile(r"([不没别未无非勿莫])\1+")
 # Spoken filler a polish is allowed to drop; the compression guard measures
 # the raw text without it so a cleaned-up ramble is not mistaken for a summary.
 _FILLER_RE = re.compile(r"嗯+|啊+|呃+|额+|唔+|哦+|那个|这个|就是说|就是|然后|的话|一下|对对+|呢|吧|嘛|呀")
-# How a chat model opens an *answer* rather than an edit. Only decisive when
-# the raw text did not open the same way and the reply grew well past it.
-_ANSWER_PREFIX_RE = re.compile(r"^(?:好的|好啊|以下是|当然可以|当然|没问题|明白了|收到|请问|作为一名|作为)")
+# Unambiguous assistant/chatbot response openings that never result from polishing speech.
+_HARD_ANSWER_PREFIX_RE = re.compile(
+    r"^(?:以下是|当然可以|请问(?:您|你|需要|有)|作为一名|作为(?:AI|人工智能|助手|语言模型)|"
+    r"(?:很)?抱歉[，,：:\s]*(?:我|作为)|对不起[，,：:\s]*我(?:无法|不能|是)|"
+    r"我(?:无法|不能)(?:为您|帮你|直接|查询|访问|联网|提供实时)|"
+    r"我是一个(?:AI|人工智能|语言模型|纯文本)|让我来(?:为您|帮你))"
+)
+# Conversational acknowledgements that can be an answer OR a light edit of "行/好".
+_ANSWER_PREFIX_RE = re.compile(r"^(?:好的|好啊|当然|没问题|明白了|收到|请问|作为)")
+_QUESTION_CUE_RE = re.compile(r"[?？]|(?:怎么|为什么|如何|请问|多少|哪里|哪儿|是谁|能不能|可不可以|是不是|吗$)")
+_CJK_OR_WORD_RE = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9]+")
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
@@ -171,7 +202,8 @@ def _expand_cn_scales(text: str) -> str:
 
 
 def _prepare_number_text(text: str) -> str:
-    return _expand_cn_scales(_normalize_cn_numerals(_THOUSANDS_SEP_RE.sub("", text or "")))
+    cleaned = _LEXICALIZED_CN_NUMBERS_RE.sub(" ", text or "")
+    return _expand_cn_scales(_normalize_cn_numerals(_THOUSANDS_SEP_RE.sub("", cleaned)))
 
 
 def _canonical_number(match: str) -> str:
@@ -234,13 +266,18 @@ _CLAUSE_SPLIT_RE = re.compile(r"[，。！？；、,.!?;]+")
 
 
 def _clause_negation_counts(text: str) -> list[int]:
-    parts = [part.strip() for part in _CLAUSE_SPLIT_RE.split(text) if part.strip()]
+    parts = [
+        part.strip()
+        for part in _CLAUSE_SPLIT_RE.split(text)
+        if part.strip() and _FILLER_RE.sub("", part).strip()
+    ]
     return [_negation_count(part) for part in parts]
 
 
 def _negation_count(text: str) -> int:
+    text = _A_NOT_A_RE.sub(" ", text)
     for word in _NON_NEGATING_WORDS:
-        text = text.replace(word, "")
+        text = text.replace(word, " ")
     text = _REPEATED_NEGATION_RE.sub(r"\1", text)
     return sum(1 for ch in text if ch in _NEGATION_CHARS) + len(_EN_NEGATION_RE.findall(text))
 
@@ -270,6 +307,15 @@ def _keeps_name(name: str, folded: str) -> bool:
     return any(pattern.search(t) for t in (folded, re.sub(r"\s+", "", folded)))
 
 
+def _content_overlap_ratio(source: str, candidate: str) -> float:
+    src_tokens = _CJK_OR_WORD_RE.findall(source.casefold())
+    if not src_tokens:
+        return 1.0
+    cand_set = set(_CJK_OR_WORD_RE.findall(candidate.casefold()))
+    matched = sum(1 for tok in src_tokens if tok in cand_set)
+    return matched / len(src_tokens)
+
+
 def polish_rejection_reason(raw: str, polished: str) -> str:
     """Why a polish reply must not replace the raw text; empty when it may.
 
@@ -291,11 +337,21 @@ def polish_rejection_reason(raw: str, polished: str) -> str:
     if len(core) >= 12 and len(polished_compact) < len(core) * 0.4:
         # A polish may drop filler and repetition, not most of the content.
         return "内容被大幅压缩"
+    hard_answer = _HARD_ANSWER_PREFIX_RE.match(polished_compact)
+    if hard_answer and not raw_compact.startswith(hard_answer.group(0)):
+        return "疑似应答而非编辑"
     answer = _ANSWER_PREFIX_RE.match(polished_compact)
+    if answer and not raw_compact.startswith(answer.group(0)):
+        if len(polished) > len(raw) * 1.3 + 2:
+            return "疑似应答而非编辑"
+        remainder = polished_compact[answer.end():].lstrip("，,。！!：:")
+        if not raw_compact.startswith(("好", "行", "嗯好", "可以")) and _content_overlap_ratio(core or raw_compact, remainder) < 0.5:
+            return "疑似应答而非编辑"
     if (
-        answer
-        and not raw_compact.startswith(answer.group(0))
-        and len(polished) > len(raw) * 1.3 + 2
+        len(core) >= 6
+        and _QUESTION_CUE_RE.search(raw_compact)
+        and not _QUESTION_CUE_RE.search(polished_compact)
+        and _content_overlap_ratio(core, polished_compact) < 0.45
     ):
         return "疑似应答而非编辑"
     raw_sequence = _number_sequence(raw)
