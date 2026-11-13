@@ -286,7 +286,8 @@ def test_h23_finalize_with_over_600_turns_uses_bounded_clustering_quickly(tmp_pa
                 )
             )
         controller.store.set_segment_speaker(rec.id, 5, 2)
-        assert controller.store.flush(timeout=5.0)
+        # 640 queued writes are setup. The bound under test is request_end below.
+        assert controller.store.flush(timeout=30.0)
 
         t0 = time.perf_counter()
         controller.request_end()
