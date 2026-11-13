@@ -5,10 +5,11 @@ import sqlite3
 
 import pytest
 from PyQt6.QtCore import QEvent, QPoint, QPointF, QTimer, Qt, QUrl
-from PyQt6.QtGui import QMouseEvent, QTextCursor
+from PyQt6.QtGui import QColor, QMouseEvent, QTextCursor
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication, QDialog, QFileDialog, QPushButton
 
+from sayink.ui import design_tokens as tok
 from sayink.ui.design_tokens import SECONDARY_CONTAINER
 from sayink.ui.flow_layout import PairedToolBar
 
@@ -809,8 +810,10 @@ def test_paragraph_actions_reveal_on_hover_without_moving_text_or_selection(meet
     page._switch_tab(1)
     QApplication.processEvents()
     view = page._transcript_view
+    idle_color = QColor(tok.TEXT_DIM).name()
+    active_color = QColor(tok.ACCENT_TEXT).name()
     action = _transcript_link(view, "edit-segment:7")
-    assert action.charFormat().foreground().color().alpha() == 0
+    assert action.charFormat().foreground().color().name() == idle_color
     selection = view.document().find("下周开始验证")
     view.setTextCursor(selection)
     before = view.cursorRect(selection)
@@ -820,14 +823,14 @@ def test_paragraph_actions_reveal_on_hover_without_moving_text_or_selection(meet
         QEvent.Type.MouseMove, QPointF(before.center()), Qt.MouseButton.NoButton,
         Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
     ))
-    assert _transcript_link(view, "edit-segment:7").charFormat().foreground().color().alpha() == 255
-    assert _transcript_link(view, "edit-segment:2").charFormat().foreground().color().alpha() == 0
+    assert _transcript_link(view, "edit-segment:7").charFormat().foreground().color().name() == active_color
+    assert _transcript_link(view, "edit-segment:2").charFormat().foreground().color().name() == idle_color
     assert view.textCursor().selectedText() == "下周开始验证"
     assert view.cursorRect(selection) == before and view.verticalScrollBar().value() == scroll
     QApplication.sendEvent(view, QEvent(QEvent.Type.Leave))
-    assert _transcript_link(view, "edit-segment:7").charFormat().foreground().color().alpha() == 0
+    assert _transcript_link(view, "edit-segment:7").charFormat().foreground().color().name() == idle_color
     page._correct_speaker_btn.click()
-    assert _transcript_link(view, "segment:7").charFormat().foreground().color().alpha() == 255
+    assert _transcript_link(view, "segment:7").charFormat().foreground().color().name() == active_color
 
 
 def test_keyboard_can_reveal_and_activate_paragraph_edit(meeting, monkeypatch):
@@ -1329,7 +1332,7 @@ def _link_characters(view, href: str):
         probe.setPosition(start + offset)
         probe.setPosition(start + offset + 1, QTextCursor.MoveMode.KeepAnchor)
         color = probe.charFormat().foreground().color()
-        chars.append((probe.selectedText(), probe.charFormat().anchorHref(), color.alpha()))
+        chars.append((probe.selectedText(), probe.charFormat().anchorHref(), color.name()))
     return chars
 
 
@@ -1364,9 +1367,10 @@ def test_live_edit_link_stays_hidden_after_the_transcript_is_redrawn(meeting):
     QApplication.processEvents()
     QApplication.sendEvent(view, QEvent(QEvent.Type.Leave))
     QApplication.processEvents()
-    hidden = _link_characters(view, "live-edit:3")
+    muted = _link_characters(view, "live-edit:3")
+    idle_color = QColor(tok.TEXT_DIM).name()
     assert "去改" in view.toPlainText()
-    assert hidden and all(alpha == 0 for _text, _href, alpha in hidden), hidden
+    assert muted and all(color == idle_color for _text, _href, color in muted), muted
     assert not view.textCursor().charFormat().anchorHref().startswith("live-edit")
 
 

@@ -122,7 +122,7 @@ def main():
             settings._src_mic_rb.setChecked(True)
             settings._trigger_hotkey_rb.setChecked(True)
             settings._advanced_recognition_btn.setChecked(True)
-            page.ensureWidgetVisible(settings._meeting_vad_combo, 0, 100)
+            page.ensureWidgetVisible(settings._vad_runtime_label, 0, 100)
             capture(f"general-advanced-{theme}")
             settings.set_recognition_runtime_status(
                 SegmentationStatus("silero", "energy", True, "示例模型加载失败"),

@@ -4,6 +4,7 @@ No microphone, speech model, or network is opened. Python 3.10.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import tempfile
@@ -28,8 +29,9 @@ from sayink.ui.floating_window import FloatingWindow
 from sayink.ui.main_window import MainWindow
 from sayink.ui.theme import apply_theme
 
-EVIDENCE = ROOT / "openspec/changes/dictation-mode-defaults/visual-evidence.md"
-OUT = ROOT / "openspec/changes/dictation-mode-defaults/visual"
+DEFAULT_OUT = ROOT / "build" / "mode-defaults"
+OUT = DEFAULT_OUT
+EVIDENCE = DEFAULT_OUT / "visual-evidence.md"
 REQUIRED = (
     "v1-setup-pending.png",
     "v2-mic-unheard.png",
@@ -212,12 +214,18 @@ def write_evidence() -> None:
         "|---|---|---|---|",
     ]
     for label, filename, state, conclusion in rows:
-        lines.append(f"| {label} | `openspec/changes/dictation-mode-defaults/visual/{filename}` | {state} | {conclusion} |")
+        lines.append(f"| {label} | `{OUT.name}/{filename}` | {state} | {conclusion} |")
     lines.append("")
     EVIDENCE.write_text("\n".join(lines), encoding="utf-8")
 
 
 def main() -> None:
+    global OUT, EVIDENCE
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUT)
+    args = parser.parse_args()
+    OUT = args.output
+    EVIDENCE = OUT / "visual-evidence.md"
     OUT.mkdir(parents=True, exist_ok=True)
     app = QApplication.instance() or QApplication([])
     for font in ("msyh.ttc", "msyhbd.ttc", "segoeui.ttf"):

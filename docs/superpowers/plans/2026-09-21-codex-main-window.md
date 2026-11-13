@@ -1,7 +1,5 @@
 # Codex-style Main Window Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Replace SayInk's spatial-island settings/history chrome with one Codex-quiet main window (160px flush sidebar + stacked pages) and a thin listen bar, without changing the transcription pipeline.
 
 **Architecture:** New `MainWindow` owns sidebar navigation and a two-slot stack (history host + settings host). `SettingsWindow` and `HistoryWindow` become embeddable `QWidget`s (no island flags). `FloatingWindow` shrinks to a listen bar. `app.py` opens `MainWindow` instead of two island dialogs. Tokens switch to an ink axis (`#181818` / `#FFFFFF`); primary buttons use ink fill, not blue.

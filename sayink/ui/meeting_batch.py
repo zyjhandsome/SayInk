@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PyQt6.QtWidgets import QMessageBox, QPushButton, QSizePolicy
+from PyQt6.QtWidgets import QPushButton, QSizePolicy
 
 
 def batch_delete_copy(count: int, live_count: int) -> tuple[str, str]:
@@ -16,15 +16,29 @@ def batch_delete_copy(count: int, live_count: int) -> tuple[str, str]:
 def confirm_batch_delete(parent, count: int, live_count: int) -> bool:
     if count <= 0:
         return False
+    from sayink.ui import design_tokens as tok
+    from sayink.ui import settings_styles as ss
+    from sayink.ui.prompts import confirm_box
+
     text, info = batch_delete_copy(count, live_count)
-    box = QMessageBox(parent)
-    box.setWindowTitle("删除会议")
-    box.setIcon(QMessageBox.Icon.Warning)
-    box.setText(text)
+    box, delete = confirm_box(
+        parent,
+        "删除会议",
+        text,
+        accept="删除",
+        cancel="取消",
+        destructive=True,
+    )
     box.setInformativeText(info)
-    delete = box.addButton("删除", QMessageBox.ButtonRole.DestructiveRole)
-    back = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
-    box.setDefaultButton(back)
+    box.setStyleSheet(
+        ss.WINDOW_CSS
+        + f" QMessageBox {{ background: {tok.BG}; color: {tok.TEXT}; }}"
+        + f" QMessageBox QLabel {{ color: {tok.TEXT}; background: transparent; }}"
+    )
+    delete.setStyleSheet(ss.BTN_DANGER_SOLID_SM)
+    for btn in box.buttons():
+        if btn is not delete:
+            btn.setStyleSheet(ss.BTN_GHOST_SM)
     box.exec()
     return box.clickedButton() == delete
 

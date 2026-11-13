@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import csv
+from dataclasses import replace
 import html
+import inspect
+import io
 import logging
 import re
 from datetime import datetime
@@ -322,6 +326,9 @@ class _SessionCheckBox(QCheckBox):
 class _DetailTextEdit(QTextEdit):
     copy_session_requested = pyqtSignal()
 
+    def set_bottom_clearance(self, px: int) -> None:
+        self.setViewportMargins(0, 0, 0, max(0, int(px)))
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._fit_reading_width()
@@ -404,6 +411,8 @@ def _chip_qss() -> str:
 class _Toast(QFrame):
     """Non-layout overlay for transient feedback (copy done / undo delete)."""
 
+    visibility_changed = pyqtSignal(bool)
+
     def __init__(self, parent: QWidget):
         super().__init__(parent)
         self.setObjectName("historyToast")
@@ -417,6 +426,14 @@ class _Toast(QFrame):
         lay.addWidget(self.button)
         self.hide()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.visibility_changed.emit(True)
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self.visibility_changed.emit(False)
+
     def reposition(self) -> None:
         parent = self.parentWidget()
         if parent is None:
@@ -427,6 +444,86 @@ class _Toast(QFrame):
         self.setFixedSize(w, h)
         self.move((parent.width() - w) // 2, parent.height() - h - 18)
         self.raise_()
+        if self.isVisible():
+            self.visibility_changed.emit(True)
+
+
+_HISTORY_EXPORT_EXTENSIONS = {
+    "md": ".md",
+    "txt": ".txt",
+    "csv": ".csv",
+}
+_KNOWN_HISTORY_SUFFIXES = {".md", ".txt", ".csv", ".json", ".srt"}
+
+
+def _with_history_export_suffix(path: str, kind: str) -> str:
+    """Append or swap export extension without truncating dotted session names."""
+    suffix = _HISTORY_EXPORT_EXTENSIONS[kind]
+    raw = str(path)
+    if raw.lower().endswith(suffix):
+        return raw
+    current_ext = Path(raw).suffix
+    if current_ext.lower() in _KNOWN_HISTORY_SUFFIXES:
+        return raw[: len(raw) - len(current_ext)] + suffix
+    return f"{raw}{suffix}"
+
+
+def _safe_csv_cell(value: object) -> str:
+    text = str(value or "")
+    if text and text[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return f"'{text}"
+    return text
+
+
+def _fallback_sessions_csv(
+    sessions: list[SessionSummary],
+    segments_by_session: dict[str, list[SegmentRecord]],
+    *,
+    prefer_raw: bool = False,
+) -> str:
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(
+        [
+            "session_id",
+            "seq",
+            "captured_at",
+            "source",
+            "target_app",
+            "duration_ms",
+            "model",
+            "speaker",
+            "raw_text",
+            "polished_text",
+            "exported_text",
+        ]
+    )
+    for session in sorted(sessions, key=lambda s: s.created_at):
+        ordered = _segments_in_order(segments_by_session.get(session.session_id, []))
+        show_speakers = history_shows_speakers(ordered)
+        for seg in ordered:
+            if not prefer_raw and seg.polished_text == _SUPPRESSED_POLISHED_MARKER:
+                continue
+            exported = seg.raw_text if prefer_raw else _effective_text(seg)
+            if not exported.strip():
+                continue
+            speaker = _speaker_heading(seg) if show_speakers else ""
+            writer.writerow(
+                [
+                    _safe_csv_cell(seg.session_id),
+                    seg.seq,
+                    _safe_csv_cell(_format_dt(_segment_clock_ms(seg))),
+                    _safe_csv_cell(seg.source or session.source),
+                    _safe_csv_cell(seg.target_app or session.target_app),
+                    int(seg.duration_ms or 0),
+                    _safe_csv_cell(seg.model),
+                    _safe_csv_cell(speaker),
+                    _safe_csv_cell(seg.raw_text),
+                    _safe_csv_cell("" if seg.polished_text == _SUPPRESSED_POLISHED_MARKER else seg.polished_text),
+                    _safe_csv_cell(exported),
+                ]
+            )
+    return buf.getvalue()
 
 
 class _ClearHistoryDialog(QDialog):
@@ -546,6 +643,7 @@ class HistoryWindow(QWidget):
         self._editing_session = False
         self._editing_session_id: str | None = None
         self._editing_original_text = ""
+        self._editing_raw_mode = False
         self._sessions_by_id: dict[str, SessionSummary] = {}
         self._pending_delete: list[SessionSummary] = []
         self._pending_merge: list[SessionSummary] = []
@@ -556,6 +654,8 @@ class HistoryWindow(QWidget):
         self._session_limit = 50
         self._has_more = False
         self._view_polished = True
+        self._user_view_polished = True
+        self._search_auto_switched = False
         self._selection_mode = False
         self._list_summary_text = ""
         self._detail_search_context: tuple[str, str] | None = None
@@ -571,6 +671,18 @@ class HistoryWindow(QWidget):
         self._setup_ui()
         self.refresh()
         self.reapply_theme()
+
+    @property
+    def running_workers(self) -> list:
+        """Active background polish workers (for clean shutdown / cancel checks)."""
+        polisher = self._polisher
+        if polisher is None:
+            return []
+        exposed = getattr(polisher, "running_workers", None)
+        if exposed is not None:
+            return list(exposed() if callable(exposed) else exposed)
+        workers = getattr(polisher, "_workers", ())
+        return [w for w in workers if callable(getattr(w, "isRunning", None)) and w.isRunning()]
 
     # ── chrome / theme ────────────────────────────────────────────
 
@@ -699,14 +811,22 @@ class HistoryWindow(QWidget):
         if hasattr(self, "_export_btn"):
             self._export_btn.setStyleSheet(ss.BTN_GHOST_SM)
         if hasattr(self, "_polish_btn"):
-            for btn in (self._polish_btn, self._edit_btn, self._cancel_edit_btn, self._merge_btn, self._to_meeting_btn):
+            for btn in (
+                self._copy_raw_btn,
+                self._polish_btn,
+                self._cancel_polish_btn,
+                self._edit_btn,
+                self._cancel_edit_btn,
+                self._merge_btn,
+                self._to_meeting_btn,
+            ):
                 btn.setStyleSheet(ss.BTN_GHOST_SM)
         if hasattr(self, "_more_btn"):
             self._more_btn.setStyleSheet(ss.BTN_GHOST_SM)
             self._history_preferences_btn.setStyleSheet(ss.BTN_ACCENT_SM)
         if hasattr(self, "_selection_mode_btn"):
             no_indicator = "QPushButton::menu-indicator { image: none; width: 0px; }"
-            for button in (self._selection_mode_btn, self._metadata_btn):
+            for button in (self._selection_mode_btn, self._select_all_btn, self._metadata_btn):
                 button.setStyleSheet(ss.BTN_GHOST_SM)
             for menu_btn in (self._manage_btn, self._detail_more_btn):
                 menu_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
@@ -739,6 +859,8 @@ class HistoryWindow(QWidget):
             f" font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 400; }}"
             f"QPushButton:hover {{ color: {tok.TEXT}; }}"
             f"QPushButton:checked {{ background: {tok.SURFACE}; color: {tok.TEXT}; font-weight: 700; }}"
+            f"QPushButton:disabled {{ color: {tok.TEXT_DIM}; }}"
+            f"QPushButton:checked:disabled {{ background: {tok.SURFACE}; color: {tok.TEXT_DIM}; font-weight: 700; }}"
             f"QPushButton:focus {{ border-color: {tok.ACCENT_FOCUS}; }}"
         )
         for btn in (self._view_polished_btn, self._view_raw_btn):
@@ -907,11 +1029,34 @@ class HistoryWindow(QWidget):
                 item.setSelected(checked)
                 break
 
+    def _toggle_select_all_loaded(self) -> None:
+        items = self.session_items()
+        if not items:
+            return
+        all_selected = len(self._selected_session_ids()) == len(items)
+        self._session_list.blockSignals(True)
+        try:
+            for item in items:
+                item.setSelected(not all_selected)
+        finally:
+            self._session_list.blockSignals(False)
+        self._on_selection_changed()
+
     def _update_list_controls(self) -> None:
         count = len(self._selected_session_ids())
+        total_loaded = self.session_count()
         self._list_summary.setText(f"已选 {count} 条" if self._selection_mode else self._list_summary_text)
         self._list_summary.setToolTip(self._list_summary_text)
-        self._selection_mode_btn.setEnabled(self.session_count() > 0 or self._selection_mode)
+        self._selection_mode_btn.setEnabled(total_loaded > 0 or self._selection_mode)
+        self._select_all_btn.setVisible(self._selection_mode and total_loaded > 0)
+        self._select_all_btn.setEnabled(total_loaded > 0)
+        all_selected = total_loaded > 0 and count == total_loaded
+        self._select_all_btn.setText("取消全选" if all_selected else "全选已加载")
+        self._select_all_btn.setToolTip(
+            "取消勾选当前已加载的全部会话" if all_selected else f"一键勾选当前列表已加载的 {total_loaded} 条会话"
+        )
+        self._manage_btn.setVisible(not self._selection_mode)
+        self._manage_btn.setEnabled(self._clear_all_action.isEnabled())
 
     def _toggle_metadata(self, expanded: bool) -> None:
         self._metadata_btn.setText("收起信息" if expanded else "详细信息")
@@ -962,6 +1107,12 @@ class HistoryWindow(QWidget):
         self._list_summary = QLabel()
         self._list_summary.setContentsMargins(3, 0, 0, 0)
         self._summary_row.add(self._list_summary, role="flex")
+        self._select_all_btn = QPushButton("全选已加载")
+        self._select_all_btn.setObjectName("historySelectAllBtn")
+        self._select_all_btn.setAccessibleName("全选已加载会话")
+        self._select_all_btn.clicked.connect(self._toggle_select_all_loaded)
+        self._select_all_btn.hide()
+        self._summary_row.add(self._select_all_btn, role="right")
         self._selection_mode_btn = QPushButton("选择")
         self._selection_mode_btn.setCheckable(True)
         self._selection_mode_btn.setToolTip("勾选多条会话，一起复制、导出或删除；也可使用 Ctrl / Shift 多选")
@@ -986,6 +1137,8 @@ class HistoryWindow(QWidget):
         self._session_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._session_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self._session_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._session_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._session_list.customContextMenuRequested.connect(self._open_session_row_menu)
         self._session_list.itemSelectionChanged.connect(self._on_selection_changed)
         stream_lay.addWidget(self._session_list, 1)
         self._list_footer = QHBoxLayout()
@@ -1055,6 +1208,12 @@ class HistoryWindow(QWidget):
         self._copy_btn = QPushButton("复制")
         self._copy_btn.clicked.connect(self._copy_selected_effective)
         tools.add(self._copy_btn)
+        self._copy_raw_btn = QPushButton("复制原文")
+        self._copy_raw_btn.setObjectName("historyCopyRawBtn")
+        self._copy_raw_btn.setToolTip("一键复制未润色的原始识别文本")
+        self._copy_raw_btn.clicked.connect(self._copy_selected_raw)
+        self._copy_raw_btn.hide()
+        tools.add(self._copy_raw_btn)
         self._polish_btn = QPushButton("润色")
         self._polish_btn.setToolTip(
             "按「AI 服务」的处理方式处理当前会话，原文保留。"
@@ -1062,6 +1221,12 @@ class HistoryWindow(QWidget):
         )
         self._polish_btn.clicked.connect(self._polish_selected_session)
         tools.add(self._polish_btn)
+        self._cancel_polish_btn = QPushButton("取消")
+        self._cancel_polish_btn.setObjectName("historyCancelPolishBtn")
+        self._cancel_polish_btn.setToolTip("取消正在进行的 AI 润色或纠错")
+        self._cancel_polish_btn.clicked.connect(lambda: self._cancel_polish(silent=False))
+        self._cancel_polish_btn.hide()
+        tools.add(self._cancel_polish_btn)
         self._edit_btn = QPushButton("编辑")
         self._edit_btn.setToolTip("直接编辑当前会话文本（修改保存为润色版，原文保持不变）")
         self._edit_btn.clicked.connect(self._on_edit_clicked)
@@ -1082,12 +1247,14 @@ class HistoryWindow(QWidget):
         self._to_meeting_btn.hide()
         tools.add(self._to_meeting_btn)
         self._export_btn = QPushButton("导出")
-        self._export_btn.setToolTip("将选中的会话导出为 Markdown 文件")
+        self._export_btn.setToolTip("将选中的会话导出为 Markdown / 纯文本 / CSV 文件")
         self._export_btn.clicked.connect(self._export_selected)
         tools.add(self._export_btn, role="right")
         self._detail_more_btn = QPushButton("更多")
         self._detail_more_btn.setAccessibleName("当前会话的更多操作")
         self._detail_menu = QMenu(self._detail_more_btn)
+        self._copy_raw_action = self._detail_menu.addAction("复制识别原文")
+        self._copy_raw_action.triggered.connect(self._copy_selected_raw)
         self._to_meeting_action = self._detail_menu.addAction("转为会议并整理")
         self._to_meeting_action.triggered.connect(self._promote_selected_to_meeting)
         self._detail_menu.addSeparator()
@@ -1101,7 +1268,9 @@ class HistoryWindow(QWidget):
         tools.add(self._delete_btn, role="right")
         for btn in (
             self._copy_btn,
+            self._copy_raw_btn,
             self._polish_btn,
+            self._cancel_polish_btn,
             self._edit_btn,
             self._cancel_edit_btn,
             self._merge_btn,
@@ -1109,6 +1278,7 @@ class HistoryWindow(QWidget):
             self._export_btn,
             self._detail_more_btn,
             self._delete_btn,
+            self._select_all_btn,
         ):
             btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         right_lay.addWidget(tools)
@@ -1141,6 +1311,7 @@ class HistoryWindow(QWidget):
 
         # ── overlay toast (copy feedback + undo delete) ──
         self._toast = _Toast(self)
+        self._toast.visibility_changed.connect(self._sync_detail_toast_margin)
         self._undo_bar = self._toast
         self._feedback_label = self._toast.label
         self._undo_label = self._feedback_label
@@ -1173,10 +1344,48 @@ class HistoryWindow(QWidget):
         if hasattr(self, "_toast") and self._toast.isVisible():
             self._toast.reposition()
 
+    def _sync_detail_toast_margin(self, visible: bool) -> None:
+        if not hasattr(self, "_details") or not hasattr(self, "_toast"):
+            return
+        clearance = (self._toast.height() + 24) if visible and self._toast.isVisible() else 0
+        self._details.set_bottom_clearance(clearance)
+
+    def _open_session_row_menu(self, pos) -> None:
+        item = self._session_list.itemAt(pos)
+        if item is None or not item.data(Qt.ItemDataRole.UserRole):
+            return
+        if not item.isSelected() and not self._selection_mode:
+            self._session_list.setCurrentItem(item)
+        from sayink.ui.tray_icon import _menu_font, _menu_stylesheet
+
+        menu = QMenu(self)
+        menu.setFont(_menu_font())
+        menu.setStyleSheet(_menu_stylesheet())
+        selected = self._selected_session_ids()
+        if len(selected) == 1:
+            has_pol = _session_has_polished(self._get_session_segments_effective(selected[0]))
+            act_eff = menu.addAction("复制润色文本" if (has_pol and self._view_polished) else "复制当前内容")
+            act_eff.triggered.connect(self._copy_selected_effective)
+            if has_pol:
+                act_raw = menu.addAction("复制识别原文")
+                act_raw.triggered.connect(self._copy_selected_raw)
+        elif len(selected) > 1:
+            act_batch = menu.addAction(f"复制已选 {len(selected)} 条")
+            act_batch.triggered.connect(self._copy_selected_effective)
+        menu.addSeparator()
+        act_export = menu.addAction("导出…")
+        act_export.setEnabled(bool(selected) and not self._editing_session)
+        act_export.triggered.connect(self._export_selected)
+        act_del = menu.addAction("删除")
+        act_del.setEnabled(bool(selected))
+        act_del.triggered.connect(self._delete_selected_sessions)
+        menu.exec(self._session_list.viewport().mapToGlobal(pos))
+
     def _sync_clear_all_enabled(self) -> None:
-        self._clear_all_action.setEnabled(
-            self.session_count() > 0 or bool(self._search_query) or bool(self._pending_delete)
-        )
+        enabled = self.session_count() > 0 or bool(self._search_query) or bool(self._pending_delete)
+        self._clear_all_action.setEnabled(enabled)
+        if hasattr(self, "_manage_btn"):
+            self._manage_btn.setEnabled(enabled)
 
     # ── data → list ───────────────────────────────────────────────
 
@@ -1260,74 +1469,126 @@ class HistoryWindow(QWidget):
             # Details can change without changing a session's preview/count.
             self._on_selection_changed()
             return
-        # Rebuilding the list clears the selection first. That signal would
-        # treat the open session as closed and snap the detail back to the top
-        # on the next paint. Restore selection, then refresh the detail once.
-        self._session_list.blockSignals(True)
-        try:
-            release_list_item_widgets(self._session_list, self)
-            self._history_preferences_btn.setVisible(
-                not sessions and not self._search_query and not self._history_enabled
-            )
-            self._more_btn.setText("加载更多结果" if self._search_query else "加载更早的会话")
-            self._more_btn.setVisible(self._has_more)
-            self._sessions_by_id = {s.session_id: s for s in sessions}
-            last_day = None
-            for session in sessions:
-                day = _day_label(session.created_at)
-                if day != last_day:
-                    self._add_group_header(day, first=last_day is None)
-                    last_day = day
-                item = QListWidgetItem(self._session_item_text(session))
-                item.setData(Qt.ItemDataRole.UserRole, session.session_id)
-                item.setForeground(Qt.GlobalColor.transparent)
-                item.setSizeHint(QSize(0, self.ROW_HEIGHT))
-                self._session_list.addItem(item)
-                row = self._build_stream_row(session)
-                row.setToolTip(
-                    f"来源：{_source_chip_text(session.source)} · "
-                    f"应用：{session.target_app or '未知应用'} · {session.segment_count} 段"
+        existing_items = self.session_items()
+        existing_ids = [it.data(Qt.ItemDataRole.UserRole) for it in existing_items]
+        existing_summaries = [self._sessions_by_id.get(sid) for sid in existing_ids]
+        can_append_incrementally = (
+            same_query
+            and bool(existing_ids)
+            and len(sessions) > len(existing_ids)
+            and sessions[: len(existing_ids)] == existing_summaries
+        )
+        if can_append_incrementally:
+            prev_scroll = self._session_list.verticalScrollBar().value()
+            self._session_list.blockSignals(True)
+            try:
+                self._more_btn.setText("加载更多结果" if self._search_query else "加载更早的会话")
+                self._more_btn.setVisible(self._has_more)
+                self._sessions_by_id = {s.session_id: s for s in sessions}
+                last_day = _day_label(sessions[len(existing_ids) - 1].created_at)
+                for session in sessions[len(existing_ids) :]:
+                    day = _day_label(session.created_at)
+                    if day != last_day:
+                        self._add_group_header(day, first=False)
+                        last_day = day
+                    item = QListWidgetItem(self._session_item_text(session))
+                    item.setData(Qt.ItemDataRole.UserRole, session.session_id)
+                    item.setForeground(Qt.GlobalColor.transparent)
+                    item.setSizeHint(QSize(0, self.ROW_HEIGHT))
+                    self._session_list.addItem(item)
+                    row = self._build_stream_row(session)
+                    row.setToolTip(
+                        f"来源：{_source_chip_text(session.source)} · "
+                        f"应用：{session.target_app or '未知应用'} · {session.segment_count} 段"
+                    )
+                    self._session_list.setItemWidget(item, row)
+            finally:
+                self._session_list.blockSignals(False)
+            self._session_list.verticalScrollBar().setValue(prev_scroll)
+        else:
+            # Rebuilding the list clears the selection first. That signal would
+            # treat the open session as closed and snap the detail back to the top
+            # on the next paint. Restore selection, then refresh the detail once.
+            self._session_list.blockSignals(True)
+            try:
+                release_list_item_widgets(self._session_list, self)
+                self._history_preferences_btn.setVisible(
+                    not sessions and not self._search_query and not self._history_enabled
                 )
-                self._session_list.setItemWidget(item, row)
-            items = self.session_items()
-            if items:
-                retained = [it for it in items if it.data(Qt.ItemDataRole.UserRole) in selected]
-                if retained:
-                    for it in retained:
-                        it.setSelected(True)
-                    current = next((it for it in retained if it.data(Qt.ItemDataRole.UserRole) == current_id), retained[0])
-                    self._session_list.setCurrentItem(current, QItemSelectionModel.SelectionFlag.NoUpdate)
-                elif not self._selection_mode:
-                    self._session_list.setCurrentItem(items[0])
-            else:
-                self._set_detail_chips([])
-                self._view_bar.hide()
-                store_disabled = getattr(self._store, "disabled", False) is True
-                if self._search_query:
-                    title, empty = "没有搜索结果", "没有匹配的转写。试试更短的关键词，或清除搜索。"
-                elif store_disabled:
-                    title = "历史记录不可用"
-                    empty = "历史记录数据库无法打开，本次运行不会保存转写历史。\n请查看日志，或删除配置目录下的 history.db 后重启。"
-                elif not self._history_enabled:
-                    title = "历史记录未开启"
-                    empty = "历史记录未开启。\n可在通用设置中开启，之后的转写文本会保存在本机。"
+                self._more_btn.setText("加载更多结果" if self._search_query else "加载更早的会话")
+                self._more_btn.setVisible(self._has_more)
+                self._sessions_by_id = {s.session_id: s for s in sessions}
+                last_day = None
+                for session in sessions:
+                    day = _day_label(session.created_at)
+                    if day != last_day:
+                        self._add_group_header(day, first=last_day is None)
+                        last_day = day
+                    item = QListWidgetItem(self._session_item_text(session))
+                    item.setData(Qt.ItemDataRole.UserRole, session.session_id)
+                    item.setForeground(Qt.GlobalColor.transparent)
+                    item.setSizeHint(QSize(0, self.ROW_HEIGHT))
+                    self._session_list.addItem(item)
+                    row = self._build_stream_row(session)
+                    row.setToolTip(
+                        f"来源：{_source_chip_text(session.source)} · "
+                        f"应用：{session.target_app or '未知应用'} · {session.segment_count} 段"
+                    )
+                    self._session_list.setItemWidget(item, row)
+                items = self.session_items()
+                if items:
+                    retained = [it for it in items if it.data(Qt.ItemDataRole.UserRole) in selected]
+                    if retained:
+                        for it in retained:
+                            it.setSelected(True)
+                        current = next((it for it in retained if it.data(Qt.ItemDataRole.UserRole) == current_id), retained[0])
+                        self._session_list.setCurrentItem(current, QItemSelectionModel.SelectionFlag.NoUpdate)
+                    elif not self._selection_mode:
+                        self._session_list.setCurrentItem(items[0])
                 else:
-                    title, empty = "还没有会话", "还没有会话。完成一次转写后会出现在这里。"
-                self._detail_title.setText(title)
-                self._set_detail_document(plain=empty)
-        finally:
-            self._session_list.blockSignals(False)
-        if anchor_id is not None:
-            anchor = next((it for it in self.session_items() if it.data(Qt.ItemDataRole.UserRole) == anchor_id), None)
-            if anchor is not None:
-                self._session_list.doItemsLayout()
-                self._session_list.scrollToItem(anchor, QAbstractItemView.ScrollHint.PositionAtTop)
-                bar = self._session_list.verticalScrollBar()
-                bar.setValue(bar.value() - anchor_top)
-        elif same_query and list_at_top:
-            self._session_list.verticalScrollBar().setValue(0)
-        count = f"{len(sessions)}+" if self._has_more and self._search_query else str(len(sessions))
-        self._list_summary_text = f"找到 {count} 条" if self._search_query else f"最近 {count} 条"
+                    self._set_detail_chips([])
+                    self._view_bar.hide()
+                    store_disabled = getattr(self._store, "disabled", False) is True
+                    if self._search_query:
+                        title, empty = "没有搜索结果", "没有匹配的转写。试试更短的关键词，或清除搜索。"
+                    elif store_disabled:
+                        title = "历史记录不可用"
+                        empty = "历史记录数据库无法打开，本次运行不会保存转写历史。\n请查看日志，或删除配置目录下的 history.db 后重启。"
+                    elif not self._history_enabled:
+                        title = "历史记录未开启"
+                        empty = "历史记录未开启。\n可在通用设置中开启，之后的转写文本会保存在本机。"
+                    else:
+                        title, empty = "还没有会话", "还没有会话。完成一次转写后会出现在这里。"
+                    self._detail_title.setText(title)
+                    self._set_detail_document(plain=empty)
+            finally:
+                self._session_list.blockSignals(False)
+            if anchor_id is not None:
+                anchor = next((it for it in self.session_items() if it.data(Qt.ItemDataRole.UserRole) == anchor_id), None)
+                if anchor is not None:
+                    self._session_list.doItemsLayout()
+                    self._session_list.scrollToItem(anchor, QAbstractItemView.ScrollHint.PositionAtTop)
+                    bar = self._session_list.verticalScrollBar()
+                    bar.setValue(bar.value() - anchor_top)
+            elif same_query and list_at_top:
+                self._session_list.verticalScrollBar().setValue(0)
+        total_count = None
+        if self._has_more and not self._search_query:
+            counter = getattr(self._store, "count_sessions", None)
+            if callable(counter):
+                try:
+                    raw_total = int(counter())
+                    total_count = max(len(sessions), raw_total - len(pending))
+                except Exception:
+                    total_count = None
+        if self._search_query:
+            count = f"{len(sessions)}+" if self._has_more else str(len(sessions))
+            self._list_summary_text = f"找到 {count} 条"
+        elif total_count is not None and total_count > len(sessions):
+            self._list_summary_text = f"最近 {len(sessions)} / 共 {total_count} 条"
+        else:
+            count = f"{len(sessions)}+" if self._has_more else str(len(sessions))
+            self._list_summary_text = f"最近 {count} 条"
         self._sync_clear_all_enabled()
         self._restyle_rows()
         self._on_selection_changed()
@@ -1427,11 +1688,38 @@ class HistoryWindow(QWidget):
         self._detail_chip_bar.setVisible(has_metadata and self._metadata_btn.isChecked())
 
     def _on_view_toggled(self, polished_checked: bool) -> None:
+        if self._editing_session:
+            expected = not getattr(self, "_editing_raw_mode", False)
+            self._view_polished_btn.blockSignals(True)
+            self._view_raw_btn.blockSignals(True)
+            self._view_polished_btn.setChecked(expected)
+            self._view_raw_btn.setChecked(not expected)
+            self._view_polished_btn.blockSignals(False)
+            self._view_raw_btn.blockSignals(False)
+            return
         self._view_polished = polished_checked
+        self._user_view_polished = polished_checked
+        self._search_auto_switched = False
         item = self._single_selected_item()
         if item is not None:
             self._expand_session(item)
-        self._apply_copy_action_styles(self._current_selection_has_polished())
+        has_polished = self._current_selection_has_polished()
+        self._apply_copy_action_styles(has_polished)
+        self._sync_copy_raw_visibility(len(self._selected_session_ids()), has_polished)
+
+    def _sync_copy_raw_visibility(self, count: int, has_polished: bool) -> None:
+        show_quick_raw = (
+            not self._selection_mode
+            and not self._editing_session
+            and count == 1
+            and has_polished
+            and self._view_polished
+        )
+        self._copy_raw_btn.setVisible(show_quick_raw)
+        self._copy_raw_btn.setEnabled(show_quick_raw)
+        if hasattr(self, "_copy_raw_action"):
+            self._copy_raw_action.setVisible(count == 1 and has_polished)
+            self._copy_raw_action.setEnabled(count == 1 and has_polished and not self._editing_session)
 
     def _single_selected_item(self) -> QListWidgetItem | None:
         selected = [it for it in self._session_list.selectedItems() if it.data(Qt.ItemDataRole.UserRole)]
@@ -1474,13 +1762,37 @@ class HistoryWindow(QWidget):
             matches_raw = any(query in segment.raw_text.casefold() for segment in segments)
             if has_polished and matches_polished != matches_raw:
                 self._view_polished = matches_polished
+                self._search_auto_switched = True
                 self._view_polished_btn.blockSignals(True)
+                self._view_raw_btn.blockSignals(True)
                 self._view_polished_btn.setChecked(matches_polished)
                 self._view_raw_btn.setChecked(not matches_polished)
                 self._view_polished_btn.blockSignals(False)
+                self._view_raw_btn.blockSignals(False)
                 self._apply_copy_action_styles(has_polished)
+            elif self._search_auto_switched:
+                self._view_polished = self._user_view_polished
+                self._search_auto_switched = False
+                self._view_polished_btn.blockSignals(True)
+                self._view_raw_btn.blockSignals(True)
+                self._view_polished_btn.setChecked(self._view_polished)
+                self._view_raw_btn.setChecked(not self._view_polished)
+                self._view_polished_btn.blockSignals(False)
+                self._view_raw_btn.blockSignals(False)
+                self._apply_copy_action_styles(has_polished)
+        elif not self._search_query and self._search_auto_switched:
+            self._view_polished = self._user_view_polished
+            self._search_auto_switched = False
+            self._view_polished_btn.blockSignals(True)
+            self._view_raw_btn.blockSignals(True)
+            self._view_polished_btn.setChecked(self._view_polished)
+            self._view_raw_btn.setChecked(not self._view_polished)
+            self._view_polished_btn.blockSignals(False)
+            self._view_raw_btn.blockSignals(False)
+            self._apply_copy_action_styles(has_polished)
         self._detail_search_context = search_context
         self._view_bar.setVisible(has_polished)
+        self._sync_copy_raw_visibility(1, has_polished)
         show_polished = self._view_polished if has_polished else False
         self._set_detail_document(
             html=self._render_segments_html(segments, show_polished),
@@ -1653,20 +1965,39 @@ class HistoryWindow(QWidget):
         has_polished = False
         if count == 1:
             has_polished = _session_has_polished(self._get_session_segments_effective(selected[0]))
-        self._copy_btn.setEnabled(count >= 1 and not self._editing_session)
+        editing = self._editing_session
+        view_tip_locked = "正在编辑中，请先保存或取消后再切换视图"
+        self._view_bar.setEnabled(not editing)
+        self._view_polished_btn.setEnabled(not editing)
+        self._view_raw_btn.setEnabled(not editing)
+        self._view_bar.setToolTip(view_tip_locked if editing else "")
+        self._view_polished_btn.setToolTip(view_tip_locked if editing else "查看润色后的文本")
+        self._view_raw_btn.setToolTip(view_tip_locked if editing else "查看未润色的原始识别文本")
+        self._copy_btn.setEnabled(count >= 1 and not editing)
         self._apply_copy_action_styles(count == 1 and has_polished)
+        self._sync_copy_raw_visibility(count, has_polished)
         polishing = self._polishing_session_id is not None
-        self._polish_btn.setVisible(not self._selection_mode and not self._editing_session)
+        polishing_this = polishing and count == 1 and selected[0] == self._polishing_session_id
+        self._polish_btn.setVisible(not self._selection_mode and not editing)
         self._polish_btn.setEnabled(count == 1 and not polishing)
         action = self._llm_action_label()
-        if polishing and count == 1 and selected[0] == self._polishing_session_id:
+        if polishing_this:
             self._polish_btn.setText(f"正在{action}")
         else:
             self._polish_btn.setText(f"重新{action}" if has_polished else action)
+        self._cancel_polish_btn.setVisible(polishing and not self._selection_mode and not editing)
+        self._cancel_polish_btn.setEnabled(polishing)
+        self._cancel_polish_btn.setText(f"取消{action}")
         self._edit_btn.setVisible(not self._selection_mode)
         self._edit_btn.setEnabled(count == 1 and not polishing)
-        self._edit_btn.setText("保存" if self._editing_session else "编辑")
-        self._cancel_edit_btn.setVisible(self._editing_session and not self._selection_mode)
+        self._edit_btn.setText("保存" if editing else "编辑")
+        if editing:
+            self._edit_btn.setToolTip("保存对当前文本的修改")
+        elif count == 1 and has_polished and not self._view_polished:
+            self._edit_btn.setToolTip("直接编辑当前识别原文（不会覆盖已有的润色版）")
+        else:
+            self._edit_btn.setToolTip("直接编辑当前会话文本（修改保存为润色版，原文保持不变）")
+        self._cancel_edit_btn.setVisible(editing and not self._selection_mode)
         self._merge_btn.setVisible(self._selection_mode)
         self._merge_btn.setEnabled(count >= 2)
         self._merge_btn.setText("合并")
@@ -1679,20 +2010,22 @@ class HistoryWindow(QWidget):
             else "复制当前会话的分段生成会议记录，并打开会议工作台整理纪要"
         )
         self._to_meeting_action.setEnabled(count >= 1)
-        self._export_btn.setVisible(not self._editing_session)
-        self._export_btn.setEnabled(count > 0 and not self._editing_session)
+        self._export_btn.setVisible(not editing)
+        self._export_btn.setEnabled(count > 0 and not editing)
         self._export_btn.setText(f"导出 {count} 条" if self._selection_mode else "导出")
         self._delete_btn.setEnabled(count > 0)
         self._delete_btn.setText(f"删除 {count} 条")
         self._delete_btn.setVisible(self._selection_mode)
         self._delete_action.setEnabled(count > 0)
-        self._detail_more_btn.setVisible(not self._selection_mode and not self._editing_session)
+        self._detail_more_btn.setVisible(not self._selection_mode and not editing)
         self._detail_more_btn.setEnabled(count > 0)
         for btn in (
             self._view_polished_btn,
             self._view_raw_btn,
             self._copy_btn,
+            self._copy_raw_btn,
             self._polish_btn,
+            self._cancel_polish_btn,
             self._edit_btn,
             self._cancel_edit_btn,
             self._merge_btn,
@@ -1701,6 +2034,7 @@ class HistoryWindow(QWidget):
             self._detail_more_btn,
             self._delete_btn,
             self._selection_mode_btn,
+            self._select_all_btn,
             self._manage_btn,
             self._metadata_btn,
         ):
@@ -1715,7 +2049,7 @@ class HistoryWindow(QWidget):
             self._detail_title.setText(f"已选 {count} 条会话" if count else "选择要管理的会话")
             self._set_detail_document(html=self._render_multi_selection_html(self._selected_sessions()))
         elif count == 1:
-            if not self._editing_session:
+            if not editing:
                 self._expand_session(self._single_selected_item())
         elif self.session_count():
             self._set_detail_chips([])
@@ -1725,6 +2059,8 @@ class HistoryWindow(QWidget):
             self._set_detail_document(plain="选择一条转写查看分段内容")
         else:
             self._detail_stats.clear()
+            self._set_detail_chips([])
+            self._view_bar.hide()
 
     def _selected_session_ids(self) -> list[str]:
         return [
@@ -1752,7 +2088,13 @@ class HistoryWindow(QWidget):
 
     # ── actions ───────────────────────────────────────────────────
 
-    def _map_edited_text_to_segments(self, segments: list[SegmentRecord], text: str) -> dict[int, str] | None:
+    def _map_edited_text_to_segments(
+        self,
+        segments: list[SegmentRecord],
+        text: str,
+        *,
+        merge_extra: bool = True,
+    ) -> dict[int, str] | None:
         ordered = _segments_in_order(segments)
         if not ordered:
             return {}
@@ -1760,15 +2102,55 @@ class HistoryWindow(QWidget):
         if len(ordered) == 1:
             return {ordered[0].seq: cleaned}
         parts = [p.strip() for p in re.split(r"\n\s*\n", cleaned) if p.strip()]
+        if not parts:
+            return {seg.seq: _SUPPRESSED_POLISHED_MARKER for seg in ordered}
         if len(parts) > len(ordered):
-            # A blank line inside one segment must not swallow every later segment.
-            return None
+            if not merge_extra:
+                return None
+            # Preserve leading segment boundaries and fold extra blank-line splits
+            # into the final segment so explicit user edits / AI polish never fail.
+            n = len(ordered)
+            out = {ordered[i].seq: parts[i] for i in range(n - 1)}
+            out[ordered[n - 1].seq] = "\n\n".join(parts[n - 1 :])
+            return out
         if len(parts) == len(ordered):
             return {seg.seq: part for seg, part in zip(ordered, parts, strict=True)}
-        out: dict[int, str] = {ordered[0].seq: cleaned}
-        for seg in ordered[1:]:
-            out[seg.seq] = "\u200b"
+        # Fewer paragraphs than segments: map 1-to-1 onto leading segments (keeping
+        # their timestamps & speaker headers intact) and suppress only trailing surplus.
+        out = {ordered[i].seq: parts[i] for i in range(len(parts))}
+        for seg in ordered[len(parts) :]:
+            out[seg.seq] = _SUPPRESSED_POLISHED_MARKER
         return out
+
+    def _update_raw_segments(self, session_id: str, raw_by_seq: dict[int, str]) -> None:
+        raw_updater = getattr(self._store, "enqueue_update_raw", None)
+        if callable(raw_updater):
+            raw_updater(session_id, raw_by_seq)
+            return
+        enqueue_write = getattr(self._store, "enqueue_write", None)
+        if callable(enqueue_write):
+            rows = [
+                ("" if str(val) == _SUPPRESSED_POLISHED_MARKER else str(val), session_id, int(seq))
+                for seq, val in raw_by_seq.items()
+            ]
+            enqueue_write(
+                lambda conn: conn.executemany(
+                    "UPDATE history SET raw_text = ? WHERE session_id = ? AND seq = ?",
+                    rows,
+                )
+            )
+            return
+        segs_map = getattr(self._store, "segments", None)
+        if isinstance(segs_map, dict) and session_id in segs_map:
+            segs_map[session_id] = [
+                replace(
+                    s,
+                    raw_text=("" if raw_by_seq[s.seq] == _SUPPRESSED_POLISHED_MARKER else raw_by_seq[s.seq]),
+                )
+                if s.seq in raw_by_seq
+                else s
+                for s in segs_map[session_id]
+            ]
 
     def _on_edit_clicked(self) -> None:
         if self._editing_session:
@@ -1802,7 +2184,9 @@ class HistoryWindow(QWidget):
         segments = _segments_in_order(self._get_session_segments_effective(session_id))
         if not segments:
             return
-        show_polished = self._view_polished if _session_has_polished(segments) else False
+        has_polished = _session_has_polished(segments)
+        show_polished = self._view_polished if has_polished else False
+        self._editing_raw_mode = has_polished and not self._view_polished
         chunks = []
         for seg in segments:
             if show_polished and seg.polished_text == _SUPPRESSED_POLISHED_MARKER:
@@ -1814,9 +2198,14 @@ class HistoryWindow(QWidget):
         self._editing_session = True
         self._editing_session_id = session_id
         self._editing_original_text = "\n\n".join(chunks)
+        self._detail_scroll_timer.stop()
         self._details.setReadOnly(False)
         self._paint_history_styles()
         self._details.setPlainText(self._editing_original_text)
+        cursor = self._details.textCursor()
+        cursor.movePosition(cursor.MoveOperation.Start)
+        self._details.setTextCursor(cursor)
+        self._details.verticalScrollBar().setValue(0)
         self._details.setFocus()
         self._on_selection_changed()
 
@@ -1824,6 +2213,7 @@ class HistoryWindow(QWidget):
         self._editing_session = False
         self._editing_session_id = None
         self._editing_original_text = ""
+        self._editing_raw_mode = False
         self._details.setReadOnly(True)
         self._paint_history_styles()
 
@@ -1845,37 +2235,48 @@ class HistoryWindow(QWidget):
         self._exit_inline_edit_state()
         self._on_selection_changed()
 
-    def _save_inline_edit(self, *, refresh: bool = True) -> bool:
+    def _save_inline_edit(self, *, refresh: bool = True, strict_paragraphs: bool = False) -> bool:
         if not self._editing_session or not self._editing_session_id:
             return True
         session_id = self._editing_session_id
+        editing_raw = getattr(self, "_editing_raw_mode", False)
         new_text = self._details.toPlainText().strip()
         segments = _segments_in_order(self._get_session_segments_effective(session_id))
         if not new_text or not segments:
             self._exit_inline_edit_state()
         else:
-            mapping = self._map_edited_text_to_segments(segments, new_text)
+            mapping = self._map_edited_text_to_segments(
+                segments, new_text, merge_extra=not strict_paragraphs
+            )
             if mapping is None:
-                self._show_feedback("空行比段落多，修改未保存。请去掉多余空行后再保存。")
+                self._show_feedback("空行比段落多，修改未保存。请点击「保存」确认合并或去掉多余空行。")
                 return False
             if getattr(self._store, "disabled", False):
                 self._show_feedback("未能保存修改")
                 return False
-            updater = getattr(self._store, "enqueue_update_polished", None)
-            if callable(updater):
-                updater(session_id, mapping)
+            if editing_raw:
+                self._update_raw_segments(session_id, mapping)
+            else:
+                updater = getattr(self._store, "enqueue_update_polished", None)
+                if callable(updater):
+                    updater(session_id, mapping)
             flush = getattr(self._store, "flush", None)
             saved = flush(timeout=2.0) if callable(flush) else True
             if saved is False:
                 self._show_feedback("未能保存修改")
                 return False
             self._exit_inline_edit_state()
-            self._view_polished = True
+            target_polished = not editing_raw
+            self._view_polished = target_polished
+            self._user_view_polished = target_polished
+            self._search_auto_switched = False
             self._view_polished_btn.blockSignals(True)
-            self._view_polished_btn.setChecked(True)
-            self._view_raw_btn.setChecked(False)
+            self._view_raw_btn.blockSignals(True)
+            self._view_polished_btn.setChecked(target_polished)
+            self._view_raw_btn.setChecked(not target_polished)
             self._view_polished_btn.blockSignals(False)
-            self._show_feedback("已保存修改")
+            self._view_raw_btn.blockSignals(False)
+            self._show_feedback("已保存原文修改" if editing_raw else "已保存修改")
         if refresh:
             self.refresh()
         return True
@@ -1893,7 +2294,7 @@ class HistoryWindow(QWidget):
             self._exit_inline_edit_state()
             self._on_selection_changed()
             return True
-        return self._save_inline_edit()
+        return self._save_inline_edit(strict_paragraphs=True)
 
     def hideEvent(self, event) -> None:
         if getattr(self, "_editing_session", False):
@@ -1982,10 +2383,24 @@ class HistoryWindow(QWidget):
             return correction_rejection_reason(raw, polished_text, getattr(self, "_polishing_glossary", ()))
         return polish_rejection_reason(raw, polished_text)
 
+    def _cancel_polish(self, *, silent: bool = False) -> None:
+        if self._polishing_session_id is None:
+            return
+        action = self._llm_action_label()
+        self._polishing_session_id = None
+        if self._polisher is not None and callable(getattr(self._polisher, "cancel", None)):
+            self._polisher.cancel()
+        self._on_selection_changed()
+        if not silent:
+            self._show_feedback(f"已取消{action}")
+
     def _on_polish_complete(self, polished_text: str) -> None:
         session_id = self._polishing_session_id
         self._polishing_session_id = None
         if not session_id:
+            self._on_selection_changed()
+            return
+        if any(s.session_id == session_id for s in self._pending_delete):
             self._on_selection_changed()
             return
         cleaned = (polished_text or "").strip()
@@ -2010,10 +2425,14 @@ class HistoryWindow(QWidget):
             if callable(flush):
                 flush(timeout=2.0)
             self._view_polished = True
+            self._user_view_polished = True
+            self._search_auto_switched = False
             self._view_polished_btn.blockSignals(True)
+            self._view_raw_btn.blockSignals(True)
             self._view_polished_btn.setChecked(True)
             self._view_raw_btn.setChecked(False)
             self._view_polished_btn.blockSignals(False)
+            self._view_raw_btn.blockSignals(False)
             self._show_feedback(f"已完成{label}")
         self.refresh()
 
@@ -2100,8 +2519,15 @@ class HistoryWindow(QWidget):
 
     def _show_feedback(self, text: str) -> None:
         self._transient_active = True
-        self._feedback_label.setText(text)
-        self._undo_btn.setVisible(False)
+        has_undo = bool(self._pending_delete or self._pending_merge)
+        if self._pending_delete and "可撤销" not in text:
+            display_text = f"{text} · 可撤销删除"
+        elif self._pending_merge and "可撤销" not in text:
+            display_text = f"{text} · 可撤销合并"
+        else:
+            display_text = text
+        self._feedback_label.setText(display_text)
+        self._undo_btn.setVisible(has_undo)
         self._toast.show()
         self._toast.reposition()
         self._feedback_timer.start(2200)
@@ -2167,6 +2593,8 @@ class HistoryWindow(QWidget):
         self._merge_committed_by_delete = self._settle_pending_merge()
         # Undo replaces the confirmation dialog: one safety net, not two.
         ids = {s.session_id for s in deletable}
+        if self._polishing_session_id in ids:
+            self._cancel_polish(silent=True)
         self._pending_delete.extend(deletable)
         self._load_sessions([
             session for session in self._sessions_by_id.values()
@@ -2248,6 +2676,7 @@ class HistoryWindow(QWidget):
         count = counter() if callable(counter) else None
         if _ClearHistoryDialog(self, session_count=count).exec() != QDialog.DialogCode.Accepted:
             return
+        self._cancel_polish(silent=True)
         self._undo_timer.stop()
         self._feedback_timer.stop()
         self._transient_active = False
@@ -2266,26 +2695,88 @@ class HistoryWindow(QWidget):
         else:
             self._export_batch(sessions)
 
+    @staticmethod
+    def _segments_for_raw_export(segments: list[SegmentRecord]) -> list[SegmentRecord]:
+        return [replace(seg, polished_text="") for seg in segments if (seg.raw_text or "").strip()]
+
+    @staticmethod
+    def _resolve_export_kind(path: str, selected_filter: str) -> str:
+        filt = (selected_filter or "").strip()
+        lower = path.lower()
+        if filt.startswith("CSV") or lower.endswith(".csv"):
+            return "csv"
+        if filt.startswith("纯文本") or lower.endswith(".txt"):
+            return "txt"
+        return "md"
+
+    def _confirm_adjusted_overwrite(self, raw_path: str, target_path: str) -> bool:
+        if Path(raw_path) == Path(target_path) or not Path(target_path).exists():
+            return True
+        from sayink.ui.prompts import confirm
+
+        return confirm(
+            self,
+            "覆盖已有文件",
+            f"目标文件「{Path(target_path).name}」已存在，是否覆盖？",
+            accept="覆盖",
+            destructive=True,
+        )
+
     def _export_single(self, session: SessionSummary) -> None:
         default = export_save_path(suggest_single_export_filename(session))
-        path, selected_filter = QFileDialog.getSaveFileName(
+        raw_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "导出历史",
             default,
-            "Markdown (*.md);;纯文本 (*.txt)",
+            "Markdown (*.md);;纯文本 (*.txt);;CSV 表格 (*.csv)",
         )
-        if not path:
+        if not raw_path:
             return
-        kind = "txt" if (selected_filter or "").startswith("纯文本") or path.lower().endswith(".txt") else "md"
-        if kind == "txt" and not path.lower().endswith(".txt"):
-            path = str(Path(path).with_suffix(".txt"))
+        kind = self._resolve_export_kind(raw_path, selected_filter)
+        path = _with_history_export_suffix(raw_path, kind)
+        if not self._confirm_adjusted_overwrite(raw_path, path):
+            return
         segments = self._get_session_segments_effective(session.session_id)
+        has_polished = _session_has_polished(segments)
+        prefer_raw = has_polished and not self._view_polished
         try:
-            text = (
-                build_single_session_plain(session, segments)
-                if kind == "txt"
-                else build_single_session_markdown(session, segments)
-            )
+            if kind == "csv":
+                from sayink.ui import history_export as _hexp
+
+                csv_fn = getattr(_hexp, "build_single_session_csv", None)
+                export_csv_fn = getattr(_hexp, "export_csv", None)
+                if callable(csv_fn):
+                    params = inspect.signature(csv_fn).parameters
+                    if "prefer_raw" in params:
+                        text = csv_fn(session, segments, prefer_raw=prefer_raw)
+                    else:
+                        segs = self._segments_for_raw_export(segments) if prefer_raw else segments
+                        text = csv_fn(session, segs)
+                elif callable(export_csv_fn):
+                    params = inspect.signature(export_csv_fn).parameters
+                    if "prefer_raw" in params:
+                        text = export_csv_fn([session], {session.session_id: segments}, prefer_raw=prefer_raw)
+                    else:
+                        segs = self._segments_for_raw_export(segments) if prefer_raw else segments
+                        text = export_csv_fn([session], {session.session_id: segs})
+                else:
+                    text = _fallback_sessions_csv(
+                        [session], {session.session_id: segments}, prefer_raw=prefer_raw
+                    )
+            elif kind == "txt":
+                params = inspect.signature(build_single_session_plain).parameters
+                if "prefer_raw" in params:
+                    text = build_single_session_plain(session, segments, prefer_raw=prefer_raw)
+                else:
+                    segs = self._segments_for_raw_export(segments) if prefer_raw else segments
+                    text = build_single_session_plain(session, segs)
+            else:
+                params = inspect.signature(build_single_session_markdown).parameters
+                if "prefer_raw" in params:
+                    text = build_single_session_markdown(session, segments, prefer_raw=prefer_raw)
+                else:
+                    segs = self._segments_for_raw_export(segments) if prefer_raw else segments
+                    text = build_single_session_markdown(session, segs)
             Path(path).write_text(text, encoding="utf-8")
         except OSError as exc:
             QMessageBox.critical(self, "导出失败", f"无法写入文件：{exc}")
@@ -2294,23 +2785,53 @@ class HistoryWindow(QWidget):
 
     def _export_batch(self, sessions: list[SessionSummary]) -> None:
         default = export_save_path(suggest_batch_export_filename())
-        path, _selected_filter = QFileDialog.getSaveFileName(
+        raw_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "批量导出历史",
             default,
-            "Markdown (*.md)",
+            "Markdown (*.md);;CSV 表格 (*.csv)",
         )
-        if not path:
+        if not raw_path:
             return
+        kind = "csv" if ((selected_filter or "").strip().startswith("CSV") or raw_path.lower().endswith(".csv")) else "md"
+        path = _with_history_export_suffix(raw_path, kind)
+        if not self._confirm_adjusted_overwrite(raw_path, path):
+            return
+        prefer_raw = not self._view_polished
         segments_by_session = {
             s.session_id: self._get_session_segments_effective(s.session_id)
             for s in sessions
         }
         try:
-            Path(path).write_text(
-                build_batch_export_markdown(sessions, segments_by_session),
-                encoding="utf-8",
-            )
+            if kind == "csv":
+                from sayink.ui import history_export as _hexp
+
+                csv_fn = getattr(_hexp, "build_batch_export_csv", None) or getattr(_hexp, "export_csv", None)
+                if callable(csv_fn):
+                    params = inspect.signature(csv_fn).parameters
+                    if "prefer_raw" in params:
+                        text = csv_fn(sessions, segments_by_session, prefer_raw=prefer_raw)
+                    else:
+                        mapped = (
+                            {sid: self._segments_for_raw_export(segs) for sid, segs in segments_by_session.items()}
+                            if prefer_raw
+                            else segments_by_session
+                        )
+                        text = csv_fn(sessions, mapped)
+                else:
+                    text = _fallback_sessions_csv(sessions, segments_by_session, prefer_raw=prefer_raw)
+            else:
+                params = inspect.signature(build_batch_export_markdown).parameters
+                if "prefer_raw" in params:
+                    text = build_batch_export_markdown(sessions, segments_by_session, prefer_raw=prefer_raw)
+                else:
+                    mapped = (
+                        {sid: self._segments_for_raw_export(segs) for sid, segs in segments_by_session.items()}
+                        if prefer_raw
+                        else segments_by_session
+                    )
+                    text = build_batch_export_markdown(sessions, mapped)
+            Path(path).write_text(text, encoding="utf-8")
         except OSError as exc:
             QMessageBox.critical(self, "导出失败", f"无法写入文件：{exc}")
             return

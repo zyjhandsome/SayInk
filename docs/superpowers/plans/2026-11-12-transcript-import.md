@@ -1,7 +1,5 @@
 # 导入文字稿 Implementation Plan
 
-> **For agentic workers:** 场景 1 已完成。场景 3、场景 2 已按后续验收继续实现，当前都待用户验收。不要提交 git，除非用户明确要求。
-
 **Goal:** 会议页可以粘贴或打开已有文字稿，生成一场已结束的会议；保留认得出的说话人与时间，纯文本不伪造「说话人待确认」和 `00:00:00`；导入后只打开会议，不自动生成纪要。
 
 **Architecture:** 纯函数解析器 `sayink/transcript_import.py` 不碰 Qt 和数据库。`MeetingStore.create_meeting_from_transcript` 在同一次写入里创建 `source=import_text` 的已结束会议、文字稿行和真实姓名。纪要请求用显式的 `speakers_distinguished` / `timestamps_available`（默认都为真，现场会议即使全是说话人 0 也保持原提示词和指纹）。界面只加一个次按钮和一个对话框。
