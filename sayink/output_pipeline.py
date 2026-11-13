@@ -738,7 +738,9 @@ class OutputPipeline:
             # A slice of the hold failed to recognise and was left out; the
             # user would otherwise only notice the gap in the pasted text.
             target_hint = f"{target_hint} · 有 {dropped} 段未识别"
-        if getattr(self.recorder, "is_recording", False):
+        if getattr(self.recorder, "is_recording", False) and not getattr(
+            self.recorder, "is_continuous", False
+        ):
             # The next hold is already being recorded.
             self.tray.set_activity_tooltip("recording")
         elif self.meeting_active():

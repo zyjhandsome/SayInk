@@ -10,6 +10,8 @@ Owns:
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 import time
 from typing import Any, Callable
 
@@ -240,9 +242,14 @@ class ReloadCoordinator:
         self.applied_audio_key = self.audio_runtime_key()
 
     def apply_audio_options(self) -> None:
+        save_audio = bool(
+            self.config.get("audio.recovery_enabled", False)
+            or (self.meeting_active() and self.config.get("meeting.save_audio", True))
+        )
+        cfg_dir = getattr(self.config, "config_dir", None)
         root = (
-            self.config.config_dir / "audio-recovery"
-            if self.config.get("audio.recovery_enabled", False)
+            Path(cfg_dir) / "audio-recovery"
+            if save_audio and isinstance(cfg_dir, (str, os.PathLike))
             else None
         )
         self.recorder.set_recovery_directory(root)
@@ -519,7 +526,7 @@ class ReloadCoordinator:
     def apply_immediate_preferences(self) -> None:
         self.sound.enabled = self.config.get("sound_enabled", True)
         self.tray.set_auto_start(self.config.get("auto_start", False))
-        self.paster.restore_clipboard = self.config.get("output.restore_clipboard", False)
+        self.paster.restore_clipboard = self.config.get("output.restore_clipboard", True)
 
     def on_settings_changed(self) -> None:
         if self.exit_started():
@@ -604,5 +611,6 @@ class ReloadCoordinator:
         """Hand the pipeline back to dictation once a meeting finishes."""
         self.recognition_change_pending = False
         self.models_reload_pending = False
+        self.apply_audio_options()
         self.apply_audio_config()
         self.configure_stt()

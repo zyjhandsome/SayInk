@@ -202,17 +202,25 @@ def reassign_turns(
     if big:
         references = {l: centroid(l) for l in big}
         small = sorted(set(counts) - set(big))
+        merge_floor = (
+            max(DISTINCT_VOICE_SIMILARITY, float(threshold) - 0.15)
+            if fallback_seed
+            else DISTINCT_VOICE_SIMILARITY
+        )
         # A recurring or long voice unlike every reference is someone else
         # (an interviewer's few long questions), not a fragment to fold away.
+        # In fallback_seed short meetings (where no cluster has reached min_turns
+        # or min_seconds yet), any clear founded voice below merge_floor is kept
+        # as an independent speaker rather than collapsed into the single seed.
         kept = [
             l for l in small
             if l in founded
             and (
-                counts[l] >= min_turns
+                fallback_seed
+                or counts[l] >= min_turns
                 or seconds[l] >= min_seconds
-                or (fallback_seed and (counts[l] >= 2 or seconds[l] >= 2.0))
             )
-            and nearest(centroid(l), references)[0] < DISTINCT_VOICE_SIMILARITY
+            and nearest(centroid(l), references)[0] < merge_floor
         ]
         references.update({l: centroid(l) for l in kept})
         unlike: list[tuple[int, int]] = []
@@ -220,9 +228,9 @@ def reassign_turns(
             if l in kept:
                 continue
             similarity, target = nearest(centroid(l), references)
-            if similarity >= DISTINCT_VOICE_SIMILARITY:
+            if similarity >= merge_floor:
                 labels[labels == l] = target
-            elif l in founded:
+            elif l in founded and not fallback_seed:
                 unlike.append((l, target))
         # A short clear group unlike every voice (laughter, a cough) says little
         # about who made it; between turns of one speaker it stays with them.

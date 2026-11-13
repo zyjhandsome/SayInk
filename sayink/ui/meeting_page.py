@@ -1566,7 +1566,7 @@ class MeetingPage(QWidget):
             f" border-radius: {tok.RADIUS_MD}px; }}"
         )
         self._system_silent_label.setStyleSheet(
-            f"color: {warn_fg}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 600; background: transparent;"
+            f"color: {warn_fg}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700; background: transparent;"
         )
         self._audio_player.reapply_theme()
         edit_css = f"""

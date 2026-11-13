@@ -617,7 +617,7 @@ class App(QObject):
         self._paster = (
             m.paster
             if m is not None and m.paster is not None
-            else TextPaster(restore_clipboard=self._config.get("output.restore_clipboard", False))
+            else TextPaster(restore_clipboard=self._config.get("output.restore_clipboard", True))
         )
         self._sound = (
             m.sound
@@ -651,6 +651,7 @@ class App(QObject):
         self._deferred_audio_settings = False
         self._meeting_idle_warned = False
         self._unrecognized_meeting_notice = ""
+        self._pending_system_silent_warning = ""
         self._meeting_idle_timer = QTimer(self)
         self._meeting_idle_timer.setInterval(30_000)
         self._meeting_idle_timer.timeout.connect(self._on_meeting_idle_tick)
@@ -789,6 +790,12 @@ class App(QObject):
         self._recorder.error.connect(self._on_recorder_error)
         self._recorder.warning.connect(self._on_recorder_warning)
         self._recorder.no_speech_warning.connect(self._on_no_speech_warning)
+        lane_levels = getattr(self._recorder, "lane_levels_changed", None)
+        if lane_levels is not None and hasattr(lane_levels, "connect"):
+            lane_levels.connect(self._on_recorder_lane_levels)
+        sys_silent = getattr(self._recorder, "system_silent_warning", None)
+        if sys_silent is not None and hasattr(sys_silent, "connect"):
+            sys_silent.connect(self._on_recorder_system_silent_warning)
 
         self._recognizer.final_result.connect(self._on_final_result)
         self._recognizer.meeting_result.connect(self._on_speaker_turn_result)
@@ -1163,10 +1170,22 @@ class App(QObject):
         self._hold_opened_at = time.monotonic()
         self._recorder.start(continuous=False)
         self._clear_live_transcript()
-        self._sound.play_start()
+        self._play_start_cue()
         self._tray.set_recording(True)
         self._tray.set_activity_tooltip("recording")
         self._floating.show_recording()
+
+    def _play_start_cue(self, input_source: str | None = None) -> None:
+        src = str(
+            input_source
+            or getattr(self._recorder, "_input_source", "")
+            or self._config.get("audio.input_source", INPUT_SOURCE_MICROPHONE)
+        )
+        if src in (INPUT_SOURCE_SYSTEM, INPUT_SOURCE_MIXED) and getattr(self._sound, "enabled", True):
+            suppress = getattr(self._recorder, "suppress_system_loopback_ms", None)
+            if callable(suppress):
+                suppress(240)
+        self._sound.play_start()
 
     def _open_hold_recorder(self):
         if not self._hold_open_pending:
@@ -1454,6 +1473,37 @@ class App(QObject):
         )
         self._pause_if_backlog_too_long()
 
+    def _on_recorder_lane_levels(self, mic_level: float, sys_level: float) -> None:
+        if self._safe_attr("_exit_started", False) or not self._meeting_active():
+            return
+        if float(sys_level) >= 0.002:
+            self._pending_system_silent_warning = ""
+        main = self._safe_attr("_main")
+        panel = getattr(main, "meeting_panel", None) if main is not None else None
+        setter = getattr(panel, "set_lane_levels", None)
+        if callable(setter):
+            setter(float(mic_level), float(sys_level))
+
+    def _on_recorder_system_silent_warning(self, message: str) -> None:
+        if self._safe_attr("_exit_started", False):
+            return
+        text = str(message or "").strip()
+        if not text:
+            return
+        log.info("电脑声静音提醒: %s", text)
+        if self._meeting_active():
+            self._pending_system_silent_warning = text
+            main = self._safe_attr("_main")
+            panel = getattr(main, "meeting_panel", None) if main is not None else None
+            shower = getattr(panel, "show_system_silent_warning", None)
+            if callable(shower):
+                shower(text)
+            if main is None or not main.isVisible():
+                self._floating.show_info("未检测到远端声音", text)
+                self._later(BAR_REFRESH_AFTER_STOP_MS, self._refresh_meeting_bar)
+        else:
+            self._floating.show_info("未检测到播放声音", text)
+
     def _start_continuous_listening(self):
         if getattr(self._meeting, "importing_media", False):
             self._floating.show_error("正在导入音视频，请完成或取消后再转写")
@@ -1473,7 +1523,7 @@ class App(QObject):
         self._locked_trigger_mode = TRIGGER_MODE_CONTINUOUS
         self._continuous_start_pending = True
         log.info("开启持续转写（来源: %s）", self._recorder.input_source_display)
-        self._sound.play_start()
+        self._play_start_cue(self._config.get("audio.input_source", INPUT_SOURCE_MICROPHONE))
         self._tray.set_activity_tooltip("listening")
         self._floating.show_listening(self._listening_target(""))
 
@@ -2949,6 +2999,18 @@ class App(QObject):
             caps = replace(caps, vad=actual.effective, vad_error=actual.error)
         record = self._meeting.begin(options, caps)
         caps = self._meeting.capabilities or caps
+        self._pending_system_silent_warning = ""
+        if self._main is not None:
+            clear_warn = getattr(self._main.meeting_panel, "clear_system_silent_warning", None)
+            if callable(clear_warn):
+                clear_warn()
+        self._apply_audio_options()
+        set_sid = getattr(self._recorder, "set_recovery_session_id", None)
+        if callable(set_sid):
+            set_sid(record.id)
+        set_paused = getattr(self._recorder, "set_paused", None)
+        if callable(set_paused):
+            set_paused(False)
         log.info(
             "开始会议 %s（来源 %s，模型 %s，VAD %s，热词 %d 字，说话人模型 %s，多人发言检测 %s）",
             record.id[:8], options.input_source, caps.model_id, caps.vad,
@@ -2975,7 +3037,7 @@ class App(QObject):
         )
         self._tray.set_meeting_in_progress(True)
         self._tray.set_activity_tooltip("meeting")
-        self._sound.play_start()
+        self._play_start_cue(options.input_source)
         self._floating.set_meeting_source(input_source_label(options.input_source))
         self._floating.show_meeting(self._meeting.elapsed_text())
         for note in caps.notes:
@@ -3001,6 +3063,18 @@ class App(QObject):
                 QSystemTrayIcon.MessageIcon.Warning, 6000,
             )
             return
+        set_paused = getattr(self._recorder, "set_paused", None)
+        if callable(set_paused):
+            set_paused(False)
+        jpath = getattr(self._recorder, "recovery_journal_path", None)
+        if isinstance(jpath, (str, os.PathLike)) and str(jpath):
+            set_audio = getattr(self._meeting, "set_audio_path", None)
+            if callable(set_audio):
+                set_audio(str(jpath), self._meeting.current_id)
+            if self._main is not None:
+                reg = getattr(self._main.meeting_panel, "set_meeting_audio_path", None)
+                if callable(reg):
+                    reg(self._meeting.current_id, str(jpath))
         self._meeting.resume()
         self._tray.set_activity_tooltip("meeting")
         self._floating.show_meeting(self._meeting.elapsed_text())
@@ -3064,6 +3138,9 @@ class App(QObject):
         self._meeting.request_end()
 
     def _on_meeting_state_changed(self, state: MeetingState) -> None:
+        set_paused = getattr(self._recorder, "set_paused", None)
+        if callable(set_paused):
+            set_paused(state is MeetingState.PAUSED)
         timer = getattr(self, "_meeting_idle_timer", None)
         if state is MeetingState.LIVE and timer is not None:
             self._meeting_idle_warned = False
@@ -3077,6 +3154,17 @@ class App(QObject):
 
     def _on_meeting_ended(self) -> None:
         self._meeting_user_paused = False
+        self._pending_system_silent_warning = ""
+        if self._main is not None:
+            clear_warn = getattr(self._main.meeting_panel, "clear_system_silent_warning", None)
+            if callable(clear_warn):
+                clear_warn()
+        set_paused = getattr(self._recorder, "set_paused", None)
+        if callable(set_paused):
+            set_paused(False)
+        set_sid = getattr(self._recorder, "set_recovery_session_id", None)
+        if callable(set_sid):
+            set_sid("")
         meeting_id = self._meeting.current_id
         log.info("会议 %s 已结束", meeting_id[:8])
         self._tray.set_meeting_in_progress(False)
@@ -3213,6 +3301,11 @@ class App(QObject):
                 meeting_page.pause_requested.connect(self.pause_meeting_capture)
                 meeting_page.resume_requested.connect(self.resume_meeting_capture)
                 meeting_page.aux_models_changed.connect(self._on_models_changed)
+            pending_silent = self._safe_attr("_pending_system_silent_warning", "")
+            if pending_silent and self._meeting_active() and meeting_page is not None:
+                shower = getattr(meeting_page, "show_system_silent_warning", None)
+                if callable(shower):
+                    shower(pending_silent)
             settings = self._main.settings_panel
             set_history_store = getattr(settings, "set_history_store", None)
             if callable(set_history_store):
@@ -3702,7 +3795,7 @@ class App(QObject):
         from sayink.ui.theme import unwatch_system_color_scheme
 
         unwatch_system_color_scheme()
-        recovery = getattr(self, "_recovery_dialog", None)
+        recovery = self._safe_attr("_recovery_dialog")
         if recovery is not None:
             recovery.cancel_processing()
         self._clear_queued_audio()
@@ -3715,6 +3808,15 @@ class App(QObject):
         flush_notes = getattr(panel, "flush_pending_user_notes", None)
         if callable(flush_notes):
             flush_notes()
+        flush_title = getattr(panel, "_flush_bound_title", None)
+        if callable(flush_title):
+            try:
+                flush_title(sync=True)
+            except TypeError:
+                flush_title()
+        save_rec_notes = getattr(panel, "_save_record_notes", None)
+        if callable(save_rec_notes):
+            save_rec_notes()
         self._meeting.shutdown(wait_ms=0)
         self._hotkey_mgr.stop()
         self._hold_open_pending = False
@@ -3741,6 +3843,12 @@ class App(QObject):
         # window, so stopping child QTimers does not drop a queued Ctrl+V.
         self._paster.cancel()
         self._updates.shutdown()
+        onb = self._safe_attr("_onboarding")
+        if onb is not None and callable(getattr(onb, "shutdown", None)):
+            onb.shutdown()
+        snd = self._safe_attr("_sound")
+        if snd is not None and callable(getattr(snd, "shutdown", None)):
+            snd.shutdown()
         self._tray.hide()
         # Queued history writes and debounced config edits finish immediately,
         # before any external installer (taskkill /F) or native worker drain.
@@ -3755,11 +3863,13 @@ class App(QObject):
         save_timer = getattr(self._config, "_save_timer", None)
         if getattr(save_timer, "isActive", lambda: False)() is True:
             self._config.save_immediate()
-        self._release_instance_lock_once()
+        updating_to_installer = bool(self._safe_attr("_updating_to_installer", False))
+        if not updating_to_installer:
+            self._release_instance_lock_once()
         owners = [self._recognizer, self._polisher, self._meeting, self._updates, self._settings_widget()]
         owners.extend(
             (
-                getattr(self, "_recovery_dialog", None),
+                self._safe_attr("_recovery_dialog"),
                 self._safe_attr("_meeting_start_downloads"),
                 self._safe_attr("_onboarding"),
             )
@@ -3790,9 +3900,11 @@ class App(QObject):
                 timeout_s,
                 len(pending),
             )
+            self._release_instance_lock_once()
             QApplication.quit()
             _force_process_exit(0)
             return
+        self._release_instance_lock_once()
         QApplication.quit()
 
     def start(self):
@@ -3812,5 +3924,5 @@ class App(QObject):
 
     def _settings_widget(self):
         if self._main is not None:
-            return self._main.settings_panel
+            return getattr(self._main, "settings_panel", None)
         return None

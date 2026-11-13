@@ -431,10 +431,33 @@ def fetch_latest_release(urlopen, *, current: str) -> ReleaseInfo | None:
     return release_from_payload(payload, current=current)
 
 
+def _shell_execute_runas(executable: str, parameters: str) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.windll.shell32
+    shell_exec = shell32.ShellExecuteW
+    shell_exec.argtypes = [
+        wintypes.HWND,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        ctypes.c_int,
+    ]
+    shell_exec.restype = ctypes.c_ssize_t
+    ret = int(shell_exec(None, "runas", executable, parameters, None, 1))
+    if ret <= 32:
+        raise OSError(f"安装包提权启动被拒绝或失败 (ShellExecuteW={ret})")
+
+
 def launch_installer(path: str, *, wait_pid: int | None = None) -> None:
     """Start the setup program with PID handshake so it waits for clean exit."""
+    target = str(path)
+    pid = int(os.getpid() if wait_pid is None else wait_pid)
+    pid_arg = f"/WAITPID={pid}"
     env = os.environ.copy()
-    env["SAYINK_UPDATE_WAIT_PID"] = str(os.getpid() if wait_pid is None else wait_pid)
+    env["SAYINK_UPDATE_WAIT_PID"] = str(pid)
     kwargs: dict = {"env": env}
     if sys.platform == "win32":
         kwargs["creationflags"] = (
@@ -442,7 +465,13 @@ def launch_installer(path: str, *, wait_pid: int | None = None) -> None:
         )
     else:
         kwargs["start_new_session"] = True
-    subprocess.Popen([path], **kwargs)
+    try:
+        subprocess.Popen([target, pid_arg], **kwargs)
+    except OSError as exc:
+        if sys.platform == "win32" and getattr(exc, "winerror", None) == 740:
+            _shell_execute_runas(target, pid_arg)
+            return
+        raise
 
 
 class InstallerVerificationError(ValueError):

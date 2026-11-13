@@ -11,6 +11,8 @@ select = [
     "F",      # pyflakes: undefined names, unused imports and variables, f-strings
     "W6",     # deprecated syntax
     "B",      # flake8-bugbear: mutable defaults, unused loop vars, zip(strict=), etc.
+    "C90",    # mccabe cyclomatic complexity ceiling
+    "PT",     # flake8-pytest-style hygiene
     "PLE",    # pylint errors
     "PLW1510",# subprocess.run without explicit check=
     "PIE807", # prefer list/dict over lambda: []
@@ -20,3 +22,14 @@ select = [
     "RUF100", # unused noqa directive
     "SIM115", # open() without context manager
 ]
+ignore = [
+    "PT006",  # existing tuple/csv parametrize argnames style
+    "PT011",  # existing broad pytest.raises without match
+    "PT018",  # existing compound assertions in integration tests
+    "PT019",  # existing _unused autouse/fixture parameter convention
+    "PT022",  # existing yield-only fixtures
+    "PT028",  # existing helper functions with default args in test modules
+]
+
+[lint.mccabe]
+max-complexity = 85

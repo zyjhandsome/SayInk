@@ -205,7 +205,7 @@ class TestUpdaterAndHandoff:
 
         monkeypatch.setattr(updater_mod.subprocess, "Popen", fake_popen)
         launch_installer("C:/Temp/SayInk-Setup-2.3.0.exe", wait_pid=43210)
-        assert captured["args"] == ["C:/Temp/SayInk-Setup-2.3.0.exe"]
+        assert captured["args"] == ["C:/Temp/SayInk-Setup-2.3.0.exe", "/WAITPID=43210"]
         assert captured["kwargs"]["env"]["SAYINK_UPDATE_WAIT_PID"] == "43210"
         iss = (REPO_ROOT / "installer" / "SayInk-Setup.iss").read_text(encoding="utf-8")
         assert "SAYINK_UPDATE_WAIT_PID" in iss
@@ -1184,3 +1184,295 @@ class TestSystemIdentitySoundAndDevTooling:
         assert "hotkey" not in meeting_cfg
         assert "separate_lanes" not in meeting_cfg
         assert meeting_cfg["save_audio"] is False
+
+
+# ---------------------------------------------------------------------------
+# 10. Post-audit seam & regression tests (#35: UpdateController, UAC, Mutex, IME)
+# ---------------------------------------------------------------------------
+
+
+class TestPostAuditSeamVerifications:
+    def test_update_controller_handoff_flushes_real_main_window_and_history_store(
+        self, monkeypatch, tmp_path
+    ):
+        from PyQt6.QtCore import QObject
+        from sayink.history_store import HistoryStore, SegmentRecord
+        from sayink.update_controller import UpdateController
+
+        monkeypatch.setattr(config_mod, "user_data_dir", lambda: tmp_path)
+        cfg = Config(secret_store=types.SimpleNamespace(read=lambda: "", write=lambda _v: True))
+        history = HistoryStore(db_path=tmp_path / "history.db")
+        call_order: list[str] = []
+
+        class _RealLikeMeetingPanel:
+            def flush_pending_user_notes(self):
+                call_order.append("flush_notes")
+
+            def _flush_bound_title(self, sync: bool = False):
+                call_order.append(f"flush_title:{sync}")
+                return True
+
+            def _save_record_notes(self):
+                call_order.append("save_record_notes")
+                return True
+
+        class _RealLikeHistoryPanel:
+            def flush_pending_delete(self):
+                call_order.append("flush_pending_delete")
+
+        class _ParentApp(QObject):
+            def __init__(self):
+                super().__init__()
+                self._config = cfg
+                self._history = history
+                self._main = types.SimpleNamespace(
+                    meeting_panel=_RealLikeMeetingPanel(),
+                    history_panel=_RealLikeHistoryPanel(),
+                )
+                self._updating_to_installer = False
+
+        parent = _ParentApp()
+        try:
+            history.enqueue(
+                SegmentRecord(
+                    "sess-upd",
+                    0,
+                    1_700_000_000_000,
+                    raw_text="升级前最后一句",
+                    duration_ms=800,
+                    trigger_mode="hotkey",
+                )
+            )
+            launched: list[str] = []
+            monkeypatch.setattr(
+                "sayink.updater.launch_installer",
+                lambda p: launched.append(str(p)),
+            )
+            quit_flags: list[bool] = []
+            ctl = UpdateController(
+                cfg,
+                parent=parent,
+                status_sink=lambda: None,
+                tray=MagicMock(),
+                show_about=lambda: None,
+                confirm_exit=lambda: True,
+                finish_quit=lambda: quit_flags.append(parent._updating_to_installer),
+                exit_started=lambda: False,
+            )
+            installer_file = tmp_path / "SayInk-Setup-2.2.35.exe"
+            installer_file.write_bytes(b"MZ")
+            ctl.on_downloaded(str(installer_file))
+
+            assert call_order == [
+                "flush_notes",
+                "flush_title:True",
+                "save_record_notes",
+                "flush_pending_delete",
+            ]
+            assert launched == [str(installer_file)]
+            assert quit_flags == [True]
+            rows = history.get_session_segments("sess-upd")
+            assert rows and any(r.raw_text == "升级前最后一句" for r in rows)
+
+            # Also verify against a 100% real MainWindow + MeetingController + SQLite row!
+            from sayink.meeting_session import MeetingController
+            from sayink.ui.main_window import MainWindow
+
+            mtg_ctl = MeetingController(cfg, history, pending_segments=lambda: 0)
+            real_win = MainWindow(cfg, history, meeting=mtg_ctl)
+            try:
+                rec = mtg_ctl.store.create_meeting(title="旧标题")
+                mtg_ctl.store.end_meeting(rec.id)
+                assert history.flush()
+                real_win.meeting_panel.show_meeting(rec.id)
+                real_win.meeting_panel._detail_title.setText("升级前修改的新标题")
+                real_win.meeting_panel._record_notes.setPlainText("升级前补充的会后笔记")
+
+                parent._main = real_win
+                parent._updating_to_installer = False
+                ctl.on_downloaded(str(installer_file))
+                updated_rec = mtg_ctl.store.get_meeting(rec.id)
+                assert updated_rec is not None
+                assert updated_rec.title == "升级前修改的新标题"
+                assert updated_rec.notes_user == "升级前补充的会后笔记"
+            finally:
+                real_win.close()
+                real_win.deleteLater()
+                mtg_ctl.shutdown()
+        finally:
+            history.close(timeout=2)
+
+    def test_launch_installer_passes_waitpid_and_falls_back_to_runas_on_winerror_740(
+        self, monkeypatch, tmp_path
+    ):
+        import os
+        from sayink import updater
+
+        exe = tmp_path / "SayInk-Setup-2.2.35.exe"
+        exe.write_bytes(b"MZ")
+        monkeypatch.setattr(updater.sys, "platform", "win32")
+
+        popen_calls: list[tuple[list[str], dict]] = []
+
+        def _fake_popen_ok(args, **kwargs):
+            popen_calls.append((list(args), kwargs))
+            return MagicMock()
+
+        monkeypatch.setattr(updater.subprocess, "Popen", _fake_popen_ok)
+        updater.launch_installer(exe)
+        assert len(popen_calls) == 1
+        cmd_args, cmd_kw = popen_calls[0]
+        assert cmd_args == [str(exe), f"/WAITPID={os.getpid()}"]
+        assert cmd_kw["env"]["SAYINK_UPDATE_WAIT_PID"] == str(os.getpid())
+
+        # WinError 740 (ERROR_ELEVATION_REQUIRED) falls back to ShellExecuteW("runas", ...)
+        def _fake_popen_740(*_a, **_kw):
+            err = OSError("请求的操作需要提升。")
+            err.winerror = 740
+            raise err
+
+        monkeypatch.setattr(updater.subprocess, "Popen", _fake_popen_740)
+        shell_calls: list[tuple] = []
+
+        class _FakeShell32:
+            class ShellExecuteW:
+                argtypes = None
+                restype = None
+
+                def __call__(self, hwnd, op, file_p, params, directory, show_cmd):
+                    shell_calls.append((hwnd, op, file_p, params, directory, show_cmd))
+                    return 42
+
+        fake_shell = _FakeShell32()
+        fake_shell.ShellExecuteW = _FakeShell32.ShellExecuteW()
+        monkeypatch.setattr(
+            ctypes,
+            "windll",
+            types.SimpleNamespace(shell32=fake_shell),
+            raising=False,
+        )
+        updater.launch_installer(exe)
+        assert len(shell_calls) == 1
+        assert shell_calls[0][1] == "runas"
+        assert shell_calls[0][2] == str(exe)
+        assert shell_calls[0][3] == f"/WAITPID={os.getpid()}"
+
+    def test_app_complete_quit_holds_mutex_until_workers_drain_only_when_updating(
+        self, monkeypatch
+    ):
+        from PyQt6.QtCore import QThread
+        from PyQt6.QtWidgets import QApplication
+        from sayink.app import App
+
+        events: list[str] = []
+        quit_calls: list[str] = []
+        monkeypatch.setattr(QApplication, "quit", lambda: quit_calls.append("quit"))
+
+        class _LiveWorker(QThread):
+            def __init__(self):
+                super().__init__()
+                self.alive = True
+
+            def isRunning(self) -> bool:
+                return self.alive
+
+        worker = _LiveWorker()
+
+        def _make_stub(updating: bool):
+            stub = App.__new__(App)
+            stub._recorder = types.SimpleNamespace(storage_busy=False)
+            stub._config = types.SimpleNamespace(_save_timer=None, save_immediate=lambda: None)
+            stub._recognizer = types.SimpleNamespace(running_workers=[worker])
+            stub._polisher = None
+            stub._meeting = None
+            stub._updates = None
+            stub._main = None
+            stub._updating_to_installer = updating
+            stub._on_release_instance_lock = lambda: events.append("release_mutex")
+            stub._later = lambda _ms, _fn: events.append("reschedule")
+            return stub
+
+        # 1) Installer handoff: mutex MUST NOT be released while native worker is still running
+        worker.alive = True
+        stub_upd = _make_stub(updating=True)
+        stub_upd._complete_quit_when_idle()
+        assert events == ["reschedule"]
+        assert quit_calls == []
+
+        # Once worker finishes draining, mutex releases right before QApplication.quit()
+        events.clear()
+        worker.alive = False
+        stub_upd._complete_quit_when_idle()
+        assert events == ["release_mutex"]
+        assert quit_calls == ["quit"]
+
+        # 2) Normal quit/relaunch: mutex releases BEFORE worker drain so immediate relaunch works
+        events.clear()
+        quit_calls.clear()
+        worker.alive = True
+        stub_norm = _make_stub(updating=False)
+        stub_norm._complete_quit_when_idle()
+        assert events == ["release_mutex", "reschedule"]
+        assert quit_calls == []
+
+    def test_cross_process_ime_popup_ignores_dwm_cloaked_host_and_detects_visible_popup(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(tp_mod.sys, "platform", "win32")
+        cloaked_state = {"val": 2}  # DWM_CLOAKED_SHELL on Win11 idle CandidateWindow.Host
+
+        class _FakeUser32:
+            class FindWindowExW:
+                argtypes = None
+                restype = None
+
+                def __call__(self, _parent, after, cls_name, _title):
+                    if cls_name == "Microsoft.IME.UIManager.CandidateWindow.Host" and not after:
+                        return 0x5001
+                    return 0
+
+            class IsWindowVisible:
+                argtypes = None
+                restype = None
+
+                def __call__(self, _hwnd):
+                    return True
+
+            class GetWindowRect:
+                argtypes = None
+                restype = None
+
+                def __call__(self, _hwnd, rect_ptr):
+                    rect = ctypes.cast(rect_ptr, ctypes.POINTER(ctypes.c_long * 4)).contents
+                    rect[0], rect[1], rect[2], rect[3] = 100, 100, 420, 160
+                    return True
+
+        class _FakeDwmapi:
+            class DwmGetWindowAttribute:
+                argtypes = None
+                restype = None
+
+                def __call__(self, _hwnd, attr, pv_attr, _cb):
+                    assert attr == 14
+                    ctypes.cast(pv_attr, ctypes.POINTER(ctypes.c_ulong))[0] = cloaked_state["val"]
+                    return 0
+
+        u32 = _FakeUser32()
+        u32.FindWindowExW = _FakeUser32.FindWindowExW()
+        u32.IsWindowVisible = _FakeUser32.IsWindowVisible()
+        u32.GetWindowRect = _FakeUser32.GetWindowRect()
+        dwm = _FakeDwmapi()
+        dwm.DwmGetWindowAttribute = _FakeDwmapi.DwmGetWindowAttribute()
+
+        monkeypatch.setattr(
+            ctypes,
+            "WinDLL",
+            lambda name, *_a, **_kw: u32 if name == "user32" else dwm,
+        )
+
+        # Cloaked CandidateWindow.Host -> False (no false positive on Win11!)
+        assert tp_mod._has_visible_ime_composition_window() is False
+
+        # Uncloaked active CandidateWindow.Host -> True (cross-process IME composition detected!)
+        cloaked_state["val"] = 0
+        assert tp_mod._has_visible_ime_composition_window() is True

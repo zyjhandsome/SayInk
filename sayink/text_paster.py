@@ -412,8 +412,90 @@ def detect_session_change(
     return False
 
 
+_IME_POPUP_CLASSES = (
+    "Microsoft.IME.UIManager.CandidateWindow.Host",
+    "MSCandUIWindow_Candidate",
+    "SoPY_Comp",
+    "Sogou_CompWnd",
+    "QQPinyinCompWnd",
+    "WXIME_Comp",
+    "BaiduPinyinCompWnd",
+)
+_DWMWA_CLOAKED = 14
+
+
+def _has_visible_ime_composition_window() -> bool:
+    """Cross-process fallback: detect an uncloaked, visible CJK IME candidate/composition popup."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", wintypes.LONG),
+                ("top", wintypes.LONG),
+                ("right", wintypes.LONG),
+                ("bottom", wintypes.LONG),
+            ]
+
+        user32 = ctypes.WinDLL("user32")
+        user32.FindWindowExW.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+        ]
+        user32.FindWindowExW.restype = wintypes.HWND
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+
+        try:
+            dwmapi = ctypes.WinDLL("dwmapi")
+            dwmapi.DwmGetWindowAttribute.argtypes = [
+                wintypes.HWND,
+                wintypes.DWORD,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            ]
+            dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+        except Exception:
+            dwmapi = None
+
+        for cls_name in _IME_POPUP_CLASSES:
+            popup = wintypes.HWND(0)
+            for _ in range(8):
+                popup = user32.FindWindowExW(None, popup, cls_name, None)
+                if not popup:
+                    break
+                if not user32.IsWindowVisible(popup):
+                    continue
+                rect = _RECT()
+                if not user32.GetWindowRect(popup, ctypes.byref(rect)):
+                    continue
+                if (rect.right - rect.left) <= 4 or (rect.bottom - rect.top) <= 4:
+                    continue
+                if dwmapi is not None:
+                    cloaked = wintypes.DWORD(0)
+                    hr = dwmapi.DwmGetWindowAttribute(
+                        popup,
+                        _DWMWA_CLOAKED,
+                        ctypes.byref(cloaked),
+                        ctypes.sizeof(cloaked),
+                    )
+                    if hr == 0 and cloaked.value != 0:
+                        continue
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _is_ime_composing(hwnd: int, focus_hwnd: int = 0) -> bool:
-    """True when Win32 IMM32 reports an uncommitted CJK composition string (GCS_COMPSTR)."""
+    """True when Win32 IMM32 or TSF/IME popup reports an uncommitted CJK composition."""
     if sys.platform != "win32" or (not hwnd and not focus_hwnd):
         return False
     try:
@@ -450,8 +532,8 @@ def _is_ime_composing(hwnd: int, focus_hwnd: int = 0) -> bool:
             finally:
                 imm32.ImmReleaseContext(wintypes.HWND(target), himc)
     except Exception:
-        return False
-    return False
+        pass
+    return _has_visible_ime_composition_window()
 
 
 def _get_window_class_name(hwnd: int) -> str:

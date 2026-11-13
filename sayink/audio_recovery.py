@@ -307,9 +307,10 @@ def delete_session_recovery_files(session_id: str, base_dir: Path | None = None)
 
 class RecordingJournal:
     def __init__(self, root: Path, *, metadata: dict | None = None,
-                 max_bytes: int = MAX_RECOVERY_BYTES, on_error=None):
+                 max_bytes: int = MAX_RECOVERY_BYTES, on_error=None,
+                 resume_dir: Path | None = None):
         self.root = root
-        self.path = root / uuid4().hex
+        self._append_mode = False
         self._max_bytes = max_bytes
         self._on_error = on_error
         self._error = ""
@@ -317,16 +318,54 @@ class RecordingJournal:
         self._queue: queue.Queue = queue.Queue(maxsize=20)
         self._stop = threading.Event()
         now = time.time()
-        self._meta = {**(metadata or {}), "sample_rate": TARGET_SAMPLE_RATE,
-                      "started_at": now, "complete": False}
-        self._written_bytes = 0
         root.mkdir(parents=True, exist_ok=True)
-        sweep_orphan_pending(root)
+        resolved_resume: Path | None = None
+        if resume_dir is not None:
+            candidate = Path(resume_dir)
+            try:
+                if (
+                    candidate.is_dir()
+                    and not candidate.is_symlink()
+                    and candidate.resolve().parent == root.resolve()
+                ):
+                    resolved_resume = candidate
+            except OSError:
+                resolved_resume = None
+        if resolved_resume is not None:
+            self.path = resolved_resume
+            self._append_mode = True
+            prev_meta: dict = {}
+            meta_file = self.path / "session.json"
+            if meta_file.is_file() and not meta_file.is_symlink():
+                try:
+                    loaded = json.loads(meta_file.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        prev_meta = loaded
+                except (OSError, ValueError):
+                    pass
+            started_at = float(prev_meta.get("started_at") or now)
+            self._meta = {
+                **prev_meta,
+                **(metadata or {}),
+                "sample_rate": TARGET_SAMPLE_RATE,
+                "started_at": started_at,
+                "complete": False,
+            }
+            self._written_bytes = _journal_f32_bytes(self.path)
+        else:
+            self.path = root / uuid4().hex
+            self._meta = {**(metadata or {}), "sample_rate": TARGET_SAMPLE_RATE,
+                          "started_at": now, "complete": False}
+            self._written_bytes = 0
+        sweep_orphan_pending(root, exclude_journal=self.path if self._append_mode else None)
         _invalidate_pending_bytes_cache(root)
         # Expire completed recordings past 7 days AND super-aged (>30d) incomplete fragments.
         existing = recordings(root)
         kept: list[RecoveryRecording] = []
         for item in existing:
+            if self._append_mode and item.path == self.path:
+                kept.append(item)
+                continue
             age = now - float(item.metadata.get("started_at", 0) or 0)
             is_complete = item.metadata.get("complete") is True
             expired = (
@@ -338,18 +377,23 @@ class RecordingJournal:
             else:
                 kept.append(item)
 
-        self._existing_bytes = sum(item.cache_bytes for item in kept)
+        self._existing_bytes = sum(
+            item.cache_bytes for item in kept if not (self._append_mode and item.path == self.path)
+        )
         # Rolling quota eviction when total cache hits max_bytes:
         # 1) evict oldest completed recordings first;
         # 2) then evict stale incomplete fragments older than INCOMPLETE_QUOTA_GRACE_SECONDS (24h),
         #    never overwriting fresh (<24h) crash recordings.
-        if self._existing_bytes >= max_bytes:
+        if self._existing_bytes + self._written_bytes >= max_bytes:
             evictable = sorted(
                 (
                     item
                     for item in kept
-                    if item.metadata.get("complete") is True
-                    or (now - float(item.metadata.get("started_at", 0) or 0)) > INCOMPLETE_QUOTA_GRACE_SECONDS
+                    if not (self._append_mode and item.path == self.path)
+                    and (
+                        item.metadata.get("complete") is True
+                        or (now - float(item.metadata.get("started_at", 0) or 0)) > INCOMPLETE_QUOTA_GRACE_SECONDS
+                    )
                 ),
                 key=lambda item: (
                     0 if item.metadata.get("complete") is True else 1,
@@ -358,7 +402,7 @@ class RecordingJournal:
             )
             evicted_paths: set[Path] = set()
             for candidate in evictable:
-                if self._existing_bytes < max_bytes:
+                if self._existing_bytes + self._written_bytes < max_bytes:
                     break
                 size_bytes = candidate.cache_bytes
                 try:
@@ -370,9 +414,10 @@ class RecordingJournal:
             if evicted_paths:
                 kept = [item for item in kept if item.path not in evicted_paths]
 
-        if self._existing_bytes >= max_bytes or shutil.disk_usage(root).free < MIN_FREE_BYTES:
+        if self._existing_bytes + self._written_bytes >= max_bytes or shutil.disk_usage(root).free < MIN_FREE_BYTES:
             raise OSError("录音缓存空间不足，请导出或删除旧录音后重试")
-        self.path.mkdir()
+        if not self._append_mode:
+            self.path.mkdir()
         self._save_metadata(sync=False)
         self._thread = threading.Thread(target=self._write, name="SayInkAudioJournal", daemon=True)
         self._thread.start()
@@ -425,10 +470,11 @@ class RecordingJournal:
             return False
 
     def _write(self):
-        size = 0
+        size = self._written_bytes
+        open_mode = "ab" if self._append_mode else "wb"
         try:
             with ExitStack() as stack:
-                handles = {"audio": stack.enter_context((self.path / "audio.f32").open("wb", buffering=0))}
+                handles = {"audio": stack.enter_context((self.path / "audio.f32").open(open_mode, buffering=0))}
                 last_sync = time.monotonic()
                 while not self._stop.is_set() or not self._queue.empty():
                     try:
@@ -448,7 +494,7 @@ class RecordingJournal:
                             break
                     for role, samples in data.items():
                         if role not in handles:
-                            handles[role] = stack.enter_context((self.path / (role + ".f32")).open("wb", buffering=0))
+                            handles[role] = stack.enter_context((self.path / (role + ".f32")).open(open_mode, buffering=0))
                         remaining = memoryview(samples)
                         while remaining:
                             written = handles[role].write(remaining)

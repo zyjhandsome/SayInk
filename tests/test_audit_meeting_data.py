@@ -1143,3 +1143,85 @@ def test_cross_backend_recovery_cleanup_and_media_audio_path(tmp_path) -> None:
     finally:
         controller.shutdown()
         history.close(timeout=2)
+
+
+def test_live_meeting_pause_resume_appends_single_journal_and_delete_cleans_playback_wav(
+    tmp_path, monkeypatch
+):
+    import numpy as np
+    import tempfile
+    from sayink.audio_recovery import RecordingJournal, _tree_f32_bytes
+    from sayink.audio_recorder import AudioRecorder
+
+    fake_temp = tmp_path / "temp_root"
+    fake_temp.mkdir(parents=True)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_temp))
+
+    cfg, history, controller = _make_controller(tmp_path / "live_mtg")
+    try:
+        opts = MeetingOptions(title="暂停续写录音测试", input_source="microphone")
+        caps = resolve_capabilities(cfg, opts, dictation_model_id="funasr-nano")
+        rec = controller.begin(opts, caps)
+
+        rec_root = cfg.config_dir / "audio-recovery"
+        part1 = np.full(8000, 0.125, dtype=np.float32)
+        part2 = np.full(8000, -0.25, dtype=np.float32)
+
+        # Before pause: create initial meeting journal
+        j1 = RecordingJournal(
+            rec_root,
+            metadata={"session_id": rec.id, "meeting_id": rec.id, "meeting": True},
+        )
+        j1_dir = j1.path
+        started_t0 = j1._meta["started_at"]
+        assert j1.append(part1)
+        assert j1.close(timeout=3)
+
+        # Recorder keeps _recovery_session_id & _last_session_journal across _close_journal when _meeting_profile=True
+        recorder = AudioRecorder()
+        recorder._meeting_profile = True
+        recorder.set_recovery_session_id(rec.id)
+        recorder._last_session_journal = (rec.id, j1_dir)
+        recorder._close_journal()
+        assert recorder._recovery_session_id == rec.id
+        assert recorder._last_session_journal == (rec.id, j1_dir)
+
+        # After resume: RecordingJournal(resume_dir=j1_dir) appends to the SAME hex32 dir!
+        j2 = RecordingJournal(
+            rec_root,
+            metadata={"session_id": rec.id, "meeting_id": rec.id, "meeting": True},
+            resume_dir=j1_dir,
+        )
+        assert j2.path == j1_dir
+        assert j2._meta["started_at"] == started_t0
+        assert j2.append(part2)
+        assert j2.close(timeout=3)
+
+        combined = np.fromfile(j1_dir / "audio.f32", dtype="<f4")
+        assert combined.size == 16000
+        assert np.allclose(combined[:8000], 0.125)
+        assert np.allclose(combined[8000:], -0.25)
+
+        # Bind audio_path to meeting and materialize %TEMP%/sayink-playback/<hex32>-64000.wav
+        controller.set_audio_path(str(j1_dir), rec.id)
+        assert history.flush()
+        assert controller.store.get_meeting(rec.id).audio_path == str(j1_dir)
+
+        playback_dir = fake_temp / "sayink-playback"
+        playback_dir.mkdir(parents=True, exist_ok=True)
+        playback_wav = playback_dir / f"{j1_dir.name}-64000.wav"
+        playback_wav.write_bytes(b"RIFF0000WAVE")
+
+        # Prime _PENDING_BYTES_CACHE before deleting meeting
+        assert _tree_f32_bytes(rec_root) == 64000
+
+        controller.store.delete_meeting(rec.id)
+        assert history.flush()
+
+        # Both the raw .f32 journal dir AND %TEMP%/sayink-playback WAV are wiped, and quota cache is 0!
+        assert not j1_dir.exists()
+        assert not playback_wav.exists()
+        assert _tree_f32_bytes(rec_root) == 0
+    finally:
+        controller.shutdown()
+        history.close(timeout=2)

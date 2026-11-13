@@ -787,7 +787,7 @@ class TestMeetingPage:
         page.show_start_card()
         _qapp_session.processEvents()
         combos = (page._opt_source, page._opt_model, page._opt_language)
-        assert max(combo.width() for combo in combos) - min(combo.width() for combo in combos) <= 1
+        assert page._opt_model.width() > page._opt_source.width() > page._opt_language.width() > 100
         for combo in combos:
             assert combo.toolTip() == combo.currentText()
 

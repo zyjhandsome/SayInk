@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 import threading
 import time
 import re
@@ -171,6 +172,8 @@ class AudioRecorder(QObject):
         self._segment_target = (0, "")
         self._recovery_root = None
         self._recovery_session_id: str = ""
+        self._last_session_journal: tuple[str, object] | None = None
+        self._mute_system_until: float = 0.0
         self._journal: RecordingJournal | None = None
         self._closing_journals = []
         self._boundary_requested = False
@@ -221,7 +224,17 @@ class AudioRecorder(QObject):
 
     def set_recovery_session_id(self, session_id: str) -> None:
         """Associate the next recovery journal with a meeting/session ID for cleanup."""
-        self._recovery_session_id = str(session_id or "").strip()
+        cleaned = str(session_id or "").strip()
+        if cleaned != self._recovery_session_id:
+            self._last_session_journal = None
+        self._recovery_session_id = cleaned
+
+    def suppress_system_loopback_ms(self, duration_ms: int = 180) -> None:
+        """Briefly mute the system loopback lane so SayInk's own start beep is not captured."""
+        self._mute_system_until = max(
+            self._mute_system_until,
+            time.monotonic() + max(0.0, float(duration_ms) / 1000.0),
+        )
 
     def seconds_since_last_speech(self) -> float | None:
         """How long the open stream has been without speech, or None if idle."""
@@ -364,6 +377,9 @@ class AudioRecorder(QObject):
             if not self._journal.close():
                 self._closing_journals.append(self._journal)
             self._journal = None
+        if not self._meeting_profile:
+            self._recovery_session_id = ""
+            self._last_session_journal = None
 
     @property
     def storage_busy(self) -> bool:
@@ -828,6 +844,8 @@ class AudioRecorder(QObject):
                 populated_roles.add(lane.endpoint.role)
             if track.size < take:
                 track = self._pad_stalled_track(track, take)
+            if lane.endpoint.role == "system" and now < self._mute_system_until:
+                track = np.zeros_like(track)
             lane_tracks.append((lane.endpoint.role, track))
 
         roles = [role for role, _track in lane_tracks]
@@ -1180,13 +1198,32 @@ class AudioRecorder(QObject):
                         "meeting": self._meeting_profile,
                         "continuous": continuous,
                     }
+                    resume_dir = None
                     if self._recovery_session_id:
                         journal_meta["session_id"] = self._recovery_session_id
+                        if self._meeting_profile:
+                            journal_meta["meeting_id"] = self._recovery_session_id
+                        if (
+                            self._last_session_journal is not None
+                            and self._last_session_journal[0] == self._recovery_session_id
+                        ):
+                            prev_path = Path(self._last_session_journal[1])
+                            if prev_path.is_dir() and not any(
+                                j.path == prev_path and j.is_writing
+                                for j in self._closing_journals
+                            ):
+                                resume_dir = prev_path
                     self._journal = RecordingJournal(
                         self._recovery_root,
                         metadata=journal_meta,
                         on_error=self.warning.emit,
+                        resume_dir=resume_dir,
                     )
+                    if self._recovery_session_id:
+                        self._last_session_journal = (
+                            self._recovery_session_id,
+                            self._journal.path,
+                        )
                 except OSError as exc:
                     self.warning.emit(f"未能启用录音缓存：{exc}；本次仅在内存中处理")
             self._continuous_timer.start()

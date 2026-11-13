@@ -241,15 +241,35 @@ class UpdateController(QObject):
         """Persist drafts, SQLite WAL, and config non-destructively before spawning Setup."""
         parent = self.parent()
         if parent is not None:
-            mw = getattr(parent, "_main_window", None)
+            mw = getattr(parent, "_main", None) or getattr(parent, "_main_window", None)
             if mw is not None:
-                flush_notes = getattr(mw, "flush_pending_user_notes", None)
-                if callable(flush_notes):
-                    try:
-                        flush_notes()
-                    except Exception:
-                        log.debug("更新前刷新会议笔记草稿失败", exc_info=True)
-                hp = getattr(mw, "_history_page", None)
+                mp = getattr(mw, "meeting_panel", None)
+                for owner in (mp, mw):
+                    if owner is None:
+                        continue
+                    flush_notes = getattr(owner, "flush_pending_user_notes", None)
+                    if callable(flush_notes):
+                        try:
+                            flush_notes()
+                        except Exception:
+                            log.debug("更新前刷新会议笔记草稿失败", exc_info=True)
+                        break
+                if mp is not None:
+                    flush_title = getattr(mp, "_flush_bound_title", None)
+                    if callable(flush_title):
+                        try:
+                            flush_title(sync=True)
+                        except Exception:
+                            log.debug("更新前刷新会议标题草稿失败", exc_info=True)
+                    has_rec_notes = getattr(mp, "_has_unsaved_record_notes", None)
+                    save_rec_notes = getattr(mp, "_save_record_notes", None)
+                    if callable(save_rec_notes):
+                        try:
+                            if not callable(has_rec_notes) or has_rec_notes():
+                                save_rec_notes()
+                        except Exception:
+                            log.debug("更新前保存会后笔记草稿失败", exc_info=True)
+                hp = getattr(mw, "history_panel", None) or getattr(mw, "_history_page", None)
                 flush_del = getattr(hp, "flush_pending_delete", None) if hp is not None else None
                 if callable(flush_del):
                     try:
@@ -257,12 +277,21 @@ class UpdateController(QObject):
                     except Exception:
                         log.debug("更新前提交待删除历史记录失败", exc_info=True)
             history = getattr(parent, "_history", None)
-            conn = getattr(history, "_conn", None) if history is not None else None
-            if conn is not None:
-                try:
-                    conn.commit()
-                except Exception:
-                    log.debug("更新前提交 SQLite 事务失败", exc_info=True)
+            if history is not None:
+                flush_history = getattr(history, "flush", None)
+                if callable(flush_history):
+                    try:
+                        flush_history(timeout=3.0)
+                    except TypeError:
+                        flush_history()
+                    except Exception:
+                        log.debug("更新前同步刷写 HistoryStore 失败", exc_info=True)
+                conn = getattr(history, "_conn", None)
+                if conn is not None:
+                    try:
+                        conn.commit()
+                    except Exception:
+                        log.debug("更新前提交 SQLite 事务失败", exc_info=True)
         save_now = getattr(self._config, "save_immediate", None)
         if callable(save_now):
             try:
@@ -289,4 +318,10 @@ class UpdateController(QObject):
             self.state = UpdateState.AVAILABLE
             self._set_download_status("下载完成，但无法启动安装包", action="install")
             return
+        parent = self.parent()
+        if parent is not None:
+            try:
+                parent._updating_to_installer = True
+            except Exception:
+                pass
         self._finish_quit()

@@ -286,7 +286,9 @@ var
   WaitPid, I, ErrorCode: Integer;
   ProcHandle: THandle;
 begin
-  WaitPidStr := Trim(GetEnv('SAYINK_UPDATE_WAIT_PID'));
+  WaitPidStr := Trim(ExpandConstant('{param:WAITPID|}'));
+  if WaitPidStr = '' then
+    WaitPidStr := Trim(GetEnv('SAYINK_UPDATE_WAIT_PID'));
   WaitPid := StrToIntDef(WaitPidStr, 0);
   if WaitPid > 0 then
   begin

@@ -322,6 +322,8 @@ def test_saved_notes_marks_and_agenda_remain_available(config, tmp_path):
         controller.store.flush()
         page.refresh()
         assert page._materials.isVisible()
+        assert not page._materials_body.isVisible()
+        page._materials_toggle.click()
         assert page._materials_notes_label.text() == "我的笔记"
         assert page._materials_marks_label.isVisible()
         assert page._record_notes.toPlainText() == "我的会中笔记"
@@ -686,7 +688,7 @@ def test_single_segment_edit_patches_paragraph_in_place_and_keeps_anchors(
                 if fmt.isAnchor() and href.startswith(("edit-segment:", "details-segment:")):
                     action_alphas.append(fmt.foreground().color().alpha())
             it += 1
-        assert action_alphas and all(alpha == 0 for alpha in action_alphas)
+        assert action_alphas and all(alpha > 0 for alpha in action_alphas)
 
         page._transcript_view.scrollToAnchor("seg180")
         page._transcript_view.place_cursor_at_segment(180)

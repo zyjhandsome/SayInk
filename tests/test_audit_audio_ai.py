@@ -1348,3 +1348,83 @@ class TestAudit11DownloaderErrorCopyAndTags:
         tw = TranscribeWorker(fake_rec, np.zeros(0, dtype=np.float32))
         tw.run()
         assert tw._recognizer is None
+
+    def test_short_meeting_fallback_seed_preserves_distinct_speakers_and_merges_noisy_splinter(
+        self,
+    ):
+        from sayink.speaker_clustering import TurnObservation, reassign_turns
+        from sayink.speaker_session import voice_embedding
+
+        # 1) Short 2-turn heuristic voice embeddings (140Hz vs 520Hz) stay 2 distinct speakers!
+        t = np.arange(int(1.2 * TARGET_SAMPLE_RATE), dtype=np.float32) / TARGET_SAMPLE_RATE
+        emb_low = voice_embedding(0.25 * np.sin(2.0 * np.pi * 140.0 * t))
+        emb_high = voice_embedding(0.25 * np.sin(2.0 * np.pi * 520.0 * t))
+        assert emb_low is not None and emb_high is not None
+        out_two = reassign_turns(
+            [
+                TurnObservation(0, 1, emb_low, 1200, True),
+                TurnObservation(1, 2, emb_high, 1200, True),
+            ],
+            threshold=0.80,
+        )
+        assert [out_two[0], out_two[1]] == [1, 2]
+
+        # 2) Short 2-turn orthogonal CAM++-like embeddings stay [1, 2], while a 3rd noisy
+        #    single-turn splinter close to speaker 1 (>= threshold - 0.15) merges back to 1!
+        spk_a = np.zeros(192, dtype=np.float32)
+        spk_a[0] = 1.0
+        spk_b = np.zeros(192, dtype=np.float32)
+        spk_b[1] = 1.0
+        out_cam = reassign_turns(
+            [
+                TurnObservation(0, 1, spk_a, 1200, True),
+                TurnObservation(1, 2, spk_b, 1200, True),
+            ],
+            threshold=0.50,
+        )
+        assert [out_cam[0], out_cam[1]] == [1, 2]
+
+        # Noisy splinter with cosine similarity ~0.42 to spk_a (threshold=0.50 -> merge_floor=0.35)
+        splinter_a = np.zeros(192, dtype=np.float32)
+        splinter_a[0] = 0.42
+        splinter_a[2] = float(np.sqrt(1.0 - 0.42**2))
+        merged_map = reassign_turns(
+            [
+                TurnObservation(0, 1, spk_a, 1200, True),
+                TurnObservation(1, 1, spk_a.copy(), 1200, True),
+                TurnObservation(2, 3, splinter_a, 1200, True),
+                TurnObservation(3, 2, spk_b, 1200, True),
+            ],
+            threshold=0.50,
+        )
+        assert [merged_map[k] for k in range(4)] == [1, 1, 1, 2]
+
+    def test_audio_recorder_suppresses_system_loopback_start_beep_without_clipping_mic(
+        self,
+    ):
+        from sayink.audio_recorder import AudioRecorder, _CaptureLane
+
+        rec = AudioRecorder()
+        mic_lane = _CaptureLane(SimpleNamespace(role="microphone"))
+        sys_lane = _CaptureLane(SimpleNamespace(role="system"))
+        now = time.monotonic()
+        t = np.arange(1600, dtype=np.float32) / 16000.0
+        mic_speech = (0.2 * np.sin(2.0 * np.pi * 220.0 * t)).astype(np.float32)
+        sys_beep = (0.25 * np.sin(2.0 * np.pi * 880.0 * t)).astype(np.float32)
+        mic_lane.chunks = [mic_speech]
+        sys_lane.chunks = [sys_beep]
+        mic_lane.last_chunk_at = now
+        sys_lane.last_chunk_at = now
+        rec._lanes = [mic_lane, sys_lane]
+
+        rec.suppress_system_loopback_ms(240)
+        mixed = rec._drain_mixed_mono()
+        assert mixed is not None and mixed.size == 1600
+        # 880Hz start beep on system lane is muted to digital silence and never disarms 15s warning!
+        mic_lv, sys_lv = rec.lane_levels
+        assert rec._system_ever_active is False
+        assert sys_lv == 0.0
+        assert np.all(rec._recovery_tracks["system"] == 0.0)
+        # Microphone speech is completely unclipped!
+        assert mic_lv > 0.05
+        assert float(np.sqrt(np.mean(mixed**2))) > 0.05

@@ -22,7 +22,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from sayink.audio_recovery import delete_session_recovery_files
+from sayink.audio_recovery import (
+    _invalidate_pending_bytes_cache,
+    delete_session_recovery_files,
+)
 from sayink.history_store import MEETING_TRIGGER_MODE, HistoryStore, SegmentRecord, escape_like, row_to_segment
 from sayink.media_import import MEDIA_SOURCE
 from sayink.transcript_import import IMPORT_SOURCE, ImportedTranscript, assign_speakers
@@ -203,7 +206,44 @@ def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, au
         except OSError:
             continue
 
+    recovery_root = db_root / "audio-recovery"
+    journal_names: set[str] = set()
     raw = (audio_path or "").strip()
+    try:
+        if recovery_root.is_dir() and not recovery_root.is_symlink():
+            rec_resolved = recovery_root.resolve()
+            if raw:
+                try:
+                    cand_resolved = Path(raw).resolve()
+                    if cand_resolved != rec_resolved and cand_resolved.is_relative_to(rec_resolved):
+                        rel_parts = cand_resolved.relative_to(rec_resolved).parts
+                        if rel_parts and len(rel_parts[0]) == 32:
+                            journal_names.add(rel_parts[0])
+                except OSError:
+                    pass
+            for child in list(recovery_root.iterdir()):
+                if not child.is_dir() or child.is_symlink() or len(child.name) != 32:
+                    continue
+                if child.name.lower() == meeting_id.lower():
+                    journal_names.add(child.name)
+                    continue
+                meta_file = child / "session.json"
+                if meta_file.is_file() and not meta_file.is_symlink():
+                    try:
+                        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                        if isinstance(meta, dict) and any(
+                            str(meta.get(k) or "").strip() == meeting_id
+                            for k in ("session_id", "meeting_id", "history_id", "id")
+                        ):
+                            journal_names.add(child.name)
+                    except (OSError, ValueError):
+                        pass
+            delete_session_recovery_files(meeting_id, base_dir=recovery_root)
+            for jname in list(journal_names):
+                delete_session_recovery_files(jname, base_dir=recovery_root)
+    except OSError:
+        pass
+
     if raw:
         try:
             candidate = Path(raw)
@@ -218,19 +258,41 @@ def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, au
                 owned_source = source not in (MEDIA_SOURCE, IMPORT_SOURCE) or in_named_cache
                 if in_allowed and owned_source and resolved != db_resolved:
                     if candidate.is_file() and candidate.suffix.lower() in _OWNED_AUDIO_SUFFIXES:
-                        candidate.unlink(missing_ok=True)
+                        if candidate.name.lower() == "audio.f32" and candidate.parent != db_root:
+                            markers = ("audio.f32", "microphone.f32", "system.f32", "session.json")
+                            if any((candidate.parent / m).exists() for m in markers):
+                                journal_names.add(candidate.parent.name)
+                                quota_root = candidate.parent.parent
+                                shutil.rmtree(candidate.parent, ignore_errors=True)
+                                _invalidate_pending_bytes_cache(quota_root)
+                            else:
+                                candidate.unlink(missing_ok=True)
+                                _invalidate_pending_bytes_cache(candidate.parent)
+                        else:
+                            journal_names.add(candidate.parent.name)
+                            candidate.unlink(missing_ok=True)
                     elif candidate.is_dir():
                         markers = ("audio.f32", "microphone.f32", "system.f32", "session.json")
                         if any((candidate / m).exists() for m in markers):
+                            journal_names.add(candidate.name)
+                            quota_root = candidate.parent
                             shutil.rmtree(candidate, ignore_errors=True)
+                            _invalidate_pending_bytes_cache(quota_root)
         except OSError:
             pass
 
-    recovery_root = db_root / "audio-recovery"
-    try:
-        delete_session_recovery_files(meeting_id, base_dir=recovery_root)
-    except OSError:
-        pass
+    if journal_names:
+        playback_dir = temp_root / "sayink-playback"
+        try:
+            if playback_dir.is_dir() and not playback_dir.is_symlink():
+                for jname in journal_names:
+                    if not jname:
+                        continue
+                    for wav_file in list(playback_dir.glob(f"{jname}-*.wav")):
+                        if wav_file.is_file() and not wav_file.is_symlink():
+                            wav_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _note_metadata(conn: sqlite3.Connection, meeting_id: str) -> dict[str, Any]:

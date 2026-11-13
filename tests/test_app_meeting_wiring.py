@@ -589,7 +589,7 @@ def _blob_cells(db_path) -> list[str]:
 def test_meeting_keeps_text_only_no_audio_or_voiceprint_on_disk(tmp_path, monkeypatch) -> None:
     """P0: a meeting persists its transcript and speaker labels, never the
     audio or the voice embeddings used to tell speakers apart."""
-    with app_harness({"audio.trigger_mode": "hotkey"}, real_history=True) as h:
+    with app_harness({"audio.trigger_mode": "hotkey", "meeting.save_audio": False}, real_history=True) as h:
         app = h["app"]
         data_dir = app._config.config_dir
         scratch = tmp_path / "tempfiles"
@@ -659,3 +659,77 @@ def test_ending_without_a_model_reports_the_dropped_audio():
         assert app._segment_queue == []
         assert app._prefetch_segment is None
         assert "2 段" in h["tray"].showMessage.call_args.args[1]
+
+
+def test_app_meeting_wires_journal_audio_path_lane_levels_silent_warning_and_pause():
+    from sayink.ui.meeting_page import MeetingPage
+
+    with app_harness(
+        {"audio.trigger_mode": "hotkey", "meeting.save_audio": True},
+        real_history=True,
+    ) as h:
+        app = h["app"]
+        data_dir = app._config.config_dir
+        journal_dir = data_dir / "audio-recovery" / ("a" * 32)
+        journal_dir.mkdir(parents=True)
+        (journal_dir / "audio.f32").write_bytes(np.zeros(1600, dtype="<f4").tobytes())
+        h["recorder"].recovery_journal_path = journal_dir
+
+        page = MeetingPage(app._config, app.meeting)
+        page.show()
+        app._main = type(
+            "_MainStub",
+            (),
+            {
+                "meeting_panel": page,
+                "isVisible": lambda self: True,
+            },
+        )()
+        try:
+            meeting_id = _start(app, h, input_source="mixed", title="双路与缓存接线验证")
+            assert app._history.flush()
+
+            # 1) Start beep suppressed on mixed/system capture and audio_path bound to journal_dir
+            h["recorder"].suppress_system_loopback_ms.assert_called_with(240)
+            h["recorder"].set_recovery_session_id.assert_called_with(meeting_id)
+            h["recorder"].set_recovery_directory.assert_called_with(data_dir / "audio-recovery")
+            saved = app.meeting.store.get_meeting(meeting_id)
+            assert saved is not None and saved.audio_path == str(journal_dir)
+
+            # 2) System silent warning & lane levels connect in _connect_signals, forward to MeetingPage banner, and auto-clear
+            h["recorder"].system_silent_warning.connect.assert_called_once_with(
+                app._on_recorder_system_silent_warning
+            )
+            h["recorder"].lane_levels_changed.connect.assert_called_once_with(
+                app._on_recorder_lane_levels
+            )
+            sys_warn_slot = h["recorder"].system_silent_warning.connect.call_args.args[0]
+            lane_lvl_slot = h["recorder"].lane_levels_changed.connect.call_args.args[0]
+
+            sys_warn_slot("已持续 15 秒未检测到电脑播放声")
+            assert not page._system_silent_banner.isHidden()
+            assert "15 秒" in page._system_silent_label.text()
+
+            lane_lvl_slot(0.12, 0.08)
+            assert page._system_silent_banner.isHidden()
+
+            # 3) Pausing and resuming meeting propagates set_paused(True/False) to AudioRecorder
+            app.pause_meeting_capture()
+            h["recorder"].set_paused.assert_called_with(True)
+            h["recorder"].is_continuous = False
+            def _reopen():
+                h["recorder"].is_continuous = True
+            h["recorder"].start_continuous.side_effect = _reopen
+            app.resume_meeting_capture()
+            h["recorder"].set_paused.assert_called_with(False)
+
+            # 4) Ending meeting resets session_id and restores dictation recovery_directory (None)
+            app._end_meeting()
+            h["recorder"].is_continuous = False
+            QCoreApplication.processEvents()
+            h["recorder"].set_recovery_session_id.assert_called_with("")
+            h["recorder"].set_recovery_directory.assert_called_with(None)
+        finally:
+            app._main = None
+            page.close()
+            page.deleteLater()
