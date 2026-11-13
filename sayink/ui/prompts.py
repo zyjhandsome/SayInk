@@ -68,11 +68,17 @@ def text_prompt_box(
     title: str,
     label: str,
     text: str = "",
+    *,
+    validator=None,
 ) -> tuple[QDialog, QLineEdit]:
     """A one-line prompt whose buttons say 保存 and 取消."""
+    from sayink.ui import design_tokens as tok
+    from sayink.ui import settings_styles
+
     dialog = QDialog(parent)
     dialog.setWindowTitle(title)
     dialog.setMinimumWidth(420)
+    dialog.setStyleSheet(settings_styles.WINDOW_CSS)
     layout = QVBoxLayout(dialog)
     message = QLabel(label)
     message.setWordWrap(True)
@@ -80,12 +86,51 @@ def text_prompt_box(
     edit = QLineEdit(text)
     edit.setAccessibleName(title)
     layout.addWidget(edit)
+    error_label = QLabel("")
+    error_label.setObjectName("promptErrorLabel")
+    error_label.setWordWrap(True)
+    error_label.setStyleSheet(
+        f"color: {tok.RED_TEXT}; font-size: {tok.TYPE_CAPTION}px;"
+        " font-weight: 700; background: transparent;"
+    )
+    error_label.hide()
+    layout.addWidget(error_label)
+    dialog._error_label = error_label  # type: ignore[attr-defined]
     buttons = QDialogButtonBox()
     save = buttons.addButton("保存", QDialogButtonBox.ButtonRole.AcceptRole)
     cancel = buttons.addButton("取消", QDialogButtonBox.ButtonRole.RejectRole)
+    save.setStyleSheet(settings_styles.BTN_PRIMARY)
+    cancel.setStyleSheet(settings_styles.BTN_GHOST)
     save.setDefault(True)
     cancel.setAutoDefault(False)
-    buttons.accepted.connect(dialog.accept)
+
+    def _set_validation_error(err: str) -> None:
+        msg = (err or "").strip()
+        if msg:
+            error_label.setText(msg)
+            error_label.show()
+            edit.setStyleSheet(
+                f"QLineEdit {{ border: 2px solid {tok.RED_TEXT}; padding: 5px 11px; }}"
+            )
+        else:
+            error_label.clear()
+            error_label.hide()
+            edit.setStyleSheet("")
+
+    dialog.set_validation_error = _set_validation_error  # type: ignore[attr-defined]
+
+    def _on_accept() -> None:
+        if callable(validator):
+            err = validator(edit.text())
+            if err:
+                _set_validation_error(str(err))
+                edit.setFocus()
+                return
+        _set_validation_error("")
+        dialog.accept()
+
+    edit.textChanged.connect(lambda _txt: _set_validation_error("") if error_label.isVisible() else None)
+    buttons.accepted.connect(_on_accept)
     buttons.rejected.connect(dialog.reject)
     layout.addWidget(buttons)
     edit.setFocus()
@@ -97,9 +142,11 @@ def prompt_text(
     title: str,
     label: str,
     text: str = "",
+    *,
+    validator=None,
 ) -> str | None:
     """Return the entered text, including "", or None when cancelled."""
-    dialog, edit = text_prompt_box(parent, title, label, text)
+    dialog, edit = text_prompt_box(parent, title, label, text, validator=validator)
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return None
     return edit.text()

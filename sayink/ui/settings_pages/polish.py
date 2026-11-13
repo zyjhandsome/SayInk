@@ -32,11 +32,14 @@ from sayink.ui.minutes_templates import MinutesTemplatesDialog, populate_templat
 from sayink.ui.settings_components import (
     SettingsPage,
     ToggleOptionRow,
+    chain_tab_order,
+    device_selection_link,
     footnote,
     group_divider,
     inline_action_row,
     labeled_row,
     page_header,
+    paint_device_selection_link,
     polish_preview_content,
     settings_group,
     settings_section,
@@ -87,6 +90,7 @@ class PolishSettingsPage(SettingsPage):
     minutes_auto_toggled = pyqtSignal(bool)
     minutes_auto_reset_requested = pyqtSignal()
     manage_templates_requested = pyqtSignal()
+    proxy_settings_requested = pyqtSignal()
 
     # Explicitly typed widget/control fields (eliminating 23 dynamic win._* injections)
     llm_url_edit: QLineEdit
@@ -95,6 +99,8 @@ class PolishSettingsPage(SettingsPage):
     llm_model_edit: QLineEdit
     llm_test_btn: QPushButton
     llm_test_status: QLabel
+    proxy_summary_label: QLabel
+    proxy_jump_btn: QPushButton
     llm_connection_section: QWidget
     llm_enable_row: ToggleOptionRow
     llm_preview_divider: QWidget
@@ -113,6 +119,7 @@ class PolishSettingsPage(SettingsPage):
     minutes_language_combo: QComboBox
     minutes_auto_row: ToggleOptionRow
     minutes_auto_reset_btn: QPushButton
+    polish_tab_chain: list[QWidget]
 
     def __init__(
         self,
@@ -144,6 +151,28 @@ class PolishSettingsPage(SettingsPage):
         self.llm_prompt_edit.textChanged.connect(
             lambda: self.llm_prompt_timer.start(600)
         )
+        self.llm_prompt_edit.setTabChangesFocus(True)
+        self.sync_proxy_summary(config)
+        self.polish_tab_chain = [
+            self.llm_url_edit,
+            self.llm_key_edit,
+            self.llm_key_toggle,
+            self.llm_model_edit,
+            self.llm_test_btn,
+            self.proxy_jump_btn,
+            self.llm_enable_row,
+            self.llm_mode_combo,
+            self.prompt_reset_btn,
+            self.llm_prompt_edit,
+            self.minutes_model_edit,
+            self.minutes_test_btn,
+            self.minutes_template_combo,
+            self.minutes_manage_btn,
+            self.minutes_language_combo,
+            self.minutes_auto_row,
+            self.minutes_auto_reset_btn,
+        ]
+        chain_tab_order(self.polish_tab_chain)
 
     def _build_connection_section(self) -> QWidget:
         conn_group = settings_group()
@@ -194,6 +223,22 @@ class PolishSettingsPage(SettingsPage):
         conn_lay.addWidget(stacked_field_row("模型名称", model_wrap))
         self.llm_test_status = _status_label()
         conn_lay.addWidget(self.llm_test_status)
+
+        proxy_row = QWidget()
+        proxy_lay = QHBoxLayout(proxy_row)
+        proxy_lay.setContentsMargins(16, 0, 16, 12)
+        proxy_lay.setSpacing(8)
+        self.proxy_summary_label = footnote("当前网络代理：使用系统 / 环境代理")
+        self.proxy_jump_btn = device_selection_link("网络代理设置")
+        self.proxy_jump_btn.setCheckable(False)
+        self.proxy_jump_btn.setAccessibleName("前往网络代理设置")
+        self.proxy_jump_btn.setToolTip("若内网接口或本机代理导致连接超时，可前往通用页切换直连或配置直连后缀")
+        self.proxy_jump_btn.clicked.connect(self.proxy_settings_requested.emit)
+        proxy_lay.addWidget(self.proxy_summary_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        proxy_lay.addWidget(self.proxy_jump_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        proxy_lay.addStretch(1)
+        conn_lay.addWidget(proxy_row)
+
         self.llm_connection_section = settings_section("接口配置", conn_group)
         return self.llm_connection_section
 
@@ -380,17 +425,24 @@ class PolishSettingsPage(SettingsPage):
     def paint_status_label(self, label: QLabel) -> None:
         tone = label.property("viTone") or "idle"
         if tone == "ok":
-            color, bg, weight, pad = tok.GREEN_TEXT, tok.GREEN_BG, 600, "8px 16px"
+            color, bg, weight, pad = tok.GREEN_TEXT, tok.GREEN_BG, 700, "8px 16px"
         elif tone == "error":
-            color, bg, weight, pad = tok.RED, tok.RED_BG, 600, "8px 16px"
+            color, bg, weight, pad = tok.RED_TEXT, tok.RED_BG, 700, "8px 16px"
         elif tone == "busy":
-            color, bg, weight, pad = tok.TEXT, tok.SURFACE_PEARL, 600, "8px 16px"
+            color, bg, weight, pad = tok.TEXT, tok.SURFACE_PEARL, 700, "8px 16px"
         else:
             color, bg, weight, pad = tok.TEXT_SEC, "transparent", 400, "0 16px 12px 16px"
         label.setStyleSheet(
             f"color: {color}; background: {bg}; font-size: {tok.TYPE_FOOTNOTE}px;"
             f" font-weight: {weight}; border-radius: 6px; padding: {pad};"
         )
+
+    def sync_proxy_summary(self, config: Config | None) -> None:
+        mode = str(config.get("llm.proxy_mode", "system") or "system") if config is not None else "system"
+        if mode in ("direct", "none"):
+            self.proxy_summary_label.setText("当前网络代理：直连（不使用代理）")
+        else:
+            self.proxy_summary_label.setText("当前网络代理：使用系统 / 环境代理")
 
     def set_status(
         self,
@@ -415,6 +467,7 @@ class PolishSettingsPage(SettingsPage):
         self.paint_status_label(self.llm_test_status)
         self.paint_status_label(self.minutes_test_status)
         self.paint_key_toggle()
+        paint_device_selection_link(self.proxy_jump_btn)
 
     def hide_revealed_key(self) -> None:
         if self.llm_key_toggle.isChecked():
@@ -482,6 +535,7 @@ class PolishSettingsPage(SettingsPage):
         set_combo_by_data(self.llm_mode_combo, config.get("llm.mode", "polish"))
         mode = self.sync_mode_preview()
         self.load_prompt_for_mode(config, mode)
+        self.sync_proxy_summary(config)
 
     def load_minutes_config(self, config: Config) -> None:
         self.minutes_model_edit.setText(str(config.get("meeting.model_name", "") or ""))

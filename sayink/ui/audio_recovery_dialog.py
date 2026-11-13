@@ -5,7 +5,7 @@ import time
 
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor, QPalette
-from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
+from PyQt6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
                             QPushButton, QPlainTextEdit, QFileDialog, QComboBox)
 
 from sayink.asr_correction import apply_glossary_variants
@@ -160,7 +160,6 @@ class AudioRecoveryDialog(QDialog):
         font = QFont(tok.UI_FONT_FAMILY)
         font.setPixelSize(tok.TYPE_BODY)
         self.setFont(font)
-        self.resize(720, 580)
         self.root = root
         self.recognizer = recognizer
         self.vad = vad
@@ -171,6 +170,7 @@ class AudioRecoveryDialog(QDialog):
         self.recognizer_getter = recognizer_getter
         self.worker = None
         self._worker_failed = False
+        self._busy = False
         layout = QVBoxLayout(self)
         note = QLabel("录音仅保存在本机。正常结束的缓存保留 7 天，异常中断的缓存需手动删除；录音上限 2 GB。\n"
                       "可导出录音或重新识别。恢复文字显示在这里，可另存为文本。")
@@ -188,30 +188,62 @@ class AudioRecoveryDialog(QDialog):
         self.stop_btn = QPushButton("停止")
         self.delete_btn = QPushButton("删除所选录音")
         for button in (self.export_btn, self.transcribe_btn, self.stop_btn, self.delete_btn):
-            button.setMinimumHeight(36)
-            button.setStyleSheet(settings_styles.BTN_GHOST_SM)
             actions.addWidget(button)
         layout.addLayout(actions)
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
         self.output.setPlaceholderText("恢复的识别文字将显示在这里")
-        palette = self.output.palette()
-        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(tok.TEXT_DIM))
-        self.output.setPalette(palette)
         layout.addWidget(self.output)
         self.status = QLabel("")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.save_btn = QPushButton("另存文字")
-        self.save_btn.setMinimumHeight(36)
-        self.save_btn.setStyleSheet(settings_styles.BTN_GHOST_SM)
         layout.addWidget(self.save_btn)
+        self.output.textChanged.connect(self._sync_save_enabled)
         self.export_btn.clicked.connect(self._export)
         self.transcribe_btn.clicked.connect(self._transcribe)
         self.stop_btn.clicked.connect(self.cancel_processing)
         self.delete_btn.clicked.connect(self._delete)
         self.save_btn.clicked.connect(self._save_text)
+        self.reapply_theme()
+        self._fit_to_available_screen()
         self._refresh()
+
+    def _fit_to_available_screen(self) -> None:
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            self.resize(720, 580)
+            return
+        avail = screen.availableGeometry()
+        if avail.isEmpty():
+            self.resize(720, 580)
+            return
+        max_w = max(240, avail.width() - 24)
+        max_h = max(220, avail.height() - 24)
+        self.setMinimumSize(min(480, avail.width()), min(360, avail.height()))
+        self.resize(min(720, max_w), min(580, max_h))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._fit_to_available_screen()
+
+    def reapply_theme(self) -> None:
+        self.setStyleSheet(
+            settings_styles.WINDOW_CSS
+            + f"\nQDialog {{ background: {tok.BG}; }}"
+            + f"\nQListWidget, QPlainTextEdit {{ background: {tok.INPUT_BG}; color: {tok.TEXT};"
+            + f" border: 1px solid {tok.CONTROL_BORDER}; border-radius: {tok.RADIUS_MD}px; padding: 6px; }}"
+        )
+        for button in (self.export_btn, self.transcribe_btn, self.stop_btn, self.save_btn):
+            button.setStyleSheet(settings_styles.BTN_GHOST_SM)
+        self.delete_btn.setStyleSheet(settings_styles.BTN_DANGER_SM)
+        palette = self.output.palette()
+        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(tok.TEXT_DIM))
+        self.output.setPalette(palette)
+
+    def _sync_save_enabled(self) -> None:
+        has_text = bool(self.output.toPlainText().strip())
+        self.save_btn.setEnabled((not self._busy) and has_text)
 
     @property
     def running_workers(self):
@@ -252,13 +284,14 @@ class AudioRecoveryDialog(QDialog):
                 if 0 <= row < len(self.recordings) else None)
 
     def _set_busy(self, busy):
+        self._busy = bool(busy)
         for button in (self.export_btn, self.delete_btn):
             button.setEnabled(not busy and bool(self.recordings))
         self.transcribe_btn.setEnabled(not busy and bool(self.recordings) and self.recognizer is not None)
         self.stop_btn.setEnabled(bool(busy))
         self.items.setEnabled(not busy)
         self.track.setEnabled(not busy)
-        self.save_btn.setEnabled(not busy)
+        self._sync_save_enabled()
 
     def _on_progress(self, done: int, total: int) -> None:
         if self.worker is None or self.worker.cancelled or self._worker_failed:

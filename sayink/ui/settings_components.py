@@ -435,6 +435,34 @@ def stylesheet_for_role(role: object) -> str | None:
             f"color: {live.TEXT_DIM}; font-size: {live.TYPE_BODY_SM}px;"
             f" padding: 20px 12px; background: transparent;"
         )
+    if role in ("engineHeroTitle", "modelName"):
+        return (
+            f"color: {live.TEXT}; font-size: {live.TYPE_TITLE_SM}px; font-weight: 700;"
+            f" background: transparent;"
+        )
+    if role == "engineHeroBadge":
+        return (
+            f"background: {live.GREEN_BG}; color: {live.GREEN_TEXT};"
+            f" border: 1px solid {live.GREEN_BORDER};"
+            f" border-radius: {live.RADIUS_PILL}px; padding: 3px 9px;"
+            f" font-size: {live.TYPE_CAPTION}px; font-weight: 700;"
+        )
+    if role == "modelBadge":
+        return (
+            f"background: {live.SURFACE_PEARL}; color: {live.TEXT_SEC};"
+            f" border-radius: {live.RADIUS_PILL}px; padding: 3px 9px;"
+            f" font-size: {live.TYPE_CAPTION}px; font-weight: 700;"
+        )
+    if role in ("engineHeroSize", "engineHeroMeta", "modelSize", "modelMeta"):
+        return (
+            f"color: {live.TEXT_DIM}; font-size: {live.TYPE_FOOTNOTE}px;"
+            f" background: transparent;"
+        )
+    if role in ("engineHeroDesc", "modelDesc"):
+        return (
+            f"color: {live.TEXT_SEC}; font-size: {live.TYPE_BODY_SM}px; line-height: 1.45;"
+            f" background: transparent;"
+        )
     return None
 
 
@@ -818,12 +846,45 @@ class ThemeModeSegment(QWidget):
             btn.setAutoExclusive(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda _c=False, idx=i: self.setCurrentIndex(idx))
+            btn.installEventFilter(self)
             self._buttons.append(btn)
             host_lay.addWidget(btn)
         root.addWidget(self._host)
         self._buttons[0].setChecked(True)
         self._sync_tab_stop()
         self.reapply_styles()
+
+    def _handle_nav_key(self, key: int) -> bool:
+        if key in (Qt.Key.Key_Left, Qt.Key.Key_Up):
+            target = max(0, self._index - 1)
+        elif key in (Qt.Key.Key_Right, Qt.Key.Key_Down):
+            target = min(len(self._items) - 1, self._index + 1)
+        elif key == Qt.Key.Key_Home:
+            target = 0
+        elif key == Qt.Key.Key_End:
+            target = len(self._items) - 1
+        else:
+            return False
+        had_focus = self.hasFocus() or any(b.hasFocus() for b in self._buttons)
+        self.setCurrentIndex(target)
+        if had_focus:
+            self._buttons[self._index].setFocus(Qt.FocusReason.OtherFocusReason)
+        return True
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+
+        if obj in self._buttons and event.type() == QEvent.Type.KeyPress:
+            if self._handle_nav_key(event.key()):
+                event.accept()
+                return True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if self._handle_nav_key(event.key()):
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def findData(self, data) -> int:
         for i, (_label, mode) in enumerate(self._items):
@@ -990,7 +1051,9 @@ class SwitchControl(QCheckBox):
         super().setChecked(checked)
         self.setProperty("accessibleChecked", checked)
         target = 1.0 if checked else 0.0
-        if animate and self.isVisible():
+        from sayink.ui.theme import prefers_reduced_motion
+
+        if animate and self.isVisible() and not prefers_reduced_motion():
             if self._anim is not None:
                 self._anim.stop()
             self._anim = QPropertyAnimation(self, b"knob_pos", self)

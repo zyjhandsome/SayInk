@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 import shutil
+import time
 from pathlib import Path
 
+import numpy as np
 from PyQt6.QtCore import QSignalBlocker, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
@@ -46,6 +48,7 @@ from sayink.ui.settings_pages import (
 )
 from sayink.ui.settings_pages.general import (
     device_index as _device_index,
+    int_or as _int_or,
     set_combo_by_data,
     without_scroll_jump,
 )
@@ -200,6 +203,34 @@ _LEGACY_PAGE_ATTRS: dict[str, tuple[str, str]] = {
 }
 
 
+class _ModelDirMoveWorker(QThread):
+    """Background worker moving model folders off the UI thread."""
+
+    finished_move = pyqtSignal(object, int, list, list)
+
+    def __init__(self, items: list[Path], dest_dir: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._items = list(items)
+        self._dest_dir = dest_dir
+
+    def run(self) -> None:
+        moved = 0
+        skipped_existing: list[str] = []
+        failed: list[str] = []
+        for item in self._items:
+            target = self._dest_dir / item.name
+            if target.exists():
+                skipped_existing.append(item.name)
+                continue
+            try:
+                shutil.move(str(item), str(target))
+                moved += 1
+            except OSError as exc:
+                log.warning("模型目录迁移失败 %s: %s", item.name, exc)
+                failed.append(item.name)
+        self.finished_move.emit(self._dest_dir, moved, skipped_existing, failed)
+
+
 class SettingsWindow(QWidget):
     hotkey_updated = pyqtSignal(str)
     settings_changed = pyqtSignal()
@@ -209,6 +240,7 @@ class SettingsWindow(QWidget):
     sound_enabled_changed = pyqtSignal(bool)
     restore_clipboard_changed = pyqtSignal(bool)
     models_changed = pyqtSignal()
+    download_completed_notice = pyqtSignal(str)
     recognition_changed = pyqtSignal()
     theme_changed = pyqtSignal(str)
     listen_bar_prefs_changed = pyqtSignal()
@@ -233,15 +265,21 @@ class SettingsWindow(QWidget):
         self._config = config
         self._pending_segment_count = pending_segment_count
         self._recording_busy = None
+        self._history_store = None
+        self._history_limits_dirty = False
         self._dl_workers: dict[str, object] = {}
         self._download_threads: list[QThread] = []
+        self._move_workers: list[QThread] = []
         self._test_workers: list[QThread] = []
         self._llm_test_worker: QThread | None = None
         self._minutes_test_worker: QThread | None = None
         self._llm_test_stamp: tuple | None = None
+        self._llm_url_error = ""
         self._mic_test_recorder = AudioRecorder(self)
         self._mic_probe_active = False
         self._mic_probe_max = 0.0
+        self._mic_probe_mic_max = 0.0
+        self._mic_probe_sys_max = 0.0
         self._mic_probe_warning = ""
         self._last_audio_test_config: tuple[str, int, int] | None = None
         self._mic_probe_timer = QTimer(self)
@@ -339,6 +377,7 @@ class SettingsWindow(QWidget):
         gp.recognition_setting_changed.connect(self._on_recognition_setting_changed)
         gp.glossary_text_changed.connect(self._on_meeting_glossary_changed)
         gp.glossary_editing_finished.connect(self._flush_meeting_glossary)
+        gp.glossary_clear_requested.connect(self._clear_meeting_glossary)
         gp.vad_download_requested.connect(self._download_shared_vad)
         gp.meeting_setting_changed.connect(self._on_meeting_setting_changed)
         gp.meeting_start_card_reset_requested.connect(self._restore_default_meeting_start_card)
@@ -352,6 +391,7 @@ class SettingsWindow(QWidget):
         gp.restore_clipboard_toggled.connect(self._on_restore_clipboard_toggled)
         gp.history_enabled_toggled.connect(self._on_history_enabled_toggled)
         gp.history_limits_changed.connect(self._on_history_limits_changed)
+        gp.history_limits_editing_finished.connect(self._commit_pending_history_limits)
         gp.recovery_toggled.connect(self._on_recovery_toggled)
         gp.audio_recovery_requested.connect(self.audio_recovery_requested.emit)
 
@@ -366,6 +406,7 @@ class SettingsWindow(QWidget):
         pp.llm_fields_edited.connect(self._flush_llm_fields)
         pp.prompt_reset_requested.connect(self._reset_prompt)
         pp.llm_test_requested.connect(self._test_llm)
+        pp.proxy_settings_requested.connect(self._open_proxy_settings)
         pp.minutes_fields_edited.connect(self._flush_minutes_fields)
         pp.minutes_test_requested.connect(self._test_minutes_model)
         pp.minutes_auto_toggled.connect(self._on_minutes_auto_toggled)
@@ -407,12 +448,22 @@ class SettingsWindow(QWidget):
 
     def show_page(self, index: int) -> None:
         self._flush_meeting_glossary()
+        self._commit_pending_history_limits()
+        if self._pages.currentIndex() == 2 and index != 2:
+            self._flush_llm_fields()
+            self._flush_minutes_fields()
         self._pages.setCurrentIndex(index)
         if index == 2:
+            self.polish_page.sync_proxy_summary(self._config)
             self.polish_page.refresh_templates(self._config)
         if index == 3:
             self._refresh_about_info()
             self.about_page.refresh_update_check_time(self._config)
+
+    def _open_proxy_settings(self) -> None:
+        self.show_page(0)
+        self.navigation_requested.emit("general")
+        self.general_page.reveal_proxy_settings()
 
     def _open_about_setting(self, page: str, focus: str = "") -> None:
         self.show_page({"general": 0, "engine": 1, "polish": 2}[page])
@@ -485,6 +536,7 @@ class SettingsWindow(QWidget):
             recognition_pending=self._recognition_pending,
             glossary_skip_note=self._glossary_skip_note,
             vad_downloading=AUX_MODEL_SILERO_VAD in self._dl_workers,
+            save_failed=getattr(self._config, "last_save_failed", False) is True,
         )
 
     # ── Engine / Model Management ──────────────────────────
@@ -504,6 +556,8 @@ class SettingsWindow(QWidget):
         self.model_page.refresh_storage_summary(self._config)
 
     def _change_model_dir(self) -> None:
+        if any(w.isRunning() for w in self._move_workers):
+            return
         cur = str(self._config.models_dir)
         d = QFileDialog.getExistingDirectory(self, "选择模型存储目录", cur)
         if not d:
@@ -512,10 +566,10 @@ class SettingsWindow(QWidget):
         old_p = self._config.models_dir
         if new_p == old_p:
             return
-        from sayink.speech_recognizer import is_dir_writable, model_dir_names, set_models_dir
+        from sayink.speech_recognizer import is_dir_writable, model_dir_names
 
         if not is_dir_writable(new_p):
-            QMessageBox.warning(self, "无法使用该目录", f"没有写入权限或无法创建：\n{new_p}")
+            self.model_page.show_notice(f"没有写入权限或无法创建目录：{new_p}", "error")
             return
         movable = [old_p / name for name in model_dir_names() if (old_p / name).is_dir()]
         if movable:
@@ -533,30 +587,60 @@ class SettingsWindow(QWidget):
                 return
             if box.clickedButton() != move_btn:
                 movable = []
-        moved = 0
-        failed: list[str] = []
-        for item in movable:
-            target = new_p / item.name
-            if target.exists():
-                continue
-            try:
-                shutil.move(str(item), str(target))
-                moved += 1
-            except OSError as exc:
-                log.warning("模型目录迁移失败 %s: %s", item.name, exc)
-                failed.append(item.name)
+        if not movable:
+            self._finalize_model_dir_change(new_p, 0, [], [])
+            return
+        self.model_page.change_dir_btn.setEnabled(False)
+        self.model_page.show_notice(f"正在后台迁移 {len(movable)} 个模型文件夹，请稍候…", "busy")
+        worker = _ModelDirMoveWorker(movable, new_p, self)
+        self._move_workers.append(worker)
+        worker.finished_move.connect(self._on_model_dir_move_done)
+        worker.finished.connect(lambda w=worker: self._reap_move_worker(w))
+        worker.start()
+
+    def _reap_move_worker(self, worker: QThread) -> None:
+        if worker.isRunning():
+            return
+        if worker in self._move_workers:
+            self._move_workers.remove(worker)
+
+    def _on_model_dir_move_done(
+        self,
+        new_p: object,
+        moved: int,
+        skipped_existing: list[str],
+        failed: list[str],
+    ) -> None:
+        self.model_page.change_dir_btn.setEnabled(True)
+        self._finalize_model_dir_change(Path(str(new_p)), moved, skipped_existing, failed)
+
+    def _finalize_model_dir_change(
+        self,
+        new_p: Path,
+        moved: int,
+        skipped_existing: list[str],
+        failed: list[str],
+    ) -> None:
+        from sayink.speech_recognizer import set_models_dir
+
         self._config.set("stt.models_dir", str(new_p))
         set_models_dir(new_p)
         self._refresh_dir_label()
         self._rebuild_model_cards()
+        self.models_changed.emit()
+        parts: list[str] = []
         if moved > 0:
-            QMessageBox.information(self, "完成", f"已将 {moved} 个模型迁移到新目录。")
-        if failed:
-            QMessageBox.warning(
-                self,
-                "部分迁移失败",
-                "以下模型未能迁移，请手动复制后重试：\n" + "\n".join(failed),
+            parts.append(f"已将 {moved} 个模型迁移到新目录。")
+        elif not skipped_existing and not failed:
+            parts.append(f"模型存储目录已切换为 {new_p}。")
+        if skipped_existing:
+            parts.append(
+                f"目标目录已存在同名文件夹未覆盖（原目录副本保留）：{'、'.join(skipped_existing)}。"
             )
+        if failed:
+            parts.append(f"以下模型未能迁移，请手动复制后重试：{'、'.join(failed)}。")
+        tone = "error" if failed else ("warn" if skipped_existing else "ok")
+        self.model_page.show_notice(" ".join(parts), tone)
 
     def _refresh_active_model_hero(self) -> None:
         self._refresh_meeting_defaults()
@@ -578,6 +662,7 @@ class SettingsWindow(QWidget):
         if action == "select":
             self._config.set("stt.model_id", model_id)
             self._rebuild_model_cards()
+            self._refresh_about_info()
             self.models_changed.emit()
         elif action == "download":
             self._start_download(model_id)
@@ -653,7 +738,11 @@ class SettingsWindow(QWidget):
                 text = f"{name} 已下载，正在载入内存（约需数十秒）。载入完成前请勿开始录音。"
         else:
             text = f"{name} 已下载。当前仍使用原来的模型；点击该模型卡片上的「使用此模型」即可切换。"
-        QMessageBox.information(self, "完成", text)
+        self.model_page.show_notice(text, "ok")
+        if model_id == AUX_MODEL_SILERO_VAD:
+            self.general_page.vad_download_status.setText(text)
+            self.general_page.vad_download_status_row.show()
+        self.download_completed_notice.emit(text)
 
     def _on_dl_error(self, msg: str, card, model_id: str = "", *, show_error: bool = False) -> None:
         worker = self._dl_workers.pop(model_id or (card._model_id if card else ""), None)
@@ -665,7 +754,12 @@ class SettingsWindow(QWidget):
                 card.set_download_error(msg)
         self._refresh_recognition_feedback()
         if not cancelled and (show_error or card is None):
-            QMessageBox.warning(self, "下载失败", msg)
+            from sayink.speech_recognizer import AUX_MODEL_SILERO_VAD
+
+            if model_id == AUX_MODEL_SILERO_VAD:
+                self.general_page.vad_download_status.setText(f"下载失败：{msg}")
+                self.general_page.vad_download_status_row.show()
+            self.model_page.show_notice(f"下载失败：{msg}", "error")
 
     def _delete_model(self, model_id: str) -> None:
         from sayink.speech_recognizer import delete_model, get_downloaded_models, get_model_info, is_aux_model
@@ -716,6 +810,16 @@ class SettingsWindow(QWidget):
 
     def _update_llm_configuration_status(self) -> None:
         status_lbl = self.polish_page.llm_test_status
+        if getattr(self._config, "last_save_failed", False) is True:
+            self._set_llm_status(
+                status_lbl,
+                "配置写入磁盘失败，请检查配置文件目录权限。",
+                "error",
+            )
+            return
+        if self._llm_url_error:
+            self._set_llm_status(status_lbl, self._llm_url_error, "error")
+            return
         if getattr(self._config, "secret_persist_failed", False) is True:
             self._set_llm_status(
                 status_lbl,
@@ -749,6 +853,14 @@ class SettingsWindow(QWidget):
             self._show_completed_llm_status()
 
     def _reset_prompt(self) -> None:
+        if self.polish_page.llm_prompt_edit.toPlainText().strip():
+            if not self._confirm(
+                "恢复默认提示词",
+                "当前模式的自定义提示词将被清空，恢复使用内置默认提示词。\n确定恢复默认吗？",
+                accept="恢复默认",
+                destructive=True,
+            ):
+                return
         self.polish_page.llm_prompt_edit.clear()
         self._flush_llm_fields()
 
@@ -900,10 +1012,11 @@ class SettingsWindow(QWidget):
         )
         self._mic_probe_active = True
         self._mic_probe_max = 0.0
+        self._mic_probe_mic_max = 0.0
+        self._mic_probe_sys_max = 0.0
         self._mic_probe_warning = ""
         gp.set_probe_controls_enabled(False)
-        gp.mic_level_bar.setValue(0)
-        gp.mic_level_bar.show()
+        gp.show_probe_meters(mixed=(src == INPUT_SOURCE_MIXED))
         instruction = {
             INPUT_SOURCE_MICROPHONE: "请对麦克风说话",
             INPUT_SOURCE_SYSTEM: "请播放一段电脑声音",
@@ -920,13 +1033,37 @@ class SettingsWindow(QWidget):
                 gp.audio_device_summary.setText("本次测试设备：\n" + "\n".join(devices))
             self._mic_probe_timer.start(2000)
 
+    @staticmethod
+    def _meter_percent(value: float) -> int:
+        return round(min(1.0, max(0.0, float(value)) ** 0.5 * 2) * 100)
+
+    @staticmethod
+    def _track_rms(track: object) -> float:
+        if not isinstance(track, np.ndarray) or track.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(track, dtype=np.float64))))
+
     def _on_mic_probe_volume(self, volume: float) -> None:
         if not self._mic_probe_active:
             return
-        self._mic_probe_max = max(self._mic_probe_max, float(volume))
-        self.general_page.mic_level_bar.setValue(
-            round(min(1.0, max(0.0, float(volume)) ** 0.5 * 2) * 100)
-        )
+        vol = float(volume)
+        self._mic_probe_max = max(self._mic_probe_max, vol)
+        gp = self.general_page
+        mixed = self._selected_input_source() == INPUT_SOURCE_MIXED
+        tracks = getattr(self._mic_test_recorder, "_block_tracks", None) if mixed else None
+        if mixed and isinstance(tracks, dict) and ("microphone" in tracks or "system" in tracks):
+            mic_rms = self._track_rms(tracks.get("microphone"))
+            sys_rms = self._track_rms(tracks.get("system"))
+            self._mic_probe_mic_max = max(self._mic_probe_mic_max, mic_rms)
+            self._mic_probe_sys_max = max(self._mic_probe_sys_max, sys_rms)
+            self._mic_probe_max = max(self._mic_probe_max, mic_rms, sys_rms)
+            gp.mic_level_bar.setValue(self._meter_percent(mic_rms))
+            gp.system_level_bar.setValue(self._meter_percent(sys_rms))
+            return
+        pct = self._meter_percent(vol)
+        gp.mic_level_bar.setValue(pct)
+        if mixed:
+            gp.system_level_bar.setValue(pct)
 
     def _on_mic_probe_error(self, msg: str) -> None:
         if not self._mic_probe_active:
@@ -937,7 +1074,7 @@ class SettingsWindow(QWidget):
         if self._mic_test_recorder.is_recording:
             self._mic_test_recorder.cancel()
         self.general_page.set_probe_controls_enabled(True)
-        self.general_page.mic_level_bar.hide()
+        self.general_page.hide_probe_meters()
         self._set_mic_test_status(f"测试失败：{msg}。可展开「手动选择音频设备」后重试。")
 
     def _on_mic_probe_warning(self, msg: str) -> None:
@@ -955,7 +1092,7 @@ class SettingsWindow(QWidget):
         if self._mic_test_recorder.is_recording:
             self._mic_test_recorder.stop()
         self.general_page.set_probe_controls_enabled(True)
-        self.general_page.mic_level_bar.hide()
+        self.general_page.hide_probe_meters()
         peak = self._mic_probe_max
         warn = self._mic_probe_warning or self._mic_test_recorder.last_start_warning
         if peak >= 0.0015:
@@ -965,7 +1102,20 @@ class SettingsWindow(QWidget):
             elif peak > 0.8:
                 base += "输入音量偏高，建议降低来源音量后重测。"
             if self._selected_input_source() == INPUT_SOURCE_MIXED:
-                base += "混合输入请分别说话、播放声音，确认两路都能采集。"
+                has_split = self._mic_probe_mic_max > 0.0 or self._mic_probe_sys_max > 0.0
+                mic_ok = self._mic_probe_mic_max >= 0.0015
+                sys_ok = self._mic_probe_sys_max >= 0.0015
+                if has_split:
+                    if mic_ok and sys_ok:
+                        base += "麦克风与电脑声均已分别检测到声音。"
+                    elif mic_ok:
+                        base += "已检测到麦克风，未检测到电脑声（请分别说话并播放电脑声音确认两路）。"
+                    elif sys_ok:
+                        base += "已检测到电脑声，未检测到麦克风（请分别说话并播放电脑声音确认两路）。"
+                    else:
+                        base += "混合输入请分别说话、播放声音，确认两路都能采集。"
+                else:
+                    base += "混合输入请分别说话、播放声音，确认两路都能采集。"
             self._set_mic_test_status(f"{base} {warn}".strip() if warn else base)
         else:
             self._set_mic_test_status(
@@ -981,11 +1131,13 @@ class SettingsWindow(QWidget):
         if self._mic_test_recorder.is_recording:
             self._mic_test_recorder.cancel()
         self.general_page.set_probe_controls_enabled(True)
-        self.general_page.mic_level_bar.hide()
+        self.general_page.hide_probe_meters()
 
     # ── Load / Save & Instant Apply ────────────────────────
 
     def _load_settings_fields(self, *, refresh_devices: bool, heavy: bool) -> None:
+        self._llm_url_error = ""
+        self._history_limits_dirty = False
         self.general_page.load_config(self._config)
         self._refresh_audio_device_summary()
         self._refresh_hotkey_hint()
@@ -1111,7 +1263,11 @@ class SettingsWindow(QWidget):
         if not self._loading:
             self._config.set("llm.proxy_mode", self.general_page.llm_proxy_combo.currentData())
             self._llm_test_stamp = None
-            self._update_llm_configuration_status()
+            self.polish_page.sync_proxy_summary(self._config)
+            if self._llm_url_error:
+                self._flush_llm_fields()
+            else:
+                self._update_llm_configuration_status()
             self._set_llm_status(
                 self.polish_page.minutes_test_status,
                 "代理模式已更改，请重新测试连接。",
@@ -1122,7 +1278,11 @@ class SettingsWindow(QWidget):
         if not self._loading:
             self._config.set("llm.proxy_bypass_suffixes", self.general_page.llm_proxy_suffix_edit.text())
             self._llm_test_stamp = None
-            self._update_llm_configuration_status()
+            self.polish_page.sync_proxy_summary(self._config)
+            if self._llm_url_error:
+                self._flush_llm_fields()
+            else:
+                self._update_llm_configuration_status()
 
     def _on_theme_mode_changed(self, _index: int = 0) -> None:
         if self._loading:
@@ -1246,12 +1406,92 @@ class SettingsWindow(QWidget):
             self._config.set("audio.separate_lanes", bool(checked))
             self.audio_options_changed.emit()
 
+    def set_history_store(self, store: object) -> None:
+        self._history_store = store
+
+    def _count_affected_history_sessions(self, retention_days: int, max_entries: int) -> int:
+        store = self._history_store
+        if store is None:
+            return 0
+        list_sessions = getattr(store, "list_sessions", None)
+        if not callable(list_sessions):
+            return 0
+        try:
+            sessions = list_sessions(limit=100_000, offset=0)
+        except Exception:
+            return 0
+        if not sessions:
+            return 0
+        cutoff_ms = int(time.time() * 1000 - retention_days * 86_400_000) if retention_days > 0 else 0
+        kept = []
+        affected = 0
+        for s in sessions:
+            created = int(getattr(s, "created_at", 0) or 0)
+            if retention_days > 0 and created < cutoff_ms:
+                affected += 1
+            else:
+                kept.append(s)
+        if max_entries > 0 and len(kept) > max_entries:
+            affected += len(kept) - max_entries
+        return affected
+
     def _on_history_limits_changed(self, _value: int = 0) -> None:
         if self._loading:
             return
         gp = self.general_page
-        self._config.set("history.retention_days", gp.history_retention_days_spin.value())
-        self._config.set("history.max_entries", gp.history_max_entries_spin.value())
+        new_days = gp.history_retention_days_spin.value()
+        new_max = gp.history_max_entries_spin.value()
+        cur_days = _int_or(self._config.get("history.retention_days", 90), 90)
+        cur_max = _int_or(self._config.get("history.max_entries", 5000), 5000)
+        if new_days < cur_days or new_max < cur_max:
+            affected = self._count_affected_history_sessions(new_days, new_max)
+            if affected > 0:
+                self._history_limits_dirty = True
+                gp.history_cleanup_hint.setText(
+                    f"待确认：调小保留上限将清理约 {affected} 场已有转写历史"
+                    "（离开输入框或切换页面时确认生效；会议记录不受影响）。"
+                )
+                if (
+                    not gp.history_retention_days_spin.hasFocus()
+                    and not gp.history_max_entries_spin.hasFocus()
+                ):
+                    self._commit_pending_history_limits()
+                return
+        self._history_limits_dirty = False
+        gp.refresh_history_controls()
+        self._config.set("history.retention_days", new_days)
+        self._config.set("history.max_entries", new_max)
+
+    def _commit_pending_history_limits(self) -> None:
+        if self._loading or not self._history_limits_dirty:
+            return
+        self._history_limits_dirty = False
+        gp = self.general_page
+        new_days = gp.history_retention_days_spin.value()
+        new_max = gp.history_max_entries_spin.value()
+        cur_days = _int_or(self._config.get("history.retention_days", 90), 90)
+        cur_max = _int_or(self._config.get("history.max_entries", 5000), 5000)
+        if new_days < cur_days or new_max < cur_max:
+            affected = self._count_affected_history_sessions(new_days, new_max)
+            if affected > 0 and not self._confirm(
+                "调整历史保留规则",
+                f"将保留上限调整为「{new_days} 天 / {new_max} 场」后，约 {affected} 场已有转写历史"
+                "会在下次清理时被永久移除（会议记录不受影响）。\n确定应用新规则吗？",
+                accept="应用新规则",
+                destructive=True,
+            ):
+                was_loading = self._loading
+                self._loading = True
+                try:
+                    gp.history_retention_days_spin.setValue(cur_days)
+                    gp.history_max_entries_spin.setValue(cur_max)
+                finally:
+                    self._loading = was_loading
+                gp.refresh_history_controls()
+                return
+        gp.refresh_history_controls()
+        self._config.set("history.retention_days", new_days)
+        self._config.set("history.max_entries", new_max)
 
     def _on_meeting_setting_changed(self, *_args) -> None:
         if self._loading:
@@ -1299,6 +1539,20 @@ class SettingsWindow(QWidget):
         elif self._glossary_skip_note != prev_skip:
             self._refresh_recognition_feedback()
 
+    def _clear_meeting_glossary(self) -> None:
+        if not self.general_page.meeting_glossary_edit.toPlainText().strip():
+            return
+        if not self._confirm(
+            "清空自定义词汇",
+            "将清空全部已填写的自定义词汇与误写映射，清空后无法直接恢复。\n确定清空吗？",
+            accept="清空词汇",
+            destructive=True,
+        ):
+            return
+        self.general_page.meeting_glossary_edit.clear()
+        self._meeting_glossary_dirty = True
+        self._flush_meeting_glossary()
+
     def _flush_minutes_fields(self, *_args) -> None:
         if self._loading:
             return
@@ -1331,25 +1585,33 @@ class SettingsWindow(QWidget):
         self._config.set("meeting.auto_generate", enabled)
 
     def _apply_hotkey_setting(self, hotkey: str) -> None:
-        if self._loading or not hotkey:
+        if self._loading:
+            return
+        if not hotkey:
+            old = self._config.get("hotkey")
+            self._config.set("hotkey", "")
+            if old != "":
+                self.hotkey_updated.emit("")
+            self._refresh_about_runtime_rows()
+            self._refresh_hotkey_hint()
             return
         parts = hotkey.lower().split("+")
         has_modifier = any(p.strip() in ("ctrl", "alt", "shift", "win", "cmd") for p in parts)
         problem = ""
         if not has_modifier:
-            problem = "快捷键必须包含至少一个修饰键（Ctrl/Alt/Shift）。"
+            problem = "快捷键必须包含至少一个修饰键（Ctrl/Alt/Shift/Win）。"
         elif is_reserved_hotkey(hotkey):
             problem = (
                 f"{format_hotkey(hotkey)} 是系统或常用软件的快捷键，"
                 "占用后它在其他软件里会失效。请换一个组合，例如 Alt + X。"
             )
         if problem:
-            QMessageBox.warning(self, "提示", problem)
             self._loading = True
             try:
                 self.general_page.hotkey_edit.set_value(self._config.get("hotkey", DEFAULT_HOTKEY))
             finally:
                 self._loading = False
+            self.general_page.show_hotkey_feedback(problem, error=True)
             return
         old = self._config.get("hotkey")
         self._config.set("hotkey", hotkey)
@@ -1496,14 +1758,15 @@ class SettingsWindow(QWidget):
         suffixes = str(self._config.get("llm.proxy_bypass_suffixes", "") or "")
         problem = api_url_error(llm_url, proxy_bypass_suffixes=suffixes) if llm_url else None
         if problem:
-            QMessageBox.warning(self, "提示", problem)
-            self._replace_llm_edit(pp.llm_url_edit, self._config.get("llm.api_url", ""))
+            self._llm_url_error = problem
         else:
+            userinfo_err = ""
             if llm_url:
                 llm_url, removed = redact_url_userinfo(llm_url)
                 if removed:
-                    QMessageBox.warning(self, "提示", URL_USERINFO_ERROR)
-                    self._replace_llm_edit(pp.llm_url_edit, llm_url)
+                    userinfo_err = URL_USERINFO_ERROR
+                self._replace_llm_edit(pp.llm_url_edit, llm_url)
+            self._llm_url_error = userinfo_err
             self._config.set("llm.api_url", llm_url)
         key = normalize_api_key(pp.llm_key_edit.text())
         model = normalize_model_name(pp.llm_model_edit.text())
@@ -1520,7 +1783,9 @@ class SettingsWindow(QWidget):
     def _on_done(self) -> None:
         self._cancel_mic_probe_if_active()
         self._flush_meeting_glossary()
+        self._commit_pending_history_limits()
         self._flush_llm_fields()
+        self._flush_minutes_fields()
         self.close()
 
     # ── LLM Connection Test ────────────────────────────────
@@ -1560,12 +1825,23 @@ class SettingsWindow(QWidget):
         *,
         ok_text: str = "连接正常，可以使用。",
     ):
-        from sayink.text_polisher import polish_settings_complete
+        from sayink.text_polisher import api_url_error, polish_settings_complete
+
+        raw_url = self.polish_page.llm_url_edit.text().strip()
+        suffixes = str(self._config.get("llm.proxy_bypass_suffixes", "") or "")
+        if raw_url:
+            url_err = api_url_error(raw_url, proxy_bypass_suffixes=suffixes)
+            if url_err:
+                if status is self.polish_page.llm_test_status:
+                    self._llm_url_error = url_err
+                self._set_llm_status(status, url_err, "error")
+                return None
 
         url, key, model = self._llm_connection_identity(model)
         if not polish_settings_complete(url, key, model):
             self._set_llm_status(status, "请填写完整的接口信息。", "error")
             return None
+        self._llm_url_error = ""
 
         class _W(QThread):
             def __init__(self, u, k, m, proxy_mode, suffixes, parent=None):
@@ -1639,7 +1915,7 @@ class SettingsWindow(QWidget):
 
     @property
     def running_workers(self):
-        workers = [*self._download_threads, *self.findChildren(QThread)]
+        workers = [*self._download_threads, *self._move_workers, *self.findChildren(QThread)]
         return tuple(worker for worker in dict.fromkeys(workers) if worker.isRunning())
 
     def cancel_all_downloads(self) -> None:
@@ -1652,10 +1928,17 @@ class SettingsWindow(QWidget):
         self._cancel_mic_probe_if_active()
         self.cancel_hotkey_capture()
         self._flush_meeting_glossary()
+        self._commit_pending_history_limits()
         self._flush_llm_fields()
+        self._flush_minutes_fields()
         self.polish_page.hide_revealed_key()
 
     def closeEvent(self, event) -> None:
         self.on_window_hidden()
         self.cancel_all_downloads()
         super().closeEvent(event)
+
+    def focusNextPrevChild(self, next: bool) -> bool:
+        if self._pages.currentIndex() == 0:
+            self.general_page.prepare_tab_navigation(next)
+        return super().focusNextPrevChild(next)

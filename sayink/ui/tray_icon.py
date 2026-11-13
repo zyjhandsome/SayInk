@@ -125,8 +125,22 @@ def _windows_small_icon_px() -> int | None:
     return None
 
 
+_PIXMAP_CACHE: dict[tuple, QPixmap] = {}
+
+
 def _microphone_pixmap(color: str | None, recording: bool, size: int) -> QPixmap:
     from sayink.ui import design_tokens as tok
+
+    cache_key = (
+        getattr(tok, "ACTIVE_THEME", "light"),
+        color or tok.TEXT,
+        tok.STATE_RECORD,
+        bool(recording),
+        int(size),
+    )
+    cached = _PIXMAP_CACHE.get(cache_key)
+    if cached is not None and not cached.isNull():
+        return cached
 
     pixmap = QPixmap(QSize(size, size))
     # Windows drops the tray glyph when the bitmap's device pixel ratio is not 1.
@@ -220,6 +234,9 @@ def _microphone_pixmap(color: str | None, recording: bool, size: int) -> QPixmap
 
     painter.end()
     pixmap.setDevicePixelRatio(1.0)
+    if len(_PIXMAP_CACHE) >= 64:
+        _PIXMAP_CACHE.clear()
+    _PIXMAP_CACHE[cache_key] = pixmap
     return pixmap
 
 
@@ -514,6 +531,25 @@ class TrayIcon(QSystemTrayIcon):
         return self._notice_kind
 
     def update_models(self, downloaded_models: list[dict], active_id: str):
+        active_name = ""
+        for model in downloaded_models:
+            if model.get("id") == active_id:
+                active_name = str(model.get("name") or "")
+                break
+        entries = tuple((m.get("id"), _model_choice_label(m)) for m in downloaded_models)
+        if (
+            getattr(self, "_rendered_model_entries", None) == entries
+            and (
+                (not downloaded_models and self._model_group is None)
+                or (bool(downloaded_models) and self._model_group is not None)
+            )
+        ):
+            self._model_menu.setTitle(_model_switch_title(active_name))
+            if self._model_group is not None:
+                for act in self._model_group.actions():
+                    act.setChecked(act.data() == active_id)
+            return
+
         if self._model_group is not None:
             try:
                 self._model_group.triggered.disconnect()
@@ -521,12 +557,8 @@ class TrayIcon(QSystemTrayIcon):
                 pass
 
         self._model_menu.clear()
-        active_name = ""
-        for model in downloaded_models:
-            if model.get("id") == active_id:
-                active_name = str(model.get("name") or "")
-                break
         self._model_menu.setTitle(_model_switch_title(active_name))
+        self._rendered_model_entries = entries
 
         if not downloaded_models:
             empty = self._model_menu.addAction("暂无已下载模型")

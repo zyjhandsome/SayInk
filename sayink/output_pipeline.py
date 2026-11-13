@@ -199,6 +199,7 @@ class OutputPipeline:
         # while the pending history record and polisher own the current one.
         self.busy: bool = False
         self.token: int = 0
+        self.invalidated_token: int = 0
         # Raw text of the segment currently being output. A new hold recording
         # may start meanwhile and reset _current_transcription.
         self.raw_text: str = ""
@@ -224,6 +225,7 @@ class OutputPipeline:
         self.dropped_slices: int = 0
         self.keep_unsaved_continuous_text: bool = False
         self.history_failure_notified: bool = False
+        self.polish_error_failed: bool = False
 
     def _dispatch_output(self, text: str, *, degraded_from_polish: bool = False) -> None:
         target = self.output_text_dispatch or self.output_text
@@ -238,8 +240,27 @@ class OutputPipeline:
         *,
         degraded_from_polish: bool = False,
         record: SegmentRecord | None = None,
+        token: int | None = None,
     ) -> None:
+        if token is not None and token <= self.invalidated_token:
+            log.warning(
+                "忽略已超时失效的粘贴回调 (token=%s, invalidated=%s)",
+                token,
+                self.invalidated_token,
+            )
+            return
+        if token is not None and token < self.token:
+            target_app = result.target_app if isinstance(result, PasteResult) else ""
+            self.enqueue_history_record(record, target_app=target_app)
+            self.maybe_finish_dictation_speakers()
+            return
         target = self.handle_paste_result_dispatch or self.handle_paste_result
+        if token is not None:
+            try:
+                target(result, degraded_from_polish=degraded_from_polish, record=record, token=token)
+                return
+            except TypeError:
+                pass
         target(result, degraded_from_polish=degraded_from_polish, record=record)
 
     def record_for_output(self) -> _PendingHistoryRecord | None:
@@ -350,15 +371,19 @@ class OutputPipeline:
             # The polisher never answered. Its result would have been this
             # sentence anyway, so output the raw words instead of losing them.
             log.error("润色超时未回调，改为输出原文")
+            self.polish_error_failed = True
             self.polisher.cancel()
             self.stage = OutputStage.PASTE
             # The paste stage gets its own watchdog window; the one that just
             # fired must not be the last line of defence for it.
-            self.mark_busy()
             self._dispatch_output(raw, degraded_from_polish=True)
+            if self.stage is OutputStage.PASTE and self.token == token:
+                self.mark_busy()
             return
         log.error("输出流程超时未回调，释放队列以免后续语音卡住")
         self.busy = False
+        self.invalidated_token = self.token
+        self.token += 1
         self.stage = OutputStage.IDLE
         # The shortcut may still be waiting out its short delay. Sending it
         # after telling the user to paste by hand inserts the sentence twice.
@@ -383,6 +408,7 @@ class OutputPipeline:
     def deliver_recognized_text(self, text: str) -> None:
         self.claim_pending_record_for_output()
         self.mark_busy()
+        self.polish_error_failed = False
         self.raw_text = text
         self.stage = OutputStage.POLISH
         self.stage_text = ""
@@ -433,6 +459,7 @@ class OutputPipeline:
         if self.stage is not OutputStage.POLISH:
             log.warning("润色结果晚于超时到达，已输出原文，忽略")
             return
+        self.polish_error_failed = False
         raw = self.raw_text
         # Check what would actually be pasted: normalisation can strip a reply
         # down to nothing (「。」) or drop a numbered clause, and a reply that is
@@ -463,6 +490,7 @@ class OutputPipeline:
         if self.stage is not OutputStage.POLISH:
             return
         log.warning("后处理失败，降级输出原文: %s", error_msg)
+        self.polish_error_failed = True
         self._dispatch_output(
             self.raw_text,
             degraded_from_polish=True,
@@ -492,14 +520,16 @@ class OutputPipeline:
         paste_hwnd, paste_app = self.paste_target_for_output()
         record = self.freeze_pending_history_record(text, degraded_from_polish)
         is_meeting_row = record is not None and record.trigger_mode == TRIGGER_MODE_MEETING
-        history_only = self.utterance_history_only(record)
+        # H-01: Leftover dictation slices draining after a meeting has started
+        # must NEVER fire Ctrl+V into the foreground window mid-meeting.
+        forced_meeting_history = self.meeting_active() and not is_meeting_row
+        history_only = self.utterance_history_only(record) or forced_meeting_history
         if not is_meeting_row:
             # Context for the next correction: only dictation that is about to
             # go out, never a meeting row the user is not typing anywhere.
             self.last_output_text = text
             self.last_output_at = self.now_monotonic()
         preserve_tail = self.keep_unsaved_continuous_text and not getattr(self.recorder, "is_continuous", False)
-        dialog_disarmed = False
         if (
             not is_meeting_row
             and not self.meeting_active()
@@ -523,7 +553,6 @@ class OutputPipeline:
             # first, or a slow answer re-enters this sentence and pastes it twice.
             self.token += 1
             self.stage = OutputStage.PASTE
-            dialog_disarmed = True
             choice = self.ask_history_output_conflict(listening=True)
             if choice == "history":
                 self.config.set("history.enabled", True)
@@ -546,11 +575,16 @@ class OutputPipeline:
             # 「改为输入光标」/「开启历史」apply to this sentence. Re-read after
             # the dialog; the captured-source rule still applies if the user
             # only turned history back on.
-            history_only = self.utterance_history_only(record)
+            forced_meeting_history = self.meeting_active() and not is_meeting_row
+            history_only = self.utterance_history_only(record) or forced_meeting_history
         if is_meeting_row or history_only:
             # Meeting / playback capture: the words go to history, never to
             # whatever window happens to be in front.
             saved = is_meeting_row or bool(self.config.get("history.enabled", True))
+            if forced_meeting_history and not saved:
+                # Never silently lose draining dictation words when a meeting
+                # started while history was off: copy to clipboard safely.
+                self.copy_clipboard(text)
             log.info("只记录不粘贴：%d 字%s", len(text), "" if saved else "（历史已关闭，未保存）")
             self._dispatch_paste_result(
                 PasteResult("recorded", detail="" if saved else "history_disabled"),
@@ -561,18 +595,33 @@ class OutputPipeline:
         self.stage = OutputStage.PASTE
         self.stage_text = text
         # Kept outside the paste callback so the watchdog can still save the
-        # row when the paster never answers. A conflict dialog disarms the
-        # polish watchdog; arm a fresh one for the paste itself.
+        # row when the paster never answers. Always renew the watchdog when
+        # entering PASTE so slow polish time never steals PASTE's budget.
         self.stage_record = record
-        if dialog_disarmed:
-            self.mark_busy()
-        self.paster.paste_async(
-            text,
-            lambda result, record=record: self._dispatch_paste_result(
+        self.mark_busy()
+        paste_token = self.token
+        called = False
+
+        def _on_paste_done(
+            result: PasteResult | str,
+            _record: SegmentRecord | None = record,
+            _tok: int = paste_token,
+        ) -> None:
+            nonlocal called
+            if called:
+                log.warning("忽略重复的粘贴回调 (token=%s)", _tok)
+                return
+            called = True
+            self._dispatch_paste_result(
                 result,
                 degraded_from_polish=degraded_from_polish,
-                record=record,
-            ),
+                record=_record,
+                token=_tok,
+            )
+
+        self.paster.paste_async(
+            text,
+            _on_paste_done,
             target_hwnd=paste_hwnd,
             target_app=paste_app,
         )
@@ -644,9 +693,24 @@ class OutputPipeline:
         *,
         degraded_from_polish: bool = False,
         record: SegmentRecord | None = None,
+        token: int | None = None,
     ) -> None:
         if self.exit_started():
             return
+        if token is not None and token <= self.invalidated_token:
+            log.warning(
+                "忽略已超时失效的粘贴回调 (token=%s, invalidated=%s)",
+                token,
+                self.invalidated_token,
+            )
+            return
+        if token is not None and token < self.token:
+            target_app = result.target_app if isinstance(result, PasteResult) else ""
+            self.enqueue_history_record(record, target_app=target_app)
+            self.maybe_finish_dictation_speakers()
+            return
+        polish_failed = bool(self.polish_error_failed and degraded_from_polish)
+        self.polish_error_failed = False
         self.busy = False
         self.stage = OutputStage.IDLE
         self.stage_text = ""
@@ -660,8 +724,13 @@ class OutputPipeline:
             status = result.split(":", 1)[0]
             target_app = ""
             error_detail = result.partition(":")[2]
-        paste_hint = "可按 Cmd+V 粘贴" if self.platform_name() == "darwin" else "可按 Ctrl+V 粘贴"
-        success_msg = "已发送（原文）" if degraded_from_polish else "已发送"
+        paste_key = "Cmd+V" if self.platform_name() == "darwin" else "Ctrl+V"
+        paste_hint = f"可按 {paste_key} 粘贴"
+        polish_fail_notice = "润色未生效（密钥/网络异常），已发送原文"
+        if polish_failed:
+            success_msg = polish_fail_notice
+        else:
+            success_msg = "已发送（原文）" if degraded_from_polish else "已发送"
         target_hint = f"发送到 {target_app}" if target_app else "请确认目标应用已接收"
         dropped = self.dropped_slices
         self.dropped_slices = 0
@@ -672,6 +741,9 @@ class OutputPipeline:
         if getattr(self.recorder, "is_recording", False):
             # The next hold is already being recorded.
             self.tray.set_activity_tooltip("recording")
+        elif self.meeting_active():
+            # Preserve active meeting tooltip while draining leftover segments.
+            pass
         else:
             self.tray.set_activity_tooltip(
                 "listening" if self.continuous_session_active() else None
@@ -683,25 +755,35 @@ class OutputPipeline:
                 success_msg,
                 target_hint,
                 stopped_text=f"剩余内容：{success_msg} · {target_hint}",
-                use_info=degraded_from_polish,
-                refresh_ms=RESULT_TOAST_MS,
+                use_info=degraded_from_polish or polish_failed,
+                refresh_ms=RESULT_TOAST_WITH_HINT_MS if polish_failed else RESULT_TOAST_MS,
             )
         elif status == "recorded":
             saved = error_detail != "history_disabled"
             meeting_row = getattr(record, "trigger_mode", None) == TRIGGER_MODE_MEETING
-            done = "已记录" if meeting_row else "已保存到历史"
-            title = (done if saved else "未保存 · 历史已关闭") + ("（原文）" if degraded_from_polish else "")
-            if not saved:
-                hint = "当前为「仅保存到历史」，但历史已关闭；请在设置中打开历史或改为输入当前光标"
+            if self.meeting_active() and not meeting_row:
+                # Leftover dictation segment archived silently without disturbing meeting bar.
+                log.info("会议进行中：遗留口述分片已归档至历史（不发送粘贴键）")
             else:
-                hint = "" if meeting_row else "未输入其他应用"
-            self.show_post_output_floating(
-                title,
-                hint,
-                stopped_text=f"剩余内容：{title}",
-                use_info=not (saved and not degraded_from_polish),
-                refresh_ms=RESULT_TOAST_MS,
-            )
+                done = "已记录" if meeting_row else "已保存到历史"
+                if polish_failed:
+                    suffix = " · 润色未生效（密钥/网络异常），已保留原文"
+                elif degraded_from_polish:
+                    suffix = "（原文）"
+                else:
+                    suffix = ""
+                title = (done if saved else "未保存 · 历史已关闭") + suffix
+                if not saved:
+                    hint = "当前为「仅保存到历史」，但历史已关闭；请在设置中打开历史或改为输入当前光标"
+                else:
+                    hint = "" if meeting_row else "未输入其他应用"
+                self.show_post_output_floating(
+                    title,
+                    hint,
+                    stopped_text=f"剩余内容：{title}",
+                    use_info=not (saved and not degraded_from_polish and not polish_failed),
+                    refresh_ms=RESULT_TOAST_MS,
+                )
         elif status == "unverified":
             # Ctrl+V already went out, then the foreground changed. Saying
             # 「已复制」 here invites a second manual paste of the same words.
@@ -711,6 +793,8 @@ class OutputPipeline:
                 if target_app
                 else f"焦点已切换，若未出字{paste_hint}"
             )
+            if polish_failed:
+                unverified_hint = f"{unverified_hint} · 润色未生效（密钥/网络异常）"
             self.show_post_output_floating(
                 "已发送 · 未确认",
                 unverified_hint,
@@ -718,24 +802,69 @@ class OutputPipeline:
                 use_info=True,
                 refresh_ms=RESULT_TOAST_WITH_HINT_MS,
             )
+        elif status == "clipboard" and error_detail == "elevated":
+            log.info("目标窗口为管理员权限，已复制到剪贴板")
+            title = f"目标为管理员窗口，已复制，请按 {paste_key}"
+            hint = f"目标应用：{target_app}" if target_app else paste_hint
+            if polish_failed:
+                hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
+            self.show_post_output_floating(
+                title,
+                hint,
+                stopped_text=f"剩余内容：{title}",
+                use_info=True,
+                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
+            )
+        elif status == "clipboard" and error_detail == "ime_active":
+            log.info("检测到输入法候选窗活跃，已复制到剪贴板")
+            title = f"检测到正在拼音选词，已复制，请按 {paste_key}"
+            hint = f"目标应用：{target_app}" if target_app else paste_hint
+            if polish_failed:
+                hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
+            self.show_post_output_floating(
+                title,
+                hint,
+                stopped_text=f"剩余内容：{title}",
+                use_info=True,
+                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
+            )
+        elif status == "clipboard" and error_detail == "session_changed":
+            log.info("桌面会话已切换或锁屏，已复制到剪贴板")
+            title = f"桌面会话已切换，已复制，请按 {paste_key}"
+            hint = f"目标应用：{target_app}" if target_app else paste_hint
+            if polish_failed:
+                hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
+            self.show_post_output_floating(
+                title,
+                hint,
+                stopped_text=f"剩余内容：{title}",
+                use_info=True,
+                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
+            )
         elif status == "clipboard" and error_detail == "focus_changed":
             log.info("开口后的目标窗口已变化，未发送粘贴键")
             title = f"未输入到 {target_app}" if target_app else "未输入到原来的窗口"
+            hint = paste_hint
+            if polish_failed:
+                hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
             self.show_post_output_floating(
                 title,
-                paste_hint,
-                stopped_text=f"剩余内容：{title} · {paste_hint}",
+                hint,
+                stopped_text=f"剩余内容：{title} · {hint}",
                 use_info=True,
                 refresh_ms=RESULT_TOAST_WITH_HINT_MS,
             )
         elif status == "clipboard":
             log.info("已复制到剪贴板（粘贴未确认成功）")
             idle_title = "已复制" if self.continuous_session_active() else "已复制到剪贴板"
+            hint = paste_hint
+            if polish_failed:
+                hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
             self.show_post_output_floating(
                 idle_title,
-                paste_hint,
-                stopped_text=f"剩余内容：已复制 · {paste_hint}",
-                use_info=False,
+                hint,
+                stopped_text=f"剩余内容：已复制 · {hint}",
+                use_info=polish_failed,
                 refresh_ms=RESULT_TOAST_WITH_HINT_MS,
             )
         else:

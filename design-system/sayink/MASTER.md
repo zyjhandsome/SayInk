@@ -35,7 +35,7 @@
 
 **Color Notes:** Recording red + waveform blue
 
-**Floating bar state colors** (`design_tokens.activate`): listening → `GREEN`; recording / error → `STATE_RECORD` red; warning → `AMBER` (`#D97706` light / `#FBBF24` dark) so a warning is distinguishable from the grey "停止 / 已取消" states, which stay `FLOAT_TEXT_SEC`.
+**Floating bar state colors** (`design_tokens.activate`): dual-channel shape + semantic color encoding (`STATE_ICON_*`): listening → `GREEN` ring/bars; recording → `STATE_RECORD` solid dot; recognizing → `STATE_ICON_RECOGNIZE` arc/spinner; polishing → `STATE_ICON_POLISH` diamond; success → `STATE_ICON_SUCCESS` check; warning → `AMBER` triangle; error → `STATE_RECORD` cross; stopped / cancelled stay `FLOAT_TEXT_SEC`.
 
 ### Typography
 

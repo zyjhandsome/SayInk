@@ -22,6 +22,7 @@ from sayink.ui import settings_styles
 from sayink.ui.model_card import ModelCard, RATING_TOOLTIP, format_model_ratings
 from sayink.ui.settings_components import (
     SettingsPage,
+    chain_tab_order,
     elide_middle,
     empty_state,
     footnote,
@@ -48,6 +49,7 @@ class ModelSettingsPage(SettingsPage):
     storage_summary_label: QLabel
     change_dir_btn: QPushButton
     download_source_combo: QComboBox
+    model_notice_label: QLabel
     cards_container: QWidget
     cards_layout: QVBoxLayout
     model_cards: dict[str, ModelCard]
@@ -95,19 +97,51 @@ class ModelSettingsPage(SettingsPage):
         source_lay.addWidget(labeled_row("下载源", self.download_source_combo))
         self.add(settings_section("下载", source_group))
 
+        self.model_notice_label = QLabel("")
+        self.model_notice_label.setObjectName("modelNoticeLabel")
+        self.model_notice_label.setWordWrap(True)
+        self.model_notice_label.setProperty("viTone", "idle")
+        self.model_notice_label.hide()
+        self._paint_notice_label()
+        self.add(self.model_notice_label)
+
         self.cards_container = QWidget()
         self.cards_layout = QVBoxLayout(self.cards_container)
         self.cards_layout.setContentsMargins(0, 0, 0, 0)
         self.cards_layout.setSpacing(24)
         self.add(self.cards_container)
+        chain_tab_order([self.change_dir_btn, self.download_source_combo])
 
     def _emit_download_source_changed(self, _index: int = 0) -> None:
         self.download_source_changed.emit(str(self.download_source_combo.currentData() or "auto"))
+
+    def _paint_notice_label(self) -> None:
+        tone = self.model_notice_label.property("viTone") or "idle"
+        if tone == "ok":
+            color, bg = tok.GREEN_TEXT, tok.GREEN_BG
+        elif tone == "error":
+            color, bg = tok.RED_TEXT, tok.RED_BG
+        elif tone == "busy":
+            color, bg = tok.AMBER_TEXT, tok.AMBER_SOFT
+        else:
+            color, bg = tok.TEXT_SEC, tok.SURFACE_PEARL
+        self.model_notice_label.setStyleSheet(
+            f"color: {color}; background: {bg}; border-radius: {tok.RADIUS_MD}px;"
+            f" padding: 10px 14px; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700;"
+        )
+
+    def show_notice(self, text: str, tone: str = "ok") -> None:
+        cleaned = (text or "").strip()
+        self.model_notice_label.setProperty("viTone", tone)
+        self.model_notice_label.setText(cleaned)
+        self._paint_notice_label()
+        self.model_notice_label.setVisible(bool(cleaned))
 
     def apply_theme(self) -> None:
         self.storage_summary_label.setStyleSheet(
             f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; background: transparent;"
         )
+        self._paint_notice_label()
 
     def paint_hero_status(
         self,
@@ -124,7 +158,7 @@ class ModelSettingsPage(SettingsPage):
         elif runtime_status.state is RuntimeState.READY:
             fg, bg, text = tok.GREEN_TEXT, tok.GREEN_BG, "已载入 · 可用"
         elif runtime_status.state is RuntimeState.UNAVAILABLE:
-            fg, bg, text = tok.RED, tok.RED_BG, runtime_status.label
+            fg, bg, text = tok.RED_TEXT, tok.RED_BG, runtime_status.label
         else:
             fg, bg, text = tok.AMBER_TEXT, tok.AMBER_SOFT, runtime_status.label
         label.setText(text)
@@ -134,10 +168,18 @@ class ModelSettingsPage(SettingsPage):
         )
 
     def refresh_storage_summary(self, config: Config) -> None:
-        from sayink.speech_recognizer import MODEL_REGISTRY, is_model_downloaded
+        from sayink.speech_recognizer import AUX_MODEL_REGISTRY, MODEL_REGISTRY, is_model_downloaded
 
-        downloaded = [m for m in MODEL_REGISTRY if is_model_downloaded(m["id"])]
-        total_mb = sum(m["size_mb"] for m in downloaded)
+        seen_ids: set[str] = set()
+        downloaded = []
+        for m in (*MODEL_REGISTRY, *AUX_MODEL_REGISTRY):
+            mid = m["id"]
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            if is_model_downloaded(mid):
+                downloaded.append(m)
+        total_mb = sum(int(m.get("size_mb", 0) or 0) for m in downloaded)
         path = elide_middle(str(config.models_dir), 36)
         count = len(downloaded)
         self.storage_summary_label.setText(f"已下载 {count} 个 · 约 {total_mb} MB · {path}")
@@ -294,6 +336,12 @@ class ModelSettingsPage(SettingsPage):
         _add_section("可下载", available_models, False)
         self._add_aux_model_section()
         self.model_cards_for_id = active_id
+        card_buttons = [
+            btn
+            for card in self.model_cards.values()
+            for btn in card.findChildren(QPushButton)
+        ]
+        chain_tab_order([self.change_dir_btn, self.download_source_combo, *card_buttons])
 
     def _add_aux_model_section(self) -> None:
         """Shared helpers: cards show file availability, not runtime activation."""

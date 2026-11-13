@@ -5,9 +5,11 @@ from PyQt6.QtWidgets import QLayout, QLayoutItem, QSizePolicy, QWidget
 
 
 class FlowLayout(QLayout):
-    def __init__(self, parent: QWidget | None = None, spacing: int = 6) -> None:
+    def __init__(self, parent: QWidget | None = None, spacing: int = 6, *, margin: int = -1) -> None:
         super().__init__(parent)
         self._items: list[QLayoutItem] = []
+        if margin >= 0:
+            self.setContentsMargins(margin, margin, margin, margin)
         self.setSpacing(spacing)
 
     def addItem(self, item: QLayoutItem) -> None:
@@ -122,11 +124,11 @@ class WrappingToolBar(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._arrange(self.width(), apply=True)
+        self._sync_height()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        self._arrange(self.width(), apply=True)
+        self._sync_height()
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() in (QEvent.Type.Show, QEvent.Type.Hide, QEvent.Type.LayoutRequest):
@@ -143,7 +145,15 @@ class WrappingToolBar(QWidget):
         self._pending = False
         self.updateGeometry()
         if self.isVisible() or self.width() > 0:
-            self._arrange(self.width(), apply=True)
+            self._sync_height()
+
+    def _sync_height(self) -> None:
+        if self._arranging:
+            return
+        height = self._arrange(self.width(), apply=True)
+        if height != self.minimumHeight():
+            self.setMinimumHeight(height)
+            self.updateGeometry()
 
     def _visible(self) -> list[tuple[QWidget, str]]:
         return [(widget, role) for widget, role in self._entries if not widget.isHidden()]
@@ -250,7 +260,7 @@ class WrappingToolBar(QWidget):
                 x = 0
                 line_h = 0
             if apply:
-                widget.setGeometry(x, y, min(item_w, max(width, item_w)), item_h)
+                widget.setGeometry(x, y, min(item_w, width), item_h)
             if role == "flex":
                 y += item_h + gap
                 x = 0
@@ -407,9 +417,11 @@ class PairedToolBar(QWidget):
             return max(y, row_h)
         if y:
             y += gap
-        if apply:
-            self._pack(left, 0, y, row_h)
-        return y + row_h
+        if left_w <= width:
+            if apply:
+                self._pack(left, 0, y, row_h)
+            return y + row_h
+        return self._wrap_line(left, y, row_h, width, gap, apply)
 
     def _wrap_line(self, widgets: list[QWidget], y: int, row_h: int, width: int, gap: int, apply: bool) -> int:
         x = 0

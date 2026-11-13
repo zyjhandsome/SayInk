@@ -18,10 +18,71 @@ def _init_modifier_keys() -> None:
     }
 
 
+_PUNCTUATION_KEY_NAMES = {
+    Qt.Key.Key_Minus: "-",
+    Qt.Key.Key_Equal: "=",
+    Qt.Key.Key_BracketLeft: "[",
+    Qt.Key.Key_BracketRight: "]",
+    Qt.Key.Key_Backslash: "\\",
+    Qt.Key.Key_Semicolon: ";",
+    Qt.Key.Key_Apostrophe: "'",
+    Qt.Key.Key_Comma: ",",
+    Qt.Key.Key_Period: ".",
+    Qt.Key.Key_Slash: "/",
+    Qt.Key.Key_QuoteLeft: "`",
+}
+
+_COMMON_CONFLICT_HINTS: dict[frozenset[str], str] = {
+    frozenset({"alt", "space"}): (
+        "提示：Alt + Space 常被窗口菜单或启动器（如 PowerToys Run）占用，若无响应可改用 Alt + X。"
+    ),
+    frozenset({"ctrl", "space"}): (
+        "提示：Ctrl + Space 常用于中英文输入法切换，长按时可能触发输入法切换。"
+    ),
+    frozenset({"win", "space"}): (
+        "提示：Win + Space 是系统切换输入法/键盘布局的快捷键，可能产生冲突。"
+    ),
+    frozenset({"shift", "space"}): (
+        "提示：Shift + Space 常用于输入法全角/半角切换，可能产生冲突。"
+    ),
+    frozenset({"win", "h"}): (
+        "提示：Win + H 是 Windows 自带语音输入快捷键，可能产生冲突。"
+    ),
+    frozenset({"win", "e"}): (
+        "提示：Win + E 是系统打开资源管理器的快捷键，占用期间原功能可能受影响。"
+    ),
+    frozenset({"win", "r"}): (
+        "提示：Win + R 是系统打开「运行」的快捷键，占用期间原功能可能受影响。"
+    ),
+    frozenset({"ctrl", "alt", "a"}): (
+        "提示：Ctrl + Alt + A 常被微信/QQ 截图快捷键占用，请注意冲突。"
+    ),
+    frozenset({"ctrl", "alt", "z"}): (
+        "提示：Ctrl + Alt + Z 常被即时通讯软件唤起主窗占用，请注意冲突。"
+    ),
+    frozenset({"ctrl", "shift", "v"}): (
+        "提示：Ctrl + Shift + V 常用于浏览器或编辑器的无格式粘贴，占用期间原功能可能受影响。"
+    ),
+}
+
+
+def hotkey_conflict_warning(hotkey: str) -> str:
+    """Return a concise non-blocking warning for commonly conflicting shortcuts."""
+    if not hotkey:
+        return ""
+    parts = frozenset(
+        "win" if p == "cmd" else p
+        for p in (part.strip().lower() for part in hotkey.split("+"))
+        if p
+    )
+    return _COMMON_CONFLICT_HINTS.get(parts, "")
+
+
 def _qt_key_to_name(key: int) -> str:
     mapping = {
         Qt.Key.Key_Space: "space", Qt.Key.Key_Tab: "tab",
         Qt.Key.Key_Return: "enter", Qt.Key.Key_Enter: "enter",
+        **_PUNCTUATION_KEY_NAMES,
     }
     if key in mapping:
         return mapping[key]
@@ -43,11 +104,11 @@ class HotkeyEdit(QLineEdit):
         super().__init__(parent)
         _init_modifier_keys()
         self.setReadOnly(True)
-        self.setPlaceholderText("点击此处，然后按下快捷键...")
+        self.setPlaceholderText("点击此处按下快捷键（Backspace 清空）...")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setAccessibleName("录音快捷键")
         self.setAccessibleDescription(
-            "点击后按下组合键绑定快捷键；按住该键开始录音，松开结束。"
+            "点击后按下组合键绑定快捷键；按 Backspace 或 Delete 清空；按住该键开始录音，松开结束。"
         )
         self._capturing = False
         self._value = ""
@@ -59,6 +120,16 @@ class HotkeyEdit(QLineEdit):
     def set_value(self, hotkey: str):
         self._value = hotkey
         self.setText(format_hotkey(hotkey))
+
+    def clear_hotkey(self) -> None:
+        was_capturing = self._capturing
+        self._capturing = False
+        self._value = ""
+        self.setStyleSheet("")
+        self.setText("")
+        self.hotkey_changed.emit("")
+        if was_capturing:
+            self.capture_ended.emit()
 
     def mousePressEvent(self, event):
         self.begin_capture()
@@ -75,7 +146,7 @@ class HotkeyEdit(QLineEdit):
         if self._capturing:
             self.capture_ended.emit()
         self._capturing = True
-        self.setText("请按下组合键...")
+        self.setText("请按下组合键（Backspace 清空）...")
         self.setStyleSheet(
             f"border: 2px solid {tok.ACCENT_FOCUS};"
             f" background: {tok.SURFACE_PEARL}; color: {tok.TEXT};"
@@ -83,16 +154,29 @@ class HotkeyEdit(QLineEdit):
         self.capture_started.emit()
 
     def keyPressEvent(self, event):
+        key = event.key()
+        modifiers = event.modifiers()
+        has_any_mod = bool(
+            modifiers
+            & (
+                Qt.KeyboardModifier.ControlModifier
+                | Qt.KeyboardModifier.AltModifier
+                | Qt.KeyboardModifier.ShiftModifier
+                | Qt.KeyboardModifier.MetaModifier
+            )
+        )
+
         if not self._capturing:
-            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space) and not has_any_mod:
                 self.begin_capture()
+                event.accept()
+                return
+            if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete) and not has_any_mod:
+                self.clear_hotkey()
                 event.accept()
                 return
             super().keyPressEvent(event)
             return
-
-        key = event.key()
-        modifiers = event.modifiers()
 
         # Esc cancels recording and continuous listening, so it can never be
         # (part of) the hotkey; here it backs out of the capture instead.
@@ -108,8 +192,31 @@ class HotkeyEdit(QLineEdit):
             mod_parts.append("Alt")
         if modifiers & Qt.KeyboardModifier.ShiftModifier:
             mod_parts.append("Shift")
+        if modifiers & Qt.KeyboardModifier.MetaModifier:
+            mod_parts.append("Win")
+
+        # Bare Tab / Shift+Tab moves focus cleanly without trapping keyboard users.
+        if key == Qt.Key.Key_Tab and not mod_parts:
+            self.cancel_capture_if_active()
+            self.focusNextPrevChild(True)
+            event.accept()
+            return
+        if key == Qt.Key.Key_Backtab and (
+            not mod_parts or mod_parts == ["Shift"]
+        ):
+            self.cancel_capture_if_active()
+            self.focusNextPrevChild(False)
+            event.accept()
+            return
+
+        if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete) and not mod_parts:
+            self.clear_hotkey()
+            event.accept()
+            return
 
         if key in _MODIFIER_KEYS:
+            if key == Qt.Key.Key_Meta and "Win" not in mod_parts:
+                mod_parts.append("Win")
             if mod_parts:
                 self.setText(" + ".join(mod_parts) + " + ...")
             return

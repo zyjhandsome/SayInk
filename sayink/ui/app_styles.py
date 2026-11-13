@@ -7,6 +7,7 @@ from PyQt6.QtGui import QPainter, QPen
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QAbstractScrollArea,
+    QAbstractSpinBox,
     QApplication,
     QComboBox,
     QFrame,
@@ -92,24 +93,41 @@ def widen_combo_popup(view: QAbstractItemView) -> None:
 _POPUP_TRIGGERS = (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick, QEvent.Type.KeyPress)
 
 
-def _forward_wheel_to_scroll_area(combo: QComboBox, event) -> bool:
-    """Keep a closed combo from changing while the page scrolls.
-
-    The open popup list still scrolls itself. Retention days and the session
-    cap are spin boxes, so they are not affected.
-    """
-    view = combo.view()
-    popup = view.window() if view is not None else None
-    if popup is not None and popup is not combo.window() and popup.isVisible():
-        return False
+def _forward_wheel_to_ancestor_scroll_area(widget, event) -> bool:
     event.ignore()
-    parent = combo.parentWidget()
+    parent = widget.parentWidget()
     while parent is not None:
         if isinstance(parent, QAbstractScrollArea):
             QApplication.sendEvent(parent.viewport(), event)
             return True
         parent = parent.parentWidget()
     return True
+
+
+def _forward_wheel_to_scroll_area(combo: QComboBox, event) -> bool:
+    """Keep a closed combo from changing while the page scrolls.
+
+    The open popup list still scrolls itself.
+    """
+    view = combo.view()
+    popup = view.window() if view is not None else None
+    if popup is not None and popup is not combo.window() and popup.isVisible():
+        return False
+    return _forward_wheel_to_ancestor_scroll_area(combo, event)
+
+
+def _spinbox_has_active_focus(spin: QAbstractSpinBox) -> bool:
+    if spin.hasFocus():
+        return True
+    fw = QApplication.focusWidget()
+    return fw is not None and spin.isAncestorOf(fw)
+
+
+def _forward_spinbox_wheel_to_scroll_area(spin: QAbstractSpinBox, event) -> bool:
+    """Block accidental wheel edits on unfocused spin boxes while scrolling."""
+    if _spinbox_has_active_focus(spin):
+        return False
+    return _forward_wheel_to_ancestor_scroll_area(spin, event)
 
 
 class _PopupWidthFilter(QObject):
@@ -119,8 +137,14 @@ class _PopupWidthFilter(QObject):
 
     def eventFilter(self, obj, event):
         kind = event.type()
-        if kind == QEvent.Type.Wheel and isinstance(obj, QComboBox):
-            return _forward_wheel_to_scroll_area(obj, event)
+        if kind == QEvent.Type.Wheel:
+            if isinstance(obj, QComboBox):
+                return _forward_wheel_to_scroll_area(obj, event)
+            if isinstance(obj, QAbstractSpinBox):
+                return _forward_spinbox_wheel_to_scroll_area(obj, event)
+            parent = obj.parentWidget() if hasattr(obj, "parentWidget") else None
+            if isinstance(parent, QAbstractSpinBox):
+                return _forward_spinbox_wheel_to_scroll_area(parent, event)
         if self._adjusting:
             return False
         if kind in _POPUP_TRIGGERS and isinstance(obj, QComboBox):
@@ -136,6 +160,26 @@ class _PopupWidthFilter(QObject):
             finally:
                 self._adjusting = False
         return False
+
+
+_SHARED_WHEEL_FILTER: _PopupWidthFilter | None = None
+
+
+def install_spinbox_wheel_guard(spin: QAbstractSpinBox, event_filter: QObject | None = None) -> None:
+    """Ensure ``spin`` only responds to mouse wheel after explicit focus."""
+    global _SHARED_WHEEL_FILTER
+    if event_filter is None:
+        if _SHARED_WHEEL_FILTER is None:
+            _SHARED_WHEEL_FILTER = _PopupWidthFilter()
+        event_filter = _SHARED_WHEEL_FILTER
+    if spin.focusPolicy() == Qt.FocusPolicy.WheelFocus:
+        spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    if not spin.property("_wheelGuardFilter"):
+        spin.installEventFilter(event_filter)
+        editor = spin.lineEdit() if hasattr(spin, "lineEdit") else None
+        if editor is not None:
+            editor.installEventFilter(event_filter)
+        spin.setProperty("_wheelGuardFilter", True)
 
 
 def _combo_for_view(view) -> QComboBox | None:
@@ -199,6 +243,8 @@ class DropDownComboStyle(QProxyStyle):
                 if container is not None and container is not target.window():
                     container.installEventFilter(self._popup_filter)
                 target.setProperty("_popupWidthFilter", True)
+        elif isinstance(target, QAbstractSpinBox):
+            install_spinbox_wheel_guard(target, self._popup_filter)
         return super().polish(target)
 
 

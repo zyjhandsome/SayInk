@@ -51,10 +51,10 @@ Effective theme is always `light` or `dark`.
 | Foreground Dim | `#667085` | `TEXT_DIM` |
 | Border | `rgba(13,13,13,0.08)` | `BORDER` / `HAIRLINE` |
 | Control Border | `#D1D5DB` | `CONTROL_BORDER` |
-| Destructive / Record | `#C81E1E` / `#DC2626` | `RED` / `STATE_RECORD` |
-| Success / toggle on | `#15803D` | `GREEN` / `TOGGLE_ON` / `STATE_LISTEN` |
+| Destructive / Record | `#C81E1E` / `#DC2626` | `RED` / `STATE_RECORD` (`RED_TEXT`: `#991B1B`) |
+| Success / toggle on | `#15803D` | `GREEN` / `TOGGLE_ON` / `STATE_LISTEN` (`GREEN_TEXT`: `#166534`) |
 | Focus Ring | `#2563EB` | `ACCENT_FOCUS` |
-| Nav / row selected | `rgba(13,13,13,0.06)` | `NAV_SELECTED_BG` / `ROW_SELECTED` |
+| Nav / row selected | `rgba(255, 255, 255, 0.92)` / `rgba(13,13,13,0.06)` | `NAV_SELECTED_BG` / `ROW_SELECTED` |
 
 **Notes:** Ink primary actions; blue for keyboard focus and links. A subtle neutral rail separates navigation from the reading surface. Recording red is semantic only.
 
