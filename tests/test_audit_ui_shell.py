@@ -715,3 +715,89 @@ class TestSettingsAccessibilityAndSafeguards:
             ok = copy_text("hello")
         assert ok is False
         assert any("剪贴板" in r.message for r in caplog.records)
+
+    def test_all_vi_roles_ast_tokens_and_downloaded_model_settings_theme_switch(
+        self, monkeypatch, tmp_path
+    ):
+        import ast
+        from pathlib import Path
+        from sayink import config as config_mod
+        from sayink.config import Config
+        from sayink.ui import design_tokens as dt
+        from sayink.ui import settings_styles as ss
+        from sayink.ui.settings_components import stylesheet_for_role
+        from sayink.ui.settings_window import SettingsWindow
+
+        # 1) _LIGHT and _DARK token sets must match 1:1 and cover every AST tok/live/ss reference
+        assert set(dt._LIGHT.keys()) == set(dt._DARK.keys())
+        assert "GREEN_BORDER" in dt._LIGHT and "GREEN_BORDER" in dt._DARK
+
+        repo_sayink = Path(__file__).resolve().parents[1] / "sayink"
+        missing_refs: list[str] = []
+        for py_file in repo_sayink.rglob("*.py"):
+            tree = ast.parse(py_file.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                    if node.value.id in ("tok", "live", "design_tokens", "dt") and not hasattr(dt, node.attr):
+                        missing_refs.append(f"{py_file.name}:{node.lineno}:{node.value.id}.{node.attr}")
+                    elif node.value.id in ("ss", "settings_styles") and not hasattr(ss, node.attr):
+                        missing_refs.append(f"{py_file.name}:{node.lineno}:{node.value.id}.{node.attr}")
+        assert missing_refs == []
+
+        # 2) Every viRole in stylesheet_for_role renders valid QSS in both light and dark themes
+        all_roles = (
+            "pageTitle",
+            "pageSubtitle",
+            "sectionLabel",
+            "rowTitle",
+            "rowSubtitle",
+            "fieldLabel",
+            "hint",
+            "importantHint",
+            "footnote",
+            "polishPreviewHeading",
+            "polishPreviewLabel",
+            "polishPreviewText",
+            "kvKey",
+            "kvValue",
+            "kvValueMono",
+            "pickTitle",
+            "pickSubtitle",
+            "emptyState",
+            "engineHeroTitle",
+            "modelName",
+            "engineHeroBadge",
+            "modelBadge",
+            "engineHeroSize",
+            "engineHeroMeta",
+            "modelSize",
+            "modelMeta",
+            "engineHeroDesc",
+            "modelDesc",
+        )
+        try:
+            for axis in ("light", "dark"):
+                dt.activate(axis)
+                for role in all_roles:
+                    css = stylesheet_for_role(role)
+                    assert isinstance(css, str) and css.strip(), f"empty css for {role} in {axis}"
+                assert stylesheet_for_role(None) is None
+                assert stylesheet_for_role("unknownRole") is None
+        finally:
+            dt.activate("light")
+
+        # 3) SettingsWindow with is_model_downloaded=True builds engineHeroBadge & switches light/dark cleanly
+        monkeypatch.setattr(config_mod, "user_data_dir", lambda: tmp_path)
+        monkeypatch.setattr("sayink.speech_recognizer.is_model_downloaded", lambda _mid: True)
+        cfg = Config(secret_store=SimpleNamespace(read=lambda: "", write=lambda _v: True))
+        sw = SettingsWindow(cfg)
+        try:
+            assert any(w.property("viRole") == "engineHeroBadge" for w in sw.findChildren(QWidget))
+            dt.activate("dark")
+            sw.reapply_theme()
+            dt.activate("light")
+            sw.reapply_theme()
+        finally:
+            sw.close()
+            sw.deleteLater()
+            dt.activate("light")
