@@ -117,6 +117,16 @@ class TestInstallerSafetyAndStaging:
         build_src = (REPO_ROOT / "build.py").read_text(encoding="utf-8")
         assert "alt_exe.replace(exe_path)" in build_src
 
+    @pytest.mark.parametrize("marker_text", ["..", "../other", "C:/other"])
+    def test_staging_marker_cannot_select_a_directory_outside_dist(self, monkeypatch, tmp_path, marker_text):
+        dist = tmp_path / "dist"
+        dist.mkdir()
+        (dist / "SAYINK_STAGING_DIR.txt").write_text(marker_text, encoding="utf-8")
+        monkeypatch.setattr(build_installer_mod, "PROJECT_ROOT", tmp_path)
+
+        with pytest.raises(ValueError, match="staging directory"):
+            build_installer_mod.resolve_staging_dir()
+
     def test_iscc_compiles_iss_with_custom_staging_dir_if_available(self, tmp_path):
         iscc = build_installer_mod.find_inno_setup()
         if iscc is None:
@@ -611,7 +621,7 @@ class TestClipboardSnapshotAndPasteGuards:
         seq["val"] += 1
         restore_cb()
         assert restored == []
-        assert paster._restore_pending is False
+        assert paster._restore_expected is None
 
     def test_cancel_resets_restore_pending_and_skipped_paste_preserves_transcript(self, monkeypatch):
         _qapp = QApplication.instance() or QApplication(sys.argv)
@@ -623,9 +633,9 @@ class TestClipboardSnapshotAndPasteGuards:
         monkeypatch.setattr(tp_mod.QTimer, "singleShot", lambda ms, fn: timers.append((ms, fn)))
 
         paster = TextPaster(restore_clipboard=True)
-        paster._restore_pending = True
+        paster._restore_expected = (None, "pending transcript")
         paster.cancel()
-        assert paster._restore_pending is False
+        assert paster._restore_expected is None
 
         # Case A: skipped due to elevated window -> transcript MUST stay on clipboard, no restore scheduled!
         monkeypatch.setattr(tp_mod, "get_foreground_window_info", lambda: (500, "Admin CMD", 88888))
@@ -637,7 +647,7 @@ class TestClipboardSnapshotAndPasteGuards:
         assert results[-1].status == "clipboard"
         assert results[-1].detail == "elevated"
         assert clipboard["text"] == "留给手动粘贴的文字"
-        assert paster._restore_pending is False
+        assert paster._restore_expected is None
 
         # Case B: skipped due to IME composing -> detail == "ime_active", transcript stays on clipboard!
         clipboard["text"] = "旧文本"
@@ -650,7 +660,7 @@ class TestClipboardSnapshotAndPasteGuards:
         assert results[-1].status == "clipboard"
         assert results[-1].detail == "ime_active"
         assert clipboard["text"] == "拼音组词时不乱贴"
-        assert paster._restore_pending is False
+        assert paster._restore_expected is None
 
         # Case C: skipped due to same-HWND session/chat switch -> detail == "session_changed"!
         clipboard["text"] = "旧文本2"
@@ -677,7 +687,7 @@ class TestClipboardSnapshotAndPasteGuards:
         assert results[-1].status == "clipboard"
         assert results[-1].detail == "session_changed"
         assert clipboard["text"] == "切走聊天框不误发"
-        assert paster._restore_pending is False
+        assert paster._restore_expected is None
 
     def test_detect_session_change_and_terminal_paste_modes(self, monkeypatch):
         before = PasteTargetSnapshot(hwnd=10, focus_hwnd=20, title_digest="abcd")

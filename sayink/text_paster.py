@@ -990,13 +990,16 @@ class TextPaster:
         # The user's own clipboard while a delayed restore has not run yet;
         # the next paste must not mistake the previous transcript for it.
         self._saved_snapshot: ClipboardSnapshot | None = None
-        self._restore_pending = False
+        self._restore_expected: tuple[int | None, str] | None = None
+
+    def _clear_clipboard_restore(self) -> None:
+        self._saved_snapshot = None
+        self._restore_expected = None
 
     def cancel(self) -> None:
         """Forget a paste whose shortcut has not been sent yet and clear pending restore."""
         self._paste_seq += 1
-        self._restore_pending = False
-        self._saved_snapshot = None
+        self._clear_clipboard_restore()
 
     @staticmethod
     def _use_native_win32_clipboard() -> bool:
@@ -1028,9 +1031,21 @@ class TextPaster:
                 pyperclip.copy(snapshot.text_fallback)
 
     def _current_clipboard_seq(self) -> int | None:
-        if self._use_native_win32_clipboard():
+        # The Win32 sequence is available even after pyperclip lazily replaces
+        # its copy/paste functions on the first use.
+        if sys.platform == "win32":
             return get_win32_clipboard_sequence_number()
         return None
+
+    def _clipboard_paste_blocker(self, expected_seq: int | None, text: str) -> str:
+        current_seq = self._current_clipboard_seq()
+        if expected_seq is not None and current_seq is not None:
+            return "clipboard_changed" if current_seq != expected_seq else ""
+        try:
+            return "clipboard_changed" if pyperclip.paste() != text else ""
+        except Exception:
+            log.debug("无法核对剪贴板内容", exc_info=True)
+            return "clipboard_unavailable"
 
     @classmethod
     def _is_own_window(cls, info: tuple) -> bool:
@@ -1106,20 +1121,18 @@ class TextPaster:
         seq = self._paste_seq
         old_snapshot: ClipboardSnapshot | None = None
         if self.restore_clipboard:
-            if self._restore_pending and self._saved_snapshot is not None:
+            if self._restore_expected is not None and not self._clipboard_paste_blocker(*self._restore_expected):
                 old_snapshot = self._saved_snapshot
             else:
                 old_snapshot = self._capture_clipboard_snapshot()
-                self._saved_snapshot = old_snapshot
-            self._restore_pending = bool(old_snapshot)
+            self._saved_snapshot = old_snapshot
 
         report = callback
 
         def callback(result: PasteResult) -> None:
             restoring = bool(result.status == "sent" and self.restore_clipboard and old_snapshot)
             if not restoring and seq == self._paste_seq:
-                self._restore_pending = False
-                self._saved_snapshot = None
+                self._clear_clipboard_restore()
             report(result)
 
         try:
@@ -1130,6 +1143,7 @@ class TextPaster:
             return
 
         expected_clip_seq = self._current_clipboard_seq()
+        self._restore_expected = (expected_clip_seq, text) if old_snapshot else None
 
         if not has_target:
             callback(PasteResult("clipboard", target_app=target_app or "", detail=skip_detail))
@@ -1143,49 +1157,40 @@ class TextPaster:
         def _restore_clipboard():
             if seq != self._paste_seq:
                 return  # a later paste restores the same original
-            self._restore_pending = False
-            self._saved_snapshot = None
+            self._clear_clipboard_restore()
             if old_snapshot is None:
                 return
             try:
-                if expected_clip_seq is not None:
-                    now_clip_seq = self._current_clipboard_seq()
-                    if now_clip_seq is not None and now_clip_seq != expected_clip_seq:
-                        log.debug("检测到粘贴后用户更新了剪贴板，跳过恢复旧剪贴板")
-                        return
-                elif old_snapshot.use_win32 and pyperclip.paste() != text:
-                    log.debug("剪贴板序号不可用且文本已变化，跳过恢复旧剪贴板")
+                if self._clipboard_paste_blocker(expected_clip_seq, text):
+                    log.debug("剪贴板内容已变化或无法核对，跳过恢复旧剪贴板")
                     return
                 self._restore_clipboard_snapshot(old_snapshot, text)
             except Exception:
                 log.debug("恢复原剪贴板失败", exc_info=True)
-
-        def _keep_for_manual_paste(detail: str = ""):
-            try:
-                pyperclip.copy(text)
-            except Exception:
-                log.debug("重新写入剪贴板失败", exc_info=True)
-            callback(PasteResult("clipboard", target_app=target_app, detail=detail))
 
         def _do_paste():
             global _ACTIVE_PASTE_MODE
             if seq != self._paste_seq:
                 return
             info_now = get_foreground_window_info()
+            skip_detail = ""
             if hwnd == 0 or info_now[0] != hwnd:
-                log.info("粘贴前焦点已切换到其他窗口，未发送粘贴键；已保留剪贴板内容")
-                _keep_for_manual_paste("focus_changed")
+                skip_detail = "focus_changed"
+            else:
+                now_snapshot = build_paste_target_snapshot(info_now)
+                if detect_session_change(baseline_snapshot, now_snapshot):
+                    skip_detail = "session_changed"
+                elif _is_ime_composing(hwnd, now_snapshot.focus_hwnd):
+                    skip_detail = "ime_active"
+
+            paste_mode = detect_terminal_paste_mode(info_now, target_app or "") if not skip_detail else None
+            clipboard_blocker = self._clipboard_paste_blocker(expected_clip_seq, text)
+            if clipboard_blocker:
+                callback(PasteResult("skipped", target_app=target_app, detail=clipboard_blocker))
                 return
-            now_snapshot = build_paste_target_snapshot(info_now)
-            if detect_session_change(baseline_snapshot, now_snapshot):
-                log.info("粘贴前目标窗口子焦点或会话已切换，未发送粘贴键；已保留剪贴板内容")
-                _keep_for_manual_paste("session_changed")
+            if skip_detail:
+                callback(PasteResult("clipboard", target_app=target_app, detail=skip_detail))
                 return
-            if _is_ime_composing(hwnd, now_snapshot.focus_hwnd):
-                log.info("粘贴前检测到输入法正在拼音组词，未发送粘贴键；已保留剪贴板内容")
-                _keep_for_manual_paste("ime_active")
-                return
-            paste_mode = detect_terminal_paste_mode(info_now, target_app or "")
             prev_mode = _ACTIVE_PASTE_MODE
             _ACTIVE_PASTE_MODE = paste_mode
             try:
@@ -1206,11 +1211,11 @@ class TextPaster:
                     QTimer.singleShot(RESTORE_CLIPBOARD_DELAY_MS, _restore_clipboard)
                 callback(PasteResult("sent", target_app=target_app))
             else:
-                log.info("粘贴键已发出，但随后焦点切换，无法确认是否已插入；保留剪贴板内容")
-                try:
-                    pyperclip.copy(text)
-                except Exception:
-                    log.debug("重新写入剪贴板失败", exc_info=True)
-                callback(PasteResult("unverified", target_app=target_app, detail="focus_changed_after_send"))
+                log.info("粘贴键已发出，但随后焦点切换，无法确认是否已插入")
+                detail = (
+                    "clipboard_changed_after_send" if self._clipboard_paste_blocker(expected_clip_seq, text)
+                    else "focus_changed_after_send"
+                )
+                callback(PasteResult("unverified", target_app=target_app, detail=detail))
 
         QTimer.singleShot(PASTE_DELAY_MS, _do_paste)

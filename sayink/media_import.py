@@ -274,14 +274,9 @@ def recognize_file(
             return RecognitionResult((), True, audio_ms=audio_ms, audio_path=resolved_audio_path)
     else:
         try:
-            if progress_cb is not None:
-                try:
-                    audio = decode_audio_file(path, cancel=cancel, progress_cb=_emit_decode_progress)
-                except TypeError:
-                    # Support 2-arg monkeypatched decode_audio_file stubs in unit tests.
-                    audio = decode_audio_file(path, cancel=cancel)
-            else:
-                audio = decode_audio_file(path, cancel=cancel)
+            audio = decode_audio_file(
+                path, cancel=cancel, progress_cb=_emit_decode_progress if progress_cb is not None else None,
+            )
         except AudioDecodeError as exc:
             if "已取消" in str(exc):
                 return RecognitionResult((), True, audio_path=resolved_audio_path)

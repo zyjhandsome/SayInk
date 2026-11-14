@@ -255,6 +255,9 @@ def build():
         "--hidden-import=win32api",
         "--hidden-import=win32con",
         "--hidden-import=win32cred",
+        # CredRead returns a pywintypes time, which imports win32timezone
+        # lazily. Without this, the frozen app cannot read the saved API key.
+        "--hidden-import=win32timezone",
         "--hidden-import=pyaudiowpatch",
         "--hidden-import=PyQt6.QtNetwork",
         "--hidden-import=PyQt6.QtMultimedia",

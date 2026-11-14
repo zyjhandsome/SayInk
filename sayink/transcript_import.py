@@ -16,6 +16,11 @@ from typing import Any, Callable, Sequence
 
 IMPORT_SOURCE = "import_text"
 
+# The largest supported calendar timestamp (9999-12-31T23:59:59.999Z).
+# Relative offsets and durations must also leave room for the meeting start.
+_MAX_TRANSCRIPT_MS = 253_402_300_799_999
+_MAX_SPEAKER_ID = (1 << 63) - 1  # SQLite INTEGER
+
 _STOP_LABELS = frozenset({
     "背景", "注意", "摘要", "议程", "时间", "参会人", "标题", "说明", "备注", "总结", "结论", "主题",
 })
@@ -25,10 +30,10 @@ _NUMBERED = re.compile(r"^(?:说话人|发言人|speaker)\s*(\d+)$", re.IGNORECA
 _CLOCK_IN_LABEL = re.compile(r"\d{1,2}:\d{2}")
 _SENTENCE_PUNCT = "。！？!?，,"
 _CUE_TIME = re.compile(
-    r"(?:(?P<sh>\d{1,}):)?(?P<sm>\d{1,2}):(?P<ss>\d{2})[.,](?P<sms>\d{1,9})\s*-->\s*"
-    r"(?:(?P<eh>\d{1,}):)?(?P<em>\d{1,2}):(?P<es>\d{2})[.,](?P<ems>\d{1,9})"
+    r"(?<![\d:])(?:(?P<sh>\d+):)?(?P<sm>\d{1,2}):(?P<ss>\d{2})[.,](?P<sms>\d{1,9})\s*-->\s*"
+    r"(?:(?P<eh>\d+):)?(?P<em>\d{1,2}):(?P<es>\d{2})[.,](?P<ems>\d{1,9})"
 )
-_LOOSE_CUE_ARROW = re.compile(r"\d+:\d{1,2}(?::\d{1,2})?(?:[.,]\d+)?\s*-->\s*\d+:\d{1,2}")
+_LOOSE_CUE_ARROW = re.compile(r"(?<![\d:])\d+:\d{1,2}(?::\d{1,2})?(?:[.,]\d+)?\s*-->\s*\d+:\d{1,2}")
 _VTT_META_BLOCK = re.compile(r"^(?:NOTE|STYLE|REGION)(?:$|[ \t])", re.IGNORECASE)
 _VTT_INLINE_TIME = re.compile(r"<(?:\d{1,}:)?\d{1,2}:\d{2}[.,]\d{1,9}>")
 _VTT_INLINE_TAG = re.compile(
@@ -226,8 +231,12 @@ def decode_transcript(data: bytes) -> str:
     return text
 
 
-def read_transcript_file(path: str | Path) -> str:
-    return decode_transcript(Path(path).read_bytes())
+def read_transcript_file(path: str | Path, *, max_bytes: int | None = None) -> str:
+    with Path(path).open("rb") as handle:
+        data = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
+    if max_bytes is not None and len(data) > max_bytes:
+        raise TranscriptDecodeError("文件超过可导入的大小，已保留当前输入。请拆开后再导入。")
+    return decode_transcript(data)
 
 
 def parse_transcript(text: str, *, detect_structure: bool = True) -> ImportedTranscript:
@@ -263,8 +272,10 @@ def assign_speakers(turns: Sequence[ImportedTurn]) -> tuple[list[tuple[int, Impo
     used: set[int] = set()
     for turn in turns:
         match = _NUMBERED.match(turn.speaker_label.strip())
-        if match and int(match.group(1)) > 0:
-            used.add(int(match.group(1)))
+        if match:
+            speaker_id = _speaker_id(match.group(1))
+            if speaker_id:
+                used.add(speaker_id)
     names: dict[str, int] = {}
     display: dict[int, str] = {}
     next_id = 1
@@ -275,9 +286,7 @@ def assign_speakers(turns: Sequence[ImportedTurn]) -> tuple[list[tuple[int, Impo
         if not label:
             speaker_id = 0
         elif match:
-            speaker_id = int(match.group(1))
-            if speaker_id <= 0:
-                speaker_id = 0
+            speaker_id = _speaker_id(match.group(1))
         else:
             speaker_id = names.get(label, 0)
             if speaker_id <= 0:
@@ -356,10 +365,14 @@ def _clock_ms(
 
 
 def _cue_ms(hours: str | None, minutes: str, seconds: str, millis: str) -> int | None:
-    h = int(hours) if hours else 0
+    # Hours can be padded. Validate the prefix before converting the last
+    # three decimal digits so even a very long clock cannot overflow int().
+    if hours and any(int(digit) for digit in hours[:-3]):
+        return None
+    h = int(hours[-3:]) if hours else 0
     m, s = int(minutes), int(seconds)
     ms = int(millis[:3].ljust(3, "0"))
-    if h > 999 or m >= 60 or s >= 60 or ms >= 1000:
+    if m >= 60 or s >= 60:
         return None
     return ((h * 60 + m) * 60 + s) * 1000 + ms
 
@@ -663,7 +676,7 @@ def _parse_timed_line_with_kind(line: str) -> tuple[ImportedTurn, bool] | None:
         who = _clean_speaker(bracket.group("who") or "")
         body = bracket.group("body").strip()
         if who and not _plausible_label(who, limit=24) and not _NUMBERED.match(who):
-            body = f"{who}：{body}"
+            body = line[bracket.start("who"):].strip()
             who = ""
         return ImportedTurn(who, offset, 0, body), has_wall
     date_colon = _DATE_FIRST_COLON.match(line)
@@ -695,20 +708,22 @@ def _parse_timed_line_with_kind(line: str) -> tuple[ImportedTurn, bool] | None:
     return ImportedTurn(who, offset, 0, timed.group("body").strip()), has_wall
 
 
-def _parse_timed_line(line: str) -> ImportedTurn | None:
-    res = _parse_timed_line_with_kind(line)
-    return res[0] if res is not None else None
+def _speaker_id(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        speaker_id = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return speaker_id if 0 < speaker_id <= _MAX_SPEAKER_ID else 0
 
 
 def _json_speaker_lookup(raw_speakers: Any) -> dict[int, str]:
     mapping: dict[int, str] = {}
     if isinstance(raw_speakers, dict):
         for key, val in raw_speakers.items():
-            try:
-                sid = int(key)
-            except (TypeError, ValueError):
-                continue
-            if sid <= 0:
+            sid = _speaker_id(key)
+            if not sid:
                 continue
             if isinstance(val, str) and val.strip():
                 mapping[sid] = val.strip()
@@ -720,10 +735,7 @@ def _json_speaker_lookup(raw_speakers: Any) -> dict[int, str]:
         for item in raw_speakers:
             if not isinstance(item, dict):
                 continue
-            try:
-                sid = int(item.get("speaker_id") or item.get("id") or 0)
-            except (TypeError, ValueError):
-                continue
+            sid = _speaker_id(item.get("speaker_id") or item.get("id"))
             name = str(item.get("display_name") or item.get("name") or item.get("label") or "").strip()
             if sid > 0 and name:
                 mapping[sid] = name
@@ -746,34 +758,36 @@ def _json_item_text(item: dict[str, Any]) -> str:
 def _json_item_speaker(item: dict[str, Any], speaker_map: dict[int, str]) -> str:
     for key in ("speaker_label", "speaker_name", "speaker"):
         val = item.get(key)
-        if isinstance(val, int) and val > 0:
-            return speaker_map.get(val, f"说话人{val}")
+        if isinstance(val, int) and (sid := _speaker_id(val)):
+            return speaker_map.get(sid, f"说话人{sid}")
         if isinstance(val, str) and val.strip():
             raw = val.strip()
-            if raw.isdigit() and int(raw) > 0:
-                sid = int(raw)
+            if raw.isdecimal() and (sid := _speaker_id(raw)):
                 return speaker_map.get(sid, f"说话人{sid}")
             if raw == "说话人待确认":
                 return ""
             return raw[:48]
     raw_sid = item.get("speaker_id")
-    if isinstance(raw_sid, (int, float)) and not isinstance(raw_sid, bool):
-        sid = int(raw_sid)
-        if sid > 0:
-            return speaker_map.get(sid, f"说话人{sid}")
-    elif isinstance(raw_sid, str) and raw_sid.strip().isdigit():
-        sid = int(raw_sid.strip())
-        if sid > 0:
-            return speaker_map.get(sid, f"说话人{sid}")
-    return ""
+    if isinstance(raw_sid, str) and not raw_sid.strip().isdecimal():
+        return ""
+    sid = _speaker_id(raw_sid)
+    return speaker_map.get(sid, f"说话人{sid}") if sid else ""
 
 
-def _json_int_or_none(value: Any) -> int | None:
-    if isinstance(value, bool) or value is None:
+def _json_millis(value: Any, *, scale: int = 1) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if isinstance(value, (int, float)):
-        return int(round(float(value)))
-    return None
+    try:
+        millis = round(value * scale)
+    except (OverflowError, ValueError):
+        return None
+    return millis if -_MAX_TRANSCRIPT_MS <= millis <= _MAX_TRANSCRIPT_MS else None
+
+
+def _json_safe_text(value: str) -> str:
+    # JSON can contain a lone escaped surrogate. Keep its escape visible so
+    # the resulting transcript can still be written as UTF-8.
+    return re.sub(r"[\ud800-\udfff]", lambda match: ascii(match[0])[1:-1], value)
 
 
 def _parse_json_transcript(text: str) -> ImportedTranscript | None:
@@ -787,7 +801,7 @@ def _parse_json_transcript(text: str) -> ImportedTranscript | None:
         return None
     try:
         payload = json.loads(stripped)
-    except (json.JSONDecodeError, ValueError):
+    except (ValueError, RecursionError):
         return None
 
     title = ""
@@ -811,12 +825,12 @@ def _parse_json_transcript(text: str) -> ImportedTranscript | None:
         if isinstance(raw_title, str) and raw_title.strip():
             title = raw_title.strip()[:80]
         speaker_map = _json_speaker_lookup(payload.get("speakers"))
-        root_started_at = _json_int_or_none(payload.get("started_at"))
+        root_started_at = _json_millis(payload.get("started_at"))
         if root_started_at is None and isinstance(payload.get("meeting"), dict):
             meeting_meta = payload["meeting"]
             if not title and isinstance(meeting_meta.get("title"), str):
                 title = meeting_meta["title"].strip()[:80]
-            root_started_at = _json_int_or_none(meeting_meta.get("started_at"))
+            root_started_at = _json_millis(meeting_meta.get("started_at"))
             if not speaker_map:
                 speaker_map = _json_speaker_lookup(meeting_meta.get("speakers"))
         if isinstance(payload.get("sessions"), list):
@@ -854,8 +868,8 @@ def _parse_json_transcript(text: str) -> ImportedTranscript | None:
     for item in items:
         if any(k in item for k in ("offset_ms", "start_ms", "start")):
             continue
-        cap = _json_int_or_none(item.get("captured_at"))
-        cre = _json_int_or_none(item.get("created_at"))
+        cap = _json_millis(item.get("captured_at"))
+        cre = _json_millis(item.get("created_at"))
         clock = cap if (cap is not None and cap > 0) else (cre if (cre is not None and cre > 0) else None)
         if clock is not None:
             epoch_clocks.append(clock)
@@ -873,30 +887,29 @@ def _parse_json_transcript(text: str) -> ImportedTranscript | None:
         if not content:
             continue
         speaker = _json_item_speaker(item, speaker_map)
-        duration = max(0, _json_int_or_none(item.get("duration_ms")) or 0)
+        duration = max(0, _json_millis(item.get("duration_ms")) or 0)
         offset: int | None = None
         if "offset_ms" in item and item["offset_ms"] is not None:
-            raw_off = _json_int_or_none(item.get("offset_ms"))
+            raw_off = _json_millis(item.get("offset_ms"))
             if raw_off is not None and raw_off >= 0:
                 offset = raw_off
         elif "start_ms" in item and item["start_ms"] is not None:
-            raw_off = _json_int_or_none(item.get("start_ms"))
+            raw_off = _json_millis(item.get("start_ms"))
             if raw_off is not None and raw_off >= 0:
                 offset = raw_off
-            end_ms = _json_int_or_none(item.get("end_ms"))
+            end_ms = _json_millis(item.get("end_ms"))
             if not duration and offset is not None and end_ms is not None and end_ms > offset:
                 duration = end_ms - offset
         elif isinstance(item.get("start"), (int, float)) and not isinstance(item.get("start"), bool):
-            start_s = float(item["start"])
+            start_s = item["start"]
             if start_s >= 0:
-                offset = int(round(start_s * 1000))
-                if not duration and isinstance(item.get("end"), (int, float)) and not isinstance(item.get("end"), bool):
-                    end_ms = int(round(float(item["end"]) * 1000))
-                    if end_ms > offset:
-                        duration = end_ms - offset
+                offset = _json_millis(start_s, scale=1000)
+                end_ms = _json_millis(item.get("end"), scale=1000)
+                if not duration and offset is not None and end_ms is not None and end_ms > offset:
+                    duration = end_ms - offset
         elif base_epoch is not None:
-            cap = _json_int_or_none(item.get("captured_at"))
-            cre = _json_int_or_none(item.get("created_at"))
+            cap = _json_millis(item.get("captured_at"))
+            cre = _json_millis(item.get("created_at"))
             if cap is not None and cap < 0:
                 offset = None
             else:
@@ -908,12 +921,12 @@ def _parse_json_transcript(text: str) -> ImportedTranscript | None:
                     or root_started_at is not None
                 ):
                     offset = max(0, clock - base_epoch)
-        turns.append(ImportedTurn(speaker, offset, duration, content))
+        turns.append(ImportedTurn(_json_safe_text(speaker), offset, duration, _json_safe_text(content)))
 
     if not turns:
         return None
     stored = _fill_durations(turns) if any(t.offset_ms is not None for t in turns) else tuple(turns)
-    return ImportedTranscript(title, stored, "JSON 记录")
+    return ImportedTranscript(_json_safe_text(title), stored, "JSON 记录")
 
 
 def _parse_dialogue_line(line: str) -> ImportedTurn | None:
@@ -929,24 +942,21 @@ def _parse_dialogue_line(line: str) -> ImportedTurn | None:
 
 
 def _parse_timed_dialogue(text: str) -> ImportedTranscript | None:
-    return _parse_line_format(
-        text,
-        _parse_timed_line,
-        "带时间的对话",
-        wall_check=lambda ln: bool((res := _parse_timed_line_with_kind(ln)) is not None and res[1]),
-    )
+    return _parse_line_format(text, _parse_timed_line_with_kind, "带时间的对话")
 
 
 def _parse_dialogue(text: str) -> ImportedTranscript | None:
-    return _parse_line_format(text, _parse_dialogue_line, "对话记录")
+    def match(line: str) -> tuple[ImportedTurn, bool] | None:
+        turn = _parse_dialogue_line(line)
+        return (turn, False) if turn is not None else None
+
+    return _parse_line_format(text, match, "对话记录")
 
 
 def _parse_line_format(
     text: str,
-    match: Callable[[str], ImportedTurn | None],
+    match: Callable[[str], tuple[ImportedTurn, bool] | None],
     label: str,
-    *,
-    wall_check: Callable[[str], bool] | None = None,
 ) -> ImportedTranscript | None:
     """Use a line format only when it covers at least half of the non-empty lines."""
     nonempty = [(index, line.strip()) for index, line in enumerate(text.split("\n")) if line.strip()]
@@ -955,22 +965,28 @@ def _parse_line_format(
     matched: dict[int, ImportedTurn] = {}
     wall_flags: list[bool] = []
     for index, line in nonempty:
-        turn = match(line)
-        if turn is not None:
+        result = match(line)
+        if result is not None:
+            turn, is_wall = result
             matched[index] = turn
-            if wall_check is not None and turn.offset_ms is not None:
-                wall_flags.append(bool(wall_check(line)))
+            if turn.offset_ms is not None:
+                wall_flags.append(is_wall)
     if len(matched) < 2 or len(matched) * 2 < len(nonempty):
         return None
     turns: list[ImportedTurn] = []
+    continuation: list[str] = []
     for index, line in nonempty:
         if index in matched:
+            if continuation:
+                turns[-1] = replace(turns[-1], text="\n".join([turns[-1].text, *continuation]))
+                continuation.clear()
             turns.append(matched[index])
         elif turns:
-            previous = turns[-1]
-            turns[-1] = replace(previous, text=previous.text + "\n" + line)
+            continuation.append(line)
         else:
             turns.append(ImportedTurn("", None, 0, line))
+    if continuation:
+        turns[-1] = replace(turns[-1], text="\n".join([turns[-1].text, *continuation]))
     title = ""
     if (
         turns and not turns[0].speaker_label and turns[0].offset_ms is None and len(turns) > 1

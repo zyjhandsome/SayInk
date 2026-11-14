@@ -9,6 +9,7 @@ import time
 import pytest
 
 from sayink.history_store import MEETING_TRIGGER_MODE, HistoryStore, SegmentRecord
+from sayink.media_import import MediaTurn
 from sayink.meeting_store import (
     STATUS_ENDED,
     STATUS_INTERRUPTED,
@@ -43,6 +44,50 @@ def history(tmp_path):
 @pytest.fixture
 def meetings(history):
     return MeetingStore(history)
+
+
+def test_deleting_imported_meeting_keeps_original_audio_in_a_cache_directory(meetings, tmp_path):
+    source = tmp_path / "cache" / "original.wav"
+    source.parent.mkdir()
+    source.write_bytes(b"user audio")
+    record = meetings.create_meeting_from_media([MediaTurn(0, 0, 100, "hello")], audio_path=str(source))
+    assert record is not None
+
+    meetings.delete_meeting(record.id)
+
+    assert meetings.flush()
+    assert meetings.get_meeting(record.id) is None
+    assert source.read_bytes() == b"user audio"
+
+
+def test_failed_meeting_delete_commit_keeps_recording(history, meetings, tmp_path):
+    audio = tmp_path / "meeting.wav"
+    audio.write_bytes(b"recording")
+    record = meetings.create_meeting(audio_path=str(audio))
+
+    def block_delete_at_commit(conn):
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("""
+            CREATE TABLE meeting_reference (
+                meeting_id TEXT REFERENCES meetings(id) DEFERRABLE INITIALLY DEFERRED
+            )
+        """)
+        conn.execute("INSERT INTO meeting_reference VALUES (?)", (record.id,))
+
+    history.enqueue_write(block_delete_at_commit)
+    assert meetings.flush()
+
+    meetings.delete_meetings([record.id])
+
+    assert not meetings.flush()
+    assert meetings.get_meeting(record.id) is not None
+    assert audio.read_bytes() == b"recording"
+
+    history.enqueue_write(lambda conn: conn.execute("DROP TABLE meeting_reference"))
+    meetings.delete_meeting(record.id)
+    assert meetings.flush()
+    assert meetings.get_meeting(record.id) is None
+    assert not audio.exists()
 
 
 def test_generation_checkpoints_survive_restart_and_are_invalidated(tmp_path):

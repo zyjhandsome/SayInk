@@ -238,7 +238,9 @@ def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, au
 
     recovery_root = db_root / "audio-recovery"
     journal_names: set[str] = set()
-    raw = (audio_path or "").strip()
+    # Media import records the user's original path even when it is inside
+    # the app directory or a folder named "cache".
+    raw = (audio_path or "").strip() if source not in (MEDIA_SOURCE, IMPORT_SOURCE) else ""
     try:
         if recovery_root.is_dir() and not recovery_root.is_symlink():
             rec_resolved = recovery_root.resolve()
@@ -283,10 +285,7 @@ def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, au
                     resolved != root and resolved.is_relative_to(root)
                     for root in allowed_roots
                 )
-                in_named_cache = any(part.lower() in _CACHE_DIR_NAMES for part in resolved.parts)
-                # Never delete user-imported media files unless explicitly stored in an owned cache folder.
-                owned_source = source not in (MEDIA_SOURCE, IMPORT_SOURCE) or in_named_cache
-                if in_allowed and owned_source and resolved != db_resolved:
+                if in_allowed and resolved != db_resolved:
                     if candidate.is_file() and candidate.suffix.lower() in _OWNED_AUDIO_SUFFIXES:
                         if (
                             candidate.name.lower() == "audio.f32"
@@ -373,8 +372,10 @@ class MeetingStore:
 
     # -- lifecycle -------------------------------------------------------
 
-    def _write(self, fn) -> int:
-        ticket = self._history.enqueue_write(fn, failure_notice=MEETING_WRITE_FAILED_NOTICE)
+    def _write(self, fn, *, after_commit=None) -> int:
+        ticket = self._history.enqueue_write(
+            fn, failure_notice=MEETING_WRITE_FAILED_NOTICE, after_commit=after_commit,
+        )
         if ticket and self._pending_write_ticket is None:
             self._pending_write_ticket = ticket
         return ticket
@@ -778,22 +779,7 @@ class MeetingStore:
 
     def delete_meeting(self, meeting_id: str) -> None:
         """Hard-delete the meeting: metadata, transcript rows, marks, speakers, notes, and owned cached audio."""
-        db_path = self._history.db_path
-
-        def _delete(conn: sqlite3.Connection) -> None:
-            row = conn.execute("SELECT source, audio_path FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
-            conn.execute("DELETE FROM history WHERE session_id = ?", (meeting_id,))
-            conn.execute("DELETE FROM meeting_marks WHERE meeting_id = ?", (meeting_id,))
-            conn.execute("DELETE FROM meeting_speakers WHERE meeting_id = ?", (meeting_id,))
-            conn.execute("DELETE FROM meeting_notes WHERE meeting_id = ?", (meeting_id,))
-            conn.execute("DELETE FROM meeting_generation_cache WHERE meeting_id = ?", (meeting_id,))
-            conn.execute("DELETE FROM meeting_generation_queue WHERE meeting_id = ?", (meeting_id,))
-            conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
-            source = str(row[0] or "") if row else ""
-            audio_path = str(row[1] or "") if row else ""
-            _cleanup_owned_meeting_audio(db_path, meeting_id, source, audio_path)
-
-        self._write(_delete)
+        self.delete_meetings([meeting_id])
 
     def delete_meetings(self, meeting_ids: list[str]) -> None:
         """Hard-delete every id in one writer transaction.
@@ -805,9 +791,9 @@ class MeetingStore:
         if not ids or self.disabled:
             return
         db_path = self._history.db_path
+        audio_rows: list[tuple[str, str, str]] = []
 
         def _delete_all(conn: sqlite3.Connection) -> None:
-            audio_rows: list[tuple[str, str, str]] = []
             for start in range(0, len(ids), 500):
                 batch = ids[start : start + 500]
                 placeholders = ",".join("?" for _ in batch)
@@ -829,10 +815,12 @@ class MeetingStore:
                 conn.execute(f"DELETE FROM meeting_generation_cache WHERE meeting_id IN ({placeholders})", params)
                 conn.execute(f"DELETE FROM meeting_generation_queue WHERE meeting_id IN ({placeholders})", params)
                 conn.execute(f"DELETE FROM meetings WHERE id IN ({placeholders})", params)
+
+        def _cleanup_audio() -> None:
             for meeting_id, source, audio_path in audio_rows:
                 _cleanup_owned_meeting_audio(db_path, meeting_id, source, audio_path)
 
-        self._write(_delete_all)
+        self._write(_delete_all, after_commit=_cleanup_audio)
 
     # -- marks / speakers --------------------------------------------------
 

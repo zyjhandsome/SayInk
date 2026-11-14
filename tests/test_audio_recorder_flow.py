@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from sayink.audio_devices import AudioDeviceInfo, StreamEndpoint
-from sayink.audio_recorder import AudioRecorder, _CaptureLane
+from sayink.audio_recorder import AudioRecorder, HoldCaptureStats, _CaptureLane
 
 
 def _make_lane(role="microphone", chunks=None, sample_rate=16000):
@@ -467,13 +467,16 @@ class TestHoldLiveSegments:
         rec.configure(input_source="system")
         assert segments == []
 
-    def test_block_delivered_while_the_stream_closes_is_kept(self):
+    def test_block_delivered_while_the_stream_closes_is_kept(self, monkeypatch, caplog):
         """Regression: the flush ran before the streams were stopped, so the
         driver's last block arrived after recording ended and was dropped."""
         rec = AudioRecorder()
         rec._is_recording = True
         rec._continuous_mode = False
         rec._segment_live = True
+        rec._hold_capture_started_at = 10.0
+        monkeypatch.setattr("sayink.audio_recorder.time.monotonic", lambda: 10.04)
+        caplog.set_level("INFO", logger="SayInk")
         lane = _make_lane(chunks=[])
         callback = rec._make_callback(lane)
 
@@ -491,6 +494,8 @@ class TestHoldLiveSegments:
         rec._segmenter.feed = lambda block, **_kw: fed.append(block) or None
         rec.stop()
         assert fed and fed[0].size == 1600
+        assert rec.last_hold_capture == HoldCaptureStats(40, 100)
+        assert "首块=40 ms, 采集=100 ms, 送出=0 段" in caplog.text
 
 
 class TestStopOutput:
@@ -519,6 +524,7 @@ class TestStopOutput:
         rec.recording_finished.connect(results.append)
         rec.stop()
         assert results and results[0].size == 0
+        assert rec.last_hold_capture == HoldCaptureStats(None, 0)
 
     def test_cancelled_stop_emits_nothing(self):
         rec = AudioRecorder()

@@ -534,7 +534,7 @@ class HotKeyManager(QObject):
         if not self._should_reconcile_async_state():
             self._hold_watch_timer.stop()
             return
-        emit_stop = False
+        held_ms = None
         now = time.monotonic()
         with self._lock:
             if not self._is_recording or self._continuous_trigger_mode or self._paused:
@@ -568,10 +568,10 @@ class HotKeyManager(QObject):
                 self._suppressed_vks.clear()
                 self._suppressed_vk_at.clear()
                 self._suppressed_vk_async_visible.clear()
-                emit_stop = True
-        if emit_stop:
+                held_ms = (now - self._hold_started_at) * 1000
+        if held_ms is not None:
             self._hold_watch_timer.stop()
-            log.debug("GetAsyncKeyState 轮询检测到热键已松开（可能位于提权窗口），立即停止录音")
+            log.info("快捷键按住 %.0f ms，轮询检测到松开", held_ms)
             self.recording_stop.emit()
 
     def start(self):
@@ -766,7 +766,7 @@ class HotKeyManager(QObject):
             return
         normalized = self._normalize_key(key)
         newly_armed = False
-        emit_stale_stop = False
+        stale_held_ms = None
         sync_hold_timer = False
         reconcile = self._should_reconcile_async_state()
 
@@ -780,7 +780,7 @@ class HotKeyManager(QObject):
                     sync_hold_timer = True
                 if self._is_recording and not self._hotkey_still_held_locked():
                     self._is_recording = False
-                    emit_stale_stop = True
+                    stale_held_ms = (time.monotonic() - self._hold_started_at) * 1000
             # Auto-repeat re-sends keys that are already down; only the press
             # that completes the combo starts a hold. Re-arming on repeats
             # would clear ``_hold_activated`` after continuous listening began
@@ -811,8 +811,8 @@ class HotKeyManager(QObject):
                 self._hold_activated = False
                 self._hold_started_at = time.monotonic()
                 newly_armed = True
-        if emit_stale_stop:
-            self._defer_hook_log(logging.DEBUG, "检测到失焦/锁屏后修饰键已释放，结束残留录音状态")
+        if stale_held_ms is not None:
+            self._defer_hook_log(logging.INFO, "快捷键按住 %.0f ms，检测到修饰键已释放", stale_held_ms)
             self.recording_stop.emit()
         # Auto-repeat keeps calling here; restarting the timer on every repeat
         # could postpone the hold threshold forever.
@@ -826,7 +826,7 @@ class HotKeyManager(QObject):
         if self._is_menu_mask(key):
             return False
         normalized = self._normalize_key(key)
-        emit_stop = False
+        recording_held_ms = None
         sync_hold_timer = False
         emit_short_tap = False
         short_tap_held_ms: float | None = None
@@ -854,7 +854,7 @@ class HotKeyManager(QObject):
 
             if self._is_recording and not self._hotkey_still_held_locked():
                 self._is_recording = False
-                emit_stop = True
+                recording_held_ms = (time.monotonic() - self._hold_started_at) * 1000
 
         if short_tap_held_ms is not None:
             self._defer_hook_log(
@@ -866,11 +866,11 @@ class HotKeyManager(QObject):
             self.hotkey_tap_too_short.emit()
         if sync_hold_timer:
             self._arm_hold_on_main.emit()
-        if emit_stop:
+        if recording_held_ms is not None:
             if self._hold_watch_timer.isActive():
                 self._stop_timers_if_possible()
                 self._start_health_timer_if_possible()
-            self._defer_hook_log(logging.DEBUG, "快捷键松开，停止录音")
+            self._defer_hook_log(logging.INFO, "快捷键按住 %.0f ms 后松开", recording_held_ms)
             self.recording_stop.emit()
         return tapped
 

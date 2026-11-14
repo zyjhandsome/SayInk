@@ -797,7 +797,7 @@ class Config:
                     if attempt >= 3:
                         raise
                     time.sleep(0.03 * (attempt + 1))
-        except OSError as e:
+        except (OSError, TypeError, ValueError) as e:
             self.last_save_failed = True
             log.error("配置文件保存失败: %s", e)
             if tmp_path is not None:

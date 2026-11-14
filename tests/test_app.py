@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from sayink.app import App, MIN_AUDIO_SAMPLES, _QueuedSegment
 from sayink.audio_devices import INPUT_SOURCE_SYSTEM
+from sayink.audio_recorder import HoldCaptureStats
 from sayink.runtime_status import ModelLoadPhase, RuntimeState
 from sayink.text_paster import PasteResult
 from tests.helpers.app_harness import app_harness
@@ -581,6 +582,24 @@ class TestFinalResultFlow:
             assert "未识别到语音内容" in msg
             assert "录音过短" not in msg
 
+    @pytest.mark.parametrize(
+        "capture, title",
+        [
+            (HoldCaptureStats(None, 0), "未采到音频"),
+            (HoldCaptureStats(40, 70), "录音过短"),
+            (HoldCaptureStats(40, 700), "未识别到语音内容"),
+        ],
+    )
+    def test_hold_without_segments_uses_actual_capture(self, capture, title):
+        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
+            app = h["app"]
+            app._on_recording_start()
+            h["recorder"].last_hold_capture = capture
+            app._on_recording_finished(np.zeros(0, dtype=np.float32))
+            msg = h["floating"].show_error.call_args[0][0]
+            assert msg.splitlines()[0] == title
+            h["paster"].paste_async.assert_not_called()
+
     def test_esc_discards_the_slice_being_recognised(self):
         """Esc during a hold must not leave 「正在识别上一轮语音」 behind."""
         with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
@@ -603,16 +622,19 @@ class TestFinalResultFlow:
             h["recorder"].start.assert_called_once()
             h["floating"].show_busy_transcribing.assert_not_called()
 
-    def test_a_failed_slice_inside_a_hold_is_reported_with_the_result(self):
-        """A 15 s slice that failed to recognise is left out of the paste; the
-        result toast must say so instead of hiding the gap."""
+    @pytest.mark.parametrize("empty_result", [False, True])
+    def test_a_failed_slice_inside_a_hold_is_reported_with_the_result(self, empty_result):
+        """An error or empty intermediate result must be reported as a gap."""
         with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
             app = h["app"]
             h["recognizer"].is_loading = False
             app._on_recording_start()
             h["recorder"].is_recording = True
             app._on_final_result("第一段")
-            app._on_recognizer_error("识别失败: boom")
+            if empty_result:
+                app._on_final_result("")
+            else:
+                app._on_recognizer_error("识别失败: boom")
             h["floating"].show_error.assert_not_called()
             h["recorder"].is_recording = False
             app._on_final_result("第三段")

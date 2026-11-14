@@ -513,6 +513,66 @@ def test_same_timestamp_transcript_parses_quickly():
     assert len(parsed.turns) == 8000
 
 
+@pytest.mark.parametrize("metadata", [
+    '"offset_ms": NaN',
+    '"offset_ms": 1e100',
+    '"start": 1e309',
+    '"start": 0, "end": -1e309',
+    '"duration_ms": 1e309',
+    '"speaker_id": 1e309',
+    '"speaker": "²"',
+    '"speaker": "Speaker 99999999999999999999"',
+])
+def test_unusable_json_metadata_preserves_text_through_storage(tmp_path, metadata):
+    parsed = parse_transcript('[{"text":"keep this turn",' + metadata + '}]')
+    assert parsed.format_label == "JSON 记录"
+    history = HistoryStore(tmp_path / "history.db")
+    try:
+        meetings = MeetingStore(history)
+        record = meetings.create_meeting_from_transcript(parsed)
+        assert record is not None
+        assert meetings.flush()
+        assert [segment.raw_text for segment in meetings.get_segments(record.id)] == ["keep this turn"]
+    finally:
+        history.close()
+
+
+def test_deeply_nested_json_falls_back_to_plain_text():
+    text = "[" * 2000 + "0" + "]" * 2000
+    parsed = parse_transcript(text)
+    assert parsed.format_label == "纯文本"
+    assert parsed.turns[0].text == text
+
+
+def test_json_import_keeps_a_lone_surrogate_as_an_escape():
+    parsed = parse_transcript(r'{"title":"\ud800","turns":[{"speaker":"\ud800","text":"keep\ud800this 😀"}]}')
+    assert parsed.title == r"\ud800"
+    assert parsed.turns[0].speaker_label == r"\ud800"
+    assert parsed.turns[0].text == r"keep\ud800this 😀"
+
+
+def test_oversized_cue_clock_is_reported_and_following_cue_is_preserved():
+    text = "WEBVTT\n\n" + "1" * 5000 + ":01:02.000 --> 00:02:00.000\ninvalid\n\n"
+    parsed = parse_transcript(text + "00:03.000 --> 00:04.000\nvalid\n")
+    assert parsed.discarded == 1
+    assert [turn.text for turn in parsed.turns] == ["valid"]
+
+
+def test_oversized_file_and_direct_accept_keep_the_import_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr("sayink.ui.transcript_import_dialog._MAX_CHARS", 10)
+    dialog = TranscriptImportDialog()
+    dialog._edit.setPlainText("previous")
+    path = tmp_path / "oversized.txt"
+    path.write_text("too many characters", encoding="utf-8")
+
+    assert not dialog._load_file_path(path)
+    assert dialog.transcript_text() == "previous"
+    dialog._edit.setPlainText("already long")
+    dialog._accept()
+    assert not dialog._ok.isEnabled()
+    assert dialog.result() == 0
+
+
 def test_mixed_transcript_does_not_invent_an_srt_clock(tmp_path):
     from sayink.meeting_session import MeetingController
     from sayink.minutes_prompts import render_srt, transcript_lines

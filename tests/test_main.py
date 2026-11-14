@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import tempfile
 import types
@@ -150,6 +151,30 @@ class TestLogging:
             assert path is not None
             assert "落盘测试" in (tmp_path / "sayink.log").read_text(encoding="utf-8")
             assert (tmp_path / "crash.log").exists()
+        finally:
+            import faulthandler
+
+            faulthandler.disable()
+            for handler in root.handlers:
+                if handler not in saved:
+                    handler.close()
+            root.handlers[:] = saved
+            if main._crash_file is not None:
+                main._crash_file.close()
+                main._crash_file = None
+
+    def test_crash_log_is_unbuffered_so_native_dumps_reach_disk(self, tmp_path):
+        root = logging.getLogger()
+        saved = root.handlers[:]
+        try:
+            main.setup_logging(str(tmp_path))
+            crash = main._crash_file
+            assert isinstance(crash, io.FileIO)
+            import faulthandler
+
+            faulthandler.dump_traceback(file=crash, all_threads=False)
+            dumped = (tmp_path / "crash.log").read_bytes()
+            assert b"Stack (most recent call first)" in dumped
         finally:
             import faulthandler
 

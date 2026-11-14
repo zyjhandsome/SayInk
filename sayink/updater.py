@@ -823,18 +823,20 @@ def download_installer(
             ):
                 raise UpdateError(f"拒绝不受信任的安装包响应地址: {final_url}")
             total = int(response.headers.get("Content-Length") or 0) or expected_size
+            want = expected_size or total
             got = 0
             with part.open("wb") as handle:
                 while True:
                     chunk = response.read(256 * 1024)
                     if not chunk:
                         break
+                    got += len(chunk)
+                    if want and got > want:
+                        raise InstallerVerificationError(f"安装包大小超过预期（{got} / {want} 字节）")
                     handle.write(chunk)
                     hasher.update(chunk)
-                    got += len(chunk)
                     if on_progress is not None:
                         on_progress(got, total)
-        want = expected_size or total
         if want and got != want:
             raise InstallerVerificationError(f"安装包不完整（{got} / {want} 字节）")
         if hasher.hexdigest() != normalized_sha:

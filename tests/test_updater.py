@@ -286,6 +286,32 @@ class TestInstallerVerification:
         assert not dest.exists()
         assert not (tmp_path / "SayInk-Setup-2.0.9.exe.part").exists()
 
+    def test_oversized_download_stops_on_first_excess_chunk(self, tmp_path):
+        import pytest
+        from sayink.updater import InstallerVerificationError
+
+        class Response:
+            def __init__(self):
+                self.headers = {}
+                self.first = True
+
+            def read(self, _size):
+                assert self.first, "read again after exceeding the expected size"
+                self.first = False
+                return b"too much"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        dest = tmp_path / "SayInk-Setup-2.0.9.exe"
+        with pytest.raises(InstallerVerificationError, match="超过预期"):
+            download_installer(_URL, dest, lambda *args, **kwargs: Response(), expected_size=4, sha256="00" * 32)
+        assert not dest.exists()
+        assert not dest.with_suffix(".exe.part").exists()
+
     def test_missing_digest_is_rejected_before_downloading(self, tmp_path):
         import pytest
         from sayink.updater import MissingDigestError

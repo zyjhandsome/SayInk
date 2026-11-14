@@ -431,6 +431,7 @@ def setup_logging(directory: str | None = None) -> str | None:
         file_handler.setFormatter(fmt)
         handlers.append(file_handler)
         # Native crashes (ONNX Runtime, PortAudio) never reach excepthook.
+        # A buffered text file can vanish with the process before the dump is flushed.
         if _crash_file is not None:
             try:
                 faulthandler.disable()
@@ -438,7 +439,7 @@ def setup_logging(directory: str | None = None) -> str | None:
             except Exception:
                 pass
             _crash_file = None
-        _crash_file = open(os.path.join(directory, "crash.log"), "a", encoding="utf-8")  # noqa: SIM115
+        _crash_file = open(os.path.join(directory, "crash.log"), "ab", buffering=0)  # noqa: SIM115
         faulthandler.enable(file=_crash_file, all_threads=True)
     except OSError as exc:
         log_path = None

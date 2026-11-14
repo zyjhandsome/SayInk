@@ -73,12 +73,14 @@ def _uncommitted(run: Runner) -> str | None:
 
 
 def _tag_mismatch(run: Runner, tag: str, head: str) -> str | None:
+    ref = f"refs/tags/{tag}"
+    peeled_ref = f"{ref}^{{}}"
     refs = {}
-    for line in _output(run, ["git", "ls-remote", "origin", f"refs/tags/{tag}"]).splitlines():
-        sha, _, ref = line.partition("\t")
-        refs[ref.strip()] = sha.strip()
+    for line in _output(run, ["git", "ls-remote", "origin", ref, peeled_ref]).splitlines():
+        sha, _, matched_ref = line.partition("\t")
+        refs[matched_ref.strip()] = sha.strip()
     # Annotated tags list the tag object first and the commit as ``^{}``.
-    remote = refs.get(f"refs/tags/{tag}^{{}}") or refs.get(f"refs/tags/{tag}")
+    remote = refs.get(peeled_ref) or refs.get(ref)
     if remote is None:
         return f"Tag {tag} is not on origin: tag the release commit and push the tag first."
     if remote != head:

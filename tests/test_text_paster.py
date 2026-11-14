@@ -178,6 +178,7 @@ def paste_env(monkeypatch):
 
     monkeypatch.setattr(tp.pyperclip, "copy", _copy)
     monkeypatch.setattr(tp.pyperclip, "paste", lambda: state["clipboard"])
+    monkeypatch.setattr(tp, "get_win32_clipboard_sequence_number", lambda: None)
 
     def _shortcut():
         state["shortcut_calls"] += 1
@@ -250,6 +251,32 @@ class TestPasteAsyncFlow:
         assert [(r.status, r.detail) for r in results] == [("clipboard", "focus_changed")]
         assert paste_env["clipboard"] == "口述内容"
 
+    @pytest.mark.parametrize("has_sequence, focus_changes", [(True, False), (False, False), (True, True)])
+    def test_clipboard_change_before_send_preserves_the_new_copy(
+        self, paste_env, monkeypatch, has_sequence, focus_changes
+    ):
+        foreground = [(111, "Target A", 11111)]
+        pending = []
+        monkeypatch.setattr(tp, "get_foreground_window_info", lambda: foreground[0])
+        monkeypatch.setattr(tp.QTimer, "singleShot", lambda _ms, fn: pending.append(fn))
+        paster = TextPaster(restore_clipboard=True)
+        if has_sequence:
+            monkeypatch.setattr(tp.sys, "platform", "win32")
+            monkeypatch.setattr(tp, "get_win32_clipboard_sequence_number", lambda: len(paste_env["copied"]) + 1)
+        results = []
+
+        paster.paste_async("口述内容", results.append)
+        tp.pyperclip.copy("用户新复制的内容")
+        if focus_changes:
+            foreground[0] = (222, "Target B", 22222)
+        pending.pop(0)()
+
+        assert paste_env["shortcut_calls"] == 0
+        assert paste_env["clipboard"] == "用户新复制的内容"
+        assert [(r.status, r.detail) for r in results] == [("skipped", "clipboard_changed")]
+        assert paster._restore_expected is None
+        assert pending == []
+
     def test_focus_switch_after_send_is_reported_as_unverified_not_clipboard(self, paste_env):
         """README: Ctrl+V already went out, so the bar must not say 「已复制」
         (a second manual paste would duplicate the words)."""
@@ -261,6 +288,22 @@ class TestPasteAsyncFlow:
         assert [(r.status, r.detail) for r in results] == [("unverified", "focus_changed_after_send")]
         assert results[0].target_app == "editor.exe"
         assert paste_env["clipboard"] == "文本"
+
+    def test_focus_switch_after_send_preserves_a_new_copy(self, paste_env, monkeypatch):
+        paste_env["set_foreground"]([(1234, "Editor", 1), (1234, "Editor", 1), (9999, "Other", 2)])
+        pending = []
+        monkeypatch.setattr(tp.QTimer, "singleShot", lambda _ms, fn: pending.append(fn))
+        results = []
+        paster = TextPaster(restore_clipboard=True)
+
+        paster.paste_async("口述内容", results.append)
+        pending.pop(0)()
+        tp.pyperclip.copy("用户的新内容")
+        pending.pop(0)()
+
+        assert paste_env["shortcut_calls"] == 1
+        assert paste_env["clipboard"] == "用户的新内容"
+        assert [(r.status, r.detail) for r in results] == [("unverified", "clipboard_changed_after_send")]
 
     def test_own_window_skips_paste(self, paste_env):
         paste_env["set_foreground"]([(1, "SayInk", 1)])
@@ -349,6 +392,23 @@ class TestPasteAsyncFlow:
         for restore in pending:
             restore()
         assert paste_env["clipboard"] == "OLD"
+
+    def test_back_to_back_pastes_restore_the_newest_user_copy(self, paste_env, monkeypatch):
+        paste_env["set_foreground"]([(1234, "Editor", 1)])
+        pending = []
+        monkeypatch.setattr(
+            tp.QTimer,
+            "singleShot",
+            lambda ms, fn: pending.append(fn) if ms == tp.RESTORE_CLIPBOARD_DELAY_MS else fn(),
+        )
+        paster = TextPaster(restore_clipboard=True)
+        paster.paste_async("第一句", lambda _r: None)
+        tp.pyperclip.copy("用户的新内容")
+        paster.paste_async("第二句", lambda _r: None)
+        for restore in pending:
+            restore()
+
+        assert paste_env["clipboard"] == "用户的新内容"
 
 
 class TestForegroundProcessName:

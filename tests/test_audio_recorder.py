@@ -119,22 +119,11 @@ class TestAudioRecorderCancel:
 
 class TestAudioRecorderAudioCallback:
     def _lane_with_callback(self, recorder):
-        from sayink.audio_devices import AudioDeviceInfo
+        from sayink.audio_devices import AudioDeviceInfo, StreamEndpoint
+        from sayink.audio_recorder import _CaptureLane
 
-        ep = type(
-            "E",
-            (),
-            {
-                "role": "microphone",
-                "device": AudioDeviceInfo(0, "t", "w", 16000, 1, False, False),
-                "use_wasapi_loopback": False,
-            },
-        )()
-        lane = type(
-            "L",
-            (),
-            {"endpoint": ep, "chunks": [], "sample_rate": 16000, "stream": None},
-        )()
+        device = AudioDeviceInfo(0, "t", "w", 16000, 1, False, False)
+        lane = _CaptureLane(StreamEndpoint("microphone", device, False))
         cb = recorder._make_callback(lane)
         return lane, cb
 
@@ -163,6 +152,8 @@ class TestAudioRecorderAudioCallback:
         input_data = audio_data.reshape(-1, 1)
         cb(input_data, 1024, None, None)
         assert len(lane.chunks) > 0
+        assert lane.captured_samples == 1024
+        assert lane.first_chunk_at == lane.last_chunk_at
 
 
 class TestAudioRecorderVolumeCalculation:

@@ -264,6 +264,29 @@ class TestOutputPipelineDirectAndLLM:
         assert saved.target_app == "Code.exe"
         assert ("success", "已发送", "发送到 Code.exe") in ctx["floating"].events
 
+    def test_clipboard_change_keeps_the_transcript_in_history(self) -> None:
+        pipe, ctx = _build_pipeline()
+        pipe.pending_record = _PendingHistoryRecord(
+            session_id="s1",
+            seq=0,
+            raw_text="口述内容",
+            polished_text="",
+            source="mic",
+            duration_ms=1000,
+            trigger_mode=TRIGGER_MODE_HOTKEY,
+            model="funasr-nano",
+        )
+
+        pipe.deliver_recognized_text("口述内容")
+        callback = ctx["paster"].calls[0]["callback"]
+        callback(PasteResult("skipped", target_app="WeLinkPC.exe", detail="clipboard_changed"))
+
+        assert not pipe.busy
+        assert ctx["history"].records[0].raw_text == "口述内容"
+        assert (
+            "info", "剪贴板已变化，已取消自动粘贴", "本次转写可在历史中复制"
+        ) in ctx["floating"].events
+
     def test_claim_pending_record_isolates_polish_sentence_from_newer_hold_cancel(self) -> None:
         pipe, ctx = _build_pipeline(
             {

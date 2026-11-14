@@ -430,6 +430,18 @@ def test_unknown_nested_keys_survive_a_save_by_an_older_build(config_home):
     assert saved["top_extra"] == 7
 
 
+def test_save_reports_encoding_failure_and_removes_temporary_file(config):
+    assert config.save()
+    config_path = config.config_dir / "config.json"
+    original = config_path.read_bytes()
+    config.set("llm.model_name", "invalid\ud800model")
+
+    assert config.save_immediate() is False
+    assert config.last_save_failed
+    assert config_path.read_bytes() == original
+    assert list(config.config_dir.glob("config_*.tmp")) == []
+
+
 def test_save_survives_mkstemp_failure(config, monkeypatch):
     import tempfile
 

@@ -3,6 +3,7 @@ from pathlib import Path
 import threading
 import time
 import re
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import numpy as np
@@ -83,6 +84,12 @@ def _render_playback_peak() -> float:
 _WORKING_STREAM_PARAMS: dict[tuple[int, str, bool], tuple[int, bool]] = {}
 
 
+@dataclass(frozen=True)
+class HoldCaptureStats:
+    first_block_ms: int | None
+    captured_ms: int
+
+
 class _CaptureLane:
     def __init__(self, endpoint: StreamEndpoint):
         self.endpoint = endpoint
@@ -90,6 +97,8 @@ class _CaptureLane:
         # Resampled to TARGET_SAMPLE_RATE, not yet mixed with the other lanes.
         self.pending = np.zeros(0, dtype=np.float32)
         self.last_chunk_at = time.monotonic()
+        self.first_chunk_at: float | None = None
+        self.captured_samples = 0
         self.sample_rate = TARGET_SAMPLE_RATE
         self.resampler: Optional[StreamResampler] = None
         self.stream: Optional[sd.InputStream] = None
@@ -100,6 +109,14 @@ class _CaptureLane:
         self.pawp_thread: threading.Thread | None = None
         self.pawp_lock = threading.Lock()
         self.drift_ticks: int = 0
+
+    def append_chunk(self, block: np.ndarray) -> None:
+        self.chunks.append(block)
+        self.last_chunk_at = time.monotonic()
+        if block.size:
+            if self.first_chunk_at is None:
+                self.first_chunk_at = self.last_chunk_at
+            self.captured_samples += block.size
 
 
 class AudioRecorder(QObject):
@@ -222,6 +239,9 @@ class AudioRecorder(QObject):
         self._last_emitted_volume = 0.0
         self._last_real_block_at = 0.0
         self._last_loopback_pad_at = 0.0
+        self.last_hold_capture: HoldCaptureStats | None = None
+        self._hold_capture_started_at = 0.0
+        self._hold_segments_emitted = 0
 
     @property
     def sample_rate(self) -> int:
@@ -384,7 +404,7 @@ class AudioRecorder(QObject):
             self._segment_route, self._segment_captured_at, self._segment_target, acoustics = metadata
             audio = attach_segment_acoustics(audio, noise_floor=acoustics[0], quiet_level=acoustics[1])
             self._segment_route_reliable = True
-            self.segment_ready.emit(audio)
+            self._emit_segment_ready(audio)
             released += 1
         return released
 
@@ -580,8 +600,7 @@ class AudioRecorder(QObject):
                 else mono
             )
             with self._lock:
-                lane.chunks.append(block)
-                lane.last_chunk_at = time.monotonic()
+                lane.append_chunk(block)
         return _callback
 
     def _ensure_pawp(self):
@@ -655,8 +674,7 @@ class AudioRecorder(QObject):
             else:
                 block_mono = arr.copy()
             with self._lock:
-                lane.chunks.append(block_mono)
-                lane.last_chunk_at = time.monotonic()
+                lane.append_chunk(block_mono)
 
     def _open_pawp_lane(self, lane: _CaptureLane):
         import pyaudiowpatch as pyaudio
@@ -1357,6 +1375,10 @@ class AudioRecorder(QObject):
         if self._is_recording:
             return
 
+        self.last_hold_capture = None
+        self._hold_capture_started_at = time.monotonic()
+        self._hold_segments_emitted = 0
+
         # A hold can leave a window here, and hold-to-talk never consumes it.
         self._open_target = (0, "")
         self._segment_target = (0, "")
@@ -1588,7 +1610,7 @@ class AudioRecorder(QObject):
             return self._release_boundary_context()
         else:
             self._segment_route_reliable = False
-            self.segment_ready.emit(segment)
+            self._emit_segment_ready(segment)
             return 1
 
     def _release_boundary_context(self, *, ending=False):
@@ -1599,9 +1621,14 @@ class AudioRecorder(QObject):
             self._segment_route, self._segment_captured_at, self._segment_target, acoustics = metadata
             audio = attach_segment_acoustics(audio, noise_floor=acoustics[0], quiet_level=acoustics[1])
             self._segment_route_reliable = False
-            self.segment_ready.emit(audio)
+            self._emit_segment_ready(audio)
             released += 1
         return released
+
+    def _emit_segment_ready(self, audio: np.ndarray) -> None:
+        if not self._continuous_mode and audio.size:
+            self._hold_segments_emitted += 1
+        self.segment_ready.emit(audio)
 
     def consume_segment_route(self) -> str:
         """Return the route of the segment just emitted, then clear it."""
@@ -1775,8 +1802,9 @@ class AudioRecorder(QObject):
         Hold-to-talk runs through the same segmenter as continuous listening
         (``start()`` sets ``_segment_live``), so stopping only flushes the
         utterance tail as one more ``segment_ready``. ``recording_finished``
-        therefore never carries audio any more: an empty array means the gate
-        heard nothing during the whole hold.
+        therefore never carries audio any more: an empty array signals that
+        the stop emitted no segment. The app can check ongoing recognition
+        and last_hold_capture before deciding what to show.
         """
         if self._continuous_mode:
             self.stop_continuous(flush=not self._is_cancelled)
@@ -1788,9 +1816,32 @@ class AudioRecorder(QObject):
         cancelled = self._is_cancelled
         emitted = self._close_lanes_then_flush(flush=not cancelled)
         with self._lock:
+            if not cancelled:
+                first_block_at = min(
+                    (lane.first_chunk_at for lane in self._lanes if lane.first_chunk_at is not None),
+                    default=None,
+                )
+                # Parallel input lanes overlap in time. Use the longest capture.
+                captured_ms = max(
+                    (lane.captured_samples * 1000 // lane.sample_rate for lane in self._lanes),
+                    default=0,
+                )
+                first_block_ms = (
+                    round((first_block_at - self._hold_capture_started_at) * 1000)
+                    if first_block_at is not None else None
+                )
+                self.last_hold_capture = HoldCaptureStats(first_block_ms, captured_ms)
             self._is_cancelled = False
             for lane in self._lanes:
                 lane.chunks = []
+        if self.last_hold_capture is not None and not cancelled:
+            capture = self.last_hold_capture
+            log.info(
+                "单次录音结束: 首块=%s, 采集=%d ms, 送出=%d 段",
+                f"{capture.first_block_ms} ms" if capture.first_block_ms is not None else "未收到",
+                capture.captured_ms,
+                self._hold_segments_emitted,
+            )
         self._is_paused = False
         self._route_watch_enabled = False
         self._is_recording = False

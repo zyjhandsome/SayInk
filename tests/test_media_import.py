@@ -76,7 +76,10 @@ def test_recognize_file_keeps_a_partial_result_and_does_not_copy_the_source(tmp_
         AudioChunk(0, 16_000, np.ones(16_000, dtype=np.float32)),
         AudioChunk(16_000, 32_000, np.ones(16_000, dtype=np.float32)),
     ]
-    monkeypatch.setattr("sayink.media_import.decode_audio_file", lambda path, cancel=None: np.ones(32_000, dtype=np.float32))
+    monkeypatch.setattr(
+        "sayink.media_import.decode_audio_file",
+        lambda path, *, cancel=None, progress_cb=None: np.ones(32_000, dtype=np.float32),
+    )
     monkeypatch.setattr("sayink.media_import.segment_pcm", lambda *args, **kwargs: chunks)
     seen = {"n": 0}
 
@@ -318,7 +321,7 @@ def test_imported_media_applies_glossary_corrections(monkeypatch):
 
     monkeypatch.setattr(
         "sayink.media_import.decode_audio_file",
-        lambda path, cancel=None: np.ones(1600, dtype=np.float32),
+        lambda path, *, cancel=None, progress_cb=None: np.ones(1600, dtype=np.float32),
     )
     monkeypatch.setattr(
         "sayink.media_import.segment_pcm",

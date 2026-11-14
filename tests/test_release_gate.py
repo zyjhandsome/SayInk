@@ -48,7 +48,10 @@ def _runner(overrides=None):
 
 
 def test_pushed_tagged_green_commit_is_ready():
-    assert release_problems("2.2.5", run=_runner()) == []
+    run = _runner()
+    assert release_problems("2.2.5", run=run) == []
+    remote = next(cmd for cmd in run.calls if cmd[:2] == ["git", "ls-remote"])
+    assert remote[3:] == ["refs/tags/v2.2.5", "refs/tags/v2.2.5^{}"]
 
 
 def test_ci_is_looked_up_for_the_head_commit():
@@ -91,6 +94,18 @@ def test_build_script_places_pyinstaller_spec_inside_build_dir():
     assert build.BUILD_DIR == build.SCRIPT_DIR / "build"
     text = (Path(__file__).resolve().parents[1] / "build.py").read_text(encoding="utf-8")
     assert "--specpath=" in text
+
+
+def test_frozen_build_bundles_win32timezone_for_credential_reads():
+    """CredRead builds a pywintypes time and imports win32timezone lazily.
+
+    Hidden-importing win32cred alone leaves that module out of the installer,
+    so a saved API key cannot be read.
+    """
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / "build.py").read_text(encoding="utf-8")
+    assert "--hidden-import=win32timezone" in text
 
 
 def test_tag_must_exist_on_the_remote():

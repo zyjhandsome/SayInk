@@ -41,7 +41,7 @@ from sayink.audio_devices import (
     input_source_label,
     sanitize_system_device_index,
 )
-from sayink.audio_recorder import AudioRecorder
+from sayink.audio_recorder import AudioRecorder, HoldCaptureStats
 from sayink.audio_utils import TARGET_SAMPLE_RATE
 from sayink.speaker_embedding import SpeakerEmbedder, make_embedder
 from sayink.speaker_clustering import final_assignments
@@ -233,6 +233,7 @@ class App(QObject):
         "模型未就绪": "语音模型未就绪\n请打开 SayInk（双击托盘图标）→ 引擎 → 下载模型",
         "模型未下载": "语音模型未下载\n请打开 SayInk（双击托盘图标）→ 引擎 → 下载模型",
         "录音过短": "录音过短\n请按住快捷键说完一句再松开",
+        "未采到音频": "未采到音频\n请按住快捷键说完一句再松开。若再次出现，请到通用 → 测试声音",
         "未识别": "未识别到语音内容\n请确保音频来源与设备正确，并靠近麦克风或播放电脑声音",
         "音频设备": "无法打开音频设备\n请在设置 → 通用 → 录音与输入 中刷新并选择设备",
         "系统声音": "无法采集系统声音\nWindows 可启用立体声混音或安装 PyAudioWPatch；混合模式需配置电脑播放设备",
@@ -249,6 +250,7 @@ class App(QObject):
         "模型未就绪",
         "模型未下载",
         "录音过短",
+        "未采到音频",
         "未识别",
         "输出失败",
     )
@@ -1919,16 +1921,19 @@ class App(QObject):
             held_sec = time.monotonic() - self._hold_opened_at if self._hold_opened_at else 0.0
             self._hold_opened_at = 0.0
             self._reset_recording_ui_after_abort()
-            if held_sec >= HOLD_NO_SPEECH_SEC:
-                # The key was down long enough; the gate simply never heard
-                # speech. "Too short" would send the user chasing the wrong fix.
-                log.warning("按住 %.1f 秒但未检测到语音，忽略", held_sec)
-                if not self._output_busy:
-                    self._floating.show_error(self._friendly_error("未识别"))
+            capture = getattr(self._recorder, "last_hold_capture", None)
+            if isinstance(capture, HoldCaptureStats):
+                if capture.first_block_ms is None:
+                    reason = "未采到音频"
+                elif capture.captured_ms < MIN_AUDIO_SAMPLES * 1000 // TARGET_SAMPLE_RATE:
+                    reason = "录音过短"
+                else:
+                    reason = "未识别"
             else:
-                log.warning("录音过短 (%d 采样点)，忽略", full_audio.size)
-                if not self._output_busy:
-                    self._floating.show_error(self._friendly_error("录音过短"))
+                reason = "未识别" if held_sec >= HOLD_NO_SPEECH_SEC else "录音过短"
+            log.warning("单次转写未输出: %s", "未检测到语音" if reason == "未识别" else reason)
+            if not self._output_busy:
+                self._floating.show_error(self._friendly_error(reason))
             return
         context = self._capture_segment_context()
         if self._pipeline_busy() or self._segment_queue:
@@ -2191,6 +2196,8 @@ class App(QObject):
                 self._pending_record.raw_text = raw_text
         else:
             log.warning("未识别到语音内容")
+            if not self._is_continuous_mode():
+                self._hold_failed_slices += 1
 
         self._is_transcribing = False
         if self._defer_hold_output():

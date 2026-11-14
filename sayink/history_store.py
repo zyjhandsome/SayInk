@@ -483,17 +483,19 @@ class HistoryStore:
         fn: Callable[[sqlite3.Connection], None],
         *,
         failure_notice: str = WRITE_FAILED_NOTICE,
+        after_commit: Callable[[], None] | None = None,
     ) -> int:
         """Run ``fn(conn)`` on the single writer thread (meeting tables etc.).
 
         ``fn`` must not commit; the writer commits after it returns and rolls
         back if it raises. Keeps the "one writer" invariant for everything
         stored in ``history.db``.
+        ``after_commit`` runs on the writer only after a successful commit.
         """
         if self.disabled or self._closed:
             return 0
         ticket = self._next_ticket()
-        self._queue.put(("write", (fn, failure_notice), ticket))
+        self._queue.put(("write", (fn, failure_notice, after_commit), ticket))
         return ticket
 
     @staticmethod
@@ -1039,7 +1041,7 @@ class HistoryStore:
                 done_evt.set()
                 return
             elif op == "write":
-                fn, notice = payload
+                fn, notice, after_commit = payload
                 try:
                     fn(conn)
                     conn.commit()
@@ -1052,6 +1054,11 @@ class HistoryStore:
                     self._record_write_failure(ticket)
                     self._notify_failed(notice)
                     return
+                if after_commit is not None:
+                    try:
+                        after_commit()
+                    except Exception:
+                        logger.exception("HistoryStore post-commit cleanup failed")
             else:
                 return
             self._notify_committed()
@@ -1166,7 +1173,6 @@ class HistoryStore:
         max_entries: int,
         active_session_id: str | None,
     ) -> None:
-        deleted_any = False
         purged_ids: list[str] = []
         if retention_days > 0:
             cutoff_ms = int(time.time() * 1000 - retention_days * 86_400_000)
@@ -1185,7 +1191,6 @@ class HistoryStore:
             if to_delete:
                 self._delete_sessions(conn, to_delete)
                 purged_ids.extend(to_delete)
-                deleted_any = True
 
         if max_entries > 0:
             # One pass: drop the oldest sessions beyond the cap. The active
@@ -1208,9 +1213,8 @@ class HistoryStore:
                 if victims:
                     self._delete_sessions(conn, victims)
                     purged_ids.extend(victims)
-                    deleted_any = True
 
-        if deleted_any:
+        if purged_ids:
             conn.commit()
             self._cleanup_session_recovery_audio(purged_ids)
 

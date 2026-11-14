@@ -794,11 +794,13 @@ class OutputPipeline:
             # Ctrl+V already went out, then the foreground changed. Saying
             # 「已复制」 here invites a second manual paste of the same words.
             log.info("已发送粘贴快捷键，但焦点随后切换，无法确认是否已插入")
-            unverified_hint = (
-                f"焦点已切换，若 {target_app} 未出字{paste_hint}"
-                if target_app
-                else f"焦点已切换，若未出字{paste_hint}"
-            )
+            if error_detail == "clipboard_changed_after_send":
+                unverified_hint = "焦点已切换，剪贴板内容已变化或无法核对"
+            else:
+                unverified_hint = (
+                    f"焦点已切换，若 {target_app} 未出字{paste_hint}"
+                    if target_app else f"焦点已切换，若未出字{paste_hint}"
+                )
             if polish_failed:
                 unverified_hint = f"{unverified_hint} · 润色未生效（密钥/网络异常）"
             if dropped:
@@ -807,6 +809,24 @@ class OutputPipeline:
                 "已发送 · 未确认",
                 unverified_hint,
                 stopped_text=f"剩余内容：已发送 · 未确认 · {unverified_hint}",
+                use_info=True,
+                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
+            )
+        elif status == "skipped" and error_detail in {"clipboard_changed", "clipboard_unavailable"}:
+            reason = "剪贴板已变化" if error_detail == "clipboard_changed" else "无法核对剪贴板"
+            title = f"{reason}，已取消自动粘贴"
+            log.info("%s%s", title, f"（目标：{target_app}）" if target_app else "")
+            if record is not None and self.config.get("history.enabled", True) and not self.history.disabled:
+                hint = "本次转写可在历史中复制"
+            else:
+                hint = "本次转写未保存到历史，可重新转写"
+            if polish_failed:
+                hint += " · 润色未生效（密钥/网络异常）"
+            hint += dropped_suffix
+            self.show_post_output_floating(
+                title,
+                hint,
+                stopped_text=f"剩余内容：{title} · {hint}",
                 use_info=True,
                 refresh_ms=RESULT_TOAST_WITH_HINT_MS,
             )

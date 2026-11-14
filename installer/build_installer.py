@@ -51,14 +51,25 @@ def installer_file_name(version: str, *, with_model: bool) -> str:
     return f"SayInk-Setup-{version}{suffix}.exe"
 
 
+def _validate_staging_dir(staging: Path) -> None:
+    dist = PROJECT_ROOT.resolve() / "dist"
+    if staging.resolve().parent != dist or staging.is_symlink():
+        raise ValueError(f"Installer staging directory must be directly under {dist}: {staging}")
+
+
 def resolve_staging_dir() -> Path:
     """PyInstaller output folder (dist/SayInk or alternate from SAYINK_STAGING_DIR.txt)."""
-    marker = PROJECT_ROOT / "dist" / "SAYINK_STAGING_DIR.txt"
+    dist = PROJECT_ROOT / "dist"
+    marker = dist / "SAYINK_STAGING_DIR.txt"
+    staging = dist / "SayInk"
     if marker.is_file():
         name = marker.read_text(encoding="utf-8").strip()
         if name:
-            return PROJECT_ROOT / "dist" / name
-    return PROJECT_ROOT / "dist" / "SayInk"
+            if Path(name).name != name or name in {".", ".."}:
+                raise ValueError(f"Invalid installer staging directory name: {name!r}")
+            staging = dist / name
+    _validate_staging_dir(staging)
+    return staging
 
 
 # Inno Setup compiler path (common installation locations)
@@ -93,7 +104,12 @@ def check_prerequisites(*, with_model: bool = False):
     print(f"[OK] Inno Setup found: {inno_path}")
 
     # Check SayInk build exists
-    sayink_exe = resolve_staging_dir() / "SayInk.exe"
+    try:
+        staging_dir = resolve_staging_dir()
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"\n[ERROR] {exc}")
+        return False
+    sayink_exe = staging_dir / "SayInk.exe"
     if not sayink_exe.exists():
         print("\n[ERROR] SayInk.exe not found!")
         print("\nPlease run build.py first to create the executable.")
@@ -124,7 +140,7 @@ def check_prerequisites(*, with_model: bool = False):
     from build import BUNDLE_REQUIRE_MODEL_ID, bundle_aux_model_ids, bundle_model_ids
     from sayink.speech_recognizer import get_model_info
 
-    models_dir = resolve_staging_dir() / "models"
+    models_dir = staging_dir / "models"
     present = {p.name for p in models_dir.iterdir() if p.is_dir()} if models_dir.is_dir() else set()
     required_ids = bundle_model_ids() if with_model else bundle_aux_model_ids()
     required = {get_model_info(model_id)["dir_name"] for model_id in required_ids}
@@ -244,8 +260,10 @@ def build_installer(*, keep_staging: bool = False, with_model: bool = False):
     print("    Users run the installer to install SayInk.")
     print("=" * 60)
 
-    staging_dir = resolve_staging_dir()
     if not keep_staging and staging_dir.exists():
+        # Recheck the directory immediately before removing it. Keep the path
+        # passed to the compiler even if the marker has since changed.
+        _validate_staging_dir(staging_dir)
         shutil.rmtree(staging_dir, ignore_errors=True)
         marker = PROJECT_ROOT / "dist" / "SAYINK_STAGING_DIR.txt"
         if marker.is_file():

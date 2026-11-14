@@ -241,10 +241,10 @@ class TranscriptImportDialog(QDialog):
     def _load_file_path(self, path: str | Path) -> bool:
         target = Path(path)
         try:
-            if target.stat().st_size > _MAX_FILE_BYTES:
+            text = read_transcript_file(target, max_bytes=_MAX_FILE_BYTES)
+            if len(text) > _MAX_CHARS:
                 self._set_file_error("文件超过可导入的大小，已保留当前输入。请拆开后再导入。")
                 return False
-            text = read_transcript_file(target)
         except TranscriptDecodeError as exc:
             self._set_file_error(str(exc))
             return False
@@ -330,8 +330,7 @@ class TranscriptImportDialog(QDialog):
         return super().eventFilter(watched, event)
 
     def _accept(self) -> None:
-        if self._file_error:
-            return
-        if not self.parsed().turns:
+        self._refresh()
+        if not self._ok.isEnabled():
             return
         self.accept()

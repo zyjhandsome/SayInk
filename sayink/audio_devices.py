@@ -735,31 +735,6 @@ def _device_info_by_index(
     return dict(sd.query_devices(int(index)))
 
 
-def _device_name_for_any_index(index: int) -> str:
-    from sayink.pawp_capture import is_encoded_pawp_device_index
-
-    if is_encoded_pawp_device_index(int(index)):
-        for dev in _cached_pawp_loopback_devices():
-            if dev.index == int(index):
-                return dev.name
-        return ""
-    return str(_device_info_by_index(int(index)).get("name", ""))
-
-
-def _same_playback_device_name(index_a: int, index_b: int) -> bool:
-    from sayink.pawp_capture import endpoint_names_match
-
-    try:
-        name_a = _device_name_for_any_index(int(index_a))
-        name_b = _device_name_for_any_index(int(index_b))
-        return bool(name_a and name_b) and (
-            name_a == name_b or endpoint_names_match(name_a, name_b)
-        )
-    except Exception:
-        log.debug("比较播放设备 %s/%s 名称失败", index_a, index_b, exc_info=True)
-        return False
-
-
 def _wasapi_output_twin_for_default(
     default_out: int,
     *,

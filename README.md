@@ -2,7 +2,7 @@
 
 本地离线的**语音转文字**工具，提供 **单次转写、持续转写和会议** 三种模式。默认使用**单次转写**：按住快捷键说话，松开后识别并粘贴到光标处，可选大模型润色。**持续转写**启动后持续采集，按停顿分段输出。**会议**支持整场文字稿、说话人区分和会议纪要。采集**电脑播放声**或**混合音源**时，默认只记录到历史、不粘贴。音频在本机识别，单次与持续转写默认不保存音频（可主动开启本机录音恢复）；会议可在开始卡片选择本机保存会议录音以便回放核对。润色与纪要按配置调用大模型。
 
-版本号以 **`sayink/version.py`** 中的 `__version__` 为准（当前 **3.0.0**）；安装包文件名、Inno 元数据与 Windows 下 `SayInk.exe` 属性均与之同步。
+版本号以 **`sayink/version.py`** 中的 `__version__` 为准（当前 **3.0.1**）；安装包文件名、Inno 元数据与 Windows 下 `SayInk.exe` 属性均与之同步。
 
 > **原名 VoiceInk。** 从 VoiceInk 升级：安装 SayInk 会先卸载旧版 VoiceInk，并把 `~/.voiceink`（设置、历史、已下载模型）整体改名为 `~/.sayink`，凭据管理器里的 API Key 也会自动迁移；无需重新配置或重新下载模型。
 
@@ -204,8 +204,8 @@ pip install -r requirements.txt   # PyQt6、sherpa-onnx、sounddevice、pynput �
 
 | 安装包 | 大小 | 适合 |
 |--------|------|------|
-| **`SayInk-Setup-3.0.0.exe`**（轻量包，默认） | 约 89 MB | 首次安装、日常更新。已带说话人嵌入 CAM++、Silero VAD、多人发言检测（实验性）及其所需的 onnxruntime。不含 Fun-ASR-Nano，首次启动的准备页会在本页下载默认模型（约 950 MB，只需一次），并可先测麦克风；引擎载入完成前不能试说。其他模型仍可到 **设置 → 引擎** 下载 |
-| `SayInk-Setup-3.0.0-full.exe`（完整包） | 约 755 MB | 安装后要立刻离线使用：Fun-ASR-Nano、说话人嵌入 CAM++、Silero VAD、多人发言检测（实验性）随安装包装好 |
+| **`SayInk-Setup-3.0.1.exe`**（轻量包，默认） | 约 99 MB | 首次安装、日常更新。已带说话人嵌入 CAM++、Silero VAD、多人发言检测（实验性）及其所需的 onnxruntime。不含 Fun-ASR-Nano，首次启动的准备页会在本页下载默认模型（约 950 MB，只需一次），并可先测麦克风；引擎载入完成前不能试说。其他模型仍可到 **设置 → 引擎** 下载 |
+| `SayInk-Setup-3.0.1-full.exe`（完整包） | 约 760 MB | 安装后要立刻离线使用：Fun-ASR-Nano、说话人嵌入 CAM++、Silero VAD、多人发言检测（实验性）随安装包装好 |
 
 两种包装出来的程序完全相同；**应用内自动更新一律下载轻量包**。已安装的模型（无论是完整包带的 `安装目录\models`，还是自己下载到 `~/.sayink/models/` 的）在升级时都会保留，不必重新下载。无安装包见 [从源码打包](#从源码打包)。
 
@@ -283,10 +283,10 @@ py -3.10 run.py
 **Windows 10/11**，Python 3.10+。生成安装包还需 [Inno Setup 6](https://jrsoftware.org/isdl.php)。默认打出的是**轻量包**（带说话人嵌入 CAM++、Silero VAD 和多人发言检测（实验性），不含 Fun-ASR-Nano）；加 `--with-model` 打**完整包**，再带上 **Fun-ASR-Nano**。两种包装前，对应模型都要已在本地。
 
 ```bash
-pip install -r requirements-build.txt -c constraints-windows-py310.txt   # 运行依赖 + PyInstaller，按已验证版本固定
+pip install -r requirements-build.txt -r requirements-dev.txt -c constraints-windows-py310.txt   # PyInstaller、发布门禁和运行依赖
 python -m sayink_build.dependency_check                 # 打包前检查依赖版本
 python sayink_build/download_bundle_model_for_build.py   # 把 Fun-ASR-Nano、CAM++、Silero VAD、多人发言检测下载到 ./models/
-python build_release.py                 # → dist/SayInk-Setup-<版本>.exe（轻量包，约 81 MB，含 CAM++、Silero VAD 和多人发言检测）
+python build_release.py                 # → dist/SayInk-Setup-<版本>.exe（轻量包，含 CAM++、Silero VAD 和多人发言检测）
 python build_release.py --with-model    # → dist/SayInk-Setup-<版本>-full.exe（完整包，再含 Fun-ASR-Nano）
 # 或仅便携版：
 python build.py                         # → dist/SayInk/SayInk.exe（须整目录分发；加 --with-model 再带 Fun-ASR-Nano）
