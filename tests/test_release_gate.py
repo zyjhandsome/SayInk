@@ -108,6 +108,25 @@ def test_frozen_build_bundles_win32timezone_for_credential_reads():
     assert "--hidden-import=win32timezone" in text
 
 
+def test_windows_packaging_excludes_unrelated_dll_search_paths(monkeypatch):
+    import os
+    import sys
+    from pathlib import Path
+
+    import build
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setenv("PATH", r"D:\Poppler\Library\bin")
+
+    env = build._build_environment()
+    windows = Path(r"C:\Windows")
+    assert env["PATH"].split(os.pathsep) == [
+        str(windows / "System32"), str(windows), sys.base_prefix,
+    ]
+    assert os.environ["PATH"] == r"D:\Poppler\Library\bin"
+
+
 def test_tag_must_exist_on_the_remote():
     problems = release_problems("2.2.5", run=_runner({"git ls-remote": (0, "")}))
     assert problems == ["Tag v2.2.5 is not on origin: tag the release commit and push the tag first."]

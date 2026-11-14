@@ -22,6 +22,7 @@ Distribution:
   to sign `dist/SayInk/SayInk.exe` before Inno Setup bundles it.
 """
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -184,6 +185,16 @@ def _prepare_dist_output_dir() -> tuple[Path, str]:
     return dist_parent, alt_name
 
 
+def _build_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    if sys.platform == "win32":
+        windows = Path(os.environ["SystemRoot"])
+        # Qt imports Windows' ICU DLLs. A developer PATH can make PyInstaller
+        # collect an incompatible same-name DLL from another application.
+        env["PATH"] = os.pathsep.join(map(str, (windows / "System32", windows, sys.base_prefix)))
+    return env
+
+
 def build():
     """Package SayInk with PyInstaller."""
     from sayink_build.dependency_check import require_release_dependencies
@@ -197,9 +208,7 @@ def build():
 
     print("[1/3] Building SayInk with PyInstaller...")
 
-    try:
-        import PyInstaller.__main__
-    except ImportError:
+    if importlib.util.find_spec("PyInstaller") is None:
         print("\n[ERROR] PyInstaller 未安装（它只在打包时需要）: pip install -r requirements-build.txt")
         sys.exit(1)
 
@@ -285,7 +294,10 @@ def build():
         "--exclude-module=IPython",
     ])
 
-    PyInstaller.__main__.run(args)
+    build_env = _build_environment()
+    result = subprocess.run([sys.executable, "-m", "PyInstaller", *args], env=build_env, check=False)
+    if result.returncode:
+        sys.exit(result.returncode)
 
     dist_dir = dist_parent / app_name
     exe_path = dist_dir / "SayInk.exe"
@@ -301,6 +313,19 @@ def build():
     if not exe_path.exists():
         print("\n[ERROR] Build failed — SayInk.exe not found.")
         sys.exit(1)
+
+    if sys.platform == "win32":
+        print("    Checking the packaged executable starts Qt ...")
+        try:
+            smoke = subprocess.run(
+                [str(exe_path), "--startup-smoke-test"], cwd=dist_dir, env=build_env, timeout=30, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            print("[ERROR] Packaged Qt startup check timed out.")
+            sys.exit(1)
+        if smoke.returncode:
+            print(f"[ERROR] Packaged Qt startup check failed (exit code {smoke.returncode}).")
+            sys.exit(1)
 
     from sayink_build.release_signing import SigningError, sign_file_if_configured
 

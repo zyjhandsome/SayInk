@@ -463,6 +463,20 @@ def _configured_log_level() -> int:
 
 
 def main():
+    if sys.argv[1:] == ["--startup-smoke-test"]:
+        # Run before the single-instance lock, settings, and audio devices.
+        try:
+            from PyQt6.QtWidgets import QApplication, QWidget
+
+            app = QApplication(sys.argv[:1])
+            widget = QWidget()
+            widget.winId()
+            widget.close()
+            app.quit()
+        except (ImportError, OSError):
+            sys.exit(1)
+        return
+
     setup_logging()
     log = logging.getLogger("SayInk")
     _install_exception_hooks(log)
