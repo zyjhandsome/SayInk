@@ -44,7 +44,6 @@ from sayink.text_paster import (
     TextPaster,
     detect_session_change,
     detect_terminal_paste_mode,
-    is_terminal_window,
     remember_paste_target,
 )
 from sayink.update_controller import UpdateController
@@ -254,8 +253,9 @@ class TestUpdaterAndHandoff:
         direct_open = build_update_urlopen("direct")
         req = updater_mod.Request("https://github.com/zyjhandsome/SayInk/releases")
         assert direct_open(req, timeout=5) == "ok_direct"
-        assert len(built_handlers[-1]) == 1
+        assert len(built_handlers[-1]) == 2
         assert built_handlers[-1][0].proxies == {}
+        assert isinstance(built_handlers[-1][1], updater_mod._TrustedRedirectHandler)
 
         sys_open = build_update_urlopen("system")
         assert sys_open(req, timeout=5) == "ok_system"
@@ -624,10 +624,8 @@ class TestClipboardSnapshotAndPasteGuards:
 
         paster = TextPaster(restore_clipboard=True)
         paster._restore_pending = True
-        paster._saved_clipboard = "stale"
         paster.cancel()
         assert paster._restore_pending is False
-        assert paster._saved_clipboard is None
 
         # Case A: skipped due to elevated window -> transcript MUST stay on clipboard, no restore scheduled!
         monkeypatch.setattr(tp_mod, "get_foreground_window_info", lambda: (500, "Admin CMD", 88888))
@@ -692,14 +690,12 @@ class TestClipboardSnapshotAndPasteGuards:
 
         monkeypatch.setattr(tp_mod, "_get_window_class_name", lambda _h: "CASCADIA_HOSTING_WINDOW_CLASS")
         assert detect_terminal_paste_mode(1, "WindowsTerminal.exe") == "ctrl_shift_v"
-        assert is_terminal_window(1, "WindowsTerminal.exe") is True
 
         monkeypatch.setattr(tp_mod, "_get_window_class_name", lambda _h: "mintty")
         assert detect_terminal_paste_mode(2, "mintty.exe") == "shift_insert"
 
         monkeypatch.setattr(tp_mod, "_get_window_class_name", lambda _h: "ConsoleWindowClass")
         assert detect_terminal_paste_mode(3, "cmd.exe") == "ctrl_v"
-        assert is_terminal_window(3, "cmd.exe") is True
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Win32 keybd_event test")
     def test_win32_shortcut_does_not_release_physically_held_ctrl(self, monkeypatch):

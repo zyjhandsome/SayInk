@@ -33,8 +33,12 @@ _HEAVY_KEYWORDS = (
     "meeting",
     "history",
     "speech_recognizer",
-    "smoke",
-    "overlay",
+    "app",
+    "audit",
+    "window",
+    "minutes",
+    "polisher",
+    "readme",
     "onboarding",
 )
 _SUMMARY_TOKEN_RE = re.compile(

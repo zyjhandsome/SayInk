@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import ast
-import sys
 import typing
 from pathlib import Path
 
-import pytest
 from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtGui import QFocusEvent
 from PyQt6.QtWidgets import (
@@ -61,12 +59,6 @@ _INERT_WINDOW_METHODS = (
     "_refresh_about_info",
     "_refresh_audio_device_lists",
 )
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    app = QApplication.instance() or QApplication(sys.argv)
-    yield app
 
 
 class _ReadOnlyOwnerSentinel:
@@ -166,12 +158,16 @@ def test_all_subpage_type_annotations_carry_concrete_widget_instances(qapp, tmp_
     about = AboutSettingsPage(cfg)
 
     expected_counts = (
-        (GeneralSettingsPage, general, _GENERAL_LEGACY_NAMES, 75),
-        (ModelSettingsPage, model, _MODEL_LEGACY_NAMES, 9),
+        (GeneralSettingsPage, general, _GENERAL_LEGACY_NAMES, 71),
+        (ModelSettingsPage, model, _MODEL_LEGACY_NAMES, 10),
         (PolishSettingsPage, polish, _POLISH_LEGACY_NAMES, 24),
-        (AboutSettingsPage, about, _ABOUT_LEGACY_NAMES, 16),
+        (AboutSettingsPage, about, _ABOUT_LEGACY_NAMES, 13),
     )
-    nullable_before_card_build = {"model_hero_status", "model_cards_for_id"}
+    nullable_before_card_build = {
+        "model_hero_status",
+        "model_cards_for_id",
+        "model_cards_downloaded",
+    }
     concrete_control_types = (
         QWidget,
         QVBoxLayout,
@@ -235,7 +231,7 @@ def test_settings_window_holds_typed_pages_and_delegates_legacy_attrs_cleanly(
         assert win._pages.widget(3) is win.about_page
 
         # Legacy aliases are mapped to their subpages and never injected into SettingsWindow.
-        assert len(_LEGACY_PAGE_ATTRS) == 124
+        assert len(_LEGACY_PAGE_ATTRS) == 118
         assert set(_LEGACY_PAGE_ATTRS).isdisjoint(win.__dict__)
 
         for legacy_name, (page_attr, field_name) in _LEGACY_PAGE_ATTRS.items():

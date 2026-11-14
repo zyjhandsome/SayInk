@@ -122,11 +122,7 @@ _GENERAL_LEGACY_NAMES = (
     "_vad_download_status_row",
     "_vad_download_btn",
     "_vad_download_row",
-    "_quiet_speech_row",
-    "_boundary_context_row",
-    "_speaker_enabled_row",
     "_speaker_runtime_label",
-    "_speaker_activity_row",
     "_meeting_source_combo",
     "_meeting_model_combo",
     "_meeting_defaults_hint",
@@ -147,6 +143,7 @@ _MODEL_LEGACY_NAMES = (
     "_cards_layout",
     "_model_cards",
     "_model_cards_for_id",
+    "_model_cards_downloaded",
 )
 
 _POLISH_LEGACY_NAMES = (
@@ -190,9 +187,6 @@ _ABOUT_LEGACY_NAMES = (
     "_about_paths_toggle",
     "_about_paths_wrap",
     "_about_paths_lay",
-    "_about_feedback_group",
-    "_about_feedback_hint",
-    "_about_feedback_btn",
 )
 
 _LEGACY_PAGE_ATTRS: dict[str, tuple[str, str]] = {
@@ -251,7 +245,6 @@ class SettingsWindow(QWidget):
     runtime_status_changed = pyqtSignal(object)  # RuntimeStatus
     navigation_requested = pyqtSignal(str)
     usage_hint_changed = pyqtSignal()
-    closed = pyqtSignal()
     finished = pyqtSignal(int)
 
     # Strongly-typed subpage references
@@ -422,25 +415,29 @@ class SettingsWindow(QWidget):
     def reapply_theme(self) -> None:
         """Refresh dialog chrome after design tokens were activated."""
         from sayink.ui import design_tokens as tok
-        from sayink.ui.settings_components import reapply_subtree as _reapply_subtree
+        from sayink.ui.settings_components import (
+            _set_css,
+            reapply_subtree as _reapply_subtree,
+        )
 
-        self.setStyleSheet(_settings_styles.WINDOW_CSS)
-        self._paint_model_hero_status()
+        _set_css(self, _settings_styles.WINDOW_CSS)
         if isinstance(self, SettingsWindow):
-            self._content_wrap.setStyleSheet("QWidget#settingsContent { background: transparent; }")
-            self._pages_host.setStyleSheet("QWidget#settingsPagesHost { background: transparent; }")
-            self._pages.setStyleSheet("QStackedWidget#settingsPages { background: transparent; }")
+            _set_css(self._content_wrap, "QWidget#settingsContent { background: transparent; }")
+            _set_css(self._pages_host, "QWidget#settingsPagesHost { background: transparent; }")
+            _set_css(self._pages, "QStackedWidget#settingsPages { background: transparent; }")
         _reapply_subtree(self)
         if isinstance(self, SettingsWindow):
             self.general_page.apply_theme()
             self.model_page.apply_theme()
             self.polish_page.apply_theme()
             self.about_page.apply_theme()
-            self._refresh_active_model_hero()
+            self._paint_model_hero_status()
         else:
-            self._mic_level_bar.setStyleSheet(
+            self._paint_model_hero_status()
+            _set_css(
+                self._mic_level_bar,
                 f"QProgressBar {{ border: none; background: {tok.SURFACE_PEARL}; border-radius: 3px; }}"
-                f"QProgressBar::chunk {{ background: {tok.ACCENT}; border-radius: 3px; }}"
+                f"QProgressBar::chunk {{ background: {tok.ACCENT}; border-radius: 3px; }}",
             )
         self._refresh_recognition_feedback()
         self._refresh_output_controls()
@@ -469,10 +466,12 @@ class SettingsWindow(QWidget):
         self.show_page({"general": 0, "engine": 1, "polish": 2}[page])
         self.navigation_requested.emit(page)
         if focus == "hotkey":
+            from PyQt6 import sip
+
             edit = self.general_page.hotkey_edit
             self.general_page.ensureWidgetVisible(edit)
             edit.setFocus(Qt.FocusReason.TabFocusReason)
-            QTimer.singleShot(0, edit.begin_capture)
+            QTimer.singleShot(0, lambda e=edit: None if sip.isdeleted(e) else e.begin_capture())
         elif focus == "source":
             target_widget = self.general_page.src_mic_rb
             self.general_page.ensureWidgetVisible(target_widget)
@@ -493,7 +492,6 @@ class SettingsWindow(QWidget):
         self._flush_meeting_glossary()
         super().hideEvent(event)
         if self.parent() is None:
-            self.closed.emit()
             self.finished.emit(0)
 
     # ── Runtime & Recognition Status ───────────────────────
@@ -603,6 +601,7 @@ class SettingsWindow(QWidget):
             return
         if worker in self._move_workers:
             self._move_workers.remove(worker)
+        worker.deleteLater()
 
     def _on_model_dir_move_done(
         self,
@@ -676,6 +675,8 @@ class SettingsWindow(QWidget):
     def _start_download(self, model_id: str, *, show_error: bool = False) -> None:
         if model_id in self._dl_workers:
             return
+        from PyQt6 import sip
+
         from sayink.speech_recognizer import ModelDownloadWorker
 
         worker = ModelDownloadWorker(
@@ -685,14 +686,24 @@ class SettingsWindow(QWidget):
         self._dl_workers[model_id] = worker
         if isinstance(worker, QThread):
             self._download_threads.append(worker)
-            worker.finished.connect(lambda w=worker: self._reap_download_thread(w))
+            worker.finished.connect(
+                lambda w=worker: None if sip.isdeleted(self) else self._reap_download_thread(w)
+            )
         self._on_shared_download_progress(model_id, 0)
         self.model_page.update_download_progress(model_id, 0)
-        worker.progress.connect(lambda pct, mid=model_id: self.model_page.update_download_progress(mid, pct))
-        worker.progress.connect(lambda pct, mid=model_id: self._on_shared_download_progress(mid, pct))
-        worker.finished_ok.connect(lambda mid: self._on_dl_done(mid))
+        worker.progress.connect(
+            lambda pct, mid=model_id: None if sip.isdeleted(self) else self.model_page.update_download_progress(mid, pct)
+        )
+        worker.progress.connect(
+            lambda pct, mid=model_id: None if sip.isdeleted(self) else self._on_shared_download_progress(mid, pct)
+        )
+        worker.finished_ok.connect(
+            lambda mid: None if sip.isdeleted(self) else self._on_dl_done(mid)
+        )
         worker.error.connect(
-            lambda msg: self._on_dl_error(
+            lambda msg: None
+            if sip.isdeleted(self)
+            else self._on_dl_error(
                 msg, self.model_page.model_cards.get(model_id), model_id, show_error=show_error,
             )
         )
@@ -1201,14 +1212,20 @@ class SettingsWindow(QWidget):
         box = QMessageBox(self)
         box.setWindowTitle(title)
         box.setText(text)
-        box.setIcon(QMessageBox.Icon.Question)
-        role = QMessageBox.ButtonRole.DestructiveRole if destructive else QMessageBox.ButtonRole.AcceptRole
-        accept_btn = box.addButton(accept, role)
-        cancel_btn = box.addButton(cancel, QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(cancel_btn)
-        box.setEscapeButton(cancel_btn)
+        box.setIcon(
+            QMessageBox.Icon.Warning if destructive else QMessageBox.Icon.Question
+        )
+        role = (
+            QMessageBox.ButtonRole.DestructiveRole
+            if destructive
+            else QMessageBox.ButtonRole.AcceptRole
+        )
+        yes = box.addButton(accept, role)
+        no = box.addButton(cancel, QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(no)
+        box.setEscapeButton(no)
         box.exec()
-        return box.clickedButton() is accept_btn
+        return box.clickedButton() == yes
 
     def _revert_input_source_radios(self) -> None:
         self._loading = True
@@ -1497,7 +1514,7 @@ class SettingsWindow(QWidget):
         if self._loading:
             return
         gp = self.general_page
-        self._config.set("meeting.input_source", str(gp.meeting_source_combo.currentData() or ""))
+        self._config.set("meeting.input_source", str(gp.meeting_source_combo.currentData() or "mixed"))
         self._config.set("meeting.model_id", str(gp.meeting_model_combo.currentData() or ""))
         self._config.set("meeting.show_start_card", bool(gp.meeting_start_card_row.isChecked()))
         self._refresh_meeting_defaults()
@@ -1507,13 +1524,8 @@ class SettingsWindow(QWidget):
             return
         gp = self.general_page
         language = str(gp.meeting_language_combo.currentData() or "auto")
-        boundary = gp.boundary_context_row.isChecked()
-        changed = (
-            language != self._config.get("stt.language", "auto")
-            or boundary != self._config.get("stt.boundary_context_enabled", False)
-        )
+        changed = language != self._config.get("stt.language", "auto")
         self._config.set("stt.language", language)
-        self._config.set("stt.boundary_context_enabled", boundary)
         if changed:
             self.recognition_changed.emit()
         self._refresh_recognition_feedback()
@@ -1780,14 +1792,6 @@ class SettingsWindow(QWidget):
         self._config.set("llm.mode", mode)
         self._update_llm_configuration_status()
 
-    def _on_done(self) -> None:
-        self._cancel_mic_probe_if_active()
-        self._flush_meeting_glossary()
-        self._commit_pending_history_limits()
-        self._flush_llm_fields()
-        self._flush_minutes_fields()
-        self.close()
-
     # ── LLM Connection Test ────────────────────────────────
 
     def _release_button_without_shifting_focus(self, btn: QPushButton) -> None:
@@ -1879,27 +1883,35 @@ class SettingsWindow(QWidget):
         return worker
 
     def _on_test_done(self, w, btn: QPushButton, status: QLabel, ok_text: str) -> None:
+        from PyQt6 import sip
+
         try:
             self._test_workers.remove(w)
         except ValueError:
             pass
-        btn.setEnabled(True)
-        btn.setText("测试连接")
-        suffixes_now = str(self._config.get("llm.proxy_bypass_suffixes", "") or "")
-        if w.proxy_mode != self._config.get("llm.proxy_mode", "system") or w.suffixes != suffixes_now:
+        try:
+            if sip.isdeleted(self) or sip.isdeleted(btn) or sip.isdeleted(status):
+                return
+            btn.setEnabled(True)
+            btn.setText("测试连接")
+            suffixes_now = str(self._config.get("llm.proxy_bypass_suffixes", "") or "")
+            if w.proxy_mode != self._config.get("llm.proxy_mode", "system") or w.suffixes != suffixes_now:
+                if status is self.polish_page.llm_test_status:
+                    self._update_llm_configuration_status()
+                else:
+                    self._set_llm_status(status, "代理模式已更改，请重新测试连接。", "idle")
+                return
             if status is self.polish_page.llm_test_status:
+                self._llm_test_stamp = (w.u, w.k, w.m, w.ok, ok_text if w.ok else w.msg)
                 self._update_llm_configuration_status()
+                return
+            if w.ok:
+                self._set_llm_status(status, ok_text, "ok")
             else:
-                self._set_llm_status(status, "代理模式已更改，请重新测试连接。", "idle")
-            return
-        if status is self.polish_page.llm_test_status:
-            self._llm_test_stamp = (w.u, w.k, w.m, w.ok, ok_text if w.ok else w.msg)
-            self._update_llm_configuration_status()
-            return
-        if w.ok:
-            self._set_llm_status(status, ok_text, "ok")
-        else:
-            self._set_llm_status(status, w.msg, "error")
+                self._set_llm_status(status, w.msg, "error")
+        finally:
+            if hasattr(w, "deleteLater"):
+                w.deleteLater()
 
     def focus_llm_connection(self) -> None:
         self.show_page(2)

@@ -25,7 +25,7 @@ def test_readme_version_matches_the_package():
 
     from sayink.version import __version__
 
-    text = Path("README.md").read_text(encoding="utf-8")
+    text = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
     assert f"当前 **{__version__}**" in text
     assert f"SayInk-Setup-{__version__}.exe" in text
     assert f"SayInk-Setup-{__version__}-full.exe" in text
@@ -71,16 +71,17 @@ class TestReadmeSharedRecognition:
             record = h["history"].enqueue.call_args.args[0]
             assert record.raw_text == "五中资料" and record.polished_text == "五证资料"
 
-    def test_meeting_follows_dictation_audio_and_shared_parameters(self):
+    def test_meeting_keeps_its_own_audio_source_and_shares_recognition_parameters(self):
         from sayink.meeting_session import MeetingOptions
 
-        with app_harness({"audio.input_source": "system", "meeting.input_source": "",
+        # A legacy empty meeting source used to mean 「跟随转写」; it is mixed now.
+        with app_harness({"audio.input_source": "microphone", "meeting.input_source": "",
                           "stt.language": "en", "stt.glossary": [{"term": "SayInk"}]}) as h:
             options = MeetingOptions.from_config(h["config"])
-            assert options.input_source == "system"
+            assert options.input_source == "mixed"
             h["recorder"].start_continuous.side_effect = lambda: setattr(h["recorder"], "is_continuous", True)
             assert h["app"].start_meeting(options)
-            assert h["recorder"].configure.call_args.kwargs["input_source"] == "system"
+            assert h["recorder"].configure.call_args.kwargs["input_source"] == "mixed"
             assert h["recognizer"].configure.call_args.kwargs["hotwords"] == "SayInk"
             assert h["recognizer"].configure.call_args.kwargs["language"] == "en"
 
@@ -617,7 +618,7 @@ class TestReadmeIslandCopy:
     def test_readme_describes_main_window_not_island(self):
         from pathlib import Path
 
-        text = Path("README.md").read_text(encoding="utf-8")
+        text = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
         assert "打开 SayInk" in text
         assert "转写条" in text or "薄" in text
         assert "双击托盘会唤醒空间岛" not in text
@@ -781,7 +782,8 @@ class TestReadmeMeetingNotes:
         assert "再用可靠样本重新聚类" in text
         assert "高级识别设置" in text and "单次转写、持续转写与会议共用" in text
         assert "轻声自适应增益" in text and "按模式与音源自动启停" in text
-        assert "麦克风 + 电脑声音" in text and "跟随转写设置" in text and "仅用于本场" in text
+        assert "麦克风 + 电脑声音" in text and "不随转写音源变化" in text and "仅用于本场" in text
+        assert "跟随转写设置" not in text
         assert "加载失败并回退" in text and "已保存，待生效" in text
         assert "chat_completion()" in text
         # Settings copy uses the shared names; the old 会议-prefixed ones and retired manual switch guides are gone.
@@ -794,13 +796,15 @@ class TestReadmeMeetingNotes:
         ):
             assert stale not in text
 
-    def test_shared_recognition_settings_live_under_stt(self):
-        from sayink.config import DEFAULT_CONFIG, SHARED_RECOGNITION_KEYS
+    def test_shared_recognition_settings_live_under_stt(self, tmp_path):
+        from sayink.config import Config, DEFAULT_CONFIG, SHARED_RECOGNITION_KEYS
+        from sayink.recognition_settings import RecognitionSettings
 
-        assert {"glossary", "language", "vad"}.issubset(SHARED_RECOGNITION_KEYS)
-        assert set(SHARED_RECOGNITION_KEYS).issubset({"glossary", "language", "vad", "speaker_model_enabled"})
+        assert tuple(SHARED_RECOGNITION_KEYS) == ("glossary", "language")
         for key in SHARED_RECOGNITION_KEYS:
             assert key in DEFAULT_CONFIG["stt"] and key not in DEFAULT_CONFIG["meeting"]
+        cfg = Config(config_dir=tmp_path)
+        assert RecognitionSettings.from_config(cfg).vad == "silero"
 
     def test_main_window_has_six_pages_in_readme_order(self):
         from sayink.ui.main_window import NAV_LABELS, PAGE_KEYS

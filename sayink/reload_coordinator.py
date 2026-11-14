@@ -32,7 +32,7 @@ from sayink.vad_segmenter import VAD_SILERO
 
 log = logging.getLogger("SayInk")
 
-# Top-level key: Config drops unknown keys nested under defaults like "stt".
+# Top-level extra key persisted in Config._extra_keys for cross-session model load ETA.
 LOAD_SECONDS_KEY = "stt_load_seconds"
 
 
@@ -56,7 +56,7 @@ class ReloadCoordinator:
         model_registry_fn: Callable[[], list[dict]] | None = None,
         now_monotonic: Callable[[], float] | None = None,
         meeting_active: Callable[[], bool] | None = None,
-        hold_open_pending: Callable[[], bool] | None = None,
+        meeting_save_audio: Callable[[], bool | None] | None = None,
         pipeline_busy: Callable[[], bool] | None = None,
         has_queued_segments: Callable[[], bool] | None = None,
         queued_segment_count: Callable[[], int] | None = None,
@@ -87,7 +87,7 @@ class ReloadCoordinator:
         self.now_monotonic = now_monotonic or time.monotonic
 
         self.meeting_active = meeting_active or (lambda: False)
-        self.hold_open_pending = hold_open_pending or (lambda: False)
+        self.meeting_save_audio = meeting_save_audio or (lambda: None)
         self.pipeline_busy = pipeline_busy or (lambda: False)
         self.has_queued_segments = has_queued_segments or (lambda: False)
         self.queued_segment_count = queued_segment_count or (
@@ -194,7 +194,10 @@ class ReloadCoordinator:
 
     def recognition_runtime_key(self, settings: RecognitionSettings | None = None) -> tuple:
         shared = settings or RecognitionSettings.from_config(self.config)
-        return shared.asr_key(int(self.config.get("stt.num_threads", 4) or 4))
+        return (
+            *shared.asr_key(int(self.config.get("stt.num_threads", 4) or 4)),
+            str(self.config.get("stt.models_dir", "") or "").strip(),
+        )
 
     def speaker_aux_paths(self, settings: RecognitionSettings) -> tuple:
         return (
@@ -242,9 +245,16 @@ class ReloadCoordinator:
         self.applied_audio_key = self.audio_runtime_key()
 
     def apply_audio_options(self) -> None:
+        meeting_on = bool(self.meeting_active())
+        per_meeting = self.meeting_save_audio() if meeting_on else None
+        meeting_wants_audio = (
+            bool(self.config.get("meeting.save_audio", True))
+            if per_meeting is None
+            else bool(per_meeting)
+        )
         save_audio = bool(
             self.config.get("audio.recovery_enabled", False)
-            or (self.meeting_active() and self.config.get("meeting.save_audio", True))
+            or (meeting_on and meeting_wants_audio)
         )
         cfg_dir = getattr(self.config, "config_dir", None)
         root = (
@@ -354,13 +364,6 @@ class ReloadCoordinator:
             is_ready=bool(self.recognizer.is_ready),
         )
 
-    def active_model_display_name(self) -> str:
-        active_id = self.dictation_model_id()
-        for model in self._model_registry():
-            if model["id"] == active_id:
-                return model["name"]
-        return active_id or "未选择模型"
-
     def dictation_model_id(self) -> str:
         current = self.recognizer.current_model_id
         if isinstance(current, str) and current:
@@ -429,7 +432,10 @@ class ReloadCoordinator:
         new_asr_key = self.recognition_runtime_key(new)
         old_asr_key = self.applied_recognition_key
         if old_asr_key is None:
-            old_asr_key = old.asr_key(int(self.config.get("stt.num_threads", 4) or 4))
+            old_asr_key = (
+                *old.asr_key(int(self.config.get("stt.num_threads", 4) or 4)),
+                "",
+            )
         asr_changed = new_asr_key != old_asr_key or models_changed
         return speaker_changed, segmenter_changed, asr_changed
 
@@ -474,13 +480,14 @@ class ReloadCoordinator:
                 blocked = (
                     self.meeting_active()
                     or bool(getattr(self.recorder, "is_recording", False))
-                    or self.hold_open_pending()
                     or self.pipeline_busy()
                     or queue_blocks
                 )
                 if not blocked:
                     self.recognition_change_pending = False
                     self.models_reload_pending = False
+                    if models_changed or asr_changed:
+                        self.sync_models_dir()
                     self.applied_recognition_settings = new
                     if segmenter_changed:
                         self.apply_dictation_segmenter_profile()
@@ -503,7 +510,6 @@ class ReloadCoordinator:
         if (
             self.meeting_active()
             or bool(getattr(self.recorder, "is_recording", False))
-            or self.hold_open_pending()
             or self.pipeline_busy()
             or self.has_queued_segments()
         ):
@@ -544,7 +550,7 @@ class ReloadCoordinator:
             self.sync_models_dir()
             self.update_tray_models()
             return
-        if getattr(self.recorder, "is_recording", False) or self.hold_open_pending():
+        if getattr(self.recorder, "is_recording", False):
             # Rebuilding the segmenter under an open hold resets the audio
             # anchor mid-sentence. Keep this utterance, apply once it is done.
             log.info("单次录音进行中，音频与引擎设置将在本次录音结束后生效")
@@ -568,8 +574,14 @@ class ReloadCoordinator:
         # are applied; theme has its own signal.
         old_settings = self.applied_recognition_settings
         new_settings = RecognitionSettings.from_config(self.config)
-        speaker_changed = new_settings.speaker_key != old_settings.speaker_key
-        segmenter_changed = new_settings.segmenter_key != old_settings.segmenter_key
+        models_changed = bool(self.models_reload_pending)
+        speaker_changed, segmenter_changed, asr_changed = self.recognition_diff(
+            old_settings,
+            new_settings,
+            models_changed=models_changed,
+        )
+        if models_changed or asr_changed:
+            self.sync_models_dir()
         if self.audio_runtime_key() != self.applied_audio_key:
             self.apply_audio_config()
         elif segmenter_changed:
@@ -579,8 +591,7 @@ class ReloadCoordinator:
             self.sync_recognizer_quiet_speech(new_settings)
         if speaker_changed:
             self.rebuild_speaker_embedder()
-        if self.recognition_runtime_key(new_settings) != self.applied_recognition_key:
-            self.sync_models_dir()
+        if asr_changed:
             self.configure_stt()
             self.update_tray_models()
         self.recognition_change_pending = False

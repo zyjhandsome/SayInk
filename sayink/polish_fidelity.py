@@ -14,6 +14,7 @@ _THOUSANDS_SEP_RE = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
 _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 # Words and lexicalized patterns containing negation characters without negating a claim.
 _NON_NEGATING_WORDS = (
+    "不同意见", "不同观点", "不同看法", "不同立场", "不同声音",
     "非常", "无论", "不过", "不仅", "不但", "未来", "无线",
     "特别", "区别", "分别", "类别", "级别", "告别", "识别", "性别", "别人", "别的",
     "没事", "没关系", "不要紧", "不客气", "不用谢", "不好意思",
@@ -62,7 +63,7 @@ _CN_NUMERAL_RE = re.compile(
 _UNARY_SIGN_RE = re.compile(r"(?<![\d.])([+-])(\d+(?:\.\d+)?)")
 # Exclude o'clock time expressions like "十点一到" / "八点一过" / "三点一刻" from decimal parsing.
 _CN_DECIMAL_RE = re.compile(
-    r"([零〇一二两三四五六七八九十百千万亿两]+)点([零〇一二三四五六七八九]+)(?![到过开完始半刻钟左右前])"
+    r"([零〇一二两三四五六七八九十百千万亿]+)点([零〇一二三四五六七八九]+)(?![到过开完始半刻钟左右前十分秒])"
 )
 # The amount has to start at a token boundary: 1.5亿 must not be read as 5亿.
 _SCALED_PAIR_RE = re.compile(r"(?<![\d.])(\d+)亿(\d+)万")
@@ -245,10 +246,6 @@ def normalized_number_tokens(text: str) -> list[str]:
     return [_canonical_number(match) for match in _SIGNED_NUMBER_RE.findall(prepared)]
 
 
-def _numbers(text: str) -> set[str]:
-    return set(_number_sequence(text))
-
-
 def _number_order_kept(raw: list[str], polished: list[str]) -> bool:
     """Polished text may insert formatting zeros (3点 → 3:00) but not reorder."""
     index = 0
@@ -282,10 +279,6 @@ def _negation_count(text: str) -> int:
     return sum(1 for ch in text if ch in _NEGATION_CHARS) + len(_EN_NEGATION_RE.findall(text))
 
 
-def _has_negation(text: str) -> bool:
-    return _negation_count(text) > 0
-
-
 def _proper_nouns(text: str) -> set[str]:
     """Latin names worth keeping verbatim: GitHub, iPhone, API, AI, Python,
     GPT4. All-lowercase words are left out so dropped English filler is not
@@ -297,14 +290,15 @@ def _proper_nouns(text: str) -> set[str]:
     return names
 
 
-def _keeps_name(name: str, folded: str) -> bool:
+def _keeps_name(name: str, folded: str, folded_compact: str | None = None) -> bool:
     # Whole word only: API inside "rapid" is not the name. Spacing may change
     # either way (iPhone15 → iPhone 15), so try the text with and without it.
     # A digit may precede the name (2024Q3, 3GPP): the tokenizer starts a name
     # at its first letter, so the same text must pass here or an unchanged
     # sentence would be "missing" its own name.
     pattern = re.compile(rf"(?<![a-z]){re.escape(name)}(?![a-z0-9])")
-    return any(pattern.search(t) for t in (folded, re.sub(r"\s+", "", folded)))
+    compact = folded_compact if folded_compact is not None else _WHITESPACE_RE.sub("", folded)
+    return any(pattern.search(t) for t in (folded, compact))
 
 
 def _content_overlap_ratio(source: str, candidate: str) -> float:
@@ -334,6 +328,10 @@ def polish_rejection_reason(raw: str, polished: str) -> str:
     raw_compact = _WHITESPACE_RE.sub("", raw)
     polished_compact = _WHITESPACE_RE.sub("", polished)
     core = _FILLER_RE.sub("", raw_compact)
+    if not polished_compact:
+        return "内容为空"
+    if _CJK_OR_WORD_RE.search(core) and not _CJK_OR_WORD_RE.search(polished_compact):
+        return "内容被大幅压缩"
     if len(core) >= 12 and len(polished_compact) < len(core) * 0.4:
         # A polish may drop filler and repetition, not most of the content.
         return "内容被大幅压缩"
@@ -381,9 +379,12 @@ def polish_rejection_reason(raw: str, polished: str) -> str:
     # which claim it applies to (不是 A，而是 B → 是 A，不是 B).
     if raw_clauses and len(raw_clauses) == len(polished_clauses) and raw_clauses != polished_clauses:
         return "否定词错位"
-    folded = polished.casefold()
-    if any(not _keeps_name(name, folded) for name in _proper_nouns(raw)):
-        return "英文专名丢失"
+    nouns = _proper_nouns(raw)
+    if nouns:
+        folded = polished.casefold()
+        folded_compact = polished_compact.casefold()
+        if any(not _keeps_name(name, folded, folded_compact) for name in nouns):
+            return "英文专名丢失"
     return ""
 
 

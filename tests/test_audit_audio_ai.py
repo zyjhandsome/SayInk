@@ -23,7 +23,6 @@ from sayink import audio_devices
 from sayink.asr_context import ContextAudio, decode_owned_context, with_context
 from sayink.asr_correction import (
     apply_glossary_variants,
-    glossary_conflicts,
     parse_glossary_line,
 )
 from sayink.audio_devices import (
@@ -265,6 +264,8 @@ class TestAudit01LoopbackBluetoothAndMix:
         assert level_events and level_events[-1][0] > 0.05
         assert len(silent_warnings) == 1
         assert "BT Stereo" in silent_warnings[0]
+        # Mixed is the meeting default, so an in-person meeting sees this too.
+        assert "线下会议" in silent_warnings[0]
 
     def test_7_1_multichannel_to_mono_does_not_attenuate_12db(self):
         frames = 1600
@@ -993,26 +994,6 @@ class TestAudit08GlossaryBoundariesAndConflicts:
         assert "我不同意这个方案" in out
         assert "通义千问很强" in out
         assert "单独调 API 可以" in out
-
-    def test_glossary_conflicts_reports_and_logs_shadowed_variants(self, caplog):
-        import sayink.asr_correction as corr_mod
-
-        corr_mod._LOGGED_GLOSSARY_CONFLICTS.clear()
-        glossary = [
-            parse_glossary_line("新盘=训盘"),
-            parse_glossary_line("训盘=巡盘"),  # '训盘' collides with term
-            parse_glossary_line("甲词=同音"),
-            parse_glossary_line("乙词=同音"),  # duplicate variant
-            parse_glossary_line("测试=测"),    # 1-char CJK variant
-        ]
-        with caplog.at_level(logging.WARNING, logger="SayInk"):
-            conflicts = glossary_conflicts(glossary)
-
-        assert len(conflicts) == 3
-        assert any("同名" in c for c in conflicts)
-        assert any("同时指向" in c for c in conflicts)
-        assert any("单字误写" in c for c in conflicts)
-        assert any("词库冲突提示" in rec.message for rec in caplog.records)
 
 
 # ── 9. H-22, H-23, M-11, M-12: Diarization, Route Isolation & Naming ─────────

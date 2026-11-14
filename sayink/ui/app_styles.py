@@ -131,8 +131,8 @@ def _forward_spinbox_wheel_to_scroll_area(spin: QAbstractSpinBox, event) -> bool
 
 
 class _PopupWidthFilter(QObject):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
         self._adjusting = False
 
     def eventFilter(self, obj, event):
@@ -222,7 +222,7 @@ class DropDownComboStyle(QProxyStyle):
 
     def __init__(self, *args):
         super().__init__(*args)
-        self._popup_filter = _PopupWidthFilter()
+        self._popup_filter = _PopupWidthFilter(self)
 
     def styleHint(self, hint, option=None, widget=None, returnData=None):
         if hint == QStyle.StyleHint.SH_ComboBox_Popup:
@@ -263,7 +263,3 @@ def build_global_stylesheet(effective: str = "light") -> str:
         font-size: {dt.TYPE_BODY}px;
     }}
 """
-
-
-# Backward-compatible name: light axis at import; prefer build_global_stylesheet.
-GLOBAL_APP_STYLESHEET = build_global_stylesheet("light")

@@ -69,13 +69,18 @@ def reference_text(utterances: list[Utterance], *, until_ms: float | None = None
 
 
 def rttm_lines(utterances: list[Utterance], uri: str, *, until_ms: float | None = None) -> list[str]:
+    clean_uri = re.sub(r"\s+", "_", str(uri).strip()) or "recording"
     lines = []
     for u in utterances:
         if until_ms is not None and u.start_ms >= until_ms:
             continue
         stop = u.end_ms if until_ms is None else min(u.end_ms, until_ms)
-        lines.append(f"SPEAKER {uri} 1 {u.start_ms / 1000:.3f} {(stop - u.start_ms) / 1000:.3f} "
-                     f"<NA> <NA> {u.speaker} <NA> <NA>")
+        dur_s = round((stop - u.start_ms) / 1000, 3)
+        if dur_s <= 0:
+            continue
+        speaker = re.sub(r"\s+", "_", str(u.speaker).strip()) or "speaker"
+        lines.append(f"SPEAKER {clean_uri} 1 {u.start_ms / 1000:.3f} {dur_s:.3f} "
+                     f"<NA> <NA> {speaker} <NA> <NA>")
     return lines
 
 
@@ -91,11 +96,13 @@ def main(argv=None) -> int:
         utterances = read_textgrid(args.textgrid)
         until_ms = args.until * 1000 if args.until is not None else None
         out = args.out or args.textgrid.with_suffix(".txt")
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(reference_text(utterances, until_ms=until_ms), encoding="utf-8")
         print(f"{out}: {sum(1 for u in utterances if until_ms is None or u.start_ms < until_ms)} utterances, "
               f"{len({u.speaker for u in utterances})} tiers")
         if args.rttm:
             lines = rttm_lines(utterances, args.uri or args.textgrid.stem, until_ms=until_ms)
+            args.rttm.parent.mkdir(parents=True, exist_ok=True)
             args.rttm.write_text("\n".join(lines) + "\n", encoding="utf-8")
             print(f"{args.rttm}: {len(lines)} segments")
     except (OSError, ValueError) as exc:

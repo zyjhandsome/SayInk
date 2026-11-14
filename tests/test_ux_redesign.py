@@ -1,26 +1,65 @@
 """User-facing regressions for navigation, mode feedback and history reflow."""
 from __future__ import annotations
 
+from copy import deepcopy
+from pathlib import Path
+
 import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 
-from tests.test_history_window import FakeHistoryStore
-from tests.test_main_window import _make_main_window
+from sayink.config import Config, DEFAULT_CONFIG
+from sayink.history_store import HistoryStore
 from sayink.ui.history_window import HistoryWindow
+from sayink.ui.main_window import MainWindow
 from sayink.ui.settings_components import CompactPickCard
+from sayink.ui.settings_window import SettingsWindow
+from tests.test_history_window import FakeHistoryStore
+
+
+@pytest.fixture(scope="module")
+def _shared_ux_window(_qapp_session, tmp_path_factory):
+    base_dir = Path(tmp_path_factory.mktemp("ux_redesign"))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
+        mp.setattr(SettingsWindow, "_refresh_about_info", lambda self: None)
+        mp.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)
+        mp.setattr("sayink.speech_recognizer.is_model_downloaded", lambda _mid: False)
+        mp.setattr("sayink.config.default_secret_store", lambda: None)
+        mp.setattr("sayink.config.Config._sync_registry_auto_start", lambda self: None)
+        store = HistoryStore(base_dir / "h.db")
+        cfg = Config(config_dir=base_dir)
+        win = MainWindow(cfg, store)
+        win.show()
+        _qapp_session.processEvents()
+        yield win, cfg, store
+        win.hide()
+        win.close()
+        win.deleteLater()
+        cfg._save_timer.stop()
+        store.close()
 
 
 @pytest.fixture
-def main_window(_qapp_session, tmp_path, monkeypatch):
+def main_window(_shared_ux_window, _qapp_session, monkeypatch):
     monkeypatch.setattr("sayink.speech_recognizer.is_model_downloaded", lambda _mid: False)
-    win, store = _make_main_window(tmp_path, monkeypatch)
-    win.show()
+    win, cfg, _store = _shared_ux_window
+    cfg._stop_save_timer()
+    cfg._config = deepcopy(DEFAULT_CONFIG)
+    win._settings._model_cards.pop("preview", None)
+    win._settings._model_hero_status = None
+    win._settings._mic_probe_active = False
+    win._settings.hotkey_capture_ended.emit()
+    win._settings.set_runtime_status("就绪")
+    win._history.set_history_enabled(True)
+    win._settings.reload_settings()
+    win.resize(1040, 700)
+    win.show_page("general")
+    fw = _qapp_session.focusWidget()
+    if fw is not None:
+        fw.clearFocus()
     _qapp_session.processEvents()
-    yield win
-    win.hide()
-    win.deleteLater()
-    store.close()
+    return win
 
 
 def test_keyboard_can_reach_navigation_and_search(main_window, _qapp_session):
@@ -455,7 +494,8 @@ def test_listen_bar_stop_action_matches_session_state(_qapp_session):
         bar.show_recording()
         assert bar._end_btn.isHidden()
     finally:
-        bar.dismiss_if_idle()
+        bar.close()
+        bar.deleteLater()
 
 
 def test_meeting_bar_leaves_draining_state_when_meeting_ends(_qapp_session):
@@ -472,7 +512,8 @@ def test_meeting_bar_leaves_draining_state_when_meeting_ends(_qapp_session):
         assert bar._end_btn.isHidden() and bar._mark_btn.isHidden()
         assert bar._hide_timer.isActive()
     finally:
-        bar.dismiss_if_idle()
+        bar.close()
+        bar.deleteLater()
 
 
 def test_clear_all_cancels_pending_undo(_qapp_session, monkeypatch):

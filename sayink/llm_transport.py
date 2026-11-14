@@ -9,7 +9,8 @@ import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from sayink.text_polisher import (
-    LLMBrokenStream, LLMCancelled, LLMResponseError, LLMTruncatedError, _request_headers,
+    LLMBrokenStream, LLMCancelled, LLMResponseError, LLMTruncatedError,
+    _body_error_message, _content_text, _request_headers,
     chat_completions_url, normalize_api_key, normalize_model_name, strip_model_thinking,
     thinking_payload_extra,
 )
@@ -25,7 +26,19 @@ class LLMDeadlineError(LLMResponseError):
     """The whole call, retries included, ran past its total deadline."""
 
 
-_BILLING_TERMS = ("quota", "credit", "balance", "billing", "spend_limit", "usage_limit", "余额", "额度不足")
+_BILLING_TERMS = (
+    "insufficient_quota",
+    "quota",
+    "credit",
+    "balance",
+    "billing",
+    "arrears",
+    "spend_limit",
+    "usage_limit",
+    "余额",
+    "额度",
+    "欠费",
+)
 
 
 class Cancellation:
@@ -62,10 +75,19 @@ class Cancellation:
 def _error_detail(response):
     try:
         data = response.json()
-        error = data.get("error", data) if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return "", ""
+        error = data.get("error")
+        if isinstance(error, dict):
+            return str(error.get("message") or "").lower(), str(error.get("code") or "").lower()
         if isinstance(error, str):
             return error.lower(), ""
-        return str(error.get("message", "")).lower(), str(error.get("code", "")).lower()
+        msg = data.get("message") or data.get("detail") or ""
+        code = data.get("code") or ""
+        return (
+            msg.lower() if isinstance(msg, str) else "",
+            str(code).lower() if code is not None else "",
+        )
     except (ValueError, AttributeError):
         return "", ""
 
@@ -115,21 +137,31 @@ def _check_choice(choice, *, streamed=False):
     if message.get("refusal"):
         raise LLMResponseError("模型拒绝生成本次内容")
     content = message.get("content")
-    if content is not None and not isinstance(content, str):
+    if content is None:
+        text_part = ""
+    elif isinstance(content, str):
+        text_part = content
+    elif isinstance(content, list):
+        try:
+            text_part = _content_text(content)
+        except LLMResponseError as exc:
+            raise LLMResponseError("API 返回了不支持的正文格式") from exc
+    else:
         raise LLMResponseError("API 返回了不支持的正文格式")
-    return content or "", reason
+    return text_part, reason
 
 
-async def _stream_text(response, *, first_timeout, idle_timeout, on_delta, on_status=None):
+async def _stream_text(response, *, first_timeout, idle_timeout, on_delta, on_status=None, finish_out=None):
     pieces, event_lines = [], []
     finished = False
+    last_reason = None
     visible_chars = reasoning_chars = 0
     activity_deadline = time.monotonic() + first_timeout
     phase = None
     lines = response.aiter_lines().__aiter__()
 
     def consume():
-        nonlocal finished, visible_chars, reasoning_chars, activity_deadline, phase
+        nonlocal finished, last_reason, visible_chars, reasoning_chars, activity_deadline, phase
         if not event_lines:
             return
         raw = "\n".join(event_lines)
@@ -137,6 +169,8 @@ async def _stream_text(response, *, first_timeout, idle_timeout, on_delta, on_st
         if raw == "[DONE]":
             if not finished and not pieces and not reasoning_chars:
                 raise LLMBrokenStream("流式连接提前结束，结果未保存，请重试")
+            if last_reason is None:
+                last_reason = "done"
             finished = True
             return True
         try:
@@ -144,7 +178,8 @@ async def _stream_text(response, *, first_timeout, idle_timeout, on_delta, on_st
         except ValueError as exc:
             raise LLMResponseError("流式响应格式异常") from exc
         if not isinstance(data, dict) or data.get("error"):
-            raise LLMResponseError("流式响应返回错误")
+            detail = _body_error_message(data).strip() if isinstance(data, dict) else ""
+            raise LLMResponseError(f"流式响应返回错误：{detail[:200]}" if detail else "流式响应返回错误")
         choices = data.get("choices")
         if choices == []:  # Optional usage event.
             return
@@ -178,6 +213,8 @@ async def _stream_text(response, *, first_timeout, idle_timeout, on_delta, on_st
             pieces.append(content)
             if on_delta:
                 on_delta(content)
+        if reason is not None:
+            last_reason = str(reason)
         if reason in _DONE_REASONS:
             finished = True
             return True
@@ -208,13 +245,15 @@ async def _stream_text(response, *, first_timeout, idle_timeout, on_delta, on_st
         # SSE comments and event/id fields are intentionally ignored.
     if not finished:
         raise LLMBrokenStream("流式连接提前结束，结果未保存，请重试")
+    if finish_out is not None:
+        finish_out.append(last_reason)
     return _visible_text("".join(pieces))
 
 
 async def completion(client, httpx, *, api_url, api_key, model_name, messages,
                      max_tokens, timeout_sec=120, idle_timeout_sec=45, total_timeout_sec=600,
                      retry_delay_sec=1, on_delta=None, on_retry=None, on_reset=None, on_status=None, capabilities=None,
-                     thinking_mode=None):
+                     thinking_mode=None, action_label="纪要"):
     """Stream by default; downgrade only on an explicit unsupported-stream error.
 
     Each attempt has its own preview. A failed attempt can never be joined
@@ -246,8 +285,9 @@ async def completion(client, httpx, *, api_url, api_key, model_name, messages,
             response = None
             try:
                 async with client.stream("POST", url, headers=headers, json=payload) as response:
-                    log.info("纪要请求 model=%s input_chars=%d attempt=%d status=%d request_id=%s",
-                             model_name, sum(len(m["content"]) for m in messages), attempts,
+                    log.info("%s请求 model=%s input_chars=%d attempt=%d status=%d request_id=%s",
+                             action_label, model_name,
+                             sum(len(str(m.get("content") or "")) for m in messages), attempts,
                              response.status_code, response.headers.get("x-request-id", "")[:100])
                     if response.status_code >= 400:
                         await response.aread()
@@ -267,12 +307,12 @@ async def completion(client, httpx, *, api_url, api_key, model_name, messages,
                             if on_retry:
                                 on_retry("接口不支持流式，正在使用普通请求…")
                             continue
-                        if response.status_code == 400 and "max_tokens" in payload and "max_completion_tokens" in message:
+                        if response.status_code in (400, 422) and "max_tokens" in payload and "max_completion_tokens" in message:
                             payload["max_completion_tokens"] = payload.pop("max_tokens")
                             capabilities["token_parameter"] = "max_completion_tokens"
                             attempts -= 1
                             continue
-                        if response.status_code == 400 and "temperature" in payload and "temperature" in message and any(
+                        if response.status_code in (400, 422) and "temperature" in payload and "temperature" in message and any(
                             term in message for term in ("not support", "unsupported", "only the default", "不支持")
                         ):
                             del payload["temperature"]
@@ -290,10 +330,14 @@ async def completion(client, httpx, *, api_url, api_key, model_name, messages,
                     else:
                         if on_status:
                             on_status("已连接，等待模型响应…")
+                        finish_reason = "stop"
                         if "text/event-stream" in response.headers.get("content-type", "").lower():
+                            finish_box: list[str | None] = []
                             text = await _stream_text(response, first_timeout=timeout_sec,
                                                       idle_timeout=idle_timeout_sec, on_delta=on_delta,
-                                                      on_status=on_status)
+                                                      on_status=on_status, finish_out=finish_box)
+                            if finish_box and finish_box[0]:
+                                finish_reason = str(finish_box[0])
                         else:
                             # Some compatible gateways ignore stream=True and return JSON.
                             await response.aread()
@@ -301,15 +345,17 @@ async def completion(client, httpx, *, api_url, api_key, model_name, messages,
                             choices = data.get("choices") if isinstance(data, dict) else None
                             if not isinstance(choices, list) or not choices:
                                 raise LLMResponseError("API 响应格式异常")
-                            text = _visible_text(_check_choice(choices[0])[0])
+                            raw_content, reason = _check_choice(choices[0])
+                            finish_reason = str(reason or "stop")
+                            text = _visible_text(raw_content)
                             if on_status:
                                 on_status("正在接收正文…")
                             if on_delta:
                                 on_delta(text)
                         if on_status:
                             on_status("正文已接收，正在检查…")
-                        log.info("纪要请求完成 model=%s output_chars=%d elapsed=%.2fs finish_reason=stop",
-                                 model_name, len(text), time.monotonic() - started)
+                        log.info("%s请求完成 model=%s output_chars=%d elapsed=%.2fs finish_reason=%s",
+                                 action_label, model_name, len(text), time.monotonic() - started, finish_reason)
                         return text
             except (httpx.NetworkError, httpx.RemoteProtocolError, httpx.TimeoutException, asyncio.TimeoutError, LLMBrokenStream) as exc:
                 retry_cause = type(exc).__name__
@@ -320,12 +366,12 @@ async def completion(client, httpx, *, api_url, api_key, model_name, messages,
                 else:
                     retry_reason = "模型连接异常"
                 if attempts >= 2:
-                    log.warning("纪要请求失败 model=%s attempt=%d cause=%s elapsed=%.2fs",
-                                model_name, attempts, retry_cause, time.monotonic() - started)
+                    log.warning("%s请求失败 model=%s attempt=%d cause=%s elapsed=%.2fs",
+                                action_label, model_name, attempts, retry_cause, time.monotonic() - started)
                     raise
                 delay = retry_delay_sec * attempts
-            log.warning("纪要请求准备重试 model=%s attempt=%d cause=%s delay=%.2fs elapsed=%.2fs",
-                        model_name, attempts, retry_cause, delay, time.monotonic() - started)
+            log.warning("%s请求准备重试 model=%s attempt=%d cause=%s delay=%.2fs elapsed=%.2fs",
+                        action_label, model_name, attempts, retry_cause, delay, time.monotonic() - started)
             if on_retry:
                 on_retry(f"{retry_reason}，{delay:g} 秒后重试…")
             await asyncio.sleep(delay)

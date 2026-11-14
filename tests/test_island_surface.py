@@ -2,19 +2,11 @@
 
 from __future__ import annotations
 
-import sys
-
 import pytest
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication
 
 from sayink.ui.floating_window import COMPACT_HEIGHT, FloatingWindow
-from sayink.ui.island_chrome import ISLAND_SHEET_WIDTH, position_island
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication(sys.argv)
+from sayink.ui.island_chrome import position_listen_bar
 
 
 @pytest.fixture
@@ -22,6 +14,7 @@ def win(qapp):
     w = FloatingWindow()
     yield w
     w.close()
+    w.deleteLater()
 
 
 class TestIslandMorph:
@@ -79,9 +72,9 @@ class TestIslandChrome:
         assert flags & Qt.WindowType.WindowStaysOnTopHint
         assert flags & Qt.WindowType.Tool
 
-    def test_position_island_centers_near_top(self, qapp, win):
+    def test_position_listen_bar_centers_near_top(self, qapp, win):
         win.resize(320, 56)
-        position_island(win, width=320)
+        position_listen_bar(win, width=320, placement="top_center")
         screen = qapp.primaryScreen().availableGeometry()
         assert win.x() >= screen.x()
         assert win.y() <= screen.y() + 140
@@ -149,16 +142,6 @@ class TestHistoryTimeStream:
             assert any("newer preview" in t for t in texts)
         finally:
             window.close()
-
-
-class TestIslandSheetConstants:
-    def test_sheet_width_constant(self):
-        from sayink.ui.island_chrome import ISLAND_SETTINGS_WIDTH
-
-        assert ISLAND_SHEET_WIDTH >= 440
-        assert ISLAND_SHEET_WIDTH <= 560
-        assert ISLAND_SETTINGS_WIDTH >= ISLAND_SHEET_WIDTH
-        assert ISLAND_SETTINGS_WIDTH <= 760
 
 
 def _qdialog_block(css: str) -> str:

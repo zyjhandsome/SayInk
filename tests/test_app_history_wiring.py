@@ -484,25 +484,19 @@ class TestDictationSharesRecognitionSettings:
             assert h["recognizer"].configure.call_args.args[0] == "sensevoice"
 
     def test_dictation_segmenter_uses_silero_when_downloaded(self) -> None:
-        with app_harness({"stt.vad": "silero"}) as h:
+        with app_harness() as h:
             app = h["app"]
             with patch("sayink.app.aux_model_path", return_value="C:/models/silero_vad.onnx"):
-                app._apply_dictation_segmenter_profile()
+                app._reload_coordinator().apply_dictation_segmenter_profile()
             h["recorder"].set_segmenter_profile.assert_called_with(
                 vad="silero", vad_model_path="C:/models/silero_vad.onnx", meeting=False
             )
 
     def test_dictation_preserves_silero_request_for_recorder_fallback_status(self) -> None:
-        with app_harness({"stt.vad": "silero"}) as h:
-            app = h["app"]
-            with patch("sayink.app.aux_model_path", return_value=None):
-                app._apply_dictation_segmenter_profile()
-            h["recorder"].set_segmenter_profile.assert_called_with(vad="silero", vad_model_path=None, meeting=False)
-
-        with app_harness({"stt.vad": "energy"}) as h:
+        with app_harness() as h:
             app = h["app"]
             with patch("sayink.app.aux_model_path", return_value=None) as path:
-                app._apply_dictation_segmenter_profile()
+                app._reload_coordinator().apply_dictation_segmenter_profile()
             path.assert_called()
             h["recorder"].set_segmenter_profile.assert_called_with(vad="silero", vad_model_path=None, meeting=False)
 
@@ -534,7 +528,7 @@ class TestDictationSharesRecognitionSettings:
 
         calls: list[tuple] = []
 
-        def fake_make_embedder(path, *, enabled=True, activity_enabled=False):
+        def fake_make_embedder(path, *, enabled=True, activity_enabled=False, activity_path=None, **_kw):
             calls.append((path, bool(enabled), bool(activity_enabled)))
             if enabled and path:
                 return _FakeCampPlus()
@@ -805,7 +799,7 @@ def test_stuck_polish_falls_back_to_raw_text() -> None:
         assert app._output_busy is True
         assert not paster.paste_async.called
 
-        app._release_stuck_output(app._output_token)
+        app._output_pipeline().release_stuck_output(app._output_token)
 
         # The raw words went to the paster as a degraded output ...
         assert paster.paste_async.call_args[0][0] == "AAA"
@@ -824,7 +818,7 @@ def test_polish_answering_after_the_timeout_is_not_pasted_again() -> None:
         app, paster = h["app"], h["paster"]
         app._begin_transcription(_audio())
         app._on_final_result("AAA")
-        app._release_stuck_output(app._output_token)
+        app._output_pipeline().release_stuck_output(app._output_token)
         assert h["polisher"].cancel.called
         paster.paste_async.call_args[0][1]("pasted")
 
@@ -842,7 +836,7 @@ def test_stuck_paste_releases_queue_and_keeps_words_on_clipboard() -> None:
         app._enqueue_audio(_audio())
         assert paster.paste_async.call_args[0][0] == "AAA。"
 
-        app._release_stuck_output(app._output_token)
+        app._output_pipeline().release_stuck_output(app._output_token)
 
         assert app._output_busy is False
         copy.assert_called_once_with("AAA。")
@@ -863,7 +857,7 @@ def test_stuck_paste_still_saves_the_sentence_to_history() -> None:
         app._on_polish_complete("AAA。")
         assert _enqueued_records(h["history"]) == []
 
-        app._release_stuck_output(app._output_token)
+        app._output_pipeline().release_stuck_output(app._output_token)
 
         records = _enqueued_records(h["history"])
         assert [(r.raw_text, r.polished_text) for r in records] == [("AAA", "AAA。")]
@@ -904,11 +898,11 @@ def test_empty_output_releases_stage_and_pending_record() -> None:
 def test_stale_watchdog_does_not_release_a_newer_output() -> None:
     with app_harness(_POLISH_ON) as h:
         app = h["app"]
-        app._mark_output_busy()
+        app._output_pipeline().mark_busy()
         stale = app._output_token
-        app._mark_output_busy()
+        app._output_pipeline().mark_busy()
 
-        app._release_stuck_output(stale)
+        app._output_pipeline().release_stuck_output(stale)
 
         assert app._output_busy is True
 

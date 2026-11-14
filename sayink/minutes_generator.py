@@ -103,7 +103,8 @@ def request_fingerprint(request: MinutesRequest) -> str:
         "credential": hashlib.sha256(request.api_key.encode()).hexdigest(),
         "model": request.model_name, "template": asdict(request.template),
         "context": asdict(request.context), "lines": [asdict(line) for line in request.lines],
-        "names": request.speaker_names, "language": request.output_language,
+        "names": request.speaker_names,
+        "language": "" if request.template.is_refinement else request.output_language,
         "chunk_chars": request.chunk_chars, "context_tokens": request.context_window_tokens,
         "output_tokens": request.max_output_tokens,
         "prompts": [
@@ -310,6 +311,7 @@ class MinutesWorker(QThread):
             on_status=lambda text: self.progress.emit(self._stage + " · " + text),
             capabilities=self._capabilities,
             thinking_mode="disabled" if self._req.template.is_refinement else None,
+            action_label="原文精整" if self._req.template.is_refinement else "纪要",
         )
         self._publish_preview()
         return raw
@@ -431,11 +433,14 @@ class MinutesWorker(QThread):
         size = max(64, int(self._req.chunk_chars))
         merge_system: str | None = None
         while True:
-            chunk_items = chunk_transcript_with_spans(
-                self._req.lines, self._req.speaker_names, max_chars=size,
-                show_speakers=self._req.speakers_distinguished, show_times=self._req.timestamps_available,
-                label_unknown=self._req.label_unknown,
-            )
+            try:
+                chunk_items = chunk_transcript_with_spans(
+                    self._req.lines, self._req.speaker_names, max_chars=size,
+                    show_speakers=self._req.speakers_distinguished, show_times=self._req.timestamps_available,
+                    label_unknown=self._req.label_unknown,
+                )
+            except ValueError as exc:
+                raise LLMContextError(str(exc)) from exc
             chunks = [item[0] for item in chunk_items]
             spans = [(item[1], item[2]) for item in chunk_items]
             if len(chunks) > 1:
@@ -627,10 +632,14 @@ class MinutesWorker(QThread):
 
     async def _run_pipeline(self, httpx, started):
         req = self._req
-        transcript_text = render_transcript(
-            req.lines, req.speaker_names,
-            show_speakers=req.speakers_distinguished, show_times=req.timestamps_available,
-            label_unknown=req.label_unknown,
+        transcript_text = (
+            ""
+            if req.template.is_refinement
+            else render_transcript(
+                req.lines, req.speaker_names,
+                show_speakers=req.speakers_distinguished, show_times=req.timestamps_available,
+                label_unknown=req.label_unknown,
+            )
         )
         system_prompt = build_system_prompt(
             req.template, output_language=req.output_language,
@@ -726,8 +735,8 @@ class MinutesWorker(QThread):
 _FACT_NORM_RE = re.compile(r"[\s,，。；;：:！!？?、\-—·()（）\[\]\"'“”‘’]+")
 _MD_TS_TRAIL_RE = re.compile(r"\s*\[(\d{1,}:\d{2}:\d{2})\]\s*$")
 _MD_ACTION_RE = re.compile(
-    r"^(?:-\s*(?:\[[ xX]\]\s*)?)?(?P<task>.+?)"
-    r"(?:\s+[—\-]+\s*@?(?P<owner>[^·\[\n]+?))?"
+    r"^(?:(?:[-*+]|\d+[.)、])\s*(?:\[[ xX]\]\s*)?)?(?P<task>.+?)"
+    r"(?:(?:\s+[—\-]+|\s*—+)\s*@?(?P<owner>[^·\[\n]+?))?"
     r"(?:\s*·\s*(?P<due>[^\[\n]+?))?"
     r"(?:\s*\[(?P<ts>\d{1,}:\d{2}:\d{2})\])?\s*$"
 )
@@ -841,9 +850,30 @@ def _markdown_to_partial(markdown_text: str, template: MinutesTemplate) -> dict[
                     "ts": (m.group("ts") or "").strip(),
                 })
         elif current_sec == SECTION_CHAPTERS:
-            bullet = re.sub(r"^[-*+]\s+", "", line).replace("**", "")
-            if bullet:
-                partial["chapters"].append({"title": bullet, "start": "", "end": "", "summary": ""})
+            bullet = re.sub(r"^[-*+]\s+", "", line).replace("**", "").strip()
+            m_ch = re.match(
+                r"^(?:\[(?P<start>\d{1,}:\d{2}:\d{2})\](?:\s*[–—\-~～至到]+\s*\[(?P<end>\d{1,}:\d{2}:\d{2})\])?\s*)?"
+                r"(?P<body>.+)$",
+                bullet,
+            ) if bullet else None
+            if m_ch:
+                ch_start = (m_ch.group("start") or "").strip()
+                ch_end = (m_ch.group("end") or "").strip()
+                ch_body = m_ch.group("body").strip()
+                if "：" in ch_body:
+                    ch_title, ch_sum = ch_body.split("：", 1)
+                elif ":" in ch_body and not re.match(r"^\d{1,2}:\d{2}", ch_body):
+                    ch_title, ch_sum = ch_body.split(":", 1)
+                else:
+                    ch_title, ch_sum = ch_body, ""
+                ch_title = ch_title.strip()
+                if ch_title:
+                    partial["chapters"].append({
+                        "title": ch_title,
+                        "start": ch_start,
+                        "end": ch_end,
+                        "summary": ch_sum.strip(),
+                    })
         elif current_sec == SECTION_SPEAKERS:
             bullet = re.sub(r"^[-*+]\s+", "", line).replace("**", "")
             if "：" in bullet:
@@ -931,7 +961,7 @@ def _preserve_facts(payload, partials):
 
 
 # Matched with ``match(text, pos)``: anchored at ``pos`` (a line start).
-_LINE_PREFIX_RE = re.compile(r"(?:\[\d{2,}:\d{2}:\d{2}\][^\n：]*：|[^\n\[\]：]{1,24}：)")
+_LINE_PREFIX_RE = re.compile(r"(?:\[\d{1,}:\d{2}:\d{2}\](?:\s+[^\s\[\]：][^\n：]{0,23}：|\s*)|[^\n\[\]：]{1,24}：)")
 
 
 def _split_chunk(text):
@@ -950,6 +980,7 @@ def _split_chunk(text):
 
 
 def _concat_partials(partials: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    list_keys = ("topics", "decisions", "action_items", "open_questions", "chapters", "speakers")
     merged: dict[str, Any] = {
         "title": "",
         "summary": "",
@@ -960,6 +991,7 @@ def _concat_partials(partials: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "chapters": [],
         "speakers": [],
     }
+    seen_by_key: dict[str, set[str]] = {key: set() for key in list_keys}
     summaries = []
     for part in partials:
         if not isinstance(part, dict):
@@ -968,10 +1000,10 @@ def _concat_partials(partials: Sequence[dict[str, Any]]) -> dict[str, Any]:
             merged["title"] = part["title"]
         if part.get("summary"):
             summaries.append(str(part["summary"]).strip())
-        for key in ("topics", "decisions", "action_items", "open_questions", "chapters", "speakers"):
+        for key in list_keys:
             value = part.get(key)
             if isinstance(value, list):
-                seen = {json.dumps(item, sort_keys=True, ensure_ascii=False) for item in merged[key]}
+                seen = seen_by_key[key]
                 for item in value:
                     identity = json.dumps(item, sort_keys=True, ensure_ascii=False)
                     if identity not in seen:

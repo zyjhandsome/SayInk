@@ -79,7 +79,7 @@ def test_early_lock_release_waits_for_storage_busy_then_fires_once_before_worker
         with app_harness() as h:
             app = h["app"]
             released: list[str] = []
-            app.set_instance_lock_releaser(lambda: released.append("released"))
+            app._on_release_instance_lock = lambda: released.append("released")
             h["recorder"].storage_busy = True
             h["recognizer"].running_workers = (worker,)
 
@@ -179,7 +179,7 @@ def test_relaunch_during_dying_instance_native_drain_is_not_ghost_swallowed(
                 srv, server_1 = server_1, None
                 main_mod.release_instance_lock(srv)
 
-            app_1.set_instance_lock_releaser(_release_once)
+            app_1._on_release_instance_lock = _release_once
 
             with (
                 patch("sayink.app.QTimer.singleShot"),

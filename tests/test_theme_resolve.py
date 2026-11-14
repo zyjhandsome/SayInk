@@ -85,24 +85,28 @@ class TestSettingsAppearanceEntry:
 
         cfg = Config(config_dir=tmp_path)
         win = SettingsWindow(cfg)
+        try:
+            assert win._theme_combo.findData("system") >= 0
+            assert win._theme_combo.findData("light") >= 0
+            assert win._theme_combo.findData("dark") >= 0
 
-        assert win._theme_combo.findData("system") >= 0
-        assert win._theme_combo.findData("light") >= 0
-        assert win._theme_combo.findData("dark") >= 0
+            dark_index = win._theme_combo.findData("dark")
+            win._theme_combo.setCurrentIndex(dark_index)
+            assert cfg.get("appearance.theme_mode") == "dark"
 
-        dark_index = win._theme_combo.findData("dark")
-        win._theme_combo.setCurrentIndex(dark_index)
-        assert cfg.get("appearance.theme_mode") == "dark"
+            apply_theme(mode="dark", surfaces=(win,))
+            from sayink.ui import design_tokens as tok
 
-        apply_theme(mode="dark", surfaces=(win,))
-        from sayink.ui import design_tokens as tok
-
-        css = win.styleSheet()
-        assert tok.tokens_for("dark")["TEXT"] in css
-        assert "background: transparent" in css
-        dialog_block = css.split("QDialog {", 1)[1].split("}", 1)[0]
-        assert "background: transparent" in dialog_block
-        assert f"background: {tok.tokens_for('dark')['BG']}" not in dialog_block
+            css = win.styleSheet()
+            assert tok.tokens_for("dark")["TEXT"] in css
+            assert "background: transparent" in css
+            dialog_block = css.split("QDialog {", 1)[1].split("}", 1)[0]
+            assert "background: transparent" in dialog_block
+            assert f"background: {tok.tokens_for('dark')['BG']}" not in dialog_block
+        finally:
+            win.close()
+            win.deleteLater()
+            apply_theme(mode="light")
 
     def test_settings_island_header_restyles_on_dark_theme(
         self, tmp_path: Path, monkeypatch
@@ -309,16 +313,20 @@ class TestSurfaceThemeReapply:
 
         QApplication.instance() or QApplication(sys.argv)
         win = FloatingWindow()
-        apply_theme(mode="light", surfaces=(win,))
-        sheet = win._container.styleSheet()
-        assert (
-            "255, 255, 255" in sheet
-            or "243, 244, 246" in sheet
-            or "#F3F4F6" in sheet.upper()
-            or "#FFFFFF" in sheet.upper()
-        )
-        assert "39, 39, 41" not in sheet
-        assert "islandContainer" in sheet
+        try:
+            apply_theme(mode="light", surfaces=(win,))
+            sheet = win._container.styleSheet()
+            assert (
+                "255, 255, 255" in sheet
+                or "243, 244, 246" in sheet
+                or "#F3F4F6" in sheet.upper()
+                or "#FFFFFF" in sheet.upper()
+            )
+            assert "39, 39, 41" not in sheet
+            assert "islandContainer" in sheet
+        finally:
+            win.close()
+            win.deleteLater()
 
     def test_tray_menu_stylesheet_follows_dark(self):
         from sayink.ui.theme import apply_theme
@@ -344,11 +352,16 @@ class TestSurfaceThemeReapply:
         monkeypatch.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)
 
         win = SettingsWindow(Config(config_dir=tmp_path))
-        apply_theme(mode="dark", surfaces=(win,))
-        assert (
-            win._history_retention_days_spin.width()
-            == win._history_max_entries_spin.width()
-        )
+        try:
+            apply_theme(mode="dark", surfaces=(win,))
+            assert (
+                win._history_retention_days_spin.width()
+                == win._history_max_entries_spin.width()
+            )
+        finally:
+            win.close()
+            win.deleteLater()
+            apply_theme(mode="light")
 
     def test_history_reapply_keeps_construct_visual_language(self, tmp_path: Path):
         """Theme reapply must not regress History construct QSS (focus/hover/accent)."""
@@ -363,32 +376,36 @@ class TestSurfaceThemeReapply:
         QApplication.instance() or QApplication(sys.argv)
         store = HistoryStore(tmp_path / "history.db")
         win = HistoryWindow(store)
-        apply_theme(mode="dark", surfaces=(win,))
+        try:
+            apply_theme(mode="dark", surfaces=(win,))
 
-        search = win._search_edit.styleSheet()
-        assert "QLineEdit:focus" in search
-        assert "#222528" in search.upper()  # dark SURFACE_PEARL
+            search = win._search_edit.styleSheet()
+            assert "QLineEdit:focus" in search
+            assert "#222528" in search.upper()  # dark SURFACE_PEARL
 
-        list_css = win._session_list.styleSheet()
-        assert "border-left" in list_css
-        assert "item:hover" in list_css
-        assert "background: transparent" in list_css
+            list_css = win._session_list.styleSheet()
+            assert "border-left" in list_css
+            assert "item:hover" in list_css
+            assert "background: transparent" in list_css
 
-        details = win._details.styleSheet()
-        assert "background: transparent" in details
-        assert "border: none" in details
+            details = win._details.styleSheet()
+            assert "background: transparent" in details
+            assert "border: none" in details
 
-        assert hasattr(win, "_title_label")
-        title_css = win._title_label.styleSheet().upper()
-        assert "#F9FAFB" in title_css  # dark TEXT
+            assert hasattr(win, "_title_label")
+            title_css = win._title_label.styleSheet().upper()
+            assert "#F9FAFB" in title_css  # dark TEXT
 
-        undo_css = win._undo_bar.styleSheet().upper()
-        assert "#222528" in undo_css  # dark SURFACE_PEARL
+            undo_css = win._undo_bar.styleSheet().upper()
+            assert "#222528" in undo_css  # dark SURFACE_PEARL
 
-        feedback_css = win._feedback_label.styleSheet().upper()
-        assert "#F9FAFB" in feedback_css
-
-        store.close()
+            feedback_css = win._feedback_label.styleSheet().upper()
+            assert "#F9FAFB" in feedback_css
+        finally:
+            win.close()
+            win.deleteLater()
+            store.close()
+            apply_theme(mode="light")
 
     def test_history_stream_row_labels_follow_theme_reapply(self):
         """Time-stream row labels must restyle when the theme axis flips."""
@@ -462,11 +479,15 @@ class TestSurfaceThemeReapply:
         assert plate.red() > plate.blue() * 3
 
         tray = TrayIcon()
-        before = tray._recording_icon
-        apply_theme(mode="light", surfaces=(tray,))
-        assert tray._recording_icon is not before
-        assert not tray._recording_icon.isNull()
-        assert not tray._attention_icon.isNull()
+        try:
+            before = tray._recording_icon
+            apply_theme(mode="light", surfaces=(tray,))
+            assert tray._recording_icon is not before
+            assert not tray._recording_icon.isNull()
+            assert not tray._attention_icon.isNull()
+        finally:
+            tray.hide()
+            tray.deleteLater()
 
     def test_float_close_hover_is_theme_aware(self):
         import sys
@@ -479,17 +500,21 @@ class TestSurfaceThemeReapply:
 
         QApplication.instance() or QApplication(sys.argv)
         win = FloatingWindow()
-        assert not hasattr(win, "_close_btn")
-        assert win._end_btn.text() == "结束"
-        apply_theme(mode="light", surfaces=(win,))
-        sheet = win._end_btn.styleSheet()
-        assert tok.PRIMARY_CONTAINER in sheet
-        assert tok.PRIMARY_CONTAINER_HOVER in sheet
-        apply_theme(mode="dark", surfaces=(win,))
-        dark_sheet = win._end_btn.styleSheet()
-        assert tok.PRIMARY_CONTAINER in dark_sheet
-        assert tok.PRIMARY_CONTAINER_HOVER in dark_sheet
-        apply_theme(mode="light")
+        try:
+            assert not hasattr(win, "_close_btn")
+            assert win._end_btn.text() == "结束"
+            apply_theme(mode="light", surfaces=(win,))
+            sheet = win._end_btn.styleSheet()
+            assert tok.PRIMARY_CONTAINER in sheet
+            assert tok.PRIMARY_CONTAINER_HOVER in sheet
+            apply_theme(mode="dark", surfaces=(win,))
+            dark_sheet = win._end_btn.styleSheet()
+            assert tok.PRIMARY_CONTAINER in dark_sheet
+            assert tok.PRIMARY_CONTAINER_HOVER in dark_sheet
+        finally:
+            win.close()
+            win.deleteLater()
+            apply_theme(mode="light")
 
 
 class TestSettingsThemeAwareBroadcast:
@@ -604,9 +629,13 @@ class TestFourSurfaceThemeAwareProtocol:
                 assert isinstance(surface, ThemeAware)
         finally:
             settings.close()
+            settings.deleteLater()
             history.close()
+            history.deleteLater()
             floating.close()
+            floating.deleteLater()
             tray.hide()
+            tray.deleteLater()
             history._store.close()
 
     def test_apply_theme_dark_refreshes_all_four_surfaces(
@@ -658,9 +687,13 @@ class TestFourSurfaceThemeAwareProtocol:
             assert tok.TEXT.upper() in history._title_label.styleSheet().upper()
         finally:
             settings.close()
+            settings.deleteLater()
             history.close()
+            history.deleteLater()
             floating.close()
+            floating.deleteLater()
             tray.hide()
+            tray.deleteLater()
             apply_theme(mode="light")
             history._store.close()
 
@@ -758,7 +791,8 @@ def test_runtime_switch_leaves_no_widget_with_old_theme_colors(
     app = QApplication.instance() or QApplication(sys.argv)
     monkeypatch.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)
     apply_theme(mode=start)
-    win = MainWindow(Config(config_dir=tmp_path), HistoryStore(tmp_path / "h.db"))
+    store = HistoryStore(tmp_path / "h.db")
+    win = MainWindow(Config(config_dir=tmp_path), store)
     floating = FloatingWindow()
     try:
         for key in PAGE_KEYS:
@@ -778,7 +812,10 @@ def test_runtime_switch_leaves_no_widget_with_old_theme_colors(
         assert stale == []
     finally:
         win.close()
+        win.deleteLater()
         floating.close()
+        floating.deleteLater()
+        store.close()
         apply_theme(mode="light")
 
 

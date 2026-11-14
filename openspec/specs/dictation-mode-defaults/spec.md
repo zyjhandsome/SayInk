@@ -1,7 +1,9 @@
 # dictation-mode-defaults Specification
 
 ## Purpose
-TBD - created by archiving change dictation-mode-defaults. Update Purpose after archive.
+
+定义单次转写、持续转写与会议模式的默认设置边界、独立结果去向记忆、即时生效与运行期保护规则，以及会议文字稿在会中/会后的按段编辑行为。
+
 ## Requirements
 ### Requirement: Single and continuous dictation remember output separately
 
@@ -174,8 +176,3 @@ While a meeting is live or paused, the system MUST let the user edit the text of
 - **WHEN** 会议已结束或已中断，从未生成纪要，也没有正在生成
 - **THEN** 用户可以按段编辑文字稿
 - **AND** 提示说明现在可以编辑，而不是要求先完成纪要生成
-
----
-
-# dictation-mode-defaults：需求规格
-

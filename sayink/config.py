@@ -27,10 +27,6 @@ STT_MODEL_MIGRATION_VERSION = 2
 _TEST_POLLUTION_KEYS = frozenset({"test_key", "atomic_test"})
 
 
-def _get_default_models_dir() -> Path:
-    return default_models_dir()
-
-
 def format_hotkey(hotkey: str) -> str:
     if not hotkey:
         return ""
@@ -109,7 +105,6 @@ DEFAULT_CONFIG = {
         # 识别增强——转写与会议共用（曾是 meeting.* 键，启动时自动迁移）。
         "glossary": [],            # [{"term": "张鑫", "variants": ["张新"]}] → 热词
         "language": "auto",        # 语种锁定；auto → zh（支持 language 的模型）
-        "vad": "silero",           # 旧设置保留兼容；运行时自动尝试 Silero，失败时按音量分段
         "boundary_context_enabled": False,
     },
     "llm": {
@@ -139,7 +134,7 @@ DEFAULT_CONFIG = {
     },
     # 会议记录 / 会议纪要（docs/meeting-notes-design.md §4.8）。
     "meeting": {
-        "input_source": "mixed",   # 新会议默认麦克风 + 电脑声音；空 = 跟随转写音源
+        "input_source": "mixed",   # 新会议默认麦克风 + 电脑声音；不随转写音源变化
         "model_id": "",            # 空 = 沿用 stt.model_id
         "show_start_card": True,
         "polish_segments": False,
@@ -256,11 +251,12 @@ def _coerce_known_value(default_value, value):
         return copy.deepcopy(default_value), True
     return value, False
 # Keys that moved from the meeting section to stt (shared by dictation).
-SHARED_RECOGNITION_KEYS = ("glossary", "language", "vad")
+SHARED_RECOGNITION_KEYS = ("glossary", "language")
 # Retired manual recognition switches replaced by automatic mode/source policies.
 # Stripped on load so stale True/False values in older config.json files neither
 # error nor override automatic quiet-speech / speaker diarization behavior.
 RETIRED_RECOGNITION_SWITCH_KEYS = frozenset({
+    "vad",
     "speaker_model_enabled",
     "speaker_activity_enabled",
     "quiet_speech_enabled",
@@ -272,6 +268,9 @@ RETIRED_MEETING_KEYS = frozenset({
     "hotkey",
     "separate_lanes",
 })
+# The sources a meeting can record. 「跟随转写」 (stored as "") was retired:
+# it made a meeting record only the microphone whenever dictation did.
+MEETING_INPUT_SOURCES = ("mixed", "microphone", "system")
 # Run-key value name written by VoiceInk ≤ 2.1.0; removed once on first start.
 LEGACY_AUTO_START_VALUE = "VoiceInk"
 STARTUP_APPROVED_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
@@ -279,14 +278,19 @@ STARTUP_APPROVED_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\
 
 class _SaveTimerRelay(QObject):
     request_start = pyqtSignal(int)
+    request_stop = pyqtSignal()
 
     def __init__(self, timer: QTimer) -> None:
         super().__init__()
         self._timer = timer
         self.request_start.connect(self._on_start)
+        self.request_stop.connect(self._on_stop)
 
     def _on_start(self, delay_ms: int) -> None:
         self._timer.start(delay_ms)
+
+    def _on_stop(self) -> None:
+        self._timer.stop()
 
 
 class Config:
@@ -296,6 +300,7 @@ class Config:
         secret_store=None,
         *,
         file_secrets: bool | None = None,
+        sync_auto_start: bool | None = None,
     ):
         explicit_dir = config_dir is not None
         if config_dir is not None:
@@ -312,6 +317,9 @@ class Config:
         if file_secrets is None:
             file_secrets = self._secrets is None and explicit_dir
         self._file_secrets = bool(file_secrets) and self._secrets is None
+        self._sync_auto_start = (
+            (not explicit_dir) if sync_auto_start is None else bool(sync_auto_start)
+        )
         self._secret_value: str | None = None
         self._secret_persist_failed = False
         self._secret_read_failed = False
@@ -322,7 +330,7 @@ class Config:
         self.corrupt_recovered = False
         self.last_save_failed = False
         self._config_file = self._config_dir / "config.json"
-        self._models_dir = _get_default_models_dir()
+        self._models_dir = default_models_dir()
         self._config: dict = {}
         self._extra_keys: dict = {}
         # 延迟保存机制：避免频繁写入文件（支持跨线程安全触发）
@@ -332,7 +340,8 @@ class Config:
         self._save_relay = _SaveTimerRelay(self._save_timer)
         self._ensure_dirs()
         self._load()
-        self._sync_registry_auto_start()
+        if self._sync_auto_start:
+            self._sync_registry_auto_start()
 
     def _ensure_dirs(self):
         self._config_dir.mkdir(parents=True, exist_ok=True)
@@ -371,22 +380,27 @@ class Config:
             self._config["first_run_welcome_seen"] = False
         # Before any migration save, so a plaintext key is lifted into memory
         # and stripped instead of being written back out.
-        self._load_secret()
+        secret_migrated = self._load_secret(defer_save=True)
         output_migrated = self._migrate_output_by_mode()
+        meeting_source_migrated = self._migrate_meeting_input_source()
+        stt_migrated = self._migrate_stt_model(defer_save=True)
+        test_stripped = self._strip_test_pollution()
         if (
             not self._persist_blocked
             and (
-                self._strip_test_pollution()
+                test_stripped
+                or secret_migrated
                 or moved
                 or retired_cleaned
                 or output_migrated
+                or meeting_source_migrated
+                or stt_migrated
                 or self._type_repairs
             )
         ):
             self.save_immediate()
-        self._migrate_stt_model()
 
-    def _load_secret(self) -> None:
+    def _load_secret(self, *, defer_save: bool = False) -> bool:
         store = getattr(self, "_secrets", None)
         in_file = str(self._config.get("llm", {}).get("api_key", "") or "")
         if store is None:
@@ -395,7 +409,7 @@ class Config:
                 self._secret_persist_failed = True
                 self._preserve_legacy_file_key = True
                 log.warning("没有可用的凭据存储，已保留配置文件中的 API Key 以免重启丢失")
-            return
+            return False
         stored = store.read()
         if stored is None:
             self._secret_value = in_file
@@ -405,33 +419,31 @@ class Config:
             elif store.write(in_file):
                 self._preserve_legacy_file_key = False
                 self._config.setdefault("llm", {})["api_key"] = ""
-                self.save_immediate()
+                if not defer_save:
+                    self.save_immediate()
                 log.info("凭据管理器读取失败但写入成功，API Key 已迁移")
+                return True
             else:
                 self._secret_persist_failed = True
                 self._preserve_legacy_file_key = True
                 log.warning("凭据管理器不可读写，已保留配置文件中的 API Key 以免重启丢失")
-            return
+            return False
+        migrated = False
         if in_file and store.write(in_file):
             log.info("已将 API Key 从配置文件迁移到 Windows 凭据管理器")
             stored = in_file
             self._preserve_legacy_file_key = False
             self._config.setdefault("llm", {})["api_key"] = ""
-            self.save_immediate()
+            if not defer_save:
+                self.save_immediate()
+            migrated = True
         elif in_file:
             stored = in_file
             self._secret_persist_failed = True
             self._preserve_legacy_file_key = True
             log.warning("API Key 未能迁移到凭据管理器，已保留配置文件中的 API Key 以免重启丢失")
         self._secret_value = stored
-
-    def _scrub_plaintext_key(self, reason: str) -> None:
-        """Drop a legacy plaintext key from config.json only when explicitly requested."""
-        self._preserve_legacy_file_key = False
-        self._config.setdefault("llm", {})["api_key"] = ""
-        self._secret_persist_failed = True
-        self.save_immediate()
-        log.warning(reason)
+        return migrated
 
     @property
     def secret_persist_failed(self) -> bool:
@@ -445,8 +457,6 @@ class Config:
 
     def _backup_unreadable_config(self) -> Path | None:
         """Keep the unreadable file so the next save cannot erase API keys etc."""
-        import time
-
         backup = self._config_dir / f"config.corrupt-{time.strftime('%Y%m%d-%H%M%S')}.json"
         try:
             os.replace(self._config_file, backup)
@@ -485,7 +495,7 @@ class Config:
 
     @staticmethod
     def _migrate_recognition_settings(raw: dict) -> bool:
-        """Glossary / language / VAD used to be meeting-only (``meeting.*``);
+        """Glossary / language used to be meeting-only (``meeting.*``);
         dictation shares them now under ``stt.*``. Move the values once so
         nobody loses their term list. Returns True on change."""
         meeting = raw.get("meeting")
@@ -507,17 +517,31 @@ class Config:
             raw["stt"] = stt
         return moved
 
-    def _migrate_stt_model(self) -> None:
+    def _migrate_meeting_input_source(self) -> bool:
+        """A saved 「跟随转写」 (empty) or unknown meeting source becomes mixed.
+
+        Explicit choices are kept. Returns True on change.
+        """
+        meeting = self._config.get("meeting")
+        if not isinstance(meeting, dict) or meeting.get("input_source") in MEETING_INPUT_SOURCES:
+            return False
+        meeting["input_source"] = DEFAULT_CONFIG["meeting"]["input_source"]
+        log.info("升级迁移：会议音频来源不再跟随转写，已改为麦克风 + 电脑声音")
+        return True
+
+    def _migrate_stt_model(self, *, defer_save: bool = False) -> bool:
         """One-time upgrade: former app defaults → Fun-ASR-Nano."""
         stt = self._config.setdefault("stt", {})
         if stt.get("migration_version", 0) >= STT_MODEL_MIGRATION_VERSION:
-            return
+            return False
         cur = stt.get("model_id", DEFAULT_MODEL_ID)
         if cur in LEGACY_DEFAULT_MODEL_IDS and cur != DEFAULT_MODEL_ID:
             log.info("升级迁移：语音模型 %s → %s", cur, DEFAULT_MODEL_ID)
             stt["model_id"] = DEFAULT_MODEL_ID
         stt["migration_version"] = STT_MODEL_MIGRATION_VERSION
-        self.save_immediate()
+        if not defer_save:
+            self.save_immediate()
+        return True
 
     @staticmethod
     def _is_startup_disabled_by_windows(winreg) -> bool:
@@ -557,16 +581,15 @@ class Config:
 
             key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
             expected_cmd = auto_start_command()
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
             registered = False
             reg_value = ""
-            try:
-                raw_val, _ = winreg.QueryValueEx(key, "SayInk")
-                reg_value = str(raw_val or "").strip()
-                registered = bool(reg_value)
-            except FileNotFoundError:
-                pass
-            winreg.CloseKey(key)
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+                try:
+                    raw_val, _ = winreg.QueryValueEx(key, "SayInk")
+                    reg_value = str(raw_val or "").strip()
+                    registered = bool(reg_value)
+                except FileNotFoundError:
+                    pass
 
             if self._drop_legacy_auto_start_value(winreg, key_path):
                 if not registered:
@@ -721,6 +744,10 @@ class Config:
         app = QCoreApplication.instance()
         if app is None or QThread.currentThread() is timer.thread():
             timer.stop()
+        else:
+            relay = getattr(self, "_save_relay", None)
+            if relay is not None:
+                relay.request_stop.emit()
 
     def _do_save(self):
         """实际执行保存操作"""
@@ -867,7 +894,7 @@ class Config:
         self._schedule_save(500)
 
     def get_all(self) -> dict:
-        return copy.deepcopy(self._config)
+        return copy.deepcopy({**self._config, **self._extra_keys})
 
     # ── Output mode ───────────────────────────────────
 

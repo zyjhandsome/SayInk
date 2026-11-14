@@ -15,7 +15,7 @@ from sayink.minutes_prompts import (
     MeetingContext,
     TranscriptLine,
     build_system_prompt,
-    chunk_transcript,
+    chunk_transcript_with_spans,
     get_template,
     render_transcript,
 )
@@ -269,10 +269,13 @@ def test_default_prompt_and_fingerprint_stay_stable_when_shape_flags_are_true():
     )
     assert request_fingerprint(changed) != request_fingerprint(request)
     assert render_transcript([TranscriptLine(0, 1, "润色")]) == "[00:00:00] 说话人1：润色"
-    assert chunk_transcript(
-        [TranscriptLine(0, 0, "本周完成了检索。")], None, max_chars=200,
-        show_speakers=False, show_times=False,
-    ) == ["本周完成了检索。"]
+    assert [
+        c[0]
+        for c in chunk_transcript_with_spans(
+            [TranscriptLine(0, 0, "本周完成了检索。")], None, max_chars=200,
+            show_speakers=False, show_times=False,
+        )
+    ] == ["本周完成了检索。"]
 
 
 def test_refinement_input_omits_the_unconfirmed_label_when_speakers_were_not_imported():
@@ -536,5 +539,41 @@ def test_mixed_transcript_does_not_invent_an_srt_clock(tmp_path):
             assert "没有时间" in controller.srt_skip_note
         finally:
             controller.shutdown()
+    finally:
+        history.close(timeout=2)
+
+
+def test_wall_clock_import_normalizes_duration_and_midnight_rollover(tmp_path):
+    history = HistoryStore(db_path=tmp_path / "history.db")
+    meetings = MeetingStore(history)
+    try:
+        day_text = (
+            "张三 2026-11-12 14:30:00\n今天先看检索。\n\n"
+            "李四 2026-11-12 15:05:00\n下周联调。\n"
+        )
+        day_parsed = parse_transcript(day_text)
+        assert day_parsed.wall_clock_offsets is True
+        day_rec = meetings.create_meeting_from_transcript(day_parsed, title="下午评审")
+        assert day_rec is not None and meetings.flush()
+        day_saved = meetings.get_meeting(day_rec.id)
+        assert day_saved.duration_ms == 35 * 60 * 1000
+        day_segs = meetings.get_segments(day_rec.id)
+        assert day_segs[0].captured_at == day_saved.started_at
+        assert day_segs[0].duration_ms == 35 * 60 * 1000
+        assert day_segs[1].captured_at == day_saved.started_at + 35 * 60 * 1000
+
+        midnight_text = (
+            "[2026-11-12 23:58:00] 张三：夜班交接开始。\n"
+            "[2026-11-13 00:03:00] 李四：交接完成。\n"
+        )
+        mid_parsed = parse_transcript(midnight_text)
+        assert mid_parsed.wall_clock_offsets is True
+        mid_rec = meetings.create_meeting_from_transcript(mid_parsed, title="跨零点交接")
+        assert mid_rec is not None and meetings.flush()
+        mid_saved = meetings.get_meeting(mid_rec.id)
+        assert mid_saved.duration_ms == 5 * 60 * 1000
+        mid_segs = meetings.get_segments(mid_rec.id)
+        assert mid_segs[0].duration_ms == 5 * 60 * 1000
+        assert mid_segs[1].captured_at == mid_saved.started_at + 5 * 60 * 1000
     finally:
         history.close(timeout=2)

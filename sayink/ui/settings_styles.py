@@ -9,6 +9,9 @@ from sayink.ui import design_tokens as t
 from sayink.ui import settings_components as sc
 
 _SPIN_ICON_DIR = Path(__file__).resolve().parent / "icons"
+_SPIN_URL_CACHE: dict[str, tuple[str, str]] = {}
+_LOADED_AXIS: str | None = None
+_LOADED_FONT: str | None = None
 
 
 def _ensure_theme_spin_chevrons(axis: str) -> tuple[str, str] | None:
@@ -23,6 +26,9 @@ def _ensure_theme_spin_chevrons(axis: str) -> tuple[str, str] | None:
         cache_dir = Path(tempfile.gettempdir()) / "sayink_ui_icons" / axis
         up_path = cache_dir / "spin_chevron_up.png"
         down_path = cache_dir / "spin_chevron_down.png"
+        cached = _SPIN_URL_CACHE.get(axis)
+        if cached is not None and up_path.is_file() and down_path.is_file():
+            return cached
         if not (up_path.is_file() and down_path.is_file()):
             cache_dir.mkdir(parents=True, exist_ok=True)
             w, h = 20, 12
@@ -44,7 +50,9 @@ def _ensure_theme_spin_chevrons(axis: str) -> tuple[str, str] | None:
                 painter.end()
                 if not img.save(str(out_path)):
                     return None
-        return up_path.resolve().as_posix(), down_path.resolve().as_posix()
+        pair = (up_path.resolve().as_posix(), down_path.resolve().as_posix())
+        _SPIN_URL_CACHE[axis] = pair
+        return pair
     except Exception:
         return None
 
@@ -64,7 +72,7 @@ def build_spinbox_css() -> str:
     """Flat numeric stepper shared by every settings QSpinBox / QDoubleSpinBox."""
     up, down = _spin_arrow_urls()
     return f"""
-    QSpinBox, QDoubleSpinBox {{
+    QDoubleSpinBox, QSpinBox {{
         background: {t.INPUT_BG};
         color: {t.TEXT};
         border: 1px solid {t.CONTROL_BORDER};
@@ -74,17 +82,9 @@ def build_spinbox_css() -> str:
         min-height: {t.CONTROL_FIELD_HEIGHT - 14}px;
         max-height: {t.CONTROL_FIELD_HEIGHT - 14}px;
     }}
-    QSpinBox {{
-        background: {t.INPUT_BG};
-        border: 1px solid {t.CONTROL_BORDER};
-        border-radius: {t.RADIUS_MD}px;
-    }}
     QSpinBox:focus, QDoubleSpinBox:focus {{
         border: 2px solid {t.ACCENT_FOCUS};
         padding: 5px 27px 5px 11px;
-    }}
-    QSpinBox:focus {{
-        border: 2px solid {t.ACCENT_FOCUS};
     }}
     QSpinBox::up-button, QSpinBox::down-button,
     QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
@@ -153,8 +153,6 @@ def build_window_css() -> str:
         border: 2px solid {t.ACCENT_FOCUS};
         padding: 5px 11px;
     }}
-    {sc.ROW_RADIO_STYLE}
-    {sc.NAV_BTN_STYLE}
     HotkeyEdit {{
         background: {t.INPUT_BG};
         color: {t.TEXT};
@@ -340,18 +338,6 @@ def build_btn_danger_sm() -> str:
 """
 
 
-def build_btn_green_sm() -> str:
-    return f"""
-    QPushButton {{
-        background: {t.GREEN_BG}; color: {t.GREEN_TEXT}; border: 1px solid {t.GREEN};
-        border-radius: {t.RADIUS_SM}px; padding: 7px 15px; font-size: {t.TYPE_FOOTNOTE}px; font-weight: 700;
-    }}
-    QPushButton:hover {{ background: {t.GREEN_BG}; color: {t.GREEN_TEXT}; border-color: {t.GREEN_TEXT}; }}
-    QPushButton:focus {{ border: 2px solid {t.ACCENT_FOCUS}; padding: 6px 14px; }}
-    QPushButton:disabled {{ background: {t.BAR_OFF}; color: {t.TEXT_DIM}; border-color: {t.BAR_OFF}; }}
-"""
-
-
 def build_toolbar_combo_css() -> str:
     """Template picker in a meeting toolbar: same outer box as the small buttons.
 
@@ -470,6 +456,7 @@ def build_btn_danger_solid_sm() -> str:
 
 def reload_styles() -> None:
     """Rebuild module-level style aliases from the active token axis."""
+    global _LOADED_AXIS, _LOADED_FONT
     sc.reload_styles()
     g = globals()
     g["WINDOW_CSS"] = build_window_css()
@@ -478,8 +465,9 @@ def reload_styles() -> None:
     g["BTN_GHOST_SM"] = build_btn_ghost_sm()
     g["BTN_DANGER_SM"] = build_btn_danger_sm()
     g["BTN_DANGER_SOLID_SM"] = build_btn_danger_solid_sm()
-    g["BTN_GREEN_SM"] = build_btn_green_sm()
     g["BTN_ACCENT_SM"] = build_btn_accent_sm()
+    _LOADED_AXIS = getattr(t, "ACTIVE_THEME", None)
+    _LOADED_FONT = getattr(t, "UI_FONT_FAMILY", None)
 
 
 WINDOW_CSS = ""
@@ -488,7 +476,6 @@ BTN_GHOST = ""
 BTN_GHOST_SM = ""
 BTN_DANGER_SM = ""
 BTN_DANGER_SOLID_SM = ""
-BTN_GREEN_SM = ""
 BTN_ACCENT_SM = ""
 
 reload_styles()

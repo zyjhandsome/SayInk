@@ -1,13 +1,7 @@
-# PyInstaller
+# PyInstaller & Inno Setup staging / release artifacts (dist/SayInk, installers, .sig, notes)
 build/
+dist/
 *.spec
-# PyInstaller staging for Inno; release artifact is dist/SayInk-Setup-<version>.exe
-dist/SayInk/
-
-# Installers / binaries (build locally or attach to GitHub Releases)
-dist/SayInk-Setup-*.exe
-dist/*.exe
-dist/release-notes-*.md
 
 # Models (large files, download separately)
 models/
@@ -53,9 +47,6 @@ terminals/
 
 # App data
 *.lock
-
-# Model lock files
-models/.locks/
 
 # Local / tooling logs (not part of the app)
 lfs-progress.log

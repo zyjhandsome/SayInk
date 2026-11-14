@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import sys
-
 import pytest
-from PyQt6.QtWidgets import QApplication
 
 from sayink.ui.floating_window import (
     MODEL_LOADING_TITLE,
@@ -15,16 +12,12 @@ from sayink.ui.floating_window import (
 )
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication(sys.argv)
-
-
 @pytest.fixture
 def win(qapp):
     w = FloatingWindow()
     yield w
     w.close()
+    w.deleteLater()
 
 
 class TestCallWhenPainted:
@@ -659,3 +652,34 @@ def test_app_loads_listen_bar_preferences(qapp):
         floating.set_placement_preference.assert_any_call("bottom_right")
         floating.set_autohide.assert_any_call(False)
         floating.set_saved_positions.assert_called()
+
+
+def test_cold_start_floating_animated_loading_and_prebuild_deferral(win, monkeypatch):
+    from PyQt6.QtCore import Qt
+    from tests.helpers.app_harness import app_harness
+
+    assert win.testAttribute(Qt.WidgetAttribute.WA_SetCursor)
+    assert win.cursor().shape() == Qt.CursorShape.OpenHandCursor
+    monkeypatch.setattr("sayink.ui.floating_window.prefers_reduced_motion", lambda: False)
+    win.show_model_loading("正在加载语音模型")
+    assert win._dot._pulsing is True
+    assert win._dot._timer.isActive()
+
+    with app_harness() as h:
+        app = h["app"]
+        app.__dict__.pop("_prebuild_main_window", None)
+        built = []
+        app._ensure_main_window = lambda: built.append("built")
+        scheduled = []
+        app._later = lambda ms, fn: scheduled.append((ms, fn))
+
+        h["recognizer"].is_loading = True
+        h["recognizer"].is_silent_loading = False
+        app._prebuild_main_window()
+        assert built == []
+        assert scheduled == [(400, app._prebuild_main_window)]
+
+        scheduled.clear()
+        h["recognizer"].is_loading = False
+        app._prebuild_main_window()
+        assert built == ["built"]

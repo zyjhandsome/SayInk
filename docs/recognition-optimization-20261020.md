@@ -96,9 +96,8 @@
 单次 RTF 不代表性能上限；本次各项仍高于项目 0.3 的处理余量目标，
 长讲中开启项略快也不能解释为检测器加速了 ASR。
 
-仅包含数值与文本摘要哈希的结果：
-[独立复测 JSON](../build/recognition-optimization-replay.json)。
-复现脚本为 [recognition_optimization_replay.py](../build/recognition_optimization_replay.py)，
+仅包含数值与文本摘要哈希的结果保存在本机忽略目录 `build/recognition-optimization-replay.json`。
+复现脚本为 [recognition_replay.py](../tools/recognition_replay.py)（会话副本曾置于 `build/recognition_optimization_replay.py`），
 默认读取本机既有系统临时目录中的 `source.wav` / `dialogue.wav`。
 原音频与转写正文不写入报告、仓库或应用数据库。
 
@@ -107,8 +106,7 @@
 - **678 项相关回归通过**，涵盖匹配与人工纠正、聚类、检测输出与失败回退、取消、
   会议/持续转写队列、历史开关、收尾、跨场隔离、配置快照、运行状态、模型下载及安装包默认模型边界。
 - Ruff 与按仓库换行设置执行的 `git diff --check` 通过；新增源文件也检查了尾随空白。
-- 已渲染并检查高级识别设置：独立开关默认关闭，说明完整可读，沿用原有滚动布局。
-  [界面预览](../build/recognition-optimization-ui.png)。
+- 已渲染并检查高级识别设置：独立开关默认关闭，说明完整可读，沿用原有滚动布局（预览输出至本机 `build/recognition-optimization-ui.png`）。
 - 新检测器文件的固定 SHA-256 与实际下载内容一致；模型真实推理已完成上述诊断。
 
 后续要用按人物、场次、设备隔离的人工标注集，分别评估字错率、人物混淆、拆人、并人、

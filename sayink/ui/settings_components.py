@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QSize, QRectF, pyqtProperty, pyqtSignal
-from PyQt6.QtGui import QColor, QKeyEvent, QPainter, QPen
+from PyQt6.QtCore import QEasingCurve, QPointF, QPropertyAnimation, Qt, QSize, QRectF, pyqtProperty, pyqtSignal
+from PyQt6.QtGui import QColor, QFontMetrics, QKeyEvent, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QComboBox, QFrame, QHBoxLayout, QLabel,
     QCheckBox, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
@@ -28,8 +28,6 @@ PAGE_TITLE = ""
 PAGE_SUBTITLE = ""
 FOOTNOTE = ""
 GROUP_STYLE = ""
-ROW_RADIO_STYLE = ""
-NAV_BTN_STYLE = ""
 
 
 def reload_styles() -> None:
@@ -48,10 +46,10 @@ def reload_styles() -> None:
     )
     g["PAGE_SUBTITLE"] = (
         f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_BODY_SM}px; padding: 0;"
-        f" line-height: 1.45; letter-spacing: 0;"
+        f" letter-spacing: 0;"
     )
     g["FOOTNOTE"] = (
-        f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.45;"
+        f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px;"
         f" padding: 0 2px 0 2px; letter-spacing: 0;"
     )
     group_style = f"""
@@ -62,70 +60,6 @@ def reload_styles() -> None:
     }}
 """
     g["GROUP_STYLE"] = group_style
-    g["ROW_RADIO_STYLE"] = f"""
-    QRadioButton {{
-        color: {tok.TEXT};
-        spacing: 12px;
-        font-size: {tok.TYPE_BODY}px;
-        padding: 10px 14px;
-        background: transparent;
-        border: none;
-    }}
-    QRadioButton::indicator {{
-        width: 20px;
-        height: 20px;
-        subcontrol-position: right center;
-        subcontrol-origin: padding;
-        margin-right: 4px;
-        border-radius: 10px;
-        border: 2px solid {tok.CONTROL_BORDER_HOVER};
-        background: {tok.SURFACE};
-    }}
-    QRadioButton::indicator:checked {{
-        border: 2px solid {tok.ACCENT};
-        background: qradialgradient(
-            cx:0.5, cy:0.5, radius:0.45, fx:0.5, fy:0.5,
-            stop:0 {tok.ACCENT}, stop:0.52 {tok.ACCENT},
-            stop:0.53 {tok.SURFACE}, stop:1 {tok.SURFACE}
-        );
-    }}
-    QRadioButton::indicator:unchecked:hover {{
-        border-color: {tok.ACCENT_FOCUS};
-    }}
-    QRadioButton:focus {{
-        border: 2px solid {tok.ACCENT_FOCUS};
-        border-radius: {tok.RADIUS_SM}px;
-        padding: 8px 12px;
-    }}
-"""
-    g["NAV_BTN_STYLE"] = f"""
-    QPushButton#settingsNavBtn {{
-        text-align: left;
-        padding: 0 12px 0 12px;
-        border: none;
-        border-left: {tok.NAV_SELECTED_BAR_PX}px solid transparent;
-        border-radius: {tok.RADIUS_MD}px;
-        color: {tok.TEXT_SEC};
-        font-size: {tok.TYPE_BODY_SM}px;
-        font-weight: 400;
-        background: transparent;
-    }}
-    QPushButton#settingsNavBtn:checked {{
-        background: {tok.NAV_SELECTED_BG};
-        border-left: {tok.NAV_SELECTED_BAR_PX}px solid {tok.ACCENT};
-        color: {tok.ACCENT_TEXT};
-        font-weight: 700;
-    }}
-    QPushButton#settingsNavBtn:hover:!checked {{
-        background: {tok.ROW_HOVER};
-        color: {tok.TEXT};
-    }}
-    QPushButton#settingsNavBtn:focus {{
-        border: 2px solid {tok.ACCENT_FOCUS};
-        border-left: {tok.NAV_SELECTED_BAR_PX}px solid {tok.ACCENT_FOCUS};
-        padding: 0 14px 0 12px;
-    }}
-"""
 
 
 reload_styles()
@@ -175,38 +109,6 @@ def elide_middle(text: str, max_len: int = 44) -> str:
     return f"{text[:head]}…{text[-tail:]}"
 
 
-def usage_tip_bar(text: str) -> QFrame:
-    """Inline hint strip below hero (shortcut / how-to)."""
-    frame = QFrame()
-    frame.setObjectName("usageTipBar")
-    lay = QHBoxLayout(frame)
-    lay.setContentsMargins(16, 12, 16, 12)
-    lbl = QLabel(text)
-    lbl.setObjectName("usageTipBarText")
-    lbl.setWordWrap(True)
-    lay.addWidget(lbl)
-    paint_usage_tip_bar(frame)
-    return frame
-
-
-def paint_usage_tip_bar(frame: QFrame) -> None:
-    """Refresh a usage tip bar from the active token axis."""
-    from sayink.ui import design_tokens as live
-
-    frame.setStyleSheet(f"""
-        QFrame#usageTipBar {{
-            background: {live.SURFACE_PEARL};
-            border: 1px solid {live.HAIRLINE};
-            border-radius: {live.RADIUS_MD}px;
-        }}
-    """)
-    for child in frame.findChildren(QLabel):
-        child.setStyleSheet(
-            f"color: {live.TEXT_SEC}; font-size: {live.TYPE_BODY_SM}px;"
-            f" line-height: 1.45; background: transparent;"
-        )
-
-
 def polish_preview_content() -> QWidget:
     """Compact before/after sample matching the selected HTML reference."""
     frame = QWidget()
@@ -240,7 +142,7 @@ def polish_preview_content() -> QWidget:
         txt.setProperty("viRole", "polishPreviewText")
         txt.setWordWrap(True)
         txt.setStyleSheet(
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; line-height: 1.5;"
+            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px;"
             f" background: transparent;"
         )
         row_lay.addWidget(txt, 1)
@@ -321,7 +223,7 @@ def paint_info_callout(frame: QFrame) -> None:
     """)
     for child in frame.findChildren(QLabel):
         child.setStyleSheet(
-            f"color: {tok.AMBER_TEXT}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.45;"
+            f"color: {tok.AMBER_TEXT}; font-size: {tok.TYPE_FOOTNOTE}px;"
             f" background: transparent;"
         )
 
@@ -352,9 +254,10 @@ def group_divider() -> QWidget:
 def recolor_group_divider(wrap: QWidget) -> None:
     from sayink.ui import design_tokens as tok
 
+    css = f"background: {tok.DIVIDER_SOFT};"
     for line in wrap.findChildren(QFrame):
         if line.objectName() == "settingsGroupDividerLine":
-            line.setStyleSheet(f"background: {tok.DIVIDER_SOFT};")
+            _set_css(line, css)
 
 
 def stylesheet_for_role(role: object) -> str | None:
@@ -374,7 +277,7 @@ def stylesheet_for_role(role: object) -> str | None:
         )
     if role == "rowSubtitle":
         return (
-            f"color: {live.TEXT_DIM}; font-size: {live.TYPE_FOOTNOTE}px; line-height: 1.4;"
+            f"color: {live.TEXT_DIM}; font-size: {live.TYPE_FOOTNOTE}px;"
             f" background: transparent;"
         )
     if role == "fieldLabel":
@@ -384,7 +287,7 @@ def stylesheet_for_role(role: object) -> str | None:
         )
     if role == "hint":
         return (
-            f"color: {live.TEXT_DIM}; font-size: {live.TYPE_FOOTNOTE}px; line-height: 1.4;"
+            f"color: {live.TEXT_DIM}; font-size: {live.TYPE_FOOTNOTE}px;"
             f" background: transparent;"
         )
     if role == "importantHint":
@@ -403,7 +306,7 @@ def stylesheet_for_role(role: object) -> str | None:
         )
     if role == "polishPreviewText":
         return (
-            f"color: {live.TEXT_SEC}; font-size: {live.TYPE_BODY_SM}px; line-height: 1.5;"
+            f"color: {live.TEXT_SEC}; font-size: {live.TYPE_BODY_SM}px;"
             f" background: transparent;"
         )
     if role == "kvKey":
@@ -427,7 +330,7 @@ def stylesheet_for_role(role: object) -> str | None:
         )
     if role == "pickSubtitle":
         return (
-            f"color: {live.TEXT_SEC}; font-size: {live.TYPE_FOOTNOTE}px; line-height: 1.35;"
+            f"color: {live.TEXT_SEC}; font-size: {live.TYPE_FOOTNOTE}px;"
             f" background: transparent;"
         )
     if role == "emptyState":
@@ -435,16 +338,22 @@ def stylesheet_for_role(role: object) -> str | None:
             f"color: {live.TEXT_DIM}; font-size: {live.TYPE_BODY_SM}px;"
             f" padding: 20px 12px; background: transparent;"
         )
-    if role in ("engineHeroTitle", "modelName"):
+    if role == "engineHeroTitle":
+        return (
+            f"color: {live.TEXT}; font-family: {live.FONT_DISPLAY};"
+            f" font-size: {live.TYPE_HERO}px; font-weight: 700;"
+            f" background: transparent;"
+        )
+    if role == "modelName":
         return (
             f"color: {live.TEXT}; font-size: {live.TYPE_TITLE_SM}px; font-weight: 700;"
             f" background: transparent;"
         )
     if role == "engineHeroBadge":
         return (
-            f"background: {live.GREEN_BG}; color: {live.GREEN_TEXT};"
-            f" border: 1px solid {live.GREEN_BORDER};"
-            f" border-radius: {live.RADIUS_PILL}px; padding: 3px 9px;"
+            f"background: {live.SURFACE_PEARL}; color: {live.TEXT_SEC};"
+            f" border: 1px solid {live.HAIRLINE};"
+            f" border-radius: {live.RADIUS_PILL}px; padding: 3px 10px;"
             f" font-size: {live.TYPE_CAPTION}px; font-weight: 700;"
         )
     if role == "modelBadge":
@@ -460,10 +369,17 @@ def stylesheet_for_role(role: object) -> str | None:
         )
     if role in ("engineHeroDesc", "modelDesc"):
         return (
-            f"color: {live.TEXT_SEC}; font-size: {live.TYPE_BODY_SM}px; line-height: 1.45;"
+            f"color: {live.TEXT_SEC}; font-size: {live.TYPE_BODY_SM}px;"
             f" background: transparent;"
         )
     return None
+
+
+def _set_css(widget: QWidget, css: str) -> None:
+    getter = getattr(widget, "styleSheet", None)
+    if callable(getter) and getter() == css:
+        return
+    widget.setStyleSheet(css)
 
 
 def reapply_subtree(root: QWidget) -> None:
@@ -476,38 +392,30 @@ def reapply_subtree(root: QWidget) -> None:
             hook()
         if isinstance(obj, SwitchControl):
             obj.update()
-
-    for frame in root.findChildren(QFrame):
-        name = frame.objectName() or ""
-        if name == "settingsGroup":
-            frame.setStyleSheet(GROUP_STYLE)
-        elif name.endswith("Callout") or name == "infoCallout":
-            paint_info_callout(frame)
-        elif name == "usageTipBar":
-            paint_usage_tip_bar(frame)
-
-    for wrap in root.findChildren(QWidget):
-        if wrap.objectName() == "settingsGroupDivider":
-            recolor_group_divider(wrap)
-
-    for label in root.findChildren(QLabel):
-        css = stylesheet_for_role(label.property("viRole"))
-        if css:
-            label.setStyleSheet(css)
-        elif label.objectName() == "settingsGroupTitle":
-            label.setStyleSheet(SECTION_LABEL)
-
-    for btn in root.findChildren(QPushButton):
-        name = btn.objectName() or ""
-        if name in ("settingsNavBtn", "deviceSelectionLink", "themeModeSegBtn"):
-            continue
-        role = btn.property("viBtn")
-        if role == "primary":
-            btn.setStyleSheet(ss.BTN_PRIMARY)
-        elif role == "ghostSm":
-            btn.setStyleSheet(ss.BTN_GHOST_SM)
-        elif role == "accentSm":
-            btn.setStyleSheet(ss.BTN_ACCENT_SM)
+        name = obj.objectName() or ""
+        if isinstance(obj, QFrame):
+            if name == "settingsGroup":
+                _set_css(obj, GROUP_STYLE)
+            elif name.endswith("Callout") or name == "infoCallout":
+                paint_info_callout(obj)
+        if name == "settingsGroupDivider":
+            recolor_group_divider(obj)
+        if isinstance(obj, QLabel):
+            css = stylesheet_for_role(obj.property("viRole"))
+            if css:
+                _set_css(obj, css)
+            elif name == "settingsGroupTitle":
+                _set_css(obj, SECTION_LABEL)
+        elif isinstance(obj, QPushButton):
+            if name in ("settingsNavBtn", "deviceSelectionLink", "themeModeSegBtn"):
+                continue
+            role = obj.property("viBtn")
+            if role == "primary":
+                _set_css(obj, ss.BTN_PRIMARY)
+            elif role == "ghostSm":
+                _set_css(obj, ss.BTN_GHOST_SM)
+            elif role == "accentSm":
+                _set_css(obj, ss.BTN_ACCENT_SM)
 
 
 def settings_group() -> QFrame:
@@ -567,7 +475,7 @@ def option_row(title: str, subtitle: str = "") -> QWidget:
         s.setProperty("viRole", "rowSubtitle")
         s.setWordWrap(True)
         s.setStyleSheet(
-            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
+            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px;"
             f" background: transparent;"
         )
         lay.addWidget(s)
@@ -614,7 +522,7 @@ def stacked_field_row(label: str, widget: QWidget, hint: str = "") -> QWidget:
         h.setProperty("viRole", "hint")
         h.setWordWrap(True)
         h.setStyleSheet(
-            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4; background: transparent;"
+            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
         )
         outer.addWidget(h)
     return row
@@ -682,17 +590,6 @@ class CompactPickCard(QFrame):
     def reapply_styles(self) -> None:
         self._sync_style(self._radio.isChecked())
 
-    def set_copy(self, title: str, subtitle: str) -> None:
-        if self._title_label.text() == title and self._subtitle_label.text() == subtitle:
-            return
-        self._subtitle = subtitle
-        self._title_label.setText(title)
-        self._subtitle_label.setText(subtitle)
-        self.setAccessibleName(title)
-        self._radio.setAccessibleName(title)
-        self._radio.setAccessibleDescription(subtitle)
-        self._sync_style(self._radio.isChecked())
-
     def _sync_style(self, checked: bool) -> None:
         from sayink.ui import design_tokens as tok
 
@@ -708,7 +605,7 @@ class CompactPickCard(QFrame):
         )
         _paint_css(
             self._subtitle_label,
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.35;"
+            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px;"
             f" background: transparent;",
         )
         _paint_css(
@@ -1156,7 +1053,6 @@ class ToggleOptionRow(QWidget):
     def __init__(self, title: str, subtitle: str = "", parent=None):
         super().__init__(parent)
         self.setObjectName("ToggleOptionRow")
-        self._hover = False
         self._switch = SwitchControl()
         self._switch.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._switch.setAccessibleName(title)
@@ -1210,7 +1106,7 @@ class ToggleOptionRow(QWidget):
                 )
             elif role == "rowSubtitle":
                 label.setStyleSheet(
-                    f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
+                    f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px;"
                     f" background: transparent;"
                 )
         self._sync_row_style()
@@ -1223,29 +1119,26 @@ class ToggleOptionRow(QWidget):
     def _sync_row_style(self) -> None:
         from sayink.ui import design_tokens as tok
 
-        hover_bg = tok.ROW_HOVER if self._hover else "transparent"
         # No rounded “card inside card” — rows are flat slices like prototype .row.
-        self.setStyleSheet(f"""
+        css = f"""
             ToggleOptionRow {{
-                background: {hover_bg};
+                background: transparent;
                 border: none;
                 border-radius: 0;
             }}
-            ToggleOptionRow:focus {{
+            ToggleOptionRow:hover, ToggleOptionRow:focus {{
                 background: {tok.ROW_HOVER};
             }}
-        """)
+        """
+        if self.styleSheet() != css:
+            self.setStyleSheet(css)
 
     def enterEvent(self, event):
-        self._hover = True
         self._switch.set_hovered(True)
-        self._sync_row_style()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        self._hover = False
         self._switch.set_hovered(False)
-        self._sync_row_style()
         super().leaveEvent(event)
 
     @property
@@ -1400,8 +1293,115 @@ class SettingsPage(QScrollArea):
     def add(self, widget: QWidget) -> None:
         self._layout.addWidget(widget)
 
-    def add_layout(self, layout) -> None:
-        self._layout.addLayout(layout)
 
-    def add_stretch(self) -> None:
-        self._layout.addStretch(1)
+class ThemedCheckBox(QCheckBox):
+    """Token-painted ``QCheckBox`` with an explicit checkmark glyph.
+
+    Styling ``QCheckBox::indicator:checked`` via QSS replaces the native Windows
+    indicator without drawing a tick glyph unless an external ``image:`` asset
+    is supplied, leaving checked boxes as unmarked solid squares. Painting the
+    16x16 box and checkmark polyline directly keeps ``QCheckBox`` semantics,
+    keyboard navigation, mnemonics, and theme live-switching intact.
+    """
+
+    _BOX = 16
+    _GAP = 8
+    _PAD_V = 4
+    _FOCUS_PAD = 2
+
+    def __init__(self, text: str = "", parent: QWidget | None = None):
+        super().__init__(text, parent)
+        self._hovered = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        font = self.font()
+        font.setPixelSize(tok.TYPE_BODY_SM)
+        self.setFont(font)
+
+    def sizeHint(self) -> QSize:
+        fm = QFontMetrics(self.font())
+        label = self.text()
+        if label:
+            text_rect = fm.boundingRect(0, 0, 10_000, 10_000, int(Qt.TextFlag.TextShowMnemonic), label)
+            width = self._FOCUS_PAD * 2 + self._BOX + self._GAP + text_rect.width() + 2
+        else:
+            width = self._FOCUS_PAD * 2 + self._BOX
+        height = max(self._BOX + self._FOCUS_PAD * 2, fm.height()) + self._PAD_V * 2
+        return QSize(width, height)
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def hitButton(self, pos) -> bool:
+        return self.rect().contains(pos)
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        enabled = self.isEnabled()
+        checked = self.isChecked()
+        box_x = float(self._FOCUS_PAD)
+        box_y = (self.height() - self._BOX) / 2.0
+        box_rect = QRectF(box_x, box_y, float(self._BOX), float(self._BOX))
+
+        if enabled and self.hasFocus():
+            focus_pen = QPen(QColor(tok.ACCENT_FOCUS), 2.0)
+            p.setPen(focus_pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(box_rect.adjusted(-1.5, -1.5, 1.5, 1.5), 5.5, 5.5)
+
+        if not enabled:
+            fill = QColor(tok.BAR_OFF)
+            border = QColor(tok.HAIRLINE)
+        elif checked:
+            fill = QColor(tok.ACCENT)
+            border = QColor(tok.ACCENT)
+        else:
+            fill = QColor(tok.INPUT_BG)
+            border = QColor(tok.CONTROL_BORDER_HOVER if self._hovered else tok.CONTROL_BORDER)
+
+        p.setPen(QPen(border, 1.2))
+        p.setBrush(fill)
+        p.drawRoundedRect(box_rect.adjusted(0.6, 0.6, -0.6, -0.6), 4.0, 4.0)
+
+        if checked:
+            tick_color = QColor(tok.TEXT_DIM if not enabled else tok.ACCENT_ON_DARK)
+            tick_pen = QPen(tick_color, 1.8)
+            tick_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            tick_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(tick_pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPolyline(
+                QPolygonF(
+                    [
+                        QPointF(box_x + 4.0, box_y + 8.3),
+                        QPointF(box_x + 6.9, box_y + 11.2),
+                        QPointF(box_x + 12.2, box_y + 5.2),
+                    ]
+                )
+            )
+
+        label = self.text()
+        if label:
+            p.setFont(self.font())
+            p.setPen(QColor(tok.TEXT if enabled else tok.TEXT_DIM))
+            text_left = int(box_x + self._BOX + self._GAP)
+            text_rect = self.rect().adjusted(text_left, 0, 0, 0)
+            p.drawText(
+                text_rect,
+                int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextShowMnemonic),
+                label,
+            )
+        p.end()

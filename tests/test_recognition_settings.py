@@ -20,15 +20,25 @@ def test_a_new_meeting_defaults_to_the_microphone_and_system_audio(config):
 
 
 @pytest.mark.parametrize("source", ["microphone", "system", "mixed"])
-def test_meeting_follows_shared_audio_until_explicitly_overridden(config, source):
-    config.set("meeting.input_source", "")
+def test_meeting_source_does_not_follow_the_dictation_source(config, source):
+    """Dictation is usually the user's own microphone; a meeting needs both sides."""
     config.set("audio.input_source", source)
-    assert audio_source(config, meeting=True) == source
-    assert MeetingOptions.from_config(config).input_source == source
+    assert audio_source(config, meeting=True) == "mixed"
+    assert MeetingOptions.from_config(config).input_source == "mixed"
     config.set("meeting.input_source", "system")
+    assert audio_source(config, meeting=True) == "system"
     assert MeetingOptions.from_config(config).input_source == "system"
-    config.set("meeting.input_source", "")
-    assert MeetingOptions.from_config(config).input_source == source
+    # The dictation source itself is still read from the shared setting.
+    assert audio_source(config) == source
+
+
+@pytest.mark.parametrize("stale", ["", "follow"])
+def test_a_meeting_source_that_names_no_real_source_means_mixed(config, stale):
+    """「跟随转写」 was stored as an empty string before it was removed."""
+    config.set("audio.input_source", "microphone")
+    config.set("meeting.input_source", stale)
+    assert audio_source(config, meeting=True) == "mixed"
+    assert MeetingOptions.from_config(config).input_source == "mixed"
 
 
 def test_shared_settings_are_snapshots_and_match_meeting_parameters(config, monkeypatch):

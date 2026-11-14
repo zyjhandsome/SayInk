@@ -18,7 +18,6 @@ from sayink.audio_devices import (
 from sayink.config import TRIGGER_MODE_CONTINUOUS, TRIGGER_MODE_HOTKEY, Config
 from sayink.ui.design_tokens import (
     ACCENT,
-    SURFACE_PEARL,
     TEXT_DIM,
     TEXT_SEC,
 )
@@ -65,14 +64,12 @@ def test_retired_manual_recognition_switches_are_hidden_and_not_exposed_in_ui(
     qapp.processEvents()
     assert settings_window._advanced_recognition_panel.isVisible()
 
-    for retired in (
-        settings_window._quiet_speech_row,
-        settings_window._speaker_enabled_row,
-        settings_window._speaker_activity_row,
+    for retired_attr in (
+        "_quiet_speech_row",
+        "_speaker_enabled_row",
+        "_speaker_activity_row",
     ):
-        assert retired.isHidden()
-        assert not retired.isVisible()
-        assert retired not in settings_window.general_page.general_tab_chain
+        assert not hasattr(settings_window, retired_attr)
 
     rec_section = settings_window.findChild(QWidget, "sharedRecognitionSection")
     assert rec_section is not None
@@ -108,12 +105,6 @@ def test_auxiliary_model_card_distinguishes_bundled_and_downloaded(qapp, monkeyp
     assert downloaded._delete_btn is not None
     bundled.close()
     downloaded.close()
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    app = QApplication.instance() or QApplication(sys.argv)
-    yield app
 
 
 _INERT_WINDOW_METHODS = ("_rebuild_model_cards", "_refresh_about_info", "_refresh_audio_device_lists")
@@ -173,7 +164,7 @@ def settings_window(_shared_settings, config, monkeypatch):
     win._recognition_pending = False
     win._speaker_runtime_text = "尚未获取说话人区分运行状态"
     win.reload_settings()
-    yield win
+    return win
 
 
 def test_ai_proxy_mode_is_saved_and_reloaded(settings_window, config):
@@ -395,30 +386,6 @@ class TestGeneralPageLayout:
             assert "transparent" in sheet.lower()
             assert f"background: {tok.BG}" not in sheet
         assert not hasattr(settings_window, "_sheet")
-
-    def test_about_feedback_row_is_hidden_for_now(self, settings_window):
-        from sayink.ui.settings_pages import about as about_page
-
-        assert about_page.SHOW_FEEDBACK_ENTRY is False
-        assert settings_window._about_feedback_group.isHidden()
-
-    def test_about_feedback_button_opens_issue_tracker(self, settings_window, monkeypatch):
-        """P-06: the (currently hidden) feedback entry goes to GitHub issues."""
-        from sayink.ui.settings_pages import about as about_page
-        from sayink.updater import GITHUB_REPO, ISSUES_URL
-
-        opened = []
-        monkeypatch.setattr(
-            about_page.QDesktopServices, "openUrl", lambda url: opened.append(url.toString()) or True
-        )
-        btn = settings_window._about_feedback_btn
-        assert btn.text() == "GitHub 反馈"
-        assert "日志" in settings_window._about_feedback_hint.text()
-        btn.click()
-        assert opened == [ISSUES_URL]
-        assert ISSUES_URL == f"https://github.com/{GITHUB_REPO}/issues/new/choose"
-        # Same pill look as 检查更新 so the two actions read as one family.
-        assert f"background: {SURFACE_PEARL}" in btn.styleSheet()
 
     def test_about_paths_start_hidden_and_reveal_on_toggle(
         self, config, qapp, monkeypatch
@@ -1221,14 +1188,13 @@ class TestMicProbe:
 
 class TestNavigation:
     def test_back_closes_window(self, settings_window, qapp):
-        closed = []
-        settings_window.finished.connect(lambda _: closed.append(True))
-        settings_window._on_done()
-        assert settings_window.isVisible() is False or closed
+        settings_window.show()
+        settings_window.close()
+        assert settings_window.isVisible() is False
 
     def test_done_closes_window(self, settings_window):
         settings_window.show()
-        settings_window._on_done()
+        settings_window.close()
         assert not settings_window.isVisible()
 
 
@@ -1324,22 +1290,32 @@ class TestMeetingSettings:
         assert settings_window._meeting_glossary_edit.toPlainText() == ""
         assert settings_window._minutes_template_combo.currentData() == "general"
 
-    def test_meeting_defaults_show_inherited_source_in_summary(self, settings_window, config):
+    def test_meeting_defaults_offer_three_sources_and_name_the_choice(self, settings_window, config):
         from sayink.audio_devices import input_source_label
 
         combo = settings_window._meeting_source_combo
-        config.set("audio.input_source", "mixed")
-        combo.setCurrentIndex(combo.findData(""))
-        assert combo.currentText() == "跟随转写"
-        summary = settings_window.general_page.meeting_defaults_hint
-        assert f"跟随转写（当前：{input_source_label('mixed')}）" in summary.text()
-        config.set("audio.input_source", "system")
-        settings_window.general_page.refresh_meeting_defaults(config)
-        assert f"跟随转写（当前：{input_source_label('system')}）" in summary.text()
-        assert combo.currentText() == "跟随转写"
+        assert [combo.itemData(i) for i in range(combo.count())] == ["mixed", "microphone", "system"]
         for key in ("mixed", "microphone", "system"):
             assert combo.itemText(combo.findData(key)) == input_source_label(key)
+        summary = settings_window.general_page.meeting_defaults_hint
+        # The meeting source no longer tracks the dictation source.
+        config.set("audio.input_source", "system")
+        settings_window.general_page.refresh_meeting_defaults(config)
+        assert f"新会议：{input_source_label('mixed')} · " in summary.text()
+        assert "跟随转写" not in summary.text()
+        combo.setCurrentIndex(combo.findData("microphone"))
+        assert f"新会议：{input_source_label('microphone')} · " in summary.text()
         assert settings_window._meeting_model_combo.itemText(0).startswith("与转写相同（当前：")
+
+    def test_legacy_follow_dictation_source_loads_as_mixed(self, settings_window, config):
+        """「跟随转写」 used to be saved as an empty string."""
+        config.set("meeting.input_source", "")
+        config.set("audio.input_source", "microphone")
+        settings_window.reload_settings()
+        assert settings_window._meeting_source_combo.currentData() == "mixed"
+        # Touching an unrelated meeting default must not write the empty value back.
+        settings_window._meeting_start_card_row.setChecked(False)
+        assert config.get("meeting.input_source") == "mixed"
 
     def test_meeting_choices_persist(self, settings_window, config):
         win = settings_window
@@ -1347,7 +1323,7 @@ class TestMeetingSettings:
         win._meeting_language_combo.setCurrentIndex(win._meeting_language_combo.findData("en"))
         win._meeting_start_card_row.setChecked(False)
         assert config.get("meeting.input_source") == "microphone"
-        assert config.get("stt.vad") == "silero"
+        assert config.get("stt.vad") is None
         assert config.get("stt.language") == "en"
         assert config.get("meeting.show_start_card") is False
         assert config.get("meeting.vad") is None and config.get("meeting.language") is None
@@ -1652,13 +1628,21 @@ class TestSectionDefaultRestore:
         assert settings_window._hotkey_edit.value == "alt+x"
         assert emitted == ["alt+x"]
 
-    def test_legacy_energy_preference_uses_automatic_segmentation(self, settings_window, config):
+    def test_legacy_energy_preference_uses_automatic_segmentation(
+        self, settings_window, config_home
+    ):
         from sayink.recognition_settings import RecognitionSettings
 
-        config.set("stt.vad", "energy")
-        settings_window.reload_settings()
-        assert RecognitionSettings.from_config(config).vad == "silero"
-        assert RecognitionSettings.from_config(config, meeting=True).vad == "silero"
+        cfg_file = config_home / "config.json"
+        cfg_file.write_text(
+            json.dumps({"stt": {"vad": "energy"}, "meeting": {"vad": "energy"}}),
+            encoding="utf-8",
+        )
+        reloaded = Config(config_dir=config_home)
+        assert reloaded.get("stt.vad") is None
+        assert reloaded.get("meeting.vad") is None
+        assert RecognitionSettings.from_config(reloaded).vad == "silero"
+        assert RecognitionSettings.from_config(reloaded, meeting=True).vad == "silero"
         panel = settings_window.general_page.advanced_recognition_panel
         assert not any("恢复默认" in button.text() for button in panel.findChildren(QPushButton))
 

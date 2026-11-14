@@ -60,24 +60,20 @@ class TestTextPasterIsOwnWindow:
 
 
 class TestTextPasterPaste:
-    def test_empty_text_returns_error(self):
-        paster = TextPaster()
-        result = paster.paste("")
-        assert result.startswith("error:")
-
-    def test_paste_returns_status(self, paste_env):
-        paste_env["set_foreground"]([(1234, "Editor", 4242)])
-        paster = TextPaster()
-        result = paster.paste("测试文本")
-        assert result == "pasted"
-        assert paste_env["clipboard"] == "测试文本"
-
     def test_paste_async_empty_text(self):
         paster = TextPaster()
         results = []
         paster.paste_async("", lambda r: results.append(r))
         assert [result.status for result in results] == ["error"]
         assert results[0].detail == "空文本"
+
+    def test_paste_async_sends_text_and_copies_to_clipboard(self, paste_env):
+        paste_env["set_foreground"]([(1234, "Editor", 4242)])
+        paster = TextPaster()
+        results = []
+        paster.paste_async("测试文本", results.append, target_hwnd=1234, target_app="notepad.exe")
+        assert results[-1].status == "sent"
+        assert paste_env["clipboard"] == "测试文本"
 
     def test_restore_clipboard_flag(self):
         paster = TextPaster(restore_clipboard=True)

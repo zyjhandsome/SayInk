@@ -20,7 +20,10 @@ MUTEX_NAME = "Local\\SayInk_Single_Instance_Mutex"
 # SayInk started next to it would record the same hotkey twice.
 LEGACY_MUTEX_NAME = "Local\\VoiceInk_Single_Instance_Mutex"
 _SYNCHRONIZE = 0x00100000
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_ERROR_ACCESS_DENIED = 5
 _ERROR_ALREADY_EXISTS = 183
+_STILL_ACTIVE = 259
 _MB_OK_INFO = 0x00000040 | 0x00010000  # MB_ICONINFORMATION | MB_SETFOREGROUND
 
 # 在 main() 配置日志前，使用临时 logger
@@ -36,6 +39,14 @@ def _configure_kernel32_signatures(dll):
     if hasattr(dll.OpenMutexW, "argtypes"):
         dll.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
         dll.OpenMutexW.restype = wintypes.HANDLE
+    open_proc = getattr(dll, "OpenProcess", None)
+    if open_proc is not None and hasattr(open_proc, "argtypes"):
+        open_proc.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_proc.restype = wintypes.HANDLE
+    get_exit = getattr(dll, "GetExitCodeProcess", None)
+    if get_exit is not None and hasattr(get_exit, "argtypes"):
+        get_exit.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        get_exit.restype = wintypes.BOOL
     if hasattr(dll.CloseHandle, "argtypes"):
         dll.CloseHandle.argtypes = [wintypes.HANDLE]
         dll.CloseHandle.restype = wintypes.BOOL
@@ -75,12 +86,65 @@ def last_block_reason() -> str | None:
     return _last_block_reason
 
 
-def _legacy_instance_running(kernel32) -> bool:
+def _legacy_instance_running(kernel32, *, use_ctypes_err: bool = False) -> bool:
+    if use_ctypes_err:
+        ctypes.set_last_error(0)
     handle = kernel32.OpenMutexW(_SYNCHRONIZE, False, LEGACY_MUTEX_NAME)
     if not handle:
-        return False
+        err = (
+            ctypes.get_last_error()
+            if use_ctypes_err
+            else (kernel32.GetLastError() if hasattr(kernel32, "GetLastError") else 0)
+        )
+        return err == _ERROR_ACCESS_DENIED
     kernel32.CloseHandle(handle)
     return True
+
+
+def _pid_is_running(pid: int) -> bool:
+    """Non-destructively probe whether *pid* is alive (os.kill(pid, 0) terminates on Windows)."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        kernel32, use_ctypes_err = _resolve_kernel32()
+        open_proc = getattr(kernel32, "OpenProcess", None) if kernel32 is not None else None
+        if open_proc is None and hasattr(ctypes, "WinDLL"):
+            kernel32 = _configure_kernel32_signatures(
+                ctypes.WinDLL("kernel32", use_last_error=True)
+            )
+            open_proc = kernel32.OpenProcess
+            use_ctypes_err = True
+        if open_proc is None:
+            return False
+        if use_ctypes_err:
+            ctypes.set_last_error(0)
+        handle = open_proc(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            err = (
+                ctypes.get_last_error()
+                if use_ctypes_err
+                else (kernel32.GetLastError() if hasattr(kernel32, "GetLastError") else 0)
+            )
+            return err == _ERROR_ACCESS_DENIED
+        try:
+            get_exit = getattr(kernel32, "GetExitCodeProcess", None)
+            if get_exit is None:
+                return True
+            exit_code = wintypes.DWORD()
+            if not get_exit(handle, ctypes.byref(exit_code)):
+                return True
+            return int(exit_code.value) == _STILL_ACTIVE
+        finally:
+            close_fn = getattr(kernel32, "CloseHandle", None)
+            if close_fn is not None:
+                close_fn(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OSError):
+        return False
 
 
 def check_single_instance() -> bool:
@@ -101,14 +165,14 @@ def check_single_instance() -> bool:
             mutex = kernel32.CreateMutexW(None, False, mutex_name)
             last_error = ctypes.get_last_error() if use_ctypes_err else kernel32.GetLastError()
 
-            if last_error == _ERROR_ALREADY_EXISTS:
-                # 互斥锁已存在，说明已有实例运行
+            if last_error == _ERROR_ALREADY_EXISTS or (not mutex and last_error == _ERROR_ACCESS_DENIED):
+                # 互斥锁已存在（或由提权实例持有），说明已有实例运行
                 _last_block_reason = "sayink"
                 if mutex:
                     kernel32.CloseHandle(mutex)
                 return False
 
-            if _legacy_instance_running(kernel32):
+            if _legacy_instance_running(kernel32, use_ctypes_err=use_ctypes_err):
                 _last_block_reason = "legacy_voiceink"
                 _log.warning("检测到旧版 VoiceInk 正在运行，SayInk 不再启动第二个实例")
                 if mutex:
@@ -142,14 +206,10 @@ def check_single_instance() -> bool:
                 old_pid_str = f.read().strip()
             if old_pid_str.isdigit():
                 old_pid = int(old_pid_str)
-                try:
-                    os.kill(old_pid, 0)
+                if _pid_is_running(old_pid):
                     # 进程存在，说明已有实例
                     _last_block_reason = "lock_file"
                     return False
-                except (OSError, ProcessLookupError):
-                    # 进程不存在，可以启动
-                    pass
 
         with open(lock_file, "w") as f:
             f.write(str(os.getpid()))
@@ -242,13 +302,18 @@ def _activate_running_instance(*, retries: int = 1, retry_delay_s: float = 0.25)
 
             _app = QCoreApplication.instance() or QCoreApplication(sys.argv)
             sock = QLocalSocket()
-            sock.connectToServer(activation_server_name())
-            if sock.waitForConnected(1000):
-                sock.write(b"show\n")
-                sock.flush()
-                sock.waitForBytesWritten(1000)
-                sock.disconnectFromServer()
-                return True
+            try:
+                sock.connectToServer(activation_server_name())
+                if sock.waitForConnected(1000):
+                    sock.write(b"show\n")
+                    sock.flush()
+                    sock.waitForBytesWritten(1000)
+                    sock.disconnectFromServer()
+                    return True
+            finally:
+                abort_fn = getattr(sock, "abort", None)
+                if callable(abort_fn):
+                    abort_fn()
         except Exception:
             pass
         if attempt + 1 < attempts and retry_delay_s > 0:
@@ -303,7 +368,7 @@ def _handle_existing_instance(*, retries: int = 6, retry_delay_s: float = 0.25, 
 
 
 def start_activation_server(on_activate):
-    from PyQt6.QtNetwork import QLocalServer
+    from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
     server = QLocalServer()
     name = activation_server_name()
@@ -317,8 +382,13 @@ def start_activation_server(on_activate):
             conn = server.nextPendingConnection()
             if conn is None:
                 break
-            conn.readyRead.connect(conn.readAll)
-            conn.disconnected.connect(conn.deleteLater)
+            if conn.bytesAvailable():
+                conn.readAll()
+            if conn.state() == QLocalSocket.LocalSocketState.UnconnectedState:
+                conn.deleteLater()
+            else:
+                conn.readyRead.connect(conn.readAll)
+                conn.disconnected.connect(conn.deleteLater)
             on_activate()
 
     server.newConnection.connect(_on_connection)
@@ -363,9 +433,11 @@ def setup_logging(directory: str | None = None) -> str | None:
         # Native crashes (ONNX Runtime, PortAudio) never reach excepthook.
         if _crash_file is not None:
             try:
+                faulthandler.disable()
                 _crash_file.close()
-            except OSError:
+            except Exception:
                 pass
+            _crash_file = None
         _crash_file = open(os.path.join(directory, "crash.log"), "a", encoding="utf-8")  # noqa: SIM115
         faulthandler.enable(file=_crash_file, all_threads=True)
     except OSError as exc:

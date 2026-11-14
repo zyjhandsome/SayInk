@@ -211,8 +211,6 @@ class SileroGate(SpeechGate):
 
     def is_speech(self, block: np.ndarray, rms: float, *, in_speech: bool) -> bool:
         source = np.asarray(block, dtype=np.float32).reshape(-1)
-        peak = float(np.max(np.abs(source), initial=0.0))
-        target_gain = min(self.input_gain, max(1.0, 0.9 / max(peak, 1e-8)))
         raw_samples = np.concatenate([self._carry, source]) if self._carry.size else source
         scored_end = (raw_samples.size // self._window) * self._window
         if scored_end == 0:
@@ -221,13 +219,20 @@ class SileroGate(SpeechGate):
             self._carry = raw_samples.copy()
             return self._last_verdict
         raw_chunk = raw_samples[:scored_end]
-        if abs(target_gain - self._prev_gain) > 1e-3:
-            ramp = np.linspace(self._prev_gain, target_gain, scored_end, dtype=np.float32)
-            samples = np.clip(raw_chunk * ramp, -1.0, 1.0)
-        elif target_gain != 1.0:
-            samples = np.clip(raw_chunk * np.float32(target_gain), -1.0, 1.0)
-        else:
+        gain_cfg = float(self.input_gain)
+        if abs(gain_cfg - 1.0) <= 1e-3 and abs(self._prev_gain - 1.0) <= 1e-3:
+            target_gain = 1.0
             samples = raw_chunk
+        else:
+            peak = float(np.max(np.abs(raw_chunk), initial=0.0))
+            target_gain = min(gain_cfg, max(1.0, 0.9 / max(peak, 1e-8)))
+            if abs(target_gain - self._prev_gain) > 1e-3:
+                ramp = np.linspace(self._prev_gain, target_gain, scored_end, dtype=np.float32)
+                samples = np.clip(raw_chunk * ramp, -1.0, 1.0)
+            elif target_gain != 1.0:
+                samples = np.clip(raw_chunk * np.float32(target_gain), -1.0, 1.0)
+            else:
+                samples = raw_chunk
         self._prev_gain = float(target_gain)
         self._carry = raw_samples[scored_end:].copy()
 

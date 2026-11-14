@@ -344,17 +344,16 @@
 | `stt.vad` | `silero` | 旧设置保留兼容；运行时自动尝试 Silero，模型缺失或加载失败时退回 `energy`。转写用短停顿，会议用长停顿 |
 | `stt.glossary` | `[]` | 全局词表，每项 `{"term": "张鑫", "variants": ["张新", "章鑫"]}`；`variants` 供同音替换与提示词使用；对转写与会议都作为热词 |
 | `stt.language` | `auto` | 传给支持 `language` 的加载器；`auto` → `zh`（`effective_language`） |
-| `stt.speaker_model_enabled` | `true` | 已下载时是否启用 CAM++（转写与会议） |
-| `meeting.input_source` | `mixed` | 开会默认来源；开始卡片可临时改 |
+| `audio.separate_lanes` | `false` | 混合音源两路分别识别（转写与会议共用；CPU 开销更高） |
+| `meeting.input_source` | `mixed` | 开会默认来源（`mixed` / `microphone` / `system`，不随转写音源变化）；开始卡片可临时改 |
 | `meeting.model_id` | `""` | 会议识别模型；空则沿用 `stt.model_id`；开始卡片可临时改 |
-| `meeting.separate_lanes` | `false` | 混合采集两轨分别识别（M2，CPU 翻倍） |
-| `meeting.hotkey` | `""` | 开始 / 结束会议的全局快捷键（空 = 未设置） |
 | `meeting.show_start_card` | `true` | 是否显示开始卡片 |
 | `meeting.polish_segments` | `false` | 会中是否逐句润色 |
+| `meeting.save_audio` | `true` | 本机保存会议录音（默认开启，可关闭；声纹始终不落盘） |
 | `meeting.model_name` | `""` | 纪要模型；空则用 `llm.model_name` |
 | `meeting.template_id` | `general` | 默认模板；会后自动生成也用它 |
 | `meeting.auto_generate` | `false` | 会议结束后按默认模板在后台排队生成纪要（AI 服务 → 会议纪要） |
-| `meeting.output_language` | `auto` | `auto / zh / en` |
+| `meeting.output_language` | `auto` | `auto / zh / en / ja` |
 | `meeting.confirmed_remote_hosts` | `[]` | 已确认可发送文字稿的远程主机 |
 | `meeting.single_request_char_limit` | `8000` | 单次请求的文字稿上限，超过走分块；8000 同时是生成器的硬上限，此项只能调低 |
 

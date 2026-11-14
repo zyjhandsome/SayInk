@@ -320,7 +320,14 @@ def transcript_lines(
 ) -> list[TranscriptLine]:
     lines: list[TranscriptLine] = []
     for seg in segments:
-        text = (seg.corrected_text or (seg.polished_text if prefer_polished and seg.polished_text else seg.raw_text)).strip()
+        if seg.polished_text == "\u200b" and not seg.corrected_text:
+            continue
+        chosen = seg.corrected_text or (
+            seg.polished_text
+            if prefer_polished and seg.polished_text and seg.polished_text != "\u200b"
+            else seg.raw_text
+        )
+        text = chosen.replace("\u200b", "").strip()
         if not text:
             continue
         offset = segment_offset_ms(seg, meeting_started_at)
@@ -415,6 +422,7 @@ _LANGUAGE_RULES = {
     "auto": "- 语言：与文字稿主体语言一致（中文为主则用中文；专有名词保留原文）。\n",
     "zh": "- 语言：用中文撰写；专有名词保留原文。\n",
     "en": "- Language: write the minutes in English; keep proper nouns as spoken.\n",
+    "ja": "- 言語：議事録は日本語で作成し、固有名詞は発言のまま保持してください。\n",
 }
 
 
@@ -598,7 +606,7 @@ def chunk_transcript_with_spans(
 ) -> list[tuple[str, int, int]]:
     """Return ``[(chunk_text, start_ms, end_ms), ...]`` with contiguous time bounds."""
     max_chars = max(64, int(max_chars))
-    raw_chunks: list[tuple[str, int, int]] = []
+    raw_chunks: list[tuple[str, int | None, int]] = []
     current: list[str] = []
     cur_min_ms: int | None = None
     cur_max_ms: int = 0
@@ -622,7 +630,7 @@ def chunk_transcript_with_spans(
             remaining = remaining[end:]
             extra = len(rendered) + (1 if current else 0)
             if current and size + extra > max_chars:
-                raw_chunks.append(("\n".join(current), cur_min_ms or 0, cur_max_ms))
+                raw_chunks.append(("\n".join(current), cur_min_ms, cur_max_ms))
                 current, size = [], 0
                 cur_min_ms, cur_max_ms = None, 0
                 extra = len(rendered)
@@ -632,44 +640,27 @@ def chunk_transcript_with_spans(
                 cur_max_ms = max(cur_max_ms, line_end)
             size += extra
     if current:
-        raw_chunks.append(("\n".join(current), cur_min_ms or 0, cur_max_ms))
+        raw_chunks.append(("\n".join(current), cur_min_ms, cur_max_ms))
     total = len(raw_chunks)
     if total <= 1:
         return [(text, 0, 10**12) for text, _s, _e in raw_chunks]
     out: list[tuple[str, int, int]] = []
+    prev_end = -1
     for idx, (text, first_ms, max_end_ms) in enumerate(raw_chunks):
-        span_start = 0 if idx == 0 else first_ms
+        if idx == 0:
+            span_start = 0
+        elif first_ms is not None:
+            span_start = first_ms
+        else:
+            span_start = max(0, prev_end + 1)
         if idx + 1 < total:
             next_start = raw_chunks[idx + 1][1]
-            span_end = max(max_end_ms, next_start - 1) if next_start > span_start else max(span_start, max_end_ms)
+            if next_start is not None and next_start > span_start:
+                span_end = max(max_end_ms, next_start - 1)
+            else:
+                span_end = max(span_start, max_end_ms)
         else:
-            span_end = max(max_end_ms, 10**12)
+            span_end = max(span_start, max_end_ms, 10**12)
+        prev_end = max(prev_end, span_end)
         out.append((text, span_start, span_end))
     return out
-
-
-def chunk_transcript(
-    lines: Sequence[TranscriptLine],
-    names: dict[int, str] | None,
-    *,
-    max_chars: int,
-    show_speakers: bool = True,
-    show_times: bool = True,
-    label_unknown: bool = True,
-) -> list[str]:
-    """Bound every chunk, including an unusually long individual ASR line.
-
-    Split pieces retain their speaker and actual source timestamp. No
-    artificial timestamps are inferred for fragments of the same utterance.
-    """
-    return [
-        text
-        for text, _start, _end in chunk_transcript_with_spans(
-            lines,
-            names,
-            max_chars=max_chars,
-            show_speakers=show_speakers,
-            show_times=show_times,
-            label_unknown=label_unknown,
-        )
-    ]

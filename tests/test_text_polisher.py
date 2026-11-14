@@ -171,12 +171,14 @@ def test_direct_mode_ignores_suffixes_and_keeps_the_certificate_authority(monkey
     assert options["verify"] is create.return_value
 
 
-def test_update_and_model_download_do_not_read_proxy_suffixes():
+def test_model_download_does_not_read_proxy_suffixes_while_updater_honors_it():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1] / "sayink"
-    for name in ("updater.py", "speech_recognizer.py"):
-        assert "proxy_bypass_suffixes" not in (root / name).read_text(encoding="utf-8")
+    assert "proxy_bypass_suffixes" not in (root / "speech_recognizer.py").read_text(
+        encoding="utf-8"
+    )
+    assert "proxy_bypass_suffixes" in (root / "updater.py").read_text(encoding="utf-8")
 
 
 class TestSecureOrLocalUrl:
@@ -269,6 +271,11 @@ class TestSecureOrLocalUrl:
             text = " ".join(label.text() for label in page.findChildren(QLabel))
             assert API_ADDRESS_HINT in text
             assert "开头即可" not in text
+            note = next(label for label in page.findChildren(QLabel) if API_ADDRESS_HINT in label.text())
+            assert note.text().splitlines()[1] == API_ADDRESS_HINT
+            summary = page.proxy_summary_label
+            assert summary.wordWrap() is False
+            assert summary.minimumWidth() >= summary.fontMetrics().horizontalAdvance(summary.text())
         finally:
             page.deleteLater()
 

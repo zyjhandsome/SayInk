@@ -2,11 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-
-import pytest
-from PyQt6.QtWidgets import QApplication
-
 from sayink.config import Config
 from sayink.history_store import HistoryStore, SegmentRecord, SessionSummary
 from sayink.ui import history_export, history_window
@@ -21,11 +16,6 @@ from sayink.ui.history_export import (
 )
 from sayink.ui.history_window import HistoryWindow
 from sayink.ui.main_window import MainWindow
-
-
-@pytest.fixture
-def qapp():
-    return QApplication.instance() or QApplication(sys.argv)
 
 
 class _FakeHistoryStore:

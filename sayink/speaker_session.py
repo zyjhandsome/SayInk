@@ -62,6 +62,9 @@ def _mel_filterbank(sample_rate: int) -> np.ndarray:
 
 
 _MEL_BANK = _mel_filterbank(TARGET_SAMPLE_RATE)
+_FRAME_LEN = int(TARGET_SAMPLE_RATE * 0.025)
+_HOP_LEN = int(TARGET_SAMPLE_RATE * 0.010)
+_HAMMING_WINDOW = np.hamming(_FRAME_LEN).astype(np.float32)
 _FAR_FIELD_TARGET_P90 = 0.03
 _FAR_FIELD_MAX_GAIN = 32.0
 _FAR_FIELD_PEAK_CEIL = 0.90
@@ -128,18 +131,13 @@ def voice_embedding(audio: np.ndarray) -> np.ndarray:
         return empty
     centered = samples - float(np.mean(samples))
     framed = np.append(centered[:1], centered[1:] - 0.97 * centered[:-1])
-    frame_len = int(sample_rate * 0.025)
-    hop = int(sample_rate * 0.010)
+    frame_len = _FRAME_LEN
+    hop = _HOP_LEN
     if framed.size < frame_len:
         return empty
-    window = np.hamming(frame_len).astype(np.float32)
-    n_frames = 1 + (framed.size - frame_len) // hop
-    bank = _MEL_BANK
-    mels = np.empty((n_frames, _N_MELS), dtype=np.float32)
-    for index in range(n_frames):
-        start = index * hop
-        spectrum = np.abs(np.fft.rfft(framed[start : start + frame_len] * window, n=_N_FFT)) ** 2
-        mels[index] = np.log(bank @ spectrum[: bank.shape[1]] + 1e-6)
+    frames = np.lib.stride_tricks.sliding_window_view(framed, frame_len)[::hop]
+    spectra = np.abs(np.fft.rfft(frames * _HAMMING_WINDOW, n=_N_FFT, axis=1)) ** 2
+    mels = np.log(spectra[:, : _MEL_BANK.shape[1]] @ _MEL_BANK.T + 1e-6).astype(np.float32)
     mean = mels.mean(axis=0)
     centered = (mean - float(np.median(mean))).astype(np.float32)
     peak = np.zeros(_N_MELS, dtype=np.float32)
@@ -205,7 +203,8 @@ class SpeakerSession:
 
     @property
     def speaker_count(self) -> int:
-        return len(self._clusters)
+        with self._lock:
+            return len(self._clusters)
 
     @property
     def history(self) -> list[tuple[int, np.ndarray]]:
@@ -304,6 +303,8 @@ class SpeakerSession:
             return None
         if route and last.route and last.route != route:
             return None
+        if last.centroid.size != vector.size:
+            return None
         if float(np.dot(last.centroid, vector)) < self._sticky_threshold:
             return None
         return last
@@ -318,6 +319,8 @@ class SpeakerSession:
         best_sim = -2.0
         for cluster in self._clusters:
             if route is not None and cluster.route and route and cluster.route != route:
+                continue
+            if cluster.centroid.size != vector.size:
                 continue
             similarity = float(np.dot(cluster.centroid, vector))
             if similarity > best_sim:
@@ -367,18 +370,21 @@ def recluster(
     merge and existing numbers remain stable, including reserved manual ids.
     """
     protected = set(protected_ids or ())
+    limit = max(1, int(max_speakers))
     centroids: dict[int, np.ndarray] = {}
     counts: dict[int, int] = {}
     order: list[int] = []
     for speaker_id, vector in history:
         vec = np.asarray(vector, dtype=np.float32).reshape(-1)
-        if vec.size == 0 or float(np.linalg.norm(vec)) < 1e-6:
+        norm = float(np.linalg.norm(vec))
+        if vec.size == 0 or norm < 1e-6:
             continue
+        vec = vec / norm
         if speaker_id not in centroids:
-            centroids[speaker_id] = vec.copy()
+            centroids[speaker_id] = vec
             counts[speaker_id] = 1
             order.append(speaker_id)
-        else:
+        elif centroids[speaker_id].size == vec.size:
             centroids[speaker_id] = centroids[speaker_id] + vec
             counts[speaker_id] += 1
     if not centroids:
@@ -402,6 +408,8 @@ def recluster(
     ids = list(order)
     for i, a in enumerate(ids):
         for b in ids[i + 1:]:
+            if centroids[a].size != centroids[b].size:
+                continue
             pairs.append((float(np.dot(centroids[a], centroids[b])), a, b))
     pairs.sort(reverse=True)
     for sim, a, b in pairs:
@@ -411,8 +419,12 @@ def recluster(
         if ra != rb:
             if ra in protected and rb in protected:
                 continue
-            if any(float(np.dot(centroids[left], centroids[right])) < threshold
-                   for left in members[ra] for right in members[rb]):
+            if any(
+                centroids[left].size != centroids[right].size
+                or float(np.dot(centroids[left], centroids[right])) < threshold
+                for left in members[ra]
+                for right in members[rb]
+            ):
                 continue
             # Manual identities keep their number and cannot swallow each other.
             if ra in protected or (rb not in protected and order.index(ra) < order.index(rb)):
@@ -428,13 +440,19 @@ def recluster(
         if root not in roots_in_order:
             roots_in_order.append(root)
     # More roots than allowed: fold the smallest groups into their nearest root.
-    while len(roots_in_order) > max_speakers:
+    while len(roots_in_order) > limit:
         sizes = {r: sum(counts[s] for s in order if find(s) == r) for r in roots_in_order}
         candidates = [r for r in roots_in_order if r not in protected]
         if not candidates:
             break
         smallest = min(candidates, key=lambda r: sizes[r])
-        others = [r for r in roots_in_order if r != smallest]
+        others = [
+            r
+            for r in roots_in_order
+            if r != smallest and centroids[r].size == centroids[smallest].size
+        ]
+        if not others:
+            break
         nearest = max(others, key=lambda r: float(np.dot(centroids[smallest], centroids[r])))
         parent[smallest] = nearest
         roots_in_order.remove(smallest)

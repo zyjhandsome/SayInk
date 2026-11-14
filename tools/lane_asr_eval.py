@@ -15,7 +15,12 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sayink.recognition_settings import aux_model_path
-from sayink.speech_recognizer import _create_recognizer, decode_asr_slice, AUX_MODEL_SILERO_VAD
+from sayink.speech_recognizer import (
+    AUX_MODEL_SILERO_VAD,
+    _create_recognizer,
+    decode_asr_slice,
+    language_argument,
+)
 from sayink.vad_segmenter import make_meeting_segmenter
 from tools.asr_bench import load_wav, cer, edit_distance, normalize_for_cer
 from tools.textgrid_reference import read_textgrid
@@ -67,9 +72,10 @@ def main():
         sources.append(source)
         labels = read_textgrid(file.with_name(file.name.removesuffix(".ch0.wav") + ".TextGrid"))
         turns.append(clear_turns(labels)[:2])
-    rec = _create_recognizer(args.model, 4, language="中文")
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    rec = _create_recognizer(args.model, 4, language=language_argument(args.model, "zh"))
     report = {"model": args.model, "threads": 4, "controlled_overlap": True, "cases": []}
-    for index, (left, right) in enumerate(zip(*turns, strict=True)):
+    for index, (left, right) in enumerate(zip(*turns, strict=False)):
         mic, system = prepare(sources[0], left), prepare(sources[1], right)
         length = max(len(mic), len(system))
         mic, system = np.pad(mic, (0, length - len(mic))), np.pad(system, (0, length - len(system)))
@@ -91,6 +97,7 @@ def main():
         report["cases"].append(case)
         args.out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps({k: v for k, v in case.items() if k not in {"sources", "mixed", "separate"}}), flush=True)
+    args.out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0
 
 

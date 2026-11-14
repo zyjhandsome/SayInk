@@ -69,10 +69,20 @@ _MIN_H = 580
 _WM_NCHITTEST = 0x0084
 _WM_NCCALCSIZE = 0x0083
 _WM_GETMINMAXINFO = 0x0024
+_WM_ERASEBKGND = 0x0014
+_WM_SHOWWINDOW = 0x0018
+_WM_NCPAINT = 0x0085
+_WM_NCACTIVATE = 0x0086
 _WM_ENTERSIZEMOVE = 0x0231
 _WM_EXITSIZEMOVE = 0x0232
 _WM_SIZING = 0x0214
+_WM_WINDOWPOSCHANGING = 0x0046
+# Qt sets this on every size change. It throws away the client bits, and the
+# following erase is the full-window flash on an edge or corner drag.
+_SWP_NOSIZE = 0x0001
+_SWP_NOCOPYBITS = 0x0100
 # DWMWA_USE_IMMERSIVE_DARK_MODE (20) and the pre-20H1 value (19).
+_DWMWA_TRANSITIONS_FORCEDISABLED = 3
 _DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19
 _DWMWA_USE_IMMERSIVE_DARK_MODE = 20
 _DWMWA_WINDOW_CORNER_PREFERENCE = 33
@@ -80,8 +90,55 @@ _DWMWA_BORDER_COLOR = 34
 _DWMWA_CAPTION_COLOR = 35
 _DWMWA_SYSTEMBACKDROP_TYPE = 38
 _DWMSBT_NONE = 1
-_WVR_VALIDRECTS = 0x0400
+# Keep already-drawn pixels against the edges that did not move.
+_WVR_ALIGNTOP = 0x0010
+_WVR_ALIGNLEFT = 0x0020
+_WVR_ALIGNBOTTOM = 0x0040
+_WVR_ALIGNRIGHT = 0x0080
+# WM_SIZING hit edges. Top and left drags must not anchor to the moving side.
+_WMSZ_LEFT, _WMSZ_RIGHT, _WMSZ_TOP = 1, 2, 3
+_WMSZ_TOPLEFT, _WMSZ_TOPRIGHT = 4, 5
+_WMSZ_BOTTOM, _WMSZ_BOTTOMLEFT, _WMSZ_BOTTOMRIGHT = 6, 7, 8
 _MONITOR_DEFAULTTONEAREST = 2
+
+
+def _win32_draw():
+    """user32/gdi32 with pointer-sized handles.
+
+    The defaults truncate a 64-bit HDC, and FillRect then writes off the stack.
+    """
+    cached = getattr(_win32_draw, "_api", None)
+    if cached is not None:
+        return cached
+    import ctypes
+    from ctypes import byref, c_int, c_long, c_uint, c_void_p, windll
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", c_long),
+            ("top", c_long),
+            ("right", c_long),
+            ("bottom", c_long),
+        ]
+
+    user32, gdi32 = windll.user32, windll.gdi32
+    user32.GetDC.argtypes = [c_void_p]
+    user32.GetDC.restype = c_void_p
+    user32.ReleaseDC.argtypes = [c_void_p, c_void_p]
+    user32.ReleaseDC.restype = c_int
+    user32.GetClientRect.argtypes = [c_void_p, ctypes.POINTER(RECT)]
+    user32.GetClientRect.restype = c_int
+    user32.FillRect.argtypes = [c_void_p, ctypes.POINTER(RECT), c_void_p]
+    user32.FillRect.restype = c_int
+    gdi32.CreateSolidBrush.argtypes = [c_uint]
+    gdi32.CreateSolidBrush.restype = c_void_p
+    gdi32.DeleteObject.argtypes = [c_void_p]
+    gdi32.DeleteObject.restype = c_int
+    cached = (user32, gdi32, RECT, byref)
+    _win32_draw._api = cached
+    return cached
+
+
 _HTLEFT, _HTRIGHT, _HTTOP, _HTTOPLEFT, _HTTOPRIGHT = 10, 11, 12, 13, 14
 _HTBOTTOM, _HTBOTTOMLEFT, _HTBOTTOMRIGHT = 15, 16, 17
 _HTCAPTION = 2
@@ -190,6 +247,7 @@ class MainWindow(QWidget):
         self._page = "general"
         self._drag_offset = None
         self._live_resizing = False
+        self._sizing_edge = 0
         self._model_runtime_text = "正在启动…"
         self._model_runtime_state = RuntimeState.LOADING
         # A live meeting owns the dot while it runs (see _refresh_usage_summary).
@@ -200,6 +258,10 @@ class MainWindow(QWidget):
         self._connect_screen_watchers()
         self.reapply_theme()
         self.show_page("general")
+        # Build the native frame while the window is still hidden. Doing it
+        # from showEvent runs after Windows has already painted the default
+        # caption, which is the white flash on the first open.
+        self._prepare_presentation()
         # No programmatic focus on a nav button: the focus ring must only
         # appear for keyboard navigation, never as a second "selected" state.
 
@@ -303,10 +365,35 @@ class MainWindow(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        # The system brush is the light window color. Skip that erase so a
-        # drag that does repaint cannot flash it under the dark stylesheet.
+        # The system brush is the light window color. Skip Qt's own erase;
+        # WM_ERASEBKGND paints the theme color instead. A drag that repaints
+        # otherwise flashes that white brush under the dark stylesheet.
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self._bg_brush = None
+        self._bg_brush_color = None
+        self._bg_brush_cell: list[object] = [None]
+        brush_cell = self._bg_brush_cell
+        owner = weakref.ref(self)
+
+        def release_theme_brush(*_args, _cell=brush_cell, _owner=owner) -> None:
+            brush = _cell[0]
+            _cell[0] = None
+            window = _owner()
+            if window is not None:
+                d = window.__dict__
+                brush = d.get("_bg_brush") or brush
+                d["_bg_brush"] = None
+                d["_bg_brush_color"] = None
+            if brush and sys.platform == "win32":
+                try:
+                    _user32, gdi32, _rect, _byref = _win32_draw()
+                    gdi32.DeleteObject(brush)
+                except Exception:
+                    pass
+
+        self.destroyed.connect(release_theme_brush)
+        weakref.finalize(self, release_theme_brush)
         self.resize(_WINDOW_W, _WINDOW_H)
         self._fit_to_available_screen()
 
@@ -469,6 +556,9 @@ class MainWindow(QWidget):
         self._size_grip = QSizeGrip(self)
         self._size_grip.setFixedSize(16, 16)
         self._size_grip.setToolTip("拖动调整窗口大小")
+        # The grip resizes through Qt, not the native sizing loop. Without
+        # this, every move installs a new rounded region and the corner flashes.
+        self._size_grip.installEventFilter(self)
         self._settings.runtime_status_changed.connect(self._set_runtime_status)
         self._settings.navigation_requested.connect(self.show_page)
         self._settings.settings_changed.connect(self._refresh_usage_summary)
@@ -612,6 +702,11 @@ class MainWindow(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        # The iconic size is not a layout the user sees. Rebuilding the mask
+        # and the 1px border for it flashes the full window on the way down
+        # and again on the way back.
+        if self.isMinimized():
+            return
         if hasattr(self, "_size_grip"):
             inset = 6 if self.isMaximized() else 10
             self._size_grip.move(self.width() - 16 - inset, self.height() - 16 - inset)
@@ -628,18 +723,46 @@ class MainWindow(QWidget):
         # by Windows. Restore its previous normal or maximized state first.
         if self.isMinimized():
             self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        # The native frame is applied while the widget is still hidden.
+        # SetWindowPos(SWP_FRAMECHANGED) after the window is on screen is the
+        # flash where the system caption appears and disappears.
+        if not self.isVisible():
+            self._prepare_presentation()
+            self._bury_surrogate_titlebars()
+            self._sync_native_size()
         super().show()
 
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
+    def _prepare_presentation(self) -> None:
+        """Native frame, theme colors, and mask, safe to run before show."""
         self._enable_native_snap()
         self._apply_dwm_theme_colors()
+        if self.isMinimized():
+            return
         self._fit_to_available_screen()
-        if not self.isMaximized() and not self.isMinimized():
+        if not self.isMaximized():
             self._clamp_into_visible_screen()
         self._sync_frame_margin()
         self._position_frame_edges()
         self._apply_window_shape()
+        # The hidden native surface is still the light system color. Paint
+        # over it before ShowWindow so the first presented frame is the theme.
+        self._fill_native_client()
+
+    def paintEvent(self, event) -> None:
+        # Newly exposed pixels start white in the backing store. Fill them
+        # before the stylesheet so a resize cannot present that white.
+        painter = QPainter(self)
+        painter.fillRect(event.rect(), QColor(tok.BG))
+        painter.end()
+        super().paintEvent(event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._prepare_presentation()
+        # Show can parent Qt's helper caption back onto the desktop.
+        # Qt may show it again after this handler returns.
+        self._bury_surrogate_titlebars()
+        self._schedule_bury_surrogates()
         # Park focus on the window itself: otherwise Qt hands it to the first
         # tab stop and a nav button shows a focus ring nobody asked for. Tab
         # from here reaches the nav / page controls as usual.
@@ -692,6 +815,8 @@ class MainWindow(QWidget):
         dark = 1 if bg.lightness() < 128 else 0
         colorref = bg.red() | (bg.green() << 8) | (bg.blue() << 16)
         return {
+            # Opening animation draws a small system caption before our frame exists.
+            _DWMWA_TRANSITIONS_FORCEDISABLED: 1,
             _DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1: dark,
             _DWMWA_USE_IMMERSIVE_DARK_MODE: dark,
             _DWMWA_BORDER_COLOR: colorref,
@@ -703,14 +828,16 @@ class MainWindow(QWidget):
         if sys.platform != "win32":
             return
         try:
-            from ctypes import byref, c_int, sizeof, windll
+            from ctypes import byref, c_int, c_long, c_void_p, sizeof, windll, wintypes
 
             hwnd = int(self.winId())
             if hwnd == 0:
                 return
-            windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, attr, byref(c_int(value)), sizeof(c_int)
-            )
+            dwm_set = windll.dwmapi.DwmSetWindowAttribute
+            if hasattr(dwm_set, "argtypes"):
+                dwm_set.argtypes = [wintypes.HWND, wintypes.DWORD, c_void_p, wintypes.DWORD]
+                dwm_set.restype = c_long
+            dwm_set(hwnd, attr, byref(c_int(value)), sizeof(c_int))
         except Exception:
             return
 
@@ -725,7 +852,10 @@ class MainWindow(QWidget):
     def _clear_round_mask(self) -> None:
         self._mask_key = None
         if not self.mask().isEmpty():
+            # Dropping the region invalidates every pixel. The system would
+            # erase that with white; paint the theme color in the same turn.
             self.clearMask()
+            self._fill_native_client()
 
     def _apply_chrome_radius(self) -> None:
         """Theme colors for the frame. Maximize does not call this."""
@@ -894,6 +1024,33 @@ class MainWindow(QWidget):
         return obj in (self._caption, self._title, self._ink_dot)
 
     def eventFilter(self, obj, event):
+        if obj is getattr(self, "_size_grip", None):
+            etype = event.type()
+            if (
+                etype == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                self._live_resizing = True
+                self._clear_round_mask()
+            elif (
+                etype == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                self._live_resizing = False
+                self._apply_window_shape()
+            return super().eventFilter(obj, event)
+        # The caption covers the top resize border. A Qt drag from those
+        # pixels fights the native top-edge resize and the window shakes.
+        if self._caption_drag_target(obj) and event.type() in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseMove,
+            QEvent.Type.MouseButtonRelease,
+            QEvent.Type.MouseButtonDblClick,
+        ):
+            local = self.mapFromGlobal(event.globalPosition().toPoint())
+            if self._hit_test_edge(local.x(), local.y()) is not None:
+                self._drag_offset = None
+                return False
         if self._caption_drag_target(obj) and event.type() == QEvent.Type.MouseButtonDblClick:
             if event.button() == Qt.MouseButton.LeftButton:
                 self._drag_offset = None
@@ -939,11 +1096,17 @@ class MainWindow(QWidget):
         try:
             if sys.platform == "win32" and was_visible:
                 try:
-                    from ctypes import windll
+                    from ctypes import c_int, c_uint, windll, wintypes
 
                     hwnd = int(self.winId())
                     if hwnd:
-                        windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, _SWP_HIDE_ONLY)
+                        set_pos = windll.user32.SetWindowPos
+                        if hasattr(set_pos, "argtypes"):
+                            set_pos.argtypes = [
+                                wintypes.HWND, wintypes.HWND, c_int, c_int, c_int, c_int, c_uint,
+                            ]
+                            set_pos.restype = wintypes.BOOL
+                        set_pos(hwnd, 0, 0, 0, 0, 0, _SWP_HIDE_ONLY)
                 except Exception:
                     pass
             self.hide()
@@ -1003,6 +1166,9 @@ class MainWindow(QWidget):
         # Scoped: a bare declaration cascades to every descendant QWidget and
         # paints list item widgets opaque, hiding ::item:selected under them.
         self._stack.setStyleSheet(f"QStackedWidget#mainStack {{ background: {live.BG}; }}")
+        self._theme_brush()
+        if self.isVisible():
+            self._fill_native_client()
 
     # ── native edge resize (Windows) ─────────────────────────────
 
@@ -1068,21 +1234,34 @@ class MainWindow(QWidget):
             return
         try:
             import ctypes
-            from ctypes import windll
+            from ctypes import windll, wintypes
 
             hwnd = int(self.winId())
             if not hwnd:
                 return
             get_long = windll.user32.GetWindowLongPtrW
             set_long = windll.user32.SetWindowLongPtrW
-            get_long.restype = ctypes.c_ssize_t
-            set_long.restype = ctypes.c_ssize_t
-            get_long.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            set_long.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+            set_pos = windll.user32.SetWindowPos
+            if hasattr(get_long, "argtypes"):
+                get_long.restype = ctypes.c_ssize_t
+                get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+            if hasattr(set_long, "argtypes"):
+                set_long.restype = ctypes.c_ssize_t
+                set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+            if hasattr(set_pos, "argtypes"):
+                set_pos.argtypes = [
+                    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+                ]
+                set_pos.restype = wintypes.BOOL
             style = get_long(hwnd, -16)
             set_long(hwnd, -16, style | _WS_SNAP_STYLE)
-            windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, _SWP_FRAMECHANGED)
+            set_pos(hwnd, 0, 0, 0, 0, 0, _SWP_FRAMECHANGED)
             self._native_snap_ready = True
+            # Qt's helper caption is a real overlapped window at (0, 0). Showing
+            # the main window can flash it: system icon, maximize, close, white.
+            self._bury_surrogate_titlebars()
+            self._sync_native_size()
         except Exception:
             return
 
@@ -1117,13 +1296,7 @@ class MainWindow(QWidget):
         return True
 
     @staticmethod
-    def _skip_stale_client_copy(msg) -> bool:
-        """Stop Windows copying old client pixels while resizing from a top/left edge.
-
-        The frameless client area already equals the window rect, so rgrc[0] stays
-        as proposed; identical 1px source/destination rects make the copy a no-op
-        and Qt repaints the whole client area instead.
-        """
+    def _nccalc_params(msg):
         from ctypes import POINTER, Structure, c_long, c_void_p, cast
 
         class RECT(Structure):
@@ -1137,22 +1310,349 @@ class MainWindow(QWidget):
         class NCCALCSIZE_PARAMS(Structure):
             _fields_ = [("rgrc", RECT * 3), ("lppos", c_void_p)]
 
-        params = cast(msg.lParam, POINTER(NCCALCSIZE_PARAMS)).contents
+        return cast(msg.lParam, POINTER(NCCALCSIZE_PARAMS)).contents
+
+    def _is_zoomed(self, hwnd) -> bool:
+        if self.isFullScreen():
+            return True
+        try:
+            from ctypes import windll, wintypes
+
+            is_zoomed = windll.user32.IsZoomed
+            if hasattr(is_zoomed, "argtypes"):
+                is_zoomed.argtypes = [wintypes.HWND]
+                is_zoomed.restype = wintypes.BOOL
+            return bool(is_zoomed(hwnd))
+        except Exception:
+            return self.isMaximized()
+
+    def _proposed_size_changed(self, msg) -> bool:
+        params = self._nccalc_params(msg)
         new, old = params.rgrc[0], params.rgrc[1]
-        if (new.right - new.left, new.bottom - new.top) == (
-            old.right - old.left, old.bottom - old.top
-        ):
+        return (new.right - new.left, new.bottom - new.top) != (
+            old.right - old.left,
+            old.bottom - old.top,
+        )
+
+    def _nudge_client_bottom(self, msg) -> None:
+        """Break the top-edge correction loop.
+
+        A thick-frame window whose client rectangle equals the window rectangle
+        is nudged down by a pixel whenever the cursor rests on the top sizing
+        border, then nudged back, because Windows still expects a non-client
+        edge. One extra client pixel past the bottom is clipped and is enough
+        for Windows to stop correcting. The proposed rect is replaced on every
+        message, so the extra pixel does not accumulate.
+        """
+        self._nccalc_params(msg).rgrc[0].bottom += 1
+
+    def _keep_resize_bits(self, msg) -> bool:
+        """Keep the pixels already on screen while the user drags an edge.
+
+        Qt's platform window sets ``SWP_NOCOPYBITS`` on every size change so a
+        framed window does not smear. Here the client is the window, so that
+        flag discards the whole page. The erase that follows paints the theme
+        color over every pixel: the flash on all four edges and all four corners.
+        Consuming the message also skips the frame-margin correction Qt would
+        apply from the one-pixel resting nudge.
+        """
+        if not self._live_resizing:
             return False
-        for index in (1, 2):
-            params.rgrc[index].left = new.left
-            params.rgrc[index].top = new.top
-            params.rgrc[index].right = new.left + 1
-            params.rgrc[index].bottom = new.top + 1
+        import ctypes
+        from ctypes import wintypes
+
+        class WINDOWPOS(ctypes.Structure):
+            _fields_ = [
+                ("hwnd", wintypes.HWND),
+                ("hwndInsertAfter", wintypes.HWND),
+                ("x", ctypes.c_int),
+                ("y", ctypes.c_int),
+                ("cx", ctypes.c_int),
+                ("cy", ctypes.c_int),
+                ("flags", ctypes.c_uint),
+            ]
+
+        pos = ctypes.cast(msg.lParam, ctypes.POINTER(WINDOWPOS)).contents
+        if pos.flags & _SWP_NOSIZE:
+            return False
+        pos.flags &= ~_SWP_NOCOPYBITS
         return True
+
+    def _client_alignment(self) -> int:
+        """Anchor existing pixels to the edges that are not being dragged.
+
+        The default copy pins them to the top-left. A top or left drag then
+        slides the whole page for a frame. Anchoring to the stable edges
+        leaves those pixels where they are, so only the new strip is painted.
+        """
+        edge = self._sizing_edge
+        if edge in (_WMSZ_TOP, _WMSZ_TOPRIGHT):
+            return _WVR_ALIGNBOTTOM | _WVR_ALIGNLEFT
+        if edge == _WMSZ_TOPLEFT:
+            return _WVR_ALIGNBOTTOM | _WVR_ALIGNRIGHT
+        if edge in (_WMSZ_LEFT, _WMSZ_BOTTOMLEFT):
+            return _WVR_ALIGNTOP | _WVR_ALIGNRIGHT
+        return 0
+
+    def _release_theme_brush(self) -> None:
+        cell = getattr(self, "_bg_brush_cell", None)
+        cell_brush = cell[0] if isinstance(cell, list) and cell else None
+        if isinstance(cell, list) and cell:
+            cell[0] = None
+        brush = getattr(self, "_bg_brush", None) or cell_brush
+        self._bg_brush = None
+        self._bg_brush_color = None
+        if not brush or sys.platform != "win32":
+            return
+        try:
+            _user32, gdi32, _rect, _byref = _win32_draw()
+            gdi32.DeleteObject(brush)
+        except Exception:
+            return
+
+    def _theme_brush(self):
+        if sys.platform != "win32":
+            return None
+        from sayink.ui import design_tokens as live
+
+        color = QColor(live.BG)
+        colorref = color.red() | (color.green() << 8) | (color.blue() << 16)
+        if self._bg_brush is not None and self._bg_brush_color == colorref:
+            return self._bg_brush
+        self._release_theme_brush()
+        try:
+            _user32, gdi32, _rect, _byref = _win32_draw()
+            brush = gdi32.CreateSolidBrush(colorref)
+        except Exception:
+            return None
+        if not brush:
+            return None
+        self._bg_brush = brush
+        self._bg_brush_color = colorref
+        cell = getattr(self, "_bg_brush_cell", None)
+        if isinstance(cell, list) and cell:
+            cell[0] = brush
+        return brush
+
+    def _fill_dc(self, hdc, rect) -> None:
+        brush = self._theme_brush()
+        if not brush or not hdc:
+            return
+        _user32, _gdi32, _rect_type, byref = _win32_draw()
+        _user32.FillRect(hdc, byref(rect), brush)
+
+    def _fill_client_dc(self, hwnd, hdc) -> None:
+        if not hwnd or not hdc:
+            return
+        user32, _gdi32, rect_type, byref = _win32_draw()
+        rect = rect_type()
+        if user32.GetClientRect(hwnd, byref(rect)):
+            self._fill_dc(hdc, rect)
+
+    def _uses_win32_surface(self) -> bool:
+        if sys.platform != "win32":
+            return False
+        app = QApplication.instance()
+        return app is None or app.platformName() == "windows"
+
+    def _bury_surrogate_titlebars(self) -> None:
+        """Keep Qt's `_q_titlebar` window off the desktop.
+
+        Qt creates one overlapped helper per top-level window, at (0, 0), with
+        a real system caption. It stays hidden until a show path parents it
+        back. That caption is the small box: the app icon, an empty maximize
+        square, a close mark, and an unpainted white client.
+        """
+        if not self._uses_win32_surface() or getattr(self, "_burying_titlebars", False):
+            return
+        self._burying_titlebars = True
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            wndenumproc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            if hasattr(user32.EnumWindows, "argtypes"):
+                user32.EnumWindows.argtypes = [wndenumproc, wintypes.LPARAM]
+                user32.EnumWindows.restype = wintypes.BOOL
+            if hasattr(user32.EnumChildWindows, "argtypes"):
+                user32.EnumChildWindows.argtypes = [wintypes.HWND, wndenumproc, wintypes.LPARAM]
+                user32.EnumChildWindows.restype = wintypes.BOOL
+            user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+            user32.GetWindowThreadProcessId.argtypes = [
+                wintypes.HWND, ctypes.POINTER(wintypes.DWORD),
+            ]
+            user32.IsWindow.argtypes = [wintypes.HWND]
+            user32.IsWindow.restype = wintypes.BOOL
+            user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+            user32.SetParent.restype = wintypes.HWND
+            user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+            user32.SetWindowLongPtrW.argtypes = [
+                wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t,
+            ]
+            user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ]
+            pid = ctypes.windll.kernel32.GetCurrentProcessId()
+            hwnd_message = ctypes.c_void_p(-3)  # HWND_MESSAGE
+            titlebars: list[int] = []
+            trays: list[int] = []
+
+            @wndenumproc
+            def collect(hwnd, _lparam):
+                owner = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+                if owner.value != pid:
+                    return True
+                name = ctypes.create_unicode_buffer(96)
+                user32.GetClassNameW(hwnd, name, 96)
+                if name.value == "_q_titlebar":
+                    titlebars.append(int(hwnd))
+                elif name.value.endswith("TrayIconMessageWindowClass"):
+                    trays.append(int(hwnd))
+                return True
+
+            user32.EnumWindows(collect, 0)
+            # Once buried, the helper is a child (or message-only) and EnumWindows
+            # no longer sees it. A later show parents it back onto this window.
+            owner_hwnd = int(self.winId() or 0)
+            if owner_hwnd:
+                try:
+                    user32.EnumChildWindows(owner_hwnd, collect, 0)
+                except Exception:
+                    pass
+            # The tray owner is an overlapped window. A double-click can show
+            # it: system icon, maximize, close, and an unpainted client.
+            # keep_hwnd_hidden also refuses a later ShowWindow from the shell.
+            from sayink.ui.tray_icon import keep_hwnd_hidden
+
+            for hwnd in trays:
+                keep_hwnd_hidden(hwnd)
+            # Caption, thick frame, system menu, minimize, maximize.
+            caption_bits = 0x00C00000 | 0x00040000 | 0x00080000 | 0x00020000 | 0x00010000
+            for hwnd in titlebars:
+                if not user32.IsWindow(hwnd):
+                    continue
+                user32.ShowWindow(hwnd, 0)
+                style = user32.GetWindowLongPtrW(hwnd, -16)
+                buried = (style & ~caption_bits) | 0x80000000  # WS_POPUP
+                if buried != style:
+                    user32.SetWindowLongPtrW(hwnd, -16, buried)
+                keep_hwnd_hidden(hwnd)
+                user32.SetParent(hwnd, hwnd_message)
+                user32.SetWindowPos(
+                    hwnd, 0, -32000, -32000, 0, 0,
+                    0x0001 | 0x0004 | 0x0010 | 0x0080,
+                )
+        except Exception:
+            return
+        finally:
+            self._burying_titlebars = False
+
+    def _schedule_bury_surrogates(self) -> None:
+        """Hide helper captions again after show() returns them to the desktop."""
+        from PyQt6.QtCore import QTimer
+
+        timer = getattr(self, "_bury_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._bury_surrogate_titlebars)
+            self._bury_timer = timer
+        timer.start(0)
+
+    def _sync_native_size(self) -> None:
+        """Grow a caption-sized native frame up to the widget before it is shown."""
+        if (
+            not self._uses_win32_surface()
+            or self.isMaximized()
+            or self.isFullScreen()
+            or self._live_resizing
+            or getattr(self, "_syncing_native_size", False)
+        ):
+            return
+        self._syncing_native_size = True
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", wintypes.LONG),
+                    ("top", wintypes.LONG),
+                    ("right", wintypes.LONG),
+                    ("bottom", wintypes.LONG),
+                ]
+
+            user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ]
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+            rect = RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return
+            ratio = self.devicePixelRatioF() or 1.0
+            want_w = max(1, round(self.width() * ratio))
+            want_h = max(1, round(self.height() * ratio))
+            have_w, have_h = rect.right - rect.left, rect.bottom - rect.top
+            if have_w + 8 >= want_w and have_h + 8 >= want_h:
+                return
+            user32.SetWindowPos(
+                hwnd, 0, 0, 0, want_w, want_h,
+                0x0002 | 0x0004 | 0x0010,
+            )
+        except Exception:
+            return
+        finally:
+            self._syncing_native_size = False
+
+    def _fill_native_client(self) -> None:
+        """Paint the theme color into the Win32 client, which starts out white."""
+        if not self._uses_win32_surface():
+            return
+        try:
+            user32, _gdi32, _rect, _byref = _win32_draw()
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+            hdc = user32.GetDC(hwnd)
+            if not hdc:
+                return
+            try:
+                self._fill_client_dc(hwnd, hdc)
+            finally:
+                user32.ReleaseDC(hwnd, hdc)
+        except Exception:
+            return
+
+    def _erase_background(self, msg) -> None:
+        if not self._uses_win32_surface():
+            return
+        try:
+            hwnd = int(msg.hWnd)
+            hdc = int(msg.wParam)
+        except Exception:
+            return
+        if not hwnd or not hdc:
+            return
+        try:
+            self._fill_client_dc(hwnd, hdc)
+        except Exception:
+            return
 
     def _fit_maximized_to_work_area(self, msg) -> bool:
         """Pin the maximized frame to the monitor work area, without the frame offset."""
-        from ctypes import POINTER, Structure, byref, c_long, c_ulong, cast, sizeof, windll
+        from ctypes import POINTER, Structure, byref, c_long, c_ulong, cast, sizeof, windll, wintypes
 
         class POINT(Structure):
             _fields_ = [("x", c_long), ("y", c_long)]
@@ -1182,10 +1682,19 @@ class MainWindow(QWidget):
                 ("dwFlags", c_ulong),
             ]
 
+        mon_from_win = windll.user32.MonitorFromWindow
+        get_mon_info = windll.user32.GetMonitorInfoW
+        if hasattr(mon_from_win, "argtypes"):
+            mon_from_win.argtypes = [wintypes.HWND, wintypes.DWORD]
+            mon_from_win.restype = wintypes.HMONITOR
+        if hasattr(get_mon_info, "argtypes"):
+            get_mon_info.argtypes = [wintypes.HMONITOR, POINTER(MONITORINFO)]
+            get_mon_info.restype = wintypes.BOOL
+
         info = MONITORINFO()
         info.cbSize = sizeof(MONITORINFO)
-        monitor = windll.user32.MonitorFromWindow(msg.hWnd, _MONITOR_DEFAULTTONEAREST)
-        if not monitor or not windll.user32.GetMonitorInfoW(monitor, byref(info)):
+        monitor = mon_from_win(msg.hWnd, _MONITOR_DEFAULTTONEAREST)
+        if not monitor or not get_mon_info(monitor, byref(info)):
             return False
         fitted = cast(msg.lParam, POINTER(MINMAXINFO)).contents
         work, mon = info.rcWork, info.rcMonitor
@@ -1204,6 +1713,26 @@ class MainWindow(QWidget):
                 from ctypes import wintypes
 
                 msg = wintypes.MSG.from_address(int(message))
+                if msg.message == _WM_ERASEBKGND:
+                    # Windows erases with the light class brush before Qt paints.
+                    # That full-window white is the flash on show. During a drag
+                    # the old pixels are still valid; filling them is the flicker.
+                    if not self._live_resizing:
+                        self._erase_background(msg)
+                    return True, 1
+                if msg.message == _WM_WINDOWPOSCHANGING and self._keep_resize_bits(msg):
+                    return True, 0
+                if msg.message == _WM_NCPAINT:
+                    # WS_CAPTION is on for snap. Painting that non-client frame
+                    # is the small system caption (icon, maximize, close).
+                    return True, 0
+                if msg.message == _WM_NCACTIVATE:
+                    # Activation otherwise draws the default title bar for a frame.
+                    return True, 1
+                if msg.message == _WM_SHOWWINDOW and msg.wParam:
+                    self._fill_native_client()
+                    self._bury_surrogate_titlebars()
+                    self._sync_native_size()
                 if msg.message == _WM_GETMINMAXINFO:
                     if self._fill_min_max_info(msg):
                         return True, 0
@@ -1211,25 +1740,41 @@ class MainWindow(QWidget):
                     self._toggle_maximized()
                     return True, 0
                 if msg.message == _WM_NCCALCSIZE and msg.wParam:
-                    # The 1px valid-rect result is only for a live edge drag.
-                    # Maximize also changes size; applying it there discards the
-                    # old frame, then the window waits and the new size pops in.
-                    if self._live_resizing and self._skip_stale_client_copy(msg):
-                        return True, _WVR_VALIDRECTS
-                    # WS_CAPTION is set so snap and Alt+Space work. Keep the
-                    # client area equal to the window so that caption does not draw.
+                    # Decide from the rect Windows proposed. The one-pixel client
+                    # extension below would otherwise look like a size change.
+                    # A caption move has no sizing edge and keeps the resting rect.
+                    # An edge drag anchors the existing pixels instead of throwing
+                    # them away: a full discard is erased white for one frame.
+                    resizing = bool(self._sizing_edge) and self._proposed_size_changed(msg)
+                    # The extra pixel is only for a resting top border. During a
+                    # drag it makes the client one pixel taller than the window
+                    # Qt is sizing, so the two rects chase each other.
+                    if (
+                        not self._is_zoomed(msg.hWnd)
+                        and not self._live_resizing
+                        and not self._sizing_edge
+                    ):
+                        self._nudge_client_bottom(msg)
+                    if resizing:
+                        return True, self._client_alignment()
+                    # WS_CAPTION is set so snap and Alt+Space work. The nudged
+                    # client stays one pixel past the bottom while windowed;
+                    # maximized keeps the work-area rect from WM_GETMINMAXINFO.
                     return True, 0
                 if msg.message == _WM_ENTERSIZEMOVE:
                     # Caption moves and edge resizes both enter here. Dropping
-                    # the region now repaints every pixel and shows the system
-                    # fill. Wait until the size actually changes.
+                    # the region now repaints every pixel. Wait until the size
+                    # actually changes.
                     self._drag_offset = None
+                    self._sizing_edge = 0
                     self._live_resizing = True
                 elif msg.message == _WM_SIZING:
+                    self._sizing_edge = int(msg.wParam)
                     self._live_resizing = True
                     self._clear_round_mask()
                 elif msg.message == _WM_EXITSIZEMOVE:
                     self._drag_offset = None
+                    self._sizing_edge = 0
                     self._live_resizing = False
                     self._apply_window_shape()
                 if msg.message == _WM_NCHITTEST and self.windowHandle() is not None:

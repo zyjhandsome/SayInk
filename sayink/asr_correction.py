@@ -22,8 +22,10 @@ This module is pure Python so the benchmark can import it without Qt.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import re
+import threading
 import unicodedata
 from collections.abc import Iterable
 
@@ -145,6 +147,7 @@ _COMMON_DAILY_CJK_WORDS = frozenset({
     "解决", "讨论", "确认", "通知", "联系", "沟通", "安排", "计划", "方案", "结果",
 })
 _LOGGED_GLOSSARY_CONFLICTS: set[str] = set()
+_GLOSSARY_CONFLICT_LOCK = threading.Lock()
 
 
 def glossary_variant_map_with_conflicts(
@@ -156,17 +159,31 @@ def glossary_variant_map_with_conflicts(
     terms = [term.casefold() for term in terms_orig]
     term_by_cf = {term.casefold(): term for term in terms_orig}
     term_set = set(terms)
-    pairs: dict[str, str] = {}
+    pairs: dict[str, tuple[str, str]] = {}
     conflicts: list[str] = []
     for term, variants in entries:
         if not term:
             continue
+        term_cf = term.casefold()
         for variant in variants:
             key = variant.casefold()
             if len(variant) == 1 and re.fullmatch(r"[\u4e00-\u9fff]", variant):
                 msg = f"单字误写「{variant}→{term}」已忽略（易误伤常用字）"
                 if msg not in conflicts:
                     conflicts.append(msg)
+                continue
+            if key == term_cf:
+                other_terms = [
+                    orig for orig, cf in zip(terms_orig, terms, strict=True)
+                    if cf == key and orig != term
+                ]
+                if other_terms:
+                    msg = f"误写「{variant}→{term}」与术语「{other_terms[0]}」同名，已跳过"
+                    if msg not in conflicts:
+                        conflicts.append(msg)
+                    continue
+                if key not in pairs:
+                    pairs[key] = (variant, term)
                 continue
             if key in term_set:
                 other = term_by_cf.get(key, variant)
@@ -175,7 +192,8 @@ def glossary_variant_map_with_conflicts(
                     conflicts.append(msg)
                 continue
             if key in pairs:
-                msg = f"误写「{variant}」同时指向「{pairs[key]}」与「{term}」，保留「{pairs[key]}」"
+                kept_term = pairs[key][1]
+                msg = f"误写「{variant}」同时指向「{kept_term}」与「{term}」，保留「{kept_term}」"
                 if msg not in conflicts:
                     conflicts.append(msg)
                 continue
@@ -185,20 +203,16 @@ def glossary_variant_map_with_conflicts(
                 if msg not in conflicts:
                     conflicts.append(msg)
                 continue
-            pairs[key] = term
-    for msg in conflicts:
-        if msg not in _LOGGED_GLOSSARY_CONFLICTS:
-            if len(_LOGGED_GLOSSARY_CONFLICTS) > 512:
-                _LOGGED_GLOSSARY_CONFLICTS.clear()
-            _LOGGED_GLOSSARY_CONFLICTS.add(msg)
-            log.warning("词库冲突提示: %s", msg)
+            pairs[key] = (variant, term)
+    with _GLOSSARY_CONFLICT_LOCK:
+        for msg in conflicts:
+            if msg not in _LOGGED_GLOSSARY_CONFLICTS:
+                if len(_LOGGED_GLOSSARY_CONFLICTS) > 512:
+                    _LOGGED_GLOSSARY_CONFLICTS.clear()
+                _LOGGED_GLOSSARY_CONFLICTS.add(msg)
+                log.warning("词库冲突提示: %s", msg)
     ordered = sorted(pairs.items(), key=lambda kv: (-len(kv[0]), kv[0]))
-    return [(variant, term) for variant, term in ordered], conflicts
-
-
-def glossary_conflicts(glossary: Iterable) -> list[str]:
-    """Return human-readable warnings for shadowed/conflicting glossary variants."""
-    return glossary_variant_map_with_conflicts(glossary)[1]
+    return [pair for _, pair in ordered], conflicts
 
 
 def glossary_variant_map(glossary: Iterable) -> list[tuple[str, str]]:
@@ -224,6 +238,15 @@ def _variant_pattern(variant: str) -> str:
     return escaped
 
 
+@functools.lru_cache(maxsize=16)
+def _compiled_variant_rules(
+    pairs_tuple: tuple[tuple[str, str], ...],
+) -> tuple[re.Pattern[str], dict[str, str]]:
+    lookup = {variant.casefold(): term for variant, term in pairs_tuple}
+    pattern = re.compile("|".join(_variant_pattern(v) for v, _ in pairs_tuple), re.IGNORECASE)
+    return pattern, lookup
+
+
 def apply_glossary_variants(text: str, glossary: Iterable) -> str:
     """Replace every listed mis-hearing with its glossary term.
 
@@ -236,8 +259,7 @@ def apply_glossary_variants(text: str, glossary: Iterable) -> str:
     pairs = glossary_variant_map(glossary)
     if not pairs:
         return text
-    lookup = {variant.casefold(): term for variant, term in pairs}
-    pattern = re.compile("|".join(_variant_pattern(v) for v, _ in pairs), re.IGNORECASE)
+    pattern, lookup = _compiled_variant_rules(tuple(pairs))
     return pattern.sub(lambda m: lookup.get(m.group(0).casefold(), m.group(0)), text)
 
 
@@ -342,7 +364,3 @@ def correction_rejection_reason(raw: str, corrected: str, glossary: Iterable = (
     if _edit_distance(a, b, limit) > limit:
         return "改动过多"
     return ""
-
-
-def correction_acceptable(raw: str, corrected: str, glossary: Iterable = ()) -> bool:
-    return not correction_rejection_reason(raw, corrected, glossary)

@@ -11,7 +11,7 @@ class SoundManager:
     """Generates and plays simple beep sounds for recording start/stop feedback."""
 
     SAMPLE_RATE = 44100
-    _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sound")
+    _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sound")
     _executor_lock = threading.Lock()
     _play_lock = threading.Lock()
     _executor_shutdown = False
@@ -19,13 +19,14 @@ class SoundManager:
     def __init__(self, enabled: bool = True):
         self._enabled = enabled
         self._closed = False
+        self._cue_cache: dict[tuple[int, str], np.ndarray] = {}
         self._ensure_executor()
 
     @classmethod
     def _ensure_executor(cls) -> ThreadPoolExecutor:
         with cls._executor_lock:
             if cls._executor_shutdown or cls._executor is None:
-                cls._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sound")
+                cls._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sound")
                 cls._executor_shutdown = False
             return cls._executor
 
@@ -88,26 +89,39 @@ class SoundManager:
         except RuntimeError:
             log.debug("提示音线程池已关闭，跳过播放")
 
+    def _get_cue(self, name: str) -> np.ndarray:
+        key = (self.SAMPLE_RATE, name)
+        cached = self._cue_cache.get(key)
+        if cached is not None:
+            return cached
+        if name == "start":
+            tone = self._generate_tone(880, 0.1, 0.25)
+        elif name == "stop":
+            tone = self._generate_tone(660, 0.12, 0.25)
+        elif name == "error":
+            t1 = self._generate_tone(400, 0.1, 0.2)
+            silence = np.zeros(int(self.SAMPLE_RATE * 0.05), dtype=np.float32)
+            t2 = self._generate_tone(300, 0.15, 0.2)
+            tone = np.concatenate([t1, silence, t2])
+        else:
+            raise ValueError(f"Unknown sound cue: {name}")
+        self._cue_cache[key] = tone
+        return tone
+
     def play_start(self):
         if not self._enabled or self._closed:
             return
-        tone = self._generate_tone(880, 0.1, 0.25)
-        self._play_async(tone)
+        self._play_async(self._get_cue("start"))
 
     def play_stop(self):
         if not self._enabled or self._closed:
             return
-        tone = self._generate_tone(660, 0.12, 0.25)
-        self._play_async(tone)
+        self._play_async(self._get_cue("stop"))
 
     def play_error(self):
         if not self._enabled or self._closed:
             return
-        t1 = self._generate_tone(400, 0.1, 0.2)
-        silence = np.zeros(int(self.SAMPLE_RATE * 0.05), dtype=np.float32)
-        t2 = self._generate_tone(300, 0.15, 0.2)
-        tone = np.concatenate([t1, silence, t2])
-        self._play_async(tone)
+        self._play_async(self._get_cue("error"))
 
 
 atexit.register(SoundManager.shutdown_executor)

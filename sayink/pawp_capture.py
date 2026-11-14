@@ -144,7 +144,7 @@ def resolve_pawp_stream_device_info(
     return pa_instance.get_default_wasapi_loopback()
 
 
-def pick_default_pawp_loopback() -> Optional[AudioDeviceInfo]:
+def pick_default_pawp_loopback(active_mic_name: str = "") -> Optional[AudioDeviceInfo]:
     if not pawp_available():
         return None
     import pyaudiowpatch as pyaudio
@@ -154,7 +154,10 @@ def pick_default_pawp_loopback() -> Optional[AudioDeviceInfo]:
     p = pyaudio.PyAudio()
     try:
         loopbacks = list(p.get_loopback_device_info_generator())
-        preferred = preferred_windows_loopback_names()
+        try:
+            preferred = preferred_windows_loopback_names(active_mic_name=active_mic_name)
+        except TypeError:
+            preferred = preferred_windows_loopback_names()
         for target in preferred:
             if not target:
                 continue

@@ -19,7 +19,7 @@ from sayink.minutes_prompts import (
     build_markdown_system_prompt,
     build_system_prompt,
     build_user_prompt,
-    chunk_transcript,
+    chunk_transcript_with_spans,
     format_srt_timestamp,
     format_timestamp,
     render_srt,
@@ -103,11 +103,11 @@ class TestTranscript:
 
     def test_chunk_transcript_splits_at_lines(self):
         lines = [TranscriptLine(i * 1000, 1, "字" * 50) for i in range(10)]
-        chunks = chunk_transcript(lines, None, max_chars=200)
+        chunks = [c[0] for c in chunk_transcript_with_spans(lines, None, max_chars=200)]
         assert len(chunks) > 1
         assert all(len(c) <= 200 for c in chunks)
         assert "\n".join(chunks).count("\n") == 9
-        pieces = chunk_transcript([TranscriptLine(0, 1, "x" * 500)], None, max_chars=100)
+        pieces = [c[0] for c in chunk_transcript_with_spans([TranscriptLine(0, 1, "x" * 500)], None, max_chars=100)]
         assert len(pieces) > 1 and all(len(piece) <= 100 for piece in pieces)
         assert "".join(piece.split("：", 1)[1] for piece in pieces) == "x" * 500
 
@@ -540,7 +540,7 @@ class TestMinutesWorker:
     @staticmethod
     def _long_lines():
         lines = [TranscriptLine(i * 1000, 1 + i % 2, "内容" * 30) for i in range(40)]
-        n_chunks = len(chunk_transcript(lines, {}, max_chars=1000))
+        n_chunks = len(chunk_transcript_with_spans(lines, {}, max_chars=1000))
         assert n_chunks >= 3
         return lines, n_chunks
 

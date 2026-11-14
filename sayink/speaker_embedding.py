@@ -54,7 +54,6 @@ MEL_MIN_SEC = 1.0
 _QUIET_RMS = 0.005
 
 ACTIVITY_MODE_ON_DEMAND = "on_demand"
-ACTIVITY_MODE_STRICT = "strict"
 ACTIVITY_MODE_OFF = "off"
 
 
@@ -142,17 +141,21 @@ class ModelEmbedder(SpeakerEmbedder):
         return vector / norm
 
 
+_UNSET = object()
+
+
 def make_embedder(
     model_path: str | Path | None,
     *,
     enabled: bool = True,
     activity_enabled: bool = False,
-    activity_model_path: str | Path | None = None,
-    activity_path: str | Path | None = None,
+    activity_path: str | Path | None | object = _UNSET,
+    activity_model_path: str | Path | None | object = _UNSET,
     activity_mode: str = ACTIVITY_MODE_ON_DEMAND,
 ) -> SpeakerEmbedder:
     """CAM++ when enabled and available, otherwise the mel summary.
 
+    ``activity_path`` and ``activity_model_path`` are accepted as aliases.
     Activity checking runs as an internal on-demand voiceprint guardrail by
     default when ``activity_enabled`` is True and the local model file exists.
     Its load failure does not disable a working CAM++ backend.
@@ -171,11 +174,16 @@ def make_embedder(
                     from sayink.speech_recognizer import AUX_MODEL_SPEAKER_ACTIVITY
                     from sayink.speaker_activity import SpeakerActivityGuard
 
-                    resolved_activity = (
-                        activity_model_path
-                        or activity_path
-                        or aux_model_path(AUX_MODEL_SPEAKER_ACTIVITY)
-                    )
+                    if activity_path is not _UNSET and activity_model_path is not _UNSET:
+                        resolved_activity = (
+                            activity_path if activity_path is not None else activity_model_path
+                        )
+                    elif activity_path is not _UNSET:
+                        resolved_activity = activity_path
+                    elif activity_model_path is not _UNSET:
+                        resolved_activity = activity_model_path
+                    else:
+                        resolved_activity = aux_model_path(AUX_MODEL_SPEAKER_ACTIVITY)
                     if resolved_activity is not None:
                         embedder.activity_guard = SpeakerActivityGuard(resolved_activity)
                 except Exception as exc:

@@ -35,8 +35,7 @@ def test_optional_recording_controls_save_without_discarding_runtime_queue(setti
 def test_quiet_speech_switch_is_hidden_and_not_in_recording_or_recognition_sections(settings):
     from PyQt6.QtWidgets import QLabel, QWidget
 
-    assert settings._quiet_speech_row.isHidden()
-    assert not settings._quiet_speech_row.isVisible()
+    assert not hasattr(settings, "_quiet_speech_row")
     for section_name in ("recordingInputSection", "sharedRecognitionSection"):
         section = settings.findChild(QWidget, section_name)
         assert section is not None

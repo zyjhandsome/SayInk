@@ -143,15 +143,15 @@ class HotkeyEdit(QLineEdit):
     def _begin_capture(self) -> None:
         from sayink.ui import design_tokens as tok
 
-        if self._capturing:
-            self.capture_ended.emit()
+        already_capturing = self._capturing
         self._capturing = True
         self.setText("请按下组合键（Backspace 清空）...")
         self.setStyleSheet(
             f"border: 2px solid {tok.ACCENT_FOCUS};"
             f" background: {tok.SURFACE_PEARL}; color: {tok.TEXT};"
         )
-        self.capture_started.emit()
+        if not already_capturing:
+            self.capture_started.emit()
 
     def keyPressEvent(self, event):
         key = event.key()

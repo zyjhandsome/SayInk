@@ -1,4 +1,4 @@
-"""Shared recognition preferences and audio-source inheritance for every mode.
+"""Shared recognition preferences and audio-source resolution for every mode.
 
 Session controllers own their lifecycle; these values only describe the common
 audio/ASR capabilities. Meeting start-card overrides stay in that session.
@@ -10,7 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sayink.audio_devices import INPUT_SOURCES
+from sayink.audio_devices import INPUT_SOURCE_MIXED, INPUT_SOURCES
 from sayink.speech_recognizer import (
     DEFAULT_MODEL_ID,
     SUPPORTS_HOTWORDS,
@@ -140,15 +140,18 @@ def resolve_mode_recognition_policy(
 
 
 def audio_source(config, *, meeting: bool = False) -> str:
-    """Resolve an empty meeting preference against the shared dictation source."""
-    source = config.get("audio.input_source", "microphone")
-    if source not in INPUT_SOURCES:
-        source = "microphone"
+    """The dictation source, or the meeting's own source.
+
+    A meeting never inherits the dictation source: dictation is usually the
+    user's own microphone, and a meeting recorded that way loses everyone the
+    user hears through headphones. Anything that is not a real source (the
+    retired 「跟随转写」 was stored as an empty string) means mixed.
+    """
     if meeting:
-        override = config.get("meeting.input_source", "")
-        if override in INPUT_SOURCES:
-            source = override
-    return source
+        source = config.get("meeting.input_source", INPUT_SOURCE_MIXED)
+        return source if source in INPUT_SOURCES else INPUT_SOURCE_MIXED
+    source = config.get("audio.input_source", "microphone")
+    return source if source in INPUT_SOURCES else "microphone"
 
 
 def aux_model_path(model_id: str) -> Path | None:
@@ -272,8 +275,6 @@ class RecognitionSettings:
         if (self.boundary_context_enabled
                 and (get_model_info(self.model_id) or {}).get("loader") not in {"fire_red_asr_ctc", "zipformer_ctc"}):
             notes.append("当前模型不支持跨段上下文；语音仍会正常识别。")
-        if self.quiet_speech_mode is True and self.vad != VAD_SILERO:
-            notes.append("轻声增强需要实际加载 Silero；能量断句不启用此增强。")
         if self.hotwords and not self.hotwords_supported:
             notes.append(HOTWORDS_UNSUPPORTED_NOTE)
         if not self.language_supported:

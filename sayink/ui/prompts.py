@@ -17,6 +17,26 @@ from PyQt6.QtWidgets import (
 )
 
 
+def style_message_box(
+    box: QMessageBox,
+    *,
+    primary: object | None = None,
+    destructive: bool = False,
+) -> None:
+    """Apply active theme tokens to a QMessageBox and its buttons."""
+    from sayink.ui import design_tokens as tok
+    from sayink.ui import settings_styles as ss
+
+    box.setStyleSheet(
+        ss.WINDOW_CSS
+        + f"\nQMessageBox {{ background: {tok.BG}; color: {tok.TEXT}; }}"
+        + f"\nQMessageBox QLabel {{ color: {tok.TEXT}; background: transparent; }}"
+    )
+    primary_css = ss.BTN_DANGER_SOLID_SM if destructive else ss.BTN_ACCENT_SM
+    for btn in box.buttons():
+        btn.setStyleSheet(primary_css if btn is primary else ss.BTN_GHOST_SM)
+
+
 def confirm_box(
     parent: QWidget | None,
     title: str,
@@ -41,7 +61,21 @@ def confirm_box(
     cancel_btn = box.addButton(cancel, QMessageBox.ButtonRole.RejectRole)
     box.setDefaultButton(accept_btn if default_accept and not destructive else cancel_btn)
     box.setEscapeButton(cancel_btn)
+    style_message_box(box, primary=accept_btn, destructive=destructive)
     return box, accept_btn
+
+
+def alert_error(parent: QWidget | None, title: str, text: str) -> None:
+    """Show a themed error dialog with a Chinese 确定 button."""
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setIcon(QMessageBox.Icon.Critical)
+    ok_btn = box.addButton("确定", QMessageBox.ButtonRole.AcceptRole)
+    box.setDefaultButton(ok_btn)
+    box.setEscapeButton(ok_btn)
+    style_message_box(box, primary=ok_btn)
+    box.exec()
 
 
 def confirm(
@@ -78,7 +112,10 @@ def text_prompt_box(
     dialog = QDialog(parent)
     dialog.setWindowTitle(title)
     dialog.setMinimumWidth(420)
-    dialog.setStyleSheet(settings_styles.WINDOW_CSS)
+    dialog.setStyleSheet(
+        settings_styles.WINDOW_CSS
+        + f"\nQDialog {{ background: {tok.BG}; color: {tok.TEXT}; }}"
+    )
     layout = QVBoxLayout(dialog)
     message = QLabel(label)
     message.setWordWrap(True)
@@ -110,7 +147,9 @@ def text_prompt_box(
             error_label.setText(msg)
             error_label.show()
             edit.setStyleSheet(
-                f"QLineEdit {{ border: 2px solid {tok.RED_TEXT}; padding: 5px 11px; }}"
+                f"QLineEdit {{ background: {tok.SURFACE}; color: {tok.TEXT};"
+                f" border: 2px solid {tok.RED_TEXT}; border-radius: {tok.RADIUS_MD}px;"
+                " padding: 5px 11px; }"
             )
         else:
             error_label.clear()

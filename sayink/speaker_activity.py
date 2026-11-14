@@ -40,10 +40,6 @@ def _runs(mask):
     return zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1), strict=True)
 
 
-def _sustained(mask: np.ndarray, frames: int) -> bool:
-    return any(stop - start >= frames for start, stop in _runs(mask))
-
-
 class SpeakerActivityGuard:
     """Reject evidence of overlap or multiple local voices in a proposed turn.
 
@@ -120,6 +116,7 @@ class SpeakerActivityGuard:
         local_frames = math.ceil(MIN_LOCAL_VOICE_SEC * TARGET_SAMPLE_RATE / self._shift)
         max_expand = math.ceil(MAX_OVERLAP_TRANSITION_SEC * TARGET_SAMPLE_RATE / self._shift)
         edge = int(ACTIVITY_EDGE_SEC * TARGET_SAMPLE_RATE)
+        total_samples = int(np.asarray(audio).size)
         for offset, probabilities in self._probability_windows(audio, cancelled=cancelled):
             origin = offset + (self._field - self._shift) // 2
             clear = [(begin, end) for begin, end in _runs(probabilities[:, 1:4].max(axis=1) >= SINGLE_PROBABILITY)
@@ -145,7 +142,7 @@ class SpeakerActivityGuard:
                     end = min(right_ceil, min(right_starts, default=right_ceil))
 
                     overlaps.append((max(0, origin + begin * self._shift - edge),
-                                     min(len(audio), origin + end * self._shift + edge)))
+                                     min(total_samples, origin + end * self._shift + edge)))
             stable = []
             for label in (1, 2, 3):
                 for begin, end in _runs(probabilities[:, label] >= SINGLE_PROBABILITY):

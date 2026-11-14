@@ -10,9 +10,8 @@ import json
 import os
 import threading
 
-import pytest
 from PyQt6.QtCore import QRect, QUrl
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QMessageBox
 
 from sayink.config import Config
 from sayink.history_store import HistoryStore, SegmentRecord
@@ -40,17 +39,10 @@ from sayink.ui import design_tokens as tok
 from sayink.ui.floating_window import FloatingWindow, WaveformWidget
 from sayink.ui.island_chrome import (
     is_screen_alive,
-    position_island,
     position_listen_bar,
     screen_storage_key,
 )
 from sayink.ui.meeting_page import MeetingPage
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    app = QApplication.instance() or QApplication([])
-    return app
 
 
 class _DeadScreen:
@@ -141,7 +133,7 @@ class TestFloatingWindowPolish:
         win = FloatingWindow()
         try:
             win.show_listening()
-            position_island(win)
+            position_listen_bar(win)
             position_listen_bar(win, screen=dead)
 
             win._pin_screen = dead

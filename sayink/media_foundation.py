@@ -47,7 +47,9 @@ MAX_INITIAL_PTS_PAD_SEC = 2.0
 MAX_PTS_GAP_SEC = 5.0
 
 _PROTO_LOCK = threading.Lock()
-_PROTOS_READY = False
+_PROTOS_SIG: tuple[int, int] | None = None
+_OLE32 = None
+_WINFUNC_CACHE: dict[tuple, object] = {}
 
 
 class AudioFoundationError(RuntimeError):
@@ -99,12 +101,34 @@ def _check(hr: int, action: str) -> None:
         raise AudioFoundationError(f"{action}失败，请检查音视频文件是否完整且包含有效音轨")
 
 
+def _get_ole32():
+    global _OLE32
+    windll_ole32 = getattr(getattr(ctypes, "windll", None), "ole32", None)
+    win_dll_cls = getattr(ctypes, "WinDLL", None)
+    if win_dll_cls is None or not isinstance(windll_ole32, win_dll_cls):
+        return windll_ole32
+    if _OLE32 is not None:
+        return _OLE32
+    with _PROTO_LOCK:
+        if _OLE32 is None:
+            dll = win_dll_cls("ole32")
+            dll.CoInitializeEx.argtypes = [c_void_p, c_ulong]
+            dll.CoInitializeEx.restype = HRESULT
+            dll.PropVariantClear.argtypes = [POINTER(_PROPVARIANT_U64)]
+            dll.PropVariantClear.restype = HRESULT
+            dll.CoUninitialize.argtypes = []
+            dll.CoUninitialize.restype = None
+            _OLE32 = dll
+    return _OLE32
+
+
 def _ensure_prototypes(mfplat, mfreadwrite) -> None:
-    global _PROTOS_READY
-    if _PROTOS_READY:
+    global _PROTOS_SIG
+    sig = (id(mfplat), id(mfreadwrite))
+    if _PROTOS_SIG == sig:
         return
     with _PROTO_LOCK:
-        if _PROTOS_READY:
+        if _PROTOS_SIG == sig:
             return
         mfplat.MFStartup.argtypes = [c_ulong, c_ulong]
         mfplat.MFStartup.restype = HRESULT
@@ -118,12 +142,16 @@ def _ensure_prototypes(mfplat, mfreadwrite) -> None:
             POINTER(c_void_p),
         ]
         mfreadwrite.MFCreateSourceReaderFromURL.restype = HRESULT
-        _PROTOS_READY = True
+        _PROTOS_SIG = sig
 
 
 def _method(obj, index: int, restype, argtypes):
     table = cast(obj, POINTER(POINTER(c_void_p)))[0]
-    prototype = ctypes.WINFUNCTYPE(restype, c_void_p, *argtypes)
+    key = (restype, argtypes)
+    prototype = _WINFUNC_CACHE.get(key)
+    if prototype is None:
+        prototype = ctypes.WINFUNCTYPE(restype, c_void_p, *argtypes)
+        _WINFUNC_CACHE[key] = prototype
     return prototype(table[index])
 
 
@@ -236,7 +264,7 @@ def read_pcm16(
     reads, so a long file is not first expanded at its original rate. ``cancel``
     is checked between samples.
     """
-    ole32 = ctypes.windll.ole32
+    ole32 = _get_ole32()
     mfplat = ctypes.windll.mfplat
     mfreadwrite = ctypes.windll.mfreadwrite
     _ensure_prototypes(mfplat, mfreadwrite)
@@ -294,65 +322,65 @@ def read_pcm16(
                 None, byref(flags), byref(timestamp), byref(sample),
             )
             _check(hr, "读取音频数据")
-            if cancel is not None and cancel():
+            try:
+                if cancel is not None and cancel():
+                    raise AudioFoundationError("已取消")
+                if flags.value & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED:
+                    current = c_void_p()
+                    type_hr = _method(reader, 6, HRESULT, (c_ulong, POINTER(c_void_p)))(
+                        reader, c_ulong(MF_SOURCE_READER_FIRST_AUDIO_STREAM), byref(current),
+                    )
+                    try:
+                        _check(type_hr, "读取变化后的音频格式")
+                        new_rate, new_channels = _format_of(current)
+                        cur_rate, cur_channels = int(new_rate), max(int(new_channels), 1)
+                        if not chunks:
+                            rate, channels = cur_rate, cur_channels
+                    finally:
+                        _release(current)
+                if flags.value & MF_SOURCE_READERF_ERROR:
+                    raise AudioFoundationError("读取音频流失败")
+                usable = bool(sample) and not (flags.value & MF_SOURCE_READERF_STREAMTICK)
+                if usable:
+                    raw_pcm = _copy_sample(sample)
+                    pcm, frames = _adapt_pcm_chunk(
+                        raw_pcm, cur_rate, cur_channels, int(rate), max(int(channels), 1)
+                    )
+                    width = max(int(channels), 1)
+                    stamp = int(timestamp.value)
+                    if stamp >= 0 and rate > 0 and frames > 0:
+                        if origin_stamp is None:
+                            # Anchor positive stream start timestamps > 2s (e.g. OBS/live recordings)
+                            # so we never allocate multi-GB zero arrays for non-zero PTS origins.
+                            max_init_100ns = int(MAX_INITIAL_PTS_PAD_SEC * 10_000_000)
+                            origin_stamp = 0 if stamp <= max_init_100ns else stamp
+                        rel_stamp = max(0, stamp - origin_stamp)
+                        start = rel_stamp * int(rate) // 10_000_000
+                        if start > written:
+                            gap = start - written
+                            max_gap = max(1, int(rate * MAX_PTS_GAP_SEC))
+                            if gap > max_gap:
+                                # Absorb container PTS jumps above 5s into origin_stamp.
+                                excess = gap - max_gap
+                                origin_stamp += excess * 10_000_000 // int(rate)
+                                gap = max_gap
+                            chunks.append(np.zeros(gap * width, dtype=np.int16))
+                            written += gap
+                    if frames > 0:
+                        chunks.append(pcm)
+                        written += frames
+                    if progress_cb is not None and rate > 0:
+                        decoded_sec = written / float(rate)
+                        if duration_100ns > 0 and stamp >= 0:
+                            rel_100ns = max(0, stamp - (origin_stamp or 0))
+                            pct = min(99, max(0, int(rel_100ns * 100 // max(1, duration_100ns))))
+                        else:
+                            pct = min(95, int(decoded_sec) % 96)
+                        if pct != last_pct:
+                            last_pct = pct
+                            progress_cb(pct, f"正在解码音频（{decoded_sec:.0f} 秒）")
+            finally:
                 _release(sample)
-                raise AudioFoundationError("已取消")
-            if flags.value & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED:
-                current = c_void_p()
-                type_hr = _method(reader, 6, HRESULT, (c_ulong, POINTER(c_void_p)))(
-                    reader, c_ulong(MF_SOURCE_READER_FIRST_AUDIO_STREAM), byref(current),
-                )
-                try:
-                    _check(type_hr, "读取变化后的音频格式")
-                    new_rate, new_channels = _format_of(current)
-                    cur_rate, cur_channels = int(new_rate), max(int(new_channels), 1)
-                    if not chunks:
-                        rate, channels = cur_rate, cur_channels
-                finally:
-                    _release(current)
-            if flags.value & MF_SOURCE_READERF_ERROR:
-                _release(sample)
-                raise AudioFoundationError("读取音频流失败")
-            usable = bool(sample) and not (flags.value & MF_SOURCE_READERF_STREAMTICK)
-            if usable:
-                raw_pcm = _copy_sample(sample)
-                pcm, frames = _adapt_pcm_chunk(
-                    raw_pcm, cur_rate, cur_channels, int(rate), max(int(channels), 1)
-                )
-                width = max(int(channels), 1)
-                stamp = int(timestamp.value)
-                if stamp >= 0 and rate > 0 and frames > 0:
-                    if origin_stamp is None:
-                        # Anchor positive stream start timestamps > 2s (e.g. OBS/live recordings)
-                        # so we never allocate multi-GB zero arrays for non-zero PTS origins.
-                        max_init_100ns = int(MAX_INITIAL_PTS_PAD_SEC * 10_000_000)
-                        origin_stamp = 0 if stamp <= max_init_100ns else stamp
-                    rel_stamp = max(0, stamp - origin_stamp)
-                    start = rel_stamp * int(rate) // 10_000_000
-                    if start > written:
-                        gap = start - written
-                        max_gap = max(1, int(rate * MAX_PTS_GAP_SEC))
-                        if gap > max_gap:
-                            # Absorb container PTS jumps above 5s into origin_stamp.
-                            excess = gap - max_gap
-                            origin_stamp += excess * 10_000_000 // int(rate)
-                            gap = max_gap
-                        chunks.append(np.zeros(gap * width, dtype=np.int16))
-                        written += gap
-                if frames > 0:
-                    chunks.append(pcm)
-                    written += frames
-                if progress_cb is not None and rate > 0:
-                    decoded_sec = written / float(rate)
-                    if duration_100ns > 0 and stamp >= 0:
-                        rel_100ns = max(0, stamp - (origin_stamp or 0))
-                        pct = min(99, max(0, int(rel_100ns * 100 // max(1, duration_100ns))))
-                    else:
-                        pct = min(95, int(decoded_sec) % 96)
-                    if pct != last_pct:
-                        last_pct = pct
-                        progress_cb(pct, f"正在解码音频（{decoded_sec:.0f} 秒）")
-            _release(sample)
             if flags.value & MF_SOURCE_READERF_ENDOFSTREAM:
                 break
         if not chunks:

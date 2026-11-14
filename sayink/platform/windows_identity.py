@@ -20,7 +20,11 @@ def set_windows_app_user_model_id() -> None:
     try:
         import ctypes
 
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+        fn = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+        if hasattr(fn, "argtypes"):
+            fn.argtypes = [ctypes.c_wchar_p]
+            fn.restype = ctypes.HRESULT
+        fn(APP_USER_MODEL_ID)
     except Exception as exc:
         log.debug("AppUserModelID 设置失败: %s", exc)
 
@@ -139,7 +143,6 @@ def _ensure_start_menu_shortcut() -> None:
             return
 
         target, arguments, workdir = _launcher_target()
-        shell = win32com.client.Dispatch("WScript.Shell")
 
         if is_frozen and group_shortcuts:
             # Setup already created {group}\SayInk.lnk; remove any legacy duplicate
@@ -156,6 +159,8 @@ def _ensure_start_menu_shortcut() -> None:
                 except Exception:
                     pass
             return
+
+        shell = win32com.client.Dispatch("WScript.Shell")
 
         if lnk_path.is_file():
             existing = shell.CreateShortCut(str(lnk_path))
@@ -181,11 +186,12 @@ def _ensure_start_menu_shortcut() -> None:
         shortcut.WorkingDirectory = workdir
         shortcut.Description = APP_DISPLAY_NAME
 
-        icon_path = _project_root() / "sayink" / "icon.ico"
-        if icon_path.exists():
-            shortcut.IconLocation = f"{icon_path},0"
-        elif is_frozen:
+        if is_frozen:
             shortcut.IconLocation = f"{target},0"
+        else:
+            icon_path = _project_root() / "sayink" / "icon.ico"
+            if icon_path.exists():
+                shortcut.IconLocation = f"{icon_path},0"
 
         shortcut.save()
         _stamp_shortcut_app_id(lnk_path, pythoncom, propsys, pscon)

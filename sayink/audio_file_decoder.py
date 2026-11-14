@@ -41,14 +41,9 @@ def decode_audio_file(
     if not source.is_file():
         raise AudioDecodeError(f"找不到文件：{source}")
     if suffix == ".wav":
-        try:
-            chunks = list(iter_wav_pcm(source, cancel=cancel, progress_cb=progress_cb))
-            samples = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
-            rate = TARGET_SAMPLE_RATE
-        except AudioDecodeError as exc:
-            if sys.platform != "win32" or "已取消" in str(exc):
-                raise
-            samples, rate = _read_media_foundation(source, cancel=cancel, progress_cb=progress_cb)
+        chunks = list(iter_wav_pcm(source, cancel=cancel, progress_cb=progress_cb))
+        samples = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+        rate = TARGET_SAMPLE_RATE
     else:
         samples, rate = _read_media_foundation(source, cancel=cancel, progress_cb=progress_cb)
     if cancel is not None and cancel():
@@ -139,22 +134,31 @@ def _iter_riff_extended_wav(
                     if len(fmt_bytes) < 40 or fmt_bytes[28:40] != _KSDATAFORMAT_SUBTYPE_TAIL:
                         raise AudioDecodeError("不支持的扩展 WAV 子格式")
                     fmt_tag = struct.unpack("<I", fmt_bytes[24:28])[0]
+                if data_offset >= 0:
+                    break
             elif chunk_id == b"data":
                 data_offset = chunk_pos
                 data_size = chunk_len
-                break
+                if fmt_tag:
+                    break
             next_pos = chunk_pos + chunk_len + (chunk_len & 1)
             fh.seek(next_pos)
 
-        if fmt_tag not in (1, 3) or rate <= 0 or channels <= 0 or bits <= 0 or data_offset < 0:
+        valid_bits = (fmt_tag == 1 and bits in (8, 16, 24, 32)) or (
+            fmt_tag == 3 and bits in (32, 64)
+        )
+        if not valid_bits or rate <= 0 or channels <= 0 or data_offset < 0:
             raise AudioDecodeError("WAV 格式需要 Media Foundation 解码")
 
-        bytes_per_sample = max(1, bits // 8)
-        frame_bytes = max(block_align, channels * bytes_per_sample)
+        if data_size == 0:
+            raise AudioDecodeError("WAV 里没有音频数据")
+        bytes_per_sample = bits // 8
+        sample_frame_bytes = channels * bytes_per_sample
+        frame_bytes = max(block_align, sample_frame_bytes)
         step_frames = max(int(rate), 1)
         step_bytes = step_frames * frame_bytes
         fh.seek(data_offset)
-        remaining = data_size if data_size > 0 else None
+        remaining = None if data_size == 0xFFFFFFFF else data_size
         produced = False
         read_total = 0
         last_pct = -1
@@ -177,9 +181,16 @@ def _iter_riff_extended_wav(
             if usable_bytes <= 0:
                 break
             produced = True
-            samples = _decode_pcm_bytes(raw[:usable_bytes], fmt_tag=fmt_tag, bits=bits)
+            chunk_raw = raw[:usable_bytes]
+            if frame_bytes > sample_frame_bytes:
+                chunk_raw = (
+                    np.frombuffer(chunk_raw, dtype=np.uint8)
+                    .reshape(-1, frame_bytes)[:, :sample_frame_bytes]
+                    .tobytes()
+                )
+            samples = _decode_pcm_bytes(chunk_raw, fmt_tag=fmt_tag, bits=bits)
             block = _collapse_wav_channels(samples, channels)
-            if progress_cb is not None and data_size > 0:
+            if progress_cb is not None and remaining is not None and data_size > 0:
                 pct = min(99, max(0, int(read_total * 100 // max(1, data_size))))
                 if pct != last_pct:
                     last_pct = pct
@@ -283,7 +294,8 @@ def iter_wav_pcm(
         if progress_cb is not None and total_samples > 0:
             progress_cb(100, f"已完成解码（{total_samples / TARGET_SAMPLE_RATE:.0f} 秒）")
     except AudioDecodeError as exc:
-        if sys.platform != "win32" or "已取消" in str(exc):
+        msg = str(exc)
+        if sys.platform != "win32" or total_samples > 0 or "已取消" in msg or "没有音频数据" in msg:
             raise
         # Compressed WAV (ADPCM / A-law / MP3-in-WAV): fall back to Media Foundation.
         samples, rate = _read_media_foundation(path, cancel=cancel, progress_cb=progress_cb)
@@ -295,18 +307,6 @@ def iter_wav_pcm(
             if cancel is not None and cancel():
                 raise AudioDecodeError("已取消") from exc
             yield mono[offset : offset + step]
-
-
-def _read_wav(
-    path: Path,
-    cancel=None,
-    *,
-    progress_cb: Callable[[int, str], None] | None = None,
-) -> tuple[np.ndarray, int]:
-    blocks = list(iter_wav_pcm(path, cancel=cancel, progress_cb=progress_cb))
-    if not blocks:
-        raise AudioDecodeError("WAV 里没有音频数据")
-    return np.concatenate(blocks), TARGET_SAMPLE_RATE
 
 
 def _read_media_foundation(
@@ -336,7 +336,9 @@ def _read_media_foundation(
             if cancel is not None and cancel():
                 raise AudioDecodeError("已取消") from inner_exc
             raise AudioDecodeError(str(inner_exc)) from inner_exc
-    samples = pcm.astype(np.float32) / 32768.0
+    samples = pcm.astype(np.float32)
+    del pcm
+    samples *= np.float32(1.0 / 32768.0)
     if channels > 1:
         usable = (samples.size // channels) * channels
         samples = to_mono(samples[:usable].reshape(-1, channels))

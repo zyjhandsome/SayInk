@@ -12,11 +12,17 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+import types
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin, urlparse
+import urllib.request as _urllib_request
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+_STDLIB_URLOPEN = _urllib_request.urlopen
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -60,6 +66,7 @@ _TRUSTED_HOSTS = frozenset(
     }
 )
 _KNOWN_SIGNATURE_URLS: dict[str, str] = {}
+_SIGNATURE_URLS_LOCK = threading.Lock()
 
 # RFC 8032 Ed25519 curve parameters (GF(2^255 - 19), pure stdlib verification).
 _ED_P = 2**255 - 19
@@ -202,8 +209,6 @@ def parse_detached_signature(raw: str | bytes) -> bytes:
 
 def resolve_signing_public_key(public_key_hex: str | None = None) -> bytes | None:
     """Return 32-byte Ed25519 public key when configured, or ``None`` when unpinned."""
-    import os
-
     raw = (
         public_key_hex
         if public_key_hex is not None
@@ -356,12 +361,13 @@ def release_from_payload(payload: dict, *, current: str) -> ReleaseInfo | None:
     asset_name = str(asset.get("name") or "")
     asset_url = str(asset.get("browser_download_url") or "")
     sig_url = _pick_signature_asset_url(assets, asset_name)
-    if asset_url and sig_url:
-        if len(_KNOWN_SIGNATURE_URLS) >= 32 and asset_url not in _KNOWN_SIGNATURE_URLS:
-            _KNOWN_SIGNATURE_URLS.pop(next(iter(_KNOWN_SIGNATURE_URLS)))
-        _KNOWN_SIGNATURE_URLS[asset_url] = sig_url
-    elif asset_url:
-        _KNOWN_SIGNATURE_URLS.pop(asset_url, None)
+    with _SIGNATURE_URLS_LOCK:
+        if asset_url and sig_url:
+            if len(_KNOWN_SIGNATURE_URLS) >= 32 and asset_url not in _KNOWN_SIGNATURE_URLS:
+                _KNOWN_SIGNATURE_URLS.pop(next(iter(_KNOWN_SIGNATURE_URLS)))
+            _KNOWN_SIGNATURE_URLS[asset_url] = sig_url
+        elif asset_url:
+            _KNOWN_SIGNATURE_URLS.pop(asset_url, None)
     return ReleaseInfo(
         version=version,
         asset_name=asset_name,
@@ -382,18 +388,161 @@ def _request(url: str) -> Request:
     )
 
 
-def build_update_urlopen(proxy_mode: str = "system"):
-    """Build a ``urlopen(request, timeout=...)`` callable honoring ``llm.proxy_mode``."""
+class UpdateError(URLError):
+    """Raised when an update check or installer download hits an untrusted redirect."""
+
+
+class _ProxyHopSwitch(Exception):
+    """Internal signal when a redirect target crosses a proxy-bypass boundary."""
+
+    def __init__(self, request: Request) -> None:
+        super().__init__()
+        self.request = request
+
+
+def _is_trusted_api_redirect_url(url: str) -> bool:
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme.lower() == "https" and (
+        host in _TRUSTED_HOSTS or host == "api.github.com"
+    )
+
+
+class _TrustedRedirectHandler(HTTPRedirectHandler):
+    """Validate every 301/302/303/307/308 redirect target before following."""
+
+    def __init__(
+        self,
+        *,
+        trusted_only: bool = False,
+        direct: bool = False,
+        force_direct: bool = False,
+        bypass_suffixes: str = "",
+    ) -> None:
+        super().__init__()
+        self._trusted_only = trusted_only
+        self._direct = direct
+        self._force_direct = force_direct
+        self._bypass_suffixes = bypass_suffixes
+
+    def _validate_target(self, target_url: str, fp=None) -> None:
+        trusted = (
+            is_trusted_installer_url(target_url)
+            if self._trusted_only
+            else _is_trusted_api_redirect_url(target_url)
+        )
+        if not trusted:
+            if fp is not None:
+                try:
+                    fp.close()
+                except Exception:
+                    pass
+            raise UpdateError(f"拒绝重定向到不受信任的地址: {target_url}")
+
+    @staticmethod
+    def _extract_location(headers) -> str | None:
+        if headers is None:
+            return None
+        for key in ("location", "Location", "uri", "URI"):
+            val = headers.get(key)
+            if val:
+                return str(val)
+        if hasattr(headers, "items"):
+            for k, v in headers.items():
+                if str(k).lower() in ("location", "uri") and v:
+                    return str(v)
+        return None
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        location = self._extract_location(headers)
+        if location:
+            resolved = urljoin(req.full_url, location.strip())
+            self._validate_target(resolved, fp=fp)
+            if not self._force_direct and self._bypass_suffixes:
+                from sayink.text_polisher import bypasses_env_proxy
+
+                next_direct = bypasses_env_proxy(
+                    "system", resolved, self._bypass_suffixes
+                )
+                if next_direct != self._direct:
+                    new_req = self.redirect_request(req, fp, code, msg, headers, resolved)
+                    if fp is not None:
+                        try:
+                            fp.close()
+                        except Exception:
+                            pass
+                    if new_req is not None:
+                        raise _ProxyHopSwitch(new_req)
+        return super().http_error_302(req, fp, code, msg, headers)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self._validate_target(newurl, fp=fp)
+        if code == 308:
+            method = req.get_method()
+            if method not in ("GET", "HEAD"):
+                raise HTTPError(req.full_url, code, msg, headers, fp)
+            new_headers = {
+                k: v
+                for k, v in req.headers.items()
+                if k.lower() not in ("content-length", "content-type")
+            }
+            return Request(
+                newurl.replace(" ", "%20"),
+                headers=new_headers,
+                origin_req_host=req.origin_req_host,
+                unverifiable=True,
+                method=method,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def build_update_urlopen(
+    proxy_mode: str = "system",
+    *,
+    proxy_bypass_suffixes: str = "",
+    trusted_only: bool = False,
+):
+    """Build a ``urlopen(request, timeout=...)`` callable honoring ``llm.proxy_mode``
+    and ``llm.proxy_bypass_suffixes`` while validating redirect targets."""
     mode = (proxy_mode or "system").strip().lower()
+    suffixes = (proxy_bypass_suffixes or "").strip()
+    force_direct = mode in ("direct", "none", "off", "bypass")
 
     def _open(req, timeout: float = 30):
-        from urllib.request import urlopen as stdlib_urlopen
+        from sayink.text_polisher import bypasses_env_proxy
 
-        if mode in ("direct", "none", "off", "bypass"):
-            opener = build_opener(ProxyHandler({}))
-            return opener.open(req, timeout=timeout)
-        return stdlib_urlopen(req, timeout=timeout)
+        current_req = req if isinstance(req, Request) else _request(str(req))
+        for _hop in range(HTTPRedirectHandler.max_repeats):
+            target_url = current_req.full_url
+            use_direct = force_direct or (
+                bool(suffixes) and bypasses_env_proxy(mode, target_url, suffixes)
+            )
+            redirect_handler = _TrustedRedirectHandler(
+                trusted_only=trusted_only,
+                direct=use_direct,
+                force_direct=force_direct,
+                bypass_suffixes=suffixes,
+            )
+            if use_direct:
+                opener = build_opener(ProxyHandler({}), redirect_handler)
+            elif _urllib_request.urlopen is not _STDLIB_URLOPEN:
+                return _urllib_request.urlopen(current_req, timeout=timeout)
+            else:
+                opener = build_opener(redirect_handler)
+            try:
+                return opener.open(current_req, timeout=timeout)
+            except _ProxyHopSwitch as hop:
+                current_req = hop.request
+        raise UpdateError("更新请求重定向次数过多")
 
+    if not trusted_only:
+        _open.__dict__["_sayink_with_trusted_only"] = lambda: build_update_urlopen(
+            proxy_mode,
+            proxy_bypass_suffixes=proxy_bypass_suffixes,
+            trusted_only=True,
+        )
     return _open
 
 
@@ -425,8 +574,21 @@ def cleanup_stale_installers(cache_dir: Path, *, keep_asset_name: str = "") -> i
     return removed
 
 
-def fetch_latest_release(urlopen, *, current: str) -> ReleaseInfo | None:
-    with urlopen(_request(LATEST_RELEASE_URL), timeout=15) as response:
+def fetch_latest_release(
+    urlopen=None,
+    *,
+    current: str,
+    proxy_mode: str = "system",
+    proxy_bypass_suffixes: str = "",
+) -> ReleaseInfo | None:
+    opener_fn = urlopen or build_update_urlopen(
+        proxy_mode,
+        proxy_bypass_suffixes=proxy_bypass_suffixes,
+    )
+    with opener_fn(_request(LATEST_RELEASE_URL), timeout=15) as response:
+        final_url = getattr(response, "geturl", lambda: "")()
+        if isinstance(final_url, str) and final_url and not _is_trusted_api_redirect_url(final_url):
+            raise UpdateError(f"拒绝不受信任的更新检查响应地址: {final_url}")
         payload = json.loads(response.read().decode("utf-8"))
     return release_from_payload(payload, current=current)
 
@@ -435,17 +597,26 @@ def _shell_execute_runas(executable: str, parameters: str) -> None:
     import ctypes
     from ctypes import wintypes
 
-    shell32 = ctypes.windll.shell32
+    current_shell = getattr(getattr(ctypes, "windll", None), "shell32", None)
+    if (
+        sys.platform == "win32"
+        and hasattr(ctypes, "WinDLL")
+        and isinstance(current_shell, ctypes.WinDLL)
+    ):
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    else:
+        shell32 = current_shell
     shell_exec = shell32.ShellExecuteW
-    shell_exec.argtypes = [
-        wintypes.HWND,
-        wintypes.LPCWSTR,
-        wintypes.LPCWSTR,
-        wintypes.LPCWSTR,
-        wintypes.LPCWSTR,
-        ctypes.c_int,
-    ]
-    shell_exec.restype = ctypes.c_ssize_t
+    if hasattr(shell_exec, "argtypes"):
+        shell_exec.argtypes = [
+            wintypes.HWND,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            ctypes.c_int,
+        ]
+        shell_exec.restype = ctypes.c_ssize_t
     ret = int(shell_exec(None, "runas", executable, parameters, None, 1))
     if ret <= 32:
         raise OSError(f"安装包提权启动被拒绝或失败 (ShellExecuteW={ret})")
@@ -490,6 +661,14 @@ MISSING_DIGEST_MESSAGE = "该版本未提供安装包校验值，为安全起见
 INVALID_SIGNATURE_MESSAGE = "安装包数字签名校验失败，已停止自动安装，请到 GitHub 发布页核实"
 
 
+def _ensure_trusted_installer_urlopen(urlopen):
+    if isinstance(urlopen, types.FunctionType):
+        upgrade = urlopen.__dict__.get("_sayink_with_trusted_only")
+        if callable(upgrade):
+            return upgrade()
+    return urlopen
+
+
 def _fetch_and_verify_signature(
     urlopen,
     sig_url: str,
@@ -501,10 +680,18 @@ def _fetch_and_verify_signature(
 ) -> bytes:
     if not is_trusted_installer_url(sig_url):
         raise InstallerSignatureError("安装包签名地址不受信任")
+    trusted_urlopen = _ensure_trusted_installer_urlopen(urlopen)
     try:
-        with urlopen(_request(sig_url), timeout=30) as sig_resp:
+        with trusted_urlopen(_request(sig_url), timeout=30) as sig_resp:
+            final_sig_url = getattr(sig_resp, "geturl", lambda: "")()
+            if (
+                isinstance(final_sig_url, str)
+                and final_sig_url
+                and not is_trusted_installer_url(final_sig_url)
+            ):
+                raise UpdateError(f"拒绝不受信任的安装包签名响应地址: {final_sig_url}")
             raw_sig = sig_resp.read(_MAX_SIGNATURE_BYTES + 1)
-    except InstallerSignatureError:
+    except (InstallerSignatureError, UpdateError):
         raise
     except Exception as exc:
         raise InstallerSignatureError(f"无法下载安装包签名: {exc}") from exc
@@ -527,7 +714,7 @@ def _fetch_and_verify_signature(
 def download_installer(
     url: str,
     dest: Path,
-    urlopen,
+    urlopen=None,
     on_progress=None,
     *,
     expected_size: int = 0,
@@ -535,6 +722,8 @@ def download_installer(
     reuse_existing: bool = False,
     signature_url: str = "",
     public_key_hex: str | None = None,
+    proxy_mode: str = "system",
+    proxy_bypass_suffixes: str = "",
 ) -> None:
     """Download to ``<dest>.part`` and only rename after size/hash/signature checks pass.
 
@@ -545,22 +734,45 @@ def download_installer(
     Reusing an installer always rechecks its complete contents first.
     """
     import hashlib
-    import os
 
     if not is_trusted_installer_url(url):
         raise ValueError("安装包地址不受信任")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256 or ""):
         raise MissingDigestError("发布未提供有效的 SHA-256 校验值")
+    trusted_urlopen = (
+        build_update_urlopen(
+            proxy_mode,
+            proxy_bypass_suffixes=proxy_bypass_suffixes,
+            trusted_only=True,
+        )
+        if urlopen is None
+        else _ensure_trusted_installer_urlopen(urlopen)
+    )
     pub_key = resolve_signing_public_key(public_key_hex)
     resolved_sig_url = ""
     if pub_key is not None:
+        with _SIGNATURE_URLS_LOCK:
+            known_sig_url = _KNOWN_SIGNATURE_URLS.get(url, "")
         resolved_sig_url = (
-            signature_url or _KNOWN_SIGNATURE_URLS.get(url, "") or f"{url}.sig"
+            signature_url or known_sig_url or f"{url}.sig"
         ).strip()
         if not is_trusted_installer_url(resolved_sig_url):
             raise InstallerSignatureError("安装包签名地址不受信任")
     normalized_sha = sha256.lower()
     sig_dest = dest.with_name(dest.name + ".sig")
+
+    def _atomic_write_sig(payload: bytes) -> None:
+        sig_part = sig_dest.with_name(sig_dest.name + ".part")
+        try:
+            sig_part.write_bytes(payload)
+            os.replace(sig_part, sig_dest)
+        except BaseException:
+            try:
+                sig_part.unlink()
+            except OSError:
+                pass
+            raise
+
     if reuse_existing and dest.is_file():
         try:
             size = dest.stat().st_size
@@ -585,14 +797,14 @@ def download_installer(
                                 log.info("已缓存的签名文件无效，重新拉取远程签名")
                         if not sidecar_ok:
                             verified_sig = _fetch_and_verify_signature(
-                                urlopen,
+                                trusted_urlopen,
                                 resolved_sig_url,
                                 pub_key=pub_key,
                                 asset_name=dest.name,
                                 sha256=normalized_sha,
                                 size=size,
                             )
-                            sig_dest.write_bytes(verified_sig)
+                            _atomic_write_sig(verified_sig)
                     if on_progress is not None:
                         on_progress(size, size)
                     return
@@ -602,7 +814,14 @@ def download_installer(
     part = dest.with_name(dest.name + ".part")
     hasher = hashlib.sha256()
     try:
-        with urlopen(_request(url), timeout=60) as response:
+        with trusted_urlopen(_request(url), timeout=60) as response:
+            final_url = getattr(response, "geturl", lambda: "")()
+            if (
+                isinstance(final_url, str)
+                and final_url
+                and not is_trusted_installer_url(final_url)
+            ):
+                raise UpdateError(f"拒绝不受信任的安装包响应地址: {final_url}")
             total = int(response.headers.get("Content-Length") or 0) or expected_size
             got = 0
             with part.open("wb") as handle:
@@ -622,14 +841,14 @@ def download_installer(
             raise InstallerVerificationError("安装包校验值不符")
         if pub_key is not None:
             verified_sig = _fetch_and_verify_signature(
-                urlopen,
+                trusted_urlopen,
                 resolved_sig_url,
                 pub_key=pub_key,
                 asset_name=dest.name,
                 sha256=normalized_sha,
                 size=got,
             )
-            sig_dest.write_bytes(verified_sig)
+            _atomic_write_sig(verified_sig)
         os.replace(part, dest)
     except BaseException:
         try:
@@ -649,13 +868,18 @@ class UpdateCheckWorker(QThread):
         parent=None,
         *,
         proxy_mode: str = "system",
+        proxy_bypass_suffixes: str = "",
     ):
         super().__init__(parent)
         self._current = current
         self._proxy_mode = proxy_mode
+        self._proxy_bypass_suffixes = proxy_bypass_suffixes
 
     def run(self) -> None:
-        urlopen = build_update_urlopen(self._proxy_mode)
+        urlopen = build_update_urlopen(
+            self._proxy_mode,
+            proxy_bypass_suffixes=self._proxy_bypass_suffixes,
+        )
 
         try:
             self.result_ready.emit(fetch_latest_release(urlopen, current=self._current))
@@ -680,6 +904,7 @@ class UpdateDownloadWorker(QThread):
         signature_url: str = "",
         public_key_hex: str | None = None,
         proxy_mode: str = "system",
+        proxy_bypass_suffixes: str = "",
     ):
         super().__init__(parent)
         self._url = url
@@ -689,6 +914,7 @@ class UpdateDownloadWorker(QThread):
         self._signature_url = signature_url
         self._public_key_hex = public_key_hex
         self._proxy_mode = proxy_mode
+        self._proxy_bypass_suffixes = proxy_bypass_suffixes
         self._cancelled = False
         self._last_progress_at = 0.0
         self._last_progress_got = -1
@@ -714,7 +940,11 @@ class UpdateDownloadWorker(QThread):
             self.progress.emit(got, total)
 
     def run(self) -> None:
-        urlopen = build_update_urlopen(self._proxy_mode)
+        urlopen = build_update_urlopen(
+            self._proxy_mode,
+            proxy_bypass_suffixes=self._proxy_bypass_suffixes,
+            trusted_only=True,
+        )
 
         if self._cancelled:
             return
@@ -741,6 +971,9 @@ class UpdateDownloadWorker(QThread):
         except InstallerVerificationError as exc:
             log.warning("更新包校验失败: %s", exc)
             self.failed.emit("下载的安装包不完整或已损坏，请重试")
+        except UpdateError as exc:
+            log.warning("更新包重定向校验失败: %s", exc)
+            self.failed.emit("更新地址不受信任，已停止下载")
         except Exception as exc:
             if self._cancelled:
                 return

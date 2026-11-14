@@ -91,13 +91,19 @@ class OnboardingController(QObject):
         self._trial_audio = None
         self._trial_worker = None
         self._download_worker = None
+        self._download_threads: list[object] = []
         self._mic_heard = False
         self._paused_hotkey_for_setup = False
 
     @property
     def running_workers(self):
         workers = []
-        for candidate in (self._download_worker, self._trial_worker, *self.findChildren(QThread)):
+        for candidate in (
+            self._download_worker,
+            *self._download_threads,
+            self._trial_worker,
+            *self.findChildren(QThread),
+        ):
             if candidate is not None and candidate not in workers:
                 is_running = getattr(candidate, "isRunning", None)
                 if callable(is_running) and is_running():
@@ -198,7 +204,11 @@ class OnboardingController(QObject):
             )
         else:
             model_tip = "语音模型已下载，载入完成后即可试用。\n\n"
-        history_only = self._config.get("output.mode", "paste") == "history"
+        history_only = (
+            self._config.history_only_output()
+            if callable(getattr(self._config, "history_only_output", None))
+            else self._config.get("output.mode", "paste") == "history"
+        )
         result_tip = (
             "结果仅保存到「历史」，不会输入其他应用。" if history_only and self._config.get("history.enabled", True) else
             "结果当前不会保存或输入其他应用：请在通用页开启转写历史，或修改「结果去向」。" if history_only else
@@ -213,7 +223,32 @@ class OnboardingController(QObject):
             "双击托盘图标可打开主窗口。"
         )
 
+    def _dismiss_idle_floating(self) -> None:
+        """Dismiss passive startup toasts on FloatingWindow before opening an
+        ApplicationModal dialog so the floating window never sits behind a modal
+        ignoring mouse hover/clicks."""
+        floating = getattr(self.parent(), "_floating", None)
+        if floating is None:
+            return
+        is_visible = getattr(floating, "isVisible", None)
+        if not (callable(is_visible) and is_visible() is True):
+            return
+        if any(
+            getattr(floating, flag, False) is True
+            for flag in (
+                "_model_loading_active",
+                "_listening_active",
+                "_capture_active",
+                "_meeting_active",
+            )
+        ):
+            return
+        dismiss = getattr(floating, "dismiss_if_idle", None)
+        if callable(dismiss):
+            dismiss()
+
     def show_welcome(self) -> None:
+        self._dismiss_idle_floating()
         model_missing = not self._model_installed()
         box = message_box(
             self._dialog_parent(),
@@ -241,6 +276,7 @@ class OnboardingController(QObject):
         self._config.set("history.onboarded", True)
 
     def ask_history_enabled(self) -> bool:
+        self._dismiss_idle_floating()
         text = (
             "SayInk 可以在本机保存转写历史，方便稍后搜索、复制或导出。\n\n"
             "历史只保存在本地；关闭后只会停止未来写入，不会删除已有数据。\n"
@@ -261,6 +297,7 @@ class OnboardingController(QObject):
             self._setup_dialog.raise_()
             self._setup_dialog.activateWindow()
             return
+        self._dismiss_idle_floating()
         self._setup_closed = False
         self._setup_reopened = False
         self._setup_open_engine = False
@@ -335,6 +372,7 @@ class OnboardingController(QObject):
         self._setup_dialog = None
         if dialog is not None:
             dialog.hide()
+            dialog.deleteLater()
         self._welcome_scheduled = False
 
     def _reopen_setup_nonmodal(self) -> None:
@@ -397,6 +435,7 @@ class OnboardingController(QObject):
         self._setup_dialog = None
         if dialog is not None:
             dialog.hide()
+            dialog.deleteLater()
         if not self._config.get("first_run_welcome_seen", False):
             self._welcome_scheduled = False
             QTimer.singleShot(WELCOME_DELAY_MS, self.show_welcome)
@@ -630,6 +669,15 @@ class OnboardingController(QObject):
         dialog.trial_btn.setEnabled(bool(self._trial_ready() and not self._setup_mode))
         dialog.trial_result.setText(f"试说没有完成。{message} 可以再试一次，或稍后继续。".strip())
 
+    def _reap_download_worker(self, worker: object) -> None:
+        self._download_threads = [
+            t
+            for t in self._download_threads
+            if t is not worker and getattr(t, "isRunning", lambda: False)()
+        ]
+        if isinstance(worker, QThread):
+            worker.deleteLater()
+
     def _start_inline_model_download(self) -> None:
         dialog = self._setup_dialog
         if dialog is None or self._download_worker is not None:
@@ -642,15 +690,26 @@ class OnboardingController(QObject):
             source=self._config.get("stt.download_source", "auto"),
         )
         self._download_worker = worker
+        if worker not in self._download_threads:
+            self._download_threads.append(worker)
         dialog.download_btn.setEnabled(False)
         dialog.download_btn.setText("正在下载… 0%")
         dialog.cancel_download_btn.setVisible(True)
         dialog.cancel_download_btn.setEnabled(True)
         dialog.download_status.setText("正在后台下载模型，您可以先测试下方麦克风。")
         dialog.download_status.setVisible(True)
-        worker.progress.connect(self._on_setup_download_progress)
-        worker.finished_ok.connect(self._on_setup_download_done)
-        worker.error.connect(self._on_setup_download_error)
+        worker.progress.connect(
+            lambda pct, w=worker: self._on_setup_download_progress(pct, worker=w)
+        )
+        worker.finished_ok.connect(
+            lambda mid, w=worker: self._on_setup_download_done(mid, worker=w)
+        )
+        worker.error.connect(
+            lambda msg, w=worker: self._on_setup_download_error(msg, worker=w)
+        )
+        finished_sig = getattr(worker, "finished", None)
+        if finished_sig is not None and hasattr(finished_sig, "connect"):
+            finished_sig.connect(lambda w=worker: self._reap_download_worker(w))
         worker.start()
 
     def _cancel_inline_model_download(self) -> None:
@@ -668,13 +727,27 @@ class OnboardingController(QObject):
         dialog.download_status.setText("已取消模型下载。需要时可随时重新下载。")
         dialog.download_status.setVisible(True)
 
-    def _on_setup_download_progress(self, pct: int) -> None:
+    def _is_stale_download_worker(self, worker: object | None) -> bool:
+        return worker is not None and (
+            worker is not self._download_worker
+            or getattr(worker, "_cancelled", False) is True
+        )
+
+    def _on_setup_download_progress(
+        self, pct: int, *, worker: object | None = None
+    ) -> None:
+        if self._is_stale_download_worker(worker):
+            return
         dialog = self._setup_dialog
         if dialog is None or self._download_worker is None:
             return
         dialog.download_btn.setText(f"正在下载… {int(pct)}%")
 
-    def _on_setup_download_done(self, model_id: str) -> None:
+    def _on_setup_download_done(
+        self, model_id: str, *, worker: object | None = None
+    ) -> None:
+        if self._is_stale_download_worker(worker):
+            return
         self._download_worker = None
         self._config.set("stt.model_id", model_id)
         dialog = self._setup_dialog
@@ -690,7 +763,11 @@ class OnboardingController(QObject):
             parent._on_models_changed()
         self._refresh_setup_steps()
 
-    def _on_setup_download_error(self, message: str) -> None:
+    def _on_setup_download_error(
+        self, message: str, *, worker: object | None = None
+    ) -> None:
+        if self._is_stale_download_worker(worker):
+            return
         self._download_worker = None
         dialog = self._setup_dialog
         if dialog is None:

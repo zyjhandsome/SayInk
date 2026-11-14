@@ -24,12 +24,12 @@ from sayink_build.release_signing import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _load_parallel_runner():
+def _load_parallel_runner(monkeypatch: pytest.MonkeyPatch):
     script_path = REPO_ROOT / "tools" / "run_tests_parallel.py"
     spec = importlib.util.spec_from_file_location("run_tests_parallel", script_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules["run_tests_parallel"] = module
+    monkeypatch.setitem(sys.modules, "run_tests_parallel", module)
     spec.loader.exec_module(module)
     return module
 
@@ -128,8 +128,8 @@ def test_post_authenticode_binary_is_covered_by_detached_ed25519_signature(tmp_p
     assert write_detached_signature_if_configured(installer, env={}) is None
 
 
-def test_parallel_runner_lpt_sharding_and_summary_parsing(tmp_path: Path):
-    runner = _load_parallel_runner()
+def test_parallel_runner_lpt_sharding_and_summary_parsing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runner = _load_parallel_runner(monkeypatch)
     assert 1 <= runner.default_worker_count(None) <= 6
     assert runner.default_worker_count(16) == 6
     assert runner.default_worker_count(2) == 2
@@ -156,8 +156,8 @@ def test_parallel_runner_lpt_sharding_and_summary_parsing(tmp_path: Path):
     assert counts["deselected"] == 9
 
 
-def test_parallel_runner_executes_shards_and_propagates_failures(tmp_path: Path):
-    runner = _load_parallel_runner()
+def test_parallel_runner_executes_shards_and_propagates_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runner = _load_parallel_runner(monkeypatch)
     suite = tmp_path / "tests"
     suite.mkdir()
     (suite / "test_one.py").write_text(
@@ -196,8 +196,10 @@ def test_parallel_runner_executes_shards_and_propagates_failures(tmp_path: Path)
     assert sum(r.counts["failed"] for r in fail_results) == 1
 
 
-def test_parallel_runner_handles_keyword_deselection_across_shards(tmp_path: Path, capsys):
-    runner = _load_parallel_runner()
+def test_parallel_runner_handles_keyword_deselection_across_shards(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+):
+    runner = _load_parallel_runner(monkeypatch)
     suite = tmp_path / "tests"
     suite.mkdir()
     (suite / "test_one.py").write_text("def test_only_in_one():\n    assert True\n", encoding="utf-8")

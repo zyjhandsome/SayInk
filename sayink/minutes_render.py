@@ -33,7 +33,8 @@ EMPTY_SECTION_TEXT = "本场未识别到"
 UNVERIFIED_MARK = "（待核对）"
 _SPEAKER_LABEL_RE = re.compile(r"说话人\s*(\d+)")
 _SPEAKER_LABEL_FULL_RE = re.compile(r"^说话人\s*(\d+)$")
-_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
+_FENCE_OPEN_RE = re.compile(r"\A```[a-zA-Z0-9_-]*\s*")
+_FENCE_CLOSE_RE = re.compile(r"\s*```\Z")
 
 
 def extract_json(text: str) -> dict[str, Any] | None:
@@ -43,7 +44,9 @@ def extract_json(text: str) -> dict[str, Any] | None:
     stripped = strip_model_thinking(text).strip()
     if not stripped:
         return None
-    candidate = _FENCE_RE.sub("", stripped)
+    candidate = stripped
+    if candidate.startswith("```"):
+        candidate = _FENCE_CLOSE_RE.sub("", _FENCE_OPEN_RE.sub("", candidate)).strip()
     # RecursionError: absurdly nested brackets from a broken endpoint must not
     # take the minutes worker down with them; they are simply "not JSON".
     try:
@@ -123,10 +126,13 @@ def clear_timeline(payload: dict) -> dict:
         if isinstance(chapter, dict):
             chapter["start"] = ""
             chapter["end"] = ""
+            for field in ("title", "summary"):
+                if isinstance(chapter.get(field), str):
+                    chapter[field] = strip_clock_citations(chapter[field]).strip()
     return payload
 
 
-_CLOCK_CITATION = re.compile(r"\[\d{1,2}:\d{2}:\d{2}\]")
+_CLOCK_CITATION = re.compile(r"\[\d{1,}:\d{2}:\d{2}\]")
 
 
 def strip_clock_citations(text: str) -> str:
@@ -139,19 +145,30 @@ _CHECKABLE_RE = re.compile(
     r"|(?:周|星期|礼拜)[一二三四五六日天]"           # 周三
     r"|\d+(?:\.\d+)?\s*(?:%|万|亿|千|百|人|天|周|个月|小时|分钟|元|块|美元|k|K|w|W)"  # amounts
 )
-_CJK_NUMERALS = "零一二两三四五六七八九十百千万亿"
 
 
 def _normalize_for_lookup(text: str) -> str:
     return re.sub(r"[\s,，。、；;:：]", "", text or "")
 
 
-def flag_unverified(text: str, transcript_text: str) -> str:
+def flag_unverified(
+    text: str,
+    transcript_text: str,
+    *,
+    _normalized_transcript: str | None = None,
+) -> str:
     """Append 「待核对」 when a date / amount in ``text`` is absent from the transcript."""
-    if not text or not transcript_text:
+    if not text or (not transcript_text and not _normalized_transcript):
         return text
-    haystack = _normalize_for_lookup(transcript_text)
-    for match in _CHECKABLE_RE.finditer(text):
+    matches = list(_CHECKABLE_RE.finditer(text))
+    if not matches:
+        return text
+    haystack = (
+        _normalized_transcript
+        if _normalized_transcript is not None
+        else _normalize_for_lookup(transcript_text)
+    )
+    for match in matches:
         needle = _normalize_for_lookup(match.group(0))
         if needle and needle not in haystack:
             return text + UNVERIFIED_MARK
@@ -191,19 +208,18 @@ def _canonical_speaker_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     patterns: list[tuple[re.Pattern[str], str]] = []
     for name in sorted(aliases, key=len, reverse=True):
         patterns.append((_label_pattern(name), aliases[name]))
+    # Simultaneous single-pass match so swapping 张三 <-> 李四 never collides.
+    combined = re.compile(
+        "|".join(f"(?P<_g{i}>{pat.pattern})" for i, (pat, _) in enumerate(patterns))
+    )
+
+    def _sub(match: re.Match[str]) -> str:
+        group_name = match.lastgroup
+        if group_name and group_name.startswith("_g"):
+            return patterns[int(group_name[2:])][1]
+        return aliases.get(match.group(), match.group())
 
     def _replace_text(text: str) -> str:
-        # Simultaneous single-pass match so swapping 张三 <-> 李四 never collides.
-        combined = re.compile(
-            "|".join(f"(?P<_g{i}>{pat.pattern})" for i, (pat, _) in enumerate(patterns))
-        )
-
-        def _sub(match: re.Match[str]) -> str:
-            group_name = match.lastgroup
-            if group_name and group_name.startswith("_g"):
-                return patterns[int(group_name[2:])][1]
-            return aliases.get(match.group(), match.group())
-
         return combined.sub(_sub, text)
 
     def canonical(value):
@@ -239,11 +255,19 @@ def render_markdown(
     if meta_lines:
         out.append("")
         out.extend(f"- {line}" for line in meta_lines if line)
+    normalized_transcript = _normalize_for_lookup(transcript_text) if transcript_text else ""
 
     def section(key: str) -> None:
         out.append("")
         out.append(f"## {section_title(template, key)}")
-        body = _render_section(key, payload, duration_ms, transcript_text, speaker_names)
+        body = _render_section(
+            key,
+            payload,
+            duration_ms,
+            transcript_text,
+            speaker_names,
+            normalized_transcript=normalized_transcript,
+        )
         out.append(body if body else EMPTY_SECTION_TEXT)
 
     for key in template.sections:
@@ -279,6 +303,8 @@ def _render_bullet_section(
     duration_ms: int | None,
     transcript_text: str,
     fix: Callable[[str], str],
+    *,
+    normalized_transcript: str | None = None,
 ) -> str:
     lines = []
     for item in _as_list(payload.get(key)):
@@ -286,7 +312,7 @@ def _render_bullet_section(
         if not text:
             continue
         if key == SECTION_DECISIONS:
-            text = flag_unverified(text, transcript_text)
+            text = flag_unverified(text, transcript_text, _normalized_transcript=normalized_transcript)
         ts = _ts(item.get("ts"), duration_ms) if isinstance(item, dict) else ""
         lines.append(f"- {fix(text)}{(' ' + ts) if ts else ''}")
     return "\n".join(lines)
@@ -297,6 +323,8 @@ def _render_action_items_section(
     duration_ms: int | None,
     transcript_text: str,
     fix: Callable[[str], str],
+    *,
+    normalized_transcript: str | None = None,
 ) -> str:
     lines = []
     for item in _as_list(payload.get("action_items")):
@@ -305,11 +333,11 @@ def _render_action_items_section(
         task = _as_text(item.get("task"))
         if not task:
             continue
-        task = flag_unverified(task, transcript_text)
+        task = flag_unverified(task, transcript_text, _normalized_transcript=normalized_transcript)
         owner = fix(_as_text(item.get("owner"))) or "未指定"
         due = _as_text(item.get("due")) or "未提及"
         if due != "未提及":
-            due = flag_unverified(due, transcript_text)
+            due = flag_unverified(due, transcript_text, _normalized_transcript=normalized_transcript)
         ts = _ts(item.get("ts"), duration_ms)
         lines.append(f"- [ ] {fix(task)} — @{owner} · {due}{(' ' + ts) if ts else ''}")
     return "\n".join(lines)
@@ -356,7 +384,11 @@ def _render_speakers_section(
         if suggested.lower() in ("null", "none"):
             suggested = ""
         hint = ""
-        if suggested and suggested != label and not (match and names and int(match.group(1)) in names):
+        known_name = bool(names) and (
+            (match is not None and int(match.group(1)) in names)
+            or label in names.values()
+        )
+        if suggested and suggested != label and not known_name:
             ts = _ts(speaker.get("evidence_ts"), duration_ms)
             hint = f"（可能是 {suggested}{(' ' + ts) if ts else ''}）"
         lines.append(f"- **{label}**{hint}：{summary or EMPTY_SECTION_TEXT}")
@@ -369,6 +401,8 @@ def _render_section(
     duration_ms: int | None,
     transcript_text: str,
     names: Mapping[int, str] | None,
+    *,
+    normalized_transcript: str | None = None,
 ) -> str:
     def fix(text: str) -> str:
         return apply_speaker_names(text, names)
@@ -378,9 +412,13 @@ def _render_section(
     if key == SECTION_TOPICS:
         return _render_topics_section(payload, duration_ms, fix)
     if key in (SECTION_DECISIONS, SECTION_OPEN_QUESTIONS):
-        return _render_bullet_section(key, payload, duration_ms, transcript_text, fix)
+        return _render_bullet_section(
+            key, payload, duration_ms, transcript_text, fix, normalized_transcript=normalized_transcript
+        )
     if key == SECTION_ACTION_ITEMS:
-        return _render_action_items_section(payload, duration_ms, transcript_text, fix)
+        return _render_action_items_section(
+            payload, duration_ms, transcript_text, fix, normalized_transcript=normalized_transcript
+        )
     if key == SECTION_CHAPTERS:
         return _render_chapters_section(payload, duration_ms, fix)
     if key == SECTION_SPEAKERS:
@@ -417,7 +455,7 @@ def _name_bounds(label: str) -> tuple[str, str]:
     extensions (``王总`` must not hit ``王总监`` / ``王总经理``).
     """
     head = r"(?<![0-9A-Za-z])" if re.match(r"[0-9A-Za-z]", label) else ""
-    tail = r"(?![0-9A-Za-z0-9])" if re.search(r"[0-9A-Za-z]$", label) else ""
+    tail = r"(?![0-9A-Za-z])" if re.search(r"[0-9A-Za-z]$", label) else ""
     if re.search(r"[\u4e00-\u9fff]", label):
         cjk_head = rf"(?:(?<![\u4e00-\u9fff])|(?<=[{_CJK_ALLOWED_BEFORE}]))"
         head = head or cjk_head
@@ -430,12 +468,13 @@ def _name_bounds(label: str) -> tuple[str, str]:
 
 
 def _label_pattern(label: str) -> re.Pattern[str]:
-    generic = _SPEAKER_LABEL_FULL_RE.match(label.strip())
-    head, tail = _name_bounds(label.strip())
+    stripped = label.strip()
+    generic = _SPEAKER_LABEL_FULL_RE.match(stripped)
+    head, tail = _name_bounds(stripped)
     if generic is not None:
         num = int(generic.group(1))
         return re.compile(rf"{head}说话人\s*0*{num}(?!\d)")
-    return re.compile(head + re.escape(label) + tail)
+    return re.compile(head + re.escape(stripped) + tail)
 
 
 def replace_names_in_markdown(markdown: str, old_label: str, new_label: str) -> tuple[str, int]:

@@ -46,12 +46,6 @@ def _disk_glossary(cfg: Config) -> list:
 
 
 @pytest.fixture(scope="module")
-def qapp():
-    app = QApplication.instance() or QApplication(sys.argv)
-    yield app
-
-
-@pytest.fixture(scope="module")
 def _shared_settings(qapp, tmp_path_factory):
     with pytest.MonkeyPatch.context() as mp:
         for name in _INERT_WINDOW_METHODS:

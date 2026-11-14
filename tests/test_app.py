@@ -75,8 +75,7 @@ class TestIslandUserCopy:
         with app_harness() as h:
             h["recognizer"].is_loading = True
             h["recognizer"].is_ready = False
-            assert h["app"]._runtime_status_label() == "模型载入中…"
-            assert h["app"]._model_not_ready_message() == "模型载入中，请稍候"
+            assert h["app"]._runtime_status().label == "模型载入中…"
             audio = np.zeros(MIN_AUDIO_SAMPLES + 8, dtype=np.float32)
             h["app"]._on_segment_ready(audio)
             detail = h["floating"].show_model_loading.call_args[0][0]
@@ -567,17 +566,6 @@ class TestFinalResultFlow:
             h["floating"].show_recording.assert_called_once()
             assert order == ["recorder.start", "floating.show_recording"]
 
-    def test_release_before_the_device_opened_never_opens_it(self):
-        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
-            app = h["app"]
-            app._hold_open_pending = True
-
-            app._on_recording_stop()
-
-            h["recorder"].start.assert_not_called()
-            h["recorder"].stop.assert_not_called()
-            assert "录音过短" in h["floating"].show_error.call_args[0][0]
-
     def test_long_hold_without_speech_says_nothing_was_heard(self):
         """Three seconds of silence is not a 'too short' recording: the gate
         never opened, and the hint must say so."""
@@ -652,16 +640,6 @@ class TestFinalResultFlow:
             app._handle_paste_result(PasteResult("sent", target_app="notepad.exe"))
 
             assert h["tray"].set_activity_tooltip.call_args[0][0] == "recording"
-
-    def test_esc_before_the_device_opened_cancels_the_hold(self):
-        with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
-            app = h["app"]
-            app._hold_open_pending = True
-
-            app._on_recording_cancel()
-
-            h["recorder"].start.assert_not_called()
-            h["floating"].show_cancelled.assert_called_once()
 
     def test_esc_on_a_new_hold_keeps_the_sentence_still_being_polished(self):
         """A new hold may start while the previous sentence is polishing.
@@ -978,9 +956,9 @@ def test_sync_models_dir_uses_only_an_explicit_folder(tmp_path, monkeypatch):
         calls = []
         monkeypatch.setattr("sayink.app.set_models_dir", lambda path: calls.append(path) or True)
         h["config"].set("stt.models_dir", "")
-        assert h["app"]._sync_models_dir() is True
+        assert h["app"]._reload_coordinator().sync_models_dir() is True
         h["config"].set("stt.models_dir", str(tmp_path))
-        assert h["app"]._sync_models_dir() is True
+        assert h["app"]._reload_coordinator().sync_models_dir() is True
         assert calls == [None, str(tmp_path)]
 
 

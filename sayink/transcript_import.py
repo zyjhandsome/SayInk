@@ -20,16 +20,17 @@ _STOP_LABELS = frozenset({
     "背景", "注意", "摘要", "议程", "时间", "参会人", "标题", "说明", "备注", "总结", "结论", "主题",
 })
 _NOT_NAMES = _STOP_LABELS | {"http", "https", "ftp", "file", "mailto"}
+_NOT_NAMES_FOLDED = frozenset(item.casefold() for item in _NOT_NAMES)
 _NUMBERED = re.compile(r"^(?:说话人|发言人|speaker)\s*(\d+)$", re.IGNORECASE)
 _CLOCK_IN_LABEL = re.compile(r"\d{1,2}:\d{2}")
 _SENTENCE_PUNCT = "。！？!?，,"
 _CUE_TIME = re.compile(
-    r"(?:(?P<sh>\d{1,}):)?(?P<sm>\d{1,2}):(?P<ss>\d{2})[.,](?P<sms>\d{1,3})\s*-->\s*"
-    r"(?:(?P<eh>\d{1,}):)?(?P<em>\d{1,2}):(?P<es>\d{2})[.,](?P<ems>\d{1,3})"
+    r"(?:(?P<sh>\d{1,}):)?(?P<sm>\d{1,2}):(?P<ss>\d{2})[.,](?P<sms>\d{1,9})\s*-->\s*"
+    r"(?:(?P<eh>\d{1,}):)?(?P<em>\d{1,2}):(?P<es>\d{2})[.,](?P<ems>\d{1,9})"
 )
 _LOOSE_CUE_ARROW = re.compile(r"\d+:\d{1,2}(?::\d{1,2})?(?:[.,]\d+)?\s*-->\s*\d+:\d{1,2}")
 _VTT_META_BLOCK = re.compile(r"^(?:NOTE|STYLE|REGION)(?:$|[ \t])", re.IGNORECASE)
-_VTT_INLINE_TIME = re.compile(r"<(?:\d{1,}:)?\d{1,2}:\d{2}[.,]\d{1,3}>")
+_VTT_INLINE_TIME = re.compile(r"<(?:\d{1,}:)?\d{1,2}:\d{2}[.,]\d{1,9}>")
 _VTT_INLINE_TAG = re.compile(
     r"</?(?:c|v|i|b|u|s|ruby|rt|rp|lang|font)(?:\.[^\s/>]+)*(?:\s+[^>]*)?>",
     re.IGNORECASE,
@@ -87,6 +88,7 @@ class ImportedTranscript:
     format_label: str
     discarded: int = 0
     skipped: tuple[str, ...] = ()
+    wall_clock_offsets: bool = False
 
     @property
     def has_timestamps(self) -> bool:
@@ -356,7 +358,7 @@ def _clock_ms(
 def _cue_ms(hours: str | None, minutes: str, seconds: str, millis: str) -> int | None:
     h = int(hours) if hours else 0
     m, s = int(minutes), int(seconds)
-    ms = int(millis.ljust(3, "0"))
+    ms = int(millis[:3].ljust(3, "0"))
     if h > 999 or m >= 60 or s >= 60 or ms >= 1000:
         return None
     return ((h * 60 + m) * 60 + s) * 1000 + ms
@@ -383,7 +385,7 @@ def _plausible_label(who: str, *, limit: int) -> bool:
     if any(mark in label for mark in _SENTENCE_PUNCT):
         return False
     folded = label.casefold()
-    if folded in _NOT_NAMES or folded in {item.casefold() for item in _NOT_NAMES}:
+    if folded in _NOT_NAMES_FOLDED:
         return False
     if "://" in label or label.startswith("//") or "/" in label:
         return False
@@ -473,6 +475,17 @@ def _fill_durations(turns: Sequence[ImportedTurn]) -> tuple[ImportedTurn, ...]:
     return tuple(filled)
 
 
+def _starts_next_cue(lines: Sequence[str], index: int) -> bool:
+    cur = lines[index].strip()
+    if _CUE_TIME.search(cur) or _LOOSE_CUE_ARROW.search(cur):
+        return True
+    if cur.isdigit() and index + 1 < len(lines):
+        nxt = lines[index + 1].strip()
+        if _CUE_TIME.search(nxt) or _LOOSE_CUE_ARROW.search(nxt):
+            return True
+    return False
+
+
 def _parse_cues(text: str, *, vtt: bool) -> ImportedTranscript:
     lines = text.split("\n")
     index = 1 if vtt else 0
@@ -501,7 +514,7 @@ def _parse_cues(text: str, *, vtt: bool) -> ImportedTranscript:
                 header_line = next_line
                 index += 2
                 bad_body: list[str] = []
-                while index < len(lines) and lines[index].strip():
+                while index < len(lines) and lines[index].strip() and not _starts_next_cue(lines, index):
                     bad_body.append(lines[index].strip())
                     index += 1
                 skipped.append(("\n".join(bad_body).strip() or header_line).replace("\n", " ")[:80])
@@ -510,7 +523,7 @@ def _parse_cues(text: str, *, vtt: bool) -> ImportedTranscript:
             if _LOOSE_CUE_ARROW.search(line):
                 index += 1
                 bad_body = []
-                while index < len(lines) and lines[index].strip():
+                while index < len(lines) and lines[index].strip() and not _starts_next_cue(lines, index):
                     bad_body.append(lines[index].strip())
                     index += 1
                 skipped.append(("\n".join(bad_body).strip() or line).replace("\n", " ")[:80])
@@ -521,7 +534,7 @@ def _parse_cues(text: str, *, vtt: bool) -> ImportedTranscript:
         end = _cue_ms(timing.group("eh"), timing.group("em"), timing.group("es"), timing.group("ems"))
         index += 1
         body: list[str] = []
-        while index < len(lines) and lines[index].strip():
+        while index < len(lines) and lines[index].strip() and not _starts_next_cue(lines, index):
             body.append(lines[index].strip())
             index += 1
         content_block = "\n".join(body).strip()
@@ -540,7 +553,34 @@ def _parse_cues(text: str, *, vtt: bool) -> ImportedTranscript:
     )
 
 
-def _match_block_header(raw: str) -> tuple[str, int] | None:
+def normalize_wall_clock_turns(turns: Sequence[ImportedTurn]) -> tuple[ImportedTurn, ...]:
+    """Rebase absolute time-of-day turns onto a relative 0-based meeting clock,
+    handling midnight rollovers (e.g. 23:58 -> 00:03) without distorting durations."""
+    day_wrap_ms = 0
+    prev_unwrapped: int | None = None
+    unwrapped: list[int | None] = []
+    for turn in turns:
+        if turn.offset_ms is None:
+            unwrapped.append(None)
+            continue
+        cur = int(turn.offset_ms) + day_wrap_ms
+        if prev_unwrapped is not None and cur < prev_unwrapped and (prev_unwrapped - cur) >= 43_200_000:
+            day_wrap_ms += 86_400_000
+            cur = int(turn.offset_ms) + day_wrap_ms
+        prev_unwrapped = cur
+        unwrapped.append(cur)
+    known = [val for val in unwrapped if val is not None]
+    if not known:
+        return tuple(turns)
+    base_ms = min(known)
+    rebased = [
+        turn if val is None else ImportedTurn(turn.speaker_label, val - base_ms, 0, turn.text)
+        for turn, val in zip(turns, unwrapped, strict=True)
+    ]
+    return _fill_durations(rebased)
+
+
+def _match_block_header(raw: str) -> tuple[str, int, bool] | None:
     stripped = raw.strip()
     date_first = _DATE_FIRST_HEADER.match(stripped)
     if date_first is not None:
@@ -552,7 +592,7 @@ def _match_block_header(raw: str) -> tuple[str, int] | None:
                 wall_clock=True, hint=hint,
             )
             if offset is not None:
-                return who, offset
+                return who, offset, True
     match = _BLOCK_HEADER.match(stripped)
     if match is None:
         return None
@@ -569,29 +609,31 @@ def _match_block_header(raw: str) -> tuple[str, int] | None:
     )
     if offset is None:
         return None
-    return who, offset
+    return who, offset, has_wall
 
 
 def _parse_blocks(text: str) -> ImportedTranscript | None:
     lines = text.split("\n")
-    headers: list[tuple[int, str, int]] = []
+    headers: list[tuple[int, str, int, bool]] = []
     for index, raw in enumerate(lines):
         parsed_header = _match_block_header(raw)
         if parsed_header is None:
             continue
-        who, offset = parsed_header
-        headers.append((index, who, offset))
+        who, offset, is_wall = parsed_header
+        headers.append((index, who, offset, is_wall))
     if len(headers) < 2:
         return None
     turns: list[ImportedTurn] = []
+    wall_flags: list[bool] = []
     preamble: list[str] = []
-    for position, (index, who, offset) in enumerate(headers):
+    for position, (index, who, offset, is_wall) in enumerate(headers):
         if position == 0:
             preamble = [lines[i].strip() for i in range(index) if lines[i].strip()]
         end = headers[position + 1][0] if position + 1 < len(headers) else len(lines)
         body = [lines[i].strip() for i in range(index + 1, end) if lines[i].strip()]
         if body:
             turns.append(ImportedTurn(who, offset, 0, "\n".join(body)))
+            wall_flags.append(is_wall)
     if len(turns) < 2:
         return None
     title = ""
@@ -599,10 +641,13 @@ def _parse_blocks(text: str) -> ImportedTranscript | None:
         title = preamble[0]
     elif preamble:
         turns.insert(0, ImportedTurn("", None, 0, "\n".join(preamble)))
-    return ImportedTranscript(title, _fill_durations(turns), "带时间的发言记录")
+    all_wall = bool(wall_flags) and all(wall_flags)
+    return ImportedTranscript(
+        title, _fill_durations(turns), "带时间的发言记录", wall_clock_offsets=all_wall
+    )
 
 
-def _parse_timed_line(line: str) -> ImportedTurn | None:
+def _parse_timed_line_with_kind(line: str) -> tuple[ImportedTurn, bool] | None:
     bracket = _BRACKET.match(line)
     if bracket is not None:
         b_date = bracket.group("date") or ""
@@ -620,7 +665,7 @@ def _parse_timed_line(line: str) -> ImportedTurn | None:
         if who and not _plausible_label(who, limit=24) and not _NUMBERED.match(who):
             body = f"{who}：{body}"
             who = ""
-        return ImportedTurn(who, offset, 0, body)
+        return ImportedTurn(who, offset, 0, body), has_wall
     date_colon = _DATE_FIRST_COLON.match(line)
     if date_colon is not None:
         who = _clean_speaker(date_colon.group("who"))
@@ -631,7 +676,7 @@ def _parse_timed_line(line: str) -> ImportedTurn | None:
                 hint=f"{date_colon.group('date') or ''} {date_colon.group('mer') or ''}".strip(),
             )
             if offset is not None:
-                return ImportedTurn(who, offset, 0, date_colon.group("body").strip())
+                return ImportedTurn(who, offset, 0, date_colon.group("body").strip()), True
     timed = _TIMED_COLON.match(line)
     if timed is None:
         return None
@@ -647,7 +692,12 @@ def _parse_timed_line(line: str) -> ImportedTurn | None:
     )
     if offset is None:
         return None
-    return ImportedTurn(who, offset, 0, timed.group("body").strip())
+    return ImportedTurn(who, offset, 0, timed.group("body").strip()), has_wall
+
+
+def _parse_timed_line(line: str) -> ImportedTurn | None:
+    res = _parse_timed_line_with_kind(line)
+    return res[0] if res is not None else None
 
 
 def _json_speaker_lookup(raw_speakers: Any) -> dict[int, str]:
@@ -705,7 +755,7 @@ def _json_item_speaker(item: dict[str, Any], speaker_map: dict[int, str]) -> str
                 return speaker_map.get(sid, f"说话人{sid}")
             if raw == "说话人待确认":
                 return ""
-            return raw
+            return raw[:48]
     raw_sid = item.get("speaker_id")
     if isinstance(raw_sid, (int, float)) and not isinstance(raw_sid, bool):
         sid = int(raw_sid)
@@ -879,7 +929,12 @@ def _parse_dialogue_line(line: str) -> ImportedTurn | None:
 
 
 def _parse_timed_dialogue(text: str) -> ImportedTranscript | None:
-    return _parse_line_format(text, _parse_timed_line, "带时间的对话")
+    return _parse_line_format(
+        text,
+        _parse_timed_line,
+        "带时间的对话",
+        wall_check=lambda ln: bool((res := _parse_timed_line_with_kind(ln)) is not None and res[1]),
+    )
 
 
 def _parse_dialogue(text: str) -> ImportedTranscript | None:
@@ -890,16 +945,21 @@ def _parse_line_format(
     text: str,
     match: Callable[[str], ImportedTurn | None],
     label: str,
+    *,
+    wall_check: Callable[[str], bool] | None = None,
 ) -> ImportedTranscript | None:
     """Use a line format only when it covers at least half of the non-empty lines."""
     nonempty = [(index, line.strip()) for index, line in enumerate(text.split("\n")) if line.strip()]
     if len(nonempty) < 2:
         return None
     matched: dict[int, ImportedTurn] = {}
+    wall_flags: list[bool] = []
     for index, line in nonempty:
         turn = match(line)
         if turn is not None:
             matched[index] = turn
+            if wall_check is not None and turn.offset_ms is not None:
+                wall_flags.append(bool(wall_check(line)))
     if len(matched) < 2 or len(matched) * 2 < len(nonempty):
         return None
     turns: list[ImportedTurn] = []
@@ -921,7 +981,8 @@ def _parse_line_format(
     if sum(1 for turn in turns if turn.speaker_label or turn.offset_ms is not None) < 2:
         return None
     stored = _fill_durations(turns) if any(turn.offset_ms is not None for turn in turns) else tuple(turns)
-    return ImportedTranscript(title, stored, label)
+    all_wall = bool(wall_flags) and all(wall_flags)
+    return ImportedTranscript(title, stored, label, wall_clock_offsets=all_wall)
 
 
 def _plain_turns(text: str, *, extract_title: bool) -> tuple[str, tuple[ImportedTurn, ...]]:

@@ -202,17 +202,6 @@ def suggest_batch_export_filename(*, now_ms: int | None = None) -> str:
     return f"sayink-export-{_filename_dt(stamp)}.md"
 
 
-def suggest_csv_export_filename(
-    session: SessionSummary | None = None,
-    *,
-    now_ms: int | None = None,
-) -> str:
-    if session is not None:
-        return f"sayink-{_filename_dt(session.created_at)}.csv"
-    stamp = int(time.time() * 1000) if now_ms is None else now_ms
-    return f"sayink-export-{_filename_dt(stamp)}.csv"
-
-
 def build_single_session_plain(
     session: SessionSummary,
     segments: list[SegmentRecord],
@@ -533,8 +522,9 @@ __all__ = [
     "build_single_session_markdown",
     "build_single_session_plain",
     "export_csv",
+    "export_directory",
+    "export_save_path",
     "history_shows_speakers",
     "suggest_batch_export_filename",
-    "suggest_csv_export_filename",
     "suggest_single_export_filename",
 ]

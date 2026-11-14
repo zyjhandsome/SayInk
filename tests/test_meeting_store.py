@@ -489,10 +489,13 @@ class TestMeetingStore:
         db_dir = tmp_path / "ro"
         db_dir.write_text("not a dir")
         history = HistoryStore(db_path=db_dir / "history.db")
-        assert history.disabled
-        store = MeetingStore(history)
-        rec = store.create_meeting(title="x")
-        assert rec.title == "x"
-        assert store.list_meetings() == []
-        assert store.get_meeting(rec.id) is None
-        assert history.flush() is True
+        try:
+            assert history.disabled
+            store = MeetingStore(history)
+            rec = store.create_meeting(title="x")
+            assert rec.title == "x"
+            assert store.list_meetings() == []
+            assert store.get_meeting(rec.id) is None
+            assert history.flush() is True
+        finally:
+            history.close(timeout=2.0)

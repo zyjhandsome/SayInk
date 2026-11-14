@@ -787,27 +787,40 @@ class TestMeetingPage:
         page.show_start_card()
         _qapp_session.processEvents()
         combos = (page._opt_source, page._opt_model, page._opt_language)
-        assert page._opt_model.width() > page._opt_source.width() > page._opt_language.width() > 100
+        assert page._opt_model.width() > page._opt_source.width() > 100
+        assert abs(page._opt_source.width() - page._opt_language.width()) <= 2
         for combo in combos:
             assert combo.toolTip() == combo.currentText()
 
-    def test_open_start_card_follows_dictation_source_without_replacing_a_choice(self, page, config):
-        config.set("meeting.input_source", "")
+    def test_start_card_offers_three_sources_and_never_follows_dictation(self, page, config):
         config.set("audio.input_source", "system")
         page.show_start_card()
-        assert page._opt_source.itemText(0) == "跟随转写（当前：电脑声音）"
-        assert page._opt_source.currentData() == ""
+        offered = [page._opt_source.itemData(i) for i in range(page._opt_source.count())]
+        assert offered == ["mixed", "microphone", "system"]
+        assert page._opt_source.currentData() == "mixed"
 
+        # A choice made on the open card survives a dictation-source change.
+        page._opt_source.setCurrentIndex(page._opt_source.findData("microphone"))
         config.set("audio.input_source", "mixed")
         page.refresh()
-        assert page._opt_source.itemText(0) == "跟随转写（当前：麦克风 + 电脑声音）"
-        assert page._opt_source.currentData() == ""
-
-        page._opt_source.setCurrentIndex(page._opt_source.findData("microphone"))
-        config.set("audio.input_source", "system")
-        page.refresh()
-        assert page._opt_source.itemText(0) == "跟随转写（当前：电脑声音）"
         assert page._opt_source.currentData() == "microphone"
+
+    def test_start_card_treats_a_legacy_follow_dictation_value_as_mixed(self, page, config):
+        """Before the option was removed, 「跟随转写」 was saved as an empty string."""
+        config.set("meeting.input_source", "")
+        config.set("audio.input_source", "microphone")
+        received = []
+        page.start_requested.connect(received.append)
+        page.show_start_card()
+        assert page._opt_source.currentData() == "mixed"
+        page._start_from_card()
+        assert received[0].input_source == "mixed"
+
+    def test_silent_computer_audio_notice_allows_for_in_person_meetings(self):
+        """Mixed is the default, so a meeting with nobody on a call also sees this."""
+        from sayink.ui.meeting_page import MeetingPage
+
+        assert "线下会议" in MeetingPage._DEFAULT_SYSTEM_SILENT_MSG
 
     def test_start_card_names_sources_with_the_shared_labels(self, page):
         from sayink.audio_devices import input_source_label

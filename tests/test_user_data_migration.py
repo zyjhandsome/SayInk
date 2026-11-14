@@ -214,7 +214,7 @@ class TestLegacyAutoStartValue:
         monkeypatch.setitem(sys.modules, "winreg", winreg)
         monkeypatch.setattr(sys, "platform", "win32")
 
-        cfg = Config(config_dir=config_home)
+        cfg = Config(config_dir=config_home, sync_auto_start=True)
 
         assert key.deleted == [LEGACY_AUTO_START_VALUE]
         assert LEGACY_AUTO_START_VALUE not in key.values
@@ -229,7 +229,7 @@ class TestLegacyAutoStartValue:
         monkeypatch.setitem(sys.modules, "winreg", winreg)
         monkeypatch.setattr(sys, "platform", "win32")
 
-        cfg = Config(config_dir=config_home)
+        cfg = Config(config_dir=config_home, sync_auto_start=True)
 
         assert key.deleted == []
         assert cfg.get("auto_start") is False

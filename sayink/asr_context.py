@@ -69,17 +69,37 @@ class BoundaryContextBuffer:
     Original sample bounds never move. No text matching or global deduplication
     is involved. The ASR engine must supply independently validated timestamps.
     """
+    _RING_CAP = 4 * TARGET_SAMPLE_RATE
+
     def __init__(self):
-        self._ring = np.zeros(0, np.float32)
+        self._ring_buf = np.zeros(self._RING_CAP, np.float32)
+        self._ring_len = 0
         self._stop = 0
         self._previous_end = -1
         self._previous_tail = np.zeros(0, np.float32)
         self._pending = deque()
 
+    @property
+    def _ring(self) -> np.ndarray:
+        return self._ring_buf[self._RING_CAP - self._ring_len :]
+
     def feed(self, block):
-        self._stop += len(block)
+        arr = np.asarray(block, dtype=np.float32).reshape(-1)
+        n = len(arr)
+        if n == 0:
+            return
+        self._stop += n
         # Quiet-cut search can choose a point 3 seconds behind the clock.
-        self._ring = np.concatenate([self._ring, np.asarray(block)])[-4 * TARGET_SAMPLE_RATE:]
+        cap = self._RING_CAP
+        if n >= cap:
+            self._ring_buf[:] = arr[-cap:]
+            self._ring_len = cap
+        else:
+            keep = min(self._ring_len, cap - n)
+            if keep > 0:
+                self._ring_buf[cap - n - keep : cap - n] = self._ring_buf[cap - keep : cap]
+            self._ring_buf[cap - n : cap] = arr
+            self._ring_len = keep + n
 
     @property
     def pending_start(self):

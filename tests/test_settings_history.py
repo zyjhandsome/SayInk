@@ -2,18 +2,9 @@
 
 from __future__ import annotations
 
-import sys
-
 import pytest
-from PyQt6.QtWidgets import QApplication
 
 from sayink.ui.settings_window import SettingsWindow
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    app = QApplication.instance() or QApplication(sys.argv)
-    yield app
 
 
 @pytest.fixture
@@ -24,6 +15,7 @@ def settings_window(config, qapp, monkeypatch):
     win = SettingsWindow(config)
     yield win
     win.close()
+    win.deleteLater()
 
 
 class TestHistorySettings:

@@ -116,10 +116,8 @@ Effective theme is always `light` or `dark`.
 | `TYPE_BODY` | `14px` | Global baseline, brand, primary body |
 | `TYPE_TITLE_SM` | `15px` | Model card titles |
 | `TYPE_TITLE` | `16px` | Detail titles and history reading text |
-| `TYPE_ICON_LG` | `17px` | Float close glyph |
 | `TYPE_HERO` | `18px` | Engine hero title |
 | `TYPE_TITLE_LG` | `20px` | Settings page titles |
-| `TYPE_DISPLAY` | `22px` | History window title |
 
 ### Spacing
 
@@ -190,7 +188,7 @@ shadow tokens to `design_tokens.py` unless a surface actually paints one.
 ### Floating window
 
 - Follows **effective** theme float tokens (not permanently locked to dark)
-- 420×44px at rest; 420×68px with a one-line excerpt (width is constant so the bar never jumps sideways; only the height grows). Radius 22px / 16px respectively.
+- 480×44px at rest (`BAR_WIDTH = 480`); 480×68px with a one-line excerpt (`BAR_EXCERPT_WIDTH = 480`, minimum width `MIN_BAR_WIDTH = 420`; width is constant so the bar never jumps sideways, only the height grows). Radius 22px / 16px respectively.
 - The 64×30px stop target appears only during a continuous session; state colors survive theme changes.
 - Native QFont sizes use pixels to match the QSS type scale under display scaling.
 

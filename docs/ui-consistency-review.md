@@ -44,12 +44,12 @@
 
 验证结果：相关回归共覆盖 398 个独立测试，全部通过（分批执行，后续修改补跑受影响检查）。三种缩放共 138 张原生预览；换行标签和按钮文字检查均为 0 问题。Ruff 与本轮修改的差异空白检查通过。
 
-原生预览与测量结果：
+原生预览与测量结果（由 `tools/capture_ui_consistency.py` 输出至本机忽略目录 `build/ui-consistency/`）：
 
-- [100% 测量](../build/ui-consistency/after-1/measurements.json)
-- [150% 测量](../build/ui-consistency/after-15/measurements.json)
-- [200% 测量](../build/ui-consistency/after-2/measurements.json)
-- [AI 服务：宽屏深色](../build/ui-consistency/after-1/polish-1560x750-dark.png)
-- [关于：同尺寸深色](../build/ui-consistency/after-1/about-1560x750-dark.png)
+- 100% 测量：`build/ui-consistency/after-1/measurements.json`
+- 150% 测量：`build/ui-consistency/after-15/measurements.json`
+- 200% 测量：`build/ui-consistency/after-2/measurements.json`
+- AI 服务（宽屏深色）：`build/ui-consistency/after-1/polish-1560x750-dark.png`
+- 关于（同尺寸深色）：`build/ui-consistency/after-1/about-1560x750-dark.png`
 
 截图为 Qt 原生控件离屏渲染。实际在线服务、物理音频设备与 Windows 桌面显示器的端到端交互不在此复核中。此次为源码更新，未生成新的安装包。

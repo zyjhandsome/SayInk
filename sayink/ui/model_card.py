@@ -194,7 +194,7 @@ class ModelCard(QFrame):
             f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
         )
         self._desc_lbl.setStyleSheet(
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; line-height: 1.45;"
+            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px;"
             f" background: transparent;"
         )
         self._meta_lbl.setStyleSheet(

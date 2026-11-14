@@ -6,10 +6,10 @@ Prerequisites:
 - SayInk must already be built with PyInstaller (run build.py first), or use
   ../build_release.py for a one-shot build.
 
-Output: dist/SayInk-Setup-<version>.exe (lite: CAM++ and Silero VAD inside,
-Fun-ASR-Nano downloaded on first start; version from sayink/version.py).
-With --with-model the staging folder must also contain Fun-ASR-Nano and the
-output is dist/SayInk-Setup-<version>-full.exe.
+Output: dist/SayInk-Setup-<version>.exe (lite: CAM++, Silero VAD and
+speaker-activity inside; Fun-ASR-Nano downloaded on first start; version from
+sayink/version.py). With --with-model the staging folder must also contain
+Fun-ASR-Nano and the output is dist/SayInk-Setup-<version>-full.exe.
 
 By default, the intermediate folder dist/SayInk/ is deleted after a
 successful compile so dist/ only contains the setup EXE. Pass --keep-staging
@@ -270,7 +270,7 @@ if __name__ == "__main__":
     ap.add_argument(
         "--with-model",
         action="store_true",
-        help="Staging folder contains models/; output SayInk-Setup-<version>-full.exe.",
+        help="Staging folder also bundles Fun-ASR-Nano in models/; output SayInk-Setup-<version>-full.exe.",
     )
     ns = ap.parse_args()
     build_installer(keep_staging=ns.keep_staging, with_model=ns.with_model)

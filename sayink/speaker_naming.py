@@ -155,17 +155,21 @@ def infer_speaker_names(
         previous_names = {corrections.get(name, name) for name in context | related} if related and context else set()
         previous_line = line
 
+    raw_manual = dict(manual_names or {})
     owners: dict[str, set[int]] = defaultdict(set)
     for sid, names in candidates.items():
         for name in names:
             owners[name.casefold()].add(sid)
-    for sid, name in (manual_names or {}).items():
-        if name:
-            owners[name.strip().casefold()].add(sid)
+    for sid, name in raw_manual.items():
+        stripped = str(name or "").strip()
+        if stripped:
+            owners[stripped.casefold()].add(sid)
     return {
-        sid: next(iter(names)) for sid, names in candidates.items()
-        if len(names) == 1 and not names.intersection(denied[sid])
+        sid: next(iter(names))
+        for sid, names in candidates.items()
+        if len(names) == 1
+        and next(iter(names)).casefold() not in {d.casefold() for d in denied[sid]}
         and sid not in ambiguous_speakers
         and len(owners[next(iter(names)).casefold()]) == 1
-        and sid not in (manual_names or {})
+        and sid not in raw_manual
     }

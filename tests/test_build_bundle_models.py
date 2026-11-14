@@ -164,3 +164,10 @@ def test_build_download_replaces_a_corrupt_existing_file(monkeypatch, tmp_path):
     assert dl._download_one("tiny") == 0
     assert target.read_bytes() == b"weights"
     assert len(urls) == 1
+
+
+def test_build_has_no_ffmpeg_bundle_helpers():
+    assert not hasattr(build_mod, "_ffmpeg_binary_name")
+    assert not hasattr(build_mod, "_find_ffmpeg_bundle_source")
+    assert not hasattr(build_mod, "_copy_ffmpeg_into_dist")
+

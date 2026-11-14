@@ -22,6 +22,7 @@ import numpy as np
 from sayink.audio_utils import MAX_SEGMENT_SEC, TARGET_SAMPLE_RATE
 from sayink.meeting_speakers import voice_sample_is_clear
 from sayink.speaker_session import normalize_far_field_voice
+from sayink.vad_segmenter import attach_segment_acoustics
 
 
 def _clear_voice(audio: np.ndarray) -> bool:
@@ -200,9 +201,12 @@ class SpeakerTurnContext:
                 self._voices.append(vec)
 
     def analyze(self, audio, detector, *, start_ms, route, cancelled=None):
+        raw_floor = getattr(audio, "noise_floor", None)
         samples = np.asarray(audio, dtype=np.float32).reshape(-1)
         if samples.size == 0 or not np.all(np.isfinite(samples)):
             raise ValueError("invalid audio for speaker-change analysis")
+        if raw_floor is not None:
+            samples = attach_segment_acoustics(samples, noise_floor=raw_floor)
         key = (detector._embed, route)
         with self._lock:
             generation = self._generation
@@ -620,9 +624,12 @@ class SpeakerTurnDetector:
         return [SpeakerTurn(0, cut, left, False), SpeakerTurn(cut, first.stop, right, False), *turns[1:]]
 
     def _analyze(self, audio: np.ndarray, *, cancelled=None) -> list[SpeakerTurn]:
+        raw_floor = getattr(audio, "noise_floor", None)
         samples = np.asarray(audio, dtype=np.float32).reshape(-1)
         if samples.size == 0 or not np.all(np.isfinite(samples)):
             raise ValueError("invalid audio for speaker-change analysis")
+        if raw_floor is not None:
+            samples = attach_segment_acoustics(samples, noise_floor=raw_floor)
         window = int(WINDOW_SEC * TARGET_SAMPLE_RATE)
         hop = int(HOP_SEC * TARGET_SAMPLE_RATE)
         minimum = int(MIN_TURN_SEC * TARGET_SAMPLE_RATE)
@@ -658,16 +665,17 @@ class SpeakerTurnDetector:
         # A new voice may first appear in a window straddling the change.
         # Replace that mixed anchor with a repeated, better-separated state.
         # Otherwise the mixed anchor can hide a real A→B boundary.
-        refined = []
-        for index, anchor in enumerate(anchors):
-            candidates = [v for v in vectors if v is not None and float(v @ anchor) >= STABLE_SIMILARITY
-                          and index == int(np.argmax([float(v @ a) for a in anchors]))]
-            supported = [v for v in candidates
-                         if sum(float(v @ other) >= 0.9 for other in candidates) >= 2]
-            if len(anchors) > 1 and supported:
-                anchor = min(supported, key=lambda v: max(float(v @ a) for j, a in enumerate(anchors) if j != index))
-            refined.append(anchor)
-        anchors = refined
+        if len(anchors) > 1:
+            refined = []
+            for index, anchor in enumerate(anchors):
+                candidates = [v for v in vectors if v is not None and float(v @ anchor) >= STABLE_SIMILARITY
+                              and index == int(np.argmax([float(v @ a) for a in anchors]))]
+                supported = [v for v in candidates
+                             if sum(float(v @ other) >= 0.9 for other in candidates) >= 2]
+                if supported:
+                    anchor = min(supported, key=lambda v: max(float(v @ a) for j, a in enumerate(anchors) if j != index))
+                refined.append(anchor)
+            anchors = refined
         labels = []
         for vector in vectors:
             if vector is None:

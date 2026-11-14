@@ -27,13 +27,40 @@ class DuplicateLaneSuppressor:
     ACOUSTIC_MIN_CORRELATION = 0.88
     ACOUSTIC_BLOCK_CORRELATION = 0.88
 
+    _BOUND = PROBE + MAX_DELAY
+
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self._mic = np.zeros(0, dtype=np.float32)
-        self._system = np.zeros(0, dtype=np.float32)
+        self._mic_buf = np.zeros(self._BOUND, dtype=np.float32)
+        self._mic_len = 0
+        self._sys_buf = np.zeros(self._BOUND, dtype=np.float32)
+        self._sys_len = 0
         self.suppressed_samples = 0
+
+    @property
+    def _mic(self) -> np.ndarray:
+        return self._mic_buf[self._BOUND - self._mic_len :]
+
+    @property
+    def _system(self) -> np.ndarray:
+        return self._sys_buf[self._BOUND - self._sys_len :]
+
+    @staticmethod
+    def _append_ring(buf: np.ndarray, cur_len: int, chunk: np.ndarray) -> int:
+        cap = len(buf)
+        n = len(chunk)
+        if n <= 0:
+            return cur_len
+        if n >= cap:
+            buf[:] = chunk[-cap:]
+            return cap
+        keep = min(cur_len, cap - n)
+        if keep > 0:
+            buf[cap - n - keep : cap - n] = buf[cap - keep : cap]
+        buf[cap - n : cap] = chunk
+        return keep + n
 
     @staticmethod
     def _fit(reference, target):
@@ -49,11 +76,10 @@ class DuplicateLaneSuppressor:
     def _build_fir_matrix(cls, system_buf: np.ndarray, start: int, length: int) -> np.ndarray | None:
         taps = cls.FIR_TAPS
         # Row i predicts mic sample at (start + i) using system[start + i - k].
-        if start - (taps - 1) < 0 or start + length > len(system_buf):
+        if length <= 0 or start - (taps - 1) < 0 or start + length > len(system_buf):
             return None
-        sys64 = system_buf.astype(np.float64)
-        cols = [sys64[start - k : start - k + length] for k in range(taps)]
-        return np.column_stack(cols)
+        window_src = system_buf[start - (taps - 1) : start + length].astype(np.float64)
+        return np.lib.stride_tricks.sliding_window_view(window_src, taps)[:, ::-1]
 
     def _fit_acoustic_fir(self, base_lag: int, size: int) -> tuple[int, np.ndarray, float] | None:
         # Center the causal FIR slightly ahead of the peak lag so direct path +
@@ -131,9 +157,8 @@ class DuplicateLaneSuppressor:
     def _process_block(self, microphone, system):
         if len(microphone) == 0:
             return microphone
-        bound = self.PROBE + self.MAX_DELAY
-        self._mic = np.concatenate((self._mic, microphone))[-bound:]
-        self._system = np.concatenate((self._system, system))[-bound:]
+        self._mic_len = self._append_ring(self._mic_buf, self._mic_len, microphone)
+        self._sys_len = self._append_ring(self._sys_buf, self._sys_len, system)
         estimate = self._estimate()
         if estimate is None:
             return microphone

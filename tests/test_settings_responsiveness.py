@@ -65,6 +65,7 @@ def test_reopen_paints_before_reload_and_skips_theme_and_device_scan():
     main.show.side_effect = lambda: order.append("show")
     main.settings_panel.reload_settings.side_effect = lambda *args, **kwargs: order.append(kwargs)
     app._main = main
+    app._main_presented = True
     app.apply_appearance_theme = MagicMock(side_effect=lambda *args, **kwargs: order.append("theme"))
     app._sync_settings_runtime_status = lambda: order.append("status")
     app._updates = MagicMock()
@@ -74,6 +75,56 @@ def test_reopen_paints_before_reload_and_skips_theme_and_device_scan():
     assert order[0] == "show"
     assert "theme" not in order
     assert {"refresh_devices": False, "heavy": False} in order
+
+
+def test_prebuilt_window_refreshes_while_hidden_then_shows():
+    from sayink.app import App
+
+    app = App.__new__(App)
+    order = []
+    main = MagicMock()
+    main.current_page.return_value = "general"
+    main.isVisible.return_value = False
+    main.show.side_effect = lambda: order.append("show")
+    main.settings_panel.reload_settings.side_effect = lambda *args, **kwargs: order.append(kwargs)
+    app._main = main
+    app._sync_settings_runtime_status = lambda: order.append("status")
+    app._updates = MagicMock()
+
+    app._show_main_window(None)
+
+    assert order == [{"refresh_devices": False, "heavy": False}, "show", "status"]
+
+
+def test_start_schedules_the_hidden_main_window():
+    with app_harness() as h:
+        app = h["app"]
+        scheduled = []
+        original = app._later
+
+        def capture(ms, fn):
+            scheduled.append(fn)
+            return original(ms, fn)
+
+        app._later = capture
+        app.start()
+
+        assert app._prebuild_main_window in scheduled
+
+
+def test_visible_main_window_is_the_dialog_owner():
+    from sayink.app import App
+
+    app = App.__new__(App)
+    hidden = MagicMock()
+    hidden.isVisible.return_value = False
+    app._main = hidden
+    assert app._visible_main_window() is None
+
+    shown = MagicMock()
+    shown.isVisible.return_value = True
+    app._main = shown
+    assert app._visible_main_window() is shown
 
 
 def test_automatic_devices_are_not_enumerated_until_the_panel_opens(tmp_path, monkeypatch):
@@ -102,9 +153,13 @@ def test_reloading_an_open_window_does_not_rebuild_model_cards(tmp_path, monkeyp
     builds = []
 
     def fake_rebuild(self):
+        from sayink.speech_recognizer import DEFAULT_MODEL_ID, is_model_downloaded
+
         builds.append(1)
         self._model_cards = {"kept": object()}
-        self._model_cards_for_id = self._config.get("stt.model_id", "")
+        active = self._config.get("stt.model_id", DEFAULT_MODEL_ID)
+        self._model_cards_for_id = active
+        self._model_cards_downloaded = bool(active and is_model_downloaded(active))
 
     monkeypatch.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)
     monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", fake_rebuild)

@@ -29,12 +29,6 @@ import sys
 import time
 from pathlib import Path
 
-if __name__ == "__main__" and __package__ is None:
-    _root = Path(__file__).resolve().parent
-    if str(_root) not in sys.path:
-        sys.path.insert(0, str(_root))
-
-
 SCRIPT_DIR = Path(__file__).parent.resolve()
 BUILD_DIR = SCRIPT_DIR / "build"
 if str(SCRIPT_DIR) not in sys.path:
@@ -60,7 +54,8 @@ def bundle_aux_model_ids() -> list[str]:
 
     ``optional`` models are left out of the in-app required download, unless
     ``bundle`` is set. The experimental speaker-activity model is bundled that
-    way: both installers carry the file, and the switch stays off by default.
+    way: both installers carry the file so the internal on-demand overlap guard
+    can use it automatically whenever CAM++ is active.
     """
     from sayink.speech_recognizer import AUX_MODEL_REGISTRY
 
@@ -260,8 +255,9 @@ def build():
         "--hidden-import=win32api",
         "--hidden-import=win32con",
         "--hidden-import=win32cred",
-        "--hidden-import=win32timezone",
+        "--hidden-import=pyaudiowpatch",
         "--hidden-import=PyQt6.QtNetwork",
+        "--hidden-import=PyQt6.QtMultimedia",
         "--hidden-import=sherpa_onnx",
         # The speaker-activity guard runs one small ONNX graph through
         # onnxruntime's inference API. onnxruntime/__init__.py also mentions
@@ -316,9 +312,12 @@ def build():
     models_dst = dist_dir / "models"
     model_ids = bundle_model_ids() if with_model else bundle_aux_model_ids()
     if with_model:
-        print("[2/3] Copying Fun-ASR-Nano, CAM++ and Silero VAD to dist/SayInk/models/ ...")
+        print(f"[2/3] Copying Fun-ASR-Nano, CAM++, Silero VAD and speaker-activity to {models_dst} ...")
     else:
-        print("[2/3] Lite build: bundling CAM++ and Silero VAD (Fun-ASR-Nano is downloaded on first start).")
+        print(
+            f"[2/3] Lite build: bundling CAM++, Silero VAD and speaker-activity into {models_dst} "
+            "(Fun-ASR-Nano is downloaded on first start)."
+        )
     downloaded = _find_model_sources(model_ids=model_ids)
     _require_bundle_model(downloaded, model_ids)
     _require_pinned_content(downloaded)

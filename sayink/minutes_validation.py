@@ -21,7 +21,7 @@ _STRING_ITEM_PRIMARY_FIELD = {
     "speakers": "label",
 }
 _STRICT_TEXT_KEYS = ("title", "label", "text", "task", "summary")
-_KNOWN_OPTIONAL_KEYS = ("owner", "due", "ts", "evidence_ts", "start", "end")
+_KNOWN_OPTIONAL_KEYS = ("owner", "due", "ts", "evidence_ts", "start", "end", "suggested_name")
 
 
 def _coerce_item(raw_item, key: str) -> dict:
@@ -118,6 +118,7 @@ def validate_minutes(payload):
             item = _coerce_item(raw_item, key)
             _coerce_text_fields(item, key)
             if key == "topics":
+                item.setdefault("title", "")
                 item["points"] = _clean_points(item.get("points"))
                 if not isinstance(item.get("title"), str):
                     raise LLMResponseError("议题缺少标题或要点")

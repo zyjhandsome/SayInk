@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         rows = parse_label_text(args.labels.read_text(encoding="utf-8-sig"))
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     print(format_report(score_speakers(rows)))

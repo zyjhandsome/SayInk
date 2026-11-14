@@ -16,8 +16,6 @@ def batch_delete_copy(count: int, live_count: int) -> tuple[str, str]:
 def confirm_batch_delete(parent, count: int, live_count: int) -> bool:
     if count <= 0:
         return False
-    from sayink.ui import design_tokens as tok
-    from sayink.ui import settings_styles as ss
     from sayink.ui.prompts import confirm_box
 
     text, info = batch_delete_copy(count, live_count)
@@ -30,15 +28,6 @@ def confirm_batch_delete(parent, count: int, live_count: int) -> bool:
         destructive=True,
     )
     box.setInformativeText(info)
-    box.setStyleSheet(
-        ss.WINDOW_CSS
-        + f" QMessageBox {{ background: {tok.BG}; color: {tok.TEXT}; }}"
-        + f" QMessageBox QLabel {{ color: {tok.TEXT}; background: transparent; }}"
-    )
-    delete.setStyleSheet(ss.BTN_DANGER_SOLID_SM)
-    for btn in box.buttons():
-        if btn is not delete:
-            btn.setStyleSheet(ss.BTN_GHOST_SM)
     box.exec()
     return box.clickedButton() == delete
 

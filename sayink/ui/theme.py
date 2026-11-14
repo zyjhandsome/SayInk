@@ -6,6 +6,7 @@ import ctypes
 import logging
 import os
 import sys
+import time
 from typing import Iterable, Literal, Optional, Protocol, runtime_checkable, cast
 
 from PyQt6.QtCore import QSettings
@@ -15,13 +16,16 @@ from PyQt6.QtWidgets import QApplication
 from sayink.ui import design_tokens as dt
 from sayink.ui.app_styles import build_global_stylesheet
 
-log = logging.getLogger("sayink")
+log = logging.getLogger("SayInk")
 
 _SPI_GETCLIENTAREAANIMATION = 0x1042
+_REDUCED_MOTION_CACHE: tuple[int, float, bool] | None = None
+_REDUCED_MOTION_TTL_SEC = 2.0
 
 
 def prefers_reduced_motion() -> bool:
     """Return True when OS or SAYINK_REDUCED_MOTION disables UI animations."""
+    global _REDUCED_MOTION_CACHE
     env = os.environ.get("SAYINK_REDUCED_MOTION")
     if env is not None:
         return env.strip().lower() in {"1", "true", "yes", "on"}
@@ -29,15 +33,30 @@ def prefers_reduced_motion() -> bool:
         return False
     if sys.platform == "win32":
         try:
+            from ctypes import wintypes
+
+            spi = ctypes.windll.user32.SystemParametersInfoW
+            now = time.monotonic()
+            cached = _REDUCED_MOTION_CACHE
+            if (
+                cached is not None
+                and cached[0] == id(spi)
+                and 0.0 <= now - cached[1] < _REDUCED_MOTION_TTL_SEC
+            ):
+                return cached[2]
+            if hasattr(spi, "argtypes"):
+                spi.argtypes = [wintypes.UINT, wintypes.UINT, wintypes.LPVOID, wintypes.UINT]
+                spi.restype = wintypes.BOOL
             enabled = ctypes.c_int(1)
-            ok = ctypes.windll.user32.SystemParametersInfoW(
+            ok = spi(
                 _SPI_GETCLIENTAREAANIMATION,
                 0,
                 ctypes.byref(enabled),
                 0,
             )
-            if ok:
-                return not bool(enabled.value)
+            result = (not bool(enabled.value)) if ok else False
+            _REDUCED_MOTION_CACHE = (id(spi), now, result)
+            return result
         except Exception:
             return False
     return False
@@ -91,10 +110,6 @@ def resolve_effective_theme(
     if system_is_light is None:
         system_is_light = probe_system_is_light()
     return "light" if system_is_light else "dark"
-
-
-def current_effective_theme() -> EffectiveTheme:
-    return _current_effective
 
 
 _scheme_callback = None
@@ -189,12 +204,22 @@ def apply_theme(
     global _current_effective
     effective = resolve_effective_theme(mode, system_is_light=system_is_light)
     _current_effective = effective
-    dt.activate(effective)
-    dt.refresh_ui_font()
+    try:
+        dt.activate(effective, _notify=False)
+    except TypeError:
+        dt.activate(effective)
+    try:
+        dt.refresh_ui_font(_notify=False)
+    except TypeError:
+        dt.refresh_ui_font()
     try:
         from sayink.ui import settings_styles as ss
 
-        ss.reload_styles()
+        if (
+            getattr(ss, "_LOADED_AXIS", None) != effective
+            or getattr(ss, "_LOADED_FONT", None) != dt.UI_FONT_FAMILY
+        ):
+            ss.reload_styles()
     except Exception as exc:
         log.warning("重建设置样式失败: %s", exc)
 

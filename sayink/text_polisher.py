@@ -215,9 +215,8 @@ def _request_headers(api_key: str) -> dict:
 def chat_completions_url(api_url: str) -> str:
     """OpenAI-compatible chat URL. Query strings stay; userinfo and fragments do not."""
     raw = (api_url or "").strip()
-    parsed = urlparse(raw)
-    host = parsed.hostname or ""
-    if parsed.scheme not in {"http", "https"} or not _host_is_clean(host):
+    parsed, host, error = _url_parts(raw)
+    if error or parsed is None or parsed.scheme not in {"http", "https"} or not _host_is_clean(host):
         url = raw.rstrip("/")
         if not url.endswith("/chat/completions"):
             url += "/chat/completions"
@@ -248,9 +247,11 @@ _THINKING_TOGGLE_MODELS = frozenset({"deepseek-flash", "deepseek-v4-pro"})
 
 def thinking_payload_extra(api_url: str, model_name: str, thinking_mode: str | None) -> dict:
     """Extra request fields that switch a provider's reasoning off, if any."""
+    _parsed, host, error = _url_parts(api_url)
     if (
-        thinking_mode == "disabled"
-        and urlparse((api_url or "").strip()).hostname == _THINKING_TOGGLE_HOST
+        not error
+        and thinking_mode == "disabled"
+        and host.strip("[]").lower() == _THINKING_TOGGLE_HOST
         and normalize_model_name(model_name) in _THINKING_TOGGLE_MODELS
     ):
         return {"thinking": {"type": "disabled"}}
@@ -393,9 +394,13 @@ def _host_matches_suffix(host: str, suffix: str) -> bool:
 
 def bypasses_env_proxy(mode: str, url: str = "", suffixes: str = "") -> bool:
     """True when this AI call must not consult HTTP(S)_PROXY or ALL_PROXY."""
-    if mode == "direct" or is_local_endpoint(url):
+    norm_mode = (mode or "").strip().lower()
+    if norm_mode in ("direct", "none", "off", "bypass") or is_local_endpoint(url):
         return True
-    host = (urlparse((url or "").strip()).hostname or "").strip("[]").lower()
+    _parsed, raw_host, error = _url_parts(url)
+    if error:
+        return False
+    host = raw_host.strip("[]").lower()
     if not host:
         return False
     valid, _ignored = parse_proxy_bypass_suffixes(suffixes)
@@ -409,13 +414,20 @@ def http_client_options(mode: str, url: str = "", suffixes: str = "") -> dict:
     import os
     import ssl
 
-    options = {"trust_env": False}
-    cafile = os.environ.get("SSL_CERT_FILE")
-    capath = os.environ.get("SSL_CERT_DIR")
+    options: dict = {"trust_env": False}
+    cafile = (os.environ.get("SSL_CERT_FILE") or "").strip()
+    capath = (os.environ.get("SSL_CERT_DIR") or "").strip()
+    ssl_kwargs: dict[str, str] = {}
     if cafile:
-        options["verify"] = ssl.create_default_context(cafile=cafile)
-    elif capath:
-        options["verify"] = ssl.create_default_context(capath=capath)
+        ssl_kwargs["cafile"] = cafile
+    if capath:
+        ssl_kwargs["capath"] = capath
+    if ssl_kwargs:
+        try:
+            options["verify"] = ssl.create_default_context(**ssl_kwargs)
+        except (OSError, ssl.SSLError) as exc:
+            log.warning("自定义 CA 证书加载失败（%s），回退系统证书库", exc)
+            options["verify"] = ssl.create_default_context()
     return options
 
 
@@ -536,16 +548,14 @@ def chat_completion(
             time.sleep(retry_delay_sec)
             continue
         if code is not None and code >= 400:
-            try:
-                message = _body_error_message(response.json())
-            except Exception:
-                message = ""
+            err_body = _response_error_body(response)
+            message = _body_error_message(err_body)
             adapted = _adapt_chat_flags(message, token_parameter, include_temperature)
             if adapted is not None and adapted != (token_parameter, include_temperature):
                 token_parameter, include_temperature = adapted
                 attempt -= 1
                 continue
-            raise LLMResponseError(http_status_message(code))
+            raise LLMResponseError(http_status_message(code, err_body))
         break
     if response is None:
         raise LLMResponseError("API 响应格式异常")
@@ -561,6 +571,80 @@ def _body_error_message(body) -> str:
             return err
     if isinstance(body, str):
         return body
+    return ""
+
+
+_QUOTA_EXHAUSTED_TERMS = (
+    "insufficient_quota",
+    "quota",
+    "credit",
+    "balance",
+    "billing",
+    "arrears",
+    "spend_limit",
+    "usage_limit",
+    "余额",
+    "额度",
+    "欠费",
+)
+
+
+def _extract_error_detail(body: object) -> str:
+    if isinstance(body, str):
+        return body
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            parts = [
+                err[key]
+                for key in ("message", "code", "type")
+                if isinstance(err.get(key), str) and err[key]
+            ]
+            if parts:
+                return " ".join(parts)
+        if isinstance(err, str):
+            return err
+        for key in ("message", "detail"):
+            msg = body.get(key)
+            if isinstance(msg, str) and msg:
+                return msg
+    return ""
+
+
+def _is_quota_or_balance_error(body: object) -> bool:
+    detail = _extract_error_detail(body)
+    if not detail:
+        return False
+    lowered = detail.lower()
+    return any(term in lowered for term in _QUOTA_EXHAUSTED_TERMS)
+
+
+def _response_error_body(response) -> object:
+    if response is None:
+        return ""
+    raw_bytes = b""
+    try:
+        read_out = response.read()
+        if isinstance(read_out, (bytes, bytearray)):
+            raw_bytes = bytes(read_out)
+    except Exception:
+        pass
+    try:
+        return response.json()
+    except Exception:
+        pass
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text:
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+    if raw_bytes:
+        decoded = raw_bytes.decode("utf-8", errors="ignore")
+        try:
+            return json.loads(decoded)
+        except Exception:
+            return decoded
     return ""
 
 
@@ -613,13 +697,19 @@ def _content_text(content) -> str:
 def chat_message_text(data, *, reject_truncated: bool = False) -> str:
     """Message text from a chat-completion body, or a response error."""
     choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
+    if not choices or not isinstance(choices, list) or not isinstance(choices[0], dict):
         raise LLMResponseError("API 响应格式异常")
-    if reject_truncated and isinstance(choices[0], dict) and choices[0].get("finish_reason") in ("length", "max_tokens"):
-        raise LLMTruncatedError("模型输出被截断")
-    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    reason = choices[0].get("finish_reason")
+    if reason in ("length", "max_tokens"):
+        if reject_truncated:
+            raise LLMTruncatedError("模型输出被截断")
+    elif reason not in (None, "stop", "eos", "end_turn"):
+        raise LLMResponseError("模型未正常完成输出（" + str(reason) + "）")
+    message = choices[0].get("message")
     if not isinstance(message, dict):
         raise LLMResponseError("API 响应格式异常")
+    if message.get("refusal"):
+        raise LLMResponseError("模型拒绝生成本次内容")
     content = message.get("content")
     text = strip_model_thinking(_content_text(content)) if content is not None else ""
     if not text:
@@ -627,7 +717,7 @@ def chat_message_text(data, *, reject_truncated: bool = False) -> str:
     return text
 
 
-def http_status_message(code: int | None) -> str:
+def http_status_message(code: int | None, body: object = "") -> str:
     if code in (401, 403):
         return f"密钥被拒绝（HTTP {code}）。请检查 API 密钥。"
     if code == 404:
@@ -635,6 +725,8 @@ def http_status_message(code: int | None) -> str:
     if code == 400:
         return "请求被拒绝（HTTP 400）。请检查模型名称是否与该接口匹配。"
     if code == 429:
+        if _is_quota_or_balance_error(body):
+            return "API 额度或余额不足（HTTP 429），请检查账户余额或账单设置。"
         return "请求过于频繁（HTTP 429），请稍后重试。"
     if code is None:
         return "HTTP 错误"
@@ -711,9 +803,12 @@ def _iter_stream_pieces(lines, *, include_done: bool = False):
             yield "", "", "[DONE]"
             return
         if not isinstance(data, dict) or data.get("error"):
-            raise LLMResponseError("流式响应返回错误")
+            detail = _body_error_message(data).strip() if isinstance(data, dict) else ""
+            raise LLMResponseError(f"流式响应返回错误：{detail[:200]}" if detail else "流式响应返回错误")
         choices = data.get("choices")
-        if choices == [] and data.get("usage") is not None:
+        if choices == [] and any(
+            k in data for k in ("usage", "prompt_filter_results", "system_fingerprint", "id", "model")
+        ):
             continue
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise LLMResponseError("API 响应格式异常")
@@ -727,13 +822,19 @@ def _iter_stream_pieces(lines, *, include_done: bool = False):
             delta = message
             if reason is None:
                 reason = "stop"
+        if delta.get("refusal"):
+            raise LLMResponseError("模型拒绝生成本次内容")
         content = delta.get("content")
         if content is None:
             content = ""
+        elif isinstance(content, list):
+            content = _content_text(content)
         elif not isinstance(content, str):
             raise LLMResponseError("API 返回了不支持的正文格式")
         reasoning = delta.get("reasoning_content") or ""
-        if not isinstance(reasoning, str):
+        if isinstance(reasoning, list):
+            reasoning = _content_text(reasoning)
+        elif not isinstance(reasoning, str):
             reasoning = ""
         yield content, reasoning, reason
 
@@ -782,23 +883,6 @@ def _stream_showed_activity(lines) -> bool:
     return False
 
 
-def _error_message(response) -> str:
-    try:
-        response.read()
-    except Exception:
-        pass
-    try:
-        body = response.json()
-    except Exception:
-        body = None
-    return _body_error_message(body)
-
-
-def _stream_unsupported(response) -> bool:
-    """True when the endpoint explicitly rejects streaming."""
-    return _rejects_stream(_error_message(response))
-
-
 def stream_chat_completion(
     client,
     httpx,
@@ -843,7 +927,8 @@ def stream_chat_completion(
             with client.stream("POST", url, headers=headers, json=payload) as response:
                 code = response.status_code
                 if isinstance(code, int) and code >= 400:
-                    message = _error_message(response)
+                    err_body = _response_error_body(response)
+                    message = _body_error_message(err_body)
                     if code in (400, 422, 501) and _rejects_stream(message):
                         log.info("LLM %s 接口不支持流式，改用普通请求", label)
                         downgrade = True
@@ -862,7 +947,7 @@ def stream_chat_completion(
                         continue
                     if cancelled():
                         raise LLMCancelled()
-                    raise LLMResponseError(http_status_message(code))
+                    raise LLMResponseError(http_status_message(code, err_body))
                 if cancelled():
                     raise LLMCancelled()
                 try:
@@ -966,18 +1051,18 @@ def custom_prompt_or_empty(prompt: str) -> str:
     return "" if custom in (POLISH_PROMPT, _LEGACY_POLISH_PROMPT, CORRECTION_PROMPT) else custom
 
 
-_CODE_APPS = {
+_CODE_APPS = frozenset({
     "code.exe", "cursor.exe", "devenv.exe", "idea64.exe", "pycharm64.exe",
-    "windowsterminal.exe", "cmd.exe", "powershell.exe", "wt.exe", "windowsTerminal.exe",
-}
-_CHAT_APPS = {
+    "windowsterminal.exe", "cmd.exe", "powershell.exe", "wt.exe",
+})
+_CHAT_APPS = frozenset({
     "wechat.exe", "weixin.exe", "telegram.exe", "discord.exe", "slack.exe",
     "feishu.exe", "dingtalk.exe", "qq.exe", "tim.exe",
-}
-_DOC_APPS = {
+})
+_DOC_APPS = frozenset({
     "winword.exe", "powerpnt.exe", "excel.exe", "notion.exe", "onenote.exe",
     "wps.exe", "wpp.exe", "et.exe",
-}
+})
 
 
 def app_context_instruction(target_app: str) -> str:
@@ -987,14 +1072,14 @@ def app_context_instruction(target_app: str) -> str:
     this hint is only appended to the built-in polish / correction prompt.
     """
     name = (target_app or "").strip().replace("/", "\\").rsplit("\\", 1)[-1].casefold()
-    if name in {item.casefold() for item in _CODE_APPS}:
+    if name in _CODE_APPS:
         return (
             "当前文字会输入到代码或终端：保留英文标识符、驼峰命名和代码符号，"
             "不要把它们翻译成中文，不要补全或改写代码。"
         )
-    if name in {item.casefold() for item in _CHAT_APPS}:
+    if name in _CHAT_APPS:
         return "当前文字会输入到聊天软件：保持简短口语，不要改成公文，不要加标题。"
-    if name in {item.casefold() for item in _DOC_APPS}:
+    if name in _DOC_APPS:
         return "当前文字会输入到文档：整理成通顺书面语，但不要增删事实。"
     return ""
 
@@ -1153,6 +1238,8 @@ class PolishWorker(QThread):
                 return
             if not self.is_correction:
                 polished = strip_transcript_tags(polished)
+            if not polished:
+                raise LLMResponseError("API 返回空内容")
             log.debug("%s结果长度: %d 字符", self._action_label, len(polished))
             self.result_ready.emit(polished)
 
@@ -1305,22 +1392,21 @@ class TextPolisher(QObject):
                         response = client.post(url, headers=headers, json=body)
                         code = response.status_code if isinstance(getattr(response, "status_code", None), int) else None
                         if code is not None and code >= 400:
-                            try:
-                                message = _body_error_message(response.json())
-                            except Exception:
-                                message = ""
+                            err_body = _response_error_body(response)
+                            message = _body_error_message(err_body)
                             adapted = _adapt_chat_flags(message, token_parameter, False)
                             if adapted is not None and adapted[0] != token_parameter:
                                 token_parameter = adapted[0]
                                 continue
-                            return False, http_status_message(code)
+                            return False, http_status_message(code, err_body)
                         chat_message_text(response.json())
                         return True, "连接成功"
                     body["stream"] = True
                     with client.stream("POST", url, headers=headers, json=body) as response:
                         code = response.status_code
                         if isinstance(code, int) and code >= 400:
-                            message = _error_message(response)
+                            err_body = _response_error_body(response)
+                            message = _body_error_message(err_body)
                             if code in (400, 422, 501) and _rejects_stream(message):
                                 downgrade = True
                                 continue
@@ -1328,7 +1414,7 @@ class TextPolisher(QObject):
                             if adapted is not None and adapted[0] != token_parameter:
                                 token_parameter = adapted[0]
                                 continue
-                            return False, http_status_message(code)
+                            return False, http_status_message(code, err_body)
                         if not _stream_showed_activity(response.iter_lines()):
                             return False, "API 返回空内容"
                         return True, "连接成功"
@@ -1336,7 +1422,11 @@ class TextPolisher(QObject):
         except httpx.TimeoutException:
             return False, "连接超时"
         except httpx.HTTPStatusError as exc:
-            return False, http_status_message(getattr(getattr(exc, "response", None), "status_code", None))
+            resp = getattr(exc, "response", None)
+            return False, http_status_message(
+                getattr(resp, "status_code", None),
+                _response_error_body(resp),
+            )
         except LLMResponseError as exc:
             return False, str(exc)
         except Exception as exc:

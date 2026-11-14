@@ -4,6 +4,24 @@ from PyQt6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer
 from PyQt6.QtWidgets import QLayout, QLayoutItem, QSizePolicy, QWidget
 
 
+def defer_while_live_resize(widget: QWidget, callback) -> bool:
+    """Hold a layout follow-up until an edge drag pauses.
+
+    Changing a size hint on every pixel makes Qt pull the window back while
+    Windows is still moving it. The corner and edge shake is that fight.
+    """
+    if not getattr(widget.window(), "_live_resizing", False):
+        return False
+    timer = getattr(widget, "_live_resize_timer", None)
+    if timer is None:
+        timer = QTimer(widget)
+        timer.setSingleShot(True)
+        timer.timeout.connect(callback)
+        widget._live_resize_timer = timer
+    timer.start(32)
+    return True
+
+
 class FlowLayout(QLayout):
     def __init__(self, parent: QWidget | None = None, spacing: int = 6, *, margin: int = -1) -> None:
         super().__init__(parent)
@@ -124,7 +142,8 @@ class WrappingToolBar(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._sync_height()
+        if not defer_while_live_resize(self, self._sync_height):
+            self._sync_height()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -142,6 +161,10 @@ class WrappingToolBar(QWidget):
         QTimer.singleShot(0, self._flush)
 
     def _flush(self) -> None:
+        from PyQt6 import sip
+
+        if sip.isdeleted(self):
+            return
         self._pending = False
         self.updateGeometry()
         if self.isVisible() or self.width() > 0:
@@ -213,17 +236,28 @@ class WrappingToolBar(QWidget):
 
         left_w = packed(left)
         right_w = packed(right)
-        flex_min = sum(self._flex_min(widget) for widget, _hint in flex)
+        flex_mins = [self._flex_min(widget) for widget, _hint in flex]
+        flex_gaps = gap * max(0, len(flex) - 1)
+        flex_min = sum(flex_mins) + flex_gaps
         groups = sum(1 for group in (left, right, flex) if group)
         needed = left_w + right_w + flex_min + gap * max(0, groups - 1)
         if needed <= width:
             flex_w = width - left_w - right_w - gap * max(0, groups - 1)
+            flex_avail = max(0, flex_w - flex_gaps)
+            extra = max(0, flex_avail - sum(flex_mins))
             height = row_h
             flex_heights = []
-            for widget, hint in flex:
+            shares = []
+            for index, (widget, hint) in enumerate(flex):
+                share = flex_mins[index] + (
+                    (extra // len(flex)) + (1 if index < (extra % len(flex)) else 0)
+                    if flex
+                    else 0
+                )
+                shares.append(share)
                 item_h = hint.height()
                 if widget.hasHeightForWidth():
-                    item_h = max(item_h, widget.heightForWidth(max(flex_w, 1)))
+                    item_h = max(item_h, widget.heightForWidth(max(share, 1)))
                 flex_heights.append(item_h)
             if flex_heights:
                 height = max(height, max(flex_heights))
@@ -234,7 +268,7 @@ class WrappingToolBar(QWidget):
                     x += hint.width() + gap
                 flex_x = x
                 for index, (widget, _hint) in enumerate(flex):
-                    share = flex_w if len(flex) == 1 else max(self._flex_min(widget), flex_w // len(flex))
+                    share = shares[index]
                     widget.setGeometry(flex_x, 0, share, flex_heights[index])
                     flex_x += share + gap
                 x = width - right_w
@@ -309,7 +343,9 @@ class PairedToolBar(QWidget):
         return self._arrange(width, apply=False)
 
     def sizeHint(self) -> QSize:
-        return QSize(self._span(self._shown(self._left)) + self._spacing + self._span(self._shown(self._right)),
+        left, right = self._shown(self._left), self._shown(self._right)
+        gap = self._spacing if (left and right) else 0
+        return QSize(self._span(left) + gap + self._span(right),
                      self._arrange(10**6, apply=False))
 
     def minimumSizeHint(self) -> QSize:
@@ -321,7 +357,8 @@ class PairedToolBar(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._sync_height()
+        if not defer_while_live_resize(self, self._sync_height):
+            self._sync_height()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -344,6 +381,10 @@ class PairedToolBar(QWidget):
         QTimer.singleShot(0, self._flush)
 
     def _flush(self) -> None:
+        from PyQt6 import sip
+
+        if sip.isdeleted(self):
+            return
         self._pending = False
         self.updateGeometry()
         if self.isVisible() or self.width() > 0:

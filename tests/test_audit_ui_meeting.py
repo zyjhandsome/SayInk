@@ -31,6 +31,7 @@ from sayink.ui.main_window import MainWindow
 from sayink.ui.meeting_page import PAGE_LIVE, PAGE_START, MeetingPage
 from sayink.ui.meeting_views import _SegmentTextDialog, _with_export_suffix
 from sayink.ui.minutes_templates import MinutesTemplatesDialog, TemplateEditorDialog
+from sayink.ui.settings_window import SettingsWindow
 from sayink.ui.theme import apply_theme
 from sayink.ui.transcript_import_dialog import TranscriptImportDialog
 from tools.asr_bench import hotword_hits
@@ -95,8 +96,17 @@ def meeting_env(tmp_path):
     page = MeetingPage(cfg, controller)
     yield cfg, history, controller, page
     page.hide()
+    page.close()
+    page.deleteLater()
+    cfg._save_timer.stop()
     controller.shutdown()
     history.close(timeout=2.0)
+
+
+def _stub_unused_settings_builders(monkeypatch) -> None:
+    monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
+    monkeypatch.setattr(SettingsWindow, "_refresh_about_info", lambda self: None)
+    monkeypatch.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)
 
 
 # ── 1. C-10: Post-meeting materials default collapse & 0px overlap ──
@@ -104,8 +114,13 @@ def meeting_env(tmp_path):
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
 @pytest.mark.parametrize("size", [(1024, 680), (880, 580)])
-def test_c10_materials_default_collapsed_and_zero_overlap_across_sizes(meeting_env, theme, size):
-    cfg, history, controller, page = meeting_env
+def test_c10_materials_default_collapsed_and_zero_overlap_across_sizes(tmp_path, monkeypatch, theme, size):
+    _stub_unused_settings_builders(monkeypatch)
+    cfg = Config(config_dir=tmp_path / "cfg")
+    cfg.set("llm.api_url", "http://localhost:11434/v1")
+    cfg.set("llm.model_name", "local-model")
+    history = HistoryStore(db_path=tmp_path / "history.db")
+    controller = MeetingController(cfg, history, pending_segments=lambda: 0)
     app = QApplication.instance()
     win = MainWindow(cfg, history, meeting=controller)
     try:
@@ -181,6 +196,11 @@ def test_c10_materials_default_collapsed_and_zero_overlap_across_sizes(meeting_e
         )
     finally:
         win.hide()
+        win.close()
+        win.deleteLater()
+        cfg._save_timer.stop()
+        controller.shutdown()
+        history.close(timeout=2.0)
 
 
 # ── 2. C-11 & M-28: TranscriptImportDialog contrast/debounce/drop & HistoryWindow edit lock ──
@@ -249,11 +269,13 @@ def test_c11_m28_transcript_import_dialog_contrast_height_debounce_and_drop(tmp_
             assert dlg._ok.isEnabled()
         finally:
             dlg.close()
+            dlg.deleteLater()
 
 
 def test_c11_history_inline_edit_locks_view_toggle_preventing_header_corruption(tmp_path):
     cfg = Config(config_dir=tmp_path / "cfg")
     store = HistoryStore(db_path=tmp_path / "hist.db")
+    win = None
     try:
         now = int(time.time() * 1000)
         store.enqueue(
@@ -300,6 +322,12 @@ def test_c11_history_inline_edit_locks_view_toggle_preventing_header_corruption(
         assert win._view_raw_btn.isEnabled()
         win.hide()
     finally:
+        if win is not None:
+            win._undo_timer.stop()
+            win._feedback_timer.stop()
+            win.close()
+            win.deleteLater()
+        cfg._save_timer.stop()
         store.close(timeout=2.0)
 
 
@@ -307,8 +335,13 @@ def test_c11_history_inline_edit_locks_view_toggle_preventing_header_corruption(
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
-def test_c08_h49_start_card_compact_910x472_and_model_combo_1024x680(meeting_env, theme):
-    cfg, history, controller, _page = meeting_env
+def test_c08_h49_start_card_compact_910x472_and_model_combo_1024x680(tmp_path, monkeypatch, theme):
+    _stub_unused_settings_builders(monkeypatch)
+    cfg = Config(config_dir=tmp_path / "cfg")
+    cfg.set("llm.api_url", "http://localhost:11434/v1")
+    cfg.set("llm.model_name", "local-model")
+    history = HistoryStore(db_path=tmp_path / "history.db")
+    controller = MeetingController(cfg, history, pending_segments=lambda: 0)
     app = QApplication.instance()
     win = MainWindow(cfg, history, meeting=controller)
     try:
@@ -353,12 +386,19 @@ def test_c08_h49_start_card_compact_910x472_and_model_combo_1024x680(meeting_env
             _settle()
             assert not p._opt_loopback_hint.isVisible()
 
-            # At 1024x680, model combo width fits model text cleanly
+            # At 1024x680 the model stays the widest column, and language
+            # matches the audio source so「自动（中文优先）」is not squeezed away.
             win.resize(1024, 680)
             _settle(4)
-            assert p._opt_model.width() >= 260
+            assert p._opt_model.width() > p._opt_source.width()
+            assert abs(p._opt_language.width() - p._opt_source.width()) <= 4
     finally:
         win.hide()
+        win.close()
+        win.deleteLater()
+        cfg._save_timer.stop()
+        controller.shutdown()
+        history.close(timeout=2.0)
 
 
 def test_c08_live_dual_meters_and_15s_remote_silence_banner(meeting_env):
@@ -451,6 +491,7 @@ def test_h50_title_cursor_zero_paused_mark_disabled_and_templates_dialog(meeting
         assert editor.entry is not None
         staged_entry = editor.entry
     finally:
+        editor.hide()
         editor.deleteLater()
 
     dlg = MinutesTemplatesDialog(cfg)
@@ -475,6 +516,7 @@ def test_h50_title_cursor_zero_paused_mark_disabled_and_templates_dialog(meeting
         dlg.accept()
         assert cfg.get("meeting.template_id") == staged_entry["id"]
     finally:
+        dlg.hide()
         dlg.deleteLater()
 
 
@@ -634,6 +676,7 @@ def test_h54_export_suffix_preserves_dotted_titles():
 def test_h55_m16_m30_l03_history_improvements(tmp_path):
     cfg = Config(config_dir=tmp_path / "cfg")
     store = HistoryStore(db_path=tmp_path / "hist.db")
+    win = None
     try:
         base = int(time.time() * 1000)
         for idx in range(55):
@@ -725,6 +768,12 @@ def test_h55_m16_m30_l03_history_improvements(tmp_path):
         assert win.running_workers == []
         win.hide()
     finally:
+        if win is not None:
+            win._undo_timer.stop()
+            win._feedback_timer.stop()
+            win.close()
+            win.deleteLater()
+        cfg._save_timer.stop()
         store.close(timeout=2.0)
 
 
@@ -799,6 +848,7 @@ def test_h56_m29_m31_media_pct_live_scroll_pill_speaker_merge_and_hotword_bench(
     with patch.object(_SegmentTextDialog, "screen", return_value=None):
         dlg = _SegmentTextDialog(seg_sample, position="00:00", speaker="王工", save_text=lambda _t: True)
         assert dlg.width() > 0
+        dlg.close()
         dlg.deleteLater()
 
     # tools/asr_bench.py short ASCII hotword word-boundary accuracy

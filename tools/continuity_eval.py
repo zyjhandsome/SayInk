@@ -40,7 +40,9 @@ def baseline_module(ref, filename):
 def chunks(audio, module, *, context=False, quiet=False):
     seg = module.make_meeting_segmenter(vad="silero", model_path=aux_model_path(asr.AUX_MODEL_SILERO_VAD))
     if quiet:
-        seg.quiet_speech = seg.gate_name == "silero"
+        if seg.gate_name != "silero":
+            raise RuntimeError("Silero VAD model is required for quiet_enhancement evaluation")
+        seg.quiet_speech = True
         seg.gate.input_gain = 4.0
     buffer = BoundaryContextBuffer() if context else None
     output = []
@@ -109,9 +111,12 @@ def main():
     parser.add_argument("--resume", action="store_true", help="skip cases already recorded in --out")
     parser.add_argument("--only-quiet-enhancement", action="store_true")
     args = parser.parse_args()
+    if str(args.baseline_ref).startswith("-"):
+        raise ValueError(f"Invalid git revision: {args.baseline_ref!r}")
+    args.out.parent.mkdir(parents=True, exist_ok=True)
     old_asr = baseline_module(args.baseline_ref, "sayink/speech_recognizer.py")
     old_vad = baseline_module(args.baseline_ref, "sayink/vad_segmenter.py")
-    report = {"baseline_ref": subprocess.check_output(["git", "rev-parse", args.baseline_ref], cwd=ROOT).decode().strip(),
+    report = {"baseline_ref": subprocess.check_output(["git", "rev-parse", "--verify", args.baseline_ref], cwd=ROOT).decode().strip(),
               "threads": 4, "llm": False, "speaker_turns": False, "runs": []}
     if args.resume and args.out.exists():
         previous = json.loads(args.out.read_text(encoding="utf-8"))
@@ -119,7 +124,7 @@ def main():
             raise ValueError("Cannot resume results from a different baseline")
         report = previous
     for model in args.models:
-        rec = asr._create_recognizer(model, 4, language="中文")
+        rec = asr._create_recognizer(model, 4, language=asr.language_argument(model, "zh"))
         for path in sorted(args.data.glob("*.ch0.wav")):
             key = path.name.removesuffix(".ch0.wav")
             source, rate = load_wav(path)
@@ -150,6 +155,7 @@ def main():
                     report["runs"].append(result)
                     args.out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
                     print(json.dumps({k: v for k, v in result.items() if k not in {"hypothesis", "bounds"}}), flush=True)
+    args.out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0
 
 

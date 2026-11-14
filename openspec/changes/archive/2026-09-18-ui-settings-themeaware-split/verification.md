@@ -47,7 +47,7 @@
 - 一致性：未改 ASR/热键/token 数值；未同步 canonical `openspec/specs/`
 
 ## 代码审查
-独立审查：`r-uisplit-20260919-a4f2`（[Review](191b68aa-bb7f-4209-a889-5bcd83027d07)）→ **warn**，无 CRITICAL。
+独立审查：`r-uisplit-20260919-a4f2`（Review ID `191b68aa-bb7f-4209-a889-5bcd83027d07`）→ **warn**，无 CRITICAL。
 已处理：补 live callout 暗色广播断言；去掉窗级被 subtree 覆盖的重复刷色；协议测试关闭表面。
 ### 阻塞项
 - 无

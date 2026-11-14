@@ -7,7 +7,6 @@ from pathlib import Path
 from PyQt6.QtCore import QEvent, QTimer, Qt
 from PyQt6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -26,6 +25,7 @@ from sayink.transcript_import import (
 )
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles as ss
+from sayink.ui.settings_components import ThemedCheckBox
 
 _MAX_CHARS = 2_000_000
 _MAX_FILE_BYTES = _MAX_CHARS * 4
@@ -80,13 +80,14 @@ class TranscriptImportDialog(QDialog):
         self._edit.textChanged.connect(self._on_text_changed)
         layout.addWidget(self._edit, 1)
 
-        self._detect = QCheckBox("自动识别说话人与时间")
+        self._detect = ThemedCheckBox("自动识别说话人与时间")
         self._detect.setAccessibleName("自动识别说话人与时间")
         self._detect.setChecked(True)
         self._detect.toggled.connect(self._on_detect_toggled)
         layout.addWidget(self._detect)
 
         self._preview = QLabel("还没有可导入的内容")
+        self._preview.setTextFormat(Qt.TextFormat.PlainText)
         self._preview.setWordWrap(True)
         self._preview.setObjectName("transcriptImportPreview")
         layout.addWidget(self._preview)
@@ -158,24 +159,6 @@ class TranscriptImportDialog(QDialog):
                 border: 2px solid {tok.ACCENT_FOCUS};
                 padding: 7px 9px;
             }}
-            QCheckBox {{
-                color: {tok.TEXT};
-                font-size: {tok.TYPE_BODY_SM}px;
-                spacing: 8px;
-                padding: 2px 0;
-                background: transparent;
-            }}
-            QCheckBox::indicator {{
-                width: 16px;
-                height: 16px;
-                border-radius: 4px;
-                border: 1px solid {tok.CONTROL_BORDER};
-                background: {tok.INPUT_BG};
-            }}
-            QCheckBox::indicator:checked {{
-                background: {tok.ACCENT};
-                border-color: {tok.ACCENT};
-            }}
             """
         )
         self._file_btn.setStyleSheet(ss.BTN_GHOST_SM)
@@ -213,7 +196,7 @@ class TranscriptImportDialog(QDialog):
     def _on_text_changed(self) -> None:
         if not self._loading_file and self._file_error:
             self._file_error = ""
-        text_len = self._edit.document().characterCount()
+        text_len = max(0, self._edit.document().characterCount() - 1)
         if text_len > _MAX_CHARS:
             self._parse_timer.stop()
             self._refresh()
@@ -227,7 +210,7 @@ class TranscriptImportDialog(QDialog):
     def _on_detect_toggled(self, _checked: bool) -> None:
         if self._file_error:
             return
-        if self._edit.document().characterCount() > _DEBOUNCE_THRESHOLD_CHARS:
+        if max(0, self._edit.document().characterCount() - 1) > _DEBOUNCE_THRESHOLD_CHARS:
             self._parse_timer.start()
         else:
             self._refresh()

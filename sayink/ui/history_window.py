@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import csv
 from dataclasses import replace
 import html
-import inspect
-import io
 import logging
 import re
-from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
@@ -41,21 +37,22 @@ from sayink.ui.history_export import (
     _SUPPRESSED_POLISHED_MARKER,
     _day_label,
     _effective_text,
-    _filename_dt as _filename_dt,
     _format_dt,
     _format_duration,
     _highlight_html,
     _labeled_text,
-    _route_caption as _route_caption,
+    _safe_dt,
     _segment_clock_ms,
     _segments_in_order,
     _session_body,
     _session_duration_ms,
-    _session_model as _session_model,
     _session_title,
     _speaker_heading,
-    _yaml_value as _yaml_value,
+    build_batch_export_csv,
+    build_batch_export_json,
     build_batch_export_markdown,
+    build_single_session_csv,
+    build_single_session_json,
     build_single_session_markdown,
     build_single_session_plain,
     history_shows_speakers,
@@ -65,13 +62,11 @@ from sayink.ui.history_export import (
 )
 from sayink.ui import settings_styles as _settings_styles
 from sayink.ui import design_tokens as tok
-from sayink.ui.clipboard import copy_text
-from sayink.ui.flow_layout import FlowLayout, WrappingToolBar
+from sayink.ui.clipboard import COPY_FAILED_TEXT as COPY_FAILED_TEXT, copy_text
+from sayink.ui.flow_layout import FlowLayout, WrappingToolBar, defer_while_live_resize
 from sayink.ui.reading import fit_reading_width
 
 logger = logging.getLogger(__name__)
-
-COPY_FAILED_TEXT = "复制失败，请再试一次"
 
 
 def release_list_item_widgets(list_widget: QListWidget, host: QWidget) -> None:
@@ -291,7 +286,9 @@ class _SessionList(QListWidget):
         super().resizeEvent(event)
         # Qt can retain the pre-show width of setItemWidget children after a
         # splitter resize. Reflow before eliding their text to the new width.
-        self.doItemsLayout()
+        # During an edge drag, doing that on every pixel repaints the list.
+        if not defer_while_live_resize(self, self.doItemsLayout):
+            self.doItemsLayout()
 
 
 class _SessionCheckBox(QCheckBox):
@@ -395,8 +392,13 @@ def _trigger_chip_text(mode: str | None) -> str:
     return _TRIGGER_CHIP.get(key, key)
 
 
+def _segment_has_polished(segment: SegmentRecord) -> bool:
+    polished = (segment.polished_text or "").strip()
+    return bool(polished) and polished != (segment.raw_text or "").strip()
+
+
 def _session_has_polished(segments: list[SegmentRecord]) -> bool:
-    return any((s.polished_text or "").strip() for s in segments)
+    return any(_segment_has_polished(s) for s in segments)
 
 
 def _chip_qss() -> str:
@@ -420,6 +422,8 @@ class _Toast(QFrame):
         lay.setContentsMargins(14, 8, 8, 8)
         lay.setSpacing(12)
         self.label = QLabel("")
+        self.label.setTextFormat(Qt.TextFormat.PlainText)
+        self.label.setWordWrap(True)
         lay.addWidget(self.label, 1)
         self.button = QPushButton("撤销")
         self.button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -438,9 +442,16 @@ class _Toast(QFrame):
         parent = self.parentWidget()
         if parent is None:
             return
-        self.adjustSize()
-        w = min(max(self.sizeHint().width(), 240), max(240, parent.width() - 48))
-        h = self.sizeHint().height()
+        max_w = max(240, parent.width() - 48)
+        btn_w = (self.button.sizeHint().width() + 12) if not self.button.isHidden() else 0
+        text = self.label.text()
+        natural_w = self.label.fontMetrics().horizontalAdvance(text) + btn_w + 32
+        w = min(max(natural_w, 240), max_w)
+        lay = self.layout()
+        wrapped_h = lay.totalHeightForWidth(w) if lay is not None and lay.hasHeightForWidth() else -1
+        base_h = wrapped_h if wrapped_h > 0 else self.sizeHint().height()
+        h = min(max(base_h, 36), max(64, parent.height() - 36))
+        self.label.setToolTip(text if natural_w > max_w else "")
         self.setFixedSize(w, h)
         self.move((parent.width() - w) // 2, parent.height() - h - 18)
         self.raise_()
@@ -452,6 +463,7 @@ _HISTORY_EXPORT_EXTENSIONS = {
     "md": ".md",
     "txt": ".txt",
     "csv": ".csv",
+    "json": ".json",
 }
 _KNOWN_HISTORY_SUFFIXES = {".md", ".txt", ".csv", ".json", ".srt"}
 
@@ -466,64 +478,6 @@ def _with_history_export_suffix(path: str, kind: str) -> str:
     if current_ext.lower() in _KNOWN_HISTORY_SUFFIXES:
         return raw[: len(raw) - len(current_ext)] + suffix
     return f"{raw}{suffix}"
-
-
-def _safe_csv_cell(value: object) -> str:
-    text = str(value or "")
-    if text and text[0] in ("=", "+", "-", "@", "\t", "\r"):
-        return f"'{text}"
-    return text
-
-
-def _fallback_sessions_csv(
-    sessions: list[SessionSummary],
-    segments_by_session: dict[str, list[SegmentRecord]],
-    *,
-    prefer_raw: bool = False,
-) -> str:
-    buf = io.StringIO()
-    writer = csv.writer(buf, lineterminator="\n")
-    writer.writerow(
-        [
-            "session_id",
-            "seq",
-            "captured_at",
-            "source",
-            "target_app",
-            "duration_ms",
-            "model",
-            "speaker",
-            "raw_text",
-            "polished_text",
-            "exported_text",
-        ]
-    )
-    for session in sorted(sessions, key=lambda s: s.created_at):
-        ordered = _segments_in_order(segments_by_session.get(session.session_id, []))
-        show_speakers = history_shows_speakers(ordered)
-        for seg in ordered:
-            if not prefer_raw and seg.polished_text == _SUPPRESSED_POLISHED_MARKER:
-                continue
-            exported = seg.raw_text if prefer_raw else _effective_text(seg)
-            if not exported.strip():
-                continue
-            speaker = _speaker_heading(seg) if show_speakers else ""
-            writer.writerow(
-                [
-                    _safe_csv_cell(seg.session_id),
-                    seg.seq,
-                    _safe_csv_cell(_format_dt(_segment_clock_ms(seg))),
-                    _safe_csv_cell(seg.source or session.source),
-                    _safe_csv_cell(seg.target_app or session.target_app),
-                    int(seg.duration_ms or 0),
-                    _safe_csv_cell(seg.model),
-                    _safe_csv_cell(speaker),
-                    _safe_csv_cell(seg.raw_text),
-                    _safe_csv_cell("" if seg.polished_text == _SUPPRESSED_POLISHED_MARKER else seg.polished_text),
-                    _safe_csv_cell(exported),
-                ]
-            )
-    return buf.getvalue()
 
 
 class _ClearHistoryDialog(QDialog):
@@ -607,6 +561,8 @@ class _ClearHistoryDialog(QDialog):
 
 def confirm_polish_while_disabled(parent) -> bool:
     """History polish can run while the master switch is off, but only after a warning."""
+    from sayink.ui.prompts import style_message_box
+
     box = QMessageBox(parent)
     box.setIcon(QMessageBox.Icon.Warning)
     box.setWindowTitle("文字润色已关闭")
@@ -618,6 +574,7 @@ def confirm_polish_while_disabled(parent) -> bool:
         ok.setText("仍然发送")
     if cancel is not None:
         cancel.setText("取消")
+    style_message_box(box, primary=ok)
     return box.exec() == QMessageBox.StandardButton.Ok
 
 
@@ -694,12 +651,13 @@ class HistoryWindow(QWidget):
         from sayink.ui import settings_styles as ss
 
         self.setStyleSheet(ss.WINDOW_CSS)
-        self._paint_history_styles()
+        has_details = hasattr(self, "_details")
+        self._paint_history_styles(sync_selection=not has_details)
         # Detail HTML embeds token colors; re-render for the active axis.
-        if hasattr(self, "_details"):
+        if has_details:
             self._on_selection_changed()
 
-    def _paint_history_styles(self) -> None:
+    def _paint_history_styles(self, *, sync_selection: bool = True) -> None:
         """Apply styles from the active token axis (also used by reapply)."""
         from sayink.ui import design_tokens as tok
         from sayink.ui import settings_styles as ss
@@ -748,7 +706,7 @@ class HistoryWindow(QWidget):
                     border: none;
                 }}
             """)
-            self._restyle_rows()
+            self._restyle_rows(sync_selection=sync_selection)
         if hasattr(self, "_detail_title"):
             self._detail_title.setStyleSheet(
                 f"font-size: {tok.TYPE_TITLE}px; font-weight: 700; color: {tok.TEXT};"
@@ -870,7 +828,7 @@ class HistoryWindow(QWidget):
             f" border: 1px solid {tok.HAIRLINE}; border-radius: {tok.RADIUS_MD}px; }}"
         )
 
-    def _restyle_rows(self) -> None:
+    def _restyle_rows(self, *, sync_selection: bool = True) -> None:
         from sayink.ui import design_tokens as tok
 
         preview_css = f"color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; background: transparent;"
@@ -900,7 +858,8 @@ class HistoryWindow(QWidget):
                     lab.setStyleSheet(time_css)
                 else:
                     lab.setStyleSheet(meta_css)
-        self._sync_row_selection()
+        if sync_selection:
+            self._sync_row_selection()
 
     def _paint_stream_row(self, row: QWidget, *, selected: bool) -> None:
         from sayink.ui import design_tokens as tok
@@ -1181,7 +1140,6 @@ class HistoryWindow(QWidget):
         self._detail_chip_bar.setObjectName("historyMetadata")
         self._detail_chips = FlowLayout(self._detail_chip_bar, spacing=6)
         self._detail_chips.setContentsMargins(0, 0, 0, 0)
-        self._detail_chip_host = self._detail_chips
         self._detail_chip_labels: list[QLabel] = []
         right_lay.addWidget(self._detail_chip_bar)
 
@@ -1247,7 +1205,7 @@ class HistoryWindow(QWidget):
         self._to_meeting_btn.hide()
         tools.add(self._to_meeting_btn)
         self._export_btn = QPushButton("导出")
-        self._export_btn.setToolTip("将选中的会话导出为 Markdown / 纯文本 / CSV 文件")
+        self._export_btn.setToolTip("将选中的会话导出为 Markdown / 纯文本 / CSV / JSON 文件")
         self._export_btn.clicked.connect(self._export_selected)
         tools.add(self._export_btn, role="right")
         self._detail_more_btn = QPushButton("更多")
@@ -1314,7 +1272,6 @@ class HistoryWindow(QWidget):
         self._toast.visibility_changed.connect(self._sync_detail_toast_margin)
         self._undo_bar = self._toast
         self._feedback_label = self._toast.label
-        self._undo_label = self._feedback_label
         self._undo_btn = self._toast.button
         self._undo_btn.clicked.connect(self._undo_pending_action)
         self._feedback_timer = QTimer(self)
@@ -1359,6 +1316,7 @@ class HistoryWindow(QWidget):
         from sayink.ui.tray_icon import _menu_font, _menu_stylesheet
 
         menu = QMenu(self)
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         menu.setFont(_menu_font())
         menu.setStyleSheet(_menu_stylesheet())
         selected = self._selected_session_ids()
@@ -1379,7 +1337,10 @@ class HistoryWindow(QWidget):
         act_del = menu.addAction("删除")
         act_del.setEnabled(bool(selected))
         act_del.triggered.connect(self._delete_selected_sessions)
-        menu.exec(self._session_list.viewport().mapToGlobal(pos))
+        try:
+            menu.exec(self._session_list.viewport().mapToGlobal(pos))
+        finally:
+            menu.deleteLater()
 
     def _sync_clear_all_enabled(self) -> None:
         enabled = self.session_count() > 0 or bool(self._search_query) or bool(self._pending_delete)
@@ -1590,7 +1551,7 @@ class HistoryWindow(QWidget):
             count = f"{len(sessions)}+" if self._has_more else str(len(sessions))
             self._list_summary_text = f"最近 {count} 条"
         self._sync_clear_all_enabled()
-        self._restyle_rows()
+        self._restyle_rows(sync_selection=False)
         self._on_selection_changed()
         self._session_rows_key = rows_key
 
@@ -1630,7 +1591,7 @@ class HistoryWindow(QWidget):
 
         line = QHBoxLayout()
         line.setSpacing(10)
-        time_lab = QLabel(datetime.fromtimestamp(session.created_at / 1000).strftime("%H:%M"))
+        time_lab = QLabel(_safe_dt(session.created_at).strftime("%H:%M"))
         time_lab.setObjectName("streamTime")
         time_lab.setFixedWidth(42)
         line.addWidget(time_lab)
@@ -1674,6 +1635,7 @@ class HistoryWindow(QWidget):
             if not text:
                 continue
             lab = QLabel(metrics.elidedText(text, Qt.TextElideMode.ElideMiddle, 240))
+            lab.setTextFormat(Qt.TextFormat.PlainText)
             lab.setToolTip(text)
             lab.setObjectName("streamChip")
             lab.setStyleSheet(chip_css)
@@ -1905,7 +1867,7 @@ class HistoryWindow(QWidget):
             if not text:
                 continue
             if many or show_speakers:
-                stamp = datetime.fromtimestamp(_segment_clock_ms(segment) / 1000).strftime("%H:%M:%S")
+                stamp = _safe_dt(_segment_clock_ms(segment)).strftime("%H:%M:%S")
                 if show_speakers:
                     head = _speaker_heading(segment)
                 else:
@@ -2696,13 +2658,11 @@ class HistoryWindow(QWidget):
             self._export_batch(sessions)
 
     @staticmethod
-    def _segments_for_raw_export(segments: list[SegmentRecord]) -> list[SegmentRecord]:
-        return [replace(seg, polished_text="") for seg in segments if (seg.raw_text or "").strip()]
-
-    @staticmethod
     def _resolve_export_kind(path: str, selected_filter: str) -> str:
         filt = (selected_filter or "").strip()
         lower = path.lower()
+        if filt.startswith("JSON") or lower.endswith(".json"):
+            return "json"
         if filt.startswith("CSV") or lower.endswith(".csv"):
             return "csv"
         if filt.startswith("纯文本") or lower.endswith(".txt"):
@@ -2728,7 +2688,7 @@ class HistoryWindow(QWidget):
             self,
             "导出历史",
             default,
-            "Markdown (*.md);;纯文本 (*.txt);;CSV 表格 (*.csv)",
+            "Markdown (*.md);;纯文本 (*.txt);;CSV 表格 (*.csv);;JSON (*.json)",
         )
         if not raw_path:
             return
@@ -2740,43 +2700,14 @@ class HistoryWindow(QWidget):
         has_polished = _session_has_polished(segments)
         prefer_raw = has_polished and not self._view_polished
         try:
-            if kind == "csv":
-                from sayink.ui import history_export as _hexp
-
-                csv_fn = getattr(_hexp, "build_single_session_csv", None)
-                export_csv_fn = getattr(_hexp, "export_csv", None)
-                if callable(csv_fn):
-                    params = inspect.signature(csv_fn).parameters
-                    if "prefer_raw" in params:
-                        text = csv_fn(session, segments, prefer_raw=prefer_raw)
-                    else:
-                        segs = self._segments_for_raw_export(segments) if prefer_raw else segments
-                        text = csv_fn(session, segs)
-                elif callable(export_csv_fn):
-                    params = inspect.signature(export_csv_fn).parameters
-                    if "prefer_raw" in params:
-                        text = export_csv_fn([session], {session.session_id: segments}, prefer_raw=prefer_raw)
-                    else:
-                        segs = self._segments_for_raw_export(segments) if prefer_raw else segments
-                        text = export_csv_fn([session], {session.session_id: segs})
-                else:
-                    text = _fallback_sessions_csv(
-                        [session], {session.session_id: segments}, prefer_raw=prefer_raw
-                    )
+            if kind == "json":
+                text = build_single_session_json(session, segments, prefer_raw=prefer_raw)
+            elif kind == "csv":
+                text = build_single_session_csv(session, segments, prefer_raw=prefer_raw)
             elif kind == "txt":
-                params = inspect.signature(build_single_session_plain).parameters
-                if "prefer_raw" in params:
-                    text = build_single_session_plain(session, segments, prefer_raw=prefer_raw)
-                else:
-                    segs = self._segments_for_raw_export(segments) if prefer_raw else segments
-                    text = build_single_session_plain(session, segs)
+                text = build_single_session_plain(session, segments, prefer_raw=prefer_raw)
             else:
-                params = inspect.signature(build_single_session_markdown).parameters
-                if "prefer_raw" in params:
-                    text = build_single_session_markdown(session, segments, prefer_raw=prefer_raw)
-                else:
-                    segs = self._segments_for_raw_export(segments) if prefer_raw else segments
-                    text = build_single_session_markdown(session, segs)
+                text = build_single_session_markdown(session, segments, prefer_raw=prefer_raw)
             Path(path).write_text(text, encoding="utf-8")
         except OSError as exc:
             QMessageBox.critical(self, "导出失败", f"无法写入文件：{exc}")
@@ -2789,11 +2720,18 @@ class HistoryWindow(QWidget):
             self,
             "批量导出历史",
             default,
-            "Markdown (*.md);;CSV 表格 (*.csv)",
+            "Markdown (*.md);;CSV 表格 (*.csv);;JSON (*.json)",
         )
         if not raw_path:
             return
-        kind = "csv" if ((selected_filter or "").strip().startswith("CSV") or raw_path.lower().endswith(".csv")) else "md"
+        filt = (selected_filter or "").strip()
+        lower = raw_path.lower()
+        if filt.startswith("JSON") or lower.endswith(".json"):
+            kind = "json"
+        elif filt.startswith("CSV") or lower.endswith(".csv"):
+            kind = "csv"
+        else:
+            kind = "md"
         path = _with_history_export_suffix(raw_path, kind)
         if not self._confirm_adjusted_overwrite(raw_path, path):
             return
@@ -2803,34 +2741,12 @@ class HistoryWindow(QWidget):
             for s in sessions
         }
         try:
-            if kind == "csv":
-                from sayink.ui import history_export as _hexp
-
-                csv_fn = getattr(_hexp, "build_batch_export_csv", None) or getattr(_hexp, "export_csv", None)
-                if callable(csv_fn):
-                    params = inspect.signature(csv_fn).parameters
-                    if "prefer_raw" in params:
-                        text = csv_fn(sessions, segments_by_session, prefer_raw=prefer_raw)
-                    else:
-                        mapped = (
-                            {sid: self._segments_for_raw_export(segs) for sid, segs in segments_by_session.items()}
-                            if prefer_raw
-                            else segments_by_session
-                        )
-                        text = csv_fn(sessions, mapped)
-                else:
-                    text = _fallback_sessions_csv(sessions, segments_by_session, prefer_raw=prefer_raw)
+            if kind == "json":
+                text = build_batch_export_json(sessions, segments_by_session, prefer_raw=prefer_raw)
+            elif kind == "csv":
+                text = build_batch_export_csv(sessions, segments_by_session, prefer_raw=prefer_raw)
             else:
-                params = inspect.signature(build_batch_export_markdown).parameters
-                if "prefer_raw" in params:
-                    text = build_batch_export_markdown(sessions, segments_by_session, prefer_raw=prefer_raw)
-                else:
-                    mapped = (
-                        {sid: self._segments_for_raw_export(segs) for sid, segs in segments_by_session.items()}
-                        if prefer_raw
-                        else segments_by_session
-                    )
-                    text = build_batch_export_markdown(sessions, mapped)
+                text = build_batch_export_markdown(sessions, segments_by_session, prefer_raw=prefer_raw)
             Path(path).write_text(text, encoding="utf-8")
         except OSError as exc:
             QMessageBox.critical(self, "导出失败", f"无法写入文件：{exc}")

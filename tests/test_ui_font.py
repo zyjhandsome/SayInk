@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 class TestResolveUiFontFamily:
     def test_prefers_cjk_family_when_latin_variable_also_present(self):
@@ -53,13 +55,18 @@ class TestResolveUiFontFamily:
 
         windir = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
         yahei = windir / "msyh.ttc"
+        font_id = -1
         if yahei.exists():
-            QFontDatabase.addApplicationFont(str(yahei))
-        apply_theme(mode="light", system_is_light=True)
-        family = refresh_ui_font()
-        metrics = QFontMetrics(QFont(family))
-        missing = [ch for ch in "设置转写历史配置" if not metrics.inFont(ch)]
-        assert missing == [], f"{family} missing {missing}"
+            font_id = QFontDatabase.addApplicationFont(str(yahei))
+        try:
+            apply_theme(mode="light", system_is_light=True)
+            family = refresh_ui_font()
+            metrics = QFontMetrics(QFont(family))
+            missing = [ch for ch in "设置转写历史配置" if not metrics.inFont(ch)]
+            assert missing == [], f"{family} missing {missing}"
+        finally:
+            if font_id >= 0:
+                QFontDatabase.removeApplicationFont(font_id)
 
 
 class TestResolveMonoFontFamily:
@@ -101,7 +108,7 @@ class TestYaHeiWeightAndTracking:
         banned_weight = re.compile(r"font-weight:\s*(500|550|600)\b")
         banned_tracking = re.compile(r"letter-spacing:\s*(-|0\.\d)")
         offenders: list[str] = []
-        for path in Path("sayink/ui").rglob("*.py"):
+        for path in (REPO_ROOT / "sayink" / "ui").rglob("*.py"):
             for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
                 if (
                     banned_weight.search(line)
@@ -112,7 +119,7 @@ class TestYaHeiWeightAndTracking:
         assert offenders == []
 
     def test_master_documents_two_weights_and_mono_resolve(self):
-        master = Path("design-system/MASTER.md").read_text(encoding="utf-8")
+        master = (REPO_ROOT / "design-system" / "MASTER.md").read_text(encoding="utf-8")
         assert "resolve_mono_font_family" in master
         assert "400" in master and "700" in master
 
@@ -153,6 +160,7 @@ class TestFloatingWindowUsesResolvedFont:
             assert win._status_label.font().family() == "Mock UI Font"
         finally:
             win.close()
+            win.deleteLater()
 
 
 class TestTypographyScaleTokens:
@@ -167,8 +175,8 @@ class TestTypographyScaleTokens:
         assert dt.TYPE_TITLE == 16
         assert dt.TYPE_HERO == 18
         assert dt.TYPE_TITLE_LG == 20
-        assert dt.TYPE_DISPLAY == 22
-        assert dt.TYPE_ICON_LG == 17
+        assert not hasattr(dt, "TYPE_DISPLAY")
+        assert not hasattr(dt, "TYPE_ICON_LG")
 
     def test_settings_reload_styles_uses_type_tokens(self):
         from sayink.ui import design_tokens as dt
@@ -215,24 +223,7 @@ class TestThemeSurfacePolish:
             assert dt.PRIMARY_CONTAINER_HOVER in sheet
         finally:
             win.close()
-
-    def test_usage_tip_bar_follows_dark_axis(self):
-        import sys
-
-        from PyQt6.QtWidgets import QApplication, QLabel
-
-        from sayink.ui import design_tokens as dt
-        from sayink.ui.settings_components import paint_usage_tip_bar, usage_tip_bar
-        from sayink.ui.theme import apply_theme
-
-        QApplication.instance() or QApplication(sys.argv)
-        tip = usage_tip_bar("提示")
-        apply_theme(mode="dark", system_is_light=False)
-        paint_usage_tip_bar(tip)
-        assert dt.SURFACE_PEARL in tip.styleSheet()
-        labels = tip.findChildren(QLabel)
-        assert labels
-        assert dt.TEXT_SEC in labels[0].styleSheet()
+            win.deleteLater()
 
 
 class TestCalloutThemeReapply:
@@ -247,21 +238,25 @@ class TestCalloutThemeReapply:
 
         QApplication.instance() or QApplication(sys.argv)
         frame = info_callout("混合采集提示")
-        light_bg = dt.tokens_for("light")["AMBER_SOFT"]
-        dark_bg = dt.tokens_for("dark")["AMBER_SOFT"]
-        assert light_bg in frame.styleSheet()
+        try:
+            light_bg = dt.tokens_for("light")["AMBER_SOFT"]
+            dark_bg = dt.tokens_for("dark")["AMBER_SOFT"]
+            assert light_bg in frame.styleSheet()
 
-        apply_theme(mode="dark", system_is_light=False)
-        paint_info_callout(frame)
-        assert dark_bg in frame.styleSheet()
-        assert light_bg not in frame.styleSheet() or light_bg == dark_bg
+            apply_theme(mode="dark", system_is_light=False)
+            paint_info_callout(frame)
+            assert dark_bg in frame.styleSheet()
+            assert light_bg not in frame.styleSheet() or light_bg == dark_bg
+        finally:
+            frame.close()
+            frame.deleteLater()
 
 
 class TestMasterTypographyAlignment:
     def test_master_documents_font_strategy_and_type_ladder(self):
         from sayink.ui import design_tokens as dt
 
-        master = Path("design-system/MASTER.md").read_text(encoding="utf-8")
+        master = (REPO_ROOT / "design-system" / "MASTER.md").read_text(encoding="utf-8")
         assert "Segoe UI Variable" in master
         assert "Microsoft YaHei UI" in master
         assert "resolve_ui_font_family" in master or "FONT_STACK" in master
@@ -273,10 +268,8 @@ class TestMasterTypographyAlignment:
             ("TYPE_BODY", dt.TYPE_BODY),
             ("TYPE_TITLE_SM", dt.TYPE_TITLE_SM),
             ("TYPE_TITLE", dt.TYPE_TITLE),
-            ("TYPE_ICON_LG", dt.TYPE_ICON_LG),
             ("TYPE_HERO", dt.TYPE_HERO),
             ("TYPE_TITLE_LG", dt.TYPE_TITLE_LG),
-            ("TYPE_DISPLAY", dt.TYPE_DISPLAY),
         ):
             assert name in master
             assert f"{size}px" in master

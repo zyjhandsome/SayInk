@@ -18,6 +18,8 @@ The page never touches audio or the recognizer: it asks the
 from __future__ import annotations
 
 import bisect
+import copy
+import hashlib
 import html
 import json
 import logging
@@ -84,12 +86,12 @@ from sayink.meeting_store import STATUS_ENDED, STATUS_INTERRUPTED, STATUS_LIVE, 
 from sayink.minutes_prompts import describe_template, format_timestamp, get_template, list_templates, transcript_lines
 from sayink.media_import import MEDIA_SOURCE, file_dialog_filter
 from sayink.transcript_import import IMPORT_SOURCE
-from sayink.ui.history_export import export_save_path
+from sayink.ui.history_export import _safe_dt, export_save_path
 from sayink.recognition_settings import ADVANCED_RECOGNITION_PATH, audio_source
 from sayink.speech_recognizer import DEFAULT_MODEL_ID, MODEL_REGISTRY, is_model_downloaded
 from sayink.ui import design_tokens as tok
-from sayink.ui.clipboard import copy_text
-from sayink.ui.flow_layout import PairedToolBar, WrappingToolBar
+from sayink.ui.clipboard import COPY_FAILED_TEXT, copy_text
+from sayink.ui.flow_layout import PairedToolBar, WrappingToolBar, defer_while_live_resize
 from sayink.ui.history_window import (
     _ElidedLabel, _SessionCheckBox, _SessionList, release_list_item_widgets, session_list_item_css,
 )
@@ -107,10 +109,7 @@ from sayink.ui.meeting_views import (
     _ReadingView,
     _SegmentSpeakerDialog,
     _SegmentTextDialog,
-    _speaker_anchor_map as _speaker_anchor_map,
-    _speaker_anchor_skeleton as _speaker_anchor_skeleton,
     _speaker_source,
-    _split_top_paragraphs as _split_top_paragraphs,
     _TranscriptView,
     _with_export_suffix,
     build_transcript_html,
@@ -120,6 +119,7 @@ from sayink.ui.meeting_views import (
     notes_for_display,
     speaker_color as speaker_color,
 )
+from sayink.ui.prompts import alert_error, style_message_box
 
 log = logging.getLogger("SayInk")
 
@@ -159,21 +159,13 @@ def _paint_meeting_row(row: QWidget, *, selected: bool) -> None:
 
 
 def _style_dialog_box(box: QMessageBox, *, danger_btn: QPushButton | None = None) -> None:
-    from sayink.ui import design_tokens as tok
-    from sayink.ui import settings_styles as ss
-
-    box.setStyleSheet(
-        ss.WINDOW_CSS
-        + f" QMessageBox {{ background: {tok.BG}; color: {tok.TEXT}; }}"
-        + f" QMessageBox QLabel {{ color: {tok.TEXT}; background: transparent; }}"
-    )
-    for btn in box.buttons():
-        if danger_btn is not None and btn is danger_btn:
-            btn.setStyleSheet(ss.BTN_DANGER_SOLID_SM)
-        elif box.buttonRole(btn) == QMessageBox.ButtonRole.AcceptRole:
-            btn.setStyleSheet(ss.BTN_ACCENT_SM)
-        else:
-            btn.setStyleSheet(ss.BTN_GHOST_SM)
+    primary = danger_btn
+    if primary is None:
+        for btn in box.buttons():
+            if box.buttonRole(btn) == QMessageBox.ButtonRole.AcceptRole:
+                primary = btn
+                break
+    style_message_box(box, primary=primary, destructive=danger_btn is not None)
 
 
 class _CleanComboBox(QComboBox):
@@ -282,10 +274,30 @@ def _probe_wav_duration_ms(path: Path) -> int:
     return 0
 
 
+_STALE_PLAYBACK_WAV_PRUNED = False
+
+
+def _prune_stale_playback_wavs(out_dir: Path, *, max_age_s: float = 48 * 3600) -> None:
+    global _STALE_PLAYBACK_WAV_PRUNED
+    if _STALE_PLAYBACK_WAV_PRUNED:
+        return
+    _STALE_PLAYBACK_WAV_PRUNED = True
+    try:
+        if not out_dir.is_dir():
+            return
+        cutoff = time.time() - max_age_s
+        for wav_file in out_dir.glob("*.wav"):
+            try:
+                if wav_file.stat().st_mtime < cutoff:
+                    wav_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 class _AudioPlayerBar(QFrame):
     """Lightweight embedded audio playback bar for local meeting / imported / recovery audio."""
-
-    seeked = pyqtSignal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -299,6 +311,20 @@ class _AudioPlayerBar(QFrame):
         self._dragging_slider = False
         self._player = None
         self._audio_out = None
+        self._session_temp_wavs: set[Path] = set()
+        self._temp_wavs_by_source: dict[str, set[Path]] = {}
+        session_temp_wavs = self._session_temp_wavs
+
+        def _cleanup_on_destroy(*_args, _paths=session_temp_wavs) -> None:
+            for wav_path in list(_paths):
+                try:
+                    wav_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            _paths.clear()
+
+        self.destroyed.connect(_cleanup_on_destroy)
+        weakref.finalize(self, _cleanup_on_destroy)
         self._fallback_timer = QTimer(self)
         self._fallback_timer.setInterval(200)
         self._fallback_timer.timeout.connect(self._on_fallback_tick)
@@ -341,20 +367,8 @@ class _AudioPlayerBar(QFrame):
         return self._source_path
 
     @property
-    def is_playing(self) -> bool:
-        return self._playing
-
-    @property
-    def position_ms(self) -> int:
-        return self._position_ms
-
-    @property
     def duration_ms(self) -> int:
         return self._duration_ms
-
-    @property
-    def playback_rate(self) -> float:
-        return self._rate
 
     def reapply_theme(self) -> None:
         from sayink.ui import design_tokens as tok
@@ -397,6 +411,101 @@ class _AudioPlayerBar(QFrame):
             self._audio_out = None
             return False
 
+    @staticmethod
+    def _norm_audio_key(path: str | Path | None) -> str:
+        raw = str(path or "").strip()
+        if not raw:
+            return ""
+        try:
+            return str(Path(raw).resolve()).casefold()
+        except OSError:
+            return raw.casefold()
+
+    @staticmethod
+    def _temp_wav_path_for_raw_f32(raw_f32: Path) -> Path:
+        resolved_raw = raw_f32.resolve()
+        digest = hashlib.sha256(str(resolved_raw).encode("utf-8")).hexdigest()[:12]
+        out_dir = Path(tempfile.gettempdir()) / "sayink-playback"
+        _prune_stale_playback_wavs(out_dir)
+        tag = f"{raw_f32.parent.name}-{digest}-{raw_f32.stat().st_size}"
+        return out_dir / f"{tag}.wav"
+
+    def _register_temp_wav(self, source_path: str | Path, raw_f32: Path, wav_path: Path) -> None:
+        self._session_temp_wavs.add(wav_path)
+        for key in (self._norm_audio_key(source_path), self._norm_audio_key(raw_f32)):
+            if key:
+                self._temp_wavs_by_source.setdefault(key, set()).add(wav_path)
+
+    def unload_source(self) -> None:
+        self.stop()
+        if self._player is not None:
+            try:
+                self._player.setSource(QUrl())
+            except Exception:
+                pass
+        self._source_path = ""
+        self._playable_path = ""
+        self._duration_ms = 0
+        self._position_ms = 0
+        self._sync_ui()
+
+    def collect_temp_wavs_for_audio_paths(self, audio_paths) -> set[Path]:
+        targets: set[Path] = set()
+        match_keys: set[str] = set()
+        for raw_item in audio_paths or ():
+            text = str(raw_item or "").strip()
+            if not text:
+                continue
+            p = Path(text)
+            raw_f32 = p / "audio.f32" if p.is_dir() else p
+            for candidate in (p, raw_f32):
+                key = self._norm_audio_key(candidate)
+                if key:
+                    match_keys.add(key)
+                    targets.update(self._temp_wavs_by_source.get(key, ()))
+            try:
+                if raw_f32.is_file() and raw_f32.suffix.lower() == ".f32":
+                    targets.add(self._temp_wav_path_for_raw_f32(raw_f32))
+            except OSError:
+                pass
+        current_key = self._norm_audio_key(self._source_path)
+        playable_path = Path(self._playable_path) if self._playable_path else None
+        if (current_key and current_key in match_keys) or (
+            playable_path is not None and playable_path in targets
+        ):
+            self.unload_source()
+        return targets
+
+    def remove_temp_wavs(self, targets: set[Path] | list[Path] | tuple[Path, ...]) -> None:
+        target_set = set(targets)
+        if not target_set:
+            return
+        playable_path = Path(self._playable_path) if self._playable_path else None
+        if playable_path is not None and playable_path in target_set:
+            self.unload_source()
+        for wav_path in target_set:
+            try:
+                wav_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._session_temp_wavs.discard(wav_path)
+        for key in list(self._temp_wavs_by_source):
+            remaining = self._temp_wavs_by_source[key] - target_set
+            if remaining:
+                self._temp_wavs_by_source[key] = remaining
+            else:
+                self._temp_wavs_by_source.pop(key, None)
+
+    def cleanup_temp_files(self) -> None:
+        self.unload_source()
+        for wav_path in list(self._session_temp_wavs):
+            try:
+                wav_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._session_temp_wavs.clear()
+        self._temp_wavs_by_source.clear()
+
     def _materialize_playable_path(self) -> str:
         if self._playable_path and Path(self._playable_path).is_file():
             return self._playable_path
@@ -413,18 +522,29 @@ class _AudioPlayerBar(QFrame):
             raw_f32 = src / "audio.f32" if src.is_dir() else src
             if not raw_f32.is_file():
                 return ""
-            out_dir = Path(tempfile.gettempdir()) / "sayink-playback"
+            wav_path = self._temp_wav_path_for_raw_f32(raw_f32)
+            out_dir = wav_path.parent
             out_dir.mkdir(parents=True, exist_ok=True)
-            tag = f"{raw_f32.parent.name}-{raw_f32.stat().st_size}"
-            wav_path = out_dir / f"{tag}.wav"
             if not wav_path.is_file():
-                samples = np.fromfile(raw_f32, dtype="<f4")
-                pcm = (np.clip(np.nan_to_num(samples), -1.0, 1.0) * 32767.0).astype("<i2")
-                with wave.open(str(wav_path), "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(16000)
-                    wf.writeframes(pcm.tobytes())
+                tmp_path = out_dir / f"{wav_path.name}.tmp"
+                chunk_bytes = 262_144 * 4
+                try:
+                    with raw_f32.open("rb") as src_fp, wave.open(str(tmp_path), "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(16000)
+                        while raw_chunk := src_fp.read(chunk_bytes):
+                            usable = len(raw_chunk) - (len(raw_chunk) % 4)
+                            if usable <= 0:
+                                break
+                            samples = np.frombuffer(memoryview(raw_chunk)[:usable], dtype="<f4")
+                            pcm = (np.clip(np.nan_to_num(samples), -1.0, 1.0) * 32767.0).astype("<i2")
+                            wf.writeframes(pcm.tobytes())
+                    tmp_path.replace(wav_path)
+                except Exception:
+                    tmp_path.unlink(missing_ok=True)
+                    raise
+            self._register_temp_wav(self._source_path, raw_f32, wav_path)
             self._playable_path = str(wav_path)
             return self._playable_path
         except Exception:
@@ -538,10 +658,6 @@ class _AudioPlayerBar(QFrame):
             self.play()
         else:
             self._sync_ui()
-        self.seeked.emit(target)
-
-    def seek_and_play(self, offset_ms: int) -> None:
-        self.seek_ms(offset_ms, autoplay=True)
 
     def _on_fallback_tick(self) -> None:
         if not self._playing:
@@ -635,6 +751,8 @@ class MeetingPage(QWidget):
         self._detail_id = ""
         self._search_query = ""
         self._meeting_audio_paths: dict[str, str] = {}
+        self._recovery_audio_cache: dict[str, tuple[int | None, str]] = {}
+        self._templates_snapshot: object = None
         self._pending_media_import_path = ""
         self._live_remote_active_ts = time.monotonic()
         self._system_silent_dismissed = False
@@ -695,6 +813,26 @@ class MeetingPage(QWidget):
         self.refresh()
         if self._ctrl.is_active:
             self._enter_live()
+        player_temp_wavs = self._audio_player._session_temp_wavs
+
+        def _cleanup_page_temp_wavs(*_args, _paths=player_temp_wavs) -> None:
+            for wav_path in list(_paths):
+                try:
+                    wav_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            _paths.clear()
+
+        self.destroyed.connect(_cleanup_page_temp_wavs)
+        weakref.finalize(self, _cleanup_page_temp_wavs)
+
+    def cleanup(self) -> None:
+        if hasattr(self, "_audio_player"):
+            self._audio_player.cleanup_temp_files()
+
+    def closeEvent(self, event) -> None:
+        self.cleanup()
+        super().closeEvent(event)
 
     # ── draft state compatibility delegates ───────────────────────
 
@@ -908,6 +1046,7 @@ class MeetingPage(QWidget):
         self._batch_tools.hide()
         right_lay.addWidget(self._batch_tools)
         self._batch_notice = QLabel("选择要一起处理的会议。")
+        self._batch_notice.setTextFormat(Qt.TextFormat.PlainText)
         self._batch_notice.setWordWrap(True)
         self._batch_notice.setAccessibleName("已选会议说明")
         self._batch_notice.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
@@ -921,6 +1060,7 @@ class MeetingPage(QWidget):
         self._batch_notice_scroll.hide()
         right_lay.addWidget(self._batch_notice_scroll)
         self._import_progress = QLabel("")
+        self._import_progress.setTextFormat(Qt.TextFormat.PlainText)
         self._import_progress.setWordWrap(True)
         self._import_progress.setAccessibleName("导入进度")
         self._import_progress.hide()
@@ -939,6 +1079,7 @@ class MeetingPage(QWidget):
         self._detail_meta.setWordWrap(True)
         self._detail_meta.setContentsMargins(4, 0, 0, 0)
         self._notes_state = QLabel()
+        self._notes_state.setTextFormat(Qt.TextFormat.PlainText)
         self._notes_state.setWordWrap(True)
         self._notes_state.setAccessibleName("纪要来源与保存状态")
         self._state_row = QWidget()
@@ -1009,6 +1150,7 @@ class MeetingPage(QWidget):
         right_lay.addWidget(self._materials)
 
         self._status_label = QLabel("")
+        self._status_label.setTextFormat(Qt.TextFormat.PlainText)
         self._status_label.setWordWrap(True)
         self._status_label.hide()
         right_lay.addWidget(self._status_label)
@@ -1233,7 +1375,6 @@ class MeetingPage(QWidget):
         row.setSpacing(10)
         self._opt_source = _CleanComboBox()
         self._opt_source.setAccessibleName("会议音频来源")
-        self._opt_source.addItem("跟随转写设置", "")
         for key, label in _SOURCE_LABELS:
             self._opt_source.addItem(label, key)
         self._opt_model = _CleanComboBox()
@@ -1242,10 +1383,11 @@ class MeetingPage(QWidget):
         self._opt_language.setAccessibleName("会议语言")
         for key, label in _LANGUAGE_LABELS:
             self._opt_language.addItem(label, key)
+        # 「自动（中文优先）」和「麦克风 + 电脑声音」一样长；模型名更长，只多给一档。
         for caption, field, stretch in (
             ("音频来源", self._opt_source, 3),
-            ("转写模型", self._opt_model, 5),
-            ("识别语言", self._opt_language, 2),
+            ("转写模型", self._opt_model, 4),
+            ("识别语言", self._opt_language, 3),
         ):
             field.setMinimumWidth(0)
             field.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
@@ -1329,6 +1471,7 @@ class MeetingPage(QWidget):
         head = QHBoxLayout()
         head.setSpacing(12)
         self._live_title = QLabel("会议进行中")
+        self._live_title.setTextFormat(Qt.TextFormat.PlainText)
         self._live_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         head.addWidget(self._live_title, 1)
         self._live_rec_dot = QLabel()
@@ -1362,6 +1505,7 @@ class MeetingPage(QWidget):
         banner_lay.setContentsMargins(10, 6, 8, 6)
         banner_lay.setSpacing(8)
         self._system_silent_label = QLabel()
+        self._system_silent_label.setTextFormat(Qt.TextFormat.PlainText)
         self._system_silent_label.setWordWrap(True)
         self._system_silent_label.setAccessibleName("电脑声静音提醒")
         banner_lay.addWidget(self._system_silent_label, 1)
@@ -1389,6 +1533,7 @@ class MeetingPage(QWidget):
         lay.addWidget(self._live_meters_bar)
 
         self._live_status = QLabel("")
+        self._live_status.setTextFormat(Qt.TextFormat.PlainText)
         self._live_status.setWordWrap(True)
         self._live_status.hide()
         lay.addWidget(self._live_status)
@@ -1409,6 +1554,7 @@ class MeetingPage(QWidget):
         lay.addWidget(speaker_tools)
         lay.addWidget(self._live_speaker_hint)
         self._live_speaker_feedback = QLabel()
+        self._live_speaker_feedback.setTextFormat(Qt.TextFormat.PlainText)
         self._live_speaker_feedback.setWordWrap(True)
         self._live_speaker_feedback.hide()
         lay.addWidget(self._live_speaker_feedback)
@@ -1557,16 +1703,12 @@ class MeetingPage(QWidget):
             f" border-radius: 5px; }}"
             f"QProgressBar::chunk {{ background: {tok.ACCENT}; border-radius: 4px; }}"
         )
-        is_dark = QColor(tok.BG).lightness() < 128
-        warn_bg = "#3A2E12" if is_dark else "#FFFBEB"
-        warn_fg = "#FDE68A" if is_dark else "#78350F"
-        warn_border = "#D97706"
         self._system_silent_banner.setStyleSheet(
-            f"QFrame#meetingSilentBanner {{ background: {warn_bg}; border: 1px solid {warn_border};"
+            f"QFrame#meetingSilentBanner {{ background: {tok.AMBER_SOFT}; border: 1px solid {tok.CALLOUT_BORDER};"
             f" border-radius: {tok.RADIUS_MD}px; }}"
         )
         self._system_silent_label.setStyleSheet(
-            f"color: {warn_fg}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700; background: transparent;"
+            f"color: {tok.AMBER_TEXT}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700; background: transparent;"
         )
         self._audio_player.reapply_theme()
         edit_css = f"""
@@ -1595,7 +1737,13 @@ class MeetingPage(QWidget):
         self._template_combo.setMinimumHeight(tok.CONTROL_BTN_SM_HEIGHT)
         from sayink.ui.tray_icon import _menu_font, _menu_stylesheet
 
-        for menu in (self._more_menu, self._speaker_menu, self._export_menu, self._live_speaker_menu):
+        for menu in (
+            self._more_menu,
+            self._speaker_menu,
+            self._export_menu,
+            self._live_speaker_menu,
+            self._template_menu,
+        ):
             menu.setFont(_menu_font())
             menu.setStyleSheet(_menu_stylesheet())
         text_css = f"""
@@ -1697,8 +1845,20 @@ class MeetingPage(QWidget):
     def _reload_templates(self) -> None:
         from sayink.ui.minutes_templates import populate_template_combo
 
+        selected = self._template_combo.currentData() or self._config.get("meeting.template_id", "general")
+        snapshot = (copy.deepcopy(self._custom_templates()), selected)
+        if (
+            self._template_combo.count() > 0
+            and bool(self._template_menu.actions())
+            and snapshot == self._templates_snapshot
+        ):
+            return
         populate_template_combo(self._template_combo, self._config, self._template_combo.currentData())
         self._rebuild_template_menu()
+        self._templates_snapshot = (
+            copy.deepcopy(self._custom_templates()),
+            self._template_combo.currentData() or self._config.get("meeting.template_id", "general"),
+        )
 
     def _rebuild_template_menu(self) -> None:
         menu = self._template_menu
@@ -1781,8 +1941,6 @@ class MeetingPage(QWidget):
 
     def refresh(self) -> None:
         self._reload_templates()
-        if self._stack.currentIndex() == PAGE_START:
-            self._sync_follow_source_label()
         if self._store.disabled:
             self._list_summary.setText("历史数据库不可用，会议记录无法保存")
             return
@@ -2058,11 +2216,10 @@ class MeetingPage(QWidget):
         if len(ids) > 1 and not self._batch_mode:
             self._set_batch_mode(True)
             return
-        self._sync_batch_checks()
+        self._sync_batch_checks(selected_ids=ids)
         if self._batch_mode:
-            self._sync_batch_checks()
-            self._sync_batch_summary()
-            self._sync_batch_actions()
+            self._sync_batch_summary(selected_ids=ids)
+            self._sync_batch_actions(selected_ids=ids)
             return
         items = self._list.selectedItems()
         if not items:
@@ -2155,8 +2312,8 @@ class MeetingPage(QWidget):
                 self._list.blockSignals(False)
         self.refresh()
 
-    def _sync_batch_checks(self) -> None:
-        selected = set(self._selected_meeting_ids())
+    def _sync_batch_checks(self, selected_ids: list[str] | None = None) -> None:
+        selected = set(self._selected_meeting_ids() if selected_ids is None else selected_ids)
         for index in range(self._list.count()):
             item = self._list.item(index)
             widget = self._list.itemWidget(item)
@@ -2171,14 +2328,16 @@ class MeetingPage(QWidget):
             if widget is not None and widget.objectName() == "meetingStreamRow":
                 _paint_meeting_row(widget, selected=item.isSelected())
 
-    def _sync_batch_summary(self) -> None:
-        count = len(self._selected_meeting_ids())
+    def _sync_batch_summary(self, selected_ids: list[str] | None = None) -> None:
+        ids = self._selected_meeting_ids() if selected_ids is None else selected_ids
+        count = len(ids)
         if self._batch_mode:
             self._list_summary.setText(f"已选 {count} 场")
         self._list_summary.setToolTip("全选和多选都只包含当前已经加载的会议")
 
-    def _sync_batch_actions(self) -> None:
-        count = len(self._selected_meeting_ids())
+    def _sync_batch_actions(self, selected_ids: list[str] | None = None) -> None:
+        ids = self._selected_meeting_ids() if selected_ids is None else selected_ids
+        count = len(ids)
         self._batch_export_btn.setText(f"导出 {count} 场" if count else "导出")
         self._batch_generate_btn.setText(f"生成 {count} 场" if count else "生成纪要")
         self._batch_delete_btn.setText(f"删除 {count} 场" if count else "删除")
@@ -2194,10 +2353,12 @@ class MeetingPage(QWidget):
         if not self._batch_mode:
             return
         titles = []
-        for meeting_id in self._selected_meeting_ids():
+        for meeting_id in ids:
             record = self._records.get(meeting_id) or self._store.get_meeting(meeting_id)
             if record is not None:
                 titles.append(record.display_title)
+                if len(titles) > 12:
+                    break
         listed = "\n".join(titles[:12])
         if len(titles) > 12:
             listed += "\n…"
@@ -2243,7 +2404,8 @@ class MeetingPage(QWidget):
         ids = self._selected_meeting_ids()
         records = [self._store.get_meeting(meeting_id) for meeting_id in ids]
         live = [record for record in records if record is not None and record.status == STATUS_LIVE]
-        ended = [record.id for record in records if record is not None and record.status != STATUS_LIVE]
+        ended_records = [record for record in records if record is not None and record.status != STATUS_LIVE]
+        ended = [record.id for record in ended_records]
         if not ended:
             self._set_status("进行中的会议要先结束后再删除。")
             return
@@ -2251,8 +2413,10 @@ class MeetingPage(QWidget):
             return
         if not self._flush_bound_title(sync=True) or not self._save_notes_draft() or not self._save_record_notes():
             return
+        ended_audio_paths = [record.audio_path for record in ended_records if record.audio_path]
+        temp_wav_targets = self._audio_player.collect_temp_wavs_for_audio_paths(ended_audio_paths)
         if self._detail_id in ended:
-            self._audio_player.stop()
+            self._audio_player.unload_source()
             self._editing_notes = False
             self._notes_edit.clear()
             self._detail_id = ""
@@ -2260,6 +2424,7 @@ class MeetingPage(QWidget):
         if not self._ctrl.delete_meetings(ended):
             self._set_status("会议删除失败，请重试。")
         else:
+            self._audio_player.remove_temp_wavs(temp_wav_targets)
             skipped = f"，{len(live)} 场进行中的未删除" if live else ""
             self._set_status(f"已删除 {len(ended)} 场会议{skipped}")
         self.refresh()
@@ -2297,13 +2462,7 @@ class MeetingPage(QWidget):
         try:
             Path(path).write_text(self._ctrl.export_meetings_markdown(ids), encoding="utf-8")
         except OSError as exc:
-            box = QMessageBox(self)
-            box.setWindowTitle("导出失败")
-            box.setIcon(QMessageBox.Icon.Critical)
-            box.setText(f"无法写入文件：{exc}")
-            box.addButton("确定", QMessageBox.ButtonRole.AcceptRole)
-            _style_dialog_box(box)
-            box.exec()
+            alert_error(self, "导出失败", f"无法写入文件：{exc}")
             return
         self._set_status(f"已导出 {len(ids)} 场会议")
 
@@ -2580,6 +2739,8 @@ class MeetingPage(QWidget):
         if not meeting_id:
             return
         resolved = str(path or "").strip()
+        no_audio: set[str] = getattr(self, "_no_audio_meeting_ids", set())
+        no_audio.discard(meeting_id)
         if resolved:
             self._meeting_audio_paths[meeting_id] = resolved
         else:
@@ -2592,15 +2753,30 @@ class MeetingPage(QWidget):
     def _resolve_meeting_audio_path(self, record: MeetingRecord | None) -> str:
         if record is None:
             return ""
-        candidates: list[str] = []
+        direct_candidates: list[str] = []
         rec_audio = str(getattr(record, "audio_path", "") or "").strip()
         if rec_audio:
-            candidates.append(rec_audio)
+            direct_candidates.append(rec_audio)
         mapped = self._meeting_audio_paths.get(record.id, "")
         if mapped:
-            candidates.append(mapped)
+            direct_candidates.append(mapped)
+        for cand in direct_candidates:
+            p = Path(cand)
+            if p.is_file() or (p.is_dir() and (p / "audio.f32").is_file()):
+                return str(p)
+        if record.source == IMPORT_SOURCE:
+            return ""
+        no_audio = getattr(self, "_no_audio_meeting_ids", None)
+        if no_audio is None:
+            no_audio = set()
+            self._no_audio_meeting_ids = no_audio
+        if record.status != STATUS_LIVE and record.id in no_audio:
+            return ""
+        candidates: list[str] = []
         cfg_dir = getattr(self._config, "config_dir", None)
         if cfg_dir is not None:
+            import os
+
             base = Path(cfg_dir)
             for rel in (
                 base / "meeting-audio" / f"{record.id}.wav",
@@ -2608,23 +2784,41 @@ class MeetingPage(QWidget):
                 base / "audio-recovery" / f"{record.id}.wav",
             ):
                 candidates.append(str(rel))
+            for cand in candidates:
+                p = Path(cand)
+                if p.is_file() or (p.is_dir() and (p / "audio.f32").is_file()):
+                    return str(p)
             rec_root = base / "audio-recovery"
             if rec_root.is_dir():
                 try:
-                    from sayink.audio_recovery import recordings
+                    sig = hash(
+                        tuple(
+                            sorted(
+                                (entry.name, entry.stat().st_mtime_ns)
+                                for entry in os.scandir(rec_root)
+                            )
+                        )
+                    )
+                    cached = self._recovery_audio_cache.get(record.id)
+                    if cached is not None and cached[0] == sig:
+                        rec_hit = cached[1]
+                    else:
+                        from sayink.audio_recovery import recordings
 
-                    for item in recordings(rec_root):
-                        if str(item.metadata.get("meeting_id") or "") == record.id:
-                            candidates.append(str(item.path))
-                            break
+                        rec_hit = ""
+                        for item in recordings(rec_root):
+                            if str(item.metadata.get("meeting_id") or "") == record.id:
+                                rec_hit = str(item.path)
+                                break
+                        self._recovery_audio_cache[record.id] = (sig, rec_hit)
+                    if rec_hit:
+                        p = Path(rec_hit)
+                        if p.is_file() or (p.is_dir() and (p / "audio.f32").is_file()):
+                            return str(p)
                 except Exception:
                     pass
-        for cand in candidates:
-            if not cand:
-                continue
-            p = Path(cand)
-            if p.is_file() or (p.is_dir() and (p / "audio.f32").is_file()):
-                return str(p)
+        if record.status != STATUS_LIVE and not rec_audio:
+            no_audio.add(record.id)
         return ""
 
     def _clear_detail(self) -> None:
@@ -2787,7 +2981,7 @@ class MeetingPage(QWidget):
                     self._notes_view.setPlaceholderText("会议进行中，结束后可生成纪要或整理原文。")
                 elif not configured:
                     self._notes_view.setPlaceholderText(
-                        f"还没有{self._result_label()}。点击「配置 AI 接口」填写接口地址、密钥和模型，无需开启文字润色。"
+                        f"还没有{self._result_label(notes)}。点击「配置 AI 接口」填写接口地址、密钥和模型，无需开启文字润色。"
                     )
                 else:
                     self._notes_view.setPlaceholderText(
@@ -2798,7 +2992,7 @@ class MeetingPage(QWidget):
                 self._notes_stack.setCurrentWidget(self._notes_empty)
         self._edit_btn.setEnabled(not generating and (bool(markdown) or self._editing_notes))
         if not self._edit_btn.isEnabled():
-            self._edit_btn.setToolTip(f"还没有{self._result_label()}可编辑")
+            self._edit_btn.setToolTip(f"还没有{self._result_label(notes)}可编辑")
         self._sync_notes_state(notes)
 
         segments = self._store.get_segments(self._detail_id)
@@ -2836,8 +3030,8 @@ class MeetingPage(QWidget):
             action.triggered.connect(lambda _=False, sid=speaker_id: self._prompt_rename_speaker(sid))
         self._speaker_btn.setVisible(bool(speaker_ids))
         self._speaker_btn.setEnabled(not generating)
-        self._sync_copy_action()
-        self._sync_content_hint()
+        self._sync_copy_action(notes)
+        self._sync_content_hint(notes)
 
     def _on_template_changed(self, index: int) -> None:
         self._template_combo.setToolTip(str(self._template_combo.itemData(index, Qt.ItemDataRole.ToolTipRole) or ""))
@@ -2849,13 +3043,20 @@ class MeetingPage(QWidget):
     def _is_refinement(self, template_id: str | None = None) -> bool:
         return get_template(template_id or str(self._template_combo.currentData() or "general"), self._custom_templates()).is_refinement
 
-    def _result_label(self) -> str:
-        notes = self._store.get_notes(self._detail_id) if self._detail_id else None
-        template_id = notes.template_id if notes is not None and notes.markdown else None
+    _NOTES_UNSET = object()
+
+    def _resolve_notes(self, notes: object = _NOTES_UNSET):
+        if notes is self._NOTES_UNSET:
+            return self._store.get_notes(self._detail_id) if self._detail_id else None
+        return notes
+
+    def _result_label(self, notes: object = _NOTES_UNSET) -> str:
+        resolved = self._resolve_notes(notes)
+        template_id = resolved.template_id if resolved is not None and resolved.markdown else None
         return "精整正文" if self._is_refinement(template_id) else "纪要"
 
     def _sync_result_actions(self, notes) -> None:
-        label = self._result_label()
+        label = self._result_label(notes)
         has_notes = notes is not None and bool(notes.markdown)
         if minutes_settings_complete(self._config):
             if self._is_refinement():
@@ -2893,6 +3094,7 @@ class MeetingPage(QWidget):
             self._status_label.hide()
             self._paint_notes_state()
             return
+        result_label = self._result_label(notes)
         if self._editing_notes:
             state = "正在编辑 · 尚未保存"
         elif notes is None or not notes.markdown:
@@ -2900,7 +3102,7 @@ class MeetingPage(QWidget):
         else:
             state = "已手动编辑" if notes.user_edited else "AI 生成"
         if notes is not None and notes.transcript_changed:
-            state += f" · 文字稿已更正，{self._result_label()}需核对，建议重新生成"
+            state += f" · 文字稿已更正，{result_label}需核对，建议重新生成"
         elif notes is not None and "（待核对）" in notes.markdown:
             state += " · 含待核对内容"
         job = self._ctrl.queued_generation(self._detail_id) if self._detail_id else None
@@ -2915,7 +3117,7 @@ class MeetingPage(QWidget):
         else:
             self._notes_state.setToolTip(
                 "保留细节与语气的 AI 整理稿，可切换到文字稿核对；手动编辑不等于内容已经核实。"
-                if self._result_label() == "精整正文" else
+                if result_label == "精整正文" else
                 "纪要根据文字稿生成；点击引用可核对来源。手动编辑不等于内容已经核实。"
             )
         self._paint_notes_state()
@@ -2925,7 +3127,7 @@ class MeetingPage(QWidget):
         if job.failed:
             return f"自动生成失败：{reason}"
         if job.not_before > now_ms():
-            at = time.strftime("%H:%M", time.localtime(job.not_before / 1000))
+            at = _safe_dt(job.not_before).strftime("%H:%M")
             return f"自动生成暂时失败（{reason}），{at} 自动重试"
         if job.automatic and self._ctrl.defers_automatic_jobs():
             return "会议进行中，本机模型空闲后自动生成"
@@ -2954,7 +3156,7 @@ class MeetingPage(QWidget):
         )
         row.setContentsMargins(0, 0, 0, 0)
 
-    def _sync_content_hint(self) -> None:
+    def _sync_content_hint(self, notes: object = _NOTES_UNSET) -> None:
         if self._batch_mode:
             # The hint describes the open meeting, which batch mode hides.
             self._content_hint.hide()
@@ -2972,9 +3174,9 @@ class MeetingPage(QWidget):
         elif self._ctrl.generating_for == self._detail_id:
             hint = "生成预览尚未保存；复制和导出仍使用上一版。点「取消」可停下。"
         else:
-            notes = self._store.get_notes(self._detail_id) if self._detail_id else None
-            if notes is not None and notes.markdown and self._template_combo.currentData() != notes.template_id:
-                hint = f"下次生成将使用「{self._template_combo.currentText()}」；当前{self._result_label()}保持原模板。"
+            resolved = self._resolve_notes(notes)
+            if resolved is not None and resolved.markdown and self._template_combo.currentData() != resolved.template_id:
+                hint = f"下次生成将使用「{self._template_combo.currentText()}」；当前{self._result_label(resolved)}保持原模板。"
             elif self._is_refinement():
                 hint = "融合成文，保留细节与口吻；重要内容请核对文字稿。"
             else:
@@ -2982,27 +3184,29 @@ class MeetingPage(QWidget):
         self._content_hint.setText(hint)
         self._content_hint.setVisible(bool(hint))
 
-    def _current_notes_text(self) -> str:
+    def _current_notes_text(self, notes: object = _NOTES_UNSET) -> str:
         if self._editing_notes:
             return self._notes_edit.toPlainText()
-        notes = self._store.get_notes(self._detail_id) if self._detail_id else None
-        return notes.markdown if notes is not None else ""
+        resolved = self._resolve_notes(notes)
+        return resolved.markdown if resolved is not None else ""
 
-    def _sync_copy_action(self) -> None:
+    def _sync_copy_action(self, notes: object = _NOTES_UNSET) -> None:
         if not hasattr(self, "_transcript_view"):
             return
         from sayink.ui import settings_styles as ss
 
-        label = "复制草稿" if self._editing_notes else "复制" + self._result_label()
+        resolved = self._resolve_notes(notes)
+        result_label = self._result_label(resolved)
+        label = "复制草稿" if self._editing_notes else "复制" + result_label
         self._copy_btn.setText(label)
         self._copy_btn.setAccessibleName(label)
         shortcut = "" if self._editing_notes else " · Ctrl+C"
-        self._copy_btn.setToolTip(label + ("" if self._result_label() == "精整正文" else " Markdown") + shortcut)
-        has_notes = bool(self._current_notes_text().strip())
+        self._copy_btn.setToolTip(label + ("" if result_label == "精整正文" else " Markdown") + shortcut)
+        has_notes = bool(self._current_notes_text(resolved).strip())
         has_transcript = bool(self._detail_id and self._transcript_offsets)
         self._copy_btn.setEnabled(has_notes)
         if not has_notes:
-            self._copy_btn.setToolTip(f"还没有{self._result_label()}可复制")
+            self._copy_btn.setToolTip(f"还没有{result_label}可复制")
         self._transcript_copy_btn.setEnabled(has_transcript)
         # Same filled action as 历史's copy button. The large primary style is
         # taller than the shared small-button box and made the two toolbars disagree.
@@ -3267,7 +3471,6 @@ class MeetingPage(QWidget):
             self._editing_notes = False
         restore_fn = (
             getattr(self._ctrl, "restore_user_markdown", None)
-            or getattr(self._ctrl, "restore_user_notes", None)
             or getattr(self._store, "restore_user_markdown", None)
         )
         if callable(restore_fn) and getattr(notes, "user_markdown", ""):
@@ -3477,6 +3680,10 @@ class MeetingPage(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if not defer_while_live_resize(self, self._follow_live_resize):
+            self._follow_live_resize()
+
+    def _follow_live_resize(self) -> None:
         if hasattr(self, "_materials_scroll"):
             cap = max(108, min(200, int(self.height() * 0.28)))
             self._materials_scroll.setMaximumHeight(cap)
@@ -3738,7 +3945,7 @@ class MeetingPage(QWidget):
         done = "已复制当前草稿" if self._editing_notes else (
             "已复制精整正文" if self._result_label() == "精整正文" else "已复制纪要 Markdown"
         )
-        self._set_status(done if copy_text(text) else "复制失败，请重试")
+        self._set_status(done if copy_text(text) else COPY_FAILED_TEXT)
 
     def _copy_current(self) -> None:
         if self._content_stack.currentIndex() == 0:
@@ -3750,7 +3957,7 @@ class MeetingPage(QWidget):
         if self._detail_id:
             text = self._ctrl.transcript_text(self._detail_id)
             if text:
-                self._set_status("已复制文字稿" if copy_text(text) else "复制失败，请重试")
+                self._set_status("已复制文字稿" if copy_text(text) else COPY_FAILED_TEXT)
 
     def _export(self, scope: str = "all") -> None:
         if not self._flush_bound_title(sync=True) or not self._save_record_notes():
@@ -3760,7 +3967,7 @@ class MeetingPage(QWidget):
             return
         label = {"notes": self._result_label(), "transcript": "文字稿", "all": "完整会议记录"}[scope]
         default = export_save_path(
-            f"{safe_filename(record.display_title)}-{label}-{time.strftime('%Y%m%d', time.localtime(record.started_at / 1000))}.md"
+            f"{safe_filename(record.display_title)}-{label}-{_safe_dt(record.started_at).strftime('%Y%m%d')}.md"
         )
         filters = "Markdown (*.md);;纯文本 (*.txt)"
         if self._transcript_has_times:
@@ -3777,12 +3984,11 @@ class MeetingPage(QWidget):
         path = _with_export_suffix(raw_path, kind)
         if not self._confirm_export_overwrite_if_adjusted(raw_path, path):
             return
+        srt_note = ""
         try:
             if kind == "srt":
                 text = self._ctrl.export_transcript_srt(record.id)
-                note = getattr(self._ctrl, "srt_skip_note", "") or ""
-                if note:
-                    self._set_status(note)
+                srt_note = getattr(self._ctrl, "srt_skip_note", "") or ""
             elif kind == "txt":
                 if scope == "notes":
                     text = self._current_notes_text()
@@ -3809,16 +4015,10 @@ class MeetingPage(QWidget):
                 text = self._ctrl.export_markdown(record.id)
             Path(path).write_text(text, encoding="utf-8")
         except OSError as exc:
-            box = QMessageBox(self)
-            box.setWindowTitle("导出失败")
-            box.setIcon(QMessageBox.Icon.Critical)
-            box.setText(f"无法写入文件：{exc}")
-            box.addButton("确定", QMessageBox.ButtonRole.AcceptRole)
-            _style_dialog_box(box)
-            box.exec()
+            alert_error(self, "导出失败", f"无法写入文件：{exc}")
             return
         if kind == "srt":
-            self._set_status("已导出文字稿字幕")
+            self._set_status(f"已导出文字稿字幕（{srt_note}）" if srt_note else "已导出文字稿字幕")
         else:
             self._set_status("已导出" + label + ("（包含当前草稿）" if self._editing_notes and scope != "transcript" else ""))
 
@@ -3850,11 +4050,15 @@ class MeetingPage(QWidget):
         box.exec()
         if box.clickedButton() != delete:
             return
-        self._audio_player.stop()
+        temp_wav_targets = self._audio_player.collect_temp_wavs_for_audio_paths(
+            [record.audio_path] if record.audio_path else ()
+        )
+        self._audio_player.unload_source()
         if self._ctrl.delete_meeting(record.id) is False:
             self._set_status("会议删除失败，请重试。")
             self.refresh()
             return
+        self._audio_player.remove_temp_wavs(temp_wav_targets)
         self._editing_notes = False
         self._detail_id = ""
         self._drafts.title_meeting_id = ""
@@ -4124,8 +4328,7 @@ class MeetingPage(QWidget):
         self._opt_save_audio.blockSignals(True)
         self._opt_save_audio.setChecked(bool(self._config.get("meeting.save_audio", True)))
         self._opt_save_audio.blockSignals(False)
-        self._sync_follow_source_label()
-        index = self._opt_source.findData(self._config.get("meeting.input_source", "") or "")
+        index = self._opt_source.findData(defaults.input_source)
         self._opt_source.setCurrentIndex(max(0, index))
         self._opt_model.blockSignals(True)
         self._opt_model.clear()
@@ -4150,14 +4353,8 @@ class MeetingPage(QWidget):
         from sayink.speech_recognizer import get_model_info
 
         info = get_model_info(self._config.get("stt.model_id", ""))
-        name = info["name"] if info else "尚未选择"
-        return f"跟随转写（{name}）"
-
-    def _sync_follow_source_label(self) -> None:
-        """The follow option names the dictation source; a card choice stays put."""
-        self._opt_source.setItemText(
-            0, f"跟随转写（当前：{input_source_label(audio_source(self._config))}）"
-        )
+        name = info["name"] if info else "未选择"
+        return f"与转写相同（当前：{name}）"
 
     def _update_card_notes(self) -> None:
         from sayink import audio_devices
@@ -4251,26 +4448,17 @@ class MeetingPage(QWidget):
 
     def _options_from_card(self) -> MeetingOptions:
         defaults = MeetingOptions.from_config(self._config)
-        save_audio = bool(self._opt_save_audio.isChecked())
-        kwargs: dict = dict(
+        return MeetingOptions(
             title=self._opt_title.text().strip(),
             participants=self._opt_participants.text().strip(),
             agenda=self._opt_agenda.toPlainText().strip(),
-            input_source=str(self._opt_source.currentData() or audio_source(self._config)),
+            input_source=str(self._opt_source.currentData() or defaults.input_source),
             model_id=str(self._opt_model.currentData() or ""),
             glossary=defaults.glossary,
             vad=defaults.vad,
             language=str(self._opt_language.currentData() or "auto"),
+            save_audio=bool(self._opt_save_audio.isChecked()),
         )
-        if "save_audio" in getattr(MeetingOptions, "__dataclass_fields__", {}):
-            kwargs["save_audio"] = save_audio
-        options = MeetingOptions(**kwargs)
-        if not hasattr(options, "save_audio"):
-            try:
-                object.__setattr__(options, "save_audio", save_audio)
-            except Exception:
-                pass
-        return options
 
     def _leave_start_card(self) -> None:
         self._start_btn.setVisible(True)
@@ -4287,8 +4475,8 @@ class MeetingPage(QWidget):
     LIVE_REMOTE_SILENCE_THRESHOLD = 0.008
     LIVE_REMOTE_SILENCE_SECONDS = 15.0
     _DEFAULT_SYSTEM_SILENT_MSG = (
-        "电脑声（对方）已连续 15 秒无声音输入：若正在使用蓝牙耳机（Hands-Free 通信设备）"
-        "或外接声卡，请检查 Windows 默认播放设备与会议软件扬声器输出是否一致。"
+        "电脑声（对方）已连续 15 秒无声音输入：线下会议可忽略。线上会议若正在使用蓝牙耳机"
+        "（Hands-Free 通信设备）或外接声卡，请检查 Windows 默认播放设备与会议软件扬声器输出是否一致。"
     )
 
     def _live_input_source(self) -> str:
@@ -4326,9 +4514,6 @@ class MeetingPage(QWidget):
                 self._system_silent_banner.hide()
         else:
             self._check_live_remote_silence()
-
-    update_lane_levels = set_lane_levels
-    set_live_levels = set_lane_levels
 
     def show_system_silent_warning(self, message: str = "") -> None:
         """Show non-blocking yellow warning banner when remote computer audio stays silent."""
@@ -4537,9 +4722,7 @@ class MeetingPage(QWidget):
         rendered = self._transcript_html(transcript_lines(segments, started_at), names, links=True, live=True)
         if rendered != self._drafts.live_html:
             previous = self._drafts.live_html
-            if previous and self._live_transcript.retarget_speaker_labels(previous, rendered):
-                self._drafts.live_html = rendered
-            elif previous and rendered.startswith(previous):
+            if previous and rendered.startswith(previous):
                 self._drafts.live_html = rendered
                 # Normal live transcription only adds paragraphs. Keep the
                 # existing document instead of parsing and laying it out again.
@@ -4555,6 +4738,8 @@ class MeetingPage(QWidget):
                 cursor.setPosition(position, QTextCursor.MoveMode.KeepAnchor)
                 self._live_transcript.setTextCursor(cursor)
                 bar.setValue(bar.maximum() if at_end and position == anchor else scroll)
+            elif previous and self._live_transcript.retarget_speaker_labels(previous, rendered):
+                self._drafts.live_html = rendered
             elif previous and self._live_transcript.retarget_paragraphs(previous, rendered, polish_line_height=False):
                 self._drafts.live_html = rendered
                 bar.setValue(bar.maximum() if at_end and position == anchor else scroll)

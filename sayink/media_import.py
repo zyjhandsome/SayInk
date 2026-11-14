@@ -62,7 +62,7 @@ def segment_pcm(audio: np.ndarray, *, vad: str, vad_path, cancel=None) -> list[A
 
 def segment_blocks(blocks, *, vad: str, vad_path, cancel=None) -> list[AudioChunk]:
     """Cut a stream of 16 kHz mono blocks. Only a fraction of a second is buffered."""
-    from sayink.vad_segmenter import VAD_ENERGY, make_meeting_segmenter
+    from sayink.vad_segmenter import VAD_ENERGY, attach_segment_acoustics, make_meeting_segmenter
 
     segmenter = make_meeting_segmenter(vad=vad or VAD_ENERGY, model_path=vad_path)
     chunks: list[AudioChunk] = []
@@ -74,7 +74,12 @@ def segment_blocks(blocks, *, vad: str, vad_path, cancel=None) -> list[AudioChun
         if bounds is None or piece is None or not len(piece):
             return
         start, stop = bounds
-        chunks.append(AudioChunk(int(start), int(stop), np.ascontiguousarray(piece, dtype=np.float32)))
+        arr = attach_segment_acoustics(
+            np.ascontiguousarray(piece, dtype=np.float32),
+            noise_floor=getattr(piece, "noise_floor", None),
+            quiet_level=float(getattr(piece, "quiet_level", 0.0) or 0.0),
+        )
+        chunks.append(AudioChunk(int(start), int(stop), arr))
 
     def feed_ready() -> bool:
         nonlocal pending
@@ -200,6 +205,9 @@ def _chunk_analyzer(embedder, session, chunk):
     return analyzer
 
 
+_UNSET = object()
+
+
 def recognize_file(
     path,
     *,
@@ -211,6 +219,9 @@ def recognize_file(
     progress=None,
     glossary=(),
     progress_cb: Callable[[int, str], None] | None = None,
+    speaker_model_enabled: bool = True,
+    speaker_activity_enabled: bool = False,
+    activity_path: str | Path | None | object = _UNSET,
 ) -> RecognitionResult:
     """Read ``path`` in place and recognize it with the meeting segmenter."""
     from sayink.audio_file_decoder import AudioDecodeError
@@ -255,7 +266,7 @@ def recognize_file(
             blocks.close()
         audio_ms = int(total * 1000 / TARGET_SAMPLE_RATE)
         read_msg = f"已读取 {audio_ms / 1000:.0f} 秒音频"
-        if progress is not None:
+        if progress is not None and progress_cb is None:
             progress(read_msg)
         if progress_cb is not None:
             progress_cb(30, read_msg)
@@ -276,14 +287,24 @@ def recognize_file(
                 return RecognitionResult((), True, audio_path=resolved_audio_path)
             raise
         read_msg = f"已读取 {audio.size / TARGET_SAMPLE_RATE:.0f} 秒音频"
-        if progress is not None:
+        if progress is not None and progress_cb is None:
             progress(read_msg)
         if progress_cb is not None:
             progress_cb(30, read_msg)
-        chunks = segment_pcm(audio, vad=vad, vad_path=vad_path, cancel=cancel)
         audio_ms = int(audio.size * 1000 / TARGET_SAMPLE_RATE)
-    available = bool(speaker_path and Path(speaker_path).is_file())
-    embedder = make_embedder(speaker_path, enabled=available)
+        chunks = segment_pcm(audio, vad=vad, vad_path=vad_path, cancel=cancel)
+        del audio
+        if cancel is not None and cancel():
+            return RecognitionResult((), True, audio_ms=audio_ms, audio_path=resolved_audio_path)
+    effective_speaker_path = speaker_path if speaker_model_enabled else None
+    available = bool(effective_speaker_path and Path(effective_speaker_path).is_file())
+    embedder_kwargs: dict = {
+        "enabled": bool(speaker_model_enabled) and available,
+        "activity_enabled": bool(speaker_activity_enabled),
+    }
+    if activity_path is not _UNSET:
+        embedder_kwargs["activity_path"] = activity_path
+    embedder = make_embedder(effective_speaker_path, **embedder_kwargs)
     session = MeetingSpeakerSession.for_embedder(embedder)
 
     def decode_chunk(chunk):
@@ -298,7 +319,7 @@ def recognize_file(
 
     def _on_chunk_progress(done: int, total_chunks: int) -> None:
         msg = f"正在识别 {done}/{total_chunks} 段"
-        if progress is not None:
+        if progress is not None and progress_cb is None:
             progress(msg)
         if progress_cb is not None:
             pct = 30 + int(70 * done // max(1, total_chunks))

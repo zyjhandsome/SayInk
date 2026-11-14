@@ -81,7 +81,7 @@ def app_harness(config_overrides: dict | None = None, *, real_history: bool = Fa
             patch("sayink.speech_recognizer.is_model_downloaded", return_value=True),
         ]
         if not real_history:
-            patches.append(patch("sayink.app.HistoryStore", create=True))
+            patches.append(patch("sayink.app.HistoryStore"))
         for p in patches:
             p.start()
 
@@ -98,6 +98,9 @@ def app_harness(config_overrides: dict | None = None, *, real_history: bool = Fa
         app._onboarding.show_setup = lambda: None
         app._onboarding.ask_history_enabled = lambda: False
         app._updates.maybe_auto_check = lambda: None
+        # start() builds the real main window on a zero-timer. A later test's
+        # processEvents would otherwise pop that window and walk every page.
+        app._prebuild_main_window = lambda: None
         harness = {
             "app": app,
             "config": config_mock,

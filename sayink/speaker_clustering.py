@@ -49,7 +49,8 @@ def average_linkage_labels(vectors: np.ndarray, max_distance: float) -> np.ndarr
         return np.zeros(0, dtype=np.int64)
     if n == 1:
         return np.zeros(1, dtype=np.int64)
-    matrix = 1.0 - vectors.astype(np.float64) @ vectors.astype(np.float64).T
+    v64 = vectors.astype(np.float64)
+    matrix = 1.0 - v64 @ v64.T
     np.fill_diagonal(matrix, np.inf)
     sizes = np.ones(n, dtype=np.float64)
     members: dict[int, list[int]] = {i: [i] for i in range(n)}
@@ -76,10 +77,12 @@ def average_linkage_labels(vectors: np.ndarray, max_distance: float) -> np.ndarr
         # Every other row's distance to i changed; its minimum can only move
         # if i (or the vanished j) was its nearest, or i just became nearer.
         stale = np.flatnonzero((row_arg == i) | (row_arg == j))
-        for k in stale:
-            if k != i and np.isfinite(row_min[k]):
-                row_min[k] = matrix[k].min()
-                row_arg[k] = int(matrix[k].argmin())
+        stale = stale[(stale != i) & np.isfinite(row_min[stale])]
+        if stale.size:
+            sub = matrix[stale]
+            args = np.argmin(sub, axis=1)
+            row_arg[stale] = args
+            row_min[stale] = sub[np.arange(stale.size), args]
         closer = np.flatnonzero(matrix[:, i] < row_min)
         row_min[closer] = matrix[closer, i]
         row_arg[closer] = i

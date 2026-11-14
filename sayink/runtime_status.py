@@ -57,14 +57,14 @@ class SegmentationStatus:
 
     @property
     def label(self) -> str:
-        if self.requested != "silero":
-            return "能量断句 · 当前生效"
         if not self.model_available:
             return "Silero VAD 未下载 · 当前使用能量断句"
         if not self.effective:
             return "Silero VAD 已下载 · 正在加载…"
         if self.effective == "silero":
             return "Silero VAD 已下载 · 已加载 · 当前生效"
+        if self.requested != "silero" and not self.error:
+            return "Silero VAD 已下载 · 当前使用能量断句"
         return "Silero VAD 已下载 · 加载失败 · 已回退能量断句"
 
 

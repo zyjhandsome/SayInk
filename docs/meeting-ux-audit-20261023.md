@@ -77,7 +77,7 @@
 
 **原因**：页面“结束会议”先调用 `_save_user_notes()`，但托盘直接进入控制器结束流程。会议结束后 `_current` 被清空，稍后到期的保存函数取不到 `current_id`，直接返回。
 
-定位：[笔记定时器](../sayink/ui/meeting_page.py:1224)、[保存与页面结束入口](../sayink/ui/meeting_page.py:2726)、[托盘共用结束处理](../sayink/app.py:2664)、[清空当前会议](../sayink/meeting_session.py:459)。
+定位：[笔记定时器](../sayink/ui/meeting_page.py#L1224)、[保存与页面结束入口](../sayink/ui/meeting_page.py#L2726)、[托盘共用结束处理](../sayink/app.py#L2664)、[清空当前会议](../sayink/meeting_session.py#L459)。
 
 **建议**：统一所有结束／退出入口的草稿提交；草稿绑定自己的 meeting_id，不在定时器触发时临时读取当前场次。提交成功后再进入不可恢复的结束清理。验收应覆盖：页面结束、托盘结束、退出、结束后马上开新会议，末次输入均归属正确。
 
@@ -89,7 +89,7 @@
 
 `hideEvent()` 无法撤销已经完成的页面切换；主窗口也没有预先检查保存结果。程序退出路径同样没有基于这一失败返回值阻止退出，存在进一步丢稿风险；该退出后丢稿属于代码路径推断，本次没有强制退出真实应用验证。
 
-定位：[会议页隐藏处理](../sayink/ui/meeting_page.py:2183)、[页面导航](../sayink/ui/main_window.py:667)、[退出清理](../sayink/app.py:3184)。
+定位：[会议页隐藏处理](../sayink/ui/meeting_page.py#L2183)、[页面导航](../sayink/ui/main_window.py#L667)、[退出清理](../sayink/app.py#L3184)。
 
 **建议**：导航前调用可返回成功／失败的 `try_leave`；失败保留编辑页、焦点与草稿，并提供重试和复制草稿。关闭到托盘与真正退出分开处理，真正退出需能保留未保存草稿。
 
@@ -101,7 +101,7 @@
 
 控制器不返回恢复结果，`flush()` 结果未检查；页面无条件显示成功。该探针模拟未落盘，不代表正常磁盘条件下每次都会失败。
 
-定位：[控制器恢复](../sayink/meeting_session.py:780)、[页面恢复反馈](../sayink/ui/meeting_page.py:2068)。
+定位：[控制器恢复](../sayink/meeting_session.py#L780)、[页面恢复反馈](../sayink/ui/meeting_page.py#L2068)。
 
 **建议**：读回正文和版本元数据，确认交换成功后再提示。删除会议等相邻写操作也建议采用统一的结果返回约定，不再由页面自行推断成功。
 
@@ -113,7 +113,7 @@
 
 标题更新只入队，页面立即重新查询并重绘，读到了提交前的内容。正常磁盘下可能只表现为短暂闪回；故障时也没有标题级的重试草稿与状态。
 
-定位：[标题保存](../sayink/ui/meeting_page.py:2006)、[异步更新](../sayink/meeting_session.py:535)、[刷新标题](../sayink/ui/meeting_page.py:1624)。
+定位：[标题保存](../sayink/ui/meeting_page.py#L2006)、[异步更新](../sayink/meeting_session.py#L535)、[刷新标题](../sayink/ui/meeting_page.py#L1624)。
 
 **建议**：保留本地 pending 标题，写入确认后提交视图状态；失败仍保留用户输入。避免仅为消除闪回在 UI 线程上增加长时间阻塞等待。
 
@@ -123,7 +123,7 @@
 
 **实测**：点击前 `isUndoAvailable=True`，点击后变为 False，新增草稿无法恢复。
 
-定位：[恢复原文按钮](../sayink/ui/meeting_page.py:592)。
+定位：[恢复原文按钮](../sayink/ui/meeting_page.py#L592)。
 
 **建议**：通过 QTextCursor 的单个编辑事务替换内容，使“恢复原文”成为一个可撤销动作。保留“保存修改后才生效”的现有规则。验收覆盖恢复、撤销、重做，再保存。
 
@@ -135,7 +135,7 @@
 
 Qt 文本位置按 UTF-16 代码单元计数，Python 字符串切片按 Unicode 码点计数；当前实现直接把前者用于后者。emoji、部分扩展汉字等都会触发这一类偏移。完整文字稿复制走另一条路径，不能据此推断也受影响。
 
-定位：[过滤操作链接时的切片](../sayink/ui/meeting_page.py:431)。
+定位：[过滤操作链接时的切片](../sayink/ui/meeting_page.py#L431)。
 
 **建议**：保留通过 Qt 子光标获取片段文本的语义，或明确转换 UTF-16 偏移。补充 emoji 前后、扩展汉字、跨段、反向选择、混合中英文用例。
 
@@ -145,7 +145,7 @@ Qt 文本位置按 UTF-16 代码单元计数，Python 字符串切片按 Unicode
 
 **实测**：`selected target` 选区变为空，cursor.position 变为 0。滚动条位置保留不能解决光标回到开头的问题。
 
-定位：[阅读视图替换内容](../sayink/ui/meeting_page.py:209)、[保存段落后刷新](../sayink/ui/meeting_page.py:2318)。
+定位：[阅读视图替换内容](../sayink/ui/meeting_page.py#L209)、[保存段落后刷新](../sayink/ui/meeting_page.py#L2318)。
 
 **建议**：优先更新对应段落；需要全文重建时，按段落 seq 与段内位置恢复焦点、选区和视口。保存后落在刚编辑的段落附近，避免回到整篇开头。鼠标操作与键盘操作的焦点返回规则应分别验证。
 
@@ -157,7 +157,7 @@ Qt 文本位置按 UTF-16 代码单元计数，Python 字符串切片按 Unicode
 
 实时刷新保存的是全文绝对 position／anchor。前文长度改变后，这两个数字已经不再代表原来的语义位置。普通追加的既有测试通过，不代表改名和前文更正也安全。
 
-定位：[实时重建与选区恢复](../sayink/ui/meeting_page.py:2685)。
+定位：[实时重建与选区恢复](../sayink/ui/meeting_page.py#L2685)。
 
 **建议**：使用“段落 seq + 正文内部偏移”，将姓名、时间与操作链接排除在正文坐标外；对被删改的原选区作有界退化处理。复测应同时覆盖增量追加、改名、纠正归属与更正前文。
 
@@ -169,7 +169,7 @@ Qt 文本位置按 UTF-16 代码单元计数，Python 字符串切片按 Unicode
 
 默认查询限制 100 条，页面没有分页；指定 ID 不在当前结果内时走“选择第一条”。通过关键词搜索仍可能找回旧会议，因此不是数据库删除。
 
-定位：[列表默认上限](../sayink/meeting_store.py:753)、[列表刷新及回退](../sayink/ui/meeting_page.py:1433)、[指定会议](../sayink/ui/meeting_page.py:1576)。
+定位：[列表默认上限](../sayink/meeting_store.py#L753)、[列表刷新及回退](../sayink/ui/meeting_page.py#L1433)、[指定会议](../sayink/ui/meeting_page.py#L1576)。
 
 **建议**：增加总数查询与“加载更多”，或明确显示“已加载 100 场”。按 ID 打开时独立载入目标，不让列表分页或搜索过滤把目标换掉。
 
@@ -179,7 +179,7 @@ Qt 文本位置按 UTF-16 代码单元计数，Python 字符串切片按 Unicode
 
 **实测**：`MARK TO COPY` 的选区变为空。
 
-定位：[无条件设置标记 HTML](../sayink/ui/meeting_page.py:2712)。
+定位：[无条件设置标记 HTML](../sayink/ui/meeting_page.py#L2712)。
 
 **建议**：标记内容未变时不重建；增加时只追加，保留选区和阅读位置。最好让标记可点击跳转对应文字稿。
 
@@ -189,7 +189,7 @@ Qt 文本位置按 UTF-16 代码单元计数，Python 字符串切片按 Unicode
 
 **实测**：数据库中能读到 `MY PRIVATE AUDIT NOTE` 和 `MY IMPORTANT AUDIT MARK`；会后两块控件均不可见，完整导出中也没有它们。本次用无转写的会议验证，导出只包含标题、时间与时长。已有 AI 纪要可能参考这些信息，但不是原始笔记的可靠替代。
 
-定位：[会后仅纪要／文字稿两个内容页](../sayink/ui/meeting_page.py:1002)、[完整导出](../sayink/meeting_session.py:809)。
+定位：[会后仅纪要／文字稿两个内容页](../sayink/ui/meeting_page.py#L1002)、[完整导出](../sayink/meeting_session.py#L809)。
 
 **建议**：在会后提供“会议资料／我的笔记与标记”的可折叠入口，支持查看、继续编辑、定位标记；完整导出明确包含议程、原始笔记和标记，其他范围保持可选。会后应能修改参会人与议程。
 
@@ -207,7 +207,7 @@ Qt 文本位置按 UTF-16 代码单元计数，Python 字符串切片按 Unicode
 
 普通追加已经使用增量插入，这是正确方向。但每次仍读取并构造全量文字；改名／纠正走全文 setHtml，随后遍历操作链接并重新布局。正文保存还会在 UI 调用链等待写入 barrier，存储繁忙时可能叠加等待。
 
-定位：[实时刷新](../sayink/ui/meeting_page.py:2663)、[逐块隐藏操作](../sayink/ui/meeting_page.py:331)、[正文写入等待](../sayink/meeting_session.py:661)。
+定位：[实时刷新](../sayink/ui/meeting_page.py#L2663)、[逐块隐藏操作](../sayink/ui/meeting_page.py#L331)、[正文写入等待](../sayink/meeting_session.py#L661)。
 
 **建议**：缓存分段模型与正文映射，只替换受影响的块；合并短时间重复刷新；写入确认通过异步结果回到 UI。建议验收目标：500 段常用编辑响应尽量控制在 100 ms 内，超过则即时显示保存状态；具体目标需再用目标机器基准确认。
 

@@ -257,7 +257,7 @@ def build_transcript_html(
             if not live and seq in corrected_sequences:
                 head += (
                     f" <a href='edited-segment:{seq}' title='查看修改详情与原文，可恢复原文' "
-                    f"style='color:{tok.TEXT_DIM}; font-size:12px; text-decoration:none'>已编辑</a>"
+                    f"style='color:{tok.TEXT_DIM}; font-size:{tok.TYPE_CAPTION}px; text-decoration:none'>已编辑</a>"
                 )
             if correcting:
                 correction = f" <a href='{segment_link}:{seq}' style='color:{tok.ACCENT_TEXT}'>更正</a>"
@@ -551,11 +551,6 @@ class _ReadingView(QTextBrowser):
             cursor.setPosition(start)
             cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
             cursor.mergeCharFormat(link)
-
-    @staticmethod
-    def _style_links(block, color: str) -> None:
-        cursor = QTextCursor(block.document())
-        _ReadingView._style_links_with_cursor(cursor, block, color)
 
     def _fit_text_width(self) -> None:
         fit_reading_width(self, fill_available=True)

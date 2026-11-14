@@ -23,8 +23,43 @@ def _qapp_session():
     """
     from PyQt6.QtWidgets import QApplication
 
-    app = QApplication.instance() or QApplication(sys.argv)
-    yield app
+    return QApplication.instance() or QApplication(sys.argv)
+
+
+@pytest.fixture(scope="session")
+def qapp(_qapp_session):
+    """Shared QApplication fixture for UI tests."""
+    return _qapp_session
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_leaked_top_level_widgets(_qapp_session):
+    """Hide/retire top-level widgets leaked by a test and stop orphan timers.
+
+    Prevents active timers (e.g. 8s undo timers) from firing into later tests
+    and avoids O(N^2) QApplication.setStyleSheet() cascades across shards.
+    Never calls .close() (which could trigger modal dirty-draft closeEvent
+    dialogs) or sendPostedEvents(DeferredDelete) (which breaks Qt6 loop-level
+    lifetime safety for QMediaPlayer / half-constructed widgets).
+    """
+    from PyQt6 import sip
+    from PyQt6.QtCore import QTimer
+
+    before = {w for w in _qapp_session.topLevelWidgets() if not sip.isdeleted(w)}
+    yield
+    after = [w for w in _qapp_session.topLevelWidgets() if not sip.isdeleted(w) and w not in before]
+    if not after:
+        return
+    for widget in after:
+        try:
+            for timer in widget.findChildren(QTimer):
+                if not sip.isdeleted(timer) and timer.isActive():
+                    timer.stop()
+            widget.hide()
+            widget.deleteLater()
+        except RuntimeError:
+            pass
+    _qapp_session.processEvents()
 
 
 @pytest.fixture(autouse=True)

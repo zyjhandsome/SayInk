@@ -9,6 +9,177 @@ from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QSize, QRect, QRectF, QPoint,
 
 from sayink.runtime_status import MEETING_STATE_LABELS
 
+# Windows turns a CW_USEDEFAULT overlapped window into a real caption
+# (WS_CAPTION). The tray owner is that window. A double-click asks the shell
+# to show it after our hide returns, which is the small icon / minimize /
+# close / white client. The proc below refuses that show.
+_WM_WINDOWPOSCHANGING = 0x0046
+_SWP_NOMOVE = 0x0002
+_SWP_NOACTIVATE = 0x0010
+_SWP_SHOWWINDOW = 0x0040
+_SWP_HIDEWINDOW = 0x0080
+_GWL_STYLE = -16
+_GWL_EXSTYLE = -20
+_GWLP_WNDPROC = -4
+_WS_CAPTION_BITS = 0x00C00000 | 0x00040000 | 0x00080000 | 0x00020000 | 0x00010000
+_WS_POPUP = 0x80000000
+_WS_EX_TOOLWINDOW = 0x00000080
+_WS_EX_NOACTIVATE = 0x08000000
+_PINNED_PROCS: list = []
+_PINNED_HWNDS: dict[int, int] = {}
+
+
+def _win32_user32():
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    wndenumproc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    if hasattr(user32.EnumWindows, "argtypes"):
+        user32.EnumWindows.argtypes = [wndenumproc, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND, ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindow.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+    user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+    user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+    ]
+    user32.CallWindowProcW.argtypes = [
+        ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+    user32.CallWindowProcW.restype = ctypes.c_ssize_t
+    return user32
+
+
+def keep_hwnd_hidden(hwnd: int) -> None:
+    """Stop a helper window from appearing as a captioned box.
+
+    Hiding once is not enough: the shell shows the tray owner again when the
+    icon is double-clicked, after the click handler has already returned.
+    """
+    if sys.platform != "win32" or not hwnd:
+        return
+    try:
+        user32 = _win32_user32()
+        if not user32.IsWindow(hwnd):
+            return
+        _install_hide_hook(user32, int(hwnd))
+        style = user32.GetWindowLongPtrW(hwnd, _GWL_STYLE)
+        buried = (style & ~_WS_CAPTION_BITS) | _WS_POPUP
+        if buried != style:
+            user32.SetWindowLongPtrW(hwnd, _GWL_STYLE, buried)
+        exstyle = user32.GetWindowLongPtrW(hwnd, _GWL_EXSTYLE)
+        tool = exstyle | _WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE
+        if tool != exstyle:
+            user32.SetWindowLongPtrW(hwnd, _GWL_EXSTYLE, tool)
+        user32.ShowWindow(hwnd, 0)
+        user32.SetWindowPos(
+            hwnd, 0, -32000, -32000, 0, 0,
+            0x0001 | 0x0004 | _SWP_NOACTIVATE | _SWP_HIDEWINDOW,
+        )
+    except Exception:
+        return
+
+
+def _install_hide_hook(user32, hwnd: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    current = int(user32.GetWindowLongPtrW(hwnd, _GWLP_WNDPROC) or 0)
+    if not current or _PINNED_HWNDS.get(hwnd) == current:
+        return
+
+    class WINDOWPOS(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("hwndInsertAfter", wintypes.HWND),
+            ("x", ctypes.c_int),
+            ("y", ctypes.c_int),
+            ("cx", ctypes.c_int),
+            ("cy", ctypes.c_int),
+            ("flags", ctypes.c_uint),
+        ]
+
+    original = ctypes.c_void_p(current)
+    wndproc = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    )
+
+    @wndproc
+    def hook(h, msg, wparam, lparam, _orig=original, _user=user32):
+        try:
+            if msg == 0x0082:  # WM_NCDESTROY
+                _PINNED_HWNDS.pop(int(h), None)
+            elif msg == _WM_WINDOWPOSCHANGING and lparam:
+                pos = ctypes.cast(lparam, ctypes.POINTER(WINDOWPOS)).contents
+                if pos.flags & _SWP_SHOWWINDOW or _user.IsWindowVisible(h):
+                    pos.flags = (pos.flags & ~(_SWP_SHOWWINDOW | _SWP_NOMOVE)) | (
+                        _SWP_HIDEWINDOW | _SWP_NOACTIVATE
+                    )
+                    pos.x = -32000
+                    pos.y = -32000
+        except Exception:
+            pass
+        try:
+            return _user.CallWindowProcW(_orig, h, msg, wparam, lparam)
+        except Exception:
+            return 0
+
+    _PINNED_PROCS.append(hook)
+    user32.SetWindowLongPtrW(
+        hwnd, _GWLP_WNDPROC, ctypes.cast(hook, ctypes.c_void_p).value,
+    )
+    _PINNED_HWNDS[hwnd] = int(user32.GetWindowLongPtrW(hwnd, _GWLP_WNDPROC) or 0)
+
+
+def _hide_tray_message_window() -> None:
+    """Keep Qt's tray owner off the desktop.
+
+    Qt creates it as an overlapped window so it can hear TaskbarCreated.
+    Windows then gives that default-sized window a system caption. Showing it
+    paints the app icon, minimize, maximize, close, and a white client.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        import os
+        from ctypes import wintypes
+
+        user32 = _win32_user32()
+        pid = os.getpid()
+        found: list[int] = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def collect(hwnd, _lparam):
+            owner = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value != pid:
+                return True
+            name = ctypes.create_unicode_buffer(96)
+            user32.GetClassNameW(hwnd, name, 96)
+            if name.value.endswith("TrayIconMessageWindowClass"):
+                found.append(int(hwnd))
+            return True
+
+        user32.EnumWindows(collect, 0)
+        for hwnd in found:
+            keep_hwnd_hidden(hwnd)
+    except Exception:
+        return
+
+
 def _menu_font():
     from PyQt6.QtGui import QFont
 
@@ -383,6 +554,7 @@ class TrayIcon(QSystemTrayIcon):
         self._apply_icon_kind("normal")
         self._idle_tooltip = "SayInk - 就绪"
         self._status_summary = "就绪"
+        self._activity_state: str | None = None
         self.setToolTip(self._idle_tooltip)
         self._flash_timer = None
         self._flash_restore_recording = False
@@ -397,11 +569,9 @@ class TrayIcon(QSystemTrayIcon):
         self.activated.connect(self._on_activated)
 
     def _rebuild_icons(self) -> None:
-        from sayink.ui import design_tokens as tok
-
-        self._normal_icon = create_microphone_icon(recording=False)
-        self._recording_icon = create_microphone_icon(recording=True)
-        self._attention_icon = create_microphone_icon(color=tok.ATTENTION, recording=False)
+        self._normal_icon = _fresh_microphone_icon("normal")
+        self._recording_icon = _fresh_microphone_icon("recording")
+        self._attention_icon = _fresh_microphone_icon("attention")
 
     def _apply_icon_kind(self, kind: str) -> None:
         self._icon_kind = kind
@@ -413,17 +583,22 @@ class TrayIcon(QSystemTrayIcon):
     def show(self) -> None:
         super().show()
         self._schedule_icon_republish()
+        _hide_tray_message_window()
 
     def _schedule_icon_republish(self) -> None:
         if sys.platform != "win32":
             return
         from PyQt6.QtCore import QTimer
 
+        for old in getattr(self, "_icon_republish_timers", ()):
+            old.stop()
+            old.deleteLater()
         timers: list[QTimer] = []
         for delay in (0, 400):
             timer = QTimer(self)
             timer.setSingleShot(True)
             timer.timeout.connect(self._republish_icon)
+            timer.timeout.connect(timer.deleteLater)
             timer.start(delay)
             timers.append(timer)
         self._icon_republish_timers = timers
@@ -507,10 +682,6 @@ class TrayIcon(QSystemTrayIcon):
         """Flip the tray entry between 「开始会议」 and 「结束会议」."""
         self._meeting_in_progress = bool(active)
         self._meeting_toggle_action.setText("结束会议" if active else "开始会议")
-
-    @property
-    def meeting_in_progress(self) -> bool:
-        return self._meeting_in_progress
 
     def show_update_notice(self, body: str) -> None:
         """Tray balloon for a new version. Other notices clear this kind."""
@@ -608,6 +779,11 @@ class TrayIcon(QSystemTrayIcon):
         the main window inside that loop leaves the window under a spinning
         cursor until the menu closes.
         """
+        # The tray's hidden owner is a real captioned window. Hide it before
+        # the main window is built. The shell shows that owner again after
+        # this handler returns, so pin it once more on the next turn.
+        _hide_tray_message_window()
+        self._schedule_tray_owner_hide()
         if self._menu_is_open:
             self._wake_after_menu = True
             menu = self._menu
@@ -615,6 +791,11 @@ class TrayIcon(QSystemTrayIcon):
                 menu.close()
             return
         self.wake_island.emit()
+
+    def _schedule_tray_owner_hide(self) -> None:
+        from PyQt6.QtCore import QTimer
+
+        QTimer.singleShot(0, _hide_tray_message_window)
 
     def _on_menu_about_to_show(self) -> None:
         self._menu_is_open = True
@@ -651,6 +832,11 @@ class TrayIcon(QSystemTrayIcon):
             timer.stop()
 
     def set_recording(self, is_recording: bool):
+        if self._flash_timer is not None:
+            self._flash_timer.stop()
+            self._flash_timer.deleteLater()
+            self._flash_timer = None
+        self._flash_restore_recording = bool(is_recording)
         self._apply_icon_kind("recording" if is_recording else "normal")
 
     def flash_attention(self, duration_ms: int = 450) -> None:
@@ -660,16 +846,20 @@ class TrayIcon(QSystemTrayIcon):
         if self._flash_timer is not None:
             self._flash_timer.stop()
             self._flash_timer.deleteLater()
-        self._flash_restore_recording = self._icon_kind == "recording"
+        if self._icon_kind != "attention":
+            self._flash_restore_recording = self._icon_kind == "recording"
         self._apply_icon_kind("attention")
         self._flash_timer = QTimer(self)
         self._flash_timer.setSingleShot(True)
 
         def _restore():
+            timer = self._flash_timer
+            self._flash_timer = None
+            if timer is not None:
+                timer.deleteLater()
             self._apply_icon_kind(
                 "recording" if self._flash_restore_recording else "normal"
             )
-            self._flash_timer = None
 
         self._flash_timer.timeout.connect(_restore)
         self._flash_timer.start(max(120, int(duration_ms)))
@@ -678,7 +868,8 @@ class TrayIcon(QSystemTrayIcon):
         self._status_summary = (text or "就绪").strip()
         self._status_action.setText(self._status_summary)
         self._idle_tooltip = f"SayInk - {self._status_summary}"
-        self.setToolTip(self._idle_tooltip)
+        if self._activity_state is None:
+            self.setToolTip(self._idle_tooltip)
         # Tooltip updates succeed even when the shell never accepted the glyph.
         # Push the icon again once we know the tray slot exists.
         self._republish_icon()
@@ -686,6 +877,7 @@ class TrayIcon(QSystemTrayIcon):
     def set_activity_tooltip(self, state: str | None):
         """Brief tray hint for background work. None = idle."""
         if state is None:
+            self._activity_state = None
             self.setToolTip(self._idle_tooltip)
             return
         lines = {
@@ -700,8 +892,10 @@ class TrayIcon(QSystemTrayIcon):
         }
         label = lines.get(state, "")
         if label:
+            self._activity_state = state
             self.setToolTip(f"SayInk - {label}")
         else:
+            self._activity_state = None
             self.setToolTip(self._idle_tooltip)
 
     def set_auto_start(self, enabled: bool):

@@ -8,15 +8,11 @@ from PyQt6.QtCore import Qt, QPoint, QRect
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import QApplication, QWidget
 
-ISLAND_SHEET_WIDTH = 520
-ISLAND_SETTINGS_WIDTH = 720
-ISLAND_SHEET_HEIGHT = 640
 ISLAND_TOP_MARGIN = 72
 # Sits above a typical Office status bar; the taskbar is already outside
 # availableGeometry. Long sessions use this instead of the ribbon band.
 ISLAND_BOTTOM_MARGIN = 36
 ISLAND_EDGE_MARGIN = 16
-ISLAND_SHADOW_BLUR = 14
 
 LISTEN_BAR_PLACEMENTS = (
     "auto",
@@ -54,21 +50,6 @@ def _resolve_live_screen(screen=None):
         return cursor_screen
     primary = QApplication.primaryScreen()
     return primary if is_screen_alive(primary) else None
-
-
-def position_island(widget: QWidget, width: int | None = None) -> None:
-    """Place a surface as a top-center island on the screen under the cursor."""
-    screen = _resolve_live_screen()
-    if screen is None:
-        return
-    try:
-        geo = screen.availableGeometry()
-    except RuntimeError:
-        return
-    w = width if width is not None else widget.width()
-    x = geo.x() + (geo.width() - w) // 2
-    y = geo.y() + ISLAND_TOP_MARGIN
-    widget.move(QPoint(x, y))
 
 
 def normalize_listen_bar_placement(value: object) -> str:
@@ -216,12 +197,3 @@ def island_window_flags() -> Qt.WindowType:
         | Qt.WindowType.WindowStaysOnTopHint
         | Qt.WindowType.Tool
     )
-
-
-def apply_island_sheet_flags(widget: QWidget) -> None:
-    widget.setWindowFlags(
-        Qt.WindowType.FramelessWindowHint
-        | Qt.WindowType.Window
-        | Qt.WindowType.WindowStaysOnTopHint
-    )
-    widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)

@@ -200,7 +200,7 @@ def test_variant_only_edit_applies_in_zero_seconds_without_reloading_stt_or_embe
 
 
 def test_speaker_and_vad_are_isolated_from_glossary_and_language_changes():
-    with app_harness({"stt.model_id": "funasr-nano", "stt.vad": "silero"}) as h:
+    with app_harness({"stt.model_id": "funasr-nano"}) as h:
         app = h["app"]
         embedder_before = app._speaker_embedder()
         h["recognizer"].configure.reset_mock()

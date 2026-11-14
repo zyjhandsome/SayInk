@@ -61,6 +61,23 @@ _DIGITAL_SILENCE_RMS = 1e-4
 log = logging.getLogger("SayInk")
 
 
+def _render_playback_peak() -> float:
+    """Loudest level any Windows playback endpoint reports right now.
+
+    0.0 off Windows or when the endpoints cannot be queried.
+    """
+    from sayink import audio_devices
+
+    try:
+        endpoints = audio_devices._cached_windows_render_endpoints()
+        return float(max(
+            endpoints.console_peak, endpoints.communications_peak, endpoints.active_render_peak,
+        ))
+    except Exception:
+        log.debug("读取播放端点音量失败", exc_info=True)
+        return 0.0
+
+
 # Cache last-known working (sample_rate, try_loopback) per (device_index, device_name, want_loopback)
 # so hotkeys open WASAPI streams on the first attempt instead of failing 16 kHz probes each time.
 _WORKING_STREAM_PARAMS: dict[tuple[int, str, bool], tuple[int, bool]] = {}
@@ -108,6 +125,14 @@ class AudioRecorder(QObject):
     MAX_MIX_SKEW_SEC = 1.0
     DRIFT_TOLERANCE_SAMPLES = int(0.02 * TARGET_SAMPLE_RATE)
     DRIFT_SUSTAIN_TICKS = 8
+    # Share of the remaining distance a lane's mix gain covers per block.
+    LANE_GAIN_GLIDE = 0.25
+    # A microphone-only meeting that keeps hearing playback is probably a call
+    # whose remote side is not recorded: this many polls above the peak within
+    # the window, so one cue or notification is not taken for a call.
+    UNRECORDED_PLAYBACK_PEAK = 1e-3
+    UNRECORDED_PLAYBACK_HITS = 4
+    UNRECORDED_PLAYBACK_WINDOW_SEC = 60.0
 
     SAMPLE_RATE = TARGET_SAMPLE_RATE
     CHANNELS = 1
@@ -128,6 +153,7 @@ class AudioRecorder(QObject):
         self._plan: Optional[RecordingPlan] = None
         self._last_start_warning: str = ""
         self._pawp: object | None = None
+        self._retired_pawp: list[object] = []
         self._continuous_mode = False
         self._segment_live = False
         self._segmenter = SpeechSegmenter()
@@ -161,6 +187,11 @@ class AudioRecorder(QObject):
         self._segmentation_status = SegmentationStatus(VAD_ENERGY, VAD_ENERGY)
         # Per-lane loudness balancing for mixed capture (every profile).
         self._balancer: LaneBalancer | None = LaneBalancer()
+        # Mix gain each lane ended its last block with (see _glide_lane_gain).
+        self._lane_gains: dict[str, float] = {}
+        self._playback_hits: list[float] = []
+        self._playback_warned = False
+        self._last_playback_poll_at = time.monotonic()
         self._duplicate_suppressor = DuplicateLaneSuppressor()
         # Wall-clock ms at which the block that opened the current utterance
         # arrived; handed out with the segment (history.captured_at).
@@ -188,19 +219,44 @@ class AudioRecorder(QObject):
         self._quiet_speech: bool | None = None
         self._last_overflow_warning = float("-inf")
         self._suppress_empty_finished = False
+        self._last_emitted_volume = 0.0
+        self._last_real_block_at = 0.0
+        self._last_loopback_pad_at = 0.0
+
+    @property
+    def sample_rate(self) -> int:
+        return int(self.SAMPLE_RATE)
 
     @property
     def lane_levels(self) -> tuple[float, float]:
         """Independent real-time RMS levels ``(mic_level, system_level)``."""
         return float(self._mic_level), float(self._system_level)
 
-    @property
-    def last_mic_speech_at(self) -> float:
-        return float(self._last_mic_speech_at)
-
-    @property
-    def last_system_speech_at(self) -> float:
-        return float(self._last_system_speech_at)
+    def discard_current_utterance(self) -> None:
+        """Drop buffered audio, VAD state, and boundary lookahead for the active utterance."""
+        with self._lock:
+            for lane in self._lanes:
+                lane.chunks = []
+                lane.pending = np.zeros(0, dtype=np.float32)
+        self._segmenter.reset()
+        for seg in self._split_segmenters.values():
+            seg.reset()
+        if self._boundary_buffer is not None:
+            self._boundary_buffer = type(self._boundary_buffer)()
+        self._split_boundaries = {
+            role: type(buffer)() for role, buffer in self._split_boundaries.items()
+        }
+        self._split_ready = []
+        self._split_targets = {role: (0, "") for role in self._split_segmenters}
+        self._open_target = (0, "")
+        self._segment_target = (0, "")
+        self._segment_route = ""
+        self._segment_route_reliable = False
+        self._segment_captured_at = 0
+        self._segment_started_at = 0
+        self._block_started_at = 0
+        self._stream_anchor_ms = 0
+        self._last_loopback_pad_at = 0.0
 
     def set_paused(self, paused: bool) -> None:
         """Pause or resume mixed-mode silent-loopback elapsed time tracking."""
@@ -227,6 +283,10 @@ class AudioRecorder(QObject):
         cleaned = str(session_id or "").strip()
         if cleaned != self._recovery_session_id:
             self._last_session_journal = None
+            # A new meeting may be reminded once about unrecorded playback;
+            # pausing and resuming the same one must not repeat it.
+            self._playback_hits = []
+            self._playback_warned = False
         self._recovery_session_id = cleaned
 
     def suppress_system_loopback_ms(self, duration_ms: int = 180) -> None:
@@ -350,8 +410,7 @@ class AudioRecorder(QObject):
         # Segments becoming ready on the same tick follow capture time.
         for _start, role, audio in sorted(emitted, key=lambda item: (item[0], item[1])):
             self._emit_split_segment(role, audio)
-        self._release_split_ready()
-        return len(emitted)
+        return self._release_split_ready()
 
     def set_boundary_context(self, enabled: bool) -> None:
         self._boundary_requested = bool(enabled)
@@ -412,6 +471,7 @@ class AudioRecorder(QObject):
         # Mixed capture balances the two lanes in every profile: dictation
         # listening to a call has the same quiet-remote-party problem.
         self._balancer = LaneBalancer()
+        self._lane_gains = {}
         self._duplicate_suppressor.reset()
         self._rebuild_segmenter()
 
@@ -429,6 +489,7 @@ class AudioRecorder(QObject):
             for active in self._split_segmenters.values():
                 active.reset()
             self._split_boundaries = {role: type(buffer)() for role, buffer in self._split_boundaries.items()}
+            self._split_ready = []
             if emitted:
                 log.info("录音中重建断句器，先送出 %d 段已缓冲语音", emitted)
         if self._vad_kind == "silero" and self._vad_model_path:
@@ -448,6 +509,8 @@ class AudioRecorder(QObject):
         self._apply_quiet_mode(segmenter)
         self._segmenter = segmenter
         self._stream_anchor_ms = 0
+        if self._is_recording and not self._is_cancelled and self._lanes:
+            self._prepare_split_segmenters()
         self._segmentation_status = SegmentationStatus(
             self._vad_kind, gate.name, bool(self._vad_model_path),
             gate.fallback_reason, self._meeting_profile,
@@ -503,16 +566,19 @@ class AudioRecorder(QObject):
 
     def _make_callback(self, lane: _CaptureLane) -> Callable:
         def _callback(indata, _frames, _time_info, status):
-            if status:
-                log.debug("音频流状态 [%s]: %s", lane.endpoint.role, status)
-                if getattr(status, "input_overflow", False) is True:
-                    self._warn_overflow(lane.endpoint.role)
+            if status and getattr(status, "input_overflow", False) is True:
+                self._warn_overflow(lane.endpoint.role)
             if not self._is_recording or self._is_cancelled:
                 return
             # The level meter is fed once per tick from the balanced mix
             # (_on_continuous_tick); emitting the raw per-lane block here as
             # well made the meter flicker between two scales.
-            block = to_mono(indata.copy())
+            mono = to_mono(indata)
+            block = (
+                np.array(mono, dtype=np.float32, copy=True)
+                if mono.dtype != np.float32 or np.shares_memory(mono, indata)
+                else mono
+            )
             with self._lock:
                 lane.chunks.append(block)
                 lane.last_chunk_at = time.monotonic()
@@ -525,6 +591,11 @@ class AudioRecorder(QObject):
             self._pawp = pyaudio.PyAudio()
         return self._pawp
 
+    def _retire_pawp(self, thread: object | None = None) -> None:
+        if self._pawp is not None:
+            self._retired_pawp.append((self._pawp, thread))
+            self._pawp = None
+
     def _terminate_pawp(self):
         if self._pawp is not None:
             try:
@@ -532,6 +603,18 @@ class AudioRecorder(QObject):
             except Exception:
                 log.debug("释放 PyAudioWPatch 失败", exc_info=True)
             self._pawp = None
+        if self._retired_pawp:
+            still_alive = []
+            for entry in self._retired_pawp:
+                pa, th = entry if isinstance(entry, tuple) else (entry, None)
+                if th is not None and getattr(th, "is_alive", lambda: False)():
+                    still_alive.append((pa, th))
+                    continue
+                try:
+                    pa.terminate()
+                except Exception:
+                    log.debug("释放延迟退役 PyAudioWPatch 失败", exc_info=True)
+            self._retired_pawp = still_alive
 
     def _pawp_read_loop(self, lane: _CaptureLane, stream, channels: int, rate: int):
         """Blocking read loop — stream_callback is unreliable on some Windows drivers."""
@@ -568,8 +651,9 @@ class AudioRecorder(QObject):
                 continue
             arr = np.frombuffer(data, dtype=np.float32)
             if channels > 1:
-                arr = arr.reshape(-1, channels)
-            block_mono = to_mono(arr.copy())
+                block_mono = to_mono(arr.reshape(-1, channels))
+            else:
+                block_mono = arr.copy()
             with self._lock:
                 lane.chunks.append(block_mono)
                 lane.last_chunk_at = time.monotonic()
@@ -814,6 +898,7 @@ class AudioRecorder(QObject):
         if take <= 0:
             self._block_mic_energy = 0.0
             self._block_system_energy = 0.0
+            self._recovery_tracks = {}
             return None
 
         lane_tracks = []
@@ -878,6 +963,7 @@ class AudioRecorder(QObject):
             self._system_ever_active = True
 
         tracks: list[np.ndarray] = []
+        mix_roles: list[str] = []
         gains: list[float] = []
         mic_energy = 0.0
         system_energy = 0.0
@@ -890,27 +976,67 @@ class AudioRecorder(QObject):
             else:
                 mic_energy += energy
             tracks.append(track)
+            mix_roles.append(role)
             if self._balancer is not None:
                 gains.append(self._balancer.observe(role, track))
         self._block_mic_energy = mic_energy
         self._block_system_energy = system_energy
         if not tracks:
             return np.zeros(take, dtype=np.float32)
+        audible = [index for index, track in enumerate(tracks) if rms_volume(track) >= _DIGITAL_SILENCE_RMS]
         if len(tracks) == 1:
-            track = tracks[0]
-            if track.size < take:
-                track = np.concatenate([track, np.zeros(take - track.size, dtype=np.float32)])
-            return track
-        if len(tracks) > 1:
-            audible = [track for track in tracks if rms_volume(track) >= _DIGITAL_SILENCE_RMS]
-            if len(audible) == 1:
-                only = audible[0]
-                if only.size < take:
-                    only = np.concatenate([only, np.zeros(take - only.size, dtype=np.float32)])
-                return only
+            role = mix_roles[0]
+            only = (
+                self._glide_lane_gain(role, tracks[0], 1.0)
+                if (audible or role in self._lane_gains)
+                else tracks[0]
+            )
+            if only.size < take:
+                only = np.concatenate([only, np.zeros(take - only.size, dtype=np.float32)])
+            return only
+        if len(audible) == 1:
+            # The only lane with sound is not balanced against a silent one.
+            index = audible[0]
+            only = self._glide_lane_gain(mix_roles[index], tracks[index], 1.0)
+            if only.size < take:
+                only = np.concatenate([only, np.zeros(take - only.size, dtype=np.float32)])
+            return only
         if self._balancer is not None and len(gains) == len(tracks):
-            return mix_to_mono(tracks, TARGET_SAMPLE_RATE, gains=gains)
+            if not audible:
+                # Two-lane silence: do not ramp gains back toward 4.0x balancer
+                # targets, and do not return digital zeros (preserve VAD noise
+                # floor tracking and SileroGate input_gain). Glide already-heard
+                # lanes gently toward 1.0 while leaving unheard lanes unseeded.
+                scaled = [
+                    self._glide_lane_gain(role, track, 1.0) if role in self._lane_gains else track
+                    for role, track in zip(mix_roles, tracks, strict=True)
+                ]
+            else:
+                scaled = [
+                    self._glide_lane_gain(role, track, gain)
+                    for role, track, gain in zip(mix_roles, tracks, gains, strict=True)
+                ]
+            return mix_to_mono(scaled, TARGET_SAMPLE_RATE, gains=[1.0] * len(scaled))
         return mix_to_mono(tracks, TARGET_SAMPLE_RATE)
+
+    def _glide_lane_gain(self, role: str, track: np.ndarray, target: float) -> np.ndarray:
+        """Scale one lane, moving its gain toward ``target`` without a step.
+
+        A lane is balanced (up to x4 or down to x1/4) only while the other lane
+        also carries sound. Switching straight between the two gains stepped the
+        level by up to 12 dB between 100 ms blocks every time the other party
+        started or stopped. The gain now ramps inside each block and covers a
+        quarter of the remaining distance per block; a lane heard for the first
+        time starts at its target, so nothing is faded in.
+        """
+        start = self._lane_gains.get(role, target)
+        end = start + self.LANE_GAIN_GLIDE * (target - start)
+        if abs(end - target) < 1e-3:
+            end = target
+        self._lane_gains[role] = end
+        if start == end:
+            return track if end == 1.0 else track * np.float32(end)
+        return track * np.linspace(start, end, track.size, endpoint=False, dtype=np.float32)
 
     def _reset_continuous_speech_watch(self) -> None:
         now = time.monotonic()
@@ -940,6 +1066,11 @@ class AudioRecorder(QObject):
         """Attempt seamless self-healing / hot-rebind of the system loopback lane."""
         old_name = strip_loopback_suffix(lost_lane.endpoint.device.name)
         self._close_lane(lost_lane)
+        if not any(
+            ln is not lost_lane and getattr(ln, "pawp_stream", None) is not None
+            for ln in self._lanes
+        ):
+            self._terminate_pawp()
         invalidate_device_cache()
         if not any(
             ln is not lost_lane and ln.stream is not None
@@ -1005,7 +1136,10 @@ class AudioRecorder(QObject):
             )
             preferred = preferred_windows_loopback_names(active_mic_name=active_mic_name)
             if preferred and not endpoint_names_match(sys_lane.endpoint.device.name, preferred[0]):
-                invalidate_device_cache()
+                try:
+                    invalidate_device_cache(keep_win_endpoints=True)
+                except TypeError:
+                    invalidate_device_cache()
                 try:
                     next_dev = pick_default_system_capture(active_mic_name=active_mic_name)
                 except TypeError:
@@ -1033,10 +1167,42 @@ class AudioRecorder(QObject):
                 ) or "未连接"
             warn_msg = (
                 f"混合录音已持续 {int(self.SYSTEM_SILENT_WARN_SEC)} 秒，但电脑声音通道（{dev_label}）始终接近静音。"
-                "若您正佩戴蓝牙耳机开会，请确认系统或会议软件输出已切至 Hands-Free 通话通道。"
+                "线下会议可忽略；若您正佩戴蓝牙耳机开线上会议，请确认系统或会议软件输出已切至 Hands-Free 通话通道。"
             )
             log.info(warn_msg)
             self.system_silent_warning.emit(warn_msg)
+
+        self._poll_unrecorded_playback(now)
+
+    def _poll_unrecorded_playback(self, now: float) -> None:
+        """Remind a microphone-only meeting once that the computer keeps playing sound.
+
+        With headphones on, the remote side of a call never reaches the
+        microphone, and the transcript silently holds one voice only.
+        """
+        if (
+            self._playback_warned
+            or not self._meeting_profile
+            or not self._continuous_mode
+            or self._input_source != INPUT_SOURCE_MICROPHONE
+            or self._is_paused
+            or 0.0 <= now - self._last_playback_poll_at < self.SYSTEM_ROUTE_POLL_SEC
+        ):
+            return
+        self._last_playback_poll_at = now
+        if _render_playback_peak() < self.UNRECORDED_PLAYBACK_PEAK:
+            return
+        window = self.UNRECORDED_PLAYBACK_WINDOW_SEC
+        self._playback_hits = [at for at in self._playback_hits if 0.0 <= now - at <= window]
+        self._playback_hits.append(now)
+        if len(self._playback_hits) < self.UNRECORDED_PLAYBACK_HITS:
+            return
+        self._playback_warned = True
+        self._playback_hits = []
+        self.warning.emit(
+            "电脑正在播放声音，但本场会议只录麦克风：戴耳机开线上会议时，对方的声音不会被录到。"
+            f"如需同时录下电脑声音，请在开始会议时把音频来源选为「{input_source_label(INPUT_SOURCE_MIXED)}」。"
+        )
 
     def _handle_lost_device(self, lane: _CaptureLane) -> None:
         name = lane.endpoint.device.name
@@ -1048,7 +1214,8 @@ class AudioRecorder(QObject):
                 ln is not lane and ln.endpoint.role == "microphone" for ln in self._lanes
             ):
                 self._close_lane(lane)
-                self._lanes = [ln for ln in self._lanes if ln is not lane]
+                with self._lock:
+                    self._lanes = [ln for ln in self._lanes if ln is not lane]
                 msg = f"电脑声音设备「{strip_loopback_suffix(name)}」已断开，当前继续使用麦克风录音。"
                 self.warning.emit(msg)
                 return
@@ -1064,6 +1231,33 @@ class AudioRecorder(QObject):
                 self._suppress_empty_finished = False
         self.error.emit(f"音频设备已断开：{name}")
 
+    def _single_system_lane_anchor(self) -> float | None:
+        if len(self._lanes) > 1:
+            return None
+        if len(self._lanes) == 1:
+            lane = self._lanes[0]
+            if lane.endpoint.role != "system":
+                return None
+            return max(
+                float(getattr(lane, "last_chunk_at", 0.0) or 0.0),
+                float(self._last_real_block_at),
+            )
+        if self._input_source == INPUT_SOURCE_SYSTEM:
+            return float(self._last_real_block_at)
+        return None
+
+    def _has_pending_loopback_speech(self) -> bool:
+        seg = self._segmenter
+        if bool(getattr(seg, "in_speech", False)):
+            return True
+        if int(getattr(seg, "_total_samples", 0) or 0) > 0:
+            return True
+        if bool(getattr(seg, "_buffer", None)):
+            return True
+        if self._boundary_buffer is not None and self._boundary_buffer.pending_start is not None:
+            return True
+        return False
+
     def _on_continuous_tick(self):
         if not self._is_recording or self._is_cancelled:
             return
@@ -1076,7 +1270,52 @@ class AudioRecorder(QObject):
                 return
         block = self._drain_mixed_mono()
         self._poll_system_route_and_silence()
+        now = time.monotonic()
         if block is None or block.size == 0:
+            sys_anchor = self._single_system_lane_anchor()
+            if sys_anchor is not None:
+                if (now - sys_anchor) >= self.MIX_WAIT_SEC:
+                    had_lane_level = self._mic_level > 0.0 or self._system_level > 0.0
+                    self._mic_level = 0.0
+                    self._system_level = 0.0
+                    vol_was_nonzero = self._last_emitted_volume != 0.0
+                    if vol_was_nonzero:
+                        self._last_emitted_volume = 0.0
+                        self.volume_changed.emit(0.0)
+                    if had_lane_level or vol_was_nonzero:
+                        self.lane_levels_changed.emit(0.0, 0.0)
+                    if not self._is_paused and self._has_pending_loopback_speech():
+                        step_sec = 0.1
+                        pad_samples = max(1, int(self.sample_rate * step_sec))
+                        cursor = self._last_loopback_pad_at
+                        if cursor <= 0.0:
+                            cursor = (
+                                max(sys_anchor, now - 2.0)
+                                if sys_anchor > 0.0
+                                else (now - step_sec)
+                            )
+                        self._block_mic_energy = 0.0
+                        self._block_system_energy = 0.0
+                        self._recovery_tracks = {}
+                        emitted_any = False
+                        while (now - cursor) >= (step_sec - 1e-6) and self._has_pending_loopback_speech():
+                            cursor += step_sec
+                            zero_block = np.zeros(pad_samples, dtype=np.float32)
+                            flushed_seg = self._feed_segmenter(zero_block)
+                            if flushed_seg is not None and flushed_seg.size > 0:
+                                emitted_any = True
+                                self._last_speech_at = now
+                                log.debug("环回暂停收尾切分片段: %d 采样点", flushed_seg.size)
+                                self._emit_segment(flushed_seg)
+                        self._last_loopback_pad_at = (
+                            cursor if self._has_pending_loopback_speech() else 0.0
+                        )
+                        if not emitted_any:
+                            self._warn_if_silent()
+                        return
+                    self._last_loopback_pad_at = 0.0
+                self._warn_if_silent()
+                return
             if self._mic_level > 0.0 or self._system_level > 0.0:
                 self._mic_level = 0.0
                 self._system_level = 0.0
@@ -1084,20 +1323,23 @@ class AudioRecorder(QObject):
             self._warn_if_silent()
             return
         vol = rms_volume(block)
+        self._last_real_block_at = now
+        self._last_loopback_pad_at = 0.0
+        self._last_emitted_volume = float(vol)
         self.volume_changed.emit(vol)
         self.lane_levels_changed.emit(self._mic_level, self._system_level)
         gate = getattr(self._segmenter, "effective_threshold", self._segmenter.speech_threshold)
         if vol >= gate:
-            self._last_speech_at = time.monotonic()
+            self._last_speech_at = now
         if self._split_segmenters:
             if self._feed_split_tracks(block):
-                self._last_speech_at = time.monotonic()
+                self._last_speech_at = now
             elif self._warn_if_silent():
                 return
             return
         segment = self._feed_segmenter(block)
         if segment is not None and segment.size > 0:
-            self._last_speech_at = time.monotonic()
+            self._last_speech_at = now
             log.debug("持续监听切分片段: %d 采样点", segment.size)
             self._emit_segment(segment)
         else:
@@ -1137,7 +1379,12 @@ class AudioRecorder(QObject):
         self._mixed_elapsed_before_pause = 0.0
         self._mixed_unpaused_since = time.monotonic()
         self._last_route_poll_at = self._mixed_unpaused_since
+        self._last_playback_poll_at = self._mixed_unpaused_since
+        self._last_emitted_volume = 0.0
+        self._last_real_block_at = self._mixed_unpaused_since
+        self._last_loopback_pad_at = 0.0
         self._lanes = []
+        self._lane_gains = {}
         self._duplicate_suppressor.reset()
         self._stream_anchor_ms = 0
         self._last_start_warning = ""
@@ -1255,7 +1502,6 @@ class AudioRecorder(QObject):
             for role, seg in self._split_segmenters.items():
                 if (audio := seg.flush()) is not None:
                     self._emit_split_segment(role, audio)
-                    emitted += 1
                 self._release_split_context(role, ending=True)
             emitted += self._release_split_ready(ending=True)
             return emitted
@@ -1263,8 +1509,7 @@ class AudioRecorder(QObject):
             segment = self._feed_segmenter(block)
             if segment is not None and segment.size > 0:
                 log.debug("持续监听收尾片段: %d 采样点", segment.size)
-                self._emit_segment(segment)
-                emitted += 1
+                emitted += self._emit_segment(segment)
         flushed = self._segmenter.flush()
         if flushed is not None and flushed.size > 0:
             log.debug("持续监听 flush 片段: %d 采样点", flushed.size)
@@ -1272,8 +1517,7 @@ class AudioRecorder(QObject):
             # flush() never passes through _feed_segmenter, so the window
             # captured when this utterance opened would otherwise be lost.
             self._segment_target = self._open_target
-            self._emit_segment(flushed)
-            emitted += 1
+            emitted += self._emit_segment(flushed)
         return emitted
 
     def _feed_segmenter(self, block: np.ndarray) -> Optional[np.ndarray]:
@@ -1320,14 +1564,14 @@ class AudioRecorder(QObject):
         hwnd = int(info[0] or 0)
         name = get_foreground_process_name() if hwnd else ""
         if hwnd and (
-            TextPaster._is_own_window(TextPaster, info)
+            TextPaster._is_own_window(info)
             or target_rejects_synthetic_input(info)
         ):
             hwnd = 0
         self._open_target = (hwnd, name)
         self.utterance_opened.emit(hwnd, name)
 
-    def _emit_segment(self, segment: np.ndarray) -> None:
+    def _emit_segment(self, segment: np.ndarray) -> int:
         self._segment_route = self._segmenter.last_route
         self._segment_captured_at = self._block_started_at or int(time.time() * 1000)
         bounds = getattr(self._segmenter, "last_bounds", None)
@@ -1341,10 +1585,11 @@ class AudioRecorder(QObject):
                 self._segmenter.last_forced,
                 (self._segment_route, self._segment_captured_at, self._segment_target, acoustics),
             )
-            self._release_boundary_context()
+            return self._release_boundary_context()
         else:
             self._segment_route_reliable = False
             self.segment_ready.emit(segment)
+            return 1
 
     def _release_boundary_context(self, *, ending=False):
         if self._boundary_buffer is None:
@@ -1405,6 +1650,9 @@ class AudioRecorder(QObject):
         self._is_recording = False
         self._mic_level = 0.0
         self._system_level = 0.0
+        self._last_emitted_volume = 0.0
+        self._last_real_block_at = 0.0
+        self._last_loopback_pad_at = 0.0
         self._lanes = []
         self._terminate_pawp()
         self._segmenter.reset()
@@ -1503,6 +1751,7 @@ class AudioRecorder(QObject):
                 else:
                     log.warning("PyAudioWPatch 读取线程未在超时内退出，跳过同步 close 防止驱动冲突")
                     lane.pawp_stream = None
+                    self._retire_pawp(pawp_thread)
             finally:
                 if pawp_lock is not None and acquired:
                     pawp_lock.release()
@@ -1547,6 +1796,9 @@ class AudioRecorder(QObject):
         self._is_recording = False
         self._mic_level = 0.0
         self._system_level = 0.0
+        self._last_emitted_volume = 0.0
+        self._last_real_block_at = 0.0
+        self._last_loopback_pad_at = 0.0
         self._lanes = []
         self._terminate_pawp()
         self._segmenter.reset()

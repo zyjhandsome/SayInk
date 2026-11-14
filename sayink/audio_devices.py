@@ -49,7 +49,7 @@ def mark_portaudio_stream_active(delta: int) -> None:
         _active_portaudio_streams = max(0, _active_portaudio_streams + int(delta))
 
 
-def invalidate_device_cache() -> None:
+def invalidate_device_cache(*, keep_win_endpoints: bool = False) -> None:
     """Drop short-lived device enumeration caches."""
     with _portaudio_lock:
         _snapshot_cache["ts"] = 0.0
@@ -57,7 +57,8 @@ def invalidate_device_cache() -> None:
         _snapshot_cache["devices"] = None
         _snapshot_cache["hostapis"] = None
         _snapshot_cache["pawp_devices"] = None
-        _snapshot_cache["win_endpoints"] = None
+        if not keep_win_endpoints:
+            _snapshot_cache["win_endpoints"] = None
 
 
 def refresh_audio_devices(*, force: bool = False) -> bool:
@@ -242,13 +243,48 @@ def _mmdevice_friendly_name_and_peak(dev_ptr: ctypes.c_void_p, ole32: Any) -> tu
     return name, peak
 
 
+_OLE32: Any = None
+_ole32_lock = threading.Lock()
+
+
+def _get_ole32() -> Any:
+    global _OLE32
+    windll_ole32 = getattr(getattr(ctypes, "windll", None), "ole32", None)
+    win_dll_cls = getattr(ctypes, "WinDLL", None)
+    if win_dll_cls is None or not isinstance(windll_ole32, win_dll_cls):
+        return windll_ole32
+    if _OLE32 is not None:
+        return _OLE32
+    with _ole32_lock:
+        if _OLE32 is None:
+            dll = win_dll_cls("ole32")
+            dll.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            dll.CoInitializeEx.restype = ctypes.c_long
+            dll.CoCreateInstance.argtypes = [
+                ctypes.POINTER(_GUID),
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(_GUID),
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            dll.CoCreateInstance.restype = ctypes.c_long
+            dll.PropVariantClear.argtypes = [ctypes.POINTER(_PROPVARIANT)]
+            dll.PropVariantClear.restype = ctypes.c_long
+            dll.CoUninitialize.argtypes = []
+            dll.CoUninitialize.restype = None
+            _OLE32 = dll
+    return _OLE32
+
+
 def query_windows_render_endpoints() -> WindowsRenderEndpoints:
     """Query Windows CoreAudio eConsole + eCommunications render endpoints & peak meters."""
     if sys.platform != "win32":
         return WindowsRenderEndpoints()
     try:
-        ole32 = ctypes.windll.ole32
+        ole32 = _get_ole32()
     except Exception:
+        return WindowsRenderEndpoints()
+    if ole32 is None:
         return WindowsRenderEndpoints()
 
     hr_init = ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
@@ -562,14 +598,6 @@ def _hostapi_name(hostapi_index: int, apis: Optional[Sequence[dict[str, Any]]] =
         return ""
 
 
-def _wasapi_hostapi_index() -> Optional[int]:
-    _, apis = _query_raw_snapshot()
-    for i, api in enumerate(apis):
-        if "wasapi" in str(api.get("name", "")).lower():
-            return i
-    return None
-
-
 def _supports_wasapi_loopback_flag() -> bool:
     try:
         sd.WasapiSettings(loopback=True)
@@ -707,11 +735,26 @@ def _device_info_by_index(
     return dict(sd.query_devices(int(index)))
 
 
+def _device_name_for_any_index(index: int) -> str:
+    from sayink.pawp_capture import is_encoded_pawp_device_index
+
+    if is_encoded_pawp_device_index(int(index)):
+        for dev in _cached_pawp_loopback_devices():
+            if dev.index == int(index):
+                return dev.name
+        return ""
+    return str(_device_info_by_index(int(index)).get("name", ""))
+
+
 def _same_playback_device_name(index_a: int, index_b: int) -> bool:
+    from sayink.pawp_capture import endpoint_names_match
+
     try:
-        name_a = str(_device_info_by_index(int(index_a)).get("name", ""))
-        name_b = str(_device_info_by_index(int(index_b)).get("name", ""))
-        return bool(name_a) and name_a == name_b
+        name_a = _device_name_for_any_index(int(index_a))
+        name_b = _device_name_for_any_index(int(index_b))
+        return bool(name_a and name_b) and (
+            name_a == name_b or endpoint_names_match(name_a, name_b)
+        )
     except Exception:
         log.debug("比较播放设备 %s/%s 名称失败", index_a, index_b, exc_info=True)
         return False
@@ -841,13 +884,27 @@ def sanitize_system_device_index(index: int) -> int:
     """Map manual picks of known-bad loopback outputs back to auto (-1)."""
     if int(index) < 0:
         return -1
+    from sayink.pawp_capture import endpoint_names_match
+
     default_out = _default_output_device_index()
+    default_out_name = ""
+    if default_out is not None:
+        try:
+            default_out_name = str(_device_info_by_index(int(default_out)).get("name", ""))
+        except Exception:
+            default_out_name = ""
     for dev in list_system_capture_devices():
         if dev.index == int(index):
             if is_unreliable_loopback_output(dev):
                 if default_out is not None and (
                     dev.index == int(default_out)
-                    or _same_playback_device_name(dev.index, int(default_out))
+                    or (
+                        bool(default_out_name)
+                        and (
+                            dev.name == default_out_name
+                            or endpoint_names_match(dev.name, default_out_name)
+                        )
+                    )
                 ):
                     return int(index)
                 return -1
@@ -897,7 +954,11 @@ def _match_system_device_by_preferred_names(
 
 
 def pick_default_system_capture(active_mic_name: str = "") -> Optional[AudioDeviceInfo]:
-    from sayink.pawp_capture import pick_default_pawp_loopback, pick_pawp_loopback_for_names
+    from sayink.pawp_capture import (
+        endpoint_names_match,
+        pick_default_pawp_loopback,
+        pick_pawp_loopback_for_names,
+    )
 
     preferred_names = preferred_windows_loopback_names(active_mic_name=active_mic_name)
 
@@ -912,7 +973,10 @@ def pick_default_system_capture(active_mic_name: str = "") -> Optional[AudioDevi
             )
             if matched is not None:
                 return matched
-        pawp_default = pick_default_pawp_loopback()
+        try:
+            pawp_default = pick_default_pawp_loopback(active_mic_name=active_mic_name)
+        except TypeError:
+            pawp_default = pick_default_pawp_loopback()
         if pawp_default is not None:
             return pawp_default
 
@@ -932,12 +996,14 @@ def pick_default_system_capture(active_mic_name: str = "") -> Optional[AudioDevi
         for dev in pool:
             if dev.index == int(default_out):
                 return dev
-        for dev in pool:
-            if _same_playback_device_name(dev.index, int(default_out)):
-                return dev
-    for dev in pool:
-        if not is_unreliable_loopback_output(dev):
-            return dev
+        try:
+            default_out_name = str(_device_info_by_index(int(default_out)).get("name", ""))
+        except Exception:
+            default_out_name = ""
+        if default_out_name:
+            for dev in pool:
+                if dev.name == default_out_name or endpoint_names_match(dev.name, default_out_name):
+                    return dev
     return pool[0]
 
 
@@ -1064,7 +1130,3 @@ def input_source_label(source: str) -> str:
     """The one user-facing name per source (docs/terminology.md): the source
     picker, sidebar, history chips and meeting card all read from here."""
     return INPUT_SOURCE_LABELS.get(source, source)
-
-
-def plan_includes_system_capture(plan: RecordingPlan) -> bool:
-    return any(ep.role == "system" for ep in plan.endpoints)

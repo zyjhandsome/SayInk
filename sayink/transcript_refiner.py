@@ -158,11 +158,11 @@ def split_refinement_units(units: Sequence[RefinementUnit]) -> tuple[list[Refine
             [RefinementUnit(2, unit.speaker_id, unit.text[cut:])])
 
 
-_ENGLISH = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:[._+#/-][A-Za-z0-9]+)*")
+_ENGLISH = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:[._+#-][A-Za-z0-9]+)*")
 _ENGLISH_SPOKEN_FILLERS = frozenset(
     {"ok", "okay", "um", "uh", "hmm", "ah", "oh", "eh", "yeah", "yep", "well"}
 )
-_NEGATION = re.compile(r"不|没|未|无|别|\b(?:not|never|no|cannot)\b|n't", re.I)
+_NEGATION = re.compile(r"不|没|未|无|别|\b(?:not|never|no|none|cannot)\b|n't", re.I)
 _NON_NEGATING = re.compile(
     r"不同意见|不同观点|不同看法|不同立场|不同声音|不过|不仅|不但|无论|未来|无线|"
     r"特别|区别|分别|类别|级别|告别|识别|性别|别人|别的|"
@@ -174,7 +174,7 @@ _A_NOT_A = re.compile(
     r"(?![不没别未无非勿莫])([\u4e00-\u9fff])不\1"
 )
 _QUALIFIER = re.compile(r"可能|也许|大概|暂时|建议|考虑|如果|除非")
-_FORMATTING = re.compile(r"(?m)^\s*(?:#{1,6}\s|[-*+]\s|\d+[.)、]\s|```|\||说话人\s*\d+\s*[:：]|\[\d\d:\d\d:\d\d\])")
+_FORMATTING = re.compile(r"(?m)^\s*(?:#{1,6}\s|[-*+]\s|\d+[.)、]\s|```|\||说话人\s*\d+\s*[:：]|\[\d{1,}:\d\d:\d\d\])")
 _FILLER = re.compile(r"(?:嗯|啊|呃|额|唔|哦|噢|那个|就是说|大家好|你好|谢谢|再见)+")
 _STUTTER_SEP = r"(?:[\s，,、…—-]|嗯+|啊+|呃+|额+|那个|就是说|就是)+"
 _QUALIFIER_STUTTER_RE = re.compile(rf"(可能|也许|大概|暂时|建议|考虑|如果|除非){_STUTTER_SEP}\1")
@@ -258,7 +258,10 @@ def validate_refinement(payload: dict | None, units: Sequence[RefinementUnit]) -
         missing_names = (source_names - edited_names) - _ENGLISH_SPOKEN_FILLERS
         extra_names = edited_names - source_names
         if missing_names or extra_names:
-            raise RefinementValidationError("英文名称被改动")
+            raise RefinementValidationError("英文名称被改动", retry_hint=(
+                f"英文名称被改动；必须恢复：{json.dumps(sorted(missing_names)[:12], ensure_ascii=False)}；"
+                f"不得新增：{json.dumps(sorted(extra_names)[:12], ensure_ascii=False)}。"
+            ))
         if _negation_count(original) != _negation_count(rewritten):
             raise RefinementValidationError("否定表达被改动")
         raw_qualifiers = Counter(_QUALIFIER.findall(source))
@@ -286,5 +289,12 @@ def validate_refinement(payload: dict | None, units: Sequence[RefinementUnit]) -
     return paragraphs
 
 
-def render_refinement(payload: dict) -> str:
-    return "\n\n".join(p["text"].strip() for p in payload.get("paragraphs", []) if p["text"].strip()) + "\n"
+def render_refinement(payload: dict | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    blocks = [
+        p["text"].strip()
+        for p in (payload.get("paragraphs") or [])
+        if isinstance(p, dict) and isinstance(p.get("text"), str) and p["text"].strip()
+    ]
+    return ("\n\n".join(blocks) + "\n") if blocks else ""

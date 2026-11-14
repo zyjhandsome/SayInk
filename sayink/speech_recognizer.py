@@ -1,3 +1,4 @@
+import functools
 import gc
 import hashlib
 import logging
@@ -10,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
-from sayink.audio_utils import MAX_SEGMENT_SEC, TARGET_SAMPLE_RATE
+from sayink.audio_utils import MAX_SEGMENT_SEC, TARGET_SAMPLE_RATE, to_mono
 from sayink.runtime_status import ModelLoadPhase
 from sayink.speaker_turns import RecognizedTurn, analyze_turns
 from sayink.vad_segmenter import CUT_SEARCH_SEC, QUIET_FLOOR_HIGH, QUIET_FLOOR_LOW, _cosine_falloff
@@ -635,15 +636,6 @@ def effective_language(language: str) -> str:
     return "zh" if code in ("", "auto") else code
 
 
-def recognition_params(config) -> tuple[str, str]:
-    """``(hotwords, language)`` for :meth:`SpeechRecognizer.configure` from the
-    shared ``stt.glossary`` / ``stt.language`` settings."""
-    from sayink.recognition_settings import RecognitionSettings
-
-    shared = RecognitionSettings.from_config(config)
-    return shared.hotwords, shared.effective_language
-
-
 MAX_HOTWORDS = 50
 MAX_HOTWORD_CHARS = 20
 
@@ -669,6 +661,21 @@ def format_hotwords(glossary) -> str:
     return ",".join(seen)
 
 
+@functools.lru_cache(maxsize=16)
+def _compiled_glossary_case_rules(
+    terms_tuple: tuple[str, ...],
+) -> tuple[re.Pattern[str], dict[str, str]]:
+    spelling: dict[str, str] = {}
+    for term in terms_tuple:
+        spelling.setdefault(term.lower(), term)
+    alternatives = "|".join(re.escape(t) for t in sorted(spelling.values(), key=len, reverse=True))
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9])(?<![A-Za-z0-9][._-])(?:{alternatives})(?![A-Za-z0-9])(?![._-][A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+    return pattern, spelling
+
+
 def restore_glossary_case(text: str, glossary) -> str:
     """Spell glossary terms the way the glossary does.
 
@@ -677,19 +684,17 @@ def restore_glossary_case(text: str, glossary) -> str:
     word that matches a term case-insensitively takes the term's spelling;
     longer terms win, so ``code`` does not re-case ``Visual Studio Code``.
     """
-    spelling: dict[str, str] = {}
+    if not text:
+        return text
+    latin_terms: list[str] = []
     for entry in glossary or ():
         term = entry.get("term", "") if isinstance(entry, dict) else entry
         term = str(term or "").strip()
         if re.search(r"[A-Za-z]", term):
-            spelling.setdefault(term.lower(), term)
-    if not text or not spelling:
+            latin_terms.append(term)
+    if not latin_terms:
         return text
-    alternatives = "|".join(re.escape(t) for t in sorted(spelling.values(), key=len, reverse=True))
-    pattern = re.compile(
-        rf"(?<![A-Za-z0-9])(?<![A-Za-z0-9][._-])(?:{alternatives})(?![A-Za-z0-9])(?![._-][A-Za-z0-9])",
-        re.IGNORECASE,
-    )
+    pattern, spelling = _compiled_glossary_case_rules(tuple(latin_terms))
     return pattern.sub(lambda m: spelling.get(m.group(0).lower(), m.group(0)), text)
 
 
@@ -750,8 +755,6 @@ def default_models_dir() -> Path:
     The installer puts the bundled model under Program Files, which a normal
     user cannot write; that copy is still found by _get_portable_model_dir.
     """
-    import sys
-
     if hasattr(sys, '_MEIPASS'):
         install_models = Path(sys._MEIPASS).parent / "models"
         if is_dir_writable(install_models):
@@ -767,8 +770,6 @@ def _get_models_dir() -> Path:
 
 def _portable_model_roots() -> list[Path]:
     """Directories that may hold a model shipped beside the program."""
-    import sys
-
     roots = []
     if hasattr(sys, "_MEIPASS"):
         roots.append(Path(sys._MEIPASS).parent / "models")
@@ -1088,11 +1089,12 @@ class ModelDownloadWorker(QThread):
                         tmp_path.unlink()
                     except OSError:
                         pass
+                    if resuming and attempt == 0:
+                        log.warning("断点续传文件 %s 校验不一致，清理后重新完整下载", target.name)
+                        continue
                     raise ChecksumMismatchError(f"{target.name} 校验失败：内容与固定版本不一致")
                 tmp_path.replace(target)
                 return
-            except ChecksumMismatchError:
-                raise
             except _DownloadCancelled:
                 raise
 
@@ -1446,12 +1448,14 @@ def decode_asr_slice(
     """The same normalized, bounded decode policy for the app and benchmark."""
     seg_floor = noise_floor if noise_floor is not None else getattr(audio, "noise_floor", None)
 
-    def decode(piece):
+    def decode(piece, *, boost: bool = True):
         stream = recognizer.create_stream()
-        stream.accept_waveform(
-            sample_rate,
-            prepare_quiet_asr_audio(piece, sample_rate, assume_speech=quiet_speech, noise_floor=seg_floor),
+        waveform = (
+            prepare_quiet_asr_audio(piece, sample_rate, assume_speech=quiet_speech, noise_floor=seg_floor)
+            if boost
+            else piece
         )
+        stream.accept_waveform(sample_rate, waveform)
         recognizer.decode_stream(stream)
         return normalize_asr_output(stream.result.text)
 
@@ -1478,7 +1482,8 @@ def decode_asr_slice(
             log.warning("异常重复重识别失败，保留首次文字: %s", exc)
     if text or not retry_empty or (cancelled is not None and cancelled()):
         return text
-    if quiet_speech is True or quiet_speech is None:
+    already_boosted = quiet_speech is True or quiet_speech is None
+    if already_boosted:
         retry_source = prepare_quiet_asr_audio(
             audio, sample_rate, assume_speech=quiet_speech, noise_floor=seg_floor
         )
@@ -1489,7 +1494,7 @@ def decode_asr_slice(
         return text
     try:
         log.info("短句识别为空，使用保留上下文的音频重试一次")
-        return decode(retry)
+        return decode(retry, boost=not already_boosted)
     except Exception as exc:
         log.warning("短句重试失败，保留首次识别结果: %s", exc)
         return text
@@ -1601,13 +1606,14 @@ class TranscribeWorker(QThread):
         try:
             from sayink.asr_context import with_context
             self._segment_noise_floor = getattr(self._audio_data, "noise_floor", self._segment_noise_floor)
-            audio = with_context(self._audio_data, getattr(self._audio_data, "prefix", None),
-                                 getattr(self._audio_data, "suffix", None))
-            if audio.ndim > 1:
-                audio = audio[:, 0]
+            raw_audio = self._audio_data
+            prefix = getattr(raw_audio, "prefix", None)
+            suffix = getattr(raw_audio, "suffix", None)
+            mono = to_mono(raw_audio) if raw_audio.ndim > 1 else raw_audio
+            audio = with_context(mono, prefix, suffix)
 
             # 验证音频数据有效性
-            if audio.size == 0 or np.any(np.isnan(audio)) or np.any(np.isinf(audio)):
+            if audio.size == 0 or not np.all(np.isfinite(audio)):
                 self.error.emit("音频数据无效")
                 return
 
@@ -1704,7 +1710,11 @@ def available_physical_ram_bytes() -> int | None:
 
         stat = _MEMORYSTATUSEX()
         stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
-        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+        fn = ctypes.windll.kernel32.GlobalMemoryStatusEx
+        if hasattr(fn, "argtypes"):
+            fn.argtypes = [ctypes.POINTER(_MEMORYSTATUSEX)]
+            fn.restype = ctypes.c_int
+        if not fn(ctypes.byref(stat)):
             return None
         return int(stat.ullAvailPhys)
     except Exception:
@@ -2170,7 +2180,3 @@ class SpeechRecognizer(QObject):
     @property
     def current_hotwords(self) -> str:
         return self._hotwords
-
-    @property
-    def current_language(self) -> str:
-        return self._language

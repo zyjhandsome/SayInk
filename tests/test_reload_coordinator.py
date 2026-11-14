@@ -393,11 +393,9 @@ class TestReloadCoordinatorDeferralAndUnblocking:
         assert ctx["floating"].loading_messages  # Cold switch shows loading HUD
 
     def test_settings_defer_during_open_hold_and_recovery_and_exit_guards_short_circuit(self) -> None:
-        hold_pending = [True]
         recovery = [False]
         exiting = [False]
         coord, ctx = _build_coordinator(
-            hold_open_pending=lambda: hold_pending[0],
             recovery_busy=lambda: recovery[0],
             exit_started=lambda: exiting[0],
         )
@@ -405,7 +403,8 @@ class TestReloadCoordinatorDeferralAndUnblocking:
         coord.configure_stt()
         ctx["recorder"].configured.clear()
 
-        # Settings saved during hold_open_pending -> immediate prefs apply, audio deferred
+        # Settings saved during active single-shot hold -> immediate prefs apply, audio deferred
+        ctx["recorder"].is_recording = True
         ctx["config"].set("sound_enabled", False)
         ctx["config"].set("audio.input_source", "system")
         coord.on_settings_changed()
@@ -414,7 +413,7 @@ class TestReloadCoordinatorDeferralAndUnblocking:
         assert ctx["recorder"].configured == []
 
         # Hold finishes -> deferred audio settings commit without clearing queue
-        hold_pending[0] = False
+        ctx["recorder"].is_recording = False
         coord.apply_deferred_audio_settings()
         assert coord.deferred_audio_settings is False
         assert ctx["cleared_queues"][0] == 0

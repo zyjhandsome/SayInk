@@ -292,15 +292,15 @@ class MeetingSpeakerSession(SpeakerSession):
         with self._lock:
             key = int(sample_key)
             observation = self._observations.get(key)
-            if speaker_id <= 0 or observation is None:
+            if observation is None or speaker_id <= 0:
                 return False
-            turn_idx = self._turn_index.get(key)
             for sid, profile in list(self._profiles.items()):
                 profile.samples.pop(key, None)
                 profile.confirmed.discard(key)
                 if not profile.samples:
                     del self._profiles[sid]
             observation.speaker_id = speaker_id
+            turn_idx = self._turn_index.get(key)
             if turn_idx is not None and 0 <= turn_idx < len(self._turns):
                 t = self._turns[turn_idx]
                 self._turns[turn_idx] = TurnObservation(t.key, speaker_id, t.vector, t.duration_ms, t.learnable)
@@ -309,7 +309,7 @@ class MeetingSpeakerSession(SpeakerSession):
                     TurnObservation(t.key, speaker_id, t.vector, t.duration_ms, t.learnable) if t.key == key else t
                     for t in self._turns
                 ]
-            if self._observations and next(reversed(self._observations)) == key:
+            if next(reversed(self._observations)) == key:
                 self._last_id = speaker_id
             if not observation.learnable or observation.vector is None:
                 self._evict_observations()

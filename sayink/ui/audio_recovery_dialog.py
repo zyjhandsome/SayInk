@@ -249,6 +249,14 @@ class AudioRecoveryDialog(QDialog):
     def running_workers(self):
         return (self.worker,) if self.worker is not None else ()
 
+    def _current_recognizer(self):
+        if callable(self.recognizer_getter):
+            live = self.recognizer_getter()
+            if live is not None:
+                self.recognizer = live
+            return live
+        return self.recognizer
+
     def cancel_processing(self):
         if self.worker is not None:
             self.worker.cancelled = True
@@ -260,15 +268,20 @@ class AudioRecoveryDialog(QDialog):
         self.recordings = recordings(self.root)
         self.items.clear()
         for item in self.recordings:
-            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(item.metadata.get("started_at", 0)))
+            try:
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(item.metadata.get("started_at", 0)))
+            except (OSError, OverflowError, ValueError, TypeError):
+                stamp = "未知时间"
             state = "已结束" if item.metadata.get("complete") else "异常中断 / 缓存失败"
             self.items.addItem(f"{stamp} · {item.seconds / 60:.1f} 分钟 · {state}")
         if self.recordings:
             self.items.setCurrentRow(0)
+            if self._current_recognizer() is None:
+                self.status.setText("模型尚未就绪，可先导出录音；模型载入后可重新识别。")
+            else:
+                self.status.setText("")
         else:
             self.status.setText("没有录音缓存。开启「录音恢复」后，从下一次录音开始保存。")
-        if self.recordings and self.recognizer is None:
-            self.status.setText("模型尚未就绪，可先导出录音；模型载入后可重新识别。")
         self._set_busy(False)
 
     def _update_tracks(self, row):
@@ -276,7 +289,7 @@ class AudioRecoveryDialog(QDialog):
         if 0 <= row < len(self.recordings):
             titles = {"audio": "混合录音", "microphone": "麦克风原始音轨", "system": "电脑声音原始音轨"}
             for track in self.recordings[row].available_tracks:
-                self.track.addItem(titles[track], track)
+                self.track.addItem(titles.get(track, track), track)
 
     def _selected(self):
         row = self.items.currentRow()
@@ -287,7 +300,9 @@ class AudioRecoveryDialog(QDialog):
         self._busy = bool(busy)
         for button in (self.export_btn, self.delete_btn):
             button.setEnabled(not busy and bool(self.recordings))
-        self.transcribe_btn.setEnabled(not busy and bool(self.recordings) and self.recognizer is not None)
+        self.transcribe_btn.setEnabled(
+            not busy and bool(self.recordings) and self._current_recognizer() is not None
+        )
         self.stop_btn.setEnabled(bool(busy))
         self.items.setEnabled(not busy)
         self.track.setEnabled(not busy)
@@ -317,10 +332,13 @@ class AudioRecoveryDialog(QDialog):
         worker.start()
 
     def _finished(self):
-        if not self._worker_failed and self.worker is not None:
-            self.status.setText("处理完成" if not self.worker.cancelled else "已停止，已有恢复文字保留")
+        worker = self.worker
+        if not self._worker_failed and worker is not None:
+            self.status.setText("处理完成" if not worker.cancelled else "已停止，已有恢复文字保留")
         self._set_busy(False)
         self.worker = None
+        if worker is not None:
+            worker.deleteLater()
 
     def _export(self):
         if item := self._selected():
@@ -329,12 +347,13 @@ class AudioRecoveryDialog(QDialog):
                 self._start(RecoveryWorker(item, target=Path(target)))
 
     def _transcribe(self):
-        if (item := self._selected()) and self.recognizer is not None:
+        rec = self._current_recognizer()
+        if (item := self._selected()) and rec is not None:
             self.output.clear()
             self._start(
                 RecoveryWorker(
                     item,
-                    recognizer=self.recognizer,
+                    recognizer=rec,
                     vad=self.vad,
                     vad_path=self.vad_path,
                     quiet=self.quiet,
@@ -366,6 +385,7 @@ class AudioRecoveryDialog(QDialog):
     def reject(self):
         if self.worker is not None and self.worker.isRunning():
             self.worker.cancelled = True
+            self.stop_btn.setEnabled(False)
             self.status.setText("正在停止，请等待当前识别片段完成…")
             return
         super().reject()

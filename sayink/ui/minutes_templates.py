@@ -7,7 +7,6 @@ import uuid
 from PyQt6.QtCore import QSignalBlocker, Qt
 from PyQt6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -36,6 +35,7 @@ from sayink.minutes_prompts import (
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles as ss
 from sayink.ui.prompts import confirm
+from sayink.ui.settings_components import ThemedCheckBox
 
 
 def populate_template_combo(combo, config, selected_id=None) -> None:
@@ -104,23 +104,6 @@ def _style_dialog(
         QListWidget::item:selected {{
             background: {tok.ROW_SELECTED};
             color: {tok.TEXT};
-        }}
-        QCheckBox {{
-            color: {tok.TEXT};
-            padding: 3px 4px;
-            spacing: 6px;
-            background: transparent;
-        }}
-        QCheckBox::indicator {{
-            width: 16px;
-            height: 16px;
-            border-radius: 4px;
-            border: 1px solid {tok.CONTROL_BORDER};
-            background: {tok.INPUT_BG};
-        }}
-        QCheckBox::indicator:checked {{
-            background: {tok.ACCENT};
-            border-color: {tok.ACCENT};
         }}
         QLabel#templateDialogError {{
             color: {tok.RED};
@@ -192,7 +175,7 @@ class TemplateEditorDialog(QDialog):
         self._sections = {}
         section_order = dict.fromkeys((*template.sections, *ALL_SECTIONS))
         for index, section in enumerate(section_order):
-            check = QCheckBox(SECTION_TITLES[section])
+            check = ThemedCheckBox(SECTION_TITLES[section])
             check.setChecked(section in template.sections)
             grid.addWidget(check, index // 2, index % 2)
             self._sections[section] = check
@@ -323,7 +306,7 @@ class MinutesTemplatesDialog(QDialog):
             row.addWidget(button)
         layout.addLayout(row)
 
-        self._set_default_check = QCheckBox("同时将所选模板设为新会议默认模板")
+        self._set_default_check = ThemedCheckBox("同时将所选模板设为新会议默认模板")
         self._set_default_check.setAccessibleName("同时将所选模板设为新会议默认模板")
         self._set_default_check.toggled.connect(lambda _checked: self._refresh_save_label())
         layout.addWidget(self._set_default_check)

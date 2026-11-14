@@ -19,6 +19,8 @@ from PyQt6.QtWidgets import QApplication
 
 log = logging.getLogger("SayInk")
 
+COPY_FAILED_TEXT = "复制失败，请再试一次"
+
 _ATTEMPTS = 6
 _SETTLE_MS = 30
 _lock = threading.Lock()
@@ -64,6 +66,8 @@ def copy_text(text: str) -> bool:
         _queued_text = None
     try:
         clipboard = QApplication.clipboard()
+        if clipboard is None:
+            return False
         ok = _write_once(clipboard, text)
         while True:
             with _lock:

@@ -74,6 +74,30 @@ _STATE_GLYPH_MAP = {
 }
 
 
+_DIAMOND_POLY = QPolygonF([
+    QPointF(8.0, 2.0),
+    QPointF(13.5, 8.0),
+    QPointF(8.0, 14.0),
+    QPointF(2.5, 8.0),
+])
+_WARN_TRI_POLY = QPolygonF([
+    QPointF(8.0, 2.3),
+    QPointF(13.8, 13.0),
+    QPointF(2.2, 13.0),
+])
+
+
+def _build_check_path() -> QPainterPath:
+    path = QPainterPath()
+    path.moveTo(5.0, 8.2)
+    path.lineTo(7.1, 10.4)
+    path.lineTo(11.1, 5.8)
+    return path
+
+
+_CHECK_PATH = _build_check_path()
+
+
 class _DotIndicator(QWidget):
     """Dual-channel status glyph (color + distinct geometric form) for the island."""
 
@@ -168,38 +192,28 @@ class _DotIndicator(QWidget):
         elif kind == "recognize":
             p.setPen(stroke)
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawArc(QRectF(2.2, 2.2, 11.6, 11.6), 45 * 16, 270 * 16)
+            start_angle_deg = (
+                (45.0 - math.degrees(self._pulse) * 2.5) % 360.0
+                if self._timer.isActive()
+                else 45.0
+            )
+            p.drawArc(QRectF(2.2, 2.2, 11.6, 11.6), int(round(start_angle_deg * 16)), 270 * 16)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(self._color)
             p.drawEllipse(QRectF(6.5, 6.5, 3.0, 3.0))
         elif kind == "polish":
-            diamond = QPolygonF([
-                QPointF(8.0, 2.0),
-                QPointF(13.5, 8.0),
-                QPointF(8.0, 14.0),
-                QPointF(2.5, 8.0),
-            ])
             p.setPen(stroke)
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPolygon(diamond)
+            p.drawPolygon(_DIAMOND_POLY)
         elif kind == "success":
             p.setPen(stroke)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QRectF(2.0, 2.0, 12.0, 12.0))
-            check = QPainterPath()
-            check.moveTo(5.0, 8.2)
-            check.lineTo(7.1, 10.4)
-            check.lineTo(11.1, 5.8)
-            p.drawPath(check)
+            p.drawPath(_CHECK_PATH)
         elif kind == "warn":
-            tri = QPolygonF([
-                QPointF(8.0, 2.3),
-                QPointF(13.8, 13.0),
-                QPointF(2.2, 13.0),
-            ])
             p.setPen(stroke)
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPolygon(tri)
+            p.drawPolygon(_WARN_TRI_POLY)
             p.drawLine(QPointF(8.0, 6.4), QPointF(8.0, 9.4))
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(self._color)
@@ -358,7 +372,6 @@ class FloatingWindow(QWidget):
         self._full_status_text = "准备中..."
         self._pre_collapse_tooltip = ""
         self._active_context_menu: QMenu | None = None
-        self._current_accent = tok.FLOAT_TEXT
         self._mode = "compact"
         self._setup_window()
         self._setup_ui()
@@ -488,18 +501,21 @@ class FloatingWindow(QWidget):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        if self._after_paint:
+        if self._after_paint and not getattr(self, "_after_paint_queued", False):
+            self._after_paint_queued = True
             # The frame is flushed after paintEvent returns.
             QTimer.singleShot(0, self._run_after_paint)
 
     def _run_after_paint(self) -> None:
+        from PyQt6 import sip
+
+        if sip.isdeleted(self):
+            return
+        self._after_paint_queued = False
         self._after_paint_timer.stop()
         pending, self._after_paint = self._after_paint, []
         for fn in pending:
             fn()
-
-    def island_mode(self) -> str:
-        return self._mode
 
     def set_input_source(self, source: str) -> None:
         self._source = source or "microphone"
@@ -512,10 +528,15 @@ class FloatingWindow(QWidget):
         shortcut = " · Esc" if enabled else ""
         self._end_btn.setToolTip(f"结束录音，已录内容继续识别{shortcut}")
 
+    @staticmethod
+    def _set_btn_css(btn: QPushButton, css: str) -> None:
+        if btn.styleSheet() != css:
+            btn.setStyleSheet(css)
+
     def _apply_action_button_styles(self) -> None:
         from sayink.ui import design_tokens as tok
 
-        self._cancel_btn.setStyleSheet(f"""
+        self._set_btn_css(self._cancel_btn, f"""
             QPushButton {{
                 background: {tok.CHIP_BG};
                 color: {tok.FLOAT_TEXT_SEC};
@@ -534,7 +555,7 @@ class FloatingWindow(QWidget):
             rec_color = QColor(tok.STATE_RECORD)
             end_fg = "#0D0D0D" if rec_color.lightness() > 145 else "#FFFFFF"
             end_hover = rec_color.lighter(108).name() if rec_color.lightness() > 145 else rec_color.darker(112).name()
-            self._mark_btn.setStyleSheet(f"""
+            self._set_btn_css(self._mark_btn, f"""
                 QPushButton {{
                     background: {tok.CHIP_BG};
                     color: {tok.FLOAT_TEXT};
@@ -550,7 +571,7 @@ class FloatingWindow(QWidget):
                     border-color: {tok.FLOAT_TEXT_SEC};
                 }}
             """)
-            self._end_btn.setStyleSheet(f"""
+            self._set_btn_css(self._end_btn, f"""
                 QPushButton {{
                     background: {tok.STATE_RECORD};
                     color: {end_fg};
@@ -566,7 +587,7 @@ class FloatingWindow(QWidget):
                 }}
             """)
         else:
-            self._end_btn.setStyleSheet(f"""
+            end_css = f"""
                 QPushButton {{
                     background: {tok.PRIMARY_CONTAINER};
                     color: {tok.PRIMARY_ON};
@@ -583,8 +604,14 @@ class FloatingWindow(QWidget):
                 QPushButton:pressed {{
                     background: {tok.PRIMARY_CONTAINER_PRESSED};
                 }}
-            """)
-            self._mark_btn.setStyleSheet(self._end_btn.styleSheet())
+            """
+            self._set_btn_css(self._end_btn, end_css)
+            self._set_btn_css(self._mark_btn, end_css)
+
+    @staticmethod
+    def _set_widget_css(widget: QWidget, css: str) -> None:
+        if widget.styleSheet() != css:
+            widget.setStyleSheet(css)
 
     def reapply_theme(self) -> None:
         from sayink.ui import design_tokens as tok
@@ -593,28 +620,30 @@ class FloatingWindow(QWidget):
         self._status_label.setFont(
             _ui_font(tok.UI_FONT_FAMILY, tok.TYPE_BODY_SM, QFont.Weight.Bold)
         )
-        self._status_label.setStyleSheet(
+        self._set_widget_css(
+            self._status_label,
             f"color: {tok.FLOAT_TEXT}; background: transparent;"
-            f" font-family: {tok.FONT_DISPLAY};"
+            f" font-family: {tok.FONT_DISPLAY};",
         )
         self._apply_action_button_styles()
         self._text_label.setFont(_ui_font(tok.UI_FONT_FAMILY, tok.TYPE_BODY_SM))
-        self._text_label.setStyleSheet(
+        self._set_widget_css(
+            self._text_label,
             f"color: {tok.FLOAT_TEXT}; background: transparent;"
-            f" font-family: {tok.FONT};"
+            f" font-family: {tok.FONT};",
         )
         self._sync_text_line_height()
         if hasattr(self, "_state_token"):
             self._set_state(self._full_status_text or self._status_label.text(), self._state_token,
                             pulse=self._dot._pulsing)
-        else:
-            self._current_accent = tok.FLOAT_TEXT
 
     def _paint_container(self) -> None:
         radius = 16 if self._mode == "excerpt" else BAR_HEIGHT // 2
-        self._container.setStyleSheet(
+        self._set_widget_css(
+            self._container,
             f"QWidget#islandContainer {{ background: {tok.FLOAT_BG};"
-            f" border: 1px solid {tok.FLOAT_BORDER}; border-radius: {radius}px; }}")
+            f" border: 1px solid {tok.FLOAT_BORDER}; border-radius: {radius}px; }}",
+        )
 
     def _setup_window(self):
         self.setWindowFlags(island_window_flags() | Qt.WindowType.WindowDoesNotAcceptFocus)
@@ -642,7 +671,6 @@ class FloatingWindow(QWidget):
         header_row.addWidget(self._dot)
 
         self._waveform = WaveformWidget()
-        self._wave = self._waveform
         header_row.addWidget(self._waveform)
 
         from sayink.ui import design_tokens as tok
@@ -782,22 +810,6 @@ class FloatingWindow(QWidget):
             self.setMinimumWidth(MIN_BAR_WIDTH)
             self.setFixedHeight(target_h)
             self.resize(BAR_WIDTH, target_h)
-
-    def expand_live(self, text: str = "") -> None:
-        self._hide_timer.stop()
-        if text:
-            self._apply_excerpt(text)
-        else:
-            self._text_label.show()
-            self._set_mode("excerpt")
-        self._present()
-
-    def collapse_live(self) -> None:
-        if not self._listening_active:
-            return
-        self._text_label.hide()
-        self._set_mode("compact")
-        self._present()
 
     def _on_close_clicked(self) -> None:
         if self._capture_active and not self._listening_active:
@@ -1009,6 +1021,7 @@ class FloatingWindow(QWidget):
         from sayink.ui.tray_icon import _paint_menu
 
         menu = QMenu(self)
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         menu.setWindowFlags(
             menu.windowFlags()
             | Qt.WindowType.FramelessWindowHint
@@ -1027,8 +1040,20 @@ class FloatingWindow(QWidget):
         return menu
 
     def _show_position_menu(self, global_pos: QPoint) -> None:
+        prev = getattr(self, "_active_context_menu", None)
+        if prev is not None:
+            try:
+                prev.close()
+                prev.deleteLater()
+            except RuntimeError:
+                pass
         menu = self._position_menu()
         self._active_context_menu = menu
+        menu.destroyed.connect(
+            lambda *_: setattr(self, "_active_context_menu", None)
+            if getattr(self, "_active_context_menu", None) is menu
+            else None
+        )
         menu.popup(global_pos)
 
     def reset_to_default_position(self) -> None:
@@ -1154,14 +1179,14 @@ class FloatingWindow(QWidget):
     def _set_state(self, text: str, color: str, pulse: bool = False):
         self._state_token = color
         resolved = getattr(tok, color, color)
-        self._current_accent = resolved
         # AMBER on white is about 3.2:1. Warning text uses the darker text
         # token; the dot keeps the brighter amber so it still reads as a warning.
         label_color = tok.AMBER_TEXT if self._state_token == "STATE_WARN" else resolved
         self._full_status_text = text
-        self._status_label.setStyleSheet(
+        self._set_widget_css(
+            self._status_label,
             f"color: {label_color}; background: transparent;"
-            f" font-family: {tok.FONT_DISPLAY};"
+            f" font-family: {tok.FONT_DISPLAY};",
         )
         self._dot.set_state_token(self._state_token)
         self._dot.set_color(resolved)
@@ -1594,12 +1619,11 @@ class FloatingWindow(QWidget):
         if remainder:
             self._apply_excerpt(remainder)
             self._text_label.setToolTip(message)
-            self.setFixedHeight(min(self.height(), BAR_EXCERPT_HEIGHT))
         else:
             self._text_label.setText("")
             self._text_label.setToolTip("")
             self._text_label.hide()
-            self.setFixedHeight(COMPACT_HEIGHT)
+            self._set_mode("compact")
         self._present()
         if auto_dismiss_ms and auto_dismiss_ms > 0:
             self._hide_timer.start(auto_dismiss_ms)
@@ -1644,7 +1668,7 @@ class FloatingWindow(QWidget):
         self._model_loading_active = True
         # The one thing the user must know lives in the title, where nothing
         # elides it; the detail line only carries progress / ETA.
-        self._set_state(MODEL_LOADING_TITLE, "STATE_RECOGNIZE", pulse=False)
+        self._set_state(MODEL_LOADING_TITLE, "STATE_RECOGNIZE", pulse=True)
         self._waveform.hide()
         self._apply_excerpt(
             detail or "模型文件已下载，正在载入内存，请稍候…"

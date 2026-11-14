@@ -35,10 +35,13 @@ INCOMPLETE_QUOTA_GRACE_SECONDS = 24 * 3600
 _PENDING_BYTES_LOCK = threading.Lock()
 _PENDING_BYTES_CACHE: dict[Path, tuple[float, int]] = {}
 _PENDING_CACHE_TTL_SEC = 5.0
+_PENDING_GENERATION = 0
 
 
 def _invalidate_pending_bytes_cache(root: Path | None = None) -> None:
+    global _PENDING_GENERATION
     with _PENDING_BYTES_LOCK:
+        _PENDING_GENERATION += 1
         if root is None:
             _PENDING_BYTES_CACHE.clear()
         else:
@@ -49,14 +52,17 @@ def _invalidate_pending_bytes_cache(root: Path | None = None) -> None:
 
 
 def _adjust_pending_bytes_cache(root: Path, delta: int) -> None:
+    global _PENDING_GENERATION
     try:
         key = root.resolve()
     except OSError:
-        return
+        key = None
     with _PENDING_BYTES_LOCK:
-        cached = _PENDING_BYTES_CACHE.get(key)
-        if cached is not None:
-            _PENDING_BYTES_CACHE[key] = (cached[0], max(0, cached[1] + int(delta)))
+        _PENDING_GENERATION += 1
+        if key is not None:
+            cached = _PENDING_BYTES_CACHE.get(key)
+            if cached is not None:
+                _PENDING_BYTES_CACHE[key] = (cached[0], max(0, cached[1] + int(delta)))
 
 
 def _dir_f32_bytes(folder: Path) -> int:
@@ -140,6 +146,8 @@ def sweep_orphan_pending(root: Path, *, exclude_journal: Path | None = None) -> 
                 pending.rmdir()
         except OSError:
             pass
+    if removed:
+        _invalidate_pending_bytes_cache(root)
     return removed
 
 
@@ -359,6 +367,8 @@ class RecordingJournal:
             self._written_bytes = 0
         sweep_orphan_pending(root, exclude_journal=self.path if self._append_mode else None)
         _invalidate_pending_bytes_cache(root)
+        self._fail_lock = threading.Lock()
+        self._pending_cache: tuple[int, float, int] = (-1, 0.0, 0)
         # Expire completed recordings past 7 days AND super-aged (>30d) incomplete fragments.
         existing = recordings(root)
         kept: list[RecoveryRecording] = []
@@ -416,9 +426,16 @@ class RecordingJournal:
 
         if self._existing_bytes + self._written_bytes >= max_bytes or shutil.disk_usage(root).free < MIN_FREE_BYTES:
             raise OSError("录音缓存空间不足，请导出或删除旧录音后重试")
+        created_dir = False
         if not self._append_mode:
             self.path.mkdir()
-        self._save_metadata(sync=False)
+            created_dir = True
+        try:
+            self._save_metadata(sync=False)
+        except Exception:
+            if created_dir:
+                shutil.rmtree(self.path, ignore_errors=True)
+            raise
         self._thread = threading.Thread(target=self._write, name="SayInkAudioJournal", daemon=True)
         self._thread.start()
 
@@ -448,11 +465,29 @@ class RecordingJournal:
         pending = _dir_f32_bytes(self.path / "pending") + _dir_f32_bytes(self.root / "pending")
         return self._existing_bytes + self._written_bytes + pending
 
+    def _cached_pending_bytes(self) -> int:
+        now = time.monotonic()
+        gen = _PENDING_GENERATION
+        cached_gen, cached_at, cached_val = self._pending_cache
+        if cached_gen == gen and (now - cached_at) < 1.0:
+            return cached_val
+        pending = _dir_f32_bytes(self.path / "pending") + _dir_f32_bytes(self.root / "pending")
+        self._pending_cache = (gen, now, pending)
+        return pending
+
     def _fail(self, message: str):
-        if not self._error:
+        should_notify = False
+        lock = getattr(self, "_fail_lock", None)
+        if lock is not None:
+            with lock:
+                if not self._error:
+                    self._error = message
+                    should_notify = True
+        elif not self._error:
             self._error = message
-            if self._on_error:
-                self._on_error(message)
+            should_notify = True
+        if should_notify and self._on_error:
+            self._on_error(message)
         self._stop.set()
 
     def append(self, audio: np.ndarray, *, tracks=None) -> bool:
@@ -482,7 +517,8 @@ class RecordingJournal:
                     except queue.Empty:
                         continue
                     chunk_bytes = sum(map(len, data.values()))
-                    if self.total_recovery_bytes + chunk_bytes > self._max_bytes:
+                    used_bytes = self._existing_bytes + size + self._cached_pending_bytes()
+                    if used_bytes + chunk_bytes > self._max_bytes:
                         self._fail("录音缓存已达到 2 GB 上限；请导出或删除旧录音")
                         break
                     if time.monotonic() - last_sync >= 1:
@@ -551,6 +587,8 @@ class StoredAudio:
                 quota_root = _infer_recovery_root_for_pending(self.path.parent)
                 if quota_root is not None:
                     _adjust_pending_bytes_cache(quota_root, -byte_len)
+                else:
+                    _invalidate_pending_bytes_cache()
         except OSError:
             pass  # The journal still owns this cache; it remains removable there.
 
@@ -595,6 +633,8 @@ def store_pending(
             handle.flush()
         if quota_root is not None:
             _adjust_pending_bytes_cache(quota_root, len(raw_bytes))
+        else:
+            _invalidate_pending_bytes_cache()
         return StoredAudio(
             path,
             audio.size,

@@ -39,7 +39,7 @@ from sayink.config import (
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_HOTKEY,
 )
-from sayink.recognition_settings import RecognitionSettings
+from sayink.recognition_settings import RecognitionSettings, audio_source
 from sayink.runtime_status import SegmentationStatus
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles
@@ -67,7 +67,7 @@ from sayink.ui.settings_components import (
 )
 from sayink.ui.theme import normalize_theme_mode
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("SayInk")
 
 MIXED_AUDIO_NOTE = (
     "音频来源：麦克风 + 电脑声音。线上会议可同时记录双方；外放时建议佩戴耳机，避免重复收音。"
@@ -390,11 +390,7 @@ class GeneralSettingsPage(SettingsPage):
     vad_download_status_row: QWidget
     vad_download_btn: QPushButton
     vad_download_row: QWidget
-    quiet_speech_row: ToggleOptionRow
-    boundary_context_row: ToggleOptionRow
-    speaker_enabled_row: ToggleOptionRow
     speaker_runtime_label: QLabel
-    speaker_activity_row: ToggleOptionRow
     meeting_source_combo: QComboBox
     meeting_model_combo: QComboBox
     meeting_defaults_hint: QLabel
@@ -523,7 +519,7 @@ class GeneralSettingsPage(SettingsPage):
         self.hotkey_hint.setWordWrap(True)
         self.hotkey_hint.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.hotkey_hint.setStyleSheet(
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
+            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px;"
             f" background: transparent; padding: 0 16px 12px 16px;"
         )
         self.hotkey_conflict_label = QLabel()
@@ -757,7 +753,7 @@ class GeneralSettingsPage(SettingsPage):
         self.theme_desc_label = QLabel("选择浅色、暗色，或跟随 Windows 外观")
         self.theme_desc_label.setProperty("viRole", "rowSubtitle")
         self.theme_desc_label.setStyleSheet(
-            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
+            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px;"
             f" background: transparent;"
         )
         text_lay.addWidget(self.theme_title_label)
@@ -978,23 +974,6 @@ class GeneralSettingsPage(SettingsPage):
         self.vad_download_row.layout().setAlignment(self.vad_download_btn, Qt.AlignmentFlag.AlignLeft)
         advanced.addWidget(self.vad_download_row)
 
-        # Retired manual switches kept off-layout as hidden compatibility stubs
-        # so typed-page legacy attribute delegations never raise AttributeError.
-        self.quiet_speech_row = ToggleOptionRow("")
-        self.quiet_speech_row.hide()
-        self.boundary_context_row = ToggleOptionRow(
-            "跨段音频上下文（实验性）",
-            "默认关闭；仅支持带时间戳的 CTC 模型，强制分段最多多等 0.3 秒。尚未验证稳定精度收益。",
-        )
-        self.boundary_context_row.toggled.connect(
-            lambda _checked=False: self.recognition_setting_changed.emit()
-        )
-        self.boundary_context_row.hide()
-        self.speaker_enabled_row = ToggleOptionRow("")
-        self.speaker_enabled_row.hide()
-        self.speaker_activity_row = ToggleOptionRow("")
-        self.speaker_activity_row.hide()
-
         advanced.addWidget(group_divider())
         speaker_diag_title = footnote("说话人区分（会议及使用电脑声音的持续转写中自动启用）")
         speaker_diag_title.setProperty("viRole", "importantHint")
@@ -1014,13 +993,14 @@ class GeneralSettingsPage(SettingsPage):
         self.meeting_source_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.meeting_source_combo.setMinimumContentsLength(16)
         self.meeting_source_combo.setAccessibleName("会议音频来源")
-        self.meeting_source_combo.addItem("跟随转写", "")
         for key in ("mixed", "microphone", "system"):
             self.meeting_source_combo.addItem(input_source_label(key), key)
         self.meeting_source_combo.currentIndexChanged.connect(
             lambda _idx=0: self.meeting_setting_changed.emit()
         )
-        lay.addWidget(labeled_row("默认音频来源", self.meeting_source_combo, "跟随转写设置，或为会议固定选择一个音源"))
+        lay.addWidget(labeled_row(
+            "默认音频来源", self.meeting_source_combo, "线上会议需要包含电脑声音才能录到对方；不随转写音源变化",
+        ))
         lay.addWidget(group_divider())
         self.meeting_model_combo = QComboBox()
         self.meeting_model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -1075,7 +1055,7 @@ class GeneralSettingsPage(SettingsPage):
         weight = 700 if tone == "error" else 400
         self.hotkey_conflict_label.setStyleSheet(
             f"color: {color}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: {weight};"
-            f" line-height: 1.4; background: transparent; padding: 0 16px 10px 16px;"
+            f" background: transparent; padding: 0 16px 10px 16px;"
         )
 
     def show_hotkey_feedback(self, text: str, *, error: bool = False) -> None:
@@ -1092,7 +1072,7 @@ class GeneralSettingsPage(SettingsPage):
 
     def apply_theme(self) -> None:
         self.hotkey_hint.setStyleSheet(
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; line-height: 1.4;"
+            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px;"
             f" background: transparent; padding: 0 16px 12px 16px;"
         )
         self.paint_hotkey_conflict_label()
@@ -1433,8 +1413,6 @@ class GeneralSettingsPage(SettingsPage):
         if model_missing:
             effective_name = f"{effective_name} 未下载，请到「引擎」下载或改选「与转写相同」"
         effective_source = self.meeting_source_combo.currentText()
-        if self.meeting_source_combo.currentData() == "":
-            effective_source = f"{effective_source}（当前：{dictation_hints(config).source}）"
         self.meeting_defaults_hint.setText(
             f"新会议：{effective_source} · {effective_name}。仅影响之后开始的会议。"
         )
@@ -1538,7 +1516,7 @@ class GeneralSettingsPage(SettingsPage):
         self.hotkey_edit.set_value(config.get("hotkey", DEFAULT_HOTKEY))
         self.auto_start_row.setChecked(config.get("auto_start", False))
         self.sound_row.setChecked(config.get("sound_enabled", True))
-        self.restore_clipboard_row.setChecked(config.get("output.restore_clipboard", False))
+        self.restore_clipboard_row.setChecked(bool(config.get("output.restore_clipboard", True)))
         output_choice = "auto" if config.output_follows_input_source() else config.output_mode()
         set_combo_by_data(self.output_mode_combo, output_choice)
         self.esc_stop_row.setChecked(bool(config.get("audio.esc_stops_continuous", True)))
@@ -1581,11 +1559,10 @@ class GeneralSettingsPage(SettingsPage):
     def load_recognition_and_meeting(self, config: Config) -> None:
         from sayink.asr_correction import format_glossary_line
 
-        set_combo_by_data(self.meeting_source_combo, config.get("meeting.input_source", "") or "")
+        set_combo_by_data(self.meeting_source_combo, audio_source(config, meeting=True))
         set_combo_by_data(self.meeting_model_combo, config.get("meeting.model_id", "") or "")
         set_combo_by_data(self.meeting_language_combo, config.get("stt.language", "auto"))
         self.meeting_start_card_row.setChecked(bool(config.get("meeting.show_start_card", True)))
-        self.boundary_context_row.setChecked(bool(config.get("stt.boundary_context_enabled", False)))
 
         glossary = config.get("stt.glossary", []) or []
         lines = (format_glossary_line(g) for g in glossary)

@@ -36,7 +36,6 @@ from sayink.ui.clipboard import copy_text
 from sayink.ui.floating_window import FloatingWindow
 from sayink.ui.flow_layout import FlowLayout
 from sayink.ui.hotkey_edit import HotkeyEdit, hotkey_conflict_warning
-from sayink.ui.island_chrome import ISLAND_SHADOW_BLUR
 from sayink.ui.prompts import text_prompt_box
 from sayink.ui.settings_components import ThemeModeSegment
 from sayink.ui.settings_pages.general import configure_numeric_spin
@@ -284,7 +283,6 @@ class TestOrchestrationAndPipelineFixes:
         state = {
             "stt.model_id": "sense-voice-small",
             "stt.language": "auto",
-            "stt.vad": "silero",
             "stt.boundary_context_enabled": False,
             "stt.glossary": [],
             "audio.input_source": "microphone",
@@ -415,10 +413,10 @@ class TestOrchestrationAndPipelineFixes:
     def test_h09_h10_h13_h18_h31_app_guards(self):
         with app_harness({"audio.trigger_mode": "hotkey", "llm.enabled": False}) as h:
             app = h["app"]
-            # H-09: _meeting_refusal blocks while hold-to-talk open is pending
-            app._hold_open_pending = True
+            # H-09: _meeting_refusal blocks while hold-to-talk capture is open
+            h["recorder"].is_recording = True
             assert app._meeting_refusal(MagicMock()) != ""
-            app._hold_open_pending = False
+            h["recorder"].is_recording = False
 
             # H-18: hold-to-talk starts recorder BEFORE painting floating bar
             call_order = []
@@ -507,8 +505,7 @@ class TestFloatingIslandPolish:
         finally:
             bar.close()
 
-    def test_h41_h42_h50_m22_dual_channel_glyphs_cancel_buttons_and_shadow_blur(self):
-        assert ISLAND_SHADOW_BLUR <= 16
+    def test_h41_h42_h50_m22_dual_channel_glyphs_and_cancel_buttons(self):
         bar = FloatingWindow()
         try:
             glyphs = set()
@@ -577,13 +574,15 @@ class TestSettingsAccessibilityAndSafeguards:
             assert edit.value == "alt+x"
 
             # Common conflict warning & no Alt+Space recommendation
+            repo_root = Path(__file__).resolve().parents[1]
             assert hotkey_conflict_warning("ctrl+shift+v") != ""
-            app_src = Path("sayink/app.py").read_text(encoding="utf-8")
-            about_src = Path("sayink/ui/settings_pages/about.py").read_text(encoding="utf-8")
+            app_src = (repo_root / "sayink" / "app.py").read_text(encoding="utf-8")
+            about_src = (repo_root / "sayink" / "ui" / "settings_pages" / "about.py").read_text(encoding="utf-8")
             assert "Alt + Space" not in app_src
             assert "Alt+Space" not in about_src
         finally:
             host.close()
+            host.deleteLater()
 
     def test_h44_wcag_aa_contrast_in_light_and_dark_axes_and_allowed_weights(self):
         for axis in ("light", "dark"):
@@ -597,7 +596,9 @@ class TestSettingsAccessibilityAndSafeguards:
                 assert _contrast_ratio(tok.ACCENT_TEXT, tok.SURFACE_PEARL) >= 4.5
         tok.activate("light")
 
-        polish_src = Path("sayink/ui/settings_pages/polish.py").read_text(encoding="utf-8")
+        polish_src = (Path(__file__).resolve().parents[1] / "sayink" / "ui" / "settings_pages" / "polish.py").read_text(
+            encoding="utf-8"
+        )
         assert "font-weight: 600" not in polish_src
         assert "font-weight: 500" not in polish_src
 
@@ -789,6 +790,8 @@ class TestSettingsAccessibilityAndSafeguards:
         # 3) SettingsWindow with is_model_downloaded=True builds engineHeroBadge & switches light/dark cleanly
         monkeypatch.setattr(config_mod, "user_data_dir", lambda: tmp_path)
         monkeypatch.setattr("sayink.speech_recognizer.is_model_downloaded", lambda _mid: True)
+        monkeypatch.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)
+        monkeypatch.setattr(SettingsWindow, "_refresh_about_info", lambda self: None)
         cfg = Config(secret_store=SimpleNamespace(read=lambda: "", write=lambda _v: True))
         sw = SettingsWindow(cfg)
         try:

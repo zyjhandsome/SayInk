@@ -6,21 +6,17 @@ import sys
 
 import pytest
 from PyQt6.QtCore import QRect, QSize
-from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
+from PyQt6.QtWidgets import QSystemTrayIcon
 
 from sayink.ui.tray_icon import TrayIcon, tray_menu_top_left
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    app = QApplication.instance() or QApplication(sys.argv)
-    yield app
 
 
 @pytest.fixture
 def tray(qapp):
     icon = TrayIcon()
     yield icon
+    icon.hide()
+    icon.deleteLater()
 
 
 class TestTrayMenuOpensAboveTheIcon:
@@ -257,6 +253,46 @@ def test_microphone_icon_includes_windows_small_sizes():
     icon = create_microphone_icon()
     widths = {size.width() for size in icon.availableSizes()}
     assert {16, 32}.issubset(widths)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 helper window")
+def test_pinned_caption_window_stays_hidden_when_shown():
+    """A double-click shows Qt's captioned tray owner unless the show is refused."""
+    import ctypes
+    from ctypes import wintypes
+
+    from sayink.ui.tray_icon import keep_hwnd_hidden
+
+    user32 = ctypes.windll.user32
+    user32.CreateWindowExW.argtypes = [
+        ctypes.c_uint, wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, ctypes.c_void_p,
+    ]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+
+    default = ctypes.c_int(0x80000000 - 2**32).value  # CW_USEDEFAULT
+    hwnd = user32.CreateWindowExW(
+        0, "Static", "SayInk", 0,
+        default, default, default, default,
+        None, None, None, None,
+    )
+    assert hwnd
+    try:
+        assert user32.GetWindowLongPtrW(hwnd, -16) & 0x00C00000
+        keep_hwnd_hidden(int(hwnd))
+        assert user32.IsWindowVisible(hwnd) == 0
+        assert user32.GetWindowLongPtrW(hwnd, -16) & 0x00C00000 == 0
+        user32.ShowWindow(hwnd, 5)  # SW_SHOW
+        assert user32.IsWindowVisible(hwnd) == 0
+    finally:
+        user32.DestroyWindow(hwnd)
 
 
 def test_idle_mic_uses_text_token():

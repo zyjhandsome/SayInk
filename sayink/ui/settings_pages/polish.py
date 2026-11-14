@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSizePolicy,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -65,6 +66,18 @@ def llm_action_button_width() -> int:
     font.setPixelSize(tok.TYPE_BODY_SM)
     widest = max(QFontMetrics(font).horizontalAdvance(label) for label in LLM_ACTION_LABELS)
     return widest + tok.CONTROL_BTN_SM_PAD_H * 2 + 8
+
+
+def _lock_single_line_width(label: QLabel) -> None:
+    """Keep a short status as wide as its own text.
+
+    ``footnote()`` turns wrapping on. In a horizontal row that hint collapses
+    at 200% scaling, so 「系统」 breaks while empty space sits to the right.
+    """
+    font = QFont(tok.UI_FONT_FAMILY)
+    font.setPixelSize(tok.TYPE_FOOTNOTE)
+    label.setMinimumWidth(QFontMetrics(font).horizontalAdvance(label.text()) + tok.SPACE_XS)
+    label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
 
 
 def _status_label() -> QLabel:
@@ -135,9 +148,9 @@ class PolishSettingsPage(SettingsPage):
         ))
         self.add(self._build_connection_section())
         self.add(footnote(
-            "支持 OpenAI、DeepSeek、通义千问、Ollama 等 OpenAI 兼容接口。"
+            "支持 OpenAI、DeepSeek、通义千问、Ollama 等 OpenAI 兼容接口。\n"
             + API_ADDRESS_HINT
-            + "明文 HTTP 会传输密钥和转写内容。"
+            + "\n明文 HTTP 会传输密钥和转写内容。"
         ))
         self.add(self._build_polish_section())
         self.add(self._build_minutes_section(config))
@@ -229,6 +242,8 @@ class PolishSettingsPage(SettingsPage):
         proxy_lay.setContentsMargins(16, 0, 16, 12)
         proxy_lay.setSpacing(8)
         self.proxy_summary_label = footnote("当前网络代理：使用系统 / 环境代理")
+        self.proxy_summary_label.setWordWrap(False)
+        _lock_single_line_width(self.proxy_summary_label)
         self.proxy_jump_btn = device_selection_link("网络代理设置")
         self.proxy_jump_btn.setCheckable(False)
         self.proxy_jump_btn.setAccessibleName("前往网络代理设置")
@@ -443,6 +458,7 @@ class PolishSettingsPage(SettingsPage):
             self.proxy_summary_label.setText("当前网络代理：直连（不使用代理）")
         else:
             self.proxy_summary_label.setText("当前网络代理：使用系统 / 环境代理")
+        _lock_single_line_width(self.proxy_summary_label)
 
     def set_status(
         self,
@@ -468,6 +484,7 @@ class PolishSettingsPage(SettingsPage):
         self.paint_status_label(self.minutes_test_status)
         self.paint_key_toggle()
         paint_device_selection_link(self.proxy_jump_btn)
+        _lock_single_line_width(self.proxy_summary_label)
 
     def hide_revealed_key(self) -> None:
         if self.llm_key_toggle.isChecked():

@@ -134,11 +134,19 @@ class StreamResampler:
         """Drain remaining FIR filter delay at end-of-file for offline decoders."""
         if self.source_rate <= 0 or self.source_rate == self.target_rate:
             return np.zeros(0, dtype=np.float32)
-        tail = np.zeros(0, dtype=np.float32)
-        if self._taps is not None and self._last is not None:
-            half = (LOWPASS_TAPS - 1) // 2
-            tail = self.process(np.zeros(half, dtype=np.float32))
         init_pad = (LOWPASS_TAPS - 1) // 2 if self._trim_delay else (LOWPASS_TAPS - 1)
+        tail = np.zeros(0, dtype=np.float32)
+        has_buffered = self._last is not None or (
+            self._history is not None and self._history.size > init_pad
+        )
+        if self._taps is not None and has_buffered:
+            half = (LOWPASS_TAPS - 1) // 2
+            pad_len = (
+                half
+                if self._last is not None or self._history is None
+                else max(half, LOWPASS_TAPS - self._history.size)
+            )
+            tail = self.process(np.zeros(pad_len, dtype=np.float32))
         if self._taps is not None:
             self._history = np.zeros(init_pad, dtype=np.float32)
         self._last = None
@@ -150,7 +158,8 @@ def rms_volume(audio: np.ndarray) -> float:
     mono = to_mono(audio)
     if mono.size == 0:
         return 0.0
-    return float(np.sqrt(np.mean(mono ** 2)))
+    flat = np.asarray(mono, dtype=np.float32).reshape(-1)
+    return float(np.sqrt(float(np.dot(flat, flat)) / flat.size))
 
 
 def mix_to_mono(
@@ -159,7 +168,7 @@ def mix_to_mono(
     *,
     gains: list[float] | None = None,
 ) -> np.ndarray:
-    """Resample each track to sample_rate, align length, and mix with headroom.
+    """Convert each pre-resampled track to mono, align length, and mix with headroom.
 
     Without ``gains`` the tracks are averaged (dictation behaviour). With
     ``gains`` (one per track, from :class:`LaneBalancer`) each track is scaled
@@ -170,7 +179,7 @@ def mix_to_mono(
     if not tracks:
         return np.array([], dtype=np.float32)
     pairs = [
-        (resample_mono(t, sample_rate, sample_rate), (gains[i] if gains and i < len(gains) else 1.0))
+        (to_mono(t), (gains[i] if gains and i < len(gains) else 1.0))
         for i, t in enumerate(tracks)
         if t is not None and t.size > 0
     ]

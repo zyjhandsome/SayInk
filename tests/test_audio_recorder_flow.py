@@ -73,6 +73,63 @@ class TestDrainMixedMono:
         assert out is not None
         assert np.allclose(out, 0.2)
 
+    @staticmethod
+    def _balanced_pair():
+        """Both lanes talked long enough for the balancer to give the mic x4."""
+        rec = AudioRecorder()
+        mic, system = _make_lane(role="microphone"), _make_lane(role="system")
+        rec._lanes = [mic, system]
+        for _ in range(40):
+            mic.chunks = [np.full(1600, 0.0125, np.float32)]
+            system.chunks = [np.full(1600, 0.05, np.float32)]
+            rec._drain_mixed_mono()
+        assert rec._balancer.gain("microphone") == pytest.approx(4.0)
+        assert rec._balancer.gain("system") == pytest.approx(1.0)
+        return rec, mic, system
+
+    @staticmethod
+    def _mic_gain(rec, mic, system, system_blocks):
+        """Per-sample gain the mix applied to a constant microphone signal."""
+        out = []
+        for block in system_blocks:
+            mic.chunks = [np.full(1600, 0.0125, np.float32)]
+            if block is None:  # loopback delivers nothing while nothing plays
+                system.chunks = []
+                system.last_chunk_at -= AudioRecorder.MIX_WAIT_SEC + 1
+            else:
+                system.chunks = [block]
+                system.last_chunk_at = mic.last_chunk_at
+            out.append(rec._drain_mixed_mono() - (0.0 if block is None else block))
+        return np.concatenate(out) / 0.0125
+
+    @pytest.mark.parametrize("silent", [np.zeros(1600, np.float32), None],
+                             ids=["digital-silence", "no-loopback-data"])
+    def test_mic_gain_glides_instead_of_jumping_when_the_other_lane_stops(self, silent):
+        """Regression: the remote party pausing stepped the mic level by up to
+        12 dB from one 100 ms block to the next (x4 balanced -> x1 alone)."""
+        rec, mic, system = self._balanced_pair()
+        gain = self._mic_gain(rec, mic, system, [silent] * 40)
+        assert gain[0] == pytest.approx(4.0, rel=0.01)
+        assert float(np.max(np.abs(np.diff(gain)))) < 0.01
+        assert gain[-1] == pytest.approx(1.0)
+
+    def test_mic_gain_glides_back_when_the_other_lane_returns(self):
+        rec, mic, system = self._balanced_pair()
+        self._mic_gain(rec, mic, system, [np.zeros(1600, np.float32)] * 40)
+        gain = self._mic_gain(rec, mic, system, [np.full(1600, 0.05, np.float32)] * 40)
+        assert gain[0] == pytest.approx(1.0, rel=0.01)
+        assert float(np.max(np.abs(np.diff(gain)))) < 0.01
+        assert gain[-1] == pytest.approx(4.0)
+
+    def test_a_lane_hovering_at_the_silence_floor_does_not_pump_the_other(self):
+        """Comfort noise crossing the digital-silence floor on alternate blocks
+        used to flip the mic between x1 and x4 ten times a second."""
+        rec, mic, system = self._balanced_pair()
+        hover = [np.zeros(1600, np.float32), np.full(1600, 2e-4, np.float32)] * 30
+        gain = self._mic_gain(rec, mic, system, hover).reshape(-1, 1600).mean(axis=1)
+        settled = gain[-20:]
+        assert float(settled.max() / settled.min()) < 1.3
+
     def test_two_lanes_are_mixed(self):
         rec = AudioRecorder()
         rec._lanes = [
@@ -143,6 +200,74 @@ class TestDrainMixedMono:
         assert sum(len(block) for block in outputs) == len(playback)
         assert rec._block_mic_energy < 1e-8 and rec._block_system_energy > 0
         assert rec._duplicate_suppressor.suppressed_samples > 16000
+
+
+class TestUnrecordedPlaybackReminder:
+    """A microphone-only meeting cannot hear a remote party who is on headphones."""
+
+    @staticmethod
+    def _recorder(monkeypatch, peaks, *, source="microphone", meeting=True):
+        feed = iter(peaks)
+        monkeypatch.setattr("sayink.audio_recorder._render_playback_peak", lambda: next(feed, 0.0), raising=False)
+        rec = AudioRecorder()
+        rec.configure(input_source=source)
+        rec.set_segmenter_profile(meeting=meeting)
+        rec._is_recording = True
+        rec._continuous_mode = True
+        warnings = []
+        rec.warning.connect(warnings.append)
+        return rec, warnings
+
+    @staticmethod
+    def _poll(rec, seconds, start=1000.0):
+        step = AudioRecorder.SYSTEM_ROUTE_POLL_SEC
+        for index in range(int(seconds / step)):
+            rec._poll_unrecorded_playback(start + index * step)
+
+    def test_sustained_playback_in_a_microphone_only_meeting_warns_once(self, monkeypatch):
+        rec, warnings = self._recorder(monkeypatch, [0.2] * 100)
+        self._poll(rec, 120)
+        assert len(warnings) == 1
+        assert "只录麦克风" in warnings[0] and "麦克风 + 电脑声音" in warnings[0]
+
+    def test_a_single_sound_is_not_a_call(self, monkeypatch):
+        # One start cue or notification, then nothing.
+        rec, warnings = self._recorder(monkeypatch, [0.2] + [0.0] * 100)
+        self._poll(rec, 120)
+        assert warnings == []
+
+    def test_sounds_far_apart_are_not_a_call(self, monkeypatch):
+        # A notification every 40 s never gathers enough evidence inside one minute.
+        rec, warnings = self._recorder(monkeypatch, ([0.2] + [0.0] * 19) * 10)
+        self._poll(rec, 400)
+        assert warnings == []
+
+    @pytest.mark.parametrize("source, meeting", [("mixed", True), ("system", True), ("microphone", False)])
+    def test_only_microphone_only_meetings_are_checked(self, monkeypatch, source, meeting):
+        # Dictation next to music is normal; mixed and system already record playback.
+        rec, warnings = self._recorder(monkeypatch, [0.2] * 100, source=source, meeting=meeting)
+        self._poll(rec, 120)
+        assert warnings == []
+
+    def test_one_meeting_is_warned_once_even_after_a_pause(self, monkeypatch, mock_recording_hardware):
+        rec, warnings = self._recorder(monkeypatch, [0.2] * 300)
+        rec.set_recovery_session_id("meeting-a")
+        self._poll(rec, 60)
+        assert len(warnings) == 1
+        # Pause and resume reopen the device; the meeting is still the same one.
+        rec._is_recording = False
+        rec.start(continuous=True)
+        try:
+            self._poll(rec, 60, start=2000.0)
+        finally:
+            rec.cancel()
+        assert len(warnings) == 1
+
+        rec.set_recovery_session_id("meeting-b")
+        rec._is_recording = True
+        rec._continuous_mode = True
+        self._poll(rec, 60, start=3000.0)
+        assert len(warnings) == 2
 
 
 class _FakeStream:

@@ -89,17 +89,26 @@ class TestSoundManagerPlayMethods:
 
 
 class TestSoundManagerDisabled:
-    def test_play_start_when_disabled(self):
+    def test_play_start_when_disabled(self, monkeypatch):
         manager = SoundManager(enabled=False)
+        called = []
+        monkeypatch.setattr(manager, "_play_async", called.append)
         manager.play_start()
+        assert called == []
 
-    def test_play_stop_when_disabled(self):
+    def test_play_stop_when_disabled(self, monkeypatch):
         manager = SoundManager(enabled=False)
+        called = []
+        monkeypatch.setattr(manager, "_play_async", called.append)
         manager.play_stop()
+        assert called == []
 
-    def test_play_error_when_disabled(self):
+    def test_play_error_when_disabled(self, monkeypatch):
         manager = SoundManager(enabled=False)
+        called = []
+        monkeypatch.setattr(manager, "_play_async", called.append)
         manager.play_error()
+        assert called == []
 
 
 class TestSoundManagerPlayAsync:
@@ -108,10 +117,29 @@ class TestSoundManagerPlayAsync:
         assert hasattr(manager, "_play_async")
         assert callable(manager._play_async)
 
-    def test_play_async_accepts_array(self):
+    def test_play_async_accepts_array(self, monkeypatch):
+        import threading
+        import types
+
+        played = []
+        played_event = threading.Event()
+
+        def _fake_play(audio, samplerate=None, **kwargs):
+            played.append((audio, samplerate, kwargs))
+            played_event.set()
+
+        fake_sd = types.SimpleNamespace(play=_fake_play, wait=lambda: None)
+        monkeypatch.setitem(__import__("sys").modules, "sounddevice", fake_sd)
+        monkeypatch.setattr("sayink.sound_manager.sd", fake_sd, raising=False)
+
         manager = SoundManager()
         tone = manager._generate_tone(440, 0.1)
         manager._play_async(tone)
+        assert played_event.wait(timeout=2.0)
+        assert len(played) == 1
+        assert np.array_equal(played[0][0], tone)
+        assert played[0][1] == SoundManager.SAMPLE_RATE
+        assert played[0][2].get("blocking") is True
 
 
 class TestSoundManagerThreadPool:

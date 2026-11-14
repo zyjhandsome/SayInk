@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Optional, Sequence
 
-log = logging.getLogger("sayink")
+log = logging.getLogger("SayInk")
 
 # Shared non-color tokens. Qt stylesheets accept one family, not a CSS-style
 # fallback list. Prefer YaHei so common CJK stays visible; Latin-only
@@ -37,10 +37,8 @@ TYPE_BODY_SM = 14
 TYPE_BODY = 14
 TYPE_TITLE_SM = 15
 TYPE_TITLE = 16
-TYPE_ICON_LG = 17
 TYPE_HERO = 18
 TYPE_TITLE_LG = 20
-TYPE_DISPLAY = 22
 
 
 def _probe_system_font_families() -> tuple[str, ...]:
@@ -57,7 +55,7 @@ def _probe_system_font_families() -> tuple[str, ...]:
         return ()
 
 
-def _family_covers_cjk(family: str) -> bool:
+def _family_covers_cjk(family: str, *, installed: Optional[set[str]] = None) -> bool:
     """Return True when family can paint common Simplified Chinese, or if we cannot probe."""
     try:
         from PyQt6.QtGui import QFont, QFontDatabase, QFontMetrics
@@ -65,7 +63,8 @@ def _family_covers_cjk(family: str) -> bool:
 
         if QApplication.instance() is None:
             return True
-        installed = {name.casefold() for name in QFontDatabase.families()}
+        if installed is None:
+            installed = {name.casefold() for name in QFontDatabase.families()}
         if family.casefold() not in installed:
             return False
         names = {str(system) for system in QFontDatabase.writingSystems(family)}
@@ -89,9 +88,10 @@ def resolve_ui_font_family(
     probed_system = available_families is None
     if available_families is None:
         available_families = _probe_system_font_families()
-    if covers_cjk is None and probed_system:
-        covers_cjk = _family_covers_cjk
     available = {name.casefold(): name for name in available_families}
+    if covers_cjk is None and probed_system:
+        installed_set = set(available.keys())
+        covers_cjk = lambda name: _family_covers_cjk(name, installed=installed_set)
     for name in stack:
         hit = available.get(name.casefold())
         if hit is None:
@@ -123,11 +123,18 @@ def refresh_ui_font(
     *,
     available_families: Optional[Sequence[str]] = None,
     preferred: Optional[Sequence[str]] = None,
+    _notify: bool = True,
 ) -> str:
     """Resolve and publish FONT / FONT_DISPLAY / FONT_MONO for QSS and QFont."""
+    covers_cjk: Optional[Callable[[str], bool]] = None
+    if available_families is None:
+        available_families = _probe_system_font_families()
+        installed_set = {name.casefold() for name in available_families}
+        covers_cjk = lambda name: _family_covers_cjk(name, installed=installed_set)
     family = resolve_ui_font_family(
         available_families=available_families,
         preferred=preferred,
+        covers_cjk=covers_cjk,
     )
     mono = resolve_mono_font_family(available_families=available_families)
     g = globals()
@@ -135,10 +142,10 @@ def refresh_ui_font(
     g["FONT"] = f'"{family}"'
     g["FONT_DISPLAY"] = g["FONT"]
     g["FONT_MONO"] = f'"{mono}"'
-    _notify_derived_styles()
+    if _notify:
+        _notify_derived_styles()
     return family
 
-RADIUS_XS = 4
 RADIUS_SM = 6
 RADIUS_MD = 8
 RADIUS_LG = 10
@@ -148,8 +155,6 @@ WINDOW_RADIUS = 12
 SPACE_XS = 8
 SPACE_SM = 12
 SPACE_MD = 16
-SPACE_LG = 24
-SPACE_XL = 32
 PAGE_MARGIN_H = 20
 PAGE_MARGIN_V = 16
 CONTENT_MAX_WIDTH = 900
@@ -169,7 +174,6 @@ READING_LINE_HEIGHT = 160
 # Wide enough for values like「5500 场」plus a 22px flat stepper column.
 CONTROL_NUMERIC_WIDTH = 120
 CONTROL_SETTINGS_COMBO_WIDTH = 240
-CONTROL_DEVICE_COMBO_WIDTH = CONTROL_SETTINGS_COMBO_WIDTH
 
 # Shared box for settings small actions (accent + ghost) so paired
 # buttons like「使用此模型」/「删除」paint at the same outer height.
@@ -186,14 +190,11 @@ TRAY_MENU_FONT = TYPE_FOOTNOTE
 
 _LIGHT: dict[str, Any] = {
     "ACCENT": "#2563EB",
-    "ACCENT_HV": "#1D4ED8",
     "ACCENT_SOLID": "#2563EB",
-    "ACCENT_SOLID_HV": "#1D4ED8",
     "ACCENT_FOCUS": "#2563EB",
     "ACCENT_TEXT": "#2563EB",
     "ACCENT_TEXT_HOVER": "#1D4ED8",
     "ACCENT_ON_DARK": "#FFFFFF",
-    "ACCENT_BG": "#DBEAFE",
     "ACCENT_SOFT": "rgba(37, 99, 235, 0.08)",
     "PRIMARY_CONTAINER": "#0D0D0D",
     "PRIMARY_CONTAINER_HOVER": "#262626",
@@ -206,7 +207,6 @@ _LIGHT: dict[str, Any] = {
     "SURFACE_PEARL": "#F7F7F7",
     "BORDER": "rgba(13,13,13,0.08)",
     "HAIRLINE": "rgba(13,13,13,0.08)",
-    "OUTLINE_VARIANT": "#D1D5DB",
     "DIVIDER_SOFT": "#E5E7EB",
     "ROW_SELECTED": "rgba(13,13,13,0.06)",
     "INPUT_BG": "#FFFFFF",
@@ -239,14 +239,10 @@ _LIGHT: dict[str, Any] = {
     "TOGGLE_ON": "#15803D",
     "TOGGLE_ON_HOVER": "#166534",
     "ROW_HOVER": "rgba(0, 0, 0, 0.03)",
-    "FOCUS_RING": "2px solid #2563EB",
     "TRAY_MENU_BORDER": "#E5E7EB",
     "TRAY_MENU_SEPARATOR": "#E5E7EB",
     "TRAY_MENU_HOVER": "#F3F4F6",
-    "TRAY_MENU_CHECK": "#333333",
-    "TRAY_MENU_ARROW": "#9CA3AF",
     "FLOAT_BG": "rgba(255, 255, 255, 236)",
-    "FLOAT_TILE": "#FFFFFF",
     "FLOAT_BORDER": "rgba(17, 24, 39, 0.10)",
     "CHIP_BG": "rgba(17, 24, 39, 0.08)",
     "CHIP_BG_HOVER": "rgba(17, 24, 39, 0.16)",
@@ -254,14 +250,6 @@ _LIGHT: dict[str, Any] = {
     "FLOAT_TEXT": "#111827",
     "FLOAT_TEXT_SEC": "#4B5563",
     "STATE_RECORD": "#DC2626",
-    "STATE_ICON_RECORD": "#DC2626",
-    "STATE_ICON_LISTEN": "#15803D",
-    "STATE_ICON_RECOGNIZE": "#2563EB",
-    "STATE_ICON_POLISH": "#0F766E",
-    "STATE_ICON_SUCCESS": "#15803D",
-    "STATE_ICON_WARN": "#D97706",
-    "STATE_ICON_ERROR": "#DC2626",
-    "STATE_ICON_MUTED": "#667085",
     # Transcript speaker names, by speaker id. Each stays >= 4.5:1 on
     # SURFACE_PEARL and HIGHLIGHT_BG (tests/test_ui_styles.py checks).
     "SPEAKER_COLORS": ("#2563EB", "#15803D", "#7C3AED", "#B45309", "#BE185D", "#0F766E"),
@@ -270,14 +258,11 @@ _LIGHT: dict[str, Any] = {
 
 _DARK: dict[str, Any] = {
     "ACCENT": "#3B82F6",
-    "ACCENT_HV": "#60A5FA",
     "ACCENT_SOLID": "#2563EB",
-    "ACCENT_SOLID_HV": "#1D4ED8",
     "ACCENT_FOCUS": "#3B82F6",
     "ACCENT_TEXT": "#60A5FA",
     "ACCENT_TEXT_HOVER": "#93C5FD",
     "ACCENT_ON_DARK": "#0D0D0D",
-    "ACCENT_BG": "#1E3A5F",
     "ACCENT_SOFT": "rgba(59, 130, 246, 0.16)",
     "PRIMARY_CONTAINER": "#FFFFFF",
     "PRIMARY_CONTAINER_HOVER": "#E8E8E8",
@@ -290,7 +275,6 @@ _DARK: dict[str, Any] = {
     "SURFACE_PEARL": "#222528",
     "BORDER": "rgba(255,255,255,0.08)",
     "HAIRLINE": "rgba(255,255,255,0.08)",
-    "OUTLINE_VARIANT": "#4B5563",
     "DIVIDER_SOFT": "#374151",
     "ROW_SELECTED": "rgba(255,255,255,0.06)",
     "INPUT_BG": "#202326",
@@ -320,14 +304,10 @@ _DARK: dict[str, Any] = {
     "TOGGLE_ON": "#16A34A",
     "TOGGLE_ON_HOVER": "#15803D",
     "ROW_HOVER": "rgba(255, 255, 255, 0.03)",
-    "FOCUS_RING": "2px solid #3B82F6",
     "TRAY_MENU_BORDER": "#374151",
     "TRAY_MENU_SEPARATOR": "#4B5563",
     "TRAY_MENU_HOVER": "#374151",
-    "TRAY_MENU_CHECK": "#F9FAFB",
-    "TRAY_MENU_ARROW": "#9CA3AF",
     "FLOAT_BG": "rgba(24, 24, 24, 236)",
-    "FLOAT_TILE": "#181818",
     "FLOAT_BORDER": "rgba(255, 255, 255, 0.12)",
     "CHIP_BG": "rgba(210, 210, 215, 0.40)",
     "CHIP_BG_HOVER": "rgba(210, 210, 215, 0.55)",
@@ -335,14 +315,6 @@ _DARK: dict[str, Any] = {
     "FLOAT_TEXT": "#FFFFFF",
     "FLOAT_TEXT_SEC": "rgba(235, 235, 245, 0.72)",
     "STATE_RECORD": "#F87171",
-    "STATE_ICON_RECORD": "#F87171",
-    "STATE_ICON_LISTEN": "#4ADE80",
-    "STATE_ICON_RECOGNIZE": "#60A5FA",
-    "STATE_ICON_POLISH": "#5EEAD4",
-    "STATE_ICON_SUCCESS": "#4ADE80",
-    "STATE_ICON_WARN": "#FBBF24",
-    "STATE_ICON_ERROR": "#F87171",
-    "STATE_ICON_MUTED": "#9CA3AF",
     "SPEAKER_COLORS": ("#60A5FA", "#4ADE80", "#C4B5FD", "#FBBF24", "#F9A8D4", "#5EEAD4"),
     "HIGHLIGHT_BG": "#1E3A5F",
 }
@@ -372,7 +344,7 @@ def _notify_derived_styles() -> None:
 _active_axis: str | None = None
 
 
-def activate(effective: str) -> None:
+def activate(effective: str, *, _notify: bool = True) -> None:
     """Publish the effective theme onto module-level color aliases."""
     global _active_axis
     axis = "dark" if effective == "dark" else "light"
@@ -383,8 +355,8 @@ def activate(effective: str) -> None:
     g["ACTIVE_THEME"] = axis
     for key in _COLOR_KEYS:
         g[key] = vals[key]
-    # Float state aliases: text stays calm while STATE_SUCCESS & STATE_ICON_*
-    # provide distinct color + shape dual-channel encoding on the island.
+    # Float state aliases: text stays calm while STATE_* tokens and _DotIndicator
+    # glyphs provide distinct color + shape dual-channel encoding on the island.
     g["STATE_LISTEN"] = vals["GREEN"]
     g["STATE_RECOGNIZE"] = vals["FLOAT_TEXT"]
     g["STATE_POLISH"] = vals["FLOAT_TEXT_SEC"]
@@ -395,7 +367,8 @@ def activate(effective: str) -> None:
     g["STATE_MUTED"] = vals["FLOAT_TEXT_SEC"]
     g["STATE_ERROR"] = vals["STATE_RECORD"]
     _active_axis = axis
-    _notify_derived_styles()
+    if _notify:
+        _notify_derived_styles()
 
 
 # Initialize light as the default module namespace (imports before activate).

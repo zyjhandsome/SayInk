@@ -4,10 +4,6 @@ import pytest
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
 
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication(sys.argv)
-
 
 def _make_main_window(tmp_path, monkeypatch, *, with_meeting=False):
     from sayink.config import Config
@@ -366,6 +362,255 @@ def test_caption_move_keeps_the_round_mask(qapp, tmp_path, monkeypatch):
         store.close()
 
 
+def _nccalc_message(win, *, bottom: int, old_bottom: int):
+    import ctypes
+    from ctypes import wintypes
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    class PARAMS(ctypes.Structure):
+        _fields_ = [("rgrc", RECT * 3), ("lppos", ctypes.c_void_p)]
+
+    params = PARAMS()
+    params.rgrc[0].left = 10
+    params.rgrc[0].top = 20
+    params.rgrc[0].right = 410
+    params.rgrc[0].bottom = bottom
+    params.rgrc[1].left = 10
+    params.rgrc[1].top = 20
+    params.rgrc[1].right = 410
+    params.rgrc[1].bottom = old_bottom
+    msg = wintypes.MSG()
+    msg.hWnd = int(win.winId())
+    msg.message = 0x0083  # WM_NCCALCSIZE
+    msg.wParam = 1
+    msg.lParam = ctypes.addressof(params)
+    return msg, params
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 client rect")
+def test_resting_client_rect_extends_one_pixel_past_the_bottom(qapp, tmp_path, monkeypatch):
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        msg, params = _nccalc_message(win, bottom=300, old_bottom=300)
+        handled, result = win.nativeEvent(b"windows_generic_MSG", __import__("ctypes").addressof(msg))
+        assert handled is True
+        assert result == 0
+        assert params.rgrc[0].bottom == 301
+
+        msg, params = _nccalc_message(win, bottom=300, old_bottom=300)
+        win.nativeEvent(b"windows_generic_MSG", __import__("ctypes").addressof(msg))
+        assert params.rgrc[0].bottom == 301
+    finally:
+        win.close()
+        store.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 client rect")
+def test_maximized_client_rect_is_not_extended(qapp, tmp_path, monkeypatch):
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        monkeypatch.setattr(win, "_is_zoomed", lambda hwnd: True)
+        msg, params = _nccalc_message(win, bottom=300, old_bottom=280)
+        handled, result = win.nativeEvent(b"windows_generic_MSG", __import__("ctypes").addressof(msg))
+        assert handled is True
+        assert result == 0
+        assert params.rgrc[0].bottom == 300
+    finally:
+        win.close()
+        store.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 client rect")
+@pytest.mark.parametrize(
+    ("edge", "alignment"),
+    [
+        (3, 0x0040 | 0x0020),  # top: bottom + left
+        (5, 0x0040 | 0x0020),  # top-right
+        (4, 0x0040 | 0x0080),  # top-left: bottom + right
+        (1, 0x0010 | 0x0080),  # left: top + right
+        (7, 0x0010 | 0x0080),  # bottom-left
+        (2, 0),  # right stays pinned to the top-left
+        (6, 0),
+        (8, 0),
+    ],
+)
+def test_live_edge_drag_keeps_existing_client_pixels(qapp, tmp_path, monkeypatch, edge, alignment):
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        win._sizing_edge = edge
+        msg, params = _nccalc_message(win, bottom=320, old_bottom=300)
+        handled, result = win.nativeEvent(b"windows_generic_MSG", __import__("ctypes").addressof(msg))
+        assert handled is True
+        assert result == alignment
+        # The resting one-pixel extension is off while a drag is in progress.
+        assert params.rgrc[0].bottom == 320
+        assert params.rgrc[1].bottom == 300
+        assert params.rgrc[2].bottom == 0
+    finally:
+        win.close()
+        store.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 resize bits")
+def test_live_resize_does_not_discard_client_bits(qapp, tmp_path, monkeypatch):
+    import ctypes
+    from ctypes import wintypes
+
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        class WINDOWPOS(ctypes.Structure):
+            _fields_ = [
+                ("hwnd", wintypes.HWND),
+                ("hwndInsertAfter", wintypes.HWND),
+                ("x", ctypes.c_int),
+                ("y", ctypes.c_int),
+                ("cx", ctypes.c_int),
+                ("cy", ctypes.c_int),
+                ("flags", ctypes.c_uint),
+            ]
+
+        pos = WINDOWPOS()
+        pos.cx, pos.cy = 900, 640
+        pos.flags = 0x0100  # SWP_NOCOPYBITS
+        msg = wintypes.MSG()
+        msg.hWnd = int(win.winId())
+        msg.message = 0x0046  # WM_WINDOWPOSCHANGING
+        msg.lParam = ctypes.addressof(pos)
+        win._live_resizing = True
+        handled, result = win.nativeEvent(b"windows_generic_MSG", ctypes.addressof(msg))
+        assert handled is True
+        assert result == 0
+        assert pos.flags & 0x0100 == 0
+
+        pos.flags = 0x0001 | 0x0100  # a move keeps Qt's own handling
+        handled, _result = win.nativeEvent(b"windows_generic_MSG", ctypes.addressof(msg))
+        assert handled is False
+
+        win._live_resizing = False
+        pos.flags = 0x0100
+        handled, _result = win.nativeEvent(b"windows_generic_MSG", ctypes.addressof(msg))
+        assert handled is False
+    finally:
+        win.close()
+        store.close()
+
+
+def test_size_grip_drag_does_not_swap_the_round_mask(qapp, tmp_path, monkeypatch):
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QMouseEvent
+
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        win.show()
+        qapp.processEvents()
+        assert not win.mask().isEmpty()
+        local = QPointF(8, 8)
+        press = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            local,
+            local,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(win._size_grip, press)
+        assert win._live_resizing is True
+        win.resize(win.width() + 24, win.height() + 16)
+        qapp.processEvents()
+        assert win.mask().isEmpty()
+        release = QMouseEvent(
+            QEvent.Type.MouseButtonRelease,
+            local,
+            local,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(win._size_grip, release)
+        assert win._live_resizing is False
+        assert not win.mask().isEmpty()
+    finally:
+        win.close()
+        store.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 erase")
+def test_erase_background_is_handled_with_the_theme_color(qapp, tmp_path, monkeypatch):
+    import ctypes
+    from ctypes import wintypes
+
+    from PyQt6.QtGui import QColor
+
+    from sayink.ui import design_tokens as tok
+    from sayink.ui.main_window import _win32_draw
+
+    win = store = user32 = gdi32 = mem = bitmap = None
+    try:
+        tok.activate("dark")
+        win, store = _make_main_window(tmp_path, monkeypatch)
+        win.reapply_theme()
+        user32, gdi32, rect_type, byref = _win32_draw()
+        gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+        gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+        gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi32.SelectObject.restype = ctypes.c_void_p
+        gdi32.GetPixel.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        gdi32.GetPixel.restype = ctypes.c_uint
+        gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+        gdi32.DeleteDC.restype = ctypes.c_int
+        screen = user32.GetDC(0)
+        mem = gdi32.CreateCompatibleDC(screen)
+        bitmap = gdi32.CreateCompatibleBitmap(screen, 8, 8)
+        assert mem and bitmap
+        gdi32.SelectObject(mem, bitmap)
+        user32.ReleaseDC(0, screen)
+        white = gdi32.CreateSolidBrush(0x00FFFFFF)
+        rect = rect_type(0, 0, 8, 8)
+        user32.FillRect(mem, byref(rect), white)
+        gdi32.DeleteObject(white)
+        assert gdi32.GetPixel(mem, 1, 1) == 0x00FFFFFF
+        win._fill_dc(mem, rect)
+        color = QColor(tok.BG)
+        expected = color.red() | (color.green() << 8) | (color.blue() << 16)
+        assert gdi32.GetPixel(mem, 1, 1) == expected
+
+        msg = wintypes.MSG()
+        msg.message = 0x0014
+        handled, result = win.nativeEvent(b"windows_generic_MSG", ctypes.addressof(msg))
+        assert handled is True
+        assert result == 1
+        msg.message = 0x0085  # WM_NCPAINT
+        handled, result = win.nativeEvent(b"windows_generic_MSG", ctypes.addressof(msg))
+        assert handled is True
+        assert result == 0
+        msg.message = 0x0086  # WM_NCACTIVATE
+        handled, result = win.nativeEvent(b"windows_generic_MSG", ctypes.addressof(msg))
+        assert handled is True
+        assert result == 1
+        win._bury_surrogate_titlebars()
+        win._sync_native_size()
+    finally:
+        tok.activate("light")
+        if gdi32 is not None and mem:
+            gdi32.DeleteDC(mem)
+        if gdi32 is not None and bitmap:
+            gdi32.DeleteObject(bitmap)
+        if win is not None:
+            win._release_theme_brush()
+            win.close()
+        if store is not None:
+            store.close()
+
+
 def test_dwm_frame_uses_the_theme_background(qapp, tmp_path, monkeypatch):
     from PyQt6.QtGui import QColor, QPalette
 
@@ -381,6 +626,7 @@ def test_dwm_frame_uses_the_theme_background(qapp, tmp_path, monkeypatch):
         win.reapply_theme()
         QApplication.processEvents()
         attrs = win._dwm_frame_attributes()
+        assert attrs[3] == 1
         assert attrs[20] == 1
         assert attrs[19] == 1
         assert attrs[35] == colorref(tok.BG)
@@ -429,6 +675,63 @@ def test_caption_chrome_is_distinct_from_content(qapp, tmp_path, monkeypatch):
         assert f"background: {tok.BG}" in css
         assert f"border-bottom: 1px solid {tok.CONTROL_BORDER}" in css
         assert win._caption.height() == 42
+    finally:
+        win.close()
+        store.close()
+
+
+def test_window_is_built_hidden_and_stays_one_size_after_show(qapp, tmp_path, monkeypatch):
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        assert not win.isVisible()
+        assert win.updatesEnabled()
+        size_before_show = (win.width(), win.height())
+        win.show()
+        qapp.processEvents()
+        assert win.isVisible()
+        assert win.updatesEnabled()
+        for _ in range(4):
+            qapp.processEvents()
+        assert (win.width(), win.height()) == size_before_show
+        assert not win.mask().isEmpty()
+    finally:
+        win.close()
+        store.close()
+
+
+def test_top_resize_border_does_not_drag_the_caption(qapp, tmp_path, monkeypatch):
+    from PyQt6.QtCore import QEvent, QPoint, QPointF
+    from PyQt6.QtGui import QMouseEvent
+
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        win.show()
+        win.move(200, 160)
+        qapp.processEvents()
+        origin = win.pos()
+        local = QPoint(40, 0)
+        press_global = win._caption.mapToGlobal(local)
+        press = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(local),
+            QPointF(press_global),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(win._caption, press)
+        move = QMouseEvent(
+            QEvent.Type.MouseMove,
+            QPointF(local + QPoint(30, 24)),
+            QPointF(press_global + QPoint(30, 24)),
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(win._caption, move)
+        qapp.processEvents()
+        assert win.pos() == origin
+        assert win._drag_offset is None
     finally:
         win.close()
         store.close()

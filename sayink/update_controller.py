@@ -121,11 +121,21 @@ class UpdateController(QObject):
             __version__,
             self,
             proxy_mode=str(self._config.get("llm.proxy_mode", "system") or "system"),
+            proxy_bypass_suffixes=str(self._config.get("llm.proxy_bypass_suffixes", "") or ""),
         )
         worker.result_ready.connect(self.on_check_result)
         worker.failed.connect(self.on_check_failed)
+        finished_sig = getattr(worker, "finished", None)
+        if finished_sig is not None and hasattr(finished_sig, "connect"):
+            finished_sig.connect(lambda w=worker: self._reap_worker("_check_worker", w))
         self._check_worker = worker
         worker.start()
+
+    def _reap_worker(self, attr: str, worker: object) -> None:
+        if getattr(self, attr, None) is worker:
+            setattr(self, attr, None)
+        if isinstance(worker, QObject):
+            worker.deleteLater()
 
     def install(self) -> None:
         from sayink.updater import (
@@ -156,10 +166,14 @@ class UpdateController(QObject):
             sha256=release.sha256,
             signature_url=getattr(release, "signature_url", ""),
             proxy_mode=str(self._config.get("llm.proxy_mode", "system") or "system"),
+            proxy_bypass_suffixes=str(self._config.get("llm.proxy_bypass_suffixes", "") or ""),
         )
         worker.progress.connect(self.on_download_progress)
         worker.finished_path.connect(self.on_downloaded)
         worker.failed.connect(self.on_download_failed)
+        finished_sig = getattr(worker, "finished", None)
+        if finished_sig is not None and hasattr(finished_sig, "connect"):
+            finished_sig.connect(lambda w=worker: self._reap_worker("_download_worker", w))
         self._download_worker = worker
         worker.start()
 
@@ -223,6 +237,8 @@ class UpdateController(QObject):
             self.sync_status()
 
     def on_download_progress(self, got: int, total: int) -> None:
+        if self._exit_started() or self.state is not UpdateState.DOWNLOADING:
+            return
         got_mb = got / (1024 * 1024)
         if total:
             total_mb = total / (1024 * 1024)
@@ -286,12 +302,13 @@ class UpdateController(QObject):
                         flush_history()
                     except Exception:
                         log.debug("更新前同步刷写 HistoryStore 失败", exc_info=True)
-                conn = getattr(history, "_conn", None)
-                if conn is not None:
-                    try:
-                        conn.commit()
-                    except Exception:
-                        log.debug("更新前提交 SQLite 事务失败", exc_info=True)
+                else:
+                    conn = getattr(history, "_conn", None)
+                    if conn is not None:
+                        try:
+                            conn.commit()
+                        except Exception:
+                            log.debug("更新前提交 SQLite 事务失败", exc_info=True)
         save_now = getattr(self._config, "save_immediate", None)
         if callable(save_now):
             try:

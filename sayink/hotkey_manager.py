@@ -104,15 +104,59 @@ def _main_key_vk(key) -> int | None:
     try:
         import ctypes
 
-        vk_key_scan = ctypes.windll.user32.VkKeyScanW
-        vk_key_scan.argtypes = [ctypes.c_wchar]
-        vk_key_scan.restype = ctypes.c_short
-        scan = vk_key_scan(ch)
+        user32 = _win32_kbd_user32(ctypes)
+        scan = user32.VkKeyScanW(ch)
         if scan != -1:
             return scan & 0xFF
     except Exception:
         pass
     return _ASCII_OEM_VK_FALLBACK.get(ch)
+
+
+_configured_kbd_user32 = None
+
+
+def _win32_kbd_user32(ctypes_mod):
+    """Return a Win32 user32 binding with explicit 64-bit keyboard prototypes."""
+    global _configured_kbd_user32
+    from ctypes import wintypes
+
+    current = getattr(getattr(ctypes_mod, "windll", None), "user32", None)
+    if (
+        sys.platform == "win32"
+        and hasattr(ctypes_mod, "WinDLL")
+        and isinstance(current, ctypes_mod.WinDLL)
+    ):
+        if _configured_kbd_user32 is None:
+            dll = ctypes_mod.WinDLL("user32", use_last_error=True)
+            dll.VkKeyScanW.argtypes = [ctypes_mod.c_wchar]
+            dll.VkKeyScanW.restype = ctypes_mod.c_short
+            dll.GetAsyncKeyState.argtypes = [ctypes_mod.c_int]
+            dll.GetAsyncKeyState.restype = wintypes.SHORT
+            dll.keybd_event.argtypes = [
+                wintypes.BYTE,
+                wintypes.BYTE,
+                wintypes.DWORD,
+                ctypes_mod.c_size_t,
+            ]
+            dll.keybd_event.restype = None
+            _configured_kbd_user32 = dll
+        return _configured_kbd_user32
+    if current is not None:
+        for name, args, res in (
+            ("VkKeyScanW", [ctypes_mod.c_wchar], ctypes_mod.c_short),
+            ("GetAsyncKeyState", [ctypes_mod.c_int], wintypes.SHORT),
+            (
+                "keybd_event",
+                [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes_mod.c_size_t],
+                None,
+            ),
+        ):
+            fn = getattr(current, name, None)
+            if fn is not None and hasattr(fn, "argtypes"):
+                fn.argtypes = args
+                fn.restype = res
+    return current
 
 
 def parse_hotkey(hotkey_str: str) -> set:
@@ -175,7 +219,6 @@ class HotKeyManager(QObject):
         self._health_timer.setInterval(_HEALTH_CHECK_INTERVAL_MS)
         self._health_timer.timeout.connect(self._on_health_tick)
         self._last_health_wall = time.time()
-        self._last_health_mono = time.monotonic()
         self._hold_pending = False
         self._hold_activated = False
         self._hold_started_at = 0.0
@@ -219,7 +262,7 @@ class HotKeyManager(QObject):
     def _async_key_down(vk: int) -> bool:
         import ctypes
 
-        return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+        return bool(_win32_kbd_user32(ctypes).GetAsyncKeyState(vk) & 0x8000)
 
     def _modifiers_held(self, modifiers: tuple) -> bool:
         return all(
@@ -259,7 +302,7 @@ class HotKeyManager(QObject):
     def _send_menu_mask() -> None:
         import ctypes
 
-        user32 = ctypes.windll.user32
+        user32 = _win32_kbd_user32(ctypes)
         user32.keybd_event(_VK_MENU_MASK, 0, 0, SYNTHETIC_KEY_TAG)
         user32.keybd_event(_VK_MENU_MASK, 0, 0x0002, SYNTHETIC_KEY_TAG)
 
@@ -316,7 +359,7 @@ class HotKeyManager(QObject):
     def _keybd_event(vk: int, flags: int) -> None:
         import ctypes
 
-        ctypes.windll.user32.keybd_event(vk, 0, flags, SYNTHETIC_KEY_TAG)
+        _win32_kbd_user32(ctypes).keybd_event(vk, 0, flags, SYNTHETIC_KEY_TAG)
 
     def _win32_event_filter(self, msg, data):
         """Keep the hotkey's main key (and its auto-repeat) out of the focused app.
@@ -433,7 +476,6 @@ class HotKeyManager(QObject):
         app = QCoreApplication.instance()
         if app is not None and QThread.currentThread() is self._health_timer.thread():
             self._last_health_wall = time.time()
-            self._last_health_mono = time.monotonic()
             if not self._health_timer.isActive():
                 self._health_timer.start(_HEALTH_CHECK_INTERVAL_MS)
 
@@ -466,10 +508,8 @@ class HotKeyManager(QObject):
             self._health_timer.stop()
             return
         now_wall = time.time()
-        now_mono = time.monotonic()
         wall_delta = now_wall - self._last_health_wall
         self._last_health_wall = now_wall
-        self._last_health_mono = now_mono
 
         woke_from_sleep = wall_delta >= _SLEEP_WAKE_GAP_S
         listener = self._listener
@@ -750,13 +790,19 @@ class HotKeyManager(QObject):
 
             if key == keyboard.Key.esc:
                 self.esc_pressed.emit()
+                if self._hold_pending:
+                    self._hold_pending = False
+                    sync_hold_timer = True
                 if self._is_recording:
                     self._is_recording = False
                     self.recording_cancel.emit()
-                return
+                break_esc = True
+            else:
+                break_esc = False
 
             if (
-                not was_complete
+                not break_esc
+                and not was_complete
                 and not self._is_recording
                 and not self._hold_pending
                 and self._hotkey_still_held_locked()

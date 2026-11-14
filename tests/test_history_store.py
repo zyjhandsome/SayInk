@@ -439,3 +439,27 @@ class TestFailureIsolation:
         assert "summary" not in cols
         assert "session_id" in cols
         assert "seq" in cols
+
+
+def test_ticketed_flush_and_meeting_store_isolate_earlier_write_failures(tmp_path):
+    from sayink.meeting_store import MeetingStore
+
+    store = HistoryStore(db_path=tmp_path / "history.db")
+    meetings = MeetingStore(store)
+    try:
+        bad_ticket = store.enqueue_write(lambda _conn: (_ for _ in ()).throw(RuntimeError("boom")))
+        assert bad_ticket > 0
+
+        rec = meetings.create_meeting(title="不受早期失败污染")
+        assert meetings.flush(timeout=2.0) is True
+        assert meetings.get_meeting(rec.id) is not None
+
+        # The earlier fire-and-forget HistoryStore failure is still observable on an unscoped flush.
+        assert store.flush(timeout=2.0) is False
+        assert store.flush(timeout=2.0) is True
+
+        # A failing write inside MeetingStore itself still fails MeetingStore.flush().
+        meetings._write(lambda _conn: (_ for _ in ()).throw(RuntimeError("meeting-fail")))
+        assert meetings.flush(timeout=2.0) is False
+    finally:
+        store.close(timeout=2.0)

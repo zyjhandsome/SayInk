@@ -1,14 +1,6 @@
 """Chinese action labels on questions and one-line prompts."""
 
-import sys
-
-import pytest
-from PyQt6.QtWidgets import QApplication, QPushButton
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication(sys.argv)
+from PyQt6.QtWidgets import QPushButton
 
 
 def test_delete_confirm_defaults_to_cancel_and_avoids_english_buttons(qapp):

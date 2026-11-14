@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from PyQt6.QtCore import QSize, Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QDesktopServices, QIcon, QPainter
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QIcon, QPainter
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -20,27 +20,17 @@ from PyQt6.QtWidgets import (
 from sayink.config import Config, DEFAULT_HOTKEY, VERSION, format_hotkey
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles
-from sayink.ui.clipboard import copy_text
 from sayink.ui.dictation_hints import dictation_hints
 from sayink.ui.settings_components import (
     SettingsPage,
     ToggleOptionRow,
     chain_tab_order,
-    footnote,
     group_divider,
     page_header,
     settings_group,
     settings_section,
 )
 from sayink.ui.settings_pages.general import set_section_visible, without_scroll_jump
-from sayink.updater import ISSUES_URL
-
-FEEDBACK_HINT = "遇到问题或有建议？到 GitHub 提 issue，附上「文件位置」里日志目录的最新日志会更快定位。"
-SHOW_FEEDBACK_ENTRY = False
-
-
-def open_feedback_page() -> bool:
-    return bool(QDesktopServices.openUrl(QUrl(ISSUES_URL)))
 
 
 class AboutSummaryRow(QWidget):
@@ -118,9 +108,6 @@ class AboutSettingsPage(SettingsPage):
     about_paths_toggle: QPushButton
     about_paths_wrap: QWidget
     about_paths_lay: QVBoxLayout
-    about_feedback_group: QFrame
-    about_feedback_hint: QLabel
-    about_feedback_btn: QPushButton
 
     def __init__(
         self,
@@ -209,6 +196,12 @@ class AboutSettingsPage(SettingsPage):
         self.about_paths_lay = QVBoxLayout(self.about_paths_wrap)
         self.about_paths_lay.setContentsMargins(0, 0, 0, 0)
         self.about_paths_lay.setSpacing(0)
+        self.about_path_rows: dict[str, AboutSummaryRow] = {}
+        for key in ("已下载", "模型目录", "配置文件", "日志目录"):
+            self.about_paths_lay.addWidget(group_divider())
+            row = AboutSummaryRow(key, "")
+            self.about_path_rows[key] = row
+            self.about_paths_lay.addWidget(row)
 
         self.about_paths_toggle.toggled.connect(self.set_paths_expanded)
         self.set_paths_expanded(False)
@@ -216,25 +209,6 @@ class AboutSettingsPage(SettingsPage):
         paths_lay.addWidget(self.about_paths_wrap)
         self.add(paths_group)
 
-        # Preserve the existing, deliberately hidden feedback entry.
-        self.about_feedback_group = settings_group()
-        feedback_layout = QHBoxLayout(self.about_feedback_group)
-        feedback_layout.setContentsMargins(16, 12, 16, 12)
-        feedback_layout.setSpacing(12)
-        self.about_feedback_hint = footnote(FEEDBACK_HINT)
-        feedback_layout.addWidget(self.about_feedback_hint, 1)
-        self.about_feedback_btn = QPushButton("GitHub 反馈")
-        self.about_feedback_btn.setObjectName("aboutFeedbackButton")
-        self.about_feedback_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.about_feedback_btn.setAccessibleName("在 GitHub 提交反馈")
-        self.about_feedback_btn.setToolTip(ISSUES_URL)
-        self.about_feedback_btn.clicked.connect(self._handle_feedback_button)
-        feedback_layout.addWidget(self.about_feedback_btn, 0, Qt.AlignmentFlag.AlignVCenter)
-        if SHOW_FEEDBACK_ENTRY:
-            self.add(self.about_feedback_group)
-        else:
-            self.about_feedback_group.setParent(self)
-            self.about_feedback_group.hide()
         self.paint_update_row()
         self.set_compact()
         self.set_spacing(16)
@@ -247,18 +221,7 @@ class AboutSettingsPage(SettingsPage):
                 if row.action_button is not None
             ),
             self.about_paths_toggle,
-            self.about_feedback_btn,
         ])
-
-    def _handle_feedback_button(self) -> None:
-        if not open_feedback_page():
-            copy_text(ISSUES_URL)
-            self.about_feedback_hint.setText(
-                f"未能打开默认浏览器，已将反馈地址复制到剪贴板：{ISSUES_URL}"
-            )
-            self.about_update_status.setText(
-                "未能打开默认浏览器，已将 GitHub 反馈地址复制到剪贴板。"
-            )
 
     def _handle_update_button(self) -> None:
         if self.about_update_btn.text() == "下载并安装":
@@ -322,7 +285,6 @@ class AboutSettingsPage(SettingsPage):
         btn.setStyleSheet(settings_styles.BTN_GHOST_SM)
         btn.ensurePolished()
         btn.setFixedWidth(max(btn.fontMetrics().horizontalAdvance(t) for t in ("检查更新", "下载并安装")) + 36)
-        self.about_feedback_btn.setStyleSheet(settings_styles.BTN_GHOST_SM)
         self.paint_paths_toggle()
 
     def apply_theme(self) -> None:
@@ -417,11 +379,6 @@ class AboutSettingsPage(SettingsPage):
         output_row.setProperty("outputWarning", hints.output_warning)
         output_row.reapply_styles()
 
-        while self.about_paths_lay.count():
-            item = self.about_paths_lay.takeAt(0)
-            if item.widget() is not None:
-                item.widget().deleteLater()
-
         path_items = [
             ("已下载", f"{len(downloaded)} 个 · 约 {total_mb} MB"),
             ("模型目录", str(config.models_dir)),
@@ -429,10 +386,9 @@ class AboutSettingsPage(SettingsPage):
             ("日志目录", str(config.config_dir / "logs")),
         ]
         for key, val in path_items:
-            self.about_paths_lay.addWidget(group_divider())
-            row = AboutSummaryRow(key, val)
+            row = self.about_path_rows[key]
+            row.value_label.setText(val)
             row.value_label.setToolTip(val)
-            self.about_paths_lay.addWidget(row)
 
     def load_config(self, config: Config) -> None:
         self.about_auto_update_row.setChecked(bool(config.get("update.auto_check", True)))

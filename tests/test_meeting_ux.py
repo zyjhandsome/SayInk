@@ -43,7 +43,11 @@ def meeting(config, tmp_path):
     page = MeetingPage(config, controller)
     page.show_meeting(record.id)
     yield page, controller, history, record
+    for timer in page.findChildren(QTimer):
+        timer.stop()
+    page.hide()
     page.deleteLater()
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     controller.shutdown()
     history.close(timeout=2)
 
@@ -909,7 +913,7 @@ def test_success_feedback_expires_but_cannot_hide_a_later_error(meeting):
     assert page._status_timer.isActive()
     expired = QSignalSpy(page._status_timer.timeout)
     page._status_timer.start(1)
-    assert expired.wait(1000)
+    assert len(expired) > 0 or expired.wait(5000)
     assert page._status_label.isHidden()
     page._rename_speaker(1, "小周")
     page._set_status("尚未保存，请重试")

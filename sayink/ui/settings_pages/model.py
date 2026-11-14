@@ -54,12 +54,14 @@ class ModelSettingsPage(SettingsPage):
     cards_layout: QVBoxLayout
     model_cards: dict[str, ModelCard]
     model_cards_for_id: str | None
+    model_cards_downloaded: bool | None
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.model_hero_status = None
         self.model_cards = {}
         self.model_cards_for_id = None
+        self.model_cards_downloaded = None
 
         self.add(page_header("引擎", "语音在本机识别。下载模型后，需等待载入完成才能转写。"))
         self.model_hero_host = settings_group()
@@ -121,7 +123,7 @@ class ModelSettingsPage(SettingsPage):
             color, bg = tok.GREEN_TEXT, tok.GREEN_BG
         elif tone == "error":
             color, bg = tok.RED_TEXT, tok.RED_BG
-        elif tone == "busy":
+        elif tone in ("busy", "warn"):
             color, bg = tok.AMBER_TEXT, tok.AMBER_SOFT
         else:
             color, bg = tok.TEXT_SEC, tok.SURFACE_PEARL
@@ -227,6 +229,7 @@ class ModelSettingsPage(SettingsPage):
         badge.setProperty("viRole", "engineHeroBadge")
         badge.setStyleSheet(
             f"background: {tok.SURFACE_PEARL}; color: {tok.TEXT_SEC};"
+            f" border: 1px solid {tok.HAIRLINE};"
             f" border-radius: {tok.RADIUS_PILL}px; padding: 3px 10px;"
             f" font-size: {tok.TYPE_CAPTION}px; font-weight: 700;"
         )
@@ -269,10 +272,14 @@ class ModelSettingsPage(SettingsPage):
     def cards_match_config(self, config: Config) -> bool:
         if not self.model_cards:
             return False
-        from sayink.speech_recognizer import DEFAULT_MODEL_ID
+        from sayink.speech_recognizer import DEFAULT_MODEL_ID, is_model_downloaded
 
         active = config.get("stt.model_id", DEFAULT_MODEL_ID)
-        return self.model_cards_for_id == active
+        downloaded = bool(active and is_model_downloaded(active))
+        return (
+            self.model_cards_for_id == active
+            and self.model_cards_downloaded == downloaded
+        )
 
     def rebuild_cards(
         self,
@@ -336,6 +343,7 @@ class ModelSettingsPage(SettingsPage):
         _add_section("可下载", available_models, False)
         self._add_aux_model_section()
         self.model_cards_for_id = active_id
+        self.model_cards_downloaded = bool(active_id and is_model_downloaded(active_id))
         card_buttons = [
             btn
             for card in self.model_cards.values()

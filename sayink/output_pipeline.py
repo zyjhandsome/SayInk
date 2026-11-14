@@ -505,6 +505,7 @@ class OutputPipeline:
             # Nothing to paste or save: release the output slot completely so
             # the next sentence does not inherit this one's stage or record.
             self.busy = False
+            self.polish_error_failed = False
             self.stage = OutputStage.IDLE
             self.stage_text = ""
             self.stage_record = None
@@ -734,10 +735,11 @@ class OutputPipeline:
         target_hint = f"发送到 {target_app}" if target_app else "请确认目标应用已接收"
         dropped = self.dropped_slices
         self.dropped_slices = 0
+        dropped_suffix = f" · 有 {dropped} 段未识别" if dropped else ""
         if dropped:
             # A slice of the hold failed to recognise and was left out; the
             # user would otherwise only notice the gap in the pasted text.
-            target_hint = f"{target_hint} · 有 {dropped} 段未识别"
+            target_hint = f"{target_hint}{dropped_suffix}"
         if getattr(self.recorder, "is_recording", False) and not getattr(
             self.recorder, "is_continuous", False
         ):
@@ -779,11 +781,13 @@ class OutputPipeline:
                     hint = "当前为「仅保存到历史」，但历史已关闭；请在设置中打开历史或改为输入当前光标"
                 else:
                     hint = "" if meeting_row else "未输入其他应用"
+                if dropped and not meeting_row:
+                    hint = f"{hint}{dropped_suffix}" if hint else f"有 {dropped} 段未识别"
                 self.show_post_output_floating(
                     title,
                     hint,
                     stopped_text=f"剩余内容：{title}",
-                    use_info=not (saved and not degraded_from_polish and not polish_failed),
+                    use_info=not (saved and not degraded_from_polish and not polish_failed) or bool(dropped and not meeting_row),
                     refresh_ms=RESULT_TOAST_MS,
                 )
         elif status == "unverified":
@@ -797,6 +801,8 @@ class OutputPipeline:
             )
             if polish_failed:
                 unverified_hint = f"{unverified_hint} · 润色未生效（密钥/网络异常）"
+            if dropped:
+                unverified_hint = f"{unverified_hint}{dropped_suffix}"
             self.show_post_output_floating(
                 "已发送 · 未确认",
                 unverified_hint,
@@ -807,7 +813,7 @@ class OutputPipeline:
         elif status == "clipboard" and error_detail == "elevated":
             log.info("目标窗口为管理员权限，已复制到剪贴板")
             title = f"目标为管理员窗口，已复制，请按 {paste_key}"
-            hint = f"目标应用：{target_app}" if target_app else paste_hint
+            hint = (f"目标应用：{target_app}" if target_app else paste_hint) + dropped_suffix
             if polish_failed:
                 hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
             self.show_post_output_floating(
@@ -820,7 +826,7 @@ class OutputPipeline:
         elif status == "clipboard" and error_detail == "ime_active":
             log.info("检测到输入法候选窗活跃，已复制到剪贴板")
             title = f"检测到正在拼音选词，已复制，请按 {paste_key}"
-            hint = f"目标应用：{target_app}" if target_app else paste_hint
+            hint = (f"目标应用：{target_app}" if target_app else paste_hint) + dropped_suffix
             if polish_failed:
                 hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
             self.show_post_output_floating(
@@ -833,7 +839,7 @@ class OutputPipeline:
         elif status == "clipboard" and error_detail == "session_changed":
             log.info("桌面会话已切换或锁屏，已复制到剪贴板")
             title = f"桌面会话已切换，已复制，请按 {paste_key}"
-            hint = f"目标应用：{target_app}" if target_app else paste_hint
+            hint = (f"目标应用：{target_app}" if target_app else paste_hint) + dropped_suffix
             if polish_failed:
                 hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
             self.show_post_output_floating(
@@ -846,7 +852,7 @@ class OutputPipeline:
         elif status == "clipboard" and error_detail == "focus_changed":
             log.info("开口后的目标窗口已变化，未发送粘贴键")
             title = f"未输入到 {target_app}" if target_app else "未输入到原来的窗口"
-            hint = paste_hint
+            hint = paste_hint + dropped_suffix
             if polish_failed:
                 hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
             self.show_post_output_floating(
@@ -859,14 +865,14 @@ class OutputPipeline:
         elif status == "clipboard":
             log.info("已复制到剪贴板（粘贴未确认成功）")
             idle_title = "已复制" if self.continuous_session_active() else "已复制到剪贴板"
-            hint = paste_hint
+            hint = paste_hint + dropped_suffix
             if polish_failed:
                 hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
             self.show_post_output_floating(
                 idle_title,
                 hint,
                 stopped_text=f"剩余内容：已复制 · {hint}",
-                use_info=polish_failed,
+                use_info=polish_failed or bool(dropped),
                 refresh_ms=RESULT_TOAST_WITH_HINT_MS,
             )
         else:

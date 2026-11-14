@@ -2,17 +2,17 @@
 ; Creates a professional Windows installer with custom installation path
 ;
 ; Constants are normally passed by build_installer.py:
-;   ISCC /DAppVersionStr=2.2.35 /DAppVersionQuad=2.2.35.0 SayInk-Setup.iss
+;   ISCC /DAppVersionStr=3.0.0 /DAppVersionQuad=3.0.0.0 SayInk-Setup.iss
 ; Both installers copy dist\SayInk\models\. Lite has CAM++, Silero VAD and
 ; the experimental speaker-activity model; the app downloads Fun-ASR-Nano on
 ; first start. Full installer:
 ; /DOutputSuffix=-full, and models\ also contains Fun-ASR-Nano.
 ; The in-app updater only downloads the lite name (sayink/updater.py).
 #ifndef AppVersionStr
-#define AppVersionStr "2.2.35"
+#define AppVersionStr "3.0.0"
 #endif
 #ifndef AppVersionQuad
-#define AppVersionQuad "2.2.35.0"
+#define AppVersionQuad "3.0.0.0"
 #endif
 #ifndef OutputSuffix
 #define OutputSuffix ""
@@ -403,13 +403,9 @@ begin
 end;
 
 procedure DeleteStoredApiCredentials();
-var
-  ErrorCode: Integer;
 begin
   CredDeleteW('SayInk/llm.api_key', CRED_TYPE_GENERIC, 0);
   CredDeleteW('VoiceInk/llm.api_key', CRED_TYPE_GENERIC, 0);
-  Exec(ExpandConstant('{sys}\cmdkey.exe'), '/delete:SayInk/llm.api_key', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
-  Exec(ExpandConstant('{sys}\cmdkey.exe'), '/delete:VoiceInk/llm.api_key', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

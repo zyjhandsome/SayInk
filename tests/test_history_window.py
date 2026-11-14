@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
@@ -21,11 +20,6 @@ from sayink.ui.history_window import (
     suggest_single_export_filename,
 )
 from sayink.ui.tray_icon import TrayIcon
-
-
-@pytest.fixture
-def qapp():
-    return QApplication.instance() or QApplication(sys.argv)
 
 
 class FakeHistoryStore:

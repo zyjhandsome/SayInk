@@ -92,8 +92,9 @@ def test_recognize_file_keeps_a_partial_result_and_does_not_copy_the_source(tmp_
     assert result.cancelled and [turn.text for turn in result.turns] == ["第1段"]
     assert source.read_bytes() == b"original-bytes"
     assert sorted(path.name for path in tmp_path.iterdir()) == ["talk.mp4"]
-    text = Path("sayink/media_import.py").read_text(encoding="utf-8").lower()
-    foundation = Path("sayink/media_foundation.py").read_text(encoding="utf-8").lower()
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "sayink" / "media_import.py").read_text(encoding="utf-8").lower()
+    foundation = (root / "sayink" / "media_foundation.py").read_text(encoding="utf-8").lower()
     assert "ffmpeg" not in text and "shutil" not in text
     assert "ffmpeg" not in foundation
 
@@ -385,7 +386,7 @@ def test_media_import_blocks_dictation_meeting_and_recovery():
 
     with app_harness({"audio.trigger_mode": "hotkey"}) as harness:
         app = harness["app"]
-        app._hold_open_pending = True
+        harness["recorder"].is_recording = True
         assert "转写" in app._media_import_conflict()
         assert app.meeting.begin_media_import() != ""
         assert app.meeting.importing_media is False

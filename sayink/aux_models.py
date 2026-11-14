@@ -122,9 +122,9 @@ class AuxModelDownloads(QObject):
         worker = self._factory(str(self._current["id"]), self._source)
         self._worker = worker
         self._workers.append(worker)
-        worker.progress.connect(self._on_worker_progress)
-        worker.finished_ok.connect(self._on_worker_done)
-        worker.error.connect(self._on_worker_error)
+        worker.progress.connect(lambda pct, w=worker: self._on_worker_progress(pct, w))
+        worker.finished_ok.connect(lambda mid, w=worker: self._on_worker_done(mid, w))
+        worker.error.connect(lambda msg, w=worker: self._on_worker_error(msg, w))
         if hasattr(worker, "finished"):
             worker.finished.connect(lambda w=worker: self._reap_worker(w))
         log.info("下载会议辅助模型 %s", self._current["id"])
@@ -140,13 +140,17 @@ class AuxModelDownloads(QObject):
         if worker is not None and not hasattr(worker, "finished"):
             self._reap_worker(worker)
 
-    def _on_worker_progress(self, pct: int) -> None:
+    def _on_worker_progress(self, pct: int, worker: object | None = None) -> None:
+        if worker is not None and worker is not self._worker:
+            return
         current_mb = int((self._current or {}).get("size_mb") or 0)
         done_mb = aux_models_size_mb(self._done)
         overall = (done_mb + current_mb * max(0, min(100, int(pct))) / 100.0) / self._total_mb * 100.0
         self.progress.emit(min(99, int(overall)))
 
-    def _on_worker_done(self, model_id: str) -> None:
+    def _on_worker_done(self, model_id: str, worker: object | None = None) -> None:
+        if worker is not None and worker is not self._worker:
+            return
         if self._current is not None:
             self._done.append(self._current)
         if self._cancelled:
@@ -157,7 +161,9 @@ class AuxModelDownloads(QObject):
         self._release_if_not_qthread(prev)
         self._next()
 
-    def _on_worker_error(self, message: str) -> None:
+    def _on_worker_error(self, message: str, worker: object | None = None) -> None:
+        if worker is not None and worker is not self._worker:
+            return
         prev = self._worker
         self._worker = None
         self._release_if_not_qthread(prev)

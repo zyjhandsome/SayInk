@@ -28,12 +28,12 @@ A、A2、B 是来源片段标记，不是声纹核验出来的真实姓名。
 没有获取这些新候选的音频，不将搜索结果计为已测样本。
 
 Python 3.10.11、sherpa-onnx 1.13.8、Windows，本次 ASR 使用 CPU 4 线程、中文设置、无热词。
-声纹使用实际 CAM++ 后端，非频谱回退。完整诊断脚本和数值输出位于：
+声纹使用实际 CAM++ 后端，非频谱回退。完整离线诊断脚本与数值输出（保存在本机会话目录，不入库）：
 
-- [声纹/换人诊断脚本](C:/Users/zyjhandsome/.codex/visualizations/2026/10/20/01a15860-a36e-70e0-b69c-2c92b82af4dc/accuracy_probe.py)
-- [声纹/换人数值结果](C:/Users/zyjhandsome/.codex/visualizations/2026/10/20/01a15860-a36e-70e0-b69c-2c92b82af4dc/probe-results.json)
-- [ASR 输入稳定性脚本](C:/Users/zyjhandsome/.codex/visualizations/2026/10/20/01a15860-a36e-70e0-b69c-2c92b82af4dc/asr_probe.py)
-- [ASR 输入稳定性结果](C:/Users/zyjhandsome/.codex/visualizations/2026/10/20/01a15860-a36e-70e0-b69c-2c92b82af4dc/asr-probe-results.json)
+- 声纹/换人诊断脚本：`accuracy_probe.py`
+- 声纹/换人数值结果：`probe-results.json`
+- ASR 输入稳定性脚本：`asr_probe.py`
+- ASR 输入稳定性结果：`asr-probe-results.json`
 
 从项目根目录，用安装了现有依赖的 Python 执行脚本。
 `accuracy_probe.py --data <音频缓存目录> --out <结果.json>` 可覆盖默认路径。

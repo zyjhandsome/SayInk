@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS history (
   corrected_text TEXT NOT NULL DEFAULT '',
   speaker_locked INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_history_session ON history(session_id);
+DROP INDEX IF EXISTS idx_history_session;
 CREATE INDEX IF NOT EXISTS idx_history_session_seq ON history(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_history_created ON history(created_at);
 
@@ -304,6 +304,9 @@ class HistoryStore:
         self._failed_callbacks: list[Callable[[str], None]] = []
         self._segment_calibrator: Callable[[SegmentRecord], SegmentRecord] | None = None
         self._fail_lock = threading.Lock()
+        self._next_op_ticket = 1
+        self._last_failed_ticket = 0
+        self._unflushed_failure_tickets: list[int] = []
         self._write_failures = 0
         self._unflushed_failures = 0
         self._closed = False
@@ -342,7 +345,7 @@ class HistoryStore:
             self._disable()
             return
         if self._init_error is not None:
-            logger.exception(
+            logger.error(
                 "HistoryStore writer connection failed; disabling history",
                 exc_info=self._init_error,
             )
@@ -391,6 +394,7 @@ class HistoryStore:
         self._close_read_connections()
         self.disabled = True
         self.startup_notice = DISABLED_NOTICE
+        self._queue.put(self._stop)
 
     def add_committed_callback(self, callback: Callable[[], None]) -> None:
         self._committed_callbacks.append(callback)
@@ -427,54 +431,70 @@ class HistoryStore:
         wall-clock timestamps against active meeting pause intervals."""
         self._segment_calibrator = calibrator
 
-    def enqueue(self, record: SegmentRecord) -> None:
-        if self.disabled:
-            return
+    def _next_ticket(self) -> int:
+        with self._fail_lock:
+            ticket = self._next_op_ticket
+            self._next_op_ticket += 1
+            return ticket
+
+    def enqueue(self, record: SegmentRecord) -> int:
+        if self.disabled or self._closed:
+            return 0
         calibrator = self._segment_calibrator
         if calibrator is not None and record.trigger_mode == MEETING_TRIGGER_MODE:
             try:
                 record = calibrator(record)
             except Exception:
                 logger.exception("HistoryStore segment calibrator failed")
-        self._queue.put(("insert", record))
+        ticket = self._next_ticket()
+        self._queue.put(("insert", record, ticket))
+        return ticket
 
-    def enqueue_delete_sessions(self, session_ids: list[str]) -> None:
-        if self.disabled:
-            return
-        self._queue.put(("delete_sessions", list(session_ids)))
+    def enqueue_delete_sessions(self, session_ids: list[str]) -> int:
+        if self.disabled or self._closed:
+            return 0
+        ticket = self._next_ticket()
+        self._queue.put(("delete_sessions", list(session_ids), ticket))
+        return ticket
 
-    def enqueue_delete_all(self) -> None:
-        if self.disabled:
-            return
-        self._queue.put(("delete_all", None))
+    def enqueue_delete_all(self) -> int:
+        if self.disabled or self._closed:
+            return 0
+        ticket = self._next_ticket()
+        self._queue.put(("delete_all", None, ticket))
+        return ticket
 
     def enqueue_cleanup(
         self,
         retention_days: int,
         max_entries: int,
         active_session_id: str | None,
-    ) -> None:
-        if self.disabled:
-            return
+    ) -> int:
+        if self.disabled or self._closed:
+            return 0
+        ticket = self._next_ticket()
         self._queue.put(
-            ("cleanup", (retention_days, max_entries, active_session_id))
+            ("cleanup", (retention_days, max_entries, active_session_id), ticket)
         )
+        return ticket
 
     def enqueue_write(
         self,
         fn: Callable[[sqlite3.Connection], None],
         *,
         failure_notice: str = WRITE_FAILED_NOTICE,
-    ) -> None:
+    ) -> int:
         """Run ``fn(conn)`` on the single writer thread (meeting tables etc.).
 
         ``fn`` must not commit; the writer commits after it returns and rolls
         back if it raises. Keeps the "one writer" invariant for everything
         stored in ``history.db``.
         """
-        if self.disabled:
-            return
-        self._queue.put(("write", (fn, failure_notice)))
+        if self.disabled or self._closed:
+            return 0
+        ticket = self._next_ticket()
+        self._queue.put(("write", (fn, failure_notice), ticket))
+        return ticket
 
     @staticmethod
     def _row_filter(trigger_mode: str | None, respect_locks: bool) -> tuple[str, tuple]:
@@ -552,9 +572,9 @@ class HistoryStore:
         *,
         failure_notice: str = WRITE_FAILED_NOTICE,
     ) -> None:
-        """Update ``polished_text`` for specified ``seq`` rows in ``session_id``
-        without touching ``raw_text``."""
-        if self.disabled or not session_id or not polished_by_seq:
+        """Update ``polished_text`` and ``corrected_text`` for specified ``seq`` rows
+        in ``session_id`` without touching ``raw_text``."""
+        if self.disabled or self._closed or not session_id or not polished_by_seq:
             return
         rows = [
             (str(text), str(text), session_id, int(seq))
@@ -579,7 +599,7 @@ class HistoryStore:
         """Merge non-meeting segments of ``session_ids`` into ``target_session_id``
         in chronological order ``(created_at ASC, seq ASC, id ASC)`` and
         resequence ``seq`` to ``0..N-1``."""
-        if self.disabled or not target_session_id:
+        if self.disabled or self._closed or not target_session_id:
             return
         ids = list(dict.fromkeys(s for s in session_ids if s))
         if len(ids) < 2:
@@ -610,20 +630,26 @@ class HistoryStore:
 
         self.enqueue_write(_merge, failure_notice=failure_notice)
 
-    def flush(self, timeout: float = CLOSE_TIMEOUT_SEC) -> bool:
+    def flush(
+        self,
+        timeout: float = CLOSE_TIMEOUT_SEC,
+        *,
+        since_ticket: int | None = None,
+    ) -> bool:
         """Block until every write queued before this call has been applied.
 
         Readers use a separate connection; a caller that reads right after
         enqueueing (meeting end → render transcript) needs this barrier.
-        Returns True iff the barrier completed within ``timeout`` and every
-        operation processed since the previous barrier succeeded.
+        When ``since_ticket`` is given, returns True iff no operation with
+        ``ticket >= since_ticket`` failed before the barrier; otherwise returns
+        True iff every operation processed since the previous barrier succeeded.
         """
         self._reap_dead_read_connections()
-        if self.disabled or self._thread is None:
+        if self.disabled or self._closed or self._thread is None:
             return True
         done = threading.Event()
         result_box = [True]
-        self._queue.put(("barrier", (done, result_box)))
+        self._queue.put(("barrier", (done, result_box, since_ticket)))
         if not done.wait(timeout=timeout):
             return False
         self._reap_dead_read_connections()
@@ -667,13 +693,13 @@ class HistoryStore:
             with self._read_conn() as conn:
                 rows = conn.execute(
                     _SESSION_SUMMARY_SQL
-                    + f"""
-                    WHERE h.trigger_mode != '{MEETING_TRIGGER_MODE}'
+                    + """
+                    WHERE h.trigger_mode != ?
                     GROUP BY h.session_id
                     ORDER BY session_created DESC
                     LIMIT ? OFFSET ?
                     """,
-                    (limit, offset),
+                    (MEETING_TRIGGER_MODE, limit, offset),
                 ).fetchall()
             return _rows_to_summaries(rows)
         except Exception:
@@ -703,38 +729,44 @@ class HistoryStore:
             return []
         pattern = f"%{escape_like(cleaned_q)}%"
         if prefer_raw is True:
-            match_cte = f"""
+            match_cte = """
                 SELECT session_id, seq, raw_text AS matched_text
                 FROM history
-                WHERE trigger_mode != '{MEETING_TRIGGER_MODE}'
+                WHERE trigger_mode != ?
                   AND polished_text != ?
                   AND raw_text LIKE ? ESCAPE '\\'
             """
-            params: tuple[Any, ...] = (_SUPPRESSED_POLISHED_MARKER, pattern)
+            params: tuple[Any, ...] = (MEETING_TRIGGER_MODE, _SUPPRESSED_POLISHED_MARKER, pattern)
         elif prefer_raw is False or include_raw is False:
-            match_cte = f"""
+            match_cte = """
                 SELECT session_id, seq,
-                       CASE WHEN polished_text != '' THEN polished_text ELSE raw_text END AS matched_text
+                       CASE WHEN corrected_text != '' THEN corrected_text
+                            WHEN polished_text != '' THEN polished_text
+                            ELSE raw_text END AS matched_text
                 FROM history
-                WHERE trigger_mode != '{MEETING_TRIGGER_MODE}'
+                WHERE trigger_mode != ?
                   AND polished_text != ?
-                  AND (CASE WHEN polished_text != '' THEN polished_text ELSE raw_text END) LIKE ? ESCAPE '\\'
+                  AND (CASE WHEN corrected_text != '' THEN corrected_text
+                            WHEN polished_text != '' THEN polished_text
+                            ELSE raw_text END) LIKE ? ESCAPE '\\'
             """
-            params = (_SUPPRESSED_POLISHED_MARKER, pattern)
+            params = (MEETING_TRIGGER_MODE, _SUPPRESSED_POLISHED_MARKER, pattern)
         else:
-            match_cte = f"""
+            match_cte = """
                 SELECT session_id, seq,
-                       CASE WHEN polished_text LIKE ? ESCAPE '\\'
-                            THEN polished_text ELSE raw_text END AS matched_text
+                       CASE WHEN corrected_text != '' THEN corrected_text
+                            WHEN polished_text LIKE ? ESCAPE '\\' THEN polished_text
+                            ELSE raw_text END AS matched_text
                 FROM history
-                WHERE trigger_mode != '{MEETING_TRIGGER_MODE}'
+                WHERE trigger_mode != ?
                   AND polished_text != ?
                   AND (
-                    (corrected_text != '' AND polished_text LIKE ? ESCAPE '\\')
+                    corrected_text LIKE ? ESCAPE '\\'
                     OR (corrected_text = '' AND (raw_text LIKE ? ESCAPE '\\' OR polished_text LIKE ? ESCAPE '\\'))
                   )
             """
-            params = (pattern, _SUPPRESSED_POLISHED_MARKER, pattern, pattern, pattern)
+            params = (pattern, MEETING_TRIGGER_MODE, _SUPPRESSED_POLISHED_MARKER, pattern, pattern, pattern)
+        params += (MEETING_TRIGGER_MODE,)
         limit_sql = ""
         if limit is not None:
             limit_sql = "LIMIT ?"
@@ -746,20 +778,31 @@ class HistoryStore:
                     WITH matching AS (
                         {match_cte}
                     )
-                    SELECT summaries.session_id, summaries.session_created, summaries.segment_count,
-                           summaries.source, summaries.target_app,
+                    SELECT summaries.session_id,
+                           summaries.session_created,
+                           summaries.segment_count,
+                           (SELECT source FROM history h2
+                            WHERE h2.session_id = summaries.session_id
+                            ORDER BY h2.seq ASC LIMIT 1) AS source,
+                           (SELECT target_app FROM history h2
+                            WHERE h2.session_id = summaries.session_id
+                            ORDER BY h2.seq ASC LIMIT 1) AS target_app,
                            (SELECT matched_text FROM matching m
-                            WHERE m.session_id = summaries.session_id ORDER BY m.seq LIMIT 1)
+                            WHERE m.session_id = summaries.session_id
+                            ORDER BY m.seq LIMIT 1)
                     FROM (
-                    """
-                    + _SESSION_SUMMARY_SQL
-                    + f"""
-                    WHERE h.trigger_mode != '{MEETING_TRIGGER_MODE}'
-                      AND h.session_id IN (SELECT session_id FROM matching)
-                    GROUP BY h.session_id
+                        SELECT
+                            h.session_id,
+                            MIN(CASE WHEN h.captured_at > 0 THEN h.captured_at ELSE h.created_at END) AS session_created,
+                            COUNT(*) AS segment_count
+                        FROM history h
+                        WHERE h.trigger_mode != ?
+                          AND h.session_id IN (SELECT session_id FROM matching)
+                        GROUP BY h.session_id
+                        ORDER BY session_created DESC
+                        {limit_sql}
                     ) summaries
-                    ORDER BY session_created DESC
-                    {limit_sql}
+                    ORDER BY summaries.session_created DESC
                     """,
                     params,
                 ).fetchall()
@@ -888,11 +931,15 @@ class HistoryStore:
         # Read-only URI connection (WAL allows concurrent readers).
         uri = self.db_path.resolve().as_uri() + "?mode=ro"
         conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000)
-        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
-        conn.execute("PRAGMA query_only=ON;")
-        if not self._closed:
-            owner_ref = weakref.ref(threading.current_thread())
-            with self._read_lock:
+        try:
+            conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
+            conn.execute("PRAGMA query_only=ON;")
+        except Exception:
+            conn.close()
+            raise
+        owner_ref = weakref.ref(threading.current_thread())
+        with self._read_lock:
+            if not self._closed:
                 self._read_conns[id(conn)] = conn
                 self._read_conn_threads[id(conn)] = owner_ref
         return conn
@@ -905,6 +952,11 @@ class HistoryStore:
             conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
             conn.execute("PRAGMA journal_mode=WAL;")
         except Exception as exc:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             self._init_error = exc
             self._ready.set()
             return
@@ -935,15 +987,24 @@ class HistoryStore:
             except Exception:
                 logger.exception("HistoryStore writer connection close failed")
 
-    def _record_write_failure(self) -> None:
+    def _record_write_failure(self, ticket: int = 0) -> None:
         with self._fail_lock:
             self._write_failures += 1
-            self._unflushed_failures += 1
+            if ticket <= 0:
+                ticket = self._next_op_ticket
+                self._next_op_ticket += 1
+            self._last_failed_ticket = max(self._last_failed_ticket, ticket)
+            self._unflushed_failure_tickets.append(ticket)
+            self._unflushed_failures = len(self._unflushed_failure_tickets)
 
     def _dispatch(self, conn: sqlite3.Connection, item: Any) -> None:
         op = ""
+        ticket = 0
         try:
-            op, payload = item
+            if isinstance(item, tuple) and len(item) == 3:
+                op, payload, ticket = item
+            else:
+                op, payload = item
             if op == "insert":
                 self._do_insert(conn, payload)
             elif op == "delete_sessions":
@@ -954,15 +1015,28 @@ class HistoryStore:
                 retention_days, max_entries, active_session_id = payload
                 self._do_cleanup(conn, retention_days, max_entries, active_session_id)
             elif op == "barrier":
-                with self._fail_lock:
-                    ok = self._unflushed_failures == 0
-                    self._unflushed_failures = 0
-                if isinstance(payload, tuple) and len(payload) == 2:
+                since_ticket: int | None = None
+                if isinstance(payload, tuple) and len(payload) == 3:
+                    done_evt, result_box, since_ticket = payload
+                elif isinstance(payload, tuple) and len(payload) == 2:
                     done_evt, result_box = payload
-                    result_box[0] = ok
-                    done_evt.set()
                 else:
-                    payload.set()
+                    done_evt, result_box = payload, None
+                with self._fail_lock:
+                    if since_ticket is None:
+                        ok = self._unflushed_failures == 0 and not self._unflushed_failure_tickets
+                        self._unflushed_failure_tickets.clear()
+                        self._unflushed_failures = 0
+                    else:
+                        relevant = [t for t in self._unflushed_failure_tickets if t >= since_ticket]
+                        ok = not relevant
+                        self._unflushed_failure_tickets = [
+                            t for t in self._unflushed_failure_tickets if t < since_ticket
+                        ]
+                        self._unflushed_failures = len(self._unflushed_failure_tickets)
+                if result_box is not None:
+                    result_box[0] = ok
+                done_evt.set()
                 return
             elif op == "write":
                 fn, notice = payload
@@ -975,7 +1049,7 @@ class HistoryStore:
                         conn.rollback()
                     except Exception:
                         logger.exception("HistoryStore rollback after custom write failed")
-                    self._record_write_failure()
+                    self._record_write_failure(ticket)
                     self._notify_failed(notice)
                     return
             else:
@@ -987,7 +1061,7 @@ class HistoryStore:
                 conn.rollback()
             except Exception:
                 logger.exception("HistoryStore rollback after writer failure failed")
-            self._record_write_failure()
+            self._record_write_failure(ticket)
             self._notify_failed(
                 WRITE_FAILED_NOTICE if op == "insert" else DELETE_FAILED_NOTICE
             )
@@ -1073,11 +1147,14 @@ class HistoryStore:
         deleted_ids = [
             r[0]
             for r in conn.execute(
-                f"SELECT DISTINCT session_id FROM history WHERE session_id NOT IN ({_PROTECTED_SESSIONS_SQL})"
+                f"SELECT DISTINCT session_id FROM history "
+                f"WHERE trigger_mode != ? AND session_id NOT IN ({_PROTECTED_SESSIONS_SQL})",
+                (MEETING_TRIGGER_MODE,),
             ).fetchall()
         ]
         conn.execute(
-            f"DELETE FROM history WHERE session_id NOT IN ({_PROTECTED_SESSIONS_SQL})"
+            f"DELETE FROM history WHERE trigger_mode != ? AND session_id NOT IN ({_PROTECTED_SESSIONS_SQL})",
+            (MEETING_TRIGGER_MODE,),
         )
         conn.commit()
         self._cleanup_session_recovery_audio(deleted_ids)
@@ -1097,11 +1174,12 @@ class HistoryStore:
                 f"""
                 SELECT session_id
                 FROM history
-                WHERE session_id NOT IN ({_PROTECTED_SESSIONS_SQL})
+                WHERE trigger_mode != ?
+                  AND session_id NOT IN ({_PROTECTED_SESSIONS_SQL})
                 GROUP BY session_id
                 HAVING MIN(created_at) < ?
                 """,
-                (cutoff_ms,),
+                (MEETING_TRIGGER_MODE, cutoff_ms),
             ).fetchall()
             to_delete = [r[0] for r in rows if r[0] != active_session_id]
             if to_delete:
@@ -1116,10 +1194,12 @@ class HistoryStore:
                 f"""
                 SELECT session_id
                 FROM history
-                WHERE session_id NOT IN ({_PROTECTED_SESSIONS_SQL})
+                WHERE trigger_mode != ?
+                  AND session_id NOT IN ({_PROTECTED_SESSIONS_SQL})
                 GROUP BY session_id
                 ORDER BY MIN(created_at) ASC
-                """
+                """,
+                (MEETING_TRIGGER_MODE,),
             ).fetchall()
             session_ids = [r[0] for r in rows]
             overflow = len(session_ids) - max_entries
@@ -1140,6 +1220,6 @@ class HistoryStore:
             chunk = session_ids[start:start + 500]
             placeholders = ",".join("?" for _ in chunk)
             conn.execute(
-                f"DELETE FROM history WHERE session_id IN ({placeholders})",
-                chunk,
+                f"DELETE FROM history WHERE session_id IN ({placeholders}) AND trigger_mode != ?",
+                (*chunk, MEETING_TRIGGER_MODE),
             )

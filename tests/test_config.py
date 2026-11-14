@@ -112,8 +112,8 @@ class TestConfigInit:
 
 
 class TestSharedRecognitionSettings:
-    """Glossary / language / VAD are shared by dictation and meetings under
-    ``stt.*``; retired manual switches (quiet_boost / quiet_speech_enabled /
+    """Glossary / language are shared by dictation and meetings under
+    ``stt.*``; retired manual switches (vad / quiet_boost / quiet_speech_enabled /
     speaker_model_enabled / enhanced_diarization / speaker_activity*) are
     stripped cleanly on load without error or policy lock-in."""
 
@@ -121,10 +121,10 @@ class TestSharedRecognitionSettings:
         stt = DEFAULT_CONFIG["stt"]
         assert stt["glossary"] == []
         assert stt["language"] == "auto"
-        assert stt["vad"] == "silero"
-        for key in ("glossary", "language", "vad"):
+        for key in ("glossary", "language"):
             assert key not in DEFAULT_CONFIG["meeting"]
         for retired in (
+            "vad",
             "speaker_model_enabled",
             "speaker_activity_enabled",
             "quiet_speech_enabled",
@@ -144,6 +144,7 @@ class TestSharedRecognitionSettings:
                 "quiet_boost": True,
             },
             "stt": {
+                "vad": "energy",
                 "quiet_speech_enabled": False,
                 "quiet_boost": "off",
                 "speaker_model_enabled": False,
@@ -167,9 +168,9 @@ class TestSharedRecognitionSettings:
         config = Config(config_dir=config_home)
         assert config.get("stt.glossary") == [{"term": "SayInk"}]
         assert config.get("stt.language") == "en"
-        assert config.get("stt.vad") == "energy"
         assert config.get("stt.debug_force_quiet_speech") is True
         for retired in (
+            "vad",
             "speaker_model_enabled",
             "speaker_activity_enabled",
             "quiet_speech_enabled",
@@ -198,6 +199,33 @@ class TestSharedRecognitionSettings:
         config = Config(config_dir=config_home)
         assert config.get("stt.language") == "zh"
         assert config.get("meeting.language") is None
+
+
+class TestMeetingSourceMigration:
+    """「跟随转写」 was removed: a meeting records both sides unless told otherwise."""
+
+    @staticmethod
+    def _load(config_home, meeting: dict) -> Config:
+        data = {"audio": {"input_source": "microphone"}, "meeting": meeting}
+        with open(config_home / "config.json", "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        return Config(config_dir=config_home)
+
+    def test_saved_follow_dictation_value_becomes_mixed_on_disk(self, config_home):
+        config = self._load(config_home, {"input_source": "", "show_start_card": False})
+        assert config.get("meeting.input_source") == "mixed"
+        assert config.get("meeting.show_start_card") is False
+        # The dictation source is untouched.
+        assert config.get("audio.input_source") == "microphone"
+        with open(config_home / "config.json", encoding="utf-8") as f:
+            assert json.load(f)["meeting"]["input_source"] == "mixed"
+
+    def test_unknown_meeting_source_becomes_mixed(self, config_home):
+        assert self._load(config_home, {"input_source": "loopback"}).get("meeting.input_source") == "mixed"
+
+    def test_explicit_meeting_sources_are_kept(self, config_home):
+        for source in ("microphone", "system", "mixed"):
+            assert self._load(config_home, {"input_source": source}).get("meeting.input_source") == source
 
 
 class TestConfigGetSet:
@@ -409,7 +437,8 @@ def test_save_survives_mkstemp_failure(config, monkeypatch):
         raise OSError("disk full")
 
     monkeypatch.setattr(tempfile, "mkstemp", _fail)
-    config.save()
+    assert config.save() is False
+    assert config.last_save_failed is True
 
 
 class _FakeSecrets:
@@ -664,3 +693,21 @@ def test_save_failure_is_visible_to_the_caller(config_home, monkeypatch):
 
     monkeypatch.setattr("sayink.config.os.replace", deny)
     assert cfg.save_immediate() is False
+
+
+def test_explicit_config_dir_skips_registry_auto_start_sync_by_default(config_home, monkeypatch):
+    import sys
+
+    from sayink.config import Config
+
+    touched: list[str] = []
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(Config, "_sync_registry_auto_start", lambda self: touched.append("synced"))
+
+    portable = Config(config_dir=config_home)
+    assert portable.get("auto_start") is False
+    assert touched == []
+
+    explicit_sync = Config(config_dir=config_home, sync_auto_start=True)
+    assert explicit_sync.get("auto_start") is False
+    assert touched == ["synced"]

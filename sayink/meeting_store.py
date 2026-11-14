@@ -11,6 +11,7 @@ Design: docs/meeting-notes-design.md §5.2.
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 from pathlib import Path
@@ -28,7 +29,12 @@ from sayink.audio_recovery import (
 )
 from sayink.history_store import MEETING_TRIGGER_MODE, HistoryStore, SegmentRecord, escape_like, row_to_segment
 from sayink.media_import import MEDIA_SOURCE
-from sayink.transcript_import import IMPORT_SOURCE, ImportedTranscript, assign_speakers
+from sayink.transcript_import import (
+    IMPORT_SOURCE,
+    ImportedTranscript,
+    assign_speakers,
+    normalize_wall_clock_turns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +56,13 @@ QUEUE_FAILED = "failed"
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _format_local_ms(fmt: str, ts_ms: int, fallback: str = "01-01 00:00") -> str:
+    try:
+        return time.strftime(fmt, time.localtime(float(ts_ms) / 1000.0))
+    except (OSError, OverflowError, ValueError):
+        return fallback
 
 
 @dataclass(frozen=True)
@@ -80,7 +93,7 @@ class MeetingRecord:
         if self.title.strip():
             return self.title.strip()
         # strftime formats stay ASCII: Windows encodes them with the ANSI code page.
-        return time.strftime("%m-%d %H:%M", time.localtime(self.started_at / 1000)) + " 会议"
+        return _format_local_ms("%m-%d %H:%M", self.started_at) + " 会议"
 
 
 @dataclass(frozen=True)
@@ -122,10 +135,6 @@ class MeetingNotes:
     user_markdown: str = ""
     user_metadata: str = ""
     user_transcript_changed: bool = False
-
-    @property
-    def has_user_backup(self) -> bool:
-        return bool(self.user_markdown)
 
     def payload(self) -> dict[str, Any]:
         if not self.json_payload:
@@ -185,6 +194,27 @@ _CACHE_DIR_NAMES = frozenset({
     "sayink_audio_cache",
     "cache",
 })
+_JOURNAL_FILE_NAMES = frozenset({"audio.f32", "microphone.f32", "system.f32", "session.json"})
+
+
+def _is_dedicated_journal_dir(directory: Path, allowed_roots: list[Path]) -> bool:
+    try:
+        if not directory.is_dir() or directory.is_symlink():
+            return False
+        if directory.name.lower() in _CACHE_DIR_NAMES:
+            return False
+        resolved = directory.resolve()
+        if resolved in allowed_roots:
+            return False
+        entries = list(directory.iterdir())
+        if not entries:
+            return False
+        if any(entry.is_symlink() for entry in entries):
+            return False
+        names = {entry.name.lower() for entry in entries}
+        return bool(names & _JOURNAL_FILE_NAMES) and names.issubset(_JOURNAL_FILE_NAMES)
+    except OSError:
+        return False
 
 
 def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, audio_path: str) -> None:
@@ -258,26 +288,31 @@ def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, au
                 owned_source = source not in (MEDIA_SOURCE, IMPORT_SOURCE) or in_named_cache
                 if in_allowed and owned_source and resolved != db_resolved:
                     if candidate.is_file() and candidate.suffix.lower() in _OWNED_AUDIO_SUFFIXES:
-                        if candidate.name.lower() == "audio.f32" and candidate.parent != db_root:
-                            markers = ("audio.f32", "microphone.f32", "system.f32", "session.json")
-                            if any((candidate.parent / m).exists() for m in markers):
-                                journal_names.add(candidate.parent.name)
-                                quota_root = candidate.parent.parent
-                                shutil.rmtree(candidate.parent, ignore_errors=True)
-                                _invalidate_pending_bytes_cache(quota_root)
-                            else:
-                                candidate.unlink(missing_ok=True)
-                                _invalidate_pending_bytes_cache(candidate.parent)
-                        else:
+                        if (
+                            candidate.name.lower() == "audio.f32"
+                            and candidate.parent != db_root
+                            and _is_dedicated_journal_dir(candidate.parent, allowed_roots)
+                        ):
                             journal_names.add(candidate.parent.name)
-                            candidate.unlink(missing_ok=True)
-                    elif candidate.is_dir():
-                        markers = ("audio.f32", "microphone.f32", "system.f32", "session.json")
-                        if any((candidate / m).exists() for m in markers):
-                            journal_names.add(candidate.name)
-                            quota_root = candidate.parent
-                            shutil.rmtree(candidate, ignore_errors=True)
+                            quota_root = candidate.parent.parent
+                            shutil.rmtree(candidate.parent, ignore_errors=True)
                             _invalidate_pending_bytes_cache(quota_root)
+                        else:
+                            if candidate.stem and candidate.stem.lower() not in _JOURNAL_FILE_NAMES:
+                                journal_names.add(candidate.stem)
+                            if (
+                                candidate.parent != db_root
+                                and candidate.parent.name.lower() not in _CACHE_DIR_NAMES
+                            ):
+                                journal_names.add(candidate.parent.name)
+                            candidate.unlink(missing_ok=True)
+                            if candidate.suffix.lower() == ".f32":
+                                _invalidate_pending_bytes_cache(candidate.parent)
+                    elif candidate.is_dir() and _is_dedicated_journal_dir(candidate, allowed_roots):
+                        journal_names.add(candidate.name)
+                        quota_root = candidate.parent
+                        shutil.rmtree(candidate, ignore_errors=True)
+                        _invalidate_pending_bytes_cache(quota_root)
         except OSError:
             pass
 
@@ -288,7 +323,7 @@ def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, au
                 for jname in journal_names:
                     if not jname:
                         continue
-                    for wav_file in list(playback_dir.glob(f"{jname}-*.wav")):
+                    for wav_file in list(playback_dir.glob(f"{glob.escape(jname)}-*.wav")):
                         if wav_file.is_file() and not wav_file.is_symlink():
                             wav_file.unlink(missing_ok=True)
         except OSError:
@@ -330,6 +365,7 @@ class MeetingStore:
 
     def __init__(self, history: HistoryStore):
         self._history = history
+        self._pending_write_ticket: int | None = None
 
     @property
     def disabled(self) -> bool:
@@ -337,10 +373,17 @@ class MeetingStore:
 
     # -- lifecycle -------------------------------------------------------
 
-    def _write(self, fn) -> None:
-        self._history.enqueue_write(fn, failure_notice=MEETING_WRITE_FAILED_NOTICE)
+    def _write(self, fn) -> int:
+        ticket = self._history.enqueue_write(fn, failure_notice=MEETING_WRITE_FAILED_NOTICE)
+        if ticket and self._pending_write_ticket is None:
+            self._pending_write_ticket = ticket
+        return ticket
 
-    def flush(self, timeout: float = 10.0) -> bool:
+    def flush(self, timeout: float = 10.0, *, since_ticket: int | None = None) -> bool:
+        ticket = since_ticket if since_ticket is not None else self._pending_write_ticket
+        self._pending_write_ticket = None
+        if ticket is not None:
+            return self._history.flush(timeout=timeout, since_ticket=ticket)
         return self._history.flush(timeout=timeout)
 
     def create_meeting(
@@ -404,9 +447,17 @@ class MeetingStore:
         segments: list[SegmentRecord] = []
         for sid in ids:
             segments.extend(self._history.get_session_segments(sid))
+        segments.sort(key=lambda s: (int(s.created_at), int(s.seq)))
+        segments = [
+            s for s in segments
+            if (
+                (s.corrected_text or "").strip()
+                or (("" if s.polished_text == "\u200b" else s.polished_text)
+                    or ("" if s.polished_text == "\u200b" else s.raw_text)).strip()
+            )
+        ]
         if not segments:
             return None
-        segments.sort(key=lambda s: (int(s.created_at), int(s.seq)))
 
         started_candidates = [int(s.captured_at) if int(s.captured_at) > 0 else int(s.created_at) for s in segments]
         started_at = min(started_candidates)
@@ -416,7 +467,7 @@ class MeetingStore:
 
         source = next((s.source for s in segments if s.source), "")
         model_id = next((s.model for s in segments if s.model), "")
-        stamp_str = time.strftime("%m-%d %H:%M", time.localtime(started_at / 1000))
+        stamp_str = _format_local_ms("%m-%d %H:%M", started_at)
         if not title.strip():
             title = f"{stamp_str} 转写整理" if len(ids) == 1 else f"{stamp_str} 等 {len(ids)} 条转写整理"
 
@@ -445,8 +496,8 @@ class MeetingStore:
                 INSERT INTO history (
                   session_id, seq, created_at, raw_text, polished_text,
                   source, duration_ms, target_app, trigger_mode, model,
-                  speaker_id, speaker_route, captured_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  speaker_id, speaker_route, captured_at, corrected_text, speaker_locked
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -463,11 +514,10 @@ class MeetingStore:
                         int(seg.speaker_id),
                         seg.speaker_route or "",
                         int(seg.captured_at or 0),
+                        seg.corrected_text or "",
+                        int(seg.speaker_locked),
                     )
-                    for new_seq, seg in enumerate(
-                        s for s in segments
-                        if (("" if s.polished_text == "\u200b" else s.polished_text) or ("" if s.polished_text == "\u200b" else s.raw_text)).strip()
-                    )
+                    for new_seq, seg in enumerate(segments)
                 ],
             )
 
@@ -490,11 +540,17 @@ class MeetingStore:
         """
         if self.disabled or transcript is None:
             return None
-        assigned, names = assign_speakers(tuple(turn for turn in transcript.turns if turn.text.strip()))
+        source_turns = tuple(turn for turn in transcript.turns if turn.text.strip())
+        if not source_turns:
+            return None
+        if getattr(transcript, "wall_clock_offsets", False):
+            source_turns = normalize_wall_clock_turns(source_turns)
+        assigned, names = assign_speakers(source_turns)
         if not assigned:
             return None
         started = now_ms()
-        if transcript.has_timestamps:
+        has_ts = any(turn.offset_ms is not None for _speaker_id, turn in assigned)
+        if has_ts:
             span = 0
             for _speaker_id, turn in assigned:
                 if turn.offset_ms is None:
@@ -525,10 +581,10 @@ class MeetingStore:
             )
             rows = []
             for seq, (speaker_id, turn) in enumerate(assigned):
-                if transcript.has_timestamps and turn.offset_ms is not None:
+                if has_ts and turn.offset_ms is not None:
                     captured = started + int(turn.offset_ms)
                     duration = int(turn.duration_ms or 0)
-                elif transcript.has_timestamps:
+                elif has_ts:
                     # Negative captured_at means this paragraph has no clock.
                     # Zero would fall back to created_at and invent one.
                     captured = -1
@@ -752,19 +808,27 @@ class MeetingStore:
 
         def _delete_all(conn: sqlite3.Connection) -> None:
             audio_rows: list[tuple[str, str, str]] = []
-            for meeting_id in ids:
-                row = conn.execute("SELECT source, audio_path FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
-                if row is not None:
-                    audio_rows.append((meeting_id, str(row[0] or ""), str(row[1] or "")))
-                else:
-                    audio_rows.append((meeting_id, "", ""))
-                conn.execute("DELETE FROM history WHERE session_id = ?", (meeting_id,))
-                conn.execute("DELETE FROM meeting_marks WHERE meeting_id = ?", (meeting_id,))
-                conn.execute("DELETE FROM meeting_speakers WHERE meeting_id = ?", (meeting_id,))
-                conn.execute("DELETE FROM meeting_notes WHERE meeting_id = ?", (meeting_id,))
-                conn.execute("DELETE FROM meeting_generation_cache WHERE meeting_id = ?", (meeting_id,))
-                conn.execute("DELETE FROM meeting_generation_queue WHERE meeting_id = ?", (meeting_id,))
-                conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+            for start in range(0, len(ids), 500):
+                batch = ids[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                params = tuple(batch)
+                found = {
+                    str(row[0]): (str(row[1] or ""), str(row[2] or ""))
+                    for row in conn.execute(
+                        f"SELECT id, source, audio_path FROM meetings WHERE id IN ({placeholders})",
+                        params,
+                    ).fetchall()
+                }
+                for meeting_id in batch:
+                    source, audio_path = found.get(meeting_id, ("", ""))
+                    audio_rows.append((meeting_id, source, audio_path))
+                conn.execute(f"DELETE FROM history WHERE session_id IN ({placeholders})", params)
+                conn.execute(f"DELETE FROM meeting_marks WHERE meeting_id IN ({placeholders})", params)
+                conn.execute(f"DELETE FROM meeting_speakers WHERE meeting_id IN ({placeholders})", params)
+                conn.execute(f"DELETE FROM meeting_notes WHERE meeting_id IN ({placeholders})", params)
+                conn.execute(f"DELETE FROM meeting_generation_cache WHERE meeting_id IN ({placeholders})", params)
+                conn.execute(f"DELETE FROM meeting_generation_queue WHERE meeting_id IN ({placeholders})", params)
+                conn.execute(f"DELETE FROM meetings WHERE id IN ({placeholders})", params)
             for meeting_id, source, audio_path in audio_rows:
                 _cleanup_owned_meeting_audio(db_path, meeting_id, source, audio_path)
 
@@ -919,6 +983,16 @@ class MeetingStore:
             ).fetchall())
         return self._history.read(_query, default={}) or {}
 
+    def _checkpoint_payload(self, meeting_id: str, fingerprint: str, step_key: str) -> str | None:
+        def _query(conn):
+            row = conn.execute(
+                "SELECT payload FROM meeting_generation_cache "
+                "WHERE meeting_id = ? AND fingerprint = ? AND step_key = ?",
+                (meeting_id, fingerprint, step_key),
+            ).fetchone()
+            return str(row[0]) if row is not None and row[0] is not None else None
+        return self._history.read(_query, default=None)
+
     def save_generation_checkpoint(self, meeting_id: str, fingerprint: str, step_key: str, payload: str) -> None:
         saved = []
         def _save(conn):
@@ -935,7 +1009,7 @@ class MeetingStore:
         self._write(_save)
         if not self.flush(timeout=2.0):
             raise RuntimeError("分段进度未能保存，请重试")
-        if not saved or (saved[0] and self.generation_checkpoints(meeting_id, fingerprint).get(step_key) != payload):
+        if not saved or (saved[0] and self._checkpoint_payload(meeting_id, fingerprint, step_key) != payload):
             raise RuntimeError("分段进度保存失败，请重试")
 
     def clear_generation_checkpoints(self, meeting_id: str) -> None:
@@ -1263,8 +1337,6 @@ class MeetingStore:
 
         self._write(_restore)
 
-    restore_user_notes = restore_user_markdown
-
     # -- reads -------------------------------------------------------------
 
     def list_meetings(self, limit: int = 100, offset: int = 0) -> list[MeetingRecord]:
@@ -1295,10 +1367,11 @@ class MeetingStore:
         return int(self._history.read(_q, default=0) or 0)
 
     def search_meetings(self, q: str, limit: int = 200) -> list[MeetingRecord]:
-        q = q.strip()
-        if not q:
+        raw_q = q.strip()
+        if not raw_q:
             return self.list_meetings(limit=limit)
-        if limit <= 0:
+        q = raw_q.replace("\u200b", "").strip()
+        if not q or limit <= 0:
             return []
 
         pattern = f"%{escape_like(q)}%"

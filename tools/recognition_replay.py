@@ -80,7 +80,7 @@ def replay(audio, rate, recognizer, embedder, *, mode, vad="silero", contextual=
     text = "".join(row["text"] for row in rows)
     total = sum(len(chunk.audio) for chunk in chunks)
     return {"mode": mode, "vad_used": used, "speaker_backend": embedder.name,
-            "activity_backend": "off" if mode != "activity" else detector.activity_backend if chunks else "off",
+            "activity_backend": "off" if mode == "pause_only" or not chunks else detector.activity_backend,
             "contextual": contextual and mode != "pause_only", "context_actions": dict(actions),
             "speaker_groups": session.speaker_count, "profile_samples": len(session.history),
             "vad_chunks": len(chunks), "turns": len(rows), "unknown_turns": sum(row["speaker"] == 0 for row in rows),

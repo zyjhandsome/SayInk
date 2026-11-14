@@ -38,10 +38,11 @@ def _blend(foreground: str, background: str, alpha: float) -> str:
 
 class TestAppStyles:
     def test_global_stylesheet_is_nonempty_string(self):
-        from sayink.ui.app_styles import GLOBAL_APP_STYLESHEET
+        from sayink.ui.app_styles import build_global_stylesheet
 
-        assert isinstance(GLOBAL_APP_STYLESHEET, str)
-        assert len(GLOBAL_APP_STYLESHEET.strip()) > 0
+        css = build_global_stylesheet("light")
+        assert isinstance(css, str)
+        assert len(css.strip()) > 0
 
     def test_combo_wheel_scrolls_the_page_instead_of_changing_the_value(self):
         import sys
@@ -227,14 +228,11 @@ class TestSettingsStyles:
 
     def test_interactive_styles_provide_visible_focus_rings(self):
         import sayink.ui.settings_styles as st
-        from sayink.ui.settings_components import NAV_BTN_STYLE, ROW_RADIO_STYLE
 
         for style in (
             st.BTN_PRIMARY,
             st.BTN_GHOST_SM,
             st.BTN_DANGER_SM,
-            NAV_BTN_STYLE,
-            ROW_RADIO_STYLE,
         ):
             assert ":focus" in style
             assert "2px solid" in style
@@ -306,18 +304,11 @@ class TestSidebarVisualContracts:
         assert t.NAV_BG.upper() == "#F6F7F8"
         assert t.BG.upper() == "#FFFFFF"
 
-    def test_nav_btn_style_uses_single_left_bar_and_soft_wash(self):
-        from sayink.ui.design_tokens import ACCENT, NAV_SELECTED_BG
-        from sayink.ui.settings_components import NAV_BTN_STYLE
+    def test_nav_selected_tokens_define_left_bar_and_soft_wash(self):
+        from sayink.ui.design_tokens import NAV_SELECTED_BAR_PX, NAV_SELECTED_BG
 
-        assert "font-size: 14px" in NAV_BTN_STYLE
-        # Prototype v3: left bar + soft wash + accent label.
-        checked_block = NAV_BTN_STYLE.split(":checked")[1].split("}")[0]
-        assert f"background: {NAV_SELECTED_BG}" in checked_block
-        assert f"color: {ACCENT}" in checked_block
-        assert f"border-left: 3px solid {ACCENT}" in checked_block
-        assert "border: 1px solid" not in checked_block
-        assert "border: 2px solid" not in checked_block
+        assert NAV_SELECTED_BAR_PX == 3
+        assert isinstance(NAV_SELECTED_BG, str) and NAV_SELECTED_BG
 
     def test_page_title_avoids_negative_tracking(self):
         from sayink.ui.design_tokens import TEXT_SEC
@@ -337,19 +328,6 @@ class TestSidebarVisualContracts:
         assert f"background: {SURFACE}" in GROUP_STYLE
         assert f"border-radius: {RADIUS_LG}px" in GROUP_STYLE
         assert f"border: 1px solid {BORDER}" in GROUP_STYLE
-
-    def test_usage_tip_bar_is_neutral(self):
-        from sayink.ui.design_tokens import HAIRLINE, SURFACE_PEARL, TEXT_SEC
-        from sayink.ui.settings_components import usage_tip_bar
-
-        tip = usage_tip_bar("提示")
-        try:
-            assert f"background: {SURFACE_PEARL}" in tip.styleSheet()
-            assert f"border: 1px solid {HAIRLINE}" in tip.styleSheet()
-            label = next(child for child in tip.findChildren(QLabel) if child.text() == "提示")
-            assert f"color: {TEXT_SEC}" in label.styleSheet()
-        finally:
-            tip.close()
 
     def test_retired_choice_card_variants_are_gone(self):
         """Only CompactPickCard is used by the pages; the two older card
@@ -591,9 +569,9 @@ class TestSettingsControlAlignment:
         assert CONTROL_NUMERIC_WIDTH == 120
 
     def test_device_combo_width_token(self):
-        from sayink.ui.design_tokens import CONTROL_DEVICE_COMBO_WIDTH
+        from sayink.ui.design_tokens import CONTROL_SETTINGS_COMBO_WIDTH
 
-        assert CONTROL_DEVICE_COMBO_WIDTH == 240
+        assert CONTROL_SETTINGS_COMBO_WIDTH == 240
 
     def test_history_spins_share_fixed_width(self, config, monkeypatch):
         import sys
@@ -622,7 +600,7 @@ class TestSettingsControlAlignment:
 
         from PyQt6.QtWidgets import QApplication
 
-        from sayink.ui.design_tokens import CONTROL_DEVICE_COMBO_WIDTH
+        from sayink.ui.design_tokens import CONTROL_SETTINGS_COMBO_WIDTH
         from sayink.ui.settings_window import SettingsWindow
 
         QApplication.instance() or QApplication(sys.argv)
@@ -632,10 +610,10 @@ class TestSettingsControlAlignment:
 
         win = SettingsWindow(config)
         try:
-            assert win._mic_device_combo.minimumWidth() == CONTROL_DEVICE_COMBO_WIDTH
-            assert win._system_device_combo.minimumWidth() == CONTROL_DEVICE_COMBO_WIDTH
-            assert win._mic_device_combo.maximumWidth() == CONTROL_DEVICE_COMBO_WIDTH
-            assert win._system_device_combo.maximumWidth() == CONTROL_DEVICE_COMBO_WIDTH
+            assert win._mic_device_combo.minimumWidth() == CONTROL_SETTINGS_COMBO_WIDTH
+            assert win._system_device_combo.minimumWidth() == CONTROL_SETTINGS_COMBO_WIDTH
+            assert win._mic_device_combo.maximumWidth() == CONTROL_SETTINGS_COMBO_WIDTH
+            assert win._system_device_combo.maximumWidth() == CONTROL_SETTINGS_COMBO_WIDTH
         finally:
             win.close()
 

@@ -118,15 +118,15 @@ P1 表示优先处理误操作和可用性表达；P2 表示下一批统一改�
 7. 长设备名、60 字符模板名、小屏、高缩放、多屏边缘条件下可读、可选、不会越界。
 8. 设置页与会议页的模板说明随当前项同步，继承值的命名和生效范围一致。
 
-**原生证据**
+**原生证据**（本机审查输出位于忽略目录 `build/dropdown-review/native-1/`）
 
-- [正常／悬停／焦点／禁用与展开候选项对比](../build/dropdown-review/native-1/state-comparison.png)
-- [会议开始卡片：字段上下文](../build/dropdown-review/native-1/dark-start-card.png)
-- [会议导出菜单](../build/dropdown-review/native-1/dark-meeting-export.png) / [会议更多菜单](../build/dropdown-review/native-1/dark-meeting-more.png)
-- [模型列表展开态](../build/dropdown-review/native-1/light-meeting-model-popup.png)
-- [长值收起态探针](../build/dropdown-review/native-1/dark-long-template-closed.png)
-- [全部选择框与菜单测量](../build/dropdown-review/native-1/measurements.json)
-- [状态与长值探针结果](../build/dropdown-review/native-1/state-probes.json)
+- 正常／悬停／焦点／禁用与展开候选项对比：`build/dropdown-review/native-1/state-comparison.png`
+- 会议开始卡片（字段上下文）：`build/dropdown-review/native-1/dark-start-card.png`
+- 会议导出菜单 / 会议更多菜单：`build/dropdown-review/native-1/dark-meeting-export.png`、`build/dropdown-review/native-1/dark-meeting-more.png`
+- 模型列表展开态：`build/dropdown-review/native-1/light-meeting-model-popup.png`
+- 长值收起态探针：`build/dropdown-review/native-1/dark-long-template-closed.png`
+- 全部选择框与菜单测量：`build/dropdown-review/native-1/measurements.json`
+- 状态与长值探针结果：`build/dropdown-review/native-1/state-probes.json`
 
 采集工具位于 `build/dropdown-review/capture_audit.py` 与 `build/dropdown-review/probe_states.py`，只使用隔离状态。`build/` 为本机审查产物，通常不进入版本管理；若分享或提交本文档，应一起附上需要的证据图。
 

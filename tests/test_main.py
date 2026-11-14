@@ -242,19 +242,26 @@ class TestActivation:
 
 
 class TestExceptionHooks:
-    def test_hooks_installed(self):
-        log = logging.getLogger("SayInk-test-hooks")
-        main._install_exception_hooks(log)
+    def test_hooks_installed(self, monkeypatch):
         import sys as _sys
         import threading as _threading
+
+        monkeypatch.setattr(_sys, "excepthook", _sys.excepthook)
+        monkeypatch.setattr(_threading, "excepthook", _threading.excepthook)
+        log = logging.getLogger("SayInk-test-hooks")
+        main._install_exception_hooks(log)
 
         assert _sys.excepthook is not None
         assert _threading.excepthook is not None
 
-    def test_excepthook_logs_non_keyboard_interrupt(self, caplog):
+    def test_excepthook_logs_non_keyboard_interrupt(self, monkeypatch, caplog):
+        import sys as _sys
+        import threading as _threading
+
+        monkeypatch.setattr(_sys, "excepthook", _sys.excepthook)
+        monkeypatch.setattr(_threading, "excepthook", _threading.excepthook)
         log = logging.getLogger("SayInk-test-hooks2")
         main._install_exception_hooks(log)
-        import sys as _sys
 
         with caplog.at_level(logging.CRITICAL):
             try:
@@ -263,10 +270,14 @@ class TestExceptionHooks:
                 _sys.excepthook(*_sys.exc_info())
         assert any("未捕获异常" in r.message for r in caplog.records)
 
-    def test_threading_hook_ignores_system_exit(self):
+    def test_threading_hook_ignores_system_exit(self, monkeypatch, caplog):
+        import sys as _sys
+        import threading as _threading
+
+        monkeypatch.setattr(_sys, "excepthook", _sys.excepthook)
+        monkeypatch.setattr(_threading, "excepthook", _threading.excepthook)
         log = logging.getLogger("SayInk-test-hooks3")
         main._install_exception_hooks(log)
-        import threading as _threading
 
         args = types.SimpleNamespace(
             exc_type=SystemExit,
@@ -274,5 +285,6 @@ class TestExceptionHooks:
             exc_traceback=None,
             thread=None,
         )
-        # Should not raise.
-        _threading.excepthook(args)
+        with caplog.at_level(logging.CRITICAL, logger="SayInk-test-hooks3"):
+            _threading.excepthook(args)
+        assert caplog.records == []

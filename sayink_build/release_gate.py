@@ -15,9 +15,20 @@ from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = "tests.yml"
-# Untracked files in source/spec directories or at repo root must not slip past
-# a release check; build/, caches, and gitignored staging folders stay ignored.
-SOURCE_DIRS = ("sayink/", "sayink_build/", "installer/", "openspec/")
+# Untracked files in source/spec/test/doc/tooling directories or at repo root
+# must not slip past a release check; build/, caches, and gitignored staging
+# folders stay ignored.
+SOURCE_DIRS = (
+    "sayink/",
+    "sayink_build/",
+    "installer/",
+    "openspec/",
+    "tests/",
+    "tools/",
+    "docs/",
+    "design-system/",
+    ".github/",
+)
 
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
@@ -139,6 +150,25 @@ def _readme_contract_problem(run: Runner) -> str | None:
     return None
 
 
+def _installer_version_problem(_run: Runner) -> str | None:
+    """Ensure SayInk-Setup.iss fallback #defines stay synced with sayink/version.py."""
+    from sayink.version import __version__, file_version_quad
+
+    iss_path = ROOT / "installer" / "SayInk-Setup.iss"
+    try:
+        iss_text = iss_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return f"Could not read installer/SayInk-Setup.iss: {exc}"
+    expected_str = f'#define AppVersionStr "{__version__}"'
+    expected_quad = f'#define AppVersionQuad "{file_version_quad()}"'
+    if expected_str not in iss_text or expected_quad not in iss_text:
+        return (
+            "installer/SayInk-Setup.iss fallback AppVersionStr / AppVersionQuad "
+            f"does not match sayink/version.py ({__version__} / {file_version_quad()})."
+        )
+    return None
+
+
 def release_problems(version: str, run: Runner = _run) -> list[str]:
     """Everything that stops ``version`` from being released; empty when ready."""
     problems = []
@@ -152,6 +182,7 @@ def release_problems(version: str, run: Runner = _run) -> list[str]:
             problems.append(problem)
 
     check(_uncommitted)
+    check(_installer_version_problem)
     check(_ruff_problem)
     check(_readme_contract_problem)
     try:

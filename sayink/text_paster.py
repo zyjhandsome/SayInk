@@ -56,12 +56,6 @@ _TERMINAL_SHIFT_INSERT_EXES = frozenset({
     "mintty.exe",
     "putty.exe",
 })
-_TERMINAL_CONSOLE_EXES = frozenset({
-    "cmd.exe",
-    "powershell.exe",
-    "pwsh.exe",
-    "conhost.exe",
-})
 
 
 @dataclass(frozen=True)
@@ -78,7 +72,7 @@ class PasteTargetSnapshot:
 class ClipboardSnapshot:
     """Multi-format Win32 clipboard backup (or text fallback when mocked)."""
 
-    win32_entries: list[tuple[int, bytes]] = field(default_factory=list)
+    win32_entries: list[tuple[int, str, bytes] | tuple[int, bytes]] = field(default_factory=list)
     text_fallback: str | None = None
     use_win32: bool = False
     oversized: bool = False
@@ -203,6 +197,101 @@ def _process_name_from_window_info(info: tuple) -> str:
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _TOKEN_QUERY = 0x0008
 _TOKEN_INTEGRITY_LEVEL = 25
+_configured_token_kernel32 = None
+_configured_token_advapi32 = None
+
+
+def _configure_token_kernel32(dll):
+    import ctypes
+    from ctypes import wintypes
+
+    open_proc = getattr(dll, "OpenProcess", None)
+    if open_proc is not None and hasattr(open_proc, "argtypes"):
+        open_proc.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_proc.restype = wintypes.HANDLE
+    query_img = getattr(dll, "QueryFullProcessImageNameW", None)
+    if query_img is not None and hasattr(query_img, "argtypes"):
+        query_img.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        query_img.restype = wintypes.BOOL
+    close_fn = getattr(dll, "CloseHandle", None)
+    if close_fn is not None and hasattr(close_fn, "argtypes"):
+        close_fn.argtypes = [wintypes.HANDLE]
+        close_fn.restype = wintypes.BOOL
+    return dll
+
+
+def _configure_token_advapi32(dll):
+    import ctypes
+    from ctypes import wintypes
+
+    open_tok = getattr(dll, "OpenProcessToken", None)
+    if open_tok is not None and hasattr(open_tok, "argtypes"):
+        open_tok.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.HANDLE),
+        ]
+        open_tok.restype = wintypes.BOOL
+    get_info = getattr(dll, "GetTokenInformation", None)
+    if get_info is not None and hasattr(get_info, "argtypes"):
+        get_info.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        get_info.restype = wintypes.BOOL
+    get_count = getattr(dll, "GetSidSubAuthorityCount", None)
+    if get_count is not None and hasattr(get_count, "argtypes"):
+        get_count.argtypes = [ctypes.c_void_p]
+        get_count.restype = ctypes.POINTER(ctypes.c_ubyte)
+    get_sub = getattr(dll, "GetSidSubAuthority", None)
+    if get_sub is not None and hasattr(get_sub, "argtypes"):
+        get_sub.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        get_sub.restype = ctypes.POINTER(wintypes.DWORD)
+    return dll
+
+
+def _resolve_token_kernel32():
+    import ctypes
+
+    global _configured_token_kernel32
+    current = getattr(getattr(ctypes, "windll", None), "kernel32", None)
+    if (
+        sys.platform == "win32"
+        and hasattr(ctypes, "WinDLL")
+        and isinstance(current, ctypes.WinDLL)
+    ):
+        if _configured_token_kernel32 is None:
+            _configured_token_kernel32 = _configure_token_kernel32(
+                ctypes.WinDLL("kernel32", use_last_error=True)
+            )
+        return _configured_token_kernel32
+    return _configure_token_kernel32(current) if current is not None else None
+
+
+def _resolve_token_advapi32():
+    import ctypes
+
+    global _configured_token_advapi32
+    current = getattr(getattr(ctypes, "windll", None), "advapi32", None)
+    if (
+        sys.platform == "win32"
+        and hasattr(ctypes, "WinDLL")
+        and isinstance(current, ctypes.WinDLL)
+    ):
+        if _configured_token_advapi32 is None:
+            _configured_token_advapi32 = _configure_token_advapi32(
+                ctypes.WinDLL("advapi32", use_last_error=True)
+            )
+        return _configured_token_advapi32
+    return _configure_token_advapi32(current) if current is not None else None
 
 
 def _process_name_limited(info: tuple) -> str:
@@ -213,7 +302,9 @@ def _process_name_limited(info: tuple) -> str:
         import ctypes
         from ctypes import wintypes
 
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = _resolve_token_kernel32()
+        if kernel32 is None:
+            return ""
         handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(info[2]))
         if not handle:
             return ""
@@ -235,12 +326,10 @@ def _integrity_rid(pid: int) -> int | None:
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.windll.kernel32
-    advapi32 = ctypes.windll.advapi32
-    advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
-    advapi32.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
-    advapi32.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
-    advapi32.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+    kernel32 = _resolve_token_kernel32()
+    advapi32 = _resolve_token_advapi32()
+    if kernel32 is None or advapi32 is None:
+        return None
 
     process = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
     if not process:
@@ -258,8 +347,13 @@ def _integrity_rid(pid: int) -> int | None:
             ):
                 return None
             sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
-            count = advapi32.GetSidSubAuthorityCount(sid)[0]
-            return int(advapi32.GetSidSubAuthority(sid, count - 1)[0])
+            if not sid:
+                return None
+            count_ptr = advapi32.GetSidSubAuthorityCount(sid)
+            if not count_ptr or count_ptr[0] == 0:
+                return None
+            sub_ptr = advapi32.GetSidSubAuthority(sid, count_ptr[0] - 1)
+            return int(sub_ptr[0]) if sub_ptr else None
         finally:
             kernel32.CloseHandle(token)
     finally:
@@ -570,17 +664,6 @@ def detect_terminal_paste_mode(info: tuple | int, target_app: str = "") -> str:
     return "ctrl_v"
 
 
-def is_terminal_window(info: tuple | int, target_app: str = "") -> bool:
-    """True for modern terminals, SSH/mintty terminals, and classic Win32 consoles."""
-    mode = detect_terminal_paste_mode(info, target_app)
-    if mode != "ctrl_v":
-        return True
-    hwnd = _extract_hwnd(info)
-    cls_name = _get_window_class_name(hwnd)
-    exe_lower = (target_app or "").strip().lower()
-    return cls_name == "ConsoleWindowClass" or exe_lower in _TERMINAL_CONSOLE_EXES
-
-
 def _win32_clipboard_apis():
     import ctypes
     from ctypes import wintypes
@@ -602,6 +685,8 @@ def _win32_clipboard_apis():
     user32.SetClipboardData.restype = ctypes.c_void_p
     user32.GetClipboardFormatNameW.argtypes = [wintypes.UINT, wintypes.LPWSTR, ctypes.c_int]
     user32.GetClipboardFormatNameW.restype = ctypes.c_int
+    user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    user32.RegisterClipboardFormatW.restype = wintypes.UINT
     user32.GetClipboardSequenceNumber.argtypes = []
     user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
 
@@ -624,7 +709,8 @@ def get_win32_clipboard_sequence_number() -> int | None:
         return None
     try:
         _ctypes, user32, _kernel32 = _win32_clipboard_apis()
-        return int(user32.GetClipboardSequenceNumber())
+        seq = int(user32.GetClipboardSequenceNumber())
+        return seq if seq > 0 else None
     except Exception:
         return None
 
@@ -657,12 +743,15 @@ def capture_win32_clipboard_snapshot(max_bytes: int = MAX_CLIPBOARD_SNAPSHOT_BYT
                 continue
             seen_formats.add(fmt_int)
 
+            format_name = ""
             keep = fmt_int in allowed_standard
-            if not keep and fmt_int >= 0xC000:
+            if fmt_int >= 0xC000:
                 name_buf = ctypes.create_unicode_buffer(256)
                 nlen = user32.GetClipboardFormatNameW(fmt_int, name_buf, len(name_buf))
-                if nlen > 0 and name_buf.value.lower() in allowed_names:
-                    keep = True
+                if nlen > 0:
+                    format_name = name_buf.value
+                    if format_name.lower() in allowed_names:
+                        keep = True
             if not keep:
                 continue
 
@@ -686,7 +775,7 @@ def capture_win32_clipboard_snapshot(max_bytes: int = MAX_CLIPBOARD_SNAPSHOT_BYT
             # Ignore empty CF_UNICODETEXT (just a 2-byte UTF-16 NUL terminator).
             if fmt_int == _CF_UNICODETEXT and raw == b"\x00\x00":
                 continue
-            snap.win32_entries.append((fmt_int, raw))
+            snap.win32_entries.append((fmt_int, format_name if fmt_int >= 0xC000 else "", raw))
             total_bytes += size
     finally:
         user32.CloseClipboard()
@@ -706,13 +795,26 @@ def restore_win32_clipboard_snapshot(snapshot: ClipboardSnapshot) -> bool:
         time.sleep(0.01 * (attempt + 1))
     if not opened:
         return False
+    register_fn = getattr(user32, "RegisterClipboardFormatW", None)
     restored_any = False
     try:
         if not user32.EmptyClipboard():
             return False
-        for fmt_int, payload in snapshot.win32_entries:
+        for entry in snapshot.win32_entries:
+            if len(entry) == 3:
+                fmt_int, format_name, payload = entry
+            elif len(entry) == 2:
+                fmt_int, payload = entry
+                format_name = ""
+            else:
+                continue
             if not payload:
                 continue
+            target_fmt = int(fmt_int)
+            if target_fmt >= 0xC000 and format_name and callable(register_fn):
+                registered = int(register_fn(format_name) or 0)
+                if registered > 0:
+                    target_fmt = registered
             hmem = kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(payload))
             if not hmem:
                 continue
@@ -724,7 +826,7 @@ def restore_win32_clipboard_snapshot(snapshot: ClipboardSnapshot) -> bool:
                 ctypes.memmove(ptr, payload, len(payload))
             finally:
                 kernel32.GlobalUnlock(hmem)
-            if user32.SetClipboardData(int(fmt_int), hmem):
+            if user32.SetClipboardData(target_fmt, hmem):
                 restored_any = True
             else:
                 kernel32.GlobalFree(hmem)
@@ -802,6 +904,21 @@ def _paste_shortcut_win32(mode: str | None = None):
 
     effective_mode = mode or _ACTIVE_PASTE_MODE or "ctrl_v"
     user32 = ctypes.windll.user32
+    from ctypes import wintypes
+
+    for _fn_name, _args, _res in (
+        ("MapVirtualKeyW", [wintypes.UINT, wintypes.UINT], wintypes.UINT),
+        ("GetAsyncKeyState", [ctypes.c_int], wintypes.SHORT),
+        (
+            "keybd_event",
+            [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t],
+            None,
+        ),
+    ):
+        _fn = getattr(user32, _fn_name, None)
+        if _fn is not None and hasattr(_fn, "argtypes"):
+            _fn.argtypes = _args
+            _fn.restype = _res
     vk_control = 0x11
     vk_shift = 0x10
     vk_v = 0x56
@@ -819,18 +936,19 @@ def _paste_shortcut_win32(mode: str | None = None):
         _tap(vk, key_up)
 
     if effective_mode == "shift_insert":
-        if ctrl_held:
-            for cvk in (_VK_LCONTROL, _VK_RCONTROL):
-                if user32.GetAsyncKeyState(cvk) & 0x8000:
-                    _tap(cvk, key_up)
+        held_ctrls = (
+            [cvk for cvk in (_VK_LCONTROL, _VK_RCONTROL) if user32.GetAsyncKeyState(cvk) & 0x8000]
+            if ctrl_held
+            else []
+        )
+        for cvk in held_ctrls:
+            _tap(cvk, key_up)
         _tap(vk_shift, 0)
         _tap(_VK_INSERT, 0)
         _tap(_VK_INSERT, key_up)
         _tap(vk_shift, key_up)
-        if ctrl_held:
-            for cvk in (_VK_LCONTROL, _VK_RCONTROL):
-                if user32.GetAsyncKeyState(cvk) & 0x8000:
-                    _tap(cvk, 0)
+        for cvk in held_ctrls:
+            _tap(cvk, 0)
     elif effective_mode == "ctrl_shift_v":
         if not ctrl_held:
             _tap(vk_control, 0)
@@ -871,7 +989,6 @@ class TextPaster:
         self._paste_seq = 0
         # The user's own clipboard while a delayed restore has not run yet;
         # the next paste must not mistake the previous transcript for it.
-        self._saved_clipboard: str | None = None
         self._saved_snapshot: ClipboardSnapshot | None = None
         self._restore_pending = False
 
@@ -879,7 +996,6 @@ class TextPaster:
         """Forget a paste whose shortcut has not been sent yet and clear pending restore."""
         self._paste_seq += 1
         self._restore_pending = False
-        self._saved_clipboard = None
         self._saved_snapshot = None
 
     @staticmethod
@@ -916,7 +1032,8 @@ class TextPaster:
             return get_win32_clipboard_sequence_number()
         return None
 
-    def _is_own_window(self, info: tuple) -> bool:
+    @classmethod
+    def _is_own_window(cls, info: tuple) -> bool:
         """Check if the foreground window belongs to this process."""
         if sys.platform == "win32" and len(info) >= 3:
             _, title, pid = info
@@ -924,26 +1041,7 @@ class TextPaster:
                 return True
         else:
             _, title = info[:2]
-        return title in self.OWN_TITLES
-
-    def paste(self, text: str) -> str:
-        """
-        Synchronous paste (no verification). Prefer paste_async in the UI thread.
-        Returns: 'pasted', 'clipboard', or 'error:<msg>'.
-        """
-        if not text:
-            return "error:空文本"
-
-        info = get_foreground_window_info()
-        hwnd = info[0]
-        has_target = hwnd != 0 and not self._is_own_window(info)
-
-        pyperclip.copy(text)
-
-        if has_target:
-            _paste_shortcut()
-            return "pasted"
-        return "clipboard"
+        return title in cls.OWN_TITLES
 
     def paste_async(
         self,
@@ -970,6 +1068,7 @@ class TextPaster:
         current_snapshot = build_paste_target_snapshot(info)
         baseline_snapshot: PasteTargetSnapshot | None = None
         skip_detail = ""
+        checked_uipi = False
         if target_hwnd is None:
             hwnd = info[0]
             has_target = hwnd != 0 and not self._is_own_window(info)
@@ -986,17 +1085,22 @@ class TextPaster:
             if hwnd == 0 or info[0] != hwnd:
                 has_target = False
                 skip_detail = "focus_changed" if hwnd and info[0] != hwnd else ""
-            elif self._is_own_window(info) or target_rejects_synthetic_input(info):
+            elif self._is_own_window(info):
                 has_target = False
-                skip_detail = "elevated" if target_rejects_synthetic_input(info) else ""
-            elif detect_session_change(baseline_snapshot, current_snapshot):
+            elif target_rejects_synthetic_input(info):
+                checked_uipi = True
                 has_target = False
-                skip_detail = "session_changed"
-            elif _is_ime_composing(hwnd, current_snapshot.focus_hwnd):
-                has_target = False
-                skip_detail = "ime_active"
+                skip_detail = "elevated"
             else:
-                has_target = True
+                checked_uipi = True
+                if detect_session_change(baseline_snapshot, current_snapshot):
+                    has_target = False
+                    skip_detail = "session_changed"
+                elif _is_ime_composing(hwnd, current_snapshot.focus_hwnd):
+                    has_target = False
+                    skip_detail = "ime_active"
+                else:
+                    has_target = True
 
         self._paste_seq += 1
         seq = self._paste_seq
@@ -1007,7 +1111,6 @@ class TextPaster:
             else:
                 old_snapshot = self._capture_clipboard_snapshot()
                 self._saved_snapshot = old_snapshot
-                self._saved_clipboard = old_snapshot.text_fallback
             self._restore_pending = bool(old_snapshot)
 
         report = callback
@@ -1017,7 +1120,6 @@ class TextPaster:
             if not restoring and seq == self._paste_seq:
                 self._restore_pending = False
                 self._saved_snapshot = None
-                self._saved_clipboard = None
             report(result)
 
         try:
@@ -1033,7 +1135,7 @@ class TextPaster:
             callback(PasteResult("clipboard", target_app=target_app or "", detail=skip_detail))
             return
 
-        if target_rejects_synthetic_input(info):
+        if not checked_uipi and target_rejects_synthetic_input(info):
             log.info("目标窗口以更高权限运行，系统会拦截模拟粘贴；已复制到剪贴板")
             callback(PasteResult("clipboard", target_app=target_app, detail="elevated"))
             return
@@ -1043,7 +1145,6 @@ class TextPaster:
                 return  # a later paste restores the same original
             self._restore_pending = False
             self._saved_snapshot = None
-            self._saved_clipboard = None
             if old_snapshot is None:
                 return
             try:
@@ -1052,6 +1153,9 @@ class TextPaster:
                     if now_clip_seq is not None and now_clip_seq != expected_clip_seq:
                         log.debug("检测到粘贴后用户更新了剪贴板，跳过恢复旧剪贴板")
                         return
+                elif old_snapshot.use_win32 and pyperclip.paste() != text:
+                    log.debug("剪贴板序号不可用且文本已变化，跳过恢复旧剪贴板")
+                    return
                 self._restore_clipboard_snapshot(old_snapshot, text)
             except Exception:
                 log.debug("恢复原剪贴板失败", exc_info=True)

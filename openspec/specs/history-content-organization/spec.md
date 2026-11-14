@@ -1,11 +1,13 @@
 # history-content-organization Specification
 
 ## Purpose
-TBD - created by archiving change history-content-organization. Update Purpose after archive.
-## Requirements
-### Requirement: Single-session inline editing preserves raw text
 
-The history window SHALL allow users to edit the text of a single selected dictation session and persist the edited result into `polished_text` without modifying `raw_text`.
+定义转写历史窗口的单会话就地编辑（按当前查看的润色或原文视图分别保存）、单会话按需补润色/纠错、多会话合并（8 秒可撤销）以及转为会议记录的交互与持久化行为。
+
+## Requirements
+### Requirement: Single-session inline editing updates active view cleanly
+
+The history window SHALL allow users to edit the text of a single selected dictation session: saving in the polished view persists into `polished_text` without modifying `raw_text`, while saving in the raw view updates `raw_text` directly (locking the view switcher while editing).
 
 #### Scenario: 用户编辑单条历史会话并保存
 - **WHEN** 用户在历史页选中单条会话，点击「编辑」修改文本并点击「保存」
@@ -52,8 +54,3 @@ The history window SHALL allow users to promote a single selected session or mul
 - **WHEN** 用户在单选态点击「转为会议」或在多选态点击「合并转为会议」
 - **THEN** 系统在 `meetings` 表创建一条 `status = 'ended'` 的新会议记录，将所选历史会话的分段按时间顺序复制写入该 `meeting_id`（`trigger_mode = 'meeting'`），保留原日常转写历史不变
 - **AND** 主窗口自动切换到「会议」页并选中打开该新建会议，用户可直接选模板生成纪要、重命名说话人或编辑导出
-
----
-
-# history-content-organization：需求规格说明（中文对齐附注）
-

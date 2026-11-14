@@ -1,10 +1,13 @@
 """Regressions for truthful recording hints and the About page's task links."""
 
+from copy import deepcopy
+from pathlib import Path
+
 import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 
-from sayink.config import OUTPUT_MODE_HISTORY, OUTPUT_MODE_PASTE, TRIGGER_MODE_CONTINUOUS
+from sayink.config import Config, DEFAULT_CONFIG, OUTPUT_MODE_HISTORY, OUTPUT_MODE_PASTE, TRIGGER_MODE_CONTINUOUS
 from sayink.history_store import HistoryStore
 from sayink.ui import design_tokens as tok
 from sayink.ui.dictation_hints import dictation_hints
@@ -13,21 +16,50 @@ from sayink.ui.settings_window import SettingsWindow
 from sayink.ui.theme import apply_theme
 
 
+@pytest.fixture(scope="module")
+def _shared_about_bundle(_qapp_session, tmp_path_factory):
+    base_dir = Path(tmp_path_factory.mktemp("about_ux"))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
+        mp.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)
+        mp.setattr("sayink.speech_recognizer.is_model_downloaded", lambda _mid: False)
+        mp.setattr("sayink.config.default_secret_store", lambda: None)
+        mp.setattr("sayink.config.Config._sync_registry_auto_start", lambda self: None)
+        cfg = Config(config_dir=base_dir)
+        store = HistoryStore(base_dir / "about-history.db")
+        win = MainWindow(cfg, store)
+        win.show_page("about")
+        win.show()
+        _qapp_session.processEvents()
+        yield win, cfg, store
+        win.hide()
+        win.close()
+        win.deleteLater()
+        cfg._save_timer.stop()
+        store.close()
+
+
 @pytest.fixture
-def about_window(config, tmp_path, monkeypatch, _qapp_session):
-    monkeypatch.setattr(SettingsWindow, "_rebuild_model_cards", lambda self: None)
-    monkeypatch.setattr(SettingsWindow, "_refresh_audio_device_lists", lambda self: None)
+def config(_shared_about_bundle):
+    _win, cfg, _store = _shared_about_bundle
+    cfg._stop_save_timer()
+    cfg._config = deepcopy(DEFAULT_CONFIG)
+    return cfg
+
+
+@pytest.fixture
+def about_window(_shared_about_bundle, config, monkeypatch, _qapp_session):
     monkeypatch.setattr("sayink.speech_recognizer.is_model_downloaded", lambda _mid: False)
-    store = HistoryStore(tmp_path / "about-history.db")
-    win = MainWindow(config, store)
+    win, _cfg, _store = _shared_about_bundle
+    settings = win.settings_panel
+    apply_theme(_qapp_session, mode="light", surfaces=[win, settings])
+    if settings._about_paths_wrap.isVisible():
+        settings._about_paths_toggle.click()
+    settings.set_update_status("检查更新", action="check")
+    settings.reload_settings()
     win.show_page("about")
-    win.show()
     _qapp_session.processEvents()
-    yield win
-    win.hide()
-    win.deleteLater()
-    config._save_timer.stop()
-    store.close()
+    return win
 
 
 @pytest.mark.parametrize("source", ["system", "mixed", "microphone"])

@@ -293,7 +293,7 @@ def test_prefetched_meeting_turns_drain_in_order_with_original_timestamps():
 def test_output_watchdog_keeps_prefetch_while_falling_back_to_original():
     with app_harness(LLM) as h, patch("sayink.app.QTimer.singleShot"):
         app, callbacks = _two_segments(h)
-        app._release_stuck_output(app._output_token)
+        app._output_pipeline().release_stuck_output(app._output_token)
         assert h["paster"].paste_async.call_args.args[0] == "第一句"
         callbacks["on_text"]("第二句")
         h["paster"].paste_async.call_args.args[1]("sent")

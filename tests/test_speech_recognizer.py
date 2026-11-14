@@ -1044,10 +1044,10 @@ class TestMeetingModelKnobs:
         assert sr.effective_language("") == "zh"
         assert sr.effective_language(" EN ") == "en"
 
-    def test_recognition_params_read_shared_stt_settings(self):
+    def test_recognition_settings_read_shared_stt_settings(self):
         """Dictation and meetings derive the same (hotwords, language) target
         from ``stt.*`` so starting a meeting never forces a reload."""
-        from sayink import speech_recognizer as sr
+        from sayink.recognition_settings import RecognitionSettings
 
         class _Cfg:
             def __init__(self, data):
@@ -1057,9 +1057,12 @@ class TestMeetingModelKnobs:
                 return self._d.get(key, default)
 
         cfg = _Cfg({"stt.glossary": [{"term": "SayInk"}, {"term": "张鑫"}], "stt.language": "en"})
-        assert sr.recognition_params(cfg) == ("SayInk,张鑫", "en")
-        assert sr.recognition_params(_Cfg({})) == ("", "zh")
-        assert sr.recognition_params(_Cfg({"stt.glossary": None, "stt.language": None})) == ("", "zh")
+        rs = RecognitionSettings.from_config(cfg)
+        assert (rs.hotwords, rs.effective_language) == ("SayInk,张鑫", "en")
+        rs_empty = RecognitionSettings.from_config(_Cfg({}))
+        assert (rs_empty.hotwords, rs_empty.effective_language) == ("", "zh")
+        rs_none = RecognitionSettings.from_config(_Cfg({"stt.glossary": None, "stt.language": None}))
+        assert (rs_none.hotwords, rs_none.effective_language) == ("", "zh")
 
     def test_aux_registry_reachable_via_get_model_info(self):
         from sayink import speech_recognizer as sr
