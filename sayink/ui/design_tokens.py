@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Optional, Sequence
+import math
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
+
+if TYPE_CHECKING:
+    from PyQt6.QtGui import QColor
 
 log = logging.getLogger("SayInk")
 
@@ -320,6 +324,72 @@ _DARK: dict[str, Any] = {
 }
 
 _COLOR_KEYS = tuple(_LIGHT.keys())
+
+
+def _parse_rgb_channel(part: str) -> int | None:
+    text = part.strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("%"):
+            pct = float(text[:-1].strip())
+            if not math.isfinite(pct):
+                return None
+            return max(0, min(255, round(pct * 255.0 / 100.0)))
+        value = float(text)
+    except ValueError:
+        return None
+    if not math.isfinite(value):
+        return None
+    return max(0, min(255, round(value)))
+
+
+def _parse_alpha_channel(part: str) -> int | None:
+    text = part.strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("%"):
+            pct = float(text[:-1].strip())
+            if not math.isfinite(pct):
+                return None
+            return max(0, min(255, round(pct * 255.0 / 100.0)))
+        value = float(text)
+    except ValueError:
+        return None
+    if not math.isfinite(value):
+        return None
+    if value <= 1.0:
+        return max(0, min(255, round(value * 255.0)))
+    return max(0, min(255, round(value)))
+
+
+def qcolor_from_token(value: str) -> QColor:
+    """Parse a SayInk color token (`#RGB`/`#RRGGBB`/`#AARRGGBB`, `rgb(...)`, `rgba(...)`) into a `QColor`."""
+    from PyQt6.QtGui import QColor
+
+    if not isinstance(value, str):
+        return QColor()
+    raw = value.strip()
+    if not raw:
+        return QColor()
+    lowered = raw.lower()
+    if lowered.endswith(")") and lowered.startswith(("rgba(", "rgb(")):
+        is_rgba = lowered.startswith("rgba(")
+        inner = raw[5:-1] if is_rgba else raw[4:-1]
+        parts = inner.split(",")
+        expected = 4 if is_rgba else 3
+        if len(parts) != expected:
+            return QColor()
+        channels = [_parse_rgb_channel(p) for p in parts[:3]]
+        if any(ch is None for ch in channels):
+            return QColor()
+        r, g, b = int(channels[0]), int(channels[1]), int(channels[2])  # type: ignore[arg-type]
+        alpha = _parse_alpha_channel(parts[3]) if is_rgba else 255
+        if alpha is None:
+            return QColor()
+        return QColor(r, g, b, alpha)
+    return QColor(raw)
 
 
 def tokens_for(effective: str) -> dict[str, Any]:

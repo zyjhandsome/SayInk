@@ -9,7 +9,6 @@ import time
 
 from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
-    QColor,
     QFont,
     QKeySequence,
     QTextBlockFormat,
@@ -523,7 +522,7 @@ class _ReadingView(QTextBrowser):
                     if level == 1:
                         # An LLM title that differs from the meeting name: a subtitle, not a second heading.
                         char.setFontWeight(QFont.Weight.Normal)
-                        char.setForeground(QColor(tok.TEXT_SEC))
+                        char.setForeground(tok.qcolor_from_token(tok.TEXT_SEC))
                     cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
                     cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
                     cursor.mergeCharFormat(char)
@@ -534,6 +533,8 @@ class _ReadingView(QTextBrowser):
 
     @staticmethod
     def _style_links_with_cursor(cursor: QTextCursor, block, color: str) -> None:
+        from sayink.ui import design_tokens as tok
+
         ranges = []
         it = block.begin()
         while not it.atEnd():
@@ -545,7 +546,7 @@ class _ReadingView(QTextBrowser):
         if not ranges:
             return
         link = QTextCharFormat()
-        link.setForeground(QColor(color))
+        link.setForeground(tok.qcolor_from_token(color))
         link.setFontUnderline(False)
         for start, end in ranges:
             cursor.setPosition(start)
@@ -738,7 +739,7 @@ class _TranscriptView(_ReadingView):
             block = block.next()
         if ranges:
             fmt = QTextCharFormat()
-            fmt.setForeground(QColor(tok.TEXT_DIM))
+            fmt.setForeground(tok.qcolor_from_token(tok.TEXT_DIM))
             cursor = QTextCursor(doc)
             cursor.beginEditBlock()
             try:
@@ -774,7 +775,9 @@ class _TranscriptView(_ReadingView):
         if not ranges:
             return
         fmt = QTextCharFormat()
-        fmt.setForeground(QColor(tok.ACCENT_TEXT) if visible else QColor(tok.TEXT_DIM))
+        fmt.setForeground(
+            tok.qcolor_from_token(tok.ACCENT_TEXT) if visible else tok.qcolor_from_token(tok.TEXT_DIM)
+        )
         for start, length in ranges:
             cursor.setPosition(start)
             cursor.setPosition(start + length, QTextCursor.MoveMode.KeepAnchor)
@@ -975,9 +978,9 @@ def find_in_reading_view(
                 break
 
     extra: list[QTextEdit.ExtraSelection] = []
-    passive_bg = QColor(tok.AMBER_SOFT)
-    active_bg = QColor(tok.ACCENT_SOFT)
-    text_fg = QColor(tok.TEXT)
+    passive_bg = tok.qcolor_from_token(tok.AMBER_SOFT)
+    active_bg = tok.qcolor_from_token(tok.ACCENT_SOFT)
+    text_fg = tok.qcolor_from_token(tok.TEXT)
     for i, (m_start, m_end) in enumerate(matches):
         sel = QTextEdit.ExtraSelection()
         c = QTextCursor(doc)

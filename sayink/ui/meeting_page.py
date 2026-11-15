@@ -32,7 +32,6 @@ import weakref
 
 from PyQt6.QtCore import QEvent, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
-    QColor,
     QDesktopServices,
     QKeySequence,
     QPainter,
@@ -234,15 +233,16 @@ class _LevelMeterBar(QFrame):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = self.rect()
-        track_color = QColor(tok.HAIRLINE)
-        if not self._active:
-            track_color.setAlpha(90)
+        track_color = tok.qcolor_from_token(tok.HAIRLINE)
+        if not self._active and track_color.isValid():
+            base_alpha = track_color.alpha()
+            track_color.setAlpha(90 if base_alpha > 150 else max(8, int(round(base_alpha * 0.6))))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(track_color)
         painter.drawRoundedRect(rect, 4.0, 4.0)
         if self._active and self._level > 0.005:
             fill_w = max(4, int(round(rect.width() * self._level)))
-            bar_color = QColor(tok.STATE_WARN if self._level > 0.85 else tok.ACCENT)
+            bar_color = tok.qcolor_from_token(tok.STATE_WARN if self._level > 0.85 else tok.ACCENT)
             painter.setBrush(bar_color)
             painter.drawRoundedRect(0, 0, min(rect.width(), fill_w), rect.height(), 4.0, 4.0)
         painter.end()
@@ -275,19 +275,38 @@ def _probe_wav_duration_ms(path: Path) -> int:
 
 
 _STALE_PLAYBACK_WAV_PRUNED = False
+_PRUNED_PLAYBACK_DIRS: set[str] = set()
 
 
-def _prune_stale_playback_wavs(out_dir: Path, *, max_age_s: float = 48 * 3600) -> None:
+def _prune_stale_playback_wavs(
+    out_dir: Path,
+    *,
+    max_age_s: float = 48 * 3600,
+    exclude: set[Path] | None = None,
+    force: bool = False,
+) -> None:
     global _STALE_PLAYBACK_WAV_PRUNED
-    if _STALE_PLAYBACK_WAV_PRUNED:
+    if not _STALE_PLAYBACK_WAV_PRUNED:
+        _PRUNED_PLAYBACK_DIRS.clear()
+    dir_key = str(out_dir).casefold()
+    if not force and dir_key in _PRUNED_PLAYBACK_DIRS:
         return
     _STALE_PLAYBACK_WAV_PRUNED = True
+    _PRUNED_PLAYBACK_DIRS.add(dir_key)
+    excluded: set[str] = set()
+    for item in exclude or ():
+        try:
+            excluded.add(str(Path(item).resolve()).casefold())
+        except OSError:
+            excluded.add(str(item).casefold())
     try:
         if not out_dir.is_dir():
             return
         cutoff = time.time() - max_age_s
         for wav_file in out_dir.glob("*.wav"):
             try:
+                if excluded and str(wav_file.resolve()).casefold() in excluded:
+                    continue
                 if wav_file.stat().st_mtime < cutoff:
                     wav_file.unlink(missing_ok=True)
             except OSError:
@@ -299,6 +318,8 @@ def _prune_stale_playback_wavs(out_dir: Path, *, max_age_s: float = 48 * 3600) -
 class _AudioPlayerBar(QFrame):
     """Lightweight embedded audio playback bar for local meeting / imported / recovery audio."""
 
+    playback_error = pyqtSignal(str)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("meetingAudioPlayer")
@@ -309,10 +330,17 @@ class _AudioPlayerBar(QFrame):
         self._playing = False
         self._rate = 1.0
         self._dragging_slider = False
+        self._allow_headless_fallback: bool = False
+        self._pending_seek_ms: int | None = None
+        self._backend_error_seen: bool = False
         self._player = None
         self._audio_out = None
         self._session_temp_wavs: set[Path] = set()
         self._temp_wavs_by_source: dict[str, set[Path]] = {}
+        _prune_stale_playback_wavs(
+            Path(tempfile.gettempdir()) / "sayink-playback",
+            exclude=self._session_temp_wavs,
+        )
         session_temp_wavs = self._session_temp_wavs
 
         def _cleanup_on_destroy(*_args, _paths=session_temp_wavs) -> None:
@@ -351,15 +379,15 @@ class _AudioPlayerBar(QFrame):
         self._slider.valueChanged.connect(self._on_slider_changed)
         lay.addWidget(self._slider, 1)
 
-        self._speed_combo = QComboBox()
+        self._speed_combo = _CleanComboBox()
         self._speed_combo.setAccessibleName("倍速播放")
         self._speed_combo.setToolTip("调整音频回放倍速")
         for rate in (0.75, 1.0, 1.25, 1.5, 2.0):
-            label = f"{rate:g}x" if rate != 1.0 else "1.0x"
+            label = f"{rate:.1f}x" if rate in (1.0, 2.0) else f"{rate:g}x"
             self._speed_combo.addItem(label, rate)
         self._speed_combo.setCurrentIndex(1)
         self._speed_combo.currentIndexChanged.connect(self._on_speed_changed)
-        self._speed_combo.setFixedWidth(96)
+        self._speed_combo.setFixedWidth(114)
         lay.addWidget(self._speed_combo, 0)
 
     @property
@@ -382,7 +410,12 @@ class _AudioPlayerBar(QFrame):
         self._time_label.setStyleSheet(
             f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_CAPTION}px; background: transparent;"
         )
-        self._speed_combo.setStyleSheet(ss.build_toolbar_combo_css())
+        self._speed_combo.setStyleSheet(
+            ss.build_toolbar_combo_css()
+            + "QComboBox { padding: 0px 4px 0px 8px; }"
+            + "QComboBox:focus, QComboBox:on { padding: 0px 3px 0px 7px; }"
+            + "QComboBox::drop-down { width: 22px; }"
+        )
         self._slider.setStyleSheet(
             f"QSlider::groove:horizontal {{ height: 4px; background: {tok.HAIRLINE}; border-radius: 2px; }}"
             f"QSlider::sub-page:horizontal {{ background: {tok.ACCENT}; border-radius: 2px; }}"
@@ -404,12 +437,43 @@ class _AudioPlayerBar(QFrame):
             self._player.positionChanged.connect(self._on_backend_position)
             self._player.durationChanged.connect(self._on_backend_duration)
             self._player.playbackStateChanged.connect(self._on_backend_state)
+            self._player.mediaStatusChanged.connect(self._on_media_status_changed)
+            self._player.errorOccurred.connect(self._on_backend_error)
             self._player.setPlaybackRate(self._rate)
             return True
         except Exception:
             self._player = None
             self._audio_out = None
             return False
+
+    def _is_media_seekable(self) -> bool:
+        if self._player is None:
+            return False
+        try:
+            from PyQt6.QtMultimedia import QMediaPlayer
+
+            return self._player.mediaStatus() in (
+                QMediaPlayer.MediaStatus.LoadedMedia,
+                QMediaPlayer.MediaStatus.BufferedMedia,
+                QMediaPlayer.MediaStatus.BufferingMedia,
+                QMediaPlayer.MediaStatus.EndOfMedia,
+            )
+        except Exception:
+            return False
+
+    def _fail_playback(self, message: str) -> None:
+        self._playing = False
+        self._fallback_timer.stop()
+        self._pending_seek_ms = None
+        self._sync_ui()
+        if message:
+            self.playback_error.emit(message)
+
+    def _start_headless_fallback(self) -> None:
+        self._playing = True
+        self._fallback_last_ts = time.monotonic()
+        self._fallback_timer.start()
+        self._sync_ui()
 
     @staticmethod
     def _norm_audio_key(path: str | Path | None) -> str:
@@ -437,6 +501,7 @@ class _AudioPlayerBar(QFrame):
                 self._temp_wavs_by_source.setdefault(key, set()).add(wav_path)
 
     def unload_source(self) -> None:
+        self._pending_seek_ms = None
         self.stop()
         if self._player is not None:
             try:
@@ -505,6 +570,10 @@ class _AudioPlayerBar(QFrame):
                 pass
         self._session_temp_wavs.clear()
         self._temp_wavs_by_source.clear()
+        _prune_stale_playback_wavs(
+            Path(tempfile.gettempdir()) / "sayink-playback",
+            force=True,
+        )
 
     def _materialize_playable_path(self) -> str:
         if self._playable_path and Path(self._playable_path).is_file():
@@ -553,22 +622,12 @@ class _AudioPlayerBar(QFrame):
     def load_audio(self, path: str | Path | None, *, fallback_duration_ms: int = 0) -> bool:
         resolved = str(path or "").strip()
         if not resolved:
-            self.stop()
-            self._source_path = ""
-            self._playable_path = ""
-            self._duration_ms = 0
-            self._position_ms = 0
-            self._sync_ui()
+            self.unload_source()
             return False
         p = Path(resolved)
         valid = p.is_file() or (p.is_dir() and (p / "audio.f32").is_file())
         if not valid:
-            self.stop()
-            self._source_path = ""
-            self._playable_path = ""
-            self._duration_ms = 0
-            self._position_ms = 0
-            self._sync_ui()
+            self.unload_source()
             return False
         if resolved == self._source_path:
             if self._duration_ms <= 0 and fallback_duration_ms > 0:
@@ -576,14 +635,17 @@ class _AudioPlayerBar(QFrame):
                 self._sync_ui()
             return True
         self.stop()
+        self._pending_seek_ms = None
         self._source_path = resolved
         self._playable_path = str(p) if p.is_file() and p.suffix.lower() != ".f32" else ""
         probed = _probe_wav_duration_ms(p)
         self._duration_ms = max(probed, max(0, int(fallback_duration_ms)))
         self._position_ms = 0
-        if self._player is not None and self._playable_path:
+        if self._player is not None:
             try:
-                self._player.setSource(QUrl.fromLocalFile(self._playable_path))
+                self._player.setSource(
+                    QUrl.fromLocalFile(self._playable_path) if self._playable_path else QUrl()
+                )
             except Exception:
                 pass
         self._sync_ui()
@@ -600,27 +662,47 @@ class _AudioPlayerBar(QFrame):
             return
         if self._duration_ms > 0 and self._position_ms >= self._duration_ms:
             self._position_ms = 0
+            if self._pending_seek_ms is not None and self._pending_seek_ms >= self._duration_ms:
+                self._pending_seek_ms = 0
         playable = self._materialize_playable_path()
-        used_backend = False
-        if playable and self._ensure_backend() and self._player is not None:
-            try:
-                target_url = QUrl.fromLocalFile(playable)
-                if self._player.source() != target_url:
-                    self._player.setSource(target_url)
-                self._player.setPlaybackRate(self._rate)
-                self._player.setPosition(self._position_ms)
-                self._player.play()
-                from PyQt6.QtMultimedia import QMediaPlayer
-
-                used_backend = self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-            except Exception:
-                used_backend = False
+        if not playable:
+            if self._allow_headless_fallback:
+                self._start_headless_fallback()
+            else:
+                self._fail_playback("无法播放该音频文件：未找到可回放的本地音频。")
+            return
+        if not self._ensure_backend() or self._player is None:
+            if self._allow_headless_fallback:
+                self._start_headless_fallback()
+            else:
+                self._fail_playback("未检测到可用的音频输出设备，无法回放录音。")
+            return
+        self._backend_error_seen = False
+        desired_pos = self._pending_seek_ms if self._pending_seek_ms is not None else self._position_ms
+        try:
+            target_url = QUrl.fromLocalFile(playable)
+            if self._player.source() != target_url:
+                self._pending_seek_ms = desired_pos
+                self._player.setSource(target_url)
+            self._player.setPlaybackRate(self._rate)
+            if self._is_media_seekable():
+                self._player.setPosition(desired_pos)
+                self._pending_seek_ms = None
+            else:
+                self._pending_seek_ms = desired_pos
+            self._player.play()
+        except Exception as exc:
+            if self._allow_headless_fallback:
+                self._start_headless_fallback()
+            else:
+                self._fail_playback(f"无法播放该音频文件：{exc}")
+            return
+        if self._backend_error_seen:
+            if self._allow_headless_fallback:
+                self._start_headless_fallback()
+            return
+        self._fallback_timer.stop()
         self._playing = True
-        if not used_backend:
-            self._fallback_last_ts = time.monotonic()
-            self._fallback_timer.start()
-        else:
-            self._fallback_timer.stop()
         self._sync_ui()
 
     def pause(self) -> None:
@@ -636,6 +718,7 @@ class _AudioPlayerBar(QFrame):
     def stop(self) -> None:
         self._playing = False
         self._fallback_timer.stop()
+        self._pending_seek_ms = None
         if self._player is not None:
             try:
                 self._player.stop()
@@ -649,9 +732,12 @@ class _AudioPlayerBar(QFrame):
         if self._duration_ms > 0:
             target = min(target, self._duration_ms)
         self._position_ms = target
-        if self._player is not None:
+        self._pending_seek_ms = target
+        if self._player is not None and self._playable_path:
             try:
-                self._player.setPosition(target)
+                if self._player.source() == QUrl.fromLocalFile(self._playable_path) and self._is_media_seekable():
+                    self._player.setPosition(target)
+                    self._pending_seek_ms = None
             except Exception:
                 pass
         if autoplay:
@@ -674,22 +760,94 @@ class _AudioPlayerBar(QFrame):
         self._sync_ui()
 
     def _on_backend_position(self, pos: int) -> None:
-        if not self._dragging_slider:
+        if not self._dragging_slider and self._pending_seek_ms is None:
             self._position_ms = max(0, int(pos))
             self._sync_ui()
 
     def _on_backend_duration(self, dur: int) -> None:
         if dur > 0:
             self._duration_ms = int(dur)
+            if self._pending_seek_ms is not None and self._pending_seek_ms > self._duration_ms:
+                self._pending_seek_ms = self._duration_ms
+                self._position_ms = self._duration_ms
             self._sync_ui()
+
+    def _on_media_status_changed(self, status) -> None:
+        try:
+            from PyQt6.QtMultimedia import QMediaPlayer
+
+            if status in (
+                QMediaPlayer.MediaStatus.LoadedMedia,
+                QMediaPlayer.MediaStatus.BufferedMedia,
+            ) and self._pending_seek_ms is not None:
+                target = max(0, int(self._pending_seek_ms))
+                if self._duration_ms > 0:
+                    target = min(target, self._duration_ms)
+                self._position_ms = target
+                if self._player is not None:
+                    self._player.setPosition(target)
+                self._pending_seek_ms = None
+                self._sync_ui()
+            elif status == QMediaPlayer.MediaStatus.EndOfMedia:
+                self._pending_seek_ms = None
+                self._playing = False
+                self._fallback_timer.stop()
+                self._sync_ui()
+            elif (
+                status == QMediaPlayer.MediaStatus.InvalidMedia
+                and not self._backend_error_seen
+                and not self._allow_headless_fallback
+            ):
+                self._backend_error_seen = True
+                self._fail_playback("无法播放该音频文件：音频格式不受支持或文件已损坏。")
+        except Exception:
+            pass
+
+    def _on_backend_error(self, error, error_string: str = "") -> None:
+        try:
+            from PyQt6.QtMultimedia import QMediaPlayer
+
+            if error == QMediaPlayer.Error.NoError:
+                return
+        except Exception:
+            pass
+        self._backend_error_seen = True
+        self._pending_seek_ms = None
+        if self._allow_headless_fallback:
+            return
+        detail = str(error_string or "").strip()
+        if not detail and self._player is not None:
+            try:
+                detail = str(self._player.errorString() or "").strip()
+            except Exception:
+                detail = ""
+        msg = (
+            f"无法播放该音频文件：{detail}"
+            if detail
+            else "无法播放该音频文件：音频格式不受支持或文件已损坏。"
+        )
+        self._fail_playback(msg)
 
     def _on_backend_state(self, state) -> None:
         try:
             from PyQt6.QtMultimedia import QMediaPlayer
 
-            if state == QMediaPlayer.PlaybackState.StoppedState and not self._fallback_timer.isActive():
-                self._playing = False
+            if state == QMediaPlayer.PlaybackState.PlayingState:
+                self._fallback_timer.stop()
+                self._playing = True
                 self._sync_ui()
+            elif state == QMediaPlayer.PlaybackState.PausedState:
+                if not self._fallback_timer.isActive():
+                    self._playing = False
+                    self._sync_ui()
+            elif state == QMediaPlayer.PlaybackState.StoppedState and not self._fallback_timer.isActive():
+                loading = (
+                    self._player is not None
+                    and self._player.mediaStatus() == QMediaPlayer.MediaStatus.LoadingMedia
+                )
+                if not loading:
+                    self._playing = False
+                    self._sync_ui()
         except Exception:
             pass
 
@@ -868,6 +1026,7 @@ class MeetingPage(QWidget):
 
     def _setup_ui(self) -> None:
         outer = QVBoxLayout(self)
+        self._outer_layout = outer
         outer.setContentsMargins(*tok.WORKSPACE_MARGINS)
         outer.setSpacing(14)
 
@@ -919,13 +1078,25 @@ class MeetingPage(QWidget):
         for button in self.findChildren(QPushButton):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._sync_media_buttons()
+        self._sync_responsive_layout()
 
     def _build_browse(self) -> QWidget:
+        browse_page = QWidget()
+        browse_lay = QVBoxLayout(browse_page)
+        browse_lay.setContentsMargins(0, 0, 0, 0)
+        browse_lay.setSpacing(8)
+        self._status_label = QLabel("")
+        self._status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._status_label.setWordWrap(True)
+        self._status_label.hide()
+        browse_lay.addWidget(self._status_label, 0)
+
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.setChildrenCollapsible(False)
         self._splitter.setHandleWidth(5)
 
         left = QWidget()
+        self._browse_left = left
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
         left_lay.setSpacing(6)
@@ -984,6 +1155,7 @@ class MeetingPage(QWidget):
 
         right = QWidget()
         right_lay = QVBoxLayout(right)
+        self._detail_layout = right_lay
         right_lay.setContentsMargins(20, 0, 0, 0)
         right_lay.setSpacing(8)
 
@@ -1054,11 +1226,11 @@ class MeetingPage(QWidget):
         self._batch_notice_scroll.setWidgetResizable(True)
         self._batch_notice_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._batch_notice_scroll.setWidget(self._batch_notice)
-        # Grow only to the notice's own height; the trailing stretch keeps the
-        # notice and any status line directly under the batch tools.
-        self._batch_notice_scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self._batch_notice_scroll.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
+        )
         self._batch_notice_scroll.hide()
-        right_lay.addWidget(self._batch_notice_scroll)
+        right_lay.addWidget(self._batch_notice_scroll, 1)
         self._import_progress = QLabel("")
         self._import_progress.setTextFormat(Qt.TextFormat.PlainText)
         self._import_progress.setWordWrap(True)
@@ -1149,13 +1321,8 @@ class MeetingPage(QWidget):
         self._materials.hide()
         right_lay.addWidget(self._materials)
 
-        self._status_label = QLabel("")
-        self._status_label.setTextFormat(Qt.TextFormat.PlainText)
-        self._status_label.setWordWrap(True)
-        self._status_label.hide()
-        right_lay.addWidget(self._status_label)
-
         self._audio_player = _AudioPlayerBar()
+        self._audio_player.playback_error.connect(self._set_status)
         self._audio_player.hide()
         right_lay.addWidget(self._audio_player)
 
@@ -1346,7 +1513,8 @@ class MeetingPage(QWidget):
         self._splitter.setStretchFactor(0, 1)
         self._splitter.setStretchFactor(1, 2)
         self._splitter.setSizes(list(tok.WORKSPACE_SPLIT_SIZES))
-        return self._splitter
+        browse_lay.addWidget(self._splitter, 1)
+        return browse_page
 
     def _build_start_card(self) -> QWidget:
         page = QWidget()
@@ -1466,6 +1634,7 @@ class MeetingPage(QWidget):
     def _build_live(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
+        self._live_layout = lay
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(10)
         head = QHBoxLayout()
@@ -1603,6 +1772,7 @@ class MeetingPage(QWidget):
         self._live_split.addWidget(self._live_transcript)
         side = QWidget()
         side_lay = QVBoxLayout(side)
+        self._live_side_layout = side_lay
         side_lay.setContentsMargins(12, 0, 0, 0)
         side_lay.setSpacing(8)
         self._marks_title = QLabel("标记")
@@ -1622,13 +1792,15 @@ class MeetingPage(QWidget):
         self._marks_view = QTextBrowser()
         self._marks_view.setAccessibleName("标记列表")
         self._marks_view.setPlaceholderText("")
-        self._marks_view.setMaximumHeight(160)
+        self._marks_view.setMinimumHeight(36)
+        self._marks_view.setMaximumHeight(88)
         side_lay.addWidget(self._marks_view)
         self._notes_title = QLabel("我的笔记")
         side_lay.addWidget(self._notes_title)
         self._user_notes = QPlainTextEdit()
         self._user_notes.setAccessibleName("我的笔记")
         self._user_notes.setPlaceholderText("随手记；生成纪要时会一并参考。")
+        self._user_notes.setMinimumHeight(64)
         self._user_notes_timer = QTimer(self)
         self._user_notes_timer.setSingleShot(True)
         self._user_notes_timer.setInterval(800)
@@ -1991,6 +2163,7 @@ class MeetingPage(QWidget):
                     item = self._list.item(index)
                     item.setSelected(str(item.data(Qt.ItemDataRole.UserRole) or "") in batch_selected)
             elif keep in self._records:
+                self._list.clearSelection()
                 for index in range(self._list.count()):
                     item = self._list.item(index)
                     if item.data(Qt.ItemDataRole.UserRole) == keep:
@@ -1998,6 +2171,7 @@ class MeetingPage(QWidget):
                         self._list.setCurrentItem(item)
                         break
             else:
+                self._list.clearSelection()
                 self._list.setCurrentItem(None)
         finally:
             self._list.blockSignals(False)
@@ -2023,12 +2197,13 @@ class MeetingPage(QWidget):
         self._selection_mode_btn.setEnabled(count > 0 or self._batch_mode)
         self._clear_search_btn.setVisible(count == 0 and bool(self._search_query))
         self._sync_batch_checks()
+        had_detail = bool(keep)
         if self._batch_mode:
             if not records:
                 if not self._flush_bound_title(sync=True) or not self._save_notes_draft() or not self._save_record_notes():
                     return
                 self._detail_id = ""
-                self._clear_detail()
+                self._clear_detail(clear_status=had_detail)
             elif keep and keep in self._records:
                 self._render_detail()
             elif records:
@@ -2042,13 +2217,11 @@ class MeetingPage(QWidget):
             if not self._flush_bound_title(sync=True) or not self._save_notes_draft() or not self._save_record_notes():
                 return
             self._detail_id = ""
-            self._clear_detail()
+            self._clear_detail(clear_status=had_detail)
         importing = bool(getattr(self._ctrl, "importing_media", False))
         if importing:
             self._show_import_detail()
-        self._detail_pane.setVisible(
-            bool(records) or self._editing_notes or importing or self._status_label.isVisible()
-        )
+        self._detail_pane.setVisible(bool(records) or self._editing_notes or importing)
 
     def _release_row_widgets(self) -> None:
         """Drop row widgets before ``clear()``.
@@ -2559,7 +2732,6 @@ class MeetingPage(QWidget):
         record = self._ctrl.import_transcript(text, title=title, detect_structure=detect)
         if record is None:
             self._set_status(getattr(self._ctrl, "transcript_import_notice", "") or "没有可导入的文字")
-            self._detail_pane.setVisible(True)
             return
         self.show_meeting(record.id)
         self._set_status("已导入文字稿。确认内容后，再点击「生成纪要」。")
@@ -2650,8 +2822,8 @@ class MeetingPage(QWidget):
             # Leave the import placeholder: show the open meeting or the batch
             # tools again before the notice explains what happened.
             self._render_detail()
+            self._detail_pane.setVisible(bool(self._records) or self._editing_notes)
             self._set_status(getattr(self._ctrl, "media_import_notice", "") or "没有识别到文字")
-            self._detail_pane.setVisible(True)
             self._import_progress.hide()
             self._import_progress_bar.hide()
             return
@@ -2673,7 +2845,6 @@ class MeetingPage(QWidget):
         self._sync_media_buttons()
         if message:
             self._set_status(message)
-            self._detail_pane.setVisible(True)
 
     def _on_media_failed(self, message: str) -> None:
         self._pending_media_import_path = ""
@@ -2681,6 +2852,7 @@ class MeetingPage(QWidget):
         self._import_progress.hide()
         self._import_progress_bar.hide()
         self._render_detail()
+        self._detail_pane.setVisible(bool(self._records) or self._editing_notes)
         self._set_status(message or "导入音视频失败")
 
     def _show_ended_meeting(self, meeting_id: str, *, unsaved_live: bool = False) -> None:
@@ -2821,10 +2993,10 @@ class MeetingPage(QWidget):
             no_audio.add(record.id)
         return ""
 
-    def _clear_detail(self) -> None:
+    def _clear_detail(self, *, clear_status: bool = True) -> None:
         if not self._flush_bound_title(sync=True) or not self._save_notes_draft() or not self._save_record_notes():
             return
-        self._audio_player.stop()
+        self._audio_player.unload_source()
         self._audio_player.hide()
         self._detail_find_bar.hide()
         self._materials.hide()
@@ -2847,7 +3019,8 @@ class MeetingPage(QWidget):
         self._notes_edit.clear()
         self._transcript_view.clear()
         self._speaker_menu.clear()
-        self._status_label.hide()
+        if clear_status:
+            self._status_label.hide()
         for widget in (self._generate_btn, self._edit_btn, self._copy_btn, self._transcript_copy_btn, self._export_btn,
                        self._more_btn, self._speaker_btn, self._correct_speaker_btn, self._template_combo, self._detail_title):
             widget.setEnabled(False)
@@ -3678,10 +3851,96 @@ class MeetingPage(QWidget):
                 self._render_detail()
         super().hideEvent(event)
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._sync_responsive_layout()
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._sync_responsive_layout()
         if not defer_while_live_resize(self, self._follow_live_resize):
             self._follow_live_resize()
+
+    def _sync_live_marks_height(self, has_marks: bool | None = None) -> None:
+        if not hasattr(self, "_marks_view"):
+            return
+        compact_h = 0 < self.height() < 540
+        if has_marks is None:
+            try:
+                current_id = self._ctrl.current_id
+                has_marks = bool(current_id and self._store.get_marks(current_id))
+            except Exception:
+                has_marks = False
+        if compact_h:
+            max_h = 68 if has_marks else 46
+        else:
+            max_h = 160 if has_marks else 88
+        self._marks_view.setMinimumHeight(34 if compact_h else 36)
+        self._marks_view.setMaximumHeight(max_h)
+
+    def _sync_responsive_layout(self) -> None:
+        if not hasattr(self, "_outer_layout"):
+            return
+        w = self.width()
+        h = self.height()
+        compact_h = 0 < h < 540
+        narrow_w = 0 < w < 880
+
+        base_left, base_top, base_right, base_bottom = tok.WORKSPACE_MARGINS
+        if narrow_w and w < 720:
+            h_margin = 16
+        elif compact_h or narrow_w:
+            h_margin = 20
+        else:
+            h_margin = base_left
+        v_top = 8 if compact_h else base_top
+        v_bottom = 8 if compact_h else base_bottom
+        self._outer_layout.setContentsMargins(h_margin, v_top, h_margin, v_bottom)
+        self._outer_layout.setSpacing(6 if compact_h else 14)
+
+        if hasattr(self, "_live_layout"):
+            self._live_layout.setSpacing(4 if compact_h else 10)
+        if hasattr(self, "_live_side_layout"):
+            self._live_side_layout.setSpacing(4 if compact_h else 8)
+            self._live_side_layout.setContentsMargins(8 if narrow_w else 12, 0, 0, 0)
+        if hasattr(self, "_user_notes"):
+            self._user_notes.setMinimumHeight(46 if compact_h else 64)
+        self._sync_live_marks_height()
+
+        if hasattr(self, "_browse_left") and hasattr(self, "_detail_pane"):
+            if narrow_w:
+                avail = max(300, w - 2 * h_margin - self._splitter.handleWidth())
+                ratio = w / 880.0
+                list_min = max(
+                    140,
+                    min(
+                        tok.WORKSPACE_LIST_MIN_WIDTH - 16,
+                        int(tok.WORKSPACE_LIST_MIN_WIDTH * ratio),
+                        int(avail * 0.34),
+                    ),
+                )
+                detail_min = max(
+                    200,
+                    min(
+                        tok.WORKSPACE_DETAIL_MIN_WIDTH - 20,
+                        int(tok.WORKSPACE_DETAIL_MIN_WIDTH * ratio),
+                        avail - list_min - 4,
+                    ),
+                )
+                self._browse_left.setMinimumWidth(list_min)
+                self._detail_pane.setMinimumWidth(detail_min)
+                if hasattr(self, "_detail_layout"):
+                    self._detail_layout.setContentsMargins(12 if w < 720 else 16, 0, 0, 0)
+                if hasattr(self, "_live_side_scroll"):
+                    self._live_side_scroll.setMinimumWidth(180)
+            else:
+                self._browse_left.setMinimumWidth(tok.WORKSPACE_LIST_MIN_WIDTH)
+                self._detail_pane.setMinimumWidth(tok.WORKSPACE_DETAIL_MIN_WIDTH)
+                if hasattr(self, "_detail_layout"):
+                    self._detail_layout.setContentsMargins(20, 0, 0, 0)
+                if hasattr(self, "_live_side_scroll"):
+                    self._live_side_scroll.setMinimumWidth(240)
+            self._fit_template_cluster()
 
     def _follow_live_resize(self) -> None:
         if hasattr(self, "_materials_scroll"):
@@ -4610,6 +4869,7 @@ class MeetingPage(QWidget):
         self._stack.setCurrentIndex(PAGE_LIVE)
         self._sync_media_buttons()
         self._sync_live_state()
+        self._sync_responsive_layout()
         self._render_live()
 
     def _sync_live_state(self) -> None:
@@ -4768,6 +5028,7 @@ class MeetingPage(QWidget):
             self._live_new_msg_btn.show()
             self._live_new_msg_btn.raise_()
         marks = self._store.get_marks(meeting_id)
+        self._sync_live_marks_height(has_marks=bool(marks))
         if marks:
             marks_html = "".join(
                 f"<p style='margin:0 0 4px 0'>[{format_timestamp(m.offset_ms)}] {html.escape(m.note) or '标记'}</p>"

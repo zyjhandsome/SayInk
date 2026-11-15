@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import QApplication
 
 from sayink.ui import design_tokens as dt
 from sayink.ui.app_styles import build_global_stylesheet
+from sayink.ui.design_tokens import qcolor_from_token
 
 log = logging.getLogger("SayInk")
 
@@ -167,7 +168,7 @@ def _application_palette(effective: EffectiveTheme) -> QPalette:
     palette = QPalette()
 
     def set_color(role: QPalette.ColorRole, token: str) -> None:
-        palette.setColor(role, QColor(t[token]))
+        palette.setColor(role, qcolor_from_token(t[token]))
 
     set_color(QPalette.ColorRole.Window, "BG")
     set_color(QPalette.ColorRole.WindowText, "TEXT")
@@ -183,12 +184,12 @@ def _application_palette(effective: EffectiveTheme) -> QPalette:
     palette.setColor(
         QPalette.ColorGroup.Disabled,
         QPalette.ColorRole.Text,
-        QColor(t["TEXT_DIM"]),
+        qcolor_from_token(t["TEXT_DIM"]),
     )
     palette.setColor(
         QPalette.ColorGroup.Disabled,
         QPalette.ColorRole.ButtonText,
-        QColor(t["TEXT_DIM"]),
+        qcolor_from_token(t["TEXT_DIM"]),
     )
     return palette
 
