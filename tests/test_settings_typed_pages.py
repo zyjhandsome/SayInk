@@ -140,7 +140,7 @@ def test_builders_accept_readonly_sentinel_without_mutating_it(qapp, tmp_path):
         assert [b.text() for b in general.section_jump_bar.jump_buttons] == [
             "录音与输入",
             "识别",
-            "会议默认",
+            "会议默认设置",
             "应用与历史",
         ]
     finally:

@@ -347,7 +347,7 @@ class TestGeneralPageLayout:
         names = {
             "录音与输入": "录音与输入",
             "识别": "识别",
-            "会议默认": "会议默认设置",
+            "会议默认设置": "会议默认设置",
             "应用与历史": "应用与历史",
         }
         assert [button.text() for button in settings_window._general_section_jumps] == list(names)

@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFontMetrics, QKeySequence, QPainter, QPen, QPolygonF, QShortcut, QTextLayout, QTextOption
+from PyQt6.QtGui import QFontMetrics, QKeySequence, QPainter, QPen, QPolygonF, QShortcut, QTextLayout, QTextOption
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from sayink.history_store import SegmentRecord, SessionSummary
+from sayink.ui.settings_components import _qcolor
 from sayink.ui.history_export import (
     _SUPPRESSED_POLISHED_MARKER,
     _day_label,
@@ -190,7 +191,7 @@ class _RowFocusRing(QWidget):
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor(tok.ACCENT_FOCUS), 2))
+        painter.setPen(QPen(_qcolor(tok.ACCENT_FOCUS), 2))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), tok.RADIUS_SM, tok.RADIUS_SM)
 
@@ -303,11 +304,11 @@ class _SessionCheckBox(QCheckBox):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         box = QRectF((self.width() - 16) / 2, (self.height() - 16) / 2, 16, 16)
-        painter.setPen(QPen(QColor(tok.ACCENT if self.isChecked() else tok.TEXT_DIM), 1))
-        painter.setBrush(QColor(tok.ACCENT if self.isChecked() else tok.SURFACE_PEARL))
+        painter.setPen(QPen(_qcolor(tok.ACCENT if self.isChecked() else tok.TEXT_DIM), 1))
+        painter.setBrush(_qcolor(tok.ACCENT if self.isChecked() else tok.SURFACE_PEARL))
         painter.drawRoundedRect(box, 3, 3)
         if self.isChecked():
-            painter.setPen(QPen(QColor("#FFFFFF"), 2, Qt.PenStyle.SolidLine,
+            painter.setPen(QPen(_qcolor("#FFFFFF"), 2, Qt.PenStyle.SolidLine,
                                 Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
             painter.drawPolyline(QPolygonF([
                 QPointF(box.left() + 4, box.top() + 8),
@@ -316,7 +317,7 @@ class _SessionCheckBox(QCheckBox):
             ]))
         if self.hasFocus():
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QColor(tok.ACCENT_FOCUS), 2))
+            painter.setPen(QPen(_qcolor(tok.ACCENT_FOCUS), 2))
             painter.drawRoundedRect(box.adjusted(-3, -3, 3, 3), 5, 5)
 
 
@@ -1113,6 +1114,7 @@ class HistoryWindow(QWidget):
         # ── right: detail ──
         self._right_pane = QWidget()
         right_lay = QVBoxLayout(self._right_pane)
+        self._right_pane_layout = right_lay
         right_lay.setContentsMargins(20, 0, 0, 0)
         right_lay.setSpacing(10)
 
@@ -1296,8 +1298,65 @@ class HistoryWindow(QWidget):
             button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self._paint_history_styles()
 
+    def sync_viewport_width(self, host_width: int | None = None) -> None:
+        if not hasattr(self, "_left_pane") or not hasattr(self, "_right_pane"):
+            return
+        top_win = self.window()
+        in_host_shell = top_win is not self
+        if host_width is not None and host_width > 0:
+            win_w = int(host_width)
+        elif in_host_shell and top_win.width() > 0:
+            win_w = top_win.width()
+        else:
+            win_w = self.width()
+        if win_w <= 0:
+            return
+        if host_width is not None and in_host_shell:
+            hist_w = max(240, win_w - tok.SIDEBAR_WIDTH - 2)
+        else:
+            hist_w = self.width() if self.width() > 0 else win_w
+
+        base_left = tok.WORKSPACE_LIST_MIN_WIDTH
+        base_right = tok.WORKSPACE_DETAIL_MIN_WIDTH
+        base_sum = base_left + base_right
+        outer = self.layout()
+        full_margins = tok.WORKSPACE_MARGINS
+        full_chrome_w = full_margins[0] + full_margins[2] + self._splitter.handleWidth()
+
+        if win_w >= 880 and hist_w >= base_sum + full_chrome_w:
+            if outer is not None and outer.contentsMargins().left() != full_margins[0]:
+                outer.setContentsMargins(*full_margins)
+            if hasattr(self, "_right_pane_layout") and self._right_pane_layout.contentsMargins().left() != 20:
+                self._right_pane_layout.setContentsMargins(20, 0, 0, 0)
+            if self._left_pane.minimumWidth() != base_left:
+                self._left_pane.setMinimumWidth(base_left)
+            if self._right_pane.minimumWidth() != base_right:
+                self._right_pane.setMinimumWidth(base_right)
+            return
+
+        compact_h = 16
+        if outer is not None and outer.contentsMargins().left() != compact_h:
+            outer.setContentsMargins(compact_h, full_margins[1], compact_h, full_margins[3])
+        if hasattr(self, "_right_pane_layout") and self._right_pane_layout.contentsMargins().left() != 12:
+            self._right_pane_layout.setContentsMargins(12, 0, 0, 0)
+
+        avail_split = max(280, hist_w - compact_h * 2 - self._splitter.handleWidth())
+        scale = min(win_w / 880.0, (avail_split - 12) / float(base_sum))
+        scale = max(0.45, min(0.96, scale))
+        left_min = max(120, int(base_left * scale))
+        right_min = max(180, int(base_right * scale))
+        if left_min + right_min > avail_split:
+            ratio = avail_split / float(left_min + right_min)
+            left_min = max(100, int(left_min * ratio))
+            right_min = max(150, avail_split - left_min)
+        if self._left_pane.minimumWidth() != left_min:
+            self._left_pane.setMinimumWidth(left_min)
+        if self._right_pane.minimumWidth() != right_min:
+            self._right_pane.setMinimumWidth(right_min)
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self.sync_viewport_width()
         if hasattr(self, "_toast") and self._toast.isVisible():
             self._toast.reposition()
 

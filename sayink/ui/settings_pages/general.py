@@ -48,6 +48,7 @@ from sayink.ui.dictation_hints import dictation_hints
 from sayink.ui.hotkey_edit import HotkeyEdit, hotkey_conflict_warning
 from sayink.ui.settings_components import (
     AudioSourcePicker,
+    ElidedComboBox,
     SettingsPage,
     ThemeModeSegment,
     ToggleOptionRow,
@@ -333,7 +334,7 @@ class GeneralSettingsPage(SettingsPage):
     mixed_audio_callout: QLabel
     mixed_audio_callout_wrap: QWidget
     output_mode_row_title: QLabel
-    output_mode_combo: QComboBox
+    output_mode_combo: ElidedComboBox
     output_mode_hint: QLabel
     enable_history_btn: QPushButton
     enable_history_wrap: QWidget
@@ -349,8 +350,8 @@ class GeneralSettingsPage(SettingsPage):
     mic_test_status: QLabel
     advanced_audio_btn: QPushButton
     advanced_audio_panel: QWidget
-    mic_device_combo: QComboBox
-    system_device_combo: QComboBox
+    mic_device_combo: ElidedComboBox
+    system_device_combo: ElidedComboBox
     theme_combo: ThemeModeSegment
     theme_title_label: QLabel
     theme_desc_label: QLabel
@@ -366,17 +367,17 @@ class GeneralSettingsPage(SettingsPage):
     history_max_entries_divider: QWidget
     history_cleanup_hint: QLabel
     history_cleanup_hint_wrap: QWidget
-    listen_bar_combo: QComboBox
+    listen_bar_combo: ElidedComboBox
     advanced_network_btn: QPushButton
     advanced_network_panel: QWidget
-    llm_proxy_combo: QComboBox
+    llm_proxy_combo: ElidedComboBox
     llm_proxy_suffix_edit: QLineEdit
     listen_bar_autohide_row: ToggleOptionRow
     advanced_recovery_btn: QPushButton
     advanced_recovery_panel: QWidget
     recovery_row: ToggleOptionRow
     recovery_btn: QPushButton
-    meeting_language_combo: QComboBox
+    meeting_language_combo: ElidedComboBox
     meeting_glossary_edit: GlossaryPlainTextEdit
     glossary_count_label: QLabel
     glossary_clear_btn: QPushButton
@@ -391,8 +392,8 @@ class GeneralSettingsPage(SettingsPage):
     vad_download_btn: QPushButton
     vad_download_row: QWidget
     speaker_runtime_label: QLabel
-    meeting_source_combo: QComboBox
-    meeting_model_combo: QComboBox
+    meeting_source_combo: ElidedComboBox
+    meeting_model_combo: ElidedComboBox
     meeting_defaults_hint: QLabel
     meeting_start_card_row: ToggleOptionRow
     meeting_start_card_reset_btn: QPushButton
@@ -414,7 +415,7 @@ class GeneralSettingsPage(SettingsPage):
         self.section_jump_bar = SectionJumpBar(self, [
             ("录音与输入", recording),
             ("识别", recognition),
-            ("会议默认", meeting),
+            ("会议默认设置", meeting),
             ("应用与历史", preferences),
         ])
         self.general_section_jumps = self.section_jump_bar.jump_buttons
@@ -535,7 +536,12 @@ class GeneralSettingsPage(SettingsPage):
             self.hotkey_reset_requested.emit,
             tooltip="仅将录音快捷键恢复为 Alt+X，不改变转写模式、Esc、音频来源和结果去向",
         )
-        lay.addWidget(inline_action_row(self.hotkey_reset_btn))
+        self.hotkey_reset_btn.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        hotkey_reset_wrap = inline_action_row(self.hotkey_reset_btn)
+        hotkey_reset_wrap.layout().setAlignment(self.hotkey_reset_btn, Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(hotkey_reset_wrap)
+        self.hotkey_edit.hotkey_changed.connect(self.sync_hotkey_reset_state)
+        self.sync_hotkey_reset_state(self.hotkey_edit.value)
         self.esc_stop_divider = group_divider()
         lay.addWidget(self.esc_stop_divider)
         self.esc_stop_row = ToggleOptionRow(
@@ -594,7 +600,7 @@ class GeneralSettingsPage(SettingsPage):
         lay.addWidget(self.mixed_audio_callout_wrap)
 
     def _build_output_controls(self, lay: QVBoxLayout) -> None:
-        self.output_mode_combo = QComboBox()
+        self.output_mode_combo = ElidedComboBox()
         self.output_mode_combo.setAccessibleName("识别结果去向")
         self.output_mode_combo.addItem("自动（随音源切换）", "auto")
         self.output_mode_combo.addItem("输入当前光标", OUTPUT_MODE_PASTE)
@@ -708,8 +714,8 @@ class GeneralSettingsPage(SettingsPage):
         adv_lay = QVBoxLayout(self.advanced_audio_panel)
         adv_lay.setContentsMargins(0, 0, 0, 0)
         adv_lay.setSpacing(0)
-        self.mic_device_combo = QComboBox()
-        self.system_device_combo = QComboBox()
+        self.mic_device_combo = ElidedComboBox()
+        self.system_device_combo = ElidedComboBox()
         self.mic_device_combo.setAccessibleName("麦克风设备")
         self.system_device_combo.setAccessibleName("电脑声音设备")
         for combo in (self.mic_device_combo, self.system_device_combo):
@@ -817,7 +823,7 @@ class GeneralSettingsPage(SettingsPage):
     def _build_listen_bar_row(self) -> QWidget:
         from sayink.ui.island_chrome import LISTEN_BAR_PLACEMENT_LABELS
 
-        self.listen_bar_combo = QComboBox()
+        self.listen_bar_combo = ElidedComboBox()
         self.listen_bar_combo.setAccessibleName("转写条位置")
         for key, label in LISTEN_BAR_PLACEMENT_LABELS:
             self.listen_bar_combo.addItem(label, key)
@@ -840,7 +846,7 @@ class GeneralSettingsPage(SettingsPage):
         net_lay = QVBoxLayout(self.advanced_network_panel)
         net_lay.setContentsMargins(0, 0, 0, 0)
         net_lay.setSpacing(0)
-        self.llm_proxy_combo = QComboBox()
+        self.llm_proxy_combo = ElidedComboBox()
         self.llm_proxy_combo.setAccessibleName("AI 服务代理模式")
         self.llm_proxy_combo.addItem("使用系统 / 环境代理", "system")
         self.llm_proxy_combo.addItem("直连（不使用代理）", "direct")
@@ -903,7 +909,7 @@ class GeneralSettingsPage(SettingsPage):
         """Common preferences, with actual runtime feedback supplied by App."""
         card, lay = _card()
 
-        self.meeting_language_combo = QComboBox()
+        self.meeting_language_combo = ElidedComboBox()
         self.meeting_language_combo.setAccessibleName("识别语言")
         for key, label in (("auto", "自动（中文优先）"), ("zh", "中文"), ("en", "English"), ("ja", "日本語")):
             self.meeting_language_combo.addItem(label, key)
@@ -989,9 +995,7 @@ class GeneralSettingsPage(SettingsPage):
         from sayink.speech_recognizer import MODEL_REGISTRY
 
         card, lay = _card()
-        self.meeting_source_combo = QComboBox()
-        self.meeting_source_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.meeting_source_combo.setMinimumContentsLength(16)
+        self.meeting_source_combo = ElidedComboBox()
         self.meeting_source_combo.setAccessibleName("会议音频来源")
         for key in ("mixed", "microphone", "system"):
             self.meeting_source_combo.addItem(input_source_label(key), key)
@@ -1002,9 +1006,7 @@ class GeneralSettingsPage(SettingsPage):
             "默认音频来源", self.meeting_source_combo, "线上会议需要包含电脑声音才能录到对方；不随转写音源变化",
         ))
         lay.addWidget(group_divider())
-        self.meeting_model_combo = QComboBox()
-        self.meeting_model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.meeting_model_combo.setMinimumContentsLength(16)
+        self.meeting_model_combo = ElidedComboBox()
         self.meeting_model_combo.setAccessibleName("会议识别模型")
         self.meeting_model_combo.addItem("与转写相同", "")
         for model in MODEL_REGISTRY:
@@ -1334,6 +1336,25 @@ class GeneralSettingsPage(SettingsPage):
             prefix + "已有转写仍按以上规则保留，超限清理无法撤销。保存新转写及启动时执行；会议记录不受影响。"
         )
 
+    @staticmethod
+    def _is_default_hotkey(raw_hotkey: str | None) -> bool:
+        normalized = "+".join(
+            part.strip().lower()
+            for part in str(raw_hotkey or "").strip().split("+")
+            if part.strip()
+        )
+        return normalized == DEFAULT_HOTKEY.lower()
+
+    def sync_hotkey_reset_state(self, raw_hotkey: str | None = None) -> None:
+        value = self.hotkey_edit.value if raw_hotkey is None else raw_hotkey
+        is_default = self._is_default_hotkey(value)
+        self.hotkey_reset_btn.setEnabled(not is_default)
+        self.hotkey_reset_btn.setToolTip(
+            "当前已是默认快捷键 Alt+X。"
+            if is_default else
+            "恢复为 Alt+X，不改变转写模式、Esc、音频来源和结果去向。"
+        )
+
     def refresh_hotkey_hint(self, config: Config) -> None:
         raw_hotkey = str(config.get("hotkey", DEFAULT_HOTKEY) or "")
         if not raw_hotkey:
@@ -1345,13 +1366,7 @@ class GeneralSettingsPage(SettingsPage):
             self.hotkey_hint.setText(dictation_hints(config).detail)
             self.show_hotkey_feedback(hotkey_conflict_warning(raw_hotkey), error=False)
         self.hotkey_hint.setToolTip("启动阈值：单次转写按住约 0.18 秒；持续转写按住约 0.30 秒，避免误触。")
-        is_default = raw_hotkey == DEFAULT_HOTKEY
-        self.hotkey_reset_btn.setEnabled(True)
-        self.hotkey_reset_btn.setToolTip(
-            "当前已是 Alt+X。点此只会再次确认，不改变转写模式、Esc、音频来源和结果去向。"
-            if is_default else
-            "恢复为 Alt+X，不改变转写模式、Esc、音频来源和结果去向。"
-        )
+        self.sync_hotkey_reset_state(raw_hotkey)
         continuous = self.selected_trigger_mode() == TRIGGER_MODE_CONTINUOUS
         set_section_visible(self.esc_stop_row, continuous)
         set_section_visible(self.esc_stop_divider, continuous)
@@ -1514,6 +1529,7 @@ class GeneralSettingsPage(SettingsPage):
         proxy_suffix = str(config.get("llm.proxy_bypass_suffixes", "") or "")
         self.llm_proxy_suffix_edit.setText(proxy_suffix)
         self.hotkey_edit.set_value(config.get("hotkey", DEFAULT_HOTKEY))
+        self.sync_hotkey_reset_state(config.get("hotkey", DEFAULT_HOTKEY))
         self.auto_start_row.setChecked(config.get("auto_start", False))
         self.sound_row.setChecked(config.get("sound_enabled", True))
         self.restore_clipboard_row.setChecked(bool(config.get("output.restore_clipboard", True)))

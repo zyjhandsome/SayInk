@@ -56,5 +56,5 @@ def dictation_hints(config) -> DictationHints:
             shortcut = "快捷键未绑定\n前往 设置 → 通用 绑定"
         else:
             detail = f"按住快捷键录音，松开后识别{output_clause}；Esc 或转写条「取消」取消本次录音，不保留本次内容。"
-            shortcut = f"按住 {hotkey}，松开识别\nEsc 取消本次录音"
+            shortcut = f"按住 {hotkey}\n松开识别\nEsc 取消本次录音"
     return DictationHints(source, mode, output, shortcut, detail, warning)

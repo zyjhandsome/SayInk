@@ -8,6 +8,7 @@ import math
 import weakref
 from sayink.runtime_status import MEETING_STATE_LABELS
 from sayink.ui import design_tokens as tok
+from sayink.ui.settings_components import _qcolor
 from sayink.ui.theme import prefers_reduced_motion
 from sayink.ui.island_chrome import (
     clamp_top_left,
@@ -105,7 +106,7 @@ class _DotIndicator(QWidget):
         super().__init__(parent)
         # Resolve at construction time so the live theme axis wins over the
         # value that happened to be active when this module was imported.
-        self._color = QColor(color or tok.STATE_RECORD)
+        self._color = _qcolor(color or tok.STATE_RECORD)
         self._state_token = "STATE_RECORD"
         self._pulse = 0.0
         self._pulsing = False
@@ -115,7 +116,7 @@ class _DotIndicator(QWidget):
         self.setFixedSize(16, 16)
 
     def set_color(self, color: str):
-        self._color = QColor(color)
+        self._color = _qcolor(color)
         self.update()
 
     def set_state_token(self, token: str) -> None:
@@ -244,7 +245,7 @@ class WaveformWidget(QWidget):
         self._volume = 0.0
         self._bar_heights = [0.0] * self.NUM_BARS
         self._phase = 0.0
-        self._accent = QColor(tok.FLOAT_TEXT)
+        self._accent = _qcolor(tok.FLOAT_TEXT)
         self._visible_bars = self.NUM_BARS
         self._running = False
         self._suspended = False
@@ -255,7 +256,7 @@ class WaveformWidget(QWidget):
         self._timer.timeout.connect(self._animate)
 
     def set_accent(self, color: str):
-        self._accent = QColor(color)
+        self._accent = _qcolor(color)
 
     def start(self):
         self._running = True
@@ -539,7 +540,7 @@ class FloatingWindow(QWidget):
         self._set_btn_css(self._cancel_btn, f"""
             QPushButton {{
                 background: {tok.CHIP_BG};
-                color: {tok.FLOAT_TEXT_SEC};
+                color: {tok.FLOAT_TEXT};
                 border: 1px solid {tok.FLOAT_BORDER};
                 font-size: {tok.TYPE_CAPTION}px;
                 font-weight: 700;
@@ -549,10 +550,11 @@ class FloatingWindow(QWidget):
             QPushButton:hover {{
                 background: {tok.ROW_HOVER};
                 color: {tok.FLOAT_TEXT};
+                border-color: {tok.FLOAT_TEXT_SEC};
             }}
         """)
         if self._meeting_active:
-            rec_color = QColor(tok.STATE_RECORD)
+            rec_color = _qcolor(tok.STATE_RECORD)
             end_fg = "#0D0D0D" if rec_color.lightness() > 145 else "#FFFFFF"
             end_hover = rec_color.lighter(108).name() if rec_color.lightness() > 145 else rec_color.darker(112).name()
             self._set_btn_css(self._mark_btn, f"""

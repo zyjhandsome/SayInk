@@ -7,7 +7,6 @@ import weakref
 
 from PyQt6.QtCore import QEvent, QLineF, QPoint, QRect, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import (
-    QColor,
     QCursor,
     QKeySequence,
     QPainter,
@@ -32,7 +31,7 @@ from PyQt6.QtWidgets import (
 
 from sayink.runtime_status import MEETING_STATE_LABELS, RuntimeState, coerce_runtime_status
 from sayink.ui import design_tokens as tok
-from sayink.ui.settings_components import sync_group_tab_stop
+from sayink.ui.settings_components import _qcolor, sync_group_tab_stop
 
 _STATE_TONES = {
     RuntimeState.READY: "GREEN",
@@ -180,7 +179,7 @@ class _CaptionIconButton(QPushButton):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         from sayink.ui import design_tokens as live
 
-        color = QColor(live.TEXT if self.underMouse() else live.TEXT_SEC)
+        color = _qcolor(live.TEXT if self.underMouse() else live.TEXT_SEC)
         pen = QPen(color)
         pen.setWidthF(_CAPTION_STROKE)
         pen.setCapStyle(Qt.PenCapStyle.FlatCap)
@@ -410,7 +409,13 @@ class MainWindow(QWidget):
             return
         # Never below what the pages need when the screen can hold them, and
         # never wider/taller than the available desktop work area (C-09).
+        for page in (getattr(self, "_history", None), getattr(self, "_meeting", None)):
+            sync_fn = getattr(page, "sync_viewport_width", None)
+            if callable(sync_fn):
+                sync_fn(avail.width())
         layout = self.layout()
+        if layout is not None:
+            layout.activate()
         floor = layout.minimumSize() if layout is not None else None
         floor_w = floor.width() if floor is not None else 0
         floor_h = floor.height() if floor is not None else 0
@@ -478,9 +483,9 @@ class MainWindow(QWidget):
         self._sidebar.setObjectName("mainSidebar")
         self._sidebar.setFixedWidth(tok.SIDEBAR_WIDTH)
         side = QVBoxLayout(self._sidebar)
-        # Vertical margins stay tight so the status block still fits a
-        # 1366×768 screen at 150% (about 472 logical pixels).
-        side.setContentsMargins(12, 8, 12, 6)
+        # Vertical margins keep comfortable bottom clearance while still fitting
+        # a 1366×768 screen at 150% (about 472 logical pixels).
+        side.setContentsMargins(12, 8, 12, 10)
         side.setSpacing(3)
 
         self._nav_group = QButtonGroup(self)
@@ -556,6 +561,7 @@ class MainWindow(QWidget):
         self._size_grip = QSizeGrip(self)
         self._size_grip.setFixedSize(16, 16)
         self._size_grip.setToolTip("拖动调整窗口大小")
+        self._position_size_grip()
         # The grip resizes through Qt, not the native sizing loop. Without
         # this, every move installs a new rounded region and the corner flashes.
         self._size_grip.installEventFilter(self)
@@ -697,8 +703,20 @@ class MainWindow(QWidget):
         color = tok.RED if self._output_label.property("outputWarning") else tok.TEXT_DIM
         self._output_label.setStyleSheet(
             f"color: {color}; font-size: {tok.TYPE_CAPTION}px;"
-            " background: transparent; padding: 2px 8px;"
+            " background: transparent; padding: 2px 6px;"
         )
+
+    def _position_size_grip(self) -> None:
+        if not hasattr(self, "_size_grip"):
+            return
+        grip_w = self._size_grip.width()
+        grip_h = self._size_grip.height()
+        inset = 3
+        self._size_grip.move(
+            max(0, self.width() - grip_w - inset),
+            max(0, self.height() - grip_h - inset),
+        )
+        self._size_grip.setVisible(not self.isMaximized())
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -707,10 +725,11 @@ class MainWindow(QWidget):
         # and again on the way back.
         if self.isMinimized():
             return
-        if hasattr(self, "_size_grip"):
-            inset = 6 if self.isMaximized() else 10
-            self._size_grip.move(self.width() - 16 - inset, self.height() - 16 - inset)
-            self._size_grip.setVisible(not self.isMaximized())
+        for page in (getattr(self, "_history", None), getattr(self, "_meeting", None)):
+            sync_fn = getattr(page, "sync_viewport_width", None)
+            if callable(sync_fn):
+                sync_fn(self.width())
+        self._position_size_grip()
         self._sync_frame_margin()
         self._position_frame_edges()
         if self.isMaximized():
@@ -752,7 +771,7 @@ class MainWindow(QWidget):
         # Newly exposed pixels start white in the backing store. Fill them
         # before the stylesheet so a resize cannot present that white.
         painter = QPainter(self)
-        painter.fillRect(event.rect(), QColor(tok.BG))
+        painter.fillRect(event.rect(), _qcolor(tok.BG))
         painter.end()
         super().paintEvent(event)
 
@@ -811,7 +830,7 @@ class MainWindow(QWidget):
         """
         from sayink.ui import design_tokens as live
 
-        bg = QColor(live.BG)
+        bg = _qcolor(live.BG)
         dark = 1 if bg.lightness() < 128 else 0
         colorref = bg.red() | (bg.green() << 8) | (bg.blue() << 16)
         return {
@@ -866,7 +885,7 @@ class MainWindow(QWidget):
         )
         # Keep the erase color on the same background. Stylesheet polish can
         # leave Window on the light style default, which is the flash on drag.
-        bg = QColor(live.BG)
+        bg = _qcolor(live.BG)
         palette = self.palette()
         if palette.color(QPalette.ColorRole.Window) != bg:
             palette.setColor(QPalette.ColorRole.Window, bg)
@@ -883,7 +902,7 @@ class MainWindow(QWidget):
             f" border-right: 1px solid {live.HAIRLINE}; }}"
         )
         if hasattr(self, "_frame_edges"):
-            color = QColor(live.TEXT_DIM)
+            color = _qcolor(live.TEXT_DIM)
             for edge in self._frame_edges:
                 palette = edge.palette()
                 palette.setColor(edge.backgroundRole(), color)
@@ -1156,7 +1175,7 @@ class MainWindow(QWidget):
             btn.setStyleSheet(nav_css)
         for label in (self._mode_label, self._shortcut_label):
             label.setStyleSheet(f"color: {live.TEXT_SEC}; font-size: {live.TYPE_CAPTION}px;"
-                               " background: transparent; padding: 2px 8px;")
+                               " background: transparent; padding: 2px 6px;")
         self._paint_output_hint()
         self._status_rule.setStyleSheet(f"background: {live.HAIRLINE};")
         self._runtime_label.setStyleSheet(
@@ -1415,7 +1434,7 @@ class MainWindow(QWidget):
             return None
         from sayink.ui import design_tokens as live
 
-        color = QColor(live.BG)
+        color = _qcolor(live.BG)
         colorref = color.red() | (color.green() << 8) | (color.blue() << 16)
         if self._bg_brush is not None and self._bg_brush_color == colorref:
             return self._bg_brush

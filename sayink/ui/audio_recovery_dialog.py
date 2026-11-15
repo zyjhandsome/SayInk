@@ -3,10 +3,12 @@ from pathlib import Path
 from dataclasses import replace
 import time
 
-from PyQt6.QtCore import QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QColor, QPalette
-from PyQt6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
-                            QPushButton, QPlainTextEdit, QFileDialog, QComboBox)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QFont, QPalette
+from PyQt6.QtWidgets import (
+    QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QListWidget,
+    QPlainTextEdit, QPushButton, QVBoxLayout,
+)
 
 from sayink.asr_correction import apply_glossary_variants
 from sayink.audio_recovery import recordings, delete_recording
@@ -20,6 +22,7 @@ from sayink.vad_segmenter import SpeechSegmenter, make_speech_gate
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles
 from sayink.ui.prompts import confirm
+from sayink.ui.settings_components import ElidedComboBox, _qcolor
 
 
 class RecoveryWorker(QThread):
@@ -172,39 +175,88 @@ class AudioRecoveryDialog(QDialog):
         self._worker_failed = False
         self._busy = False
         layout = QVBoxLayout(self)
-        note = QLabel("录音仅保存在本机。正常结束的缓存保留 7 天，异常中断的缓存需手动删除；录音上限 2 GB。\n"
-                      "可导出录音或重新识别。恢复文字显示在这里，可另存为文本。")
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        layout.setContentsMargins(tok.SPACE_MD, tok.SPACE_MD, tok.SPACE_MD, tok.SPACE_MD)
+        layout.setSpacing(10)
+
+        self._note_label = QLabel(
+            "录音仅保存在本机。正常结束的缓存保留 7 天，异常中断的缓存需手动删除；录音上限 2 GB。\n"
+            "可导出录音或重新识别。恢复文字显示在这里，可另存为文本。"
+        )
+        self._note_label.setWordWrap(True)
+        layout.addWidget(self._note_label)
+
         self.items = QListWidget()
-        layout.addWidget(self.items)
-        self.track = QComboBox()
+        self.items.setAccessibleName("可恢复录音列表")
+        layout.addWidget(self.items, 1)
+
+        track_row = QHBoxLayout()
+        track_row.setContentsMargins(0, 0, 0, 0)
+        track_row.setSpacing(tok.SPACE_SM)
+        self._track_label = QLabel("恢复音轨")
+        track_row.addWidget(self._track_label)
+        self.track = ElidedComboBox()
         self.track.setAccessibleName("恢复音轨")
-        layout.addWidget(self.track)
+        track_row.addWidget(self.track, 1)
+        layout.addLayout(track_row)
         self.items.currentRowChanged.connect(self._update_tracks)
+
         actions = QHBoxLayout()
-        self.export_btn = QPushButton("导出 WAV")
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(tok.SPACE_SM)
         self.transcribe_btn = QPushButton("重新识别")
+        self.transcribe_btn.setProperty("viBtn", "primarySm")
+        self.export_btn = QPushButton("导出 WAV")
+        self.export_btn.setProperty("viBtn", "ghostSm")
         self.stop_btn = QPushButton("停止")
+        self.stop_btn.setProperty("viBtn", "ghostSm")
         self.delete_btn = QPushButton("删除所选录音")
-        for button in (self.export_btn, self.transcribe_btn, self.stop_btn, self.delete_btn):
-            actions.addWidget(button)
+        self.delete_btn.setProperty("viBtn", "dangerSm")
+        actions.addWidget(self.transcribe_btn)
+        actions.addWidget(self.export_btn)
+        actions.addWidget(self.stop_btn)
+        actions.addStretch(1)
+        actions.addWidget(self.delete_btn)
         layout.addLayout(actions)
+
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
+        self.output.setAccessibleName("恢复的识别文字")
         self.output.setPlaceholderText("恢复的识别文字将显示在这里")
-        layout.addWidget(self.output)
+        layout.addWidget(self.output, 1)
+
         self.status = QLabel("")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+
+        footer = QHBoxLayout()
+        footer.setContentsMargins(0, 0, 0, 0)
+        footer.setSpacing(tok.SPACE_SM)
+        footer.addStretch(1)
         self.save_btn = QPushButton("另存文字")
-        layout.addWidget(self.save_btn)
+        self.save_btn.setProperty("viBtn", "ghostSm")
+        self.close_btn = QPushButton("关闭")
+        self.close_btn.setProperty("viBtn", "ghostSm")
+        footer.addWidget(self.save_btn)
+        footer.addWidget(self.close_btn)
+        layout.addLayout(footer)
+
+        for button in (
+            self.transcribe_btn,
+            self.export_btn,
+            self.stop_btn,
+            self.delete_btn,
+            self.save_btn,
+            self.close_btn,
+        ):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+
         self.output.textChanged.connect(self._sync_save_enabled)
         self.export_btn.clicked.connect(self._export)
         self.transcribe_btn.clicked.connect(self._transcribe)
         self.stop_btn.clicked.connect(self.cancel_processing)
         self.delete_btn.clicked.connect(self._delete)
         self.save_btn.clicked.connect(self._save_text)
+        self.close_btn.clicked.connect(self.close)
         self.reapply_theme()
         self._fit_to_available_screen()
         self._refresh()
@@ -228,17 +280,39 @@ class AudioRecoveryDialog(QDialog):
         self._fit_to_available_screen()
 
     def reapply_theme(self) -> None:
+        primary_sm = getattr(settings_styles, "BTN_PRIMARY_SM", settings_styles.BTN_ACCENT_SM)
         self.setStyleSheet(
             settings_styles.WINDOW_CSS
             + f"\nQDialog {{ background: {tok.BG}; }}"
-            + f"\nQListWidget, QPlainTextEdit {{ background: {tok.INPUT_BG}; color: {tok.TEXT};"
-            + f" border: 1px solid {tok.CONTROL_BORDER}; border-radius: {tok.RADIUS_MD}px; padding: 6px; }}"
+            + "\nQListWidget {"
+            + f" background: {tok.INPUT_BG}; color: {tok.TEXT};"
+            + f" border: 1px solid {tok.CONTROL_BORDER}; border-radius: {tok.RADIUS_MD}px;"
+            + " padding: 4px; outline: none; }"
+            + "\nQListWidget::item {"
+            + f" color: {tok.TEXT}; border-radius: {tok.RADIUS_SM}px;"
+            + " padding: 7px 10px; margin: 1px 0; }"
+            + f"\nQListWidget::item:hover:!selected {{ background: {tok.ROW_HOVER}; color: {tok.TEXT}; }}"
+            + "\nQListWidget::item:selected, QListWidget::item:selected:active, QListWidget::item:selected:!active {"
+            + f" background: {tok.ACCENT_SOFT}; color: {tok.TEXT}; }}"
+            + "\nQPlainTextEdit {"
+            + f" background: {tok.INPUT_BG}; color: {tok.TEXT};"
+            + f" border: 1px solid {tok.CONTROL_BORDER}; border-radius: {tok.RADIUS_MD}px; padding: 8px 10px; }}"
         )
-        for button in (self.export_btn, self.transcribe_btn, self.stop_btn, self.save_btn):
+        self._note_label.setStyleSheet(
+            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
+        )
+        self._track_label.setStyleSheet(
+            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; background: transparent;"
+        )
+        self.status.setStyleSheet(
+            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
+        )
+        self.transcribe_btn.setStyleSheet(primary_sm)
+        for button in (self.export_btn, self.stop_btn, self.save_btn, self.close_btn):
             button.setStyleSheet(settings_styles.BTN_GHOST_SM)
         self.delete_btn.setStyleSheet(settings_styles.BTN_DANGER_SM)
         palette = self.output.palette()
-        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(tok.TEXT_DIM))
+        palette.setColor(QPalette.ColorRole.PlaceholderText, _qcolor(tok.TEXT_DIM))
         self.output.setPalette(palette)
 
     def _sync_save_enabled(self) -> None:

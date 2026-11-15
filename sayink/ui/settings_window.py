@@ -330,7 +330,7 @@ class SettingsWindow(QWidget):
         pages_host.setObjectName("settingsPagesHost")
         pages_host.setStyleSheet("QWidget#settingsPagesHost { background: transparent; }")
         pages_lay = QHBoxLayout(pages_host)
-        pages_lay.setContentsMargins(6, 8, 6, 12)
+        pages_lay.setContentsMargins(6, 8, 6, 20)
         pages_lay.setSpacing(0)
 
         self._pages = QStackedWidget()
@@ -1618,9 +1618,11 @@ class SettingsWindow(QWidget):
                 "占用后它在其他软件里会失效。请换一个组合，例如 Alt + X。"
             )
         if problem:
+            saved_hotkey = self._config.get("hotkey", DEFAULT_HOTKEY)
             self._loading = True
             try:
-                self.general_page.hotkey_edit.set_value(self._config.get("hotkey", DEFAULT_HOTKEY))
+                self.general_page.hotkey_edit.set_value(saved_hotkey)
+                self.general_page.sync_hotkey_reset_state(saved_hotkey)
             finally:
                 self._loading = False
             self.general_page.show_hotkey_feedback(problem, error=True)

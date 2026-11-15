@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
-    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -21,6 +20,7 @@ from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles
 from sayink.ui.model_card import ModelCard, RATING_TOOLTIP, format_model_ratings
 from sayink.ui.settings_components import (
+    ElidedComboBox,
     SettingsPage,
     chain_tab_order,
     elide_middle,
@@ -48,7 +48,7 @@ class ModelSettingsPage(SettingsPage):
     model_hero_status: QLabel | None
     storage_summary_label: QLabel
     change_dir_btn: QPushButton
-    download_source_combo: QComboBox
+    download_source_combo: ElidedComboBox
     model_notice_label: QLabel
     cards_container: QWidget
     cards_layout: QVBoxLayout
@@ -91,7 +91,7 @@ class ModelSettingsPage(SettingsPage):
         source_group = settings_group()
         source_lay = QVBoxLayout(source_group)
         source_lay.setContentsMargins(0, 0, 0, 0)
-        self.download_source_combo = QComboBox()
+        self.download_source_combo = ElidedComboBox()
         self.download_source_combo.setAccessibleName("模型下载源")
         for value, label in DOWNLOAD_SOURCE_LABELS:
             self.download_source_combo.addItem(label, value)

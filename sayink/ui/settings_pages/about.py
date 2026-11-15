@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QIcon, QPainter
+from PyQt6.QtGui import QIcon, QPainter
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -24,6 +24,7 @@ from sayink.ui.dictation_hints import dictation_hints
 from sayink.ui.settings_components import (
     SettingsPage,
     ToggleOptionRow,
+    _qcolor,
     chain_tab_order,
     group_divider,
     page_header,
@@ -265,7 +266,7 @@ class AboutSettingsPage(SettingsPage):
         pixmap = btn.style().standardIcon(arrow).pixmap(QSize(16, 16), btn.devicePixelRatioF())
         painter = QPainter(pixmap)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
-        painter.fillRect(pixmap.rect(), QColor(tok.TEXT_SEC))
+        painter.fillRect(pixmap.rect(), _qcolor(tok.TEXT_SEC))
         painter.end()
         btn.setIcon(QIcon(pixmap))
         btn.setIconSize(QSize(16, 16))

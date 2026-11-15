@@ -5,7 +5,6 @@ from __future__ import annotations
 from PyQt6.QtCore import QSignalBlocker, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtWidgets import (
-    QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -31,6 +30,7 @@ from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles
 from sayink.ui.minutes_templates import MinutesTemplatesDialog, populate_template_combo
 from sayink.ui.settings_components import (
+    ElidedComboBox,
     SettingsPage,
     ToggleOptionRow,
     chain_tab_order,
@@ -119,7 +119,7 @@ class PolishSettingsPage(SettingsPage):
     llm_preview_divider: QWidget
     llm_preview_card: QWidget
     llm_prompt_container: QWidget
-    llm_mode_combo: QComboBox
+    llm_mode_combo: ElidedComboBox
     prompt_reset_btn: QPushButton
     llm_prompt_edit: QTextEdit
     llm_prompt_timer: QTimer
@@ -127,9 +127,9 @@ class PolishSettingsPage(SettingsPage):
     minutes_model_edit: QLineEdit
     minutes_test_btn: QPushButton
     minutes_test_status: QLabel
-    minutes_template_combo: QComboBox
+    minutes_template_combo: ElidedComboBox
     minutes_manage_btn: QPushButton
-    minutes_language_combo: QComboBox
+    minutes_language_combo: ElidedComboBox
     minutes_auto_row: ToggleOptionRow
     minutes_auto_reset_btn: QPushButton
     polish_tab_chain: list[QWidget]
@@ -287,7 +287,7 @@ class PolishSettingsPage(SettingsPage):
         mode_lay = QVBoxLayout(mode_group)
         mode_lay.setContentsMargins(0, 0, 0, 0)
         mode_lay.setSpacing(0)
-        self.llm_mode_combo = QComboBox()
+        self.llm_mode_combo = ElidedComboBox()
         self.llm_mode_combo.setAccessibleName("处理方式")
         self.llm_mode_combo.addItem("润色", LLM_MODE_POLISH)
         self.llm_mode_combo.addItem("纠错", LLM_MODE_CORRECT)
@@ -347,7 +347,7 @@ class PolishSettingsPage(SettingsPage):
         self.minutes_test_status.hide()
         lay.addWidget(self.minutes_test_status)
         lay.addWidget(group_divider())
-        self.minutes_template_combo = QComboBox()
+        self.minutes_template_combo = ElidedComboBox()
         self.minutes_template_combo.setAccessibleName("默认会议模板")
         if config is not None:
             populate_template_combo(self.minutes_template_combo, config)
@@ -365,7 +365,7 @@ class PolishSettingsPage(SettingsPage):
         template_row.addWidget(self.minutes_manage_btn)
         lay.addWidget(stacked_field_row("默认模板", template_wrap, "生成时可在会议页临时更换；管理模板可新建或复制后修改"))
         lay.addWidget(group_divider())
-        self.minutes_language_combo = QComboBox()
+        self.minutes_language_combo = ElidedComboBox()
         self.minutes_language_combo.setAccessibleName("纪要输出语言")
         self.minutes_language_combo.setToolTip("适用于会议纪要；原文精整始终保留原文语言和中外文混用。")
         for key, label in (("auto", "与会议语言相同"), ("zh", "中文"), ("en", "English"), ("ja", "日本語")):

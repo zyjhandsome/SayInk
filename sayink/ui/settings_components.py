@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QEasingCurve, QPointF, QPropertyAnimation, Qt, QSize, QRectF, pyqtProperty, pyqtSignal
+import re
+
+from PyQt6.QtCore import (
+    QEasingCurve, QEvent, QPointF, QPropertyAnimation, QRectF, QSize, Qt,
+    pyqtProperty, pyqtSignal,
+)
 from PyQt6.QtGui import QColor, QFontMetrics, QKeyEvent, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (
-    QComboBox, QFrame, QHBoxLayout, QLabel,
-    QCheckBox, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
+    QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel,
+    QPushButton, QRadioButton, QScrollArea, QSizePolicy,
+    QStyle, QStyleOptionComboBox, QStylePainter,
     QVBoxLayout, QWidget,
 )
 
@@ -20,6 +26,40 @@ from sayink.ui.design_tokens import (
     SPACE_MD,
     SPACE_SM,
 )
+
+_RGBA_TOKEN_RE = re.compile(
+    r"^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})"
+    r"(?:\s*,\s*([0-9]*\.?[0-9]+%?))?\s*\)$",
+    re.IGNORECASE,
+)
+
+
+def _qcolor(value: str | QColor) -> QColor:
+    """Convert a design token (``#hex``, ``rgb(...)``, ``rgba(...)``) into a valid ``QColor``."""
+    if isinstance(value, QColor):
+        return QColor(value)
+    token_fn = getattr(tok, "qcolor_from_token", None)
+    if callable(token_fn):
+        return token_fn(value)
+    raw = str(value or "").strip()
+    match = _RGBA_TOKEN_RE.match(raw)
+    if match:
+        r = max(0, min(255, int(match.group(1))))
+        g = max(0, min(255, int(match.group(2))))
+        b = max(0, min(255, int(match.group(3))))
+        alpha_str = match.group(4)
+        if alpha_str is None:
+            return QColor(r, g, b)
+        if alpha_str.endswith("%"):
+            alpha = round(float(alpha_str[:-1]) * 255.0 / 100.0)
+        else:
+            alpha_val = float(alpha_str)
+            if "." in alpha_str or alpha_val <= 1.0:
+                alpha = round(alpha_val * 255.0)
+            else:
+                alpha = round(alpha_val)
+        return QColor(r, g, b, max(0, min(255, alpha)))
+    return QColor(raw)
 
 # ── Style fragments (rebuilt from active token axis via reload_styles) ──
 
@@ -923,8 +963,8 @@ class SwitchControl(QCheckBox):
 
         # Prototype: off #E5E2E3 / on #16A34A (green); hover only slightly shifts.
         if self._checked or self._knob_pos > 0.5:
-            return QColor(tok.TOGGLE_ON_HOVER if self._hover else tok.TOGGLE_ON)
-        return QColor(tok.TOGGLE_OFF_HOVER if self._hover else tok.TOGGLE_OFF)
+            return _qcolor(tok.TOGGLE_ON_HOVER if self._hover else tok.TOGGLE_ON)
+        return _qcolor(tok.TOGGLE_OFF_HOVER if self._hover else tok.TOGGLE_OFF)
 
     def _get_knob_pos(self) -> float:
         return self._knob_pos
@@ -1029,7 +1069,7 @@ class SwitchControl(QCheckBox):
         p.drawEllipse(knob_x, knob_y, knob_d, knob_d)
 
         if self.hasFocus():
-            focus_pen = QPen(QColor(tok.ACCENT_FOCUS), 2)
+            focus_pen = QPen(_qcolor(tok.ACCENT_FOCUS), 2)
             focus_pen.setCosmetic(True)
             p.setPen(focus_pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
@@ -1357,27 +1397,27 @@ class ThemedCheckBox(QCheckBox):
         box_rect = QRectF(box_x, box_y, float(self._BOX), float(self._BOX))
 
         if enabled and self.hasFocus():
-            focus_pen = QPen(QColor(tok.ACCENT_FOCUS), 2.0)
+            focus_pen = QPen(_qcolor(tok.ACCENT_FOCUS), 2.0)
             p.setPen(focus_pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRoundedRect(box_rect.adjusted(-1.5, -1.5, 1.5, 1.5), 5.5, 5.5)
 
         if not enabled:
-            fill = QColor(tok.BAR_OFF)
-            border = QColor(tok.HAIRLINE)
+            fill = _qcolor(tok.BAR_OFF)
+            border = _qcolor(tok.HAIRLINE)
         elif checked:
-            fill = QColor(tok.ACCENT)
-            border = QColor(tok.ACCENT)
+            fill = _qcolor(tok.ACCENT)
+            border = _qcolor(tok.ACCENT)
         else:
-            fill = QColor(tok.INPUT_BG)
-            border = QColor(tok.CONTROL_BORDER_HOVER if self._hovered else tok.CONTROL_BORDER)
+            fill = _qcolor(tok.INPUT_BG)
+            border = _qcolor(tok.CONTROL_BORDER_HOVER if self._hovered else tok.CONTROL_BORDER)
 
         p.setPen(QPen(border, 1.2))
         p.setBrush(fill)
         p.drawRoundedRect(box_rect.adjusted(0.6, 0.6, -0.6, -0.6), 4.0, 4.0)
 
         if checked:
-            tick_color = QColor(tok.TEXT_DIM if not enabled else tok.ACCENT_ON_DARK)
+            tick_color = _qcolor(tok.TEXT_DIM if not enabled else tok.ACCENT_ON_DARK)
             tick_pen = QPen(tick_color, 1.8)
             tick_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             tick_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -1396,7 +1436,7 @@ class ThemedCheckBox(QCheckBox):
         label = self.text()
         if label:
             p.setFont(self.font())
-            p.setPen(QColor(tok.TEXT if enabled else tok.TEXT_DIM))
+            p.setPen(_qcolor(tok.TEXT if enabled else tok.TEXT_DIM))
             text_left = int(box_x + self._BOX + self._GAP)
             text_rect = self.rect().adjusted(text_left, 0, 0, 0)
             p.drawText(
@@ -1405,3 +1445,118 @@ class ThemedCheckBox(QCheckBox):
                 label,
             )
         p.end()
+
+
+class ElidedComboBox(QComboBox):
+    """Closed-state eliding combo box that exposes full current text via tooltip when truncated."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._custom_tooltip: str = ""
+        self._applying_auto_tooltip: bool = False
+        self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.setMinimumContentsLength(0)
+        self.currentIndexChanged.connect(self._on_combo_content_changed)
+        self.currentTextChanged.connect(self._on_combo_content_changed)
+        self._connect_model_signals(self.model())
+
+    def _connect_model_signals(self, model) -> None:
+        if model is None:
+            return
+        for sig_name in ("dataChanged", "rowsInserted", "rowsRemoved", "modelReset"):
+            sig = getattr(model, sig_name, None)
+            if sig is not None:
+                sig.connect(self._on_combo_content_changed)
+
+    def setModel(self, model) -> None:
+        super().setModel(model)
+        self._connect_model_signals(model)
+        self._refresh_elided_tooltip()
+
+    def _on_combo_content_changed(self, *_args) -> None:
+        self._refresh_elided_tooltip()
+
+    def setToolTip(self, tip: str) -> None:
+        if not self._applying_auto_tooltip:
+            self._custom_tooltip = tip or ""
+            self._refresh_elided_tooltip()
+            return
+        super().setToolTip(tip)
+
+    def _available_text_width(self) -> int:
+        self.ensurePolished()
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        edit_rect = self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox,
+            opt,
+            QStyle.SubControl.SC_ComboBoxEditField,
+            self,
+        )
+        if edit_rect.width() <= 0:
+            base_w = self.width() or self.minimumWidth() or tok.CONTROL_SETTINGS_COMBO_WIDTH
+            return max(24, base_w - 44)
+        return max(24, edit_rect.width() - 4)
+
+    def elidedCurrentText(self) -> str:
+        full_text = self.currentText()
+        if not full_text:
+            return ""
+        return self.fontMetrics().elidedText(
+            full_text, Qt.TextElideMode.ElideRight, self._available_text_width()
+        )
+
+    def isTextElided(self) -> bool:
+        full_text = self.currentText()
+        return bool(full_text) and self.elidedCurrentText() != full_text
+
+    def _refresh_elided_tooltip(self) -> None:
+        full_text = self.currentText()
+        if full_text and self.isTextElided():
+            if self._custom_tooltip and self._custom_tooltip != full_text:
+                target = f"{full_text}\n{self._custom_tooltip}"
+            else:
+                target = full_text
+        else:
+            target = self._custom_tooltip
+        if super().toolTip() != target:
+            self._applying_auto_tooltip = True
+            try:
+                super().setToolTip(target)
+            finally:
+                self._applying_auto_tooltip = False
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh_elided_tooltip()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._refresh_elided_tooltip()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event is not None and event.type() in (
+            QEvent.Type.FontChange,
+            QEvent.Type.StyleChange,
+            QEvent.Type.Polish,
+        ):
+            self._refresh_elided_tooltip()
+
+    def paintEvent(self, _event) -> None:
+        painter = QStylePainter(self)
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        edit_rect = self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox,
+            opt,
+            QStyle.SubControl.SC_ComboBoxEditField,
+            self,
+        )
+        avail = max(24, edit_rect.width() - 4)
+        opt.currentText = self.fontMetrics().elidedText(
+            opt.currentText, Qt.TextElideMode.ElideRight, avail
+        )
+        self._refresh_elided_tooltip()
+        painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, opt)
+        painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, opt)
