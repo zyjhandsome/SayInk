@@ -94,8 +94,9 @@ def release_list_item_widgets(list_widget: QListWidget, host: QWidget) -> None:
 
 class _ElidedLabel(QLabel):
     """A single-line preview that keeps the full text available to assistive tools."""
-    def __init__(self, text: str, parent=None):
+    def __init__(self, text: str, parent=None, *, show_full_tooltip: bool = True):
         super().__init__(parent)
+        self._show_full_tooltip = show_full_tooltip
         self.setTextFormat(Qt.TextFormat.PlainText)
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -103,13 +104,22 @@ class _ElidedLabel(QLabel):
 
     def set_full_text(self, text: str) -> None:
         self._full_text = " ".join(text.split())
-        self.setToolTip(text)
+        if self._show_full_tooltip:
+            self.setToolTip(text)
+        elif self.toolTip():
+            self.setToolTip("")
         self.setAccessibleName(text)
         self._elide()
 
     def _elide(self):
-        self.setText(QFontMetrics(self.font()).elidedText(
-            self._full_text, Qt.TextElideMode.ElideRight, max(0, self.contentsRect().width())))
+        width = max(0, self.contentsRect().width())
+        shown = QFontMetrics(self.font()).elidedText(
+            self._full_text, Qt.TextElideMode.ElideRight, width)
+        self.setText(shown)
+        if not self._show_full_tooltip:
+            tip = self._full_text if width > 0 and shown != self._full_text else ""
+            if self.toolTip() != tip:
+                self.setToolTip(tip)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -144,6 +154,10 @@ class _PreviewLabel(_ElidedLabel):
                 self._full_text[end:].lstrip(), Qt.TextElideMode.ElideRight, width))
         self.setText("\n".join(lines))
         self.setFixedHeight(QFontMetrics(self.font()).lineSpacing() * 2)
+        if not self._show_full_tooltip:
+            tip = self._full_text if width > 0 and end < len(self._full_text) else ""
+            if self.toolTip() != tip:
+                self.setToolTip(tip)
 
 
 def session_list_item_css() -> str:
@@ -1660,11 +1674,14 @@ class HistoryWindow(QWidget):
         elif session.source:
             meta_parts.append(_source_description(session.source))
         meta_parts.append(f"{session.segment_count} 段")
-        meta = _ElidedLabel(" · ".join(meta_parts))
+        meta = _ElidedLabel(" · ".join(meta_parts), show_full_tooltip=False)
         meta.setObjectName("streamMeta")
         line.addWidget(meta, 1)
         lay.addLayout(line)
-        preview = _PreviewLabel(_search_excerpt(session.preview or "(无内容)", self._search_query))
+        preview = _PreviewLabel(
+            _search_excerpt(session.preview or "(无内容)", self._search_query),
+            show_full_tooltip=False,
+        )
         preview.setObjectName("streamPreview")
         lay.addWidget(preview)
         return row
@@ -1693,9 +1710,10 @@ class HistoryWindow(QWidget):
         for text in texts:
             if not text:
                 continue
-            lab = QLabel(metrics.elidedText(text, Qt.TextElideMode.ElideMiddle, 240))
+            shown = metrics.elidedText(text, Qt.TextElideMode.ElideMiddle, 240)
+            lab = QLabel(shown)
             lab.setTextFormat(Qt.TextFormat.PlainText)
-            lab.setToolTip(text)
+            lab.setToolTip(text if shown != text else "")
             lab.setObjectName("streamChip")
             lab.setStyleSheet(chip_css)
             # Chips size to their content and wrap to a new row when the

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QCheckBox, QFileDialog, QListWidget
+from PyQt6.QtWidgets import QCheckBox, QFileDialog, QLabel, QListWidget
 
 from sayink.history_store import HistoryStore, SegmentRecord
 from sayink.meeting_session import MeetingController
@@ -261,6 +261,26 @@ def test_batch_generate_uses_the_default_template_not_the_open_meeting(config, t
         page._select_loaded_meetings()
         page._generate_selected_meetings()
         assert seen == ["general"]
+    finally:
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_batch_selection_does_not_repeat_titles_in_a_tooltip(config, tmp_path):
+    page, controller, history, first, second = _page(config, tmp_path)
+    try:
+        page._set_batch_mode(True)
+        page._select_loaded_meetings()
+        notice = page._batch_notice.text()
+        assert "已选 2 场" in notice
+        assert first.title not in notice
+        assert second.title not in notice
+        for index in range(page._list.count()):
+            row = page._list.itemWidget(page._list.item(index))
+            assert row.toolTip() == ""
+            title = row.findChild(QLabel, "meetingRowTitle")
+            assert title is not None and title.toolTip() == ""
     finally:
         page.deleteLater()
         controller.shutdown()

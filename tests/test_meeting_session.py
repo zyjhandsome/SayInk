@@ -814,8 +814,21 @@ class TestMeetingPage:
         combos = (page._opt_source, page._opt_model, page._opt_language)
         assert page._opt_model.width() > page._opt_source.width() > 100
         assert abs(page._opt_source.width() - page._opt_language.width()) <= 2
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtWidgets import QStyle, QStyleOptionComboBox
+
         for combo in combos:
-            assert combo.toolTip() == combo.currentText()
+            full = combo.currentText()
+            option = QStyleOptionComboBox()
+            combo.initStyleOption(option)
+            field = combo.style().subControlRect(
+                QStyle.ComplexControl.CC_ComboBox, option,
+                QStyle.SubControl.SC_ComboBoxEditField, combo,
+            )
+            shown = combo.fontMetrics().elidedText(
+                full, Qt.TextElideMode.ElideRight, max(0, field.width() - 4),
+            )
+            assert combo.toolTip() == ("" if field.width() <= 4 or shown == full else full)
 
     def test_start_card_offers_three_sources_and_never_follows_dictation(self, page, config):
         config.set("audio.input_source", "system")

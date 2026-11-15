@@ -18,6 +18,7 @@ The page never touches audio or the recognizer: it asks the
 from __future__ import annotations
 
 import bisect
+from contextlib import contextmanager
 import copy
 import hashlib
 import html
@@ -170,6 +171,23 @@ def _paint_meeting_row(row: QWidget, *, selected: bool) -> None:
         row.setStyleSheet(css)
 
 
+@contextmanager
+def _quiet_tooltips(widget: QWidget):
+    """Hide tips before a dialog, and don't let them pop again while it is open."""
+    from PyQt6.QtWidgets import QToolTip
+
+    QToolTip.hideText()
+    forced = widget.testAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips)
+    if forced:
+        widget.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, False)
+    try:
+        yield
+    finally:
+        if forced:
+            widget.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
+        QToolTip.hideText()
+
+
 def _style_dialog_box(box: QMessageBox, *, danger_btn: QPushButton | None = None) -> None:
     primary = danger_btn
     if primary is None:
@@ -182,6 +200,37 @@ def _style_dialog_box(box: QMessageBox, *, danger_btn: QPushButton | None = None
 
 class _CleanComboBox(QComboBox):
     """ComboBox that elides overflowing closed-box text cleanly instead of mid-glyph clipping."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.currentTextChanged.connect(self._sync_overflow_tooltip)
+
+    def _sync_overflow_tooltip(self, *_args) -> None:
+        """Repeat the value only when the closed box cannot show all of it."""
+        from PyQt6.QtWidgets import QStyle, QStyleOptionComboBox
+
+        text = self.currentText()
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        edit_rect = self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox, opt, QStyle.SubControl.SC_ComboBoxEditField, self,
+        )
+        avail = edit_rect.width() - 4
+        if avail <= 0 or not text:
+            tip = ""
+        else:
+            elided = self.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, avail)
+            tip = text if elided != text else ""
+        if self.toolTip() != tip:
+            self.setToolTip(tip)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._sync_overflow_tooltip()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._sync_overflow_tooltip()
 
     def paintEvent(self, event) -> None:
         from PyQt6.QtWidgets import QStyle, QStyleOptionComboBox, QStylePainter
@@ -1163,7 +1212,6 @@ class MeetingPage(QWidget):
         self._list = _SessionList()
         self._list.setObjectName("meetingList")
         self._list.setAccessibleName("会议列表")
-        self._list.setToolTip("Ctrl 点选，Shift 连选。点「选择」后，单击一行即可勾选或取消。Delete 删除所选")
         self._list.setFrameShape(QFrame.Shape.NoFrame)
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -1633,8 +1681,6 @@ class MeetingPage(QWidget):
         ):
             field.setMinimumWidth(0)
             field.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-            field.currentTextChanged.connect(field.setToolTip)
-            field.setToolTip(field.currentText())
             column = QVBoxLayout()
             column.setSpacing(4)
             label = QLabel(caption)
@@ -2200,7 +2246,9 @@ class MeetingPage(QWidget):
         from sayink.ui.minutes_templates import MinutesTemplatesDialog
 
         dialog = MinutesTemplatesDialog(self._config, self._template_combo.currentData(), self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        with _quiet_tooltips(self):
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if accepted:
             self._reload_templates()
             self._template_combo.setCurrentIndex(self._template_combo.findData(dialog.selected_template_id))
             self._on_template_changed(self._template_combo.currentIndex())
@@ -2243,7 +2291,6 @@ class MeetingPage(QWidget):
                     item.setData(Qt.ItemDataRole.UserRole, record.id)
                     item.setData(Qt.ItemDataRole.AccessibleTextRole, _meeting_row_text(record, minutes.get(record.id, "")))
                     row = self._build_list_row(record, minutes.get(record.id, ""))
-                    row.setToolTip(record.display_title)
                     self._list.addItem(item)
                     self._list.setItemWidget(item, row)
                     row.ensurePolished()
@@ -2378,10 +2425,10 @@ class MeetingPage(QWidget):
         outer.addWidget(box, 0, Qt.AlignmentFlag.AlignVCenter)
         lay = QVBoxLayout()
         lay.setSpacing(2)
-        title = _ElidedLabel(record.display_title)
+        title = _ElidedLabel(record.display_title, show_full_tooltip=False)
         title.setObjectName("meetingRowTitle")
         lay.addWidget(title)
-        meta = _ElidedLabel(_meeting_row_meta(record, minutes))
+        meta = _ElidedLabel(_meeting_row_meta(record, minutes), show_full_tooltip=False)
         meta.setObjectName("meetingRowMeta")
         lay.addWidget(meta)
         outer.addLayout(lay, 1)
@@ -2628,22 +2675,11 @@ class MeetingPage(QWidget):
         self._copy_btn.setVisible(not self._batch_mode)
         if not self._batch_mode:
             return
-        titles = []
-        for meeting_id in ids:
-            record = self._records.get(meeting_id) or self._store.get_meeting(meeting_id)
-            if record is not None:
-                titles.append(record.display_title)
-                if len(titles) > 12:
-                    break
-        listed = "\n".join(titles[:12])
-        if len(titles) > 12:
-            listed += "\n…"
         self._batch_notice.setText(
             f"已选 {count} 场已加载的会议。\n"
             "单击勾选或取消，Shift 连选，Ctrl 加选。\n"
             "全选只包含当前列表里已经加载的会议。\n"
-            "导出会写成一个 Markdown。生成纪要只排队还没有纪要的会议。删除无法撤销。\n\n"
-            + listed
+            "导出会写成一个 Markdown。生成纪要只排队还没有纪要的会议。删除无法撤销。"
         )
         self._batch_notice_scroll.updateGeometry()
 
@@ -2685,7 +2721,9 @@ class MeetingPage(QWidget):
         if not ended:
             self._set_status("进行中的会议要先结束后再删除。")
             return
-        if not confirm_batch_delete(self, len(ended), len(live)):
+        with _quiet_tooltips(self):
+            confirmed = confirm_batch_delete(self, len(ended), len(live))
+        if not confirmed:
             return
         if not self._flush_bound_title(sync=True) or not self._save_notes_draft() or not self._save_record_notes():
             return
@@ -2720,7 +2758,8 @@ class MeetingPage(QWidget):
                 destructive=True,
             )
             _style_dialog_box(box, danger_btn=overwrite)
-            box.exec()
+            with _quiet_tooltips(self):
+                box.exec()
             return box.clickedButton() == overwrite
         return True
 
@@ -2761,7 +2800,8 @@ class MeetingPage(QWidget):
             box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
             box.setDefaultButton(ok)
             _style_dialog_box(box)
-            box.exec()
+            with _quiet_tooltips(self):
+                box.exec()
             if box.clickedButton() != ok:
                 return
             self._ctrl.confirm_remote_host(host)
@@ -2821,7 +2861,9 @@ class MeetingPage(QWidget):
         from sayink.ui.transcript_import_dialog import TranscriptImportDialog
 
         dialog = TranscriptImportDialog(self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        with _quiet_tooltips(self):
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if not accepted:
             return None
         return (
             dialog.transcript_text(),
@@ -3103,7 +3145,8 @@ class MeetingPage(QWidget):
         stay = box.addButton("继续识别", QMessageBox.ButtonRole.RejectRole)
         stop = box.addButton("停止并保留已识别的文字", QMessageBox.ButtonRole.DestructiveRole)
         box.setDefaultButton(stay)
-        box.exec()
+        with _quiet_tooltips(self):
+            box.exec()
         return box.clickedButton() is stop
 
     def _on_media_progress(self, text: str) -> None:
@@ -3848,7 +3891,9 @@ class MeetingPage(QWidget):
         buttons.addWidget(cancel)
         buttons.addWidget(save)
         layout.addLayout(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        with _quiet_tooltips(self):
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if not accepted:
             return
         self._store.shift_meeting_start(record.id, int(edit.dateTime().toMSecsSinceEpoch()))
         if not self._store.flush():
@@ -3984,7 +4029,8 @@ class MeetingPage(QWidget):
             box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
             box.setDefaultButton(ok)
             _style_dialog_box(box)
-            box.exec()
+            with _quiet_tooltips(self):
+                box.exec()
             if box.clickedButton() != ok:
                 return
             self._ctrl.confirm_remote_host(host)
@@ -4011,7 +4057,8 @@ class MeetingPage(QWidget):
         back = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(back if notes.user_edited else go)
         _style_dialog_box(box)
-        box.exec()
+        with _quiet_tooltips(self):
+            box.exec()
         return box.clickedButton() == go
 
     def _available_user_backup(self, meeting_id: str, notes=None) -> str:
@@ -4206,7 +4253,8 @@ class MeetingPage(QWidget):
             )
             box.setInformativeText("放弃后将恢复为编辑前的已保存内容。")
             _style_dialog_box(box, danger_btn=discard)
-            box.exec()
+            with _quiet_tooltips(self):
+                box.exec()
             if box.clickedButton() != discard:
                 return
         self._notes_edit.blockSignals(True)
@@ -4430,7 +4478,9 @@ class MeetingPage(QWidget):
         if loaded and ignored:
             dialog._extra_note = f"一次只能导入一个文件，已忽略其余 {ignored} 个。"
             dialog._refresh()
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        with _quiet_tooltips(self):
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if not accepted:
             return
         record = self._ctrl.import_transcript(
             dialog.transcript_text(),
@@ -4787,7 +4837,8 @@ class MeetingPage(QWidget):
             box.setText("请先结束会议，再删除记录。")
             box.addButton("确定", QMessageBox.ButtonRole.AcceptRole)
             _style_dialog_box(box)
-            box.exec()
+            with _quiet_tooltips(self):
+                box.exec()
             return
         from sayink.ui.prompts import confirm_box
 
@@ -4801,7 +4852,8 @@ class MeetingPage(QWidget):
         )
         box.setInformativeText("文字稿、笔记、标记与纪要会一起删除，无法撤销。")
         _style_dialog_box(box, danger_btn=delete)
-        box.exec()
+        with _quiet_tooltips(self):
+            box.exec()
         if box.clickedButton() != delete:
             return
         temp_wav_targets = self._audio_player.collect_temp_wavs_for_audio_paths(
@@ -4880,7 +4932,9 @@ class MeetingPage(QWidget):
             save_text=lambda text: self._ctrl.save_segment_text(record.id, seq, text), parent=self,
             details=detail_text, read_only=read_only,
         )
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        with _quiet_tooltips(self):
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if accepted:
             action = "已恢复这一段的原文" if dialog.corrected_text is None else "已保存这一段的修改"
             if self._stack.currentIndex() == PAGE_LIVE and self._ctrl.current_id == record.id:
                 self._render_live()
@@ -4932,7 +4986,9 @@ class MeetingPage(QWidget):
             return self._ctrl.correct_segment_speaker(record.id, seq, speaker_id)
 
         dialog = _SegmentSpeakerDialog(segment, choices, self, save_speaker=save, live=live)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        with _quiet_tooltips(self):
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if accepted:
             self._speaker_edit_status(record.id, "已更正这一段的发言人，人工更正会保留。" if live else
                                       "已更正这一段的发言人；请核对纪要中的相关归属。", transient=True)
 
@@ -5093,7 +5149,7 @@ class MeetingPage(QWidget):
         index = self._opt_model.findData(defaults.model_id)
         self._opt_model.setCurrentIndex(max(0, index))
         self._opt_model.blockSignals(False)
-        self._opt_model.setToolTip(self._opt_model.currentText())
+        self._opt_model._sync_overflow_tooltip()
         index = self._opt_language.findData(defaults.language)
         self._opt_language.setCurrentIndex(max(0, index))
         self._update_card_notes()
@@ -5611,7 +5667,8 @@ class MeetingPage(QWidget):
         box.setDefaultButton(end)
         box.setEscapeButton(back)
         _style_dialog_box(box, danger_btn=end)
-        box.exec()
+        with _quiet_tooltips(self):
+            box.exec()
         if box.clickedButton() == end:
             self.end_requested.emit()
 
