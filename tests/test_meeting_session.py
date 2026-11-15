@@ -443,9 +443,34 @@ class TestGeneration:
         config.set("meeting.confirmed_remote_hosts", ["api.example.com"])
         config.set("llm.api_url", "https://api.example.com/v1")
         assert controller.remote_host_needing_confirmation() == ""
+        config.set("llm.api_url", "https://api.example.com:8443/v1")
+        assert controller.remote_host_needing_confirmation() == "https://api.example.com:8443"
         config.set("llm.api_url", "http://api.example.com/v1")
         assert controller.remote_host_needing_confirmation() == "http://api.example.com"
         controller.confirm_remote_host("http://api.example.com")
+        assert controller.remote_host_needing_confirmation() == ""
+
+    def test_remote_host_confirmation_scopes_by_effective_port(self, controller, config):
+        config.set("llm.api_url", "https://gateway.example.com:9443/v1")
+        assert controller.remote_host_needing_confirmation() == "https://gateway.example.com:9443"
+        controller.confirm_remote_host("https://gateway.example.com:9443")
+        assert controller.remote_host_needing_confirmation() == ""
+        assert config.get("meeting.confirmed_remote_hosts") == ["https://gateway.example.com:9443"]
+
+        # Switching port on the same scheme+host must require fresh user confirmation.
+        config.set("llm.api_url", "https://gateway.example.com:8443/v1")
+        assert controller.remote_host_needing_confirmation() == "https://gateway.example.com:8443"
+        controller.confirm_remote_host("gateway.example.com:8443")
+        assert controller.remote_host_needing_confirmation() == ""
+        assert "https://gateway.example.com:8443" in config.get("meeting.confirmed_remote_hosts")
+
+        # Explicit default port (:443 for https, :80 for http) canonicalizes without port suffix.
+        config.set("llm.api_url", "https://api.example.com:443/v1")
+        assert controller.remote_host_needing_confirmation() == "https://api.example.com"
+        controller.confirm_remote_host("https://api.example.com:443/v1")
+        assert controller.remote_host_needing_confirmation() == ""
+        assert "https://api.example.com" in config.get("meeting.confirmed_remote_hosts")
+        config.set("llm.api_url", "https://api.example.com/v1")
         assert controller.remote_host_needing_confirmation() == ""
 
     def test_cancel_generation_is_not_reported_as_a_failure(self, controller):

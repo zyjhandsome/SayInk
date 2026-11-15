@@ -189,9 +189,32 @@ def _build_environment() -> dict[str, str]:
     env = os.environ.copy()
     if sys.platform == "win32":
         windows = Path(os.environ["SystemRoot"])
+        prefix = Path(sys.prefix)
+        base_prefix = Path(sys.base_prefix)
         # Qt imports Windows' ICU DLLs. A developer PATH can make PyInstaller
-        # collect an incompatible same-name DLL from another application.
-        env["PATH"] = os.pathsep.join(map(str, (windows / "System32", windows, sys.base_prefix)))
+        # collect an incompatible same-name DLL from another application, while
+        # venv and Conda environments still need Python's own DLL directories
+        # (OpenSSL, SQLite, libffi, etc.).
+        candidates = (
+            windows / "System32",
+            windows,
+            prefix,
+            prefix / "Scripts",
+            prefix / "Library" / "bin",
+            prefix / "DLLs",
+            base_prefix,
+            base_prefix / "Library" / "bin",
+            base_prefix / "DLLs",
+        )
+        seen: set[str] = set()
+        path_entries: list[str] = []
+        for candidate in candidates:
+            entry = str(candidate)
+            norm = os.path.normcase(os.path.normpath(entry))
+            if norm not in seen and candidate.is_dir():
+                seen.add(norm)
+                path_entries.append(entry)
+        env["PATH"] = os.pathsep.join(path_entries)
     return env
 
 

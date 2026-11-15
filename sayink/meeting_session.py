@@ -228,13 +228,46 @@ def minutes_settings_complete(config: Config) -> bool:
     return polish_settings_complete(*minutes_settings(config))
 
 
-def _format_remote_origin(scheme: str, host: str) -> str:
-    bracketed = f"[{host}]" if ":" in host else host
-    return f"{scheme}://{bracketed}"
+_DEFAULT_SCHEME_PORTS: dict[str, int] = {"http": 80, "https": 443}
 
 
-def _confirmed_remote_origins(entries) -> set[tuple[str, str]]:
-    origins: set[tuple[str, str]] = set()
+def _effective_port(scheme: str, port: int | None) -> int:
+    if port is not None:
+        return int(port)
+    return _DEFAULT_SCHEME_PORTS.get(scheme.lower(), 443)
+
+
+def _format_remote_origin(scheme: str, host: str, port: int | None = None) -> str:
+    norm_scheme = scheme.lower()
+    clean_host = host.strip("[]").lower()
+    eff_port = _effective_port(norm_scheme, port)
+    bracketed = f"[{clean_host}]" if ":" in clean_host else clean_host
+    if eff_port == _DEFAULT_SCHEME_PORTS.get(norm_scheme):
+        return f"{norm_scheme}://{bracketed}"
+    return f"{norm_scheme}://{bracketed}:{eff_port}"
+
+
+def _parse_bare_host_port(item: str) -> tuple[str, int | None] | None:
+    stripped = item.strip()
+    if not stripped:
+        return None
+    unbracketed = stripped.strip("[]")
+    try:
+        ipaddress.ip_address(unbracketed)
+        return unbracketed.lower(), None
+    except ValueError:
+        pass
+    parsed, raw_host, error = _url_parts(f"https://{stripped}")
+    if error or parsed is None:
+        return None
+    hostname = raw_host.strip("[]").lower()
+    if not hostname:
+        return None
+    return hostname, parsed.port
+
+
+def _confirmed_remote_origins(entries) -> set[tuple[str, str, int]]:
+    origins: set[tuple[str, str, int]] = set()
     for raw in entries or ():
         item = str(raw or "").strip().lower()
         if not item:
@@ -243,16 +276,21 @@ def _confirmed_remote_origins(entries) -> set[tuple[str, str]]:
             parsed, raw_host, error = _url_parts(item)
             host = raw_host.strip("[]").lower()
             if not error and parsed is not None and parsed.scheme in {"http", "https"} and host:
-                origins.add((parsed.scheme, host))
+                scheme = parsed.scheme.lower()
+                origins.add((scheme, host, _effective_port(scheme, parsed.port)))
         else:
             # Backward-compatible with legacy bare-hostname entries, scoped to
-            # HTTPS so downgrading https://host -> http://host requires confirmation.
-            origins.add(("https", item.strip("[]")))
+            # HTTPS default port (unless an explicit port was included) so
+            # downgrading https://host -> http://host or switching ports requires confirmation.
+            bare = _parse_bare_host_port(item)
+            if bare is not None:
+                hostname, explicit_port = bare
+                origins.add(("https", hostname, _effective_port("https", explicit_port)))
     return origins
 
 
 def remote_host_needing_confirmation(config: Config) -> str:
-    """``scheme://host`` when the minutes endpoint is remote and not yet confirmed."""
+    """``scheme://host[:port]`` when the minutes endpoint is remote and not yet confirmed."""
     api_url, _key, _model = minutes_settings(config)
     if not api_url or is_local_endpoint(api_url):
         return ""
@@ -263,8 +301,9 @@ def remote_host_needing_confirmation(config: Config) -> str:
     host = raw_host.strip("[]").lower()
     if not host or scheme not in {"http", "https"}:
         return ""
+    port = _effective_port(scheme, parsed.port)
     confirmed = _confirmed_remote_origins(config.get("meeting.confirmed_remote_hosts", []))
-    return "" if (scheme, host) in confirmed else _format_remote_origin(scheme, host)
+    return "" if (scheme, host, port) in confirmed else _format_remote_origin(scheme, host, port)
 
 
 def confirm_remote_host(config: Config, host: str) -> None:
@@ -279,15 +318,25 @@ def confirm_remote_host(config: Config, host: str) -> None:
         hostname = raw_host.strip("[]").lower()
         if scheme not in {"http", "https"} or not hostname:
             return
-        canonical = _format_remote_origin(scheme, hostname)
+        port = _effective_port(scheme, parsed.port)
+        canonical = _format_remote_origin(scheme, hostname, port)
     else:
+        bare = _parse_bare_host_port(item)
+        if bare is None:
+            return
+        hostname, explicit_port = bare
         api_url, _key, _model = minutes_settings(config)
         parsed_api, raw_api_host, api_error = _url_parts(api_url)
         api_host = "" if api_error else raw_api_host.strip("[]").lower()
         api_scheme = "" if (api_error or parsed_api is None) else (parsed_api.scheme or "").lower()
-        hostname = item.strip("[]")
-        scheme = api_scheme if api_host == hostname and api_scheme in {"http", "https"} else "https"
-        canonical = _format_remote_origin(scheme, hostname)
+        api_port = None if (api_error or parsed_api is None) else parsed_api.port
+        if api_host == hostname and api_scheme in {"http", "https"}:
+            scheme = api_scheme
+            port = _effective_port(scheme, explicit_port if explicit_port is not None else api_port)
+        else:
+            scheme = "https"
+            port = _effective_port("https", explicit_port)
+        canonical = _format_remote_origin(scheme, hostname, port)
     hosts = list(config.get("meeting.confirmed_remote_hosts", []) or [])
     if canonical not in {str(h).strip().lower() for h in hosts}:
         hosts.append(canonical)

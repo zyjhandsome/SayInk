@@ -296,7 +296,7 @@ begin
     if ProcHandle <> 0 then
     begin
       Log('Waiting for updating SayInk PID ' + IntToStr(WaitPid) + ' to exit cleanly');
-      WaitForSingleObject(ProcHandle, 12000);
+      WaitForSingleObject(ProcHandle, 18000);
       CloseHandle(ProcHandle);
     end;
   end;

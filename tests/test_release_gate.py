@@ -121,9 +121,29 @@ def test_windows_packaging_excludes_unrelated_dll_search_paths(monkeypatch):
 
     env = build._build_environment()
     windows = Path(r"C:\Windows")
-    assert env["PATH"].split(os.pathsep) == [
-        str(windows / "System32"), str(windows), sys.base_prefix,
-    ]
+    prefix = Path(sys.prefix)
+    base_prefix = Path(sys.base_prefix)
+    candidates = (
+        windows / "System32",
+        windows,
+        prefix,
+        prefix / "Scripts",
+        prefix / "Library" / "bin",
+        prefix / "DLLs",
+        base_prefix,
+        base_prefix / "Library" / "bin",
+        base_prefix / "DLLs",
+    )
+    expected: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        norm = os.path.normcase(os.path.normpath(str(candidate)))
+        if norm not in seen and candidate.is_dir():
+            seen.add(norm)
+            expected.append(str(candidate))
+    entries = env["PATH"].split(os.pathsep)
+    assert entries == expected
+    assert r"D:\Poppler\Library\bin" not in entries
     assert os.environ["PATH"] == r"D:\Poppler\Library\bin"
 
 

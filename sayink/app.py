@@ -118,7 +118,7 @@ MEETING_IDLE_REMINDER_SEC = 15 * 60
 # One event-loop turn after the bar painted 「录音中」 before opening the device.
 CONTINUOUS_START_DELAY_MS = 50
 QUIT_POLL_MS = 80
-QUIT_NATIVE_DRAIN_TIMEOUT_S = 12.0
+QUIT_NATIVE_DRAIN_TIMEOUT_S = 8.0
 UPDATE_CHECK_STARTUP_DELAY_MS = 5000
 
 
@@ -3487,9 +3487,9 @@ class App(QObject):
             for attr in ("_main", "_floating", "_tray", "_recovery_dialog")
             if (surface := self._safe_attr(attr)) is not None
         ]
+        seen_ids = {id(s) for s in surfaces}
         main = self._safe_attr("_main")
         if main is not None:
-            seen_ids = {id(s) for s in surfaces}
             for child_attr in (
                 "settings_panel",
                 "history_panel",
@@ -3506,7 +3506,18 @@ class App(QObject):
                 ):
                     seen_ids.add(id(child))
                     surfaces.append(child)
-        apply_theme(QApplication.instance(), mode=theme_mode, surfaces=surfaces)
+        qapp = QApplication.instance()
+        if qapp is not None:
+            top_level_fn = getattr(qapp, "topLevelWidgets", None)
+            for widget in (top_level_fn() if callable(top_level_fn) else ()):
+                if (
+                    widget is not None
+                    and id(widget) not in seen_ids
+                    and callable(getattr(widget, "reapply_theme", None))
+                ):
+                    seen_ids.add(id(widget))
+                    surfaces.append(widget)
+        apply_theme(qapp, mode=theme_mode, surfaces=surfaces)
         onb = self._safe_attr("_onboarding")
         refresh_onb = getattr(onb, "refresh_theme", None) if onb is not None else None
         if callable(refresh_onb):
@@ -3795,6 +3806,13 @@ class App(QObject):
         save_rec_notes = getattr(panel, "_save_record_notes", None)
         if callable(save_rec_notes):
             save_rec_notes()
+        cleanup = getattr(panel, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+        else:
+            cleanup_temp = getattr(getattr(panel, "_audio_player", None), "cleanup_temp_files", None)
+            if callable(cleanup_temp):
+                cleanup_temp()
         self._meeting.shutdown(wait_ms=0)
         self._hotkey_mgr.stop()
         if self._recorder.is_recording:
@@ -3833,9 +3851,34 @@ class App(QObject):
         self._config.save_immediate()
         self._complete_quit_when_idle()
 
+    def _check_quit_drain_deadline(self) -> tuple[bool, float]:
+        now = time.monotonic()
+        timeout_s = float(
+            self._safe_attr("_quit_drain_timeout_s", QUIT_NATIVE_DRAIN_TIMEOUT_S)
+        )
+        deadline = self._safe_attr("_quit_drain_deadline")
+        if deadline is None:
+            deadline = now + max(0.0, timeout_s)
+            self._quit_drain_deadline = deadline
+        return now >= deadline, timeout_s
+
     def _complete_quit_when_idle(self):
-        if getattr(self._recorder, "storage_busy", False) is True:
-            self._later(QUIT_POLL_MS, self._complete_quit_when_idle)
+        recorder = self._safe_attr("_recorder")
+        if getattr(recorder, "storage_busy", False) is True:
+            expired, timeout_s = self._check_quit_drain_deadline()
+            if not expired:
+                self._later(QUIT_POLL_MS, self._complete_quit_when_idle)
+                return
+            save_timer = getattr(self._safe_attr("_config"), "_save_timer", None)
+            if getattr(save_timer, "isActive", lambda: False)() is True:
+                self._config.save_immediate()
+            log.warning(
+                "退出等待录音缓存落盘超时（%.1fs），强制结束进程",
+                timeout_s,
+            )
+            self._release_instance_lock_once()
+            QApplication.quit()
+            _force_process_exit(0)
             return
         save_timer = getattr(self._config, "_save_timer", None)
         if getattr(save_timer, "isActive", lambda: False)() is True:
@@ -3861,15 +3904,8 @@ class App(QObject):
                    for worker in getattr(owner, "running_workers", ())
                    if isinstance(worker, QThread) and worker.isRunning()]
         if pending:
-            now = time.monotonic()
-            timeout_s = float(
-                self._safe_attr("_quit_drain_timeout_s", QUIT_NATIVE_DRAIN_TIMEOUT_S)
-            )
-            deadline = self._safe_attr("_quit_drain_deadline")
-            if deadline is None:
-                deadline = now + max(0.0, timeout_s)
-                self._quit_drain_deadline = deadline
-            if now < deadline:
+            expired, timeout_s = self._check_quit_drain_deadline()
+            if not expired:
                 self._later(QUIT_POLL_MS, self._complete_quit_when_idle)
                 return
             log.warning(
