@@ -6,6 +6,7 @@ directory, and speaker embeddings are not returned to the caller.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
@@ -17,6 +18,11 @@ from sayink.audio_utils import TARGET_SAMPLE_RATE
 
 MEDIA_SOURCE = "import_media"
 _SAMPLES_PER_MS = TARGET_SAMPLE_RATE // 1000
+# Reading the file is the short part of an import. The bar reserves the first
+# 30 points for decode and the rest for recognition, so a finished read is 30,
+# not 100. Callers must not leave the UI on that 30 with a "已读取" label.
+_READ_PROGRESS_BUDGET = 30
+_RECOGNITION_PROGRESS_BUDGET = 70
 
 
 @dataclass(frozen=True)
@@ -267,6 +273,15 @@ def _apply_final_speakers(turns: list[MediaTurn], mapping: dict) -> tuple[MediaT
     return tuple(revised)
 
 
+def _preview_lines(rows, *, limit: int = 8) -> str:
+    lines: list[str] = []
+    for turn in rows[-limit:]:
+        text = " ".join(str(getattr(turn, "text", "") or "").split())
+        if text:
+            lines.append(text[:100])
+    return "\n".join(lines)
+
+
 def recognize_with_session(
     chunks,
     decode_chunk,
@@ -276,6 +291,7 @@ def recognize_with_session(
     cancel,
     finalize=None,
     progress=None,
+    preview=None,
 ) -> RecognitionResult:
     """Recognize ready-cut chunks. ``cancel`` is checked before each new chunk.
 
@@ -321,6 +337,8 @@ def recognize_with_session(
             ))
         if progress is not None:
             progress(index + 1, total)
+        if preview is not None and rows:
+            preview(_preview_lines(rows))
         if cancel():
             mapping = _mapping(session, threshold, rows, finalize, final_assignments)
             return RecognitionResult(_apply_final_speakers(rows, mapping), True)
@@ -422,14 +440,35 @@ def _segment_source_media(
                 close_stream()
 
     audio_ms = int(timeline_samples * 1000 / TARGET_SAMPLE_RATE)
-    read_msg = f"已读取 {audio_ms / 1000:.0f} 秒音频"
+    # The percent-aware path owns the next status line ("正在识别"). Emitting
+    # "已读取 N 秒（30%）" here is what left the bar stuck after the file was
+    # already fully read.
     if progress is not None and progress_cb is None:
-        progress(read_msg)
-    if progress_cb is not None:
-        progress_cb(30, read_msg)
+        progress(f"已读取 {audio_ms / 1000:.0f} 秒音频")
     if cancel is not None and cancel():
         return None, audio_ms, RecognitionResult((), True, audio_ms=audio_ms, audio_path=resolved_audio_path)
     return chunks, audio_ms, None
+
+
+def _recognition_percent(index: int, fraction: float, count: int) -> int:
+    """Map chunk progress onto the 30–99 band. 100 is completion.
+
+    ``index`` is 1-based and ``fraction`` is how far the current chunk has
+    been decoded. Leading silence is not treated as work already done.
+    """
+    total = max(1, int(count))
+    done = (max(1, int(index)) - 1) + max(0.0, min(1.0, float(fraction)))
+    return min(99, _READ_PROGRESS_BUDGET + int(_RECOGNITION_PROGRESS_BUDGET * done / total))
+
+
+def _decode_accepts_on_progress(fn) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "on_progress" in params:
+        return True
+    return any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
 
 
 def recognize_file(
@@ -443,6 +482,7 @@ def recognize_file(
     progress=None,
     glossary=(),
     progress_cb: Callable[[int, str], None] | None = None,
+    preview_cb: Callable[[str], None] | None = None,
     speaker_model_enabled: bool = True,
     speaker_activity_enabled: bool = False,
     activity_path: str | Path | None | object = _UNSET,
@@ -454,7 +494,8 @@ def recognize_file(
 
     def _emit_decode_progress(pct: int, msg: str) -> None:
         if progress_cb is not None:
-            progress_cb(min(30, max(0, int(pct * 30 // 100))), msg)
+            scaled = int(pct) * _READ_PROGRESS_BUDGET // 100
+            progress_cb(min(_READ_PROGRESS_BUDGET, max(0, scaled)), msg)
 
     if cancel is not None and cancel():
         return RecognitionResult((), True)
@@ -478,6 +519,26 @@ def recognize_file(
     if early is not None:
         return early
     assert chunks is not None
+    reported = {"pct": -1}
+
+    def emit_recognition(fraction: float, index: int) -> None:
+        if not chunks or (progress is None and progress_cb is None):
+            return
+        pct = _recognition_percent(index, fraction, len(chunks))
+        if pct < reported["pct"]:
+            pct = reported["pct"]
+        else:
+            reported["pct"] = pct
+        msg = f"正在识别 {index}/{len(chunks)} 段"
+        if progress_cb is not None:
+            progress_cb(pct, msg)
+        elif progress is not None:
+            progress(msg)
+
+    if chunks:
+        # Publish this before the speaker model loads. Otherwise the last line
+        # the UI has is "已读取（30%）" for the whole first segment.
+        emit_recognition(0.0, 1)
     effective_speaker_path = speaker_path if speaker_model_enabled else None
     available = bool(effective_speaker_path and Path(effective_speaker_path).is_file())
     embedder_kwargs: dict = {
@@ -488,24 +549,30 @@ def recognize_file(
         embedder_kwargs["activity_path"] = activity_path
     embedder = make_embedder(effective_speaker_path, **embedder_kwargs)
     session = MeetingSpeakerSession.for_embedder(embedder)
+    decode_with_progress = _decode_accepts_on_progress(recognizer.decode_meeting_blocking)
+    index_box = {"n": 0}
 
     def decode_chunk(chunk):
-        turns, error = recognizer.decode_meeting_blocking(
-            chunk.audio,
-            turn_analyzer=_chunk_analyzer(embedder, session, chunk),
-            cancelled=cancel,
-        )
+        index_box["n"] += 1
+        index = index_box["n"]
+
+        def on_progress(done: int, total: int) -> None:
+            total_samples = max(1, int(total))
+            done_samples = max(0, min(total_samples, int(done)))
+            emit_recognition(done_samples / total_samples, index)
+
+        emit_recognition(0.0, index)
+        kwargs = {
+            "turn_analyzer": _chunk_analyzer(embedder, session, chunk),
+            "cancelled": cancel,
+        }
+        if decode_with_progress:
+            kwargs["on_progress"] = on_progress
+        turns, error = recognizer.decode_meeting_blocking(chunk.audio, **kwargs)
         if error:
             raise AudioDecodeError(error)
+        emit_recognition(1.0, index)
         return turns
-
-    def _on_chunk_progress(done: int, total_chunks: int) -> None:
-        msg = f"正在识别 {done}/{total_chunks} 段"
-        if progress is not None and progress_cb is None:
-            progress(msg)
-        if progress_cb is not None:
-            pct = 30 + int(70 * done // max(1, total_chunks))
-            progress_cb(min(100, max(30, pct)), msg)
 
     result = recognize_with_session(
         chunks,
@@ -513,7 +580,7 @@ def recognize_file(
         session,
         threshold=float(embedder.cluster_threshold),
         cancel=cancel,
-        progress=_on_chunk_progress if (progress is not None or progress_cb is not None) else None,
+        preview=preview_cb,
     )
     if result.error and not result.turns:
         raise AudioDecodeError(result.error)

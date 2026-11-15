@@ -130,10 +130,16 @@ def test_decode_meeting_blocking_stays_on_the_caller_thread():
     def analyzer(clip, cancelled=None):
         return [SpeakerTurn(0, len(clip), np.zeros(1, dtype=np.float32), False)]
 
+    reported: list[tuple[int, int]] = []
     turns, error = recognizer.decode_meeting_blocking(
-        audio, turn_analyzer=analyzer, cancelled=lambda: False,
+        audio,
+        turn_analyzer=analyzer,
+        cancelled=lambda: False,
+        on_progress=lambda done, total: reported.append((done, total)),
     )
     assert error == "" and turns and turns[0].text == "你好"
+    assert reported and reported[0] == (0, len(audio))
+    assert reported[-1] == (len(audio), len(audio))
     recognizer.deleteLater()
 
 
@@ -174,6 +180,17 @@ def test_store_writes_media_times_and_keeps_them_after_history_cleanup(tmp_path)
         assert [segment.raw_text for segment in meetings.get_segments(record.id)] == ["内地的评论", "我没有想过"]
     finally:
         history.close(timeout=2)
+
+
+def test_recognition_percent_ignores_leading_silence():
+    from sayink.media_import import _recognition_percent
+
+    assert _recognition_percent(1, 0.0, 4) == 30
+    assert _recognition_percent(1, 0.0, 4) < 50
+    assert _recognition_percent(1, 1.0, 4) < _recognition_percent(2, 0.0, 4) or (
+        _recognition_percent(1, 1.0, 4) == _recognition_percent(2, 0.0, 4)
+    )
+    assert _recognition_percent(4, 1.0, 4) == 99
 
 
 def _controller(config, tmp_path):
@@ -262,9 +279,9 @@ def test_meeting_page_imports_a_file_and_cancel_keeps_the_partial_transcript(con
         cancel = next(item for item in page.findChildren(QPushButton) if item.accessibleName() == "取消导入音视频")
         assert not cancel.isHidden()
         assert not page._start_btn.isEnabled()
-        assert page._detail_title.text() == "clip"
+        assert page._import_filename.text() == "clip" or page._import_filename.toolTip() == "clip"
         assert page._content_stack.isHidden()
-        assert _wait_until(lambda: "正在识别 1/3 段" in page._import_progress.text())
+        assert _wait_until(lambda: "正在识别" in page._import_progress.text() and "段" not in page._import_progress.text())
         assert not page._import_progress.isHidden()
         cancel.click()
         assert _wait_until(lambda: not controller.importing_media)
@@ -280,6 +297,74 @@ def test_meeting_page_imports_a_file_and_cancel_keeps_the_partial_transcript(con
         history.close(timeout=2)
 
 
+def test_explicit_job_percent_wins_over_segment_fraction(config, tmp_path):
+    """「1/6 段（45%）」里的 45 是整段导入进度，不能再按 1/6 画成 17%。"""
+    controller, history = _controller(config, tmp_path)
+    page = MeetingPage(config, controller)
+    try:
+        controller._importing_media = True
+        page._on_media_progress("正在识别 1/6 段（45%）")
+        assert page._import_progress_bar.value() == 45
+        assert "45%" in page._import_progress.text()
+        assert "段" not in page._import_progress.text()
+        # 没有显式百分比时，仍按段数比例显示。
+        page._on_media_progress("正在识别第 3 / 10 段")
+        assert page._import_progress_bar.value() == 30
+        assert "30%" in page._import_progress.text()
+    finally:
+        controller._importing_media = False
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_finished_read_does_not_stay_on_thirty_percent_while_recognizing(tmp_path, monkeypatch):
+    """文件读完后不能停在「已读取 …（30%）」；识别一开始就要换成识别进度，并随音频往前走。"""
+    source = tmp_path / "talk.mp4"
+    source.write_bytes(b"original")
+    chunks = [
+        AudioChunk(0, 16_000, np.ones(16_000, dtype=np.float32)),
+        AudioChunk(16_000, 32_000, np.ones(16_000, dtype=np.float32)),
+    ]
+    monkeypatch.setattr(
+        "sayink.media_import.iter_media_pcm_timed",
+        lambda path, *, cancel=None, progress_cb=None: iter([(np.ones(32_000, dtype=np.float32), 0, 0)]),
+    )
+    monkeypatch.setattr(
+        "sayink.media_import.segment_timed_blocks",
+        lambda *args, **kwargs: (chunks, 32_000),
+    )
+    seen: list[tuple[int, str]] = []
+
+    class Recognizer:
+        def decode_meeting_blocking(self, audio, *, turn_analyzer, cancelled, on_progress=None):
+            recog = [(pct, msg) for pct, msg in seen if "正在识别" in msg]
+            assert recog, seen
+            assert not any(msg.startswith("已读取") for _, msg in seen), seen
+            assert recog[0][0] >= 30
+            if on_progress is not None:
+                before = len(seen)
+                on_progress(max(1, len(audio) // 2), len(audio))
+                moved = [pct for pct, msg in seen[before:] if "正在识别" in msg and pct > recog[0][0]]
+                assert moved, seen
+            return [_turn("一段", 0, len(audio))], ""
+
+    result = recognize_file(
+        source,
+        recognizer=Recognizer(),
+        speaker_path=None,
+        vad="energy",
+        vad_path=None,
+        cancel=lambda: False,
+        progress_cb=lambda pct, msg: seen.append((int(pct), msg)),
+    )
+    assert [turn.text for turn in result.turns] == ["一段", "一段"]
+    percents = [pct for pct, _ in seen]
+    assert percents[0] == 0 and percents[-1] == 100
+    assert all(earlier <= later for earlier, later in zip(percents, percents[1:], strict=False))
+    assert any(pct > 30 for pct, msg in seen if "正在识别" in msg)
+
+
 def test_empty_library_keeps_import_progress_visible(config, tmp_path):
     controller, history = _controller(config, tmp_path)
     page = MeetingPage(config, controller)
@@ -293,8 +378,9 @@ def test_empty_library_keeps_import_progress_visible(config, tmp_path):
         page.refresh()
         assert not page._detail_pane.isHidden()
         assert not page._import_progress.isHidden()
-        assert "1/10" in page._import_progress.text()
-        assert "demo.wav" in page._detail_title.text()
+        assert "正在识别" in page._import_progress.text()
+        assert "段" not in page._import_progress.text()
+        assert "demo.wav" in page._import_filename.toolTip()
     finally:
         controller._importing_media = False
         page.deleteLater()
@@ -474,8 +560,15 @@ def test_destroying_the_controller_stops_the_import_thread(config, tmp_path):
         assert controller._media_job in controller.running_workers
         controller.shutdown(wait_ms=0)
         assert controller._media_job is not None and controller._media_job.isRunning()
+        job = controller._media_job
         controller.deleteLater()
         app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        try:
+            job.previewed.disconnect()
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("import preview stayed connected after the controller was destroyed")
     finally:
         release.set()
         from sayink.meeting_session import _ORPHAN_MEDIA_JOBS

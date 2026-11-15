@@ -16,6 +16,7 @@ first, then automatic end-of-meeting jobs in order
 
 from __future__ import annotations
 
+import inspect
 import ipaddress
 import logging
 import json
@@ -474,6 +475,17 @@ def _bounded_final_assignments(
     return full
 
 
+def _file_mtime_ms(path: str) -> int | None:
+    """Local file modification time in epoch milliseconds, or None when unknown."""
+    if not path:
+        return None
+    try:
+        millis = int(Path(path).stat().st_mtime * 1000)
+    except OSError:
+        return None
+    return millis if millis > 0 else None
+
+
 class MediaCommitError(RuntimeError):
     """Recognition finished, but the meeting row was not stored."""
 
@@ -487,6 +499,7 @@ class _MediaImportJob(QThread):
     """Read and recognize one file away from the UI thread. The runner is injected."""
 
     progressed = pyqtSignal(str)
+    previewed = pyqtSignal(str)
     succeeded = pyqtSignal(object)
     failed = pyqtSignal(str)
 
@@ -498,7 +511,14 @@ class _MediaImportJob(QThread):
 
     def run(self) -> None:
         try:
-            result = self._runner(self._path, self._cancel.is_set, self.progressed.emit)
+            kwargs = {}
+            try:
+                params = inspect.signature(self._runner).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "preview" in params:
+                kwargs["preview"] = self.previewed.emit
+            result = self._runner(self._path, self._cancel.is_set, self.progressed.emit, **kwargs)
             self.succeeded.emit(result)
         except Exception as exc:
             log.warning("导入音视频失败: %s", exc)
@@ -519,6 +539,7 @@ class MeetingController(QObject):
     generation_queued = pyqtSignal(str)         # meeting_id waits in the queue (new, deferred or retrying)
     notice = pyqtSignal(str, str)               # title, detail (for bar / tray)
     media_import_progress = pyqtSignal(str)
+    media_import_preview = pyqtSignal(str)
     media_import_finished = pyqtSignal(str)     # meeting id, or "" when nothing was saved
     media_import_failed = pyqtSignal(str)
 
@@ -573,10 +594,12 @@ class MeetingController(QObject):
         self._media_runner = None
         self._external_block: Callable[[], str] | None = None
         self._media_job: _MediaImportJob | None = None
+        self._media_queue: list[tuple[str, str]] = []
         self._media_title = ""
         self._media_source_path = ""
         self._unsaved_media: tuple | None = None
         self.media_import_notice = ""
+        self.media_queue_notice = ""
         self.transcript_import_notice = ""
         self.srt_skip_note = ""
 
@@ -1285,6 +1308,7 @@ class MeetingController(QObject):
         *,
         title: str = "",
         detect_structure: bool = True,
+        started_at: int | None = None,
     ) -> MeetingRecord | None:
         """Save pasted text as an ended meeting. The user generates minutes later."""
         parsed = parse_transcript(text or "", detect_structure=detect_structure)
@@ -1292,7 +1316,9 @@ class MeetingController(QObject):
             self.transcript_import_notice = "没有可导入的文字"
             return None
         try:
-            record = self._store.create_meeting_from_transcript(parsed, title=title)
+            record = self._store.create_meeting_from_transcript(
+                parsed, title=title, started_at=started_at,
+            )
         except Exception as exc:
             self.transcript_import_notice = f"写入数据库失败：{exc}"
             return None
@@ -1336,22 +1362,41 @@ class MeetingController(QObject):
     def cancel_media_import(self) -> None:
         self._media_cancel.set()
 
+    def queued_media(self) -> tuple[tuple[str, str], ...]:
+        """Files waiting behind the one being recognized: ``(path, title)``."""
+        return tuple(getattr(self, "_media_queue", ()) or ())
+
+    def remove_queued_media(self, index: int) -> None:
+        """Drop a file that has not started. The current recognition stays."""
+        queue = getattr(self, "_media_queue", None)
+        if queue is None or not 0 <= int(index) < len(queue):
+            return
+        del queue[int(index)]
+
     def start_media_import(self, path: str, *, title: str = "") -> str:
         from sayink.audio_file_decoder import SUPPORTED_EXTENSIONS
 
         suffix = Path(path).suffix.lower()
         if suffix not in SUPPORTED_EXTENSIONS:
             return f"不支持的文件类型：{suffix or '无扩展名'}"
+        chosen_title = (title or Path(path).stem).strip()
+        if self._importing_media:
+            self._media_queue.append((str(path), chosen_title))
+            self.media_queue_notice = f"已加入队列，前面还有 {len(self._media_queue)} 个文件"
+            return ""
         reason = self.begin_media_import()
         if reason:
             return reason
         if self._media_runner is None:
             self._importing_media = False
             return "语音模型未就绪，请等待模型加载完成后再导入音视频"
-        self._media_title = (title or Path(path).stem).strip()
+        # A previous "queued" notice must not stick to the file that just started.
+        self.media_queue_notice = ""
+        self._media_title = chosen_title
         self._media_source_path = str(path or "")
         job = _MediaImportJob(path, self._media_runner, self._media_cancel, None)
         job.progressed.connect(self.media_import_progress)
+        job.previewed.connect(self.media_import_preview)
         job.succeeded.connect(self._on_media_job_done)
         job.failed.connect(self._on_media_job_failed)
         job.finished.connect(self._retire_media_job)
@@ -1401,21 +1446,25 @@ class MeetingController(QObject):
                 glossary=glossary,
                 meeting_id=target_id,
                 audio_path=resolved_audio_path,
+                started_at=_file_mtime_ms(resolved_audio_path),
             )
             if record is None:
                 return None
             saved = self._store.get_meeting(record.id) if self._store.flush() else None
             if saved is None:
-                self._unsaved_media = (result, title, record.id, resolved_audio_path)
+                self._remember_unsaved(result, title, record.id, resolved_audio_path)
                 raise MediaCommitError("识别已经完成，但写入数据库失败。可以重试保存，不必重新识别。")
-            self._unsaved_media = None
+            # A later file in the queue must not erase an earlier file's retry payload.
+            pending = self._unsaved_media
+            if pending is None or pending[0] is result:
+                self._unsaved_media = None
             self.auto_name_speakers(saved.id, _emit=False, record=saved)
             self.meeting_changed.emit(saved.id)
             return saved
         except MediaCommitError:
             raise
         except Exception as exc:
-            self._unsaved_media = (result, title, target_id, resolved_audio_path)
+            self._remember_unsaved(result, title, target_id, resolved_audio_path)
             raise MediaCommitError(f"写入数据库失败：{exc}") from exc
         finally:
             self._importing_media = False
@@ -1428,6 +1477,7 @@ class MeetingController(QObject):
         except MediaCommitError as exc:
             self.media_import_notice = str(exc)
             self.media_import_finished.emit("")
+            self._kick_media_queue()
             return
         error = str(getattr(result, "error", "") or "")
         if saved is None and getattr(result, "cancelled", False):
@@ -1441,6 +1491,7 @@ class MeetingController(QObject):
         else:
             self.media_import_notice = ""
         self.media_import_finished.emit(saved.id if saved is not None else "")
+        self._kick_media_queue()
 
     def retry_media_save(self) -> str:
         """Write the last recognized file again after a database failure."""
@@ -1458,6 +1509,7 @@ class MeetingController(QObject):
             self.auto_name_speakers(meeting_id, _emit=False)
             self.meeting_changed.emit(meeting_id)
             self.media_import_finished.emit(meeting_id)
+            self._kick_media_queue()
             return ""
         self._importing_media = True
         self._media_title = title
@@ -1472,6 +1524,7 @@ class MeetingController(QObject):
             return self.media_import_notice or "没有识别到文字"
         self.media_import_notice = ""
         self.media_import_finished.emit(saved.id)
+        self._kick_media_queue()
         return ""
 
     def _retire_media_job(self) -> None:
@@ -1486,6 +1539,25 @@ class MeetingController(QObject):
         self._importing_media = False
         self._media_cancel.clear()
         self.media_import_failed.emit(message or "导入音视频失败")
+        self._kick_media_queue()
+
+    def _remember_unsaved(self, result, title: str, meeting_id: str, audio_path: str) -> None:
+        """Keep the first recognized file that still needs a database write."""
+        pending = self._unsaved_media
+        if pending is not None and pending[0] is not result:
+            return
+        self._unsaved_media = (result, title, meeting_id, audio_path)
+
+    def _kick_media_queue(self) -> None:
+        # Starting the next file used to replace the only copy of a transcript
+        # that had already been recognized but not saved.
+        if self._unsaved_media or self._importing_media or not self._media_queue:
+            return
+        path, title = self._media_queue.pop(0)
+        message = self.start_media_import(path, title=title)
+        if message:
+            self.media_import_failed.emit(message)
+            self._kick_media_queue()
 
     def transcript_shape(self, record: MeetingRecord, lines: list[TranscriptLine] | None = None) -> tuple[bool, bool]:
         """(speakers are real, timestamps are real).
@@ -2127,6 +2199,7 @@ class MeetingController(QObject):
         return super().event(event)
 
     def _stop_media_job(self, *, force: bool, wait_ms: int = 0) -> None:
+        self._media_queue.clear()
         self.cancel_media_import()
         job = self._media_job
         if job is None:
@@ -2136,7 +2209,7 @@ class MeetingController(QObject):
         if job.isRunning() and force:
             # Keep the QThread alive after this controller is destroyed. Terminating
             # it here deadlocks a Python worker that still needs this thread.
-            for signal in (job.progressed, job.succeeded, job.failed, job.finished):
+            for signal in (job.progressed, job.previewed, job.succeeded, job.failed, job.finished):
                 try:
                     signal.disconnect()
                 except TypeError:

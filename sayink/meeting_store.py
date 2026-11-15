@@ -531,6 +531,7 @@ class MeetingStore:
         *,
         title: str = "",
         meeting_id: str | None = None,
+        started_at: int | None = None,
     ) -> MeetingRecord | None:
         """Create an ended meeting from parsed text. One write covers rows and names.
 
@@ -549,7 +550,7 @@ class MeetingStore:
         assigned, names = assign_speakers(source_turns)
         if not assigned:
             return None
-        started = now_ms()
+        started = now_ms() if started_at is None else int(started_at)
         has_ts = any(turn.offset_ms is not None for _speaker_id, turn in assigned)
         if has_ts:
             span = 0
@@ -632,6 +633,7 @@ class MeetingStore:
         glossary: list[dict[str, Any]] | None = None,
         meeting_id: str | None = None,
         audio_path: str = "",
+        started_at: int | None = None,
     ) -> MeetingRecord | None:
         """Save recognized file turns. The source media itself is not stored.
 
@@ -643,7 +645,7 @@ class MeetingStore:
             return None
         if status not in (STATUS_ENDED, STATUS_INTERRUPTED):
             status = STATUS_ENDED
-        started = now_ms()
+        started = now_ms() if started_at is None else int(started_at)
         span = 0
         for turn in usable:
             span = max(span, int(turn.offset_ms) + int(turn.duration_ms or 0))
@@ -694,6 +696,58 @@ class MeetingStore:
 
         self._write(_insert)
         return record
+
+    def shift_meeting_start(self, meeting_id: str, started_at: int) -> None:
+        """Move a meeting's clock. Relative speech offsets stay the same.
+
+        A negative ``captured_at`` means that paragraph has no clock and stays
+        put. Older rows store the clock only in ``created_at`` (``captured_at``
+        is 0); those move with the meeting so their offset does not jump.
+        """
+        new = int(started_at)
+
+        def _shift(conn: sqlite3.Connection) -> None:
+            row = conn.execute(
+                "SELECT started_at, ended_at FROM meetings WHERE id = ?",
+                (meeting_id,),
+            ).fetchone()
+            if row is None:
+                return
+            old = int(row[0] or 0)
+            delta = new - old
+            ended = row[1]
+            if ended is None:
+                conn.execute(
+                    "UPDATE meetings SET started_at = ? WHERE id = ?",
+                    (new, meeting_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE meetings SET started_at = ?, ended_at = ? WHERE id = ?",
+                    (new, int(ended) + delta, meeting_id),
+                )
+            if delta:
+                conn.execute(
+                    """
+                    UPDATE history
+                    SET captured_at = captured_at + ?, created_at = created_at + ?
+                    WHERE session_id = ? AND captured_at > 0
+                    """,
+                    (delta, delta, meeting_id),
+                )
+                # Older rows have no captured_at. Their offset is derived from
+                # created_at, so that clock has to move with the meeting start.
+                # Negative captured_at means "this paragraph has no clock".
+                conn.execute(
+                    """
+                    UPDATE history
+                    SET created_at = created_at + ?
+                    WHERE session_id = ? AND captured_at = 0
+                    """,
+                    (delta, meeting_id),
+                )
+
+        self._write(_shift)
 
     def end_meeting(
         self,
