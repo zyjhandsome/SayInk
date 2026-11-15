@@ -1,6 +1,9 @@
 """Local audio decoding stays inside the process and never calls ffmpeg."""
 from __future__ import annotations
 
+import ctypes
+import shutil
+import subprocess
 import sys
 import wave
 from pathlib import Path
@@ -77,3 +80,116 @@ def test_media_foundation_reads_pcm_from_a_wav(tmp_path):
     converted, converted_rate, converted_channels = read_pcm16(source, sample_rate=16000, channels=1)
     assert converted_rate == 16000 and converted_channels == 1
     assert abs(converted.size - 16000) <= 8
+
+
+def test_probe_duration_uses_com_vtable_index_12(monkeypatch):
+    import sayink.media_foundation as mf
+
+    seen_indices: list[int] = []
+    cleared: list[int] = []
+
+    def _fake_method(_obj, index: int, _restype, _argtypes):
+        seen_indices.append(index)
+        assert index != 11, "vtable index 11 is 5-arg GetServiceForStream and corrupts the x64 stack"
+
+        def _get_presentation_attr(_reader, stream_idx, _guid_ptr, var_ptr):
+            assert int(stream_idx.value) == mf.MF_SOURCE_READER_MEDIASOURCE
+            prop = ctypes.cast(var_ptr, ctypes.POINTER(mf._PROPVARIANT_U64))[0]
+            prop.vt = 21  # VT_UI8
+            prop.uhVal = 25_000_000
+            return 0
+
+        return _get_presentation_attr
+
+    class _FakeOle32:
+        def PropVariantClear(self, _var_ptr):
+            cleared.append(1)
+            return 0
+
+    monkeypatch.setattr(mf, "_method", _fake_method)
+    duration = mf._probe_duration_100ns(ctypes.c_void_p(0x1234), _FakeOle32())
+    assert seen_indices == [12]
+    assert duration == 25_000_000
+    assert cleared == [1]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Media Foundation is the Windows decoder")
+def test_media_foundation_progress_cb_uses_vtable_12_on_real_wav_and_mp4(tmp_path, monkeypatch):
+    import sayink.media_foundation as mf
+    from sayink.media_foundation import read_pcm16
+
+    orig_method = mf._method
+    called_indices: list[int] = []
+
+    def _spy_method(obj, index: int, restype, argtypes):
+        called_indices.append(index)
+        assert index != 11, "Must never call vtable index 11 (GetServiceForStream)"
+        return orig_method(obj, index, restype, argtypes)
+
+    monkeypatch.setattr(mf, "_method", _spy_method)
+
+    wav_path = tmp_path / "progress_clip.wav"
+    n_samples = int(16000 * 1.5)
+    tone = (np.sin(2 * np.pi * 330 * np.arange(n_samples) / 16000) * 0.3).astype(np.float32)
+    _write_wav(wav_path, tone, 16000)
+
+    wav_progress: list[tuple[int, str]] = []
+    pcm, rate, ch = read_pcm16(
+        wav_path,
+        sample_rate=16000,
+        channels=1,
+        progress_cb=lambda pct, msg: wav_progress.append((pct, msg)),
+    )
+    assert 12 in called_indices
+    assert rate == 16000 and ch == 1 and abs(pcm.size - n_samples) <= 16
+    assert wav_progress and wav_progress[-1][0] == 100
+    assert any(0 <= pct < 100 for pct, _ in wav_progress)
+
+    wav_dec_progress: list[tuple[int, str]] = []
+    decoded_wav = decode_audio_file(
+        wav_path,
+        progress_cb=lambda pct, msg: wav_dec_progress.append((pct, msg)),
+    )
+    assert decoded_wav.size == n_samples
+    assert wav_dec_progress and wav_dec_progress[-1][0] == 100
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        mp4_path = tmp_path / "progress_clip.mp4"
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:r=10:d=2.0",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=2.0",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                str(mp4_path),
+            ],
+            check=True,
+        )
+        called_indices.clear()
+        mp4_progress: list[tuple[int, str]] = []
+        decoded_mp4 = decode_audio_file(
+            mp4_path,
+            progress_cb=lambda pct, msg: mp4_progress.append((pct, msg)),
+        )
+        assert 12 in called_indices
+        assert 11 not in called_indices
+        assert mp4_progress and mp4_progress[-1][0] == 100
+        assert abs(decoded_mp4.size - 32000) <= 2048
+        assert float(np.max(np.abs(decoded_mp4))) > 0.1

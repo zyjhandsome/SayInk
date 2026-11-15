@@ -9,14 +9,34 @@ from __future__ import annotations
 import struct
 import sys
 import wave
+from itertools import chain
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator, NamedTuple
 
 import numpy as np
 
 from sayink.audio_utils import TARGET_SAMPLE_RATE, StreamResampler, resample_mono, to_mono
 
 SUPPORTED_EXTENSIONS = frozenset({".wav", ".mp3", ".m4a", ".aac", ".mp4", ".mov", ".mkv", ".wma", ".flac"})
+LIVE_PTS_ORIGIN_SEC = 1800.0
+_PTS_DISCONTINUITY_100NS = 200_000  # 20 ms
+_STREAM_BLOCK_SAMPLES = TARGET_SAMPLE_RATE // 2  # 0.5 s (8000 samples)
+
+
+class TimedAudioBlock(NamedTuple):
+    """A 16 kHz mono float32 block paired with its true container start position."""
+
+    samples: np.ndarray
+    start_sample: int
+    start_ms: int
+
+    @property
+    def end_sample(self) -> int:
+        return self.start_sample + int(self.samples.size)
+
+    @property
+    def end_ms(self) -> int:
+        return self.end_sample * 1000 // TARGET_SAMPLE_RATE
 
 _KSDATAFORMAT_SUBTYPE_TAIL = b"\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71"
 
@@ -343,3 +363,220 @@ def _read_media_foundation(
         usable = (samples.size // channels) * channels
         samples = to_mono(samples[:usable].reshape(-1, channels))
     return np.ascontiguousarray(samples, dtype=np.float32), rate
+
+
+def _iter_wav_timed(
+    source: Path,
+    *,
+    cancel=None,
+    progress_cb: Callable[[int, str], None] | None = None,
+) -> Iterator[TimedAudioBlock]:
+    cursor = 0
+    for block in iter_wav_pcm(source, cancel=cancel, progress_cb=progress_cb):
+        arr = np.ascontiguousarray(block, dtype=np.float32)
+        if arr.size <= 0:
+            continue
+        yield TimedAudioBlock(arr, cursor, cursor * 1000 // TARGET_SAMPLE_RATE)
+        cursor += int(arr.size)
+    if cursor <= 0:
+        raise AudioDecodeError("文件里没有可识别的声音")
+
+
+def _open_mf_timed_stream(
+    source: Path,
+    *,
+    cancel=None,
+    progress_cb: Callable[[int, str], None] | None = None,
+):
+    from sayink.media_foundation import AudioFoundationError, iter_pcm16_timed
+
+    gen = iter_pcm16_timed(
+        source,
+        cancel=cancel,
+        sample_rate=TARGET_SAMPLE_RATE,
+        channels=1,
+        progress_cb=progress_cb,
+    )
+    try:
+        return gen, next(gen), AudioFoundationError
+    except StopIteration as exc:
+        gen.close()
+        raise AudioDecodeError("文件里没有可识别的声音") from exc
+    except AudioFoundationError as exc:
+        gen.close()
+        if (cancel is not None and cancel()) or "已取消" in str(exc):
+            raise AudioDecodeError("已取消") from exc
+        gen2 = iter_pcm16_timed(source, cancel=cancel, progress_cb=progress_cb)
+        try:
+            return gen2, next(gen2), AudioFoundationError
+        except StopIteration as inner_stop:
+            gen2.close()
+            raise AudioDecodeError("文件里没有可识别的声音") from inner_stop
+        except AudioFoundationError as inner_exc:
+            gen2.close()
+            if (cancel is not None and cancel()) or "已取消" in str(inner_exc):
+                raise AudioDecodeError("已取消") from inner_exc
+            raise AudioDecodeError(str(inner_exc)) from inner_exc
+
+
+def _pcm16_packet_to_mono_f32(pcm: np.ndarray, channels: int) -> tuple[np.ndarray, int]:
+    ch = max(int(channels), 1)
+    usable = (int(pcm.size) // ch) * ch
+    if usable <= 0:
+        return np.zeros(0, dtype=np.float32), 0
+    flt = pcm[:usable].astype(np.float32) * np.float32(1.0 / 32768.0)
+    mono = to_mono(flt.reshape(-1, ch)) if ch > 1 else flt
+    return np.ascontiguousarray(mono, dtype=np.float32), usable // ch
+
+
+class _TimedPcmCoalescer:
+    """Coalesce decoded packets into 16 kHz mono blocks with stateful resampling and PTS tracking."""
+
+    def __init__(self, *, live_origin_sec: float) -> None:
+        self._live_anchor_100ns = int(live_origin_sec * 10_000_000) if live_origin_sec > 0 else 0
+        self._origin_100ns: int | None = None
+        self._expected_pts_100ns: int | None = None
+        self._resampler: StreamResampler | None = None
+        self._buf: list[np.ndarray] = []
+        self._buf_samples = 0
+        self._buf_start = 0
+        self._cursor = 0
+        self.produced = False
+
+    def _append_samples(self, arr: np.ndarray) -> None:
+        if arr.size > 0:
+            self._buf.append(np.ascontiguousarray(arr, dtype=np.float32))
+            self._buf_samples += int(arr.size)
+
+    def _pop_ready_blocks(self) -> list[TimedAudioBlock]:
+        if self._buf_samples < _STREAM_BLOCK_SAMPLES:
+            return []
+        merged = self._buf[0] if len(self._buf) == 1 else np.concatenate(self._buf)
+        merged = np.ascontiguousarray(merged, dtype=np.float32)
+        out: list[TimedAudioBlock] = []
+        offset = 0
+        while merged.size - offset >= _STREAM_BLOCK_SAMPLES:
+            piece = merged[offset : offset + _STREAM_BLOCK_SAMPLES]
+            out.append(TimedAudioBlock(piece, self._buf_start, self._buf_start * 1000 // TARGET_SAMPLE_RATE))
+            self._buf_start += _STREAM_BLOCK_SAMPLES
+            self._cursor = self._buf_start
+            self.produced = True
+            offset += _STREAM_BLOCK_SAMPLES
+        rem = merged[offset:]
+        self._buf = [rem] if rem.size > 0 else []
+        self._buf_samples = int(rem.size)
+        return out
+
+    def flush(self) -> list[TimedAudioBlock]:
+        if self._resampler is not None:
+            self._append_samples(self._resampler.flush())
+            self._resampler = None
+        if self._buf_samples <= 0:
+            return []
+        merged = self._buf[0] if len(self._buf) == 1 else np.concatenate(self._buf)
+        merged = np.ascontiguousarray(merged, dtype=np.float32)
+        block = TimedAudioBlock(merged, self._buf_start, self._buf_start * 1000 // TARGET_SAMPLE_RATE)
+        self._buf = []
+        self._buf_samples = 0
+        self._cursor = self._buf_start + int(merged.size)
+        self._buf_start = self._cursor
+        self.produced = True
+        return [block]
+
+    def push(self, pcm: np.ndarray, rate: int, channels: int, pts_100ns: int) -> list[TimedAudioBlock]:
+        if rate <= 0:
+            return []
+        mono, src_frames = _pcm16_packet_to_mono_f32(pcm, channels)
+        if src_frames <= 0:
+            return []
+        out_blocks: list[TimedAudioBlock] = []
+        pts = max(0, int(pts_100ns))
+        if self._origin_100ns is None:
+            self._origin_100ns = (
+                pts if (self._live_anchor_100ns > 0 and pts >= self._live_anchor_100ns) else 0
+            )
+            rel_100ns = max(0, pts - self._origin_100ns)
+            self._buf_start = int(round(rel_100ns * TARGET_SAMPLE_RATE / 10_000_000))
+            self._cursor = self._buf_start
+        elif self._expected_pts_100ns is not None and (pts - self._expected_pts_100ns) > _PTS_DISCONTINUITY_100NS:
+            out_blocks.extend(self.flush())
+            rel_100ns = max(0, pts - self._origin_100ns)
+            target_sample = int(round(rel_100ns * TARGET_SAMPLE_RATE / 10_000_000))
+            self._buf_start = max(self._cursor, target_sample)
+            self._cursor = self._buf_start
+        self._expected_pts_100ns = pts + int(round(src_frames * 10_000_000 / rate))
+
+        if rate == TARGET_SAMPLE_RATE:
+            if self._resampler is not None:
+                self._append_samples(self._resampler.flush())
+                self._resampler = None
+            self._append_samples(mono)
+        else:
+            if self._resampler is None or self._resampler.source_rate != rate:
+                if self._resampler is not None:
+                    self._append_samples(self._resampler.flush())
+                self._resampler = StreamResampler(rate, TARGET_SAMPLE_RATE, trim_delay=True)
+            self._append_samples(self._resampler.process(mono))
+        out_blocks.extend(self._pop_ready_blocks())
+        return out_blocks
+
+
+def _iter_mf_timed(
+    source: Path,
+    *,
+    cancel=None,
+    progress_cb: Callable[[int, str], None] | None = None,
+    live_origin_sec: float = LIVE_PTS_ORIGIN_SEC,
+) -> Iterator[TimedAudioBlock]:
+    if sys.platform != "win32":
+        raise AudioDecodeError("这个格式需要 Windows Media Foundation")
+    gen, first, mf_err_cls = _open_mf_timed_stream(source, cancel=cancel, progress_cb=progress_cb)
+    coalescer = _TimedPcmCoalescer(live_origin_sec=live_origin_sec)
+    try:
+        try:
+            for pcm, rate, channels, pts_100ns in chain((first,), gen):
+                if cancel is not None and cancel():
+                    raise AudioDecodeError("已取消")
+                for block in coalescer.push(pcm, int(rate), int(channels), int(pts_100ns)):
+                    yield block
+        except mf_err_cls as exc:
+            if (cancel is not None and cancel()) or "已取消" in str(exc):
+                raise AudioDecodeError("已取消") from exc
+            raise AudioDecodeError(str(exc)) from exc
+        for block in coalescer.flush():
+            yield block
+        if not coalescer.produced:
+            raise AudioDecodeError("文件里没有可识别的声音")
+    finally:
+        gen.close()
+
+
+def iter_media_pcm_timed(
+    path: str | Path,
+    *,
+    cancel=None,
+    progress_cb: Callable[[int, str], None] | None = None,
+    live_origin_sec: float = LIVE_PTS_ORIGIN_SEC,
+) -> Iterator[TimedAudioBlock]:
+    """Stream 16 kHz mono float32 blocks with real container sample/ms start positions.
+
+    Preserves leading container offsets (``< live_origin_sec``) and mid-stream
+    PTS discontinuities without allocating zero-padding arrays, while anchoring
+    multi-hour live wallclock origins (``>= live_origin_sec``) to ``0``.
+    """
+    if cancel is not None and cancel():
+        raise AudioDecodeError("已取消")
+    source = Path(path)
+    suffix = source.suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        raise AudioDecodeError(f"不支持的文件类型：{suffix or '无扩展名'}")
+    if not source.is_file():
+        raise AudioDecodeError(f"找不到文件：{source}")
+    if suffix == ".wav":
+        return _iter_wav_timed(source, cancel=cancel, progress_cb=progress_cb)
+    return _iter_mf_timed(
+        source,
+        cancel=cancel,
+        progress_cb=progress_cb,
+        live_origin_sec=live_origin_sec,
+    )

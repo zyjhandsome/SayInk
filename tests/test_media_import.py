@@ -77,10 +77,10 @@ def test_recognize_file_keeps_a_partial_result_and_does_not_copy_the_source(tmp_
         AudioChunk(16_000, 32_000, np.ones(16_000, dtype=np.float32)),
     ]
     monkeypatch.setattr(
-        "sayink.media_import.decode_audio_file",
-        lambda path, *, cancel=None, progress_cb=None: np.ones(32_000, dtype=np.float32),
+        "sayink.media_import.iter_media_pcm_timed",
+        lambda path, *, cancel=None, progress_cb=None: iter([(np.ones(32_000, dtype=np.float32), 0, 0)]),
     )
-    monkeypatch.setattr("sayink.media_import.segment_pcm", lambda *args, **kwargs: chunks)
+    monkeypatch.setattr("sayink.media_import.segment_timed_blocks", lambda *args, **kwargs: (chunks, 32_000))
     seen = {"n": 0}
 
     class Recognizer:
@@ -320,12 +320,12 @@ def test_imported_media_applies_glossary_corrections(monkeypatch):
     from sayink.media_import import recognize_file
 
     monkeypatch.setattr(
-        "sayink.media_import.decode_audio_file",
-        lambda path, *, cancel=None, progress_cb=None: np.ones(1600, dtype=np.float32),
+        "sayink.media_import.iter_media_pcm_timed",
+        lambda path, *, cancel=None, progress_cb=None: iter([(np.ones(1600, dtype=np.float32), 0, 0)]),
     )
     monkeypatch.setattr(
-        "sayink.media_import.segment_pcm",
-        lambda *args, **kwargs: [AudioChunk(0, 1600, np.ones(1600, dtype=np.float32))],
+        "sayink.media_import.segment_timed_blocks",
+        lambda *args, **kwargs: ([AudioChunk(0, 1600, np.ones(1600, dtype=np.float32))], 1600),
     )
 
     class Recognizer:
@@ -346,7 +346,7 @@ def test_cancel_before_reading_does_not_open_the_file(monkeypatch):
     def opened(*_args, **_kwargs):
         raise AssertionError("取消后不应再读取文件")
 
-    monkeypatch.setattr("sayink.media_import.decode_audio_file", opened)
+    monkeypatch.setattr("sayink.media_import.iter_media_pcm_timed", opened)
     result = recognize_file(
         "clip.wav", recognizer=object(), speaker_path=None, vad="energy", vad_path=None,
         cancel=lambda: True, progress=lambda _text: None,
@@ -482,3 +482,65 @@ def test_destroying_the_controller_stops_the_import_thread(config, tmp_path):
         for job in list(_ORPHAN_MEDIA_JOBS):
             job.wait(2000)
         history.close(timeout=2)
+
+
+def test_recognize_file_streams_non_wav_with_delayed_origin_and_pts_gap(tmp_path, monkeypatch):
+    from sayink.audio_file_decoder import TimedAudioBlock
+
+    source = tmp_path / "delayed_gap.mp4"
+    source.write_bytes(b"mp4-stub")
+
+    def _forbid_full_decode(*_args, **_kwargs):
+        raise AssertionError("recognize_file must stream blocks without calling decode_audio_file")
+
+    monkeypatch.setattr("sayink.audio_file_decoder.decode_audio_file", _forbid_full_decode)
+
+    closed: list[bool] = []
+    tone_samples = int(TARGET_SAMPLE_RATE * 1.5)  # 24_000 samples (1.5s)
+    lead_samples = int(TARGET_SAMPLE_RATE * 600.0)  # 600s leading audio track delay!
+    gap_samples = int(TARGET_SAMPLE_RATE * 12.0)  # 12s mid-stream PTS silence jump!
+    second_start = lead_samples + tone_samples + gap_samples  # 613.5s
+    tone = (0.25 * np.sin(2.0 * np.pi * 440.0 * np.arange(tone_samples) / TARGET_SAMPLE_RATE)).astype(
+        np.float32
+    )
+
+    def _fake_timed_stream(path, *, cancel=None, progress_cb=None):
+        assert Path(path) == source
+        try:
+            if progress_cb is not None:
+                progress_cb(50, "正在解码音频（2 秒）")
+            yield TimedAudioBlock(tone, lead_samples, lead_samples * 1000 // TARGET_SAMPLE_RATE)
+            yield TimedAudioBlock(tone, second_start, second_start * 1000 // TARGET_SAMPLE_RATE)
+            if progress_cb is not None:
+                progress_cb(100, "已完成解码（3 秒）")
+        finally:
+            closed.append(True)
+
+    monkeypatch.setattr("sayink.media_import.iter_media_pcm_timed", _fake_timed_stream)
+
+    seen_idx = {"n": 0}
+
+    class _Recognizer:
+        def decode_meeting_blocking(self, audio, *, turn_analyzer, cancelled):
+            seen_idx["n"] += 1
+            return [_turn(f"片段{seen_idx['n']}", 0, len(audio))], ""
+
+    pcts: list[int] = []
+    result = recognize_file(
+        source,
+        recognizer=_Recognizer(),
+        speaker_path=None,
+        vad="energy",
+        vad_path=None,
+        cancel=lambda: False,
+        progress_cb=lambda pct, _msg: pcts.append(pct),
+    )
+    assert closed == [True]
+    assert not result.cancelled
+    assert [t.text for t in result.turns] == ["片段1", "片段2"]
+    assert result.turns[0].offset_ms == 600_000
+    assert result.turns[0].duration_ms == 1_500
+    assert result.turns[1].offset_ms == 613_500
+    assert result.turns[1].duration_ms == 1_500
+    assert result.audio_ms == 615_000
+    assert pcts[0] == 0 and 30 in pcts and pcts[-1] == 100
