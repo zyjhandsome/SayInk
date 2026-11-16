@@ -577,10 +577,15 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("SayInk")
     if sys.platform == "win32":
-        from sayink.ui.tray_icon import _bind_helper_guard, _hide_tray_message_window
+        from sayink.ui.tray_icon import (
+            _bind_helper_guard,
+            _hide_tray_message_window,
+            warm_win32_accessibility,
+        )
 
         _bind_helper_guard()
         _hide_tray_message_window()
+        warm_win32_accessibility()
 
     say_ink = None
     _early_activate_requested = False

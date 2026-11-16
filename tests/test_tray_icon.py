@@ -705,3 +705,155 @@ def test_native_double_click_defers_wake_out_of_win32_send_message(qapp):
     finally:
         tray.hide()
         tray.deleteLater()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 accessibility warmup")
+def test_warm_win32_accessibility_defers_when_inside_input_sync_call(monkeypatch):
+    from PyQt6.QtCore import QTimer
+    from PyQt6.QtWidgets import QApplication
+
+    import sayink.ui.tray_icon as tray_mod
+
+    class _FakeWinApp:
+        @staticmethod
+        def platformName():
+            return "windows"
+
+    fake_app = _FakeWinApp()
+    scheduled: list[tuple[int, object]] = []
+    monkeypatch.setattr(QApplication, "instance", staticmethod(lambda: fake_app))
+    monkeypatch.setattr(tray_mod, "_ACCESSIBILITY_WARMED_APP_REF", None)
+    monkeypatch.setattr(tray_mod, "in_win32_input_sync_call", lambda: True)
+    monkeypatch.setattr(
+        QTimer,
+        "singleShot",
+        staticmethod(lambda ms, cb: scheduled.append((ms, cb))),
+    )
+
+    tray_mod.warm_win32_accessibility()
+    assert scheduled == [(0, tray_mod.warm_win32_accessibility)]
+    assert tray_mod._ACCESSIBILITY_WARMED_APP_REF is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 WM_GETOBJECT / faulthandler")
+def test_autostart_floating_window_wm_getobject_does_not_log_0x8001010d(tmp_path):
+    """Cross-process MSAA & UIA queries on FloatingWindow before MainWindow exists
+    must never trigger caught COM 0x8001010D dumps in faulthandler crash.log."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    repo_root = str(Path(__file__).resolve().parents[1])
+    crash_log = tmp_path / "crash.log"
+    client_script = tmp_path / "wm_getobject_client.py"
+    host_script = tmp_path / "autostart_host.py"
+
+    client_script.write_text(
+        """import ctypes, sys
+from ctypes import wintypes
+
+hwnd = int(sys.argv[1])
+ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+ole32.CoInitializeEx(None, 2)
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+# 1) Cross-process MSAA (AccessibleObjectFromWindow / OBJID_CLIENT)
+oleacc = ctypes.WinDLL("oleacc", use_last_error=True)
+oleacc.AccessibleObjectFromWindow.argtypes = [
+    wintypes.HWND, wintypes.DWORD, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)
+]
+oleacc.AccessibleObjectFromWindow.restype = ctypes.c_long
+iid_acc = GUID(0x618736E0, 0x3C3D, 0x11CF, (ctypes.c_ubyte * 8)(0x81, 0x0C, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71))
+acc_ptr = ctypes.c_void_p()
+hr_msaa = oleacc.AccessibleObjectFromWindow(
+    wintypes.HWND(hwnd), wintypes.DWORD(0xFFFFFFFC), ctypes.byref(iid_acc), ctypes.byref(acc_ptr)
+)
+
+# 2) Cross-process UI Automation (CUIAutomation::ElementFromHandle)
+clsid_uia = GUID(0xFF48DBA4, 0x60EF, 0x4201, (ctypes.c_ubyte * 8)(0xAA, 0x87, 0x54, 0x10, 0x3E, 0xEF, 0x59, 0x4E))
+iid_uia = GUID(0x30CBE57D, 0xD9D0, 0x452A, (ctypes.c_ubyte * 8)(0xAB, 0x13, 0x7A, 0xC5, 0xAC, 0x48, 0x25, 0xEE))
+ole32.CoCreateInstance.argtypes = [
+    ctypes.POINTER(GUID), ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)
+]
+ole32.CoCreateInstance.restype = ctypes.c_long
+uia = ctypes.c_void_p()
+hr_uia = ole32.CoCreateInstance(ctypes.byref(clsid_uia), None, 1, ctypes.byref(iid_uia), ctypes.byref(uia))
+if hr_uia == 0 and uia.value:
+    vtbl = ctypes.cast(ctypes.c_void_p.from_address(uia.value).value, ctypes.POINTER(ctypes.c_void_p))
+    elem_fn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.HWND, ctypes.POINTER(ctypes.c_void_p))(vtbl[6])
+    elem = ctypes.c_void_p()
+    hr_uia = elem_fn(uia, wintypes.HWND(hwnd), ctypes.byref(elem))
+
+sys.exit(0 if (hr_msaa == 0 and hr_uia == 0) else 2)
+""",
+        encoding="utf-8",
+    )
+
+    host_script.write_text(
+        f"""import faulthandler, subprocess, sys
+sys.path.insert(0, {repo_root!r})
+
+crash_f = open({str(crash_log)!r}, "ab", buffering=0)
+faulthandler.enable(file=crash_f, all_threads=True)
+
+from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import QApplication
+from sayink.ui.floating_window import FloatingWindow
+from sayink.ui.tray_icon import _bind_helper_guard, _hide_tray_message_window, _install_helper_creation_guard
+
+_install_helper_creation_guard()
+app = QApplication([])
+if app.platformName() != "windows":
+    faulthandler.disable()
+    crash_f.close()
+    sys.exit(77)
+
+_bind_helper_guard()
+_hide_tray_message_window()
+
+fw = FloatingWindow()
+fw.show_model_loading("正在加载语音模型，请稍候...")
+hwnd = int(fw.winId())
+
+proc = subprocess.Popen([sys.executable, {str(client_script)!r}, str(hwnd)])
+
+def _poll():
+    rc = proc.poll()
+    if rc is None:
+        return
+    fw.close()
+    app.exit(rc)
+
+timer = QTimer()
+timer.timeout.connect(_poll)
+timer.start(25)
+QTimer.singleShot(4000, lambda: (fw.close(), app.exit(99)))
+code = app.exec()
+faulthandler.disable()
+crash_f.close()
+sys.exit(code)
+""",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "windows"
+    result = subprocess.run(
+        [sys.executable, str(host_script)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode == 77:
+        pytest.skip("native Windows desktop Qt platform unavailable")
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert crash_log.read_bytes() == b""

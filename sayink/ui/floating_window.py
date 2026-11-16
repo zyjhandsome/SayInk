@@ -495,6 +495,9 @@ class FloatingWindow(QWidget):
         self._meeting_click_timer.timeout.connect(self._open_meeting_from_click)
         self._screen_watchers: list[tuple[object, str, object]] = []
         self._connect_screen_watchers()
+        from sayink.ui.tray_icon import warm_win32_accessibility
+
+        warm_win32_accessibility()
 
     def _connect_screen_watchers(self) -> None:
         app = QApplication.instance()

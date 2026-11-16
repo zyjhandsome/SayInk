@@ -33,6 +33,7 @@ _PENDING_SUBCLASS_HWNDS: set[int] = set()
 _CLOAKED_HWNDS: set[int] = set()
 _HELPER_CREATION_GUARD = None
 _TRANSIENT_CALL_GUARD = None
+_ACCESSIBILITY_WARMED_APP_REF = None
 _DWMWA_CLOAK = 13
 _ISMEX_PENDING_MASK = 0x00000007  # ISMEX_SEND | ISMEX_NOTIFY | ISMEX_CALLBACK
 _IN_NATIVE_TRAY_PROC = 0
@@ -394,18 +395,113 @@ def _install_helper_creation_guard() -> None:
 
 def _bind_helper_guard() -> None:
     """Drop the hooks when the application exits. Safe before it exists."""
-    if sys.platform != "win32" or _HELPER_CREATION_GUARD is None:
-        return
-    if getattr(_bind_helper_guard, "bound", False):
+    if sys.platform != "win32":
         return
     from PyQt6.QtWidgets import QApplication
 
     app = QApplication.instance()
-    if app is None or app.platformName() != "windows":
+    platform_fn = getattr(app, "platformName", None) if app is not None else None
+    if app is None or not callable(platform_fn) or platform_fn() != "windows":
+        return
+    warm_win32_accessibility()
+    if _HELPER_CREATION_GUARD is None or getattr(_bind_helper_guard, "bound", False):
         return
     app.aboutToQuit.connect(_remove_helper_creation_guard)
     app.destroyed.connect(_remove_helper_creation_guard)
     _bind_helper_guard.bound = True
+
+
+def warm_win32_accessibility() -> None:
+    """Pre-warm Qt/STA accessibility marshaling outside Win32 SendMessage.
+
+    Before ``MainWindow`` is constructed (e.g. during ``--autostart`` silent boot
+    while the ASR model loads), ``FloatingWindow`` can be the first visible Qt
+    window. When an external process (IME, Explorer, UI Automation, screen
+    reader, or launcher tool) sends cross-process ``WM_GETOBJECT`` via
+    ``SendMessage``, ``oleacc`` / ``combase`` lazily registers the UI STA
+    channel inside that input-synchronous call and raises caught COM exception
+    ``RPC_E_CANTCALLOUT_ININPUTSYNCCALL`` (``0x8001010D``), which Python's
+    first-chance ``faulthandler`` VEH logs to ``crash.log`` as a false-positive
+    fatal exception. Querying ``OBJID_CLIENT`` once on the UI thread upfront
+    initializes the STA marshaler cleanly before any external ``SendMessage``.
+    """
+    global _ACCESSIBILITY_WARMED_APP_REF
+    if sys.platform != "win32":
+        return
+    import weakref
+
+    from PyQt6.QtCore import Qt, QTimer
+    from PyQt6.QtWidgets import QApplication, QWidget
+
+    app = QApplication.instance()
+    platform_fn = getattr(app, "platformName", None) if app is not None else None
+    if app is None or not callable(platform_fn) or platform_fn() != "windows":
+        return
+    if _ACCESSIBILITY_WARMED_APP_REF is not None and _ACCESSIBILITY_WARMED_APP_REF() is app:
+        return
+    if in_win32_input_sync_call():
+        QTimer.singleShot(0, warm_win32_accessibility)
+        return
+    _ACCESSIBILITY_WARMED_APP_REF = weakref.ref(app)
+
+    probe = None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        probe = QWidget(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        probe.setAccessibleName("SayInk")
+        hwnd = int(probe.winId() or 0)
+        if not hwnd:
+            return
+        oleacc = ctypes.WinDLL("oleacc", use_last_error=True)
+        oleacc.AccessibleObjectFromWindow.argtypes = [
+            wintypes.HWND,
+            wintypes.DWORD,
+            ctypes.POINTER(_GUID),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        oleacc.AccessibleObjectFromWindow.restype = ctypes.c_long
+        # IID_IAccessible = {618736e0-3c3d-11cf-810c-00aa00389b71}, OBJID_CLIENT = 0xFFFFFFFC
+        iid_iaccessible = _GUID(
+            0x618736E0,
+            0x3C3D,
+            0x11CF,
+            (ctypes.c_ubyte * 8)(0x81, 0x0C, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71),
+        )
+        acc_ptr = ctypes.c_void_p()
+        hr = oleacc.AccessibleObjectFromWindow(
+            wintypes.HWND(hwnd),
+            wintypes.DWORD(0xFFFFFFFC),
+            ctypes.byref(iid_iaccessible),
+            ctypes.byref(acc_ptr),
+        )
+        if hr == 0 and acc_ptr.value:
+            vtbl = ctypes.cast(
+                ctypes.c_void_p.from_address(acc_ptr.value).value,
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            release_fn = ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)(vtbl[2])
+            release_fn(acc_ptr)
+    except Exception:
+        import logging
+
+        logging.getLogger("SayInk").debug("预热 Windows 无障碍通道失败", exc_info=True)
+    finally:
+        if probe is not None:
+            try:
+                probe.destroy()
+                probe.deleteLater()
+            except Exception:
+                pass
 
 
 def _remove_helper_creation_guard() -> None:
