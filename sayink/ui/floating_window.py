@@ -3,7 +3,17 @@ from PyQt6.QtWidgets import (
     QApplication, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, QEvent, pyqtSignal
-from PyQt6.QtGui import QFontMetrics, QPainter, QPainterPath, QPen, QPolygonF, QColor, QFont, QCursor
+from PyQt6.QtGui import (
+    QColor,
+    QCursor,
+    QFont,
+    QFontMetrics,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPolygonF,
+    QTextLayout,
+)
 import math
 import weakref
 from sayink.runtime_status import MEETING_STATE_LABELS
@@ -749,13 +759,17 @@ class FloatingWindow(QWidget):
             f"color: {tok.FLOAT_TEXT}; background: transparent;"
             f" font-family: {tok.FONT};",
         )
-        self._sync_text_line_height()
+        if self._mode == "error_excerpt":
+            line_h = max(18, QFontMetrics(self._text_label.font()).height())
+            self._text_label.setMaximumHeight(line_h * 2 + 4)
+        else:
+            self._sync_text_line_height()
         if hasattr(self, "_state_token"):
             self._set_state(self._full_status_text or self._status_label.text(), self._state_token,
                             pulse=self._dot._pulsing)
 
     def _paint_container(self) -> None:
-        radius = 16 if self._mode == "excerpt" else BAR_HEIGHT // 2
+        radius = 16 if self._mode in ("excerpt", "error_excerpt") else BAR_HEIGHT // 2
         self._container.sync_colors_and_radius(tok.FLOAT_BG, tok.FLOAT_BORDER, radius)
 
     def _setup_window(self):
@@ -900,7 +914,11 @@ class FloatingWindow(QWidget):
                 self._status_label.setToolTip(f"{raw} · {tip}" if tip else raw)
 
     def _sync_cancel_button(self) -> None:
-        if self._meeting_active or self._model_loading_active:
+        if (
+            self._meeting_active
+            or self._model_loading_active
+            or getattr(self, "_state_token", "") == "STATE_ERROR"
+        ):
             self._cancel_btn.hide()
             return
         if self._capture_active and not self._listening_active:
@@ -920,6 +938,14 @@ class FloatingWindow(QWidget):
     def _set_mode(self, mode: str) -> None:
         self._mode = mode
         self._paint_container()
+        if mode == "error_excerpt":
+            line_h = max(18, QFontMetrics(self._text_label.font()).height())
+            self._text_label.setMaximumHeight(line_h * 2 + 4)
+            target_h = min(COMPACT_HEIGHT + 40, BAR_EXCERPT_HEIGHT + min(16, line_h))
+            self.setMinimumWidth(MIN_BAR_WIDTH)
+            self.setFixedHeight(target_h)
+            self.resize(BAR_EXCERPT_WIDTH, target_h)
+            return
         line_h = self._sync_text_line_height()
         extra_h = max(0, line_h - 18)
         excerpt = mode == "excerpt"
@@ -1738,24 +1764,80 @@ class FloatingWindow(QWidget):
         self._present()
         self._hide_timer.start(1000)
 
-    def show_error(self, message: str, *, auto_dismiss_ms: int = 5000):
+    def _apply_error_excerpt(self, text: str, full_tooltip: str) -> None:
+        clauses = [" ".join(line.split()) for line in (text or "").splitlines() if line.strip()]
+        if not clauses:
+            self._text_label.setText("")
+            self._text_label.setToolTip("")
+            self._text_label.hide()
+            self._set_mode("compact")
+            return
+        joined = clauses[0]
+        for clause in clauses[1:]:
+            sep = "" if joined.endswith(("。", "；", "，", "！", "？", ".", ";", ",")) else " · "
+            joined = f"{joined}{sep}{clause}"
+        metrics = QFontMetrics(self._text_label.font())
+        avail = max(80, BAR_EXCERPT_WIDTH - 24)
+        if metrics.horizontalAdvance(joined) <= avail:
+            self._text_label.setText(joined)
+            self._text_label.setToolTip(full_tooltip)
+            self._text_label.show()
+            self._idle_collapsed = False
+            self._set_mode("excerpt")
+            return
+        tl = QTextLayout(joined, self._text_label.font())
+        tl.beginLayout()
+        first = tl.createLine()
+        if first.isValid():
+            first.setLineWidth(avail)
+            cut = first.textStart() + first.textLength()
+        else:
+            cut = len(joined)
+        tl.endLayout()
+        line1 = joined[:cut].rstrip()
+        rest = joined[cut:].lstrip()
+        if not rest:
+            self._text_label.setText(line1)
+            self._text_label.setToolTip(full_tooltip)
+            self._text_label.show()
+            self._idle_collapsed = False
+            self._set_mode("excerpt")
+            return
+        line2 = metrics.elidedText(rest, Qt.TextElideMode.ElideRight, avail)
+        self._text_label.setText(f"{line1}\n{line2}")
+        self._text_label.setToolTip(full_tooltip)
+        self._text_label.show()
+        self._idle_collapsed = False
+        self._set_mode("error_excerpt")
+
+    def show_error(
+        self,
+        message: str,
+        *,
+        auto_dismiss_ms: int = 5000,
+        keep_continuous: bool = False,
+    ):
         if self._model_loading_active:
             return
         if self._meeting_bar_stays(message, transient=True, duration_ms=max(0, int(auto_dismiss_ms or 0))):
             return
+        self._capture_active = False
+        self._capture_released = False
+        if not keep_continuous:
+            self._listening_active = False
+            self._live_text = ""
         self._set_mode("compact")
         self._waveform.stop()
         self._waveform.hide()
         first_line, _, body_after_newline = message.partition("\n")
         status, colon_remainder = _error_headline(first_line)
         parts = [p for p in (colon_remainder, body_after_newline) if p]
-        remainder = "\n".join(parts)
-        self._set_state(status, "STATE_ERROR")
+        remainder = "\n".join(parts).strip()
         self.setToolTip(message)
-        remainder = remainder.strip()
+        self._status_label.setToolTip(message)
+        self._set_state(status, "STATE_ERROR")
         if remainder:
-            self._apply_excerpt(remainder)
-            self._text_label.setToolTip(message)
+            self._apply_error_excerpt(remainder, message)
         else:
             self._text_label.setText("")
             self._text_label.setToolTip("")

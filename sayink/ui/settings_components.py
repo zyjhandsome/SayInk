@@ -541,7 +541,13 @@ def labeled_row(label: str, widget: QWidget, hint: str = "") -> QWidget:
     return row
 
 
-def stacked_field_row(label: str, widget: QWidget, hint: str = "") -> QWidget:
+def stacked_field_row(
+    label: str,
+    widget: QWidget,
+    hint: str = "",
+    *,
+    buddy: QWidget | None = None,
+) -> QWidget:
     """Vertical field — label, control, optional hint (prototype .field)."""
     row = QWidget()
     outer = QVBoxLayout(row)
@@ -553,7 +559,7 @@ def stacked_field_row(label: str, widget: QWidget, hint: str = "") -> QWidget:
     lbl.setStyleSheet(
         f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 400; background: transparent;"
     )
-    lbl.setBuddy(widget)
+    lbl.setBuddy(buddy if buddy is not None else widget)
     outer.addWidget(lbl)
     outer.addWidget(widget)
 
