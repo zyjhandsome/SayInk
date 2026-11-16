@@ -571,7 +571,7 @@ class TestSettingsControlAlignment:
     def test_device_combo_width_token(self):
         from sayink.ui.design_tokens import CONTROL_SETTINGS_COMBO_WIDTH
 
-        assert CONTROL_SETTINGS_COMBO_WIDTH == 240
+        assert CONTROL_SETTINGS_COMBO_WIDTH == 280
 
     def test_history_spins_share_fixed_width(self, config, monkeypatch):
         import sys

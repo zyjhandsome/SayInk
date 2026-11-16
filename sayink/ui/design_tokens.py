@@ -177,7 +177,7 @@ READING_LINE_HEIGHT = 160
 
 # Wide enough for values like「5500 场」plus a 22px flat stepper column.
 CONTROL_NUMERIC_WIDTH = 120
-CONTROL_SETTINGS_COMBO_WIDTH = 240
+CONTROL_SETTINGS_COMBO_WIDTH = 280
 
 # Shared box for settings small actions (accent + ghost) so paired
 # buttons like「使用此模型」/「删除」paint at the same outer height.
@@ -234,12 +234,12 @@ _LIGHT: dict[str, Any] = {
     "AMBER_SOFT": "#FFFBEB",
     "CALLOUT_BORDER": "#F5E6B8",
     "ATTENTION": "#D97706",
-    "CONTROL_BORDER": "#D1D5DB",
-    "CONTROL_BORDER_HOVER": "#9CA3AF",
-    # Cooler off-track than prototype's warm #E5E2E3 so the white knob reads
-    # on SURFACE rows; still a flat gray pill like .toggle.
-    "TOGGLE_OFF": "#D1D5DB",
-    "TOGGLE_OFF_HOVER": "#9CA3AF",
+    "CONTROL_BORDER": "#858D99",
+    "CONTROL_BORDER_HOVER": "#6B7280",
+    # WCAG 2.1 SC 1.4.11 (>= 3.0:1) against both BG (#FFFFFF) and SURFACE_PEARL (#F7F7F7),
+    # while preserving >= 3.0:1 contrast for the #FFFFFF switch knob.
+    "TOGGLE_OFF": "#858D99",
+    "TOGGLE_OFF_HOVER": "#6B7280",
     "TOGGLE_ON": "#15803D",
     "TOGGLE_ON_HOVER": "#166534",
     "ROW_HOVER": "rgba(0, 0, 0, 0.03)",
@@ -284,7 +284,7 @@ _DARK: dict[str, Any] = {
     "INPUT_BG": "#202326",
     "BAR_OFF": "#4B5563",
     "SETTINGS_SIDEBAR_BG": "#181818",
-    "NAV_SELECTED_BG": "rgba(255,255,255,0.06)",
+    "NAV_SELECTED_BG": "rgba(255, 255, 255, 0.12)",
     "TEXT": "#F9FAFB",
     "TEXT_SEC": "#D1D5DB",
     "TEXT_DIM": "#9CA3AF",
@@ -301,13 +301,13 @@ _DARK: dict[str, Any] = {
     "AMBER_SOFT": "#422006",
     "CALLOUT_BORDER": "#78350F",
     "ATTENTION": "#FBBF24",
-    "CONTROL_BORDER": "#4B5563",
-    "CONTROL_BORDER_HOVER": "#6B7280",
-    "TOGGLE_OFF": "#4B5563",
-    "TOGGLE_OFF_HOVER": "#6B7280",
+    "CONTROL_BORDER": "#737C8C",
+    "CONTROL_BORDER_HOVER": "#8891A0",
+    "TOGGLE_OFF": "#737C8C",
+    "TOGGLE_OFF_HOVER": "#8891A0",
     "TOGGLE_ON": "#16A34A",
     "TOGGLE_ON_HOVER": "#15803D",
-    "ROW_HOVER": "rgba(255, 255, 255, 0.03)",
+    "ROW_HOVER": "rgba(255, 255, 255, 0.04)",
     "TRAY_MENU_BORDER": "#374151",
     "TRAY_MENU_SEPARATOR": "#4B5563",
     "TRAY_MENU_HOVER": "#374151",
