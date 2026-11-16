@@ -45,6 +45,15 @@ _PARAGRAPH_RE = re.compile(r"<p\b[^>]*>.*?</p>", re.DOTALL)
 _SPEAKER_ANCHOR_RE = re.compile(
     r"<a href='((?:live-)?speaker:\d+)' title='([^']*)' style='[^']*'><b>([^<]*)</b></a>"
 )
+# Longer prefixes first so ``edit-segment:`` is not read as ``segment:``.
+_SWAPPABLE_ACTION_RE = re.compile(
+    r"[ \t]*<a href='((?:live-edit|live-segment|live-details|edit-segment|details-segment|segment):\d+)'"
+    r"(?: title='([^']*)')?[^>]*>([^<]*)</a>"
+)
+_SWAPPABLE_ACTION_PREFIXES = (
+    "live-edit:", "live-segment:", "live-details:",
+    "edit-segment:", "details-segment:", "segment:",
+)
 
 
 def _duration_label(ms: int) -> str:
@@ -154,6 +163,21 @@ def _split_top_paragraphs(source: str) -> list[str] | None:
 
 def _speaker_anchor_skeleton(source: str) -> str:
     return _SPEAKER_ANCHOR_RE.sub(r"<a href='\1'><b></b></a>", source)
+
+
+def _is_swappable_action(href: str) -> bool:
+    return bool(href) and href.startswith(_SWAPPABLE_ACTION_PREFIXES)
+
+
+def _action_anchors(paragraph: str) -> list[tuple[str, str, str]]:
+    return [
+        (href, html.unescape(title or ""), html.unescape(label))
+        for href, title, label in _SWAPPABLE_ACTION_RE.findall(paragraph)
+    ]
+
+
+def _without_swappable_actions(paragraph: str) -> str:
+    return _SWAPPABLE_ACTION_RE.sub("", paragraph)
 
 
 def _speaker_anchor_map(source: str) -> dict[str, tuple[str, str]]:
@@ -293,17 +317,46 @@ class _ReadingView(QTextBrowser):
         self._reading_key = None
         self._reading_anchor = 0
         self._defer_layout = False
+        self._pending_scroll: tuple[str, int] | None = None
+        self._scroll_guard = 0
         self._reading_timer = QTimer(self)
         self._reading_timer.setSingleShot(True)
         self._reading_timer.timeout.connect(self._restore_reading_position)
 
     def restore_reading_position(self, value: int) -> None:
         self._reading_anchor = value
-        self._restore_reading_position()
+        self.pin_scroll(value)
         self._reading_timer.start(0)
 
+    def pin_scroll(self, value: int | None = None, *, follow_bottom: bool = False) -> None:
+        """Remember a scroll target and reapply it as later layout batches grow the document."""
+        if follow_bottom:
+            self._pending_scroll = ("bottom", 0)
+        else:
+            self._pending_scroll = ("value", max(0, int(value or 0)))
+        self._apply_pending_scroll()
+
+    def _apply_pending_scroll(self) -> None:
+        pending = self._pending_scroll
+        if pending is None:
+            return
+        bar = self.verticalScrollBar()
+        self._scroll_guard += 1
+        try:
+            if pending[0] == "bottom":
+                bar.setValue(bar.maximum())
+            else:
+                bar.setValue(min(pending[1], bar.maximum()))
+        finally:
+            self._scroll_guard -= 1
+
+    def note_user_scroll(self) -> None:
+        if self._scroll_guard:
+            return
+        self._pending_scroll = None
+
     def _restore_reading_position(self) -> None:
-        self.verticalScrollBar().setValue(self._reading_anchor)
+        self._apply_pending_scroll()
 
     def _set_reading(self, text: str, *, markdown: bool, plain: bool = False) -> None:
         from sayink.ui import design_tokens as tok
@@ -319,6 +372,7 @@ class _ReadingView(QTextBrowser):
             and len(previous) >= 6 and previous[5] == tok.TEXT_DIM
             and (
                 self.retarget_speaker_labels(previous[2], text)
+                or self.retarget_action_links(previous[2], text)
                 or self.retarget_paragraphs(previous[2], text, polish_line_height=True)
             )
         ):
@@ -408,6 +462,80 @@ class _ReadingView(QTextBrowser):
             fmt.setToolTip(title)
             cursor.insertText(label, fmt)
         cursor.endEditBlock()
+        return True
+
+    def retarget_action_links(self, old_html: str, new_html: str) -> bool:
+        """Swap edit/correct anchors in place when the spoken text did not change.
+
+        A correction toggle rewrites every row, which is too many paragraphs for
+        ``retarget_paragraphs`` and used to rebuild the whole document. Speaker
+        headings and multiline rows are kept: only the action anchors move.
+        """
+        from sayink.ui import design_tokens as tok
+
+        old_paras = _split_top_paragraphs(old_html)
+        new_paras = _split_top_paragraphs(new_html)
+        doc = self.document()
+        if (
+            old_paras is None or new_paras is None
+            or len(old_paras) != len(new_paras)
+            or doc.blockCount() != len(old_paras)
+        ):
+            return False
+        planned: list[tuple[int, int, str, str, str]] = []
+        changed = False
+        block = doc.begin()
+        for old_p, new_p in zip(old_paras, new_paras, strict=True):
+            if not block.isValid() or _without_swappable_actions(old_p) != _without_swappable_actions(new_p):
+                return False
+            old_actions = _action_anchors(old_p)
+            new_actions = _action_anchors(new_p)
+            if len(old_actions) != len(new_actions):
+                return False
+            fragments = []
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                href = fragment.charFormat().anchorHref() if fragment.isValid() else ""
+                if _is_swappable_action(href):
+                    fragments.append(fragment)
+                iterator += 1
+            if len(fragments) != len(new_actions):
+                return False
+            for fragment, old_action, new_action in zip(fragments, old_actions, new_actions, strict=True):
+                if old_action == new_action:
+                    continue
+                href, title, label = new_action
+                planned.append((fragment.position(), fragment.position() + fragment.length(), href, title, label))
+                changed = True
+            block = block.next()
+        if block.isValid() or not changed:
+            return False
+        accent = tok.qcolor_from_token(tok.ACCENT_TEXT)
+        dim = tok.qcolor_from_token(tok.TEXT_DIM)
+        saved_scroll = self.verticalScrollBar().value()
+        saved = self._before_retarget()
+        cursor = QTextCursor(doc)
+        cursor.beginEditBlock()
+        try:
+            for start, end, href, title, label in reversed(planned):
+                cursor.setPosition(start)
+                cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+                fmt = cursor.charFormat()
+                fmt.setAnchor(True)
+                fmt.setAnchorHref(href)
+                fmt.setToolTip(title)
+                fmt.setFontUnderline(False)
+                fmt.setForeground(accent if href.startswith(("segment:", "live-segment:")) else dim)
+                cursor.insertText(label, fmt)
+        finally:
+            cursor.endEditBlock()
+        self._after_retarget(saved)
+        self._scroll_guard += 1
+        try:
+            self.verticalScrollBar().setValue(saved_scroll)
+        finally:
+            self._scroll_guard -= 1
         return True
 
     def retarget_paragraphs(self, old_html: str, new_html: str, *, polish_line_height: bool = True) -> bool:
@@ -578,11 +706,14 @@ class _TranscriptView(_ReadingView):
         self._action_block = None
         self._keyboard_actions = False
         self._next_layout_block_num = 0
+        self._repair_scheduled = False
+        self._laid_out_viewport_width = 0
         self._layout_timer = QTimer(self)
         self._layout_timer.setSingleShot(True)
         self._layout_timer.timeout.connect(self._layout_next_batch)
         self.setMouseTracking(True)
         self.cursorPositionChanged.connect(self._reveal_cursor_actions)
+        self.verticalScrollBar().valueChanged.connect(lambda _value: self.note_user_scroll())
 
     def reset_actions(self) -> None:
         self._activate_actions()
@@ -633,9 +764,63 @@ class _TranscriptView(_ReadingView):
             self._next_layout_block_num = block.blockNumber()
             self._layout_timer.start(0)
         else:
+            self._schedule_blank_repair()
+        self._apply_pending_scroll()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        width = self.viewport().width()
+        # A scrollbar gutter or window resize invalidates off-screen blocks.
+        # The batch cursor must start over, or the middle of a long meeting
+        # stays at height 0 forever.
+        if (
+            self._laid_out_viewport_width
+            and width != self._laid_out_viewport_width
+            and self.document().blockCount()
+        ):
+            self._repair_scheduled = False
             self._next_layout_block_num = 0
+            self._layout_timer.start(0)
+        self._laid_out_viewport_width = width
+
+    def flush_layout(self) -> None:
+        """Finish any pending batches before a scroll target is applied."""
+        self._layout_timer.stop()
+        self._repair_scheduled = False
+        doc = self.document()
+        layout = doc.documentLayout()
+        block = doc.findBlockByNumber(self._next_layout_block_num)
+        while block.isValid():
+            layout.blockBoundingRect(block)
+            block = block.next()
+        self._next_layout_block_num = 0
+        self._repair_blank_blocks()
+
+    def _schedule_blank_repair(self) -> None:
+        self._next_layout_block_num = 0
+        self._repair_scheduled = True
+        self._layout_timer.start(0)
+
+    def _repair_blank_blocks(self) -> bool:
+        doc = self.document()
+        layout = doc.documentLayout()
+        found = False
+        block = doc.begin()
+        while block.isValid():
+            if block.text().strip():
+                block_layout = block.layout()
+                if block_layout is None or block_layout.boundingRect().height() <= 0:
+                    layout.blockBoundingRect(block)
+                    found = True
+            block = block.next()
+        return found
 
     def _layout_next_batch(self) -> None:
+        if self._repair_scheduled:
+            self._repair_scheduled = False
+            self._repair_blank_blocks()
+            self._apply_pending_scroll()
+            return
         doc = self.document()
         layout = doc.documentLayout()
         block = doc.findBlockByNumber(self._next_layout_block_num)
@@ -648,7 +833,8 @@ class _TranscriptView(_ReadingView):
             self._next_layout_block_num = block.blockNumber()
             self._layout_timer.start(0)
         else:
-            self._next_layout_block_num = 0
+            self._schedule_blank_repair()
+        self._apply_pending_scroll()
 
     def scrollToAnchor(self, name: str) -> None:
         if self._layout_timer.isActive():

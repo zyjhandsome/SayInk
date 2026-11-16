@@ -893,7 +893,7 @@ class GeneralSettingsPage(SettingsPage):
         rec_lay.setSpacing(0)
         self.recovery_row = ToggleOptionRow(
             "录音恢复（本机缓存）",
-            "默认关闭；开启后保存完整录音，正常结束保留 7 天，总量上限 2 GB。下次录音生效。",
+            "默认关闭；开启后保存完整录音，正常结束保留 7 天，总量上限 5 GB，超出时自动清理最早的旧录音。下次录音生效。",
         )
         self.recovery_row.toggled.connect(self.recovery_toggled.emit)
         rec_lay.addWidget(self.recovery_row)

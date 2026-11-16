@@ -42,6 +42,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -592,6 +593,9 @@ class _AudioPlayerBar(QFrame):
                 self._player.setSource(QUrl())
             except Exception:
                 pass
+        if self._source_path:
+            from sayink.audio_recovery import release_recovery_path
+            release_recovery_path(Path(self._source_path))
         self._source_path = ""
         self._playable_path = ""
         self._duration_ms = 0
@@ -771,7 +775,13 @@ class _AudioPlayerBar(QFrame):
             return True
         self.stop()
         self._pending_seek_ms = None
+        from sayink.audio_recovery import hold_recovery_path, release_recovery_path
+
+        if self._source_path:
+            release_recovery_path(Path(self._source_path))
         self._source_path = resolved
+        if p.is_dir():
+            hold_recovery_path(p)
         self._playable_path = str(p) if p.is_file() and p.suffix.lower() != ".f32" else ""
         probed = _probe_wav_duration_ms(p)
         self._duration_ms = max(probed, max(0, int(fallback_duration_ms)))
@@ -1977,9 +1987,13 @@ class MeetingPage(QWidget):
         self._live_transcript.setAccessibleName("实时文字稿")
         self._live_transcript.setPlaceholderText("开始说话后，这里会按说话人逐条出现文字…")
         self._live_transcript.viewport().installEventFilter(self)
+        self._live_follow_bottom = True
+        self._live_scroll_guard = 0
         self._live_transcript.verticalScrollBar().valueChanged.connect(self._on_live_scroll_changed)
+        self._live_transcript.verticalScrollBar().rangeChanged.connect(self._on_live_range_changed)
         self._live_new_msg_btn = QPushButton("↓ 底部有新发言", self._live_transcript.viewport())
         self._live_new_msg_btn.setAccessibleName("跳到底部查看新发言")
+        self._live_new_msg_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._live_new_msg_btn.clicked.connect(self._scroll_live_to_bottom)
         self._live_new_msg_btn.hide()
         self._live_split.addWidget(self._live_transcript)
@@ -5774,15 +5788,63 @@ class MeetingPage(QWidget):
             if not self._system_silent_banner.isVisible():
                 self.show_system_silent_warning()
 
+    def _set_live_scroll(self, value: int) -> None:
+        view = self._live_transcript
+        bar = view.verticalScrollBar()
+        self._live_scroll_guard += 1
+        view._scroll_guard += 1
+        try:
+            bar.setValue(value)
+        finally:
+            view._scroll_guard -= 1
+            self._live_scroll_guard -= 1
+
+    def _should_follow_live(self, position: int, anchor: int) -> bool:
+        if not self._live_follow_bottom or position != anchor:
+            return False
+        return not bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
+
+    def _stick_live_bottom(self) -> None:
+        view = self._live_transcript
+        self._live_scroll_guard += 1
+        view._scroll_guard += 1
+        try:
+            cursor = view.textCursor()
+            if not cursor.hasSelection():
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                view.setTextCursor(cursor)
+            view.verticalScrollBar().setValue(view.verticalScrollBar().maximum())
+        finally:
+            view._scroll_guard -= 1
+            self._live_scroll_guard -= 1
+
+    def _on_live_range_changed(self, _minimum: int, maximum: int) -> None:
+        if not self._live_follow_bottom:
+            return
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            return
+        bar = self._live_transcript.verticalScrollBar()
+        if bar.value() >= maximum:
+            return
+        self._set_live_scroll(maximum)
+
     def _on_live_scroll_changed(self, value: int) -> None:
+        if self._live_scroll_guard:
+            return
         bar = self._live_transcript.verticalScrollBar()
         if value >= max(0, bar.maximum() - 24):
+            self._live_follow_bottom = True
             self._live_new_msg_btn.hide()
+        else:
+            self._live_follow_bottom = False
 
     def _scroll_live_to_bottom(self) -> None:
-        bar = self._live_transcript.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        self._live_follow_bottom = True
         self._live_new_msg_btn.hide()
+        view = self._live_transcript
+        if hasattr(view, "flush_layout"):
+            view.flush_layout()
+        self._stick_live_bottom()
 
     def _position_live_new_msg_btn(self) -> None:
         if not hasattr(self, "_live_new_msg_btn") or not hasattr(self, "_live_transcript"):
@@ -5804,6 +5866,7 @@ class MeetingPage(QWidget):
             self._live_find_edit.clear()
             self._live_find_bar.hide()
             self._live_correcting_speakers = False
+            self._live_follow_bottom = True
             self._live_speaker_menu.clear()
             self._live_speaker_feedback.clear()
             self._live_speaker_feedback.hide()
@@ -5950,50 +6013,64 @@ class MeetingPage(QWidget):
         cursor = self._live_transcript.textCursor()
         position, anchor = cursor.position(), cursor.anchor()
         scroll = bar.value()
-        at_end = bar.value() >= max(0, bar.maximum() - 24)
+        follow = self._should_follow_live(position, anchor)
         rendered = self._transcript_html(transcript_lines(segments, started_at), names, links=True, live=True)
-        if rendered != self._drafts.live_html:
-            previous = self._drafts.live_html
-            if previous and rendered.startswith(previous):
-                self._drafts.live_html = rendered
-                # Normal live transcription only adds paragraphs. Keep the
-                # existing document instead of parsing and laying it out again.
-                tail = QTextCursor(self._live_transcript.document())
-                tail.movePosition(QTextCursor.MoveOperation.End)
-                tail.insertBlock()
-                tail.insertHtml(rendered[len(previous):])
-                cursor = self._live_transcript.textCursor()
-                last = self._live_transcript.document().characterCount() - 1
-                anchor = self._live_transcript.position_before_action(min(anchor, last))
-                position = self._live_transcript.position_before_action(min(position, last))
-                cursor.setPosition(anchor)
-                cursor.setPosition(position, QTextCursor.MoveMode.KeepAnchor)
-                self._live_transcript.setTextCursor(cursor)
-                bar.setValue(bar.maximum() if at_end and position == anchor else scroll)
-            elif previous and self._live_transcript.retarget_speaker_labels(previous, rendered):
-                self._drafts.live_html = rendered
-            elif previous and self._live_transcript.retarget_paragraphs(previous, rendered, polish_line_height=False):
-                self._drafts.live_html = rendered
-                bar.setValue(bar.maximum() if at_end and position == anchor else scroll)
-            else:
-                # Corrections that split/merge paragraphs or toggle every row rebuild.
-                self._drafts.live_html = rendered
-                self._live_transcript.setHtml(rendered)
-                if at_end and position == anchor:
-                    end = self._live_transcript.textCursor()
-                    end.movePosition(QTextCursor.MoveOperation.End)
-                    self._live_transcript.setTextCursor(end)
-                    bar.setValue(bar.maximum())
+        self._live_scroll_guard += 1
+        try:
+            if rendered != self._drafts.live_html:
+                previous = self._drafts.live_html
+                if previous and rendered.startswith(previous):
+                    self._drafts.live_html = rendered
+                    # Normal live transcription only adds paragraphs. Keep the
+                    # existing document instead of parsing and laying it out again.
+                    tail = QTextCursor(self._live_transcript.document())
+                    tail.movePosition(QTextCursor.MoveOperation.End)
+                    tail.insertBlock()
+                    tail.insertHtml(rendered[len(previous):])
+                    if follow:
+                        self._stick_live_bottom()
+                    else:
+                        cursor = self._live_transcript.textCursor()
+                        last = self._live_transcript.document().characterCount() - 1
+                        anchor = self._live_transcript.position_before_action(min(anchor, last))
+                        position = self._live_transcript.position_before_action(min(position, last))
+                        cursor.setPosition(anchor)
+                        cursor.setPosition(position, QTextCursor.MoveMode.KeepAnchor)
+                        self._live_transcript.setTextCursor(cursor)
+                        bar.setValue(scroll)
+                elif previous and self._live_transcript.retarget_speaker_labels(previous, rendered):
+                    self._drafts.live_html = rendered
+                    if follow:
+                        self._stick_live_bottom()
+                elif previous and self._live_transcript.retarget_action_links(previous, rendered):
+                    self._drafts.live_html = rendered
+                    if follow:
+                        self._stick_live_bottom()
+                elif previous and self._live_transcript.retarget_paragraphs(previous, rendered, polish_line_height=False):
+                    self._drafts.live_html = rendered
+                    if follow:
+                        self._stick_live_bottom()
+                    else:
+                        bar.setValue(scroll)
                 else:
-                    bar.setValue(scroll)
-            if self._live_find_bar.isVisible() and self._live_find_edit.text().strip():
-                idx, total = find_in_reading_view(
-                    self._live_transcript, self._live_find_edit.text(), step=False
-                )
-                self._live_find_status.setText("未找到" if total == 0 else f"{idx} / {total}")
+                    # Paragraphs were split or merged. Rebuild, then keep the
+                    # scroll target until the later layout batches finish.
+                    self._drafts.live_html = rendered
+                    self._live_transcript.setHtml(rendered)
+                    if follow:
+                        self._live_transcript.pin_scroll(follow_bottom=True)
+                        self._stick_live_bottom()
+                    else:
+                        self._live_transcript.pin_scroll(scroll)
+                if self._live_find_bar.isVisible() and self._live_find_edit.text().strip():
+                    idx, total = find_in_reading_view(
+                        self._live_transcript, self._live_find_edit.text(), step=False
+                    )
+                    self._live_find_status.setText("未找到" if total == 0 else f"{idx} / {total}")
+        finally:
+            self._live_scroll_guard -= 1
         self._drafts.live_segment_count = cur_seg_count
-        now_at_end = bar.value() >= max(0, bar.maximum() - 24)
-        if now_at_end:
+        if self._live_follow_bottom:
             self._live_new_msg_btn.hide()
         elif cur_seg_count > prev_seg_count:
             self._position_live_new_msg_btn()

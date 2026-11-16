@@ -9,8 +9,10 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from sayink.audio_recovery import (RecordingJournal, recordings, delete_recording,
-                                    store_pending, StoredAudio)
+from sayink.audio_recovery import (
+    RecordingJournal, recordings, delete_recording, store_pending, StoredAudio,
+    hold_recovery_path, release_recovery_path,
+)
 from sayink.audio_recorder import AudioRecorder
 from sayink.asr_context import with_context
 from tests.helpers.app_harness import app_harness
@@ -62,10 +64,18 @@ def test_quota_failure_does_not_overwrite_earlier_recording(tmp_path):
     assert errors and not journal.healthy
     item, = recordings(tmp_path)
     assert item.samples == 16
-    assert not item.metadata["complete"]
-    with pytest.raises(OSError):
-        RecordingJournal(tmp_path, max_bytes=64)
-    assert item.samples == 16
+    assert item.metadata["complete"] is False
+    assert item.metadata["closed"] is True
+    np.testing.assert_array_equal(np.concatenate(list(item.blocks())), np.ones(16, np.float32))
+    # A quota stop is closed, so the next meeting may remove it. It must not
+    # have been truncated in place by the chunk that did not fit.
+    follow = RecordingJournal(tmp_path, max_bytes=64)
+    try:
+        assert not item.path.exists()
+        assert follow.close()
+    finally:
+        if follow._thread.is_alive():
+            follow.close()
 
 
 @pytest.mark.parametrize("complete", ["false", "0", 1, [False]])
@@ -218,6 +228,72 @@ os._exit(2)
     item, = recordings(tmp_path)
     assert not item.metadata["complete"] and item.samples == 16000
     np.testing.assert_array_equal(np.concatenate(list(item.blocks())), np.full(16000, 0.25, np.float32))
+
+
+def _completed_journal(root, *, samples: int, started_at: float, name: str = "a" * 32):
+    folder = root / name
+    folder.mkdir()
+    (folder / "session.json").write_text(json.dumps({
+        "sample_rate": RATE, "complete": True, "closed": True, "started_at": started_at,
+    }), encoding="utf-8")
+    np.ones(samples, "<f4").tofile(folder / "audio.f32")
+    return folder
+
+
+def test_active_write_deletes_the_oldest_completed_journal_and_keeps_going(tmp_path):
+    old = _completed_journal(tmp_path, samples=10, started_at=time.time() - 3600)
+    fresh_crash = tmp_path / ("b" * 32)
+    fresh_crash.mkdir()
+    (fresh_crash / "session.json").write_text(json.dumps({
+        "sample_rate": RATE, "complete": False, "started_at": time.time() - 60,
+    }), encoding="utf-8")
+    np.ones(2, "<f4").tofile(fresh_crash / "audio.f32")
+    errors = []
+    # Completed 40 bytes + crash 8 bytes fit under the 100 byte cap, so startup
+    # must not delete anything. The next 60 byte chunk crosses the cap.
+    journal = RecordingJournal(tmp_path, max_bytes=100, on_error=errors.append)
+    assert old.exists() and fresh_crash.exists()
+    assert journal.append(np.ones(15, np.float32))
+    deadline = time.monotonic() + 2
+    while not (journal.path / "audio.f32").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    deadline = time.monotonic() + 2
+    while (journal.path / "audio.f32").stat().st_size < 60 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not errors
+    assert journal.healthy
+    assert not old.exists()
+    assert fresh_crash.exists()
+    assert journal.close()
+    assert (journal.path / "audio.f32").stat().st_size == 60
+
+
+def test_quota_closed_journal_can_be_replaced_by_the_next_meeting(tmp_path):
+    folder = tmp_path / ("c" * 32)
+    folder.mkdir()
+    (folder / "session.json").write_text(json.dumps({
+        "sample_rate": RATE, "complete": False, "closed": True,
+        "started_at": time.time() - 30, "error": "录音缓存已达到上限",
+    }), encoding="utf-8")
+    np.ones(40, "<f4").tofile(folder / "audio.f32")
+    journal = RecordingJournal(tmp_path, max_bytes=80)
+    assert journal.path != folder
+    assert not folder.exists()
+    assert journal.close()
+    assert journal.path.exists()
+
+
+def test_playback_hold_keeps_a_completed_journal_when_the_cache_is_over_cap(tmp_path):
+    playing = _completed_journal(tmp_path, samples=20, started_at=time.time() - 7200, name="d" * 32)
+    older = _completed_journal(tmp_path, samples=40, started_at=time.time() - 10_000, name="e" * 32)
+    hold_recovery_path(playing)
+    try:
+        journal = RecordingJournal(tmp_path, max_bytes=200)
+        assert playing.exists()
+        assert not older.exists()
+        journal.close()
+    finally:
+        release_recovery_path(playing)
 
 
 @pytest.mark.parametrize("metadata", [None, "broken json", "[]"])

@@ -9,6 +9,8 @@ from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QLabel
 from sayink.history_store import HistoryStore, SegmentRecord
 from sayink.meeting_session import MeetingController, MeetingOptions, MeetingState, resolve_capabilities
 from sayink.ui import settings_styles as ss
+from sayink.minutes_prompts import TranscriptLine
+from sayink.ui.meeting_views import build_transcript_html
 from sayink.ui.meeting_page import (
     PAGE_BROWSE,
     PAGE_LIVE,
@@ -89,6 +91,136 @@ def test_rebuilding_a_long_transcript_lays_out_every_paragraph():
         block = block.next()
     view.deleteLater()
     assert blank == 0
+
+
+def _unlaid_blocks(view) -> int:
+    blank = 0
+    block = view.document().begin()
+    while block.isValid():
+        layout = block.layout()
+        if layout is None or layout.boundingRect().height() <= 0:
+            blank += 1
+        block = block.next()
+    return blank
+
+
+def _drain_layout(view, seconds: float = 5.0) -> None:
+    import time
+    deadline = time.monotonic() + seconds
+    idle = 0
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        if view._layout_timer.isActive():
+            idle = 0
+        else:
+            idle += 1
+            if idle > 4:
+                return
+        time.sleep(0.005)
+
+
+def test_speaker_correction_retargets_action_links_without_rebuilding():
+    lines = [
+        TranscriptLine(i * 8000, (i % 2) + 1, "第一行内容\n第二行内容" if i == 3 else f"第{i}段发言")
+        for i in range(12)
+    ]
+    names = {1: "甲", 2: "乙"}
+    sequences = list(range(12))
+    editing = build_transcript_html(
+        lines, names, links=True, sequences=sequences, editable=True,
+    )
+    correcting = build_transcript_html(
+        lines, names, links=True, sequences=sequences, editable=True, correcting=True,
+    )
+    view = _TranscriptView()
+    view.resize(640, 480)
+    view.show()
+    rebuilds = {"n": 0}
+    original = view.setHtml
+
+    def counting(text: str) -> None:
+        rebuilds["n"] += 1
+        original(text)
+
+    view.setHtml = counting
+    view.setHtml(editing)
+    _drain_layout(view)
+    bar = view.verticalScrollBar()
+    bar.setValue(bar.maximum() // 2)
+    QApplication.processEvents()
+    scroll = bar.value()
+    assert view.retarget_action_links(editing, correcting)
+    assert rebuilds["n"] == 1
+    assert bar.value() == scroll
+    text = view.toPlainText()
+    assert "更正" in text and "第一行内容" in text and "第二行内容" in text
+    hrefs = []
+    block = view.document().begin()
+    while block.isValid():
+        it = block.begin()
+        while not it.atEnd():
+            href = it.fragment().charFormat().anchorHref()
+            if href:
+                hrefs.append(href)
+            it += 1
+        block = block.next()
+    assert any(href.startswith("segment:") for href in hrefs)
+    assert not any(href.startswith("edit-segment:") for href in hrefs)
+    view.deleteLater()
+
+
+def test_width_change_does_not_leave_a_blank_hole_past_the_first_screen():
+    view = _TranscriptView()
+    view.resize(640, 480)
+    view.show()
+    view.setHtml("".join(
+        f"<p style='margin:0 0 6px 0'>第{i}段，这里是一句用来撑开长文字稿的示例发言。</p>"
+        for i in range(800)
+    ))
+    _drain_layout(view)
+    assert _unlaid_blocks(view) == 0
+    view.resize(420, 480)
+    _drain_layout(view, seconds=8)
+    assert _unlaid_blocks(view) == 0
+    assert "第799段" in view.toPlainText()
+    view.deleteLater()
+
+
+def test_new_speech_button_mouse_click_stays_at_the_bottom(config, tmp_path):
+    page, controller, history, _record = _page(config, tmp_path)
+    try:
+        live = _live(page, controller, history)
+        for i in range(40):
+            history.enqueue(SegmentRecord(
+                live.id, i, live.started_at + i * 1000,
+                raw_text=f"第{i}条较长的实时发言，用来把文字稿撑出滚动条。" * 2,
+                speaker_id=1, trigger_mode="meeting", captured_at=live.started_at + i * 1000,
+            ))
+        history.flush()
+        page._render_live()
+        QApplication.processEvents()
+        bar = page._live_transcript.verticalScrollBar()
+        assert bar.maximum() > 40
+        bar.setValue(bar.maximum() // 2)
+        QApplication.processEvents()
+        history.enqueue(SegmentRecord(
+            live.id, 40, live.started_at + 40_000,
+            raw_text="用户回看上文时新到的一句。",
+            speaker_id=1, trigger_mode="meeting", captured_at=live.started_at + 40_000,
+        ))
+        history.flush()
+        page._render_live()
+        QApplication.processEvents()
+        assert page._live_new_msg_btn.isVisible()
+        QTest.mouseClick(page._live_new_msg_btn, Qt.MouseButton.LeftButton)
+        QApplication.processEvents()
+        assert bar.value() >= bar.maximum() - 24
+        assert page._live_follow_bottom
+        assert not page._live_new_msg_btn.isVisible()
+    finally:
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
 
 
 def test_restore_original_stays_undoable(config, tmp_path):

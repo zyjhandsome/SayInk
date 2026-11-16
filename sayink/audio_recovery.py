@@ -22,15 +22,55 @@ import numpy as np
 
 from sayink.audio_utils import TARGET_SAMPLE_RATE
 
-MAX_RECOVERY_BYTES = 2 * 1024**3
+MAX_RECOVERY_BYTES = 5 * 1024**3
 MIN_FREE_BYTES = 128 * 1024**2
+# Leave this much free inside the cap after a cleanup so the next minutes of
+# audio do not immediately hit the ceiling again. Tests pass a tiny cap, so
+# the real 256 MB reserve shrinks with the cap.
+QUOTA_HEADROOM_BYTES = 256 * 1024**2
 RETENTION_SECONDS = 7 * 86400
 # Super-aged incomplete crash fragments are cleaned up after 30 days, and
-# fragments older than 24h are eligible for rolling 2 GB quota eviction so
+# fragments older than 24h are eligible for rolling quota eviction so
 # abandoned fragments can never permanently lock out future recordings while
 # fresh (<24h) crash recordings remain untouched.
 INCOMPLETE_RETENTION_SECONDS = 30 * 86400
 INCOMPLETE_QUOTA_GRACE_SECONDS = 24 * 3600
+
+def quota_headroom(max_bytes: int) -> int:
+    return min(QUOTA_HEADROOM_BYTES, max(0, int(max_bytes) // 8))
+
+
+_EVICT_LOCK = threading.Lock()
+_HELD_LOCK = threading.Lock()
+_HELD_RECOVERY_PATHS: set[str] = set()
+
+
+def _path_key(path: Path) -> str:
+    try:
+        return os.path.normcase(str(Path(path).resolve()))
+    except OSError:
+        return os.path.normcase(str(path))
+
+
+def hold_recovery_path(path: Path) -> None:
+    """Keep a journal that the player is using out of automatic cleanup."""
+    with _HELD_LOCK:
+        _HELD_RECOVERY_PATHS.add(_path_key(path))
+
+
+def release_recovery_path(path: Path) -> None:
+    with _HELD_LOCK:
+        _HELD_RECOVERY_PATHS.discard(_path_key(path))
+
+
+def _is_held(path: Path) -> bool:
+    key = _path_key(path)
+    with _HELD_LOCK:
+        for held in _HELD_RECOVERY_PATHS:
+            if key == held or key.startswith(held + os.sep) or held.startswith(key + os.sep):
+                return True
+    return False
+
 
 _PENDING_BYTES_LOCK = threading.Lock()
 _PENDING_BYTES_CACHE: dict[Path, tuple[float, int]] = {}
@@ -247,6 +287,54 @@ def delete_recording(root: Path, recording: RecoveryRecording) -> None:
     _invalidate_pending_bytes_cache(root)
 
 
+def _evict_rank(item: RecoveryRecording, now: float) -> tuple[int, float] | None:
+    """Sort key for journals that automatic cleanup may remove. None is protected."""
+    if _is_held(item.path):
+        return None
+    meta = item.metadata
+    started = float(meta.get("started_at") or 0)
+    if meta.get("complete") is True:
+        return (0, started)
+    if meta.get("closed") is True:
+        return (1, started)
+    if now - started > INCOMPLETE_QUOTA_GRACE_SECONDS:
+        return (2, started)
+    return None
+
+
+def evict_oldest_recordings(
+    root: Path, *, target_total_bytes: int, exclude_paths: tuple[Path, ...] = (),
+) -> int:
+    """Delete the oldest eligible journals until the cache is within ``target_total_bytes``.
+
+    Completed journals go first, then sessions that closed after a quota or disk
+    stop, then crash fragments older than 24 hours. The active journal, a file
+    the player is holding, and a fresh crash fragment stay.
+    """
+    exclude = {_path_key(path) for path in exclude_paths}
+    removed = 0
+    with _EVICT_LOCK:
+        while True:
+            items = recordings(root)
+            total = sum(item.cache_bytes for item in items)
+            if total <= target_total_bytes:
+                return removed
+            ranked = []
+            for item in items:
+                if _path_key(item.path) in exclude:
+                    continue
+                rank = _evict_rank(item, time.time())
+                if rank is not None:
+                    ranked.append((rank, item))
+            if not ranked:
+                return removed
+            ranked.sort(key=lambda pair: pair[0])
+            victim = ranked[0][1]
+            size = victim.cache_bytes
+            delete_recording(root, victim)
+            removed += size
+
+
 def _is_hex32_dir(path: Path) -> bool:
     if not path.is_dir() or path.is_symlink() or len(path.name) != 32:
         return False
@@ -370,11 +458,8 @@ class RecordingJournal:
         self._fail_lock = threading.Lock()
         self._pending_cache: tuple[int, float, int] = (-1, 0.0, 0)
         # Expire completed recordings past 7 days AND super-aged (>30d) incomplete fragments.
-        existing = recordings(root)
-        kept: list[RecoveryRecording] = []
-        for item in existing:
+        for item in recordings(root):
             if self._append_mode and item.path == self.path:
-                kept.append(item)
                 continue
             age = now - float(item.metadata.get("started_at", 0) or 0)
             is_complete = item.metadata.get("complete") is True
@@ -384,46 +469,17 @@ class RecordingJournal:
             )
             if expired:
                 delete_recording(root, item)
-            else:
-                kept.append(item)
 
-        self._existing_bytes = sum(
-            item.cache_bytes for item in kept if not (self._append_mode and item.path == self.path)
+        # Leave headroom so the meeting does not fill the cap in the next minute.
+        # Completed journals, quota-closed sessions, then stale crash fragments.
+        evict_oldest_recordings(
+            root,
+            target_total_bytes=max(0, max_bytes - quota_headroom(max_bytes)),
+            exclude_paths=(self.path,),
         )
-        # Rolling quota eviction when total cache hits max_bytes:
-        # 1) evict oldest completed recordings first;
-        # 2) then evict stale incomplete fragments older than INCOMPLETE_QUOTA_GRACE_SECONDS (24h),
-        #    never overwriting fresh (<24h) crash recordings.
-        if self._existing_bytes + self._written_bytes >= max_bytes:
-            evictable = sorted(
-                (
-                    item
-                    for item in kept
-                    if not (self._append_mode and item.path == self.path)
-                    and (
-                        item.metadata.get("complete") is True
-                        or (now - float(item.metadata.get("started_at", 0) or 0)) > INCOMPLETE_QUOTA_GRACE_SECONDS
-                    )
-                ),
-                key=lambda item: (
-                    0 if item.metadata.get("complete") is True else 1,
-                    float(item.metadata.get("started_at", 0) or 0),
-                ),
-            )
-            evicted_paths: set[Path] = set()
-            for candidate in evictable:
-                if self._existing_bytes + self._written_bytes < max_bytes:
-                    break
-                size_bytes = candidate.cache_bytes
-                try:
-                    delete_recording(root, candidate)
-                    evicted_paths.add(candidate.path)
-                    self._existing_bytes = max(0, self._existing_bytes - size_bytes)
-                except OSError:
-                    continue
-            if evicted_paths:
-                kept = [item for item in kept if item.path not in evicted_paths]
-
+        self._existing_bytes = sum(
+            item.cache_bytes for item in recordings(root) if _path_key(item.path) != _path_key(self.path)
+        )
         if self._existing_bytes + self._written_bytes >= max_bytes or shutil.disk_usage(root).free < MIN_FREE_BYTES:
             raise OSError("录音缓存空间不足，请导出或删除旧录音后重试")
         created_dir = False
@@ -517,9 +573,21 @@ class RecordingJournal:
                     except queue.Empty:
                         continue
                     chunk_bytes = sum(map(len, data.values()))
+                    limit = self._max_bytes - quota_headroom(self._max_bytes)
                     used_bytes = self._existing_bytes + size + self._cached_pending_bytes()
+                    if used_bytes + chunk_bytes > limit or shutil.disk_usage(self.root).free < MIN_FREE_BYTES + chunk_bytes:
+                        evict_oldest_recordings(
+                            self.root,
+                            target_total_bytes=max(0, limit - chunk_bytes),
+                            exclude_paths=(self.path,),
+                        )
+                        self._existing_bytes = sum(
+                            item.cache_bytes for item in recordings(self.root)
+                            if _path_key(item.path) != _path_key(self.path)
+                        )
+                        used_bytes = self._existing_bytes + size + self._cached_pending_bytes()
                     if used_bytes + chunk_bytes > self._max_bytes:
-                        self._fail("录音缓存已达到 2 GB 上限；请导出或删除旧录音")
+                        self._fail("录音缓存已达到 5 GB 上限；请导出或删除仍需保留的录音")
                         break
                     if time.monotonic() - last_sync >= 1:
                         for handle in handles.values():
@@ -542,6 +610,7 @@ class RecordingJournal:
                 for handle in handles.values():
                     os.fsync(handle.fileno())
             self._meta.update(complete=self._closed and not self._error,
+                              closed=bool(self._closed),
                               samples=(self.path / "audio.f32").stat().st_size // 4,
                               error=self._error, stopped_at=time.time())
             self._save_metadata()
@@ -552,6 +621,16 @@ class RecordingJournal:
         self._closed = True
         self._stop.set()
         self._thread.join(timeout=timeout)
+        # A quota stop used to look like a fresh crash (complete false, never
+        # closed) and then blocked every later meeting for 24 hours.
+        try:
+            if self.path.is_dir() and not (self.path / "session.json").is_symlink():
+                self._meta["closed"] = True
+                self._meta["complete"] = not self._error
+                self._meta.setdefault("stopped_at", time.time())
+                self._save_metadata()
+        except OSError:
+            pass
         return not self._thread.is_alive()
 
 
@@ -622,8 +701,18 @@ def store_pending(
         raise OSError("磁盘空间不足，无法继续缓存排队语音")
     quota_root = recovery_root if recovery_root is not None else _infer_recovery_root_for_pending(root)
     used_bytes = _tree_f32_bytes(quota_root) if quota_root is not None else _dir_f32_bytes(root)
+    if used_bytes + len(raw_bytes) > max_bytes - quota_headroom(max_bytes):
+        if quota_root is not None:
+            active = root.parent if root.name == "pending" and _is_hex32_dir(root.parent) else None
+            evict_oldest_recordings(
+                quota_root,
+                target_total_bytes=max(0, max_bytes - quota_headroom(max_bytes) - len(raw_bytes)),
+                exclude_paths=(active,) if active is not None else (),
+            )
+            _invalidate_pending_bytes_cache(quota_root)
+            used_bytes = _tree_f32_bytes(quota_root)
     if used_bytes + len(raw_bytes) > max_bytes:
-        raise OSError("待识别录音已达到 2 GB 上限，请等待识别完成")
+        raise OSError("待识别录音已达到 5 GB 上限，请等待识别完成")
     path = root / (uuid4().hex + ".f32")
     noise_floor = getattr(audio, "noise_floor", None)
     quiet_level = float(getattr(audio, "quiet_level", 0.0) or 0.0)

@@ -180,7 +180,7 @@ class AudioRecoveryDialog(QDialog):
         layout.setSpacing(10)
 
         self._note_label = QLabel(
-            "录音仅保存在本机。正常结束的缓存保留 7 天，异常中断的缓存需手动删除；录音上限 2 GB。\n"
+            "录音仅保存在本机。正常结束的缓存保留 7 天，总量上限 5 GB，超出时自动清理最早的旧录音。\n"
             "可导出录音或重新识别。恢复文字显示在这里，可另存为文本。"
         )
         self._note_label.setWordWrap(True)
