@@ -94,6 +94,66 @@
 反而升到 32.9%，多吐出的房间噪声开始被识别成字。
 通用降噪（GTCRN）在该音频上为负收益（35.5%），不建议用于远场。
 
+## 模型矩阵覆盖状态与复现配方
+
+当前仓库共在 `sayink/speech_recognizer.py`（`MODEL_REGISTRY`）中注册 **9 款离线识别模型**。上表仅录入已在真实远场会议语料上跑完核对的实测数据；尚未在同一真实语料跑完的模型保持「待实测」，**严禁填入估算值、公开榜单转抄值或 TTS 合成语音结果**。
+
+| 模型 ID | 界面名称 | 语种范围 | 热词注入 (`hotwords`) | 语言锁定 (`language`) | 长音频滑窗 | 当前基线状态 |
+|---|---|---|---|---|---|---|
+| `funasr-nano` | Fun-ASR-Nano | 中/英/日/方言 | 支持 | 支持 | 15 s 滑窗 | 已实测（当前默认） |
+| `sensevoice` | SenseVoice | 中/英/日/韩/粤 | 不支持（仅术语表后置替换） | 支持 | 整段解码 | 待实测 |
+| `qwen3-asr-0.6b` | Qwen3-ASR 0.6B | 中/英/多语种 | 支持 | 不支持 | 15 s 滑窗 | 待实测 |
+| `fireredasr2-ctc` | FireRedASR2 | 中/英/方言 | 不支持（仅术语表后置替换） | 不支持 | 整段解码 | 已实测（候选对照） |
+| `fireredasr2-aed` | FireRedASR2 AED | 中/英/方言 | 不支持（仅术语表后置替换） | 不支持 | 整段解码 | 待实测 |
+| `paraformer-zh` | Paraformer 中文 | 中/英 | 不支持（仅术语表后置替换） | 不支持 | 整段解码 | 待实测 |
+| `paraformer-trilingual` | Paraformer 三语 | 中/英/粤 | 不支持（仅术语表后置替换） | 不支持 | 整段解码 | 待实测 |
+| `zipformer-ctc-zh` | Zipformer CTC | 纯中文 | 不支持（仅术语表后置替换） | 不支持 | 整段解码 | 待实测 |
+| `qwen3-asr-1.7b` | Qwen3-ASR 1.7B | 中/英/多语种 | 支持 | 不支持 | 15 s 滑窗 | 待实测 |
+
+### 复现全部 9 款已注册模型的评测命令
+
+在应用「引擎」页下载所需模型（及辅助模型 Silero VAD、CAM++）后，可在同一真实会议目录上一次性对比全部 9 款模型，并分别跑 `--vad silero` 与 `--vad energy` 对照：
+
+```powershell
+# 1) 默认会议链路（Silero VAD + CAM++ 换人切分 + 短句空结果重试）跑全部 9 款模型
+py -3.10 tools/asr_bench.py --data D:\bench `
+  --models funasr-nano sensevoice qwen3-asr-0.6b fireredasr2-ctc fireredasr2-aed paraformer-zh paraformer-trilingual zipformer-ctc-zh qwen3-asr-1.7b `
+  --language zh --vad silero --speaker-turns auto --out D:\bench\matrix-silero.json
+
+# 2) 同一批音频用能量门限对照，确认 Silero 在各模型上的真实收益
+py -3.10 tools/asr_bench.py --data D:\bench `
+  --models funasr-nano sensevoice qwen3-asr-0.6b fireredasr2-ctc fireredasr2-aed paraformer-zh paraformer-trilingual zipformer-ctc-zh qwen3-asr-1.7b `
+  --language zh --vad energy --speaker-turns off --out D:\bench\matrix-energy.json
+```
+
+> 说明：不传 `--models` 时，`tools/asr_bench.py` 会自动遍历本机已下载的全部已注册模型；仅 `funasr-nano`、`qwen3-asr-0.6b`、`qwen3-asr-1.7b` 会向解码器注入热词提示，其余模型的「热词命中率 / 术语写法正确率」反映的是无解码器热词下配合术语表大小写恢复与误写替换（`词=误写1、误写2`）的真实表现。
+
+### 双通道（麦克风 + 电脑系统环回）录音评测配方
+
+上面的 AISHELL-4 基线测的是**单通道远场阵列录音**，不代表佩戴耳机/外放开线上会议时的 `microphone + system` 双路采集链路（双路音量平衡、回声重复抑制与分路断句）。双通道场景目前尚未录入实测基线，按以下可复现实验与回放工具分层验证：
+
+1. **受控双轨重叠对比（单声道混音 vs 双路独立切段）**：准备至少两场带人工校对 `.TextGrid` 与 16 kHz 单声道 `.ch0.wav` 的录音，运行 `tools/lane_asr_eval.py` 对比混音解码（`mixed_cer_best_order`、`mixed_rtf`）与麦克风/系统声分路解码（`separate_weighted_cer`、`separate_rtf`）：
+
+   ```powershell
+   py -3.10 tools/lane_asr_eval.py --data D:\bench --model funasr-nano --out D:\bench\lane-overlap-funasr.json
+   ```
+
+   注意该脚本仅评估受控双轨语音重叠，不等同于真实声卡环回硬件延迟与扬声器串音。
+
+2. **真实双路（麦克风 + 系统环回）会议录音评测**：
+   - **有人工校对逐字稿与说话人时间轴（RTTM）时**：将真实混合录音（及分路导出的 16 kHz 单声道 `.wav`）配对人工校对 `.txt` 放入评测目录跑 `tools/asr_bench.py` 获取 CER / RTF，并用 `tools/meeting_timeline_bench.py` 评估说话人时间轴归属与 DER：
+
+     ```powershell
+     py -3.10 tools/asr_bench.py --data D:\bench\dual-lane --language zh --vad silero --out D:\bench\dual-lane-asr.json
+     py -3.10 tools/meeting_timeline_bench.py --manifest D:\bench\dual-lane\manifest.json --segmenter silero --out D:\bench\dual-lane-timeline.json
+     ```
+
+   - **仅有本机真实录音、尚无人工逐字真值时**：使用 `tools/recognition_replay.py` 生成本地试听核对页（对比仅按停顿、说话人分析、多人检测三种模式），人工逐段核对前不计算 CER/DER：
+
+     ```powershell
+     py -3.10 tools/recognition_replay.py --audio D:\bench\dual-lane\sample.wav --out D:\bench\replay.json --review-html D:\bench\review.html
+     ```
+
 ## 决策记录
 
 - 默认会议模型保持 Fun-ASR-Nano，直到某个候选在同一组数据上 CER 低 ≥ 15% 且 RTF ≤ 0.3。

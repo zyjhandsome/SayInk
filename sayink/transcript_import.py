@@ -843,6 +843,131 @@ def _sort_json_sessions_chronologically(sessions: list[Any]) -> list[dict[str, A
     return dict_sessions
 
 
+def _extract_json_dict_payload(
+    payload: dict[str, Any],
+) -> tuple[str, dict[int, str], int | None, list[dict[str, Any]]]:
+    title = ""
+    raw_title = payload.get("title")
+    if isinstance(raw_title, str) and raw_title.strip():
+        title = raw_title.strip()[:80]
+    speaker_map = _json_speaker_lookup(payload.get("speakers"))
+    root_started_at = _json_millis(payload.get("started_at"))
+    if root_started_at is None and isinstance(payload.get("meeting"), dict):
+        meeting_meta = payload["meeting"]
+        if not title and isinstance(meeting_meta.get("title"), str):
+            title = meeting_meta["title"].strip()[:80]
+        root_started_at = _json_millis(meeting_meta.get("started_at"))
+        if not speaker_map:
+            speaker_map = _json_speaker_lookup(meeting_meta.get("speakers"))
+    items: list[dict[str, Any]] = []
+    if isinstance(payload.get("sessions"), list):
+        sessions = payload["sessions"]
+        if not title and len(sessions) == 1 and isinstance(sessions[0], dict):
+            preview = sessions[0].get("title") or sessions[0].get("preview")
+            if isinstance(preview, str) and preview.strip():
+                title = preview.strip()[:80]
+        for session_obj in _sort_json_sessions_chronologically(sessions):
+            segs = session_obj.get("segments")
+            if isinstance(segs, list) and segs:
+                items.extend(seg for seg in segs if isinstance(seg, dict))
+            elif _json_item_text(session_obj):
+                items.append(session_obj)
+    else:
+        for list_key in ("segments", "turns", "utterances", "paragraphs", "items", "messages", "results"):
+            candidate = payload.get(list_key)
+            if isinstance(candidate, list):
+                items = [entry for entry in candidate if isinstance(entry, dict)]
+                break
+        if not items and _json_item_text(payload):
+            items = [payload]
+    return title, speaker_map, root_started_at, items
+
+
+def _extract_json_payload_items(
+    payload: Any,
+) -> tuple[str, dict[int, str], int | None, list[dict[str, Any]]] | None:
+    if isinstance(payload, list):
+        dict_entries = [entry for entry in payload if isinstance(entry, dict)]
+        if len(dict_entries) >= 2 and all(isinstance(e.get("segments"), list) for e in dict_entries):
+            dict_entries = _sort_json_sessions_chronologically(dict_entries)
+        items: list[dict[str, Any]] = []
+        for entry in dict_entries:
+            nested_segs = entry.get("segments")
+            if isinstance(nested_segs, list) and nested_segs:
+                items.extend(seg for seg in nested_segs if isinstance(seg, dict))
+            else:
+                items.append(entry)
+        return "", {}, None, items
+    if isinstance(payload, dict):
+        return _extract_json_dict_payload(payload)
+    return None
+
+
+def _compute_json_epoch_base(
+    items: list[dict[str, Any]],
+    root_started_at: int | None,
+) -> tuple[int | None, int]:
+    epoch_clocks: list[int] = []
+    for item in items:
+        if any(k in item for k in ("offset_ms", "start_ms", "start")):
+            continue
+        cap = _json_millis(item.get("captured_at"))
+        cre = _json_millis(item.get("created_at"))
+        clock = cap if (cap is not None and cap > 0) else (cre if (cre is not None and cre > 0) else None)
+        if clock is not None:
+            epoch_clocks.append(clock)
+    if not epoch_clocks:
+        return None, 0
+    earliest = min(epoch_clocks)
+    if root_started_at is not None and 0 < root_started_at <= earliest:
+        return root_started_at, len(epoch_clocks)
+    return earliest, len(epoch_clocks)
+
+
+def _resolve_json_item_timing(
+    item: dict[str, Any],
+    *,
+    base_epoch: int | None,
+    epoch_clock_count: int,
+    root_started_at: int | None,
+) -> tuple[int | None, int]:
+    duration = max(0, _json_millis(item.get("duration_ms")) or 0)
+    if "offset_ms" in item and item["offset_ms"] is not None:
+        raw_off = _json_millis(item.get("offset_ms"))
+        return (raw_off if raw_off is not None and raw_off >= 0 else None), duration
+    if "start_ms" in item and item["start_ms"] is not None:
+        raw_off = _json_millis(item.get("start_ms"))
+        offset = raw_off if raw_off is not None and raw_off >= 0 else None
+        end_ms = _json_millis(item.get("end_ms"))
+        if not duration and offset is not None and end_ms is not None and end_ms > offset:
+            duration = end_ms - offset
+        return offset, duration
+    if isinstance(item.get("start"), (int, float)) and not isinstance(item.get("start"), bool):
+        start_s = item["start"]
+        if start_s < 0:
+            return None, duration
+        offset = _json_millis(start_s, scale=1000)
+        end_ms = _json_millis(item.get("end"), scale=1000)
+        if not duration and offset is not None and end_ms is not None and end_ms > offset:
+            duration = end_ms - offset
+        return offset, duration
+    if base_epoch is None:
+        return None, duration
+    cap = _json_millis(item.get("captured_at"))
+    if cap is not None and cap < 0:
+        return None, duration
+    cre = _json_millis(item.get("created_at"))
+    clock = cap if (cap is not None and cap > 0) else (cre if (cre is not None and cre > 0) else None)
+    if clock is not None and (
+        epoch_clock_count >= 2
+        or duration > 0
+        or (cap is not None and cap > 0)
+        or root_started_at is not None
+    ):
+        return max(0, clock - base_epoch), duration
+    return None, duration
+
+
 def _parse_json_transcript(text: str) -> ImportedTranscript | None:
     stripped = text.strip()
     if len(stripped) < 2:
@@ -857,122 +982,26 @@ def _parse_json_transcript(text: str) -> ImportedTranscript | None:
     except (ValueError, RecursionError):
         return None
 
-    title = ""
-    speaker_map: dict[int, str] = {}
-    root_started_at: int | None = None
-    items: list[dict[str, Any]] = []
-
-    if isinstance(payload, list):
-        dict_entries = [entry for entry in payload if isinstance(entry, dict)]
-        if len(dict_entries) >= 2 and all(isinstance(e.get("segments"), list) for e in dict_entries):
-            dict_entries = _sort_json_sessions_chronologically(dict_entries)
-        for entry in dict_entries:
-            nested_segs = entry.get("segments")
-            if isinstance(nested_segs, list) and nested_segs:
-                for seg in nested_segs:
-                    if isinstance(seg, dict):
-                        items.append(seg)
-            else:
-                items.append(entry)
-    elif isinstance(payload, dict):
-        raw_title = payload.get("title")
-        if isinstance(raw_title, str) and raw_title.strip():
-            title = raw_title.strip()[:80]
-        speaker_map = _json_speaker_lookup(payload.get("speakers"))
-        root_started_at = _json_millis(payload.get("started_at"))
-        if root_started_at is None and isinstance(payload.get("meeting"), dict):
-            meeting_meta = payload["meeting"]
-            if not title and isinstance(meeting_meta.get("title"), str):
-                title = meeting_meta["title"].strip()[:80]
-            root_started_at = _json_millis(meeting_meta.get("started_at"))
-            if not speaker_map:
-                speaker_map = _json_speaker_lookup(meeting_meta.get("speakers"))
-        if isinstance(payload.get("sessions"), list):
-            sessions = payload["sessions"]
-            if not title and len(sessions) == 1 and isinstance(sessions[0], dict):
-                preview = sessions[0].get("title") or sessions[0].get("preview")
-                if isinstance(preview, str) and preview.strip():
-                    title = preview.strip()[:80]
-            for session_obj in _sort_json_sessions_chronologically(sessions):
-                segs = session_obj.get("segments")
-                if isinstance(segs, list) and segs:
-                    for seg in segs:
-                        if isinstance(seg, dict):
-                            items.append(seg)
-                elif _json_item_text(session_obj):
-                    items.append(session_obj)
-        else:
-            for list_key in ("segments", "turns", "utterances", "paragraphs", "items", "messages", "results"):
-                candidate = payload.get(list_key)
-                if isinstance(candidate, list):
-                    items = [entry for entry in candidate if isinstance(entry, dict)]
-                    break
-            if not items and _json_item_text(payload):
-                items = [payload]
-    else:
+    extracted = _extract_json_payload_items(payload)
+    if extracted is None:
         return None
-
+    title, speaker_map, root_started_at, items = extracted
     if not items:
         return None
 
-    # Determine base epoch timestamp when rows carry SayInk epoch-ms clocks (captured_at / created_at).
-    epoch_clocks: list[int] = []
-    for item in items:
-        if any(k in item for k in ("offset_ms", "start_ms", "start")):
-            continue
-        cap = _json_millis(item.get("captured_at"))
-        cre = _json_millis(item.get("created_at"))
-        clock = cap if (cap is not None and cap > 0) else (cre if (cre is not None and cre > 0) else None)
-        if clock is not None:
-            epoch_clocks.append(clock)
-    base_epoch: int | None = None
-    if epoch_clocks:
-        earliest = min(epoch_clocks)
-        if root_started_at is not None and 0 < root_started_at <= earliest:
-            base_epoch = root_started_at
-        else:
-            base_epoch = earliest
-
+    base_epoch, epoch_clock_count = _compute_json_epoch_base(items, root_started_at)
     turns: list[ImportedTurn] = []
     for item in items:
         content = _json_item_text(item)
         if not content:
             continue
         speaker = _json_item_speaker(item, speaker_map)
-        duration = max(0, _json_millis(item.get("duration_ms")) or 0)
-        offset: int | None = None
-        if "offset_ms" in item and item["offset_ms"] is not None:
-            raw_off = _json_millis(item.get("offset_ms"))
-            if raw_off is not None and raw_off >= 0:
-                offset = raw_off
-        elif "start_ms" in item and item["start_ms"] is not None:
-            raw_off = _json_millis(item.get("start_ms"))
-            if raw_off is not None and raw_off >= 0:
-                offset = raw_off
-            end_ms = _json_millis(item.get("end_ms"))
-            if not duration and offset is not None and end_ms is not None and end_ms > offset:
-                duration = end_ms - offset
-        elif isinstance(item.get("start"), (int, float)) and not isinstance(item.get("start"), bool):
-            start_s = item["start"]
-            if start_s >= 0:
-                offset = _json_millis(start_s, scale=1000)
-                end_ms = _json_millis(item.get("end"), scale=1000)
-                if not duration and offset is not None and end_ms is not None and end_ms > offset:
-                    duration = end_ms - offset
-        elif base_epoch is not None:
-            cap = _json_millis(item.get("captured_at"))
-            cre = _json_millis(item.get("created_at"))
-            if cap is not None and cap < 0:
-                offset = None
-            else:
-                clock = cap if (cap is not None and cap > 0) else (cre if (cre is not None and cre > 0) else None)
-                if clock is not None and (
-                    len(epoch_clocks) >= 2
-                    or duration > 0
-                    or (cap is not None and cap > 0)
-                    or root_started_at is not None
-                ):
-                    offset = max(0, clock - base_epoch)
+        offset, duration = _resolve_json_item_timing(
+            item,
+            base_epoch=base_epoch,
+            epoch_clock_count=epoch_clock_count,
+            root_started_at=root_started_at,
+        )
         turns.append(ImportedTurn(_json_safe_text(speaker), offset, duration, _json_safe_text(content)))
 
     if not turns:
