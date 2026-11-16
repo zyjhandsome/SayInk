@@ -723,3 +723,85 @@ def test_explicit_config_dir_skips_registry_auto_start_sync_by_default(config_ho
     explicit_sync = Config(config_dir=config_home, sync_auto_start=True)
     assert explicit_sync.get("auto_start") is False
     assert touched == ["synced"]
+
+
+def test_source_and_dist_launches_preserve_valid_installed_auto_start(tmp_path, monkeypatch):
+    import json
+    import sys
+    import types
+
+    from sayink import config as config_mod
+    from sayink.config import Config
+
+    installed_exe = tmp_path / "ProgramFiles" / "SayInk" / "SayInk.exe"
+    installed_exe.parent.mkdir(parents=True)
+    installed_exe.write_bytes(b"exe")
+
+    python_exe = tmp_path / "Python310" / "python.exe"
+    python_exe.parent.mkdir(parents=True)
+    python_exe.write_bytes(b"py")
+    run_py = tmp_path / "repo" / "run.py"
+    run_py.parent.mkdir(parents=True)
+    run_py.write_text("# launcher\n", encoding="utf-8")
+
+    dist_exe = tmp_path / "repo" / "dist" / "SayInk-full-3.0.3" / "SayInk.exe"
+    dist_exe.parent.mkdir(parents=True)
+    dist_exe.write_bytes(b"exe")
+
+    data_dir = tmp_path / "userdata"
+    data_dir.mkdir()
+    (data_dir / "config.json").write_text(json.dumps({"auto_start": True}), encoding="utf-8")
+
+    run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    reg_values = {(run_key, "SayInk"): (f'"{installed_exe}"', 1)}
+    written: list[tuple[str, str, str]] = []
+
+    class FakeKey:
+        def __init__(self, path):
+            self.path = path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def _set_val(key, name, _r, _t, val):
+        reg_values[(key.path, name)] = (val, 1)
+        written.append((key.path, name, val))
+
+    fake_winreg = types.SimpleNamespace(
+        HKEY_CURRENT_USER=1,
+        KEY_READ=1,
+        KEY_SET_VALUE=2,
+        REG_SZ=1,
+        OpenKey=lambda _root, subkey, _res=0, _acc=1: FakeKey(subkey),
+        CloseKey=lambda _k: None,
+        QueryValueEx=lambda key, name: reg_values[(key.path, name)]
+        if (key.path, name) in reg_values
+        else (_ for _ in ()).throw(FileNotFoundError(name)),
+        SetValueEx=_set_val,
+        DeleteValue=lambda key, name: (_ for _ in ()).throw(FileNotFoundError(name)),
+    )
+    stub_secrets = types.SimpleNamespace(read=lambda: "", write=lambda _v: True)
+    monkeypatch.setattr(config_mod, "user_data_dir", lambda: data_dir)
+    monkeypatch.setattr(config_mod.sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
+
+    # 1. Source run (python.exe run.py) must NOT clobber an existing installed SayInk.exe
+    monkeypatch.setattr("sayink.app.auto_start_command", lambda: f'"{python_exe}" "{run_py}"')
+    Config(secret_store=stub_secrets)
+    assert written == []
+    assert reg_values[(run_key, "SayInk")][0] == f'"{installed_exe}"'
+
+    # 2. PyInstaller dist/ staging run must NOT clobber an existing installed SayInk.exe
+    monkeypatch.setattr("sayink.app.auto_start_command", lambda: f'"{dist_exe}"')
+    Config(secret_store=stub_secrets)
+    assert written == []
+    assert reg_values[(run_key, "SayInk")][0] == f'"{installed_exe}"'
+
+    # 3. Launching the installed SayInk.exe heals a hijacked python.exe run.py Run entry
+    reg_values[(run_key, "SayInk")] = (f'"{python_exe}" "{run_py}"', 1)
+    monkeypatch.setattr("sayink.app.auto_start_command", lambda: f'"{installed_exe}"')
+    Config(secret_store=stub_secrets)
+    assert written == [(run_key, "SayInk", f'"{installed_exe}"')]

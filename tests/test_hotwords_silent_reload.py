@@ -360,7 +360,8 @@ def test_cold_start_and_non_hotword_switches_show_loading_and_ready_notification
         assert sr.last_ready_silent is False
         h["floating"].show_success.assert_called_once()
         assert h["floating"].show_success.call_args.args[0] == "已就绪"
-        h["tray"].showMessage.assert_called_once()
+        # S-POP-02: FloatingWindow toast is sufficient; avoid duplicate tray balloon.
+        h["tray"].showMessage.assert_not_called()
 
         # Switch model_id / language / num_threads: blocking visible reload + ready notifications.
         h["floating"].reset_mock()
@@ -383,7 +384,7 @@ def test_cold_start_and_non_hotword_switches_show_loading_and_ready_notification
         assert sr.last_ready_silent is False
         h["floating"].show_success.assert_called_once()
         assert h["floating"].show_success.call_args.args[0] == "已就绪"
-        h["tray"].showMessage.assert_called_once()
+        h["tray"].showMessage.assert_not_called()
 
 
 # ── 4. Edge cases A, B, and D ─────────────────────────────────────────────
@@ -500,7 +501,7 @@ def test_case_b_switching_model_or_language_mid_warm_swap_degrades_to_visible_re
         assert sr.last_ready_silent is False
         h["floating"].show_success.assert_called_once()
         assert h["floating"].show_success.call_args.args[0] == "已就绪"
-        h["tray"].showMessage.assert_called_once()
+        h["tray"].showMessage.assert_not_called()
 
 
 def test_case_d_warm_swap_worker_error_keeps_previous_recognizer_alive_and_silent():

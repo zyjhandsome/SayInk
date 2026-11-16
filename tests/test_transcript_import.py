@@ -635,5 +635,82 @@ def test_wall_clock_import_normalizes_duration_and_midnight_rollover(tmp_path):
         mid_segs = meetings.get_segments(mid_rec.id)
         assert mid_segs[0].duration_ms == 5 * 60 * 1000
         assert mid_segs[1].captured_at == mid_saved.started_at + 5 * 60 * 1000
+
+        skew_text = (
+            "[2026-11-12 14:00:05] 张三：开场第一句。\n"
+            "[2026-11-12 14:00:02] 李四：客户端慢了三秒。\n"
+            "[2026-11-12 14:00:10] 王五：继续讨论。\n"
+        )
+        skew_parsed = parse_transcript(skew_text)
+        skew_rec = meetings.create_meeting_from_transcript(skew_parsed, title="时钟微偏")
+        assert skew_rec is not None and meetings.flush()
+        skew_segs = meetings.get_segments(skew_rec.id)
+        assert skew_segs[0].captured_at == skew_rec.started_at
+        assert skew_segs[1].captured_at == skew_rec.started_at
+        assert skew_segs[2].captured_at == skew_rec.started_at + 5_000
     finally:
+        history.close(timeout=2)
+
+
+def test_out_of_order_srt_json_multisession_srt_no_overlap_and_citation_jump(config, tmp_path, qapp):
+    from sayink.minutes_prompts import TranscriptLine, render_srt
+
+    # 1. Out-of-order SRT cues sort chronologically along media timeline
+    disordered_srt = (
+        "1\n00:00:10,000 --> 00:00:12,000\n李四：后一句\n\n"
+        "2\n00:00:02,000 --> 00:00:05,000\n张三：前一句\n"
+    )
+    parsed_srt = parse_transcript(disordered_srt)
+    assert [(t.speaker_label, t.offset_ms) for t in parsed_srt.turns] == [
+        ("张三", 2_000),
+        ("李四", 10_000),
+    ]
+
+    # 2. Multi-session JSON exported newest-first imports in ascending session order
+    exported_json = json.dumps({
+        "sessions": [
+            {"session_id": "s2", "started_at": 20_000, "segments": [{"captured_at": 20_000, "raw_text": "下午结论"}]},
+            {"session_id": "s1", "started_at": 10_000, "segments": [{"captured_at": 10_000, "raw_text": "上午背景"}]},
+        ]
+    })
+    parsed_json = parse_transcript(exported_json)
+    assert [t.text for t in parsed_json.turns] == ["上午背景", "下午结论"]
+    assert [t.offset_ms for t in parsed_json.turns] == [0, 10_000]
+
+    # 3. render_srt clamps cue end to next_start to eliminate 1ms/overlap collisions
+    srt_out = render_srt([
+        TranscriptLine(1_000, 1, "第一句", duration_ms=1_501),
+        TranscriptLine(2_500, 2, "第二句", duration_ms=1_000),
+    ])
+    assert "00:00:01,000 --> 00:00:02,500" in srt_out
+
+    # 4. _jump_to_transcript works even with untimed preamble/trailing rows & sort toggle works
+    controller, history = _controller(config, tmp_path)
+    page = MeetingPage(config, controller)
+    try:
+        mixed = parse_transcript("会前说明\n更多背景。\n[00:12] 张三：切入正题\n[00:30] 李四：确定方案\n")
+        rec = controller.store.create_meeting_from_transcript(mixed, title="混合跳转", started_at=1_700_000_000_000)
+        later = controller.store.create_meeting(title="更新的会议", started_at=1_800_000_000_000)
+        controller.store.end_meeting(later.id, ended_at=later.started_at + 1000)
+        old_import = controller.store.create_meeting_from_transcript(
+            parse_transcript("甲：归档内容。\n乙：收到。"),
+            title="刚导入的旧文稿",
+            started_at=1_500_000_000_000,
+        )
+        assert rec is not None and old_import is not None and controller.store.flush()
+        page.refresh()
+        assert page._list.item(0).data(Qt.ItemDataRole.UserRole) == old_import.id
+        page._sort_btn.click()
+        assert page._list.item(0).data(Qt.ItemDataRole.UserRole) == later.id
+        page._sort_btn.click()
+        assert page._list.item(0).data(Qt.ItemDataRole.UserRole) == old_import.id
+
+        page.show_meeting(rec.id)
+        page._jump_to_transcript(30_000)
+        assert page._transcript_highlight == 2
+        page._jump_to_transcript(5_000)
+        assert page._transcript_highlight == 1
+    finally:
+        page.deleteLater()
+        controller.shutdown()
         history.close(timeout=2)

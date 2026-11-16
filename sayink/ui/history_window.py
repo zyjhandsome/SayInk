@@ -65,6 +65,7 @@ from sayink.ui import settings_styles as _settings_styles
 from sayink.ui import design_tokens as tok
 from sayink.ui.clipboard import COPY_FAILED_TEXT as COPY_FAILED_TEXT, copy_text
 from sayink.ui.flow_layout import FlowLayout, WrappingToolBar, defer_while_live_resize
+from sayink.ui.native_dialog import native_file_dialog
 from sayink.ui.reading import fit_reading_width
 
 logger = logging.getLogger(__name__)
@@ -2761,12 +2762,13 @@ class HistoryWindow(QWidget):
 
     def _export_single(self, session: SessionSummary) -> None:
         default = export_save_path(suggest_single_export_filename(session))
-        raw_path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "导出历史",
-            default,
-            "Markdown (*.md);;纯文本 (*.txt);;CSV 表格 (*.csv);;JSON (*.json)",
-        )
+        with native_file_dialog(self):
+            raw_path, selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "导出历史",
+                default,
+                "Markdown (*.md);;纯文本 (*.txt);;CSV 表格 (*.csv);;JSON (*.json)",
+            )
         if not raw_path:
             return
         kind = self._resolve_export_kind(raw_path, selected_filter)
@@ -2793,12 +2795,13 @@ class HistoryWindow(QWidget):
 
     def _export_batch(self, sessions: list[SessionSummary]) -> None:
         default = export_save_path(suggest_batch_export_filename())
-        raw_path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "批量导出历史",
-            default,
-            "Markdown (*.md);;CSV 表格 (*.csv);;JSON (*.json)",
-        )
+        with native_file_dialog(self):
+            raw_path, selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "批量导出历史",
+                default,
+                "Markdown (*.md);;CSV 表格 (*.csv);;JSON (*.json)",
+            )
         if not raw_path:
             return
         filt = (selected_filter or "").strip()

@@ -99,8 +99,59 @@ def _build_check_path() -> QPainterPath:
 _CHECK_PATH = _build_check_path()
 
 
+class _IslandContainer(QWidget):
+    """Paints the capsule/card background directly with QPainter so mode switches
+    and hover-expand never trigger Qt QSS stylesheet re-parsing."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("islandContainer")
+        self._radius: float = float(BAR_HEIGHT // 2)
+        self._bg_hex: str = ""
+        self._border_hex: str = ""
+        self._bg_color: QColor = _qcolor(tok.FLOAT_BG)
+        self._border_color: QColor = _qcolor(tok.FLOAT_BORDER)
+
+    def sync_colors_and_radius(self, bg_hex: str, border_hex: str, radius: float) -> None:
+        theme_changed = False
+        changed = False
+        if bg_hex != self._bg_hex:
+            self._bg_hex = bg_hex
+            self._bg_color = _qcolor(bg_hex)
+            theme_changed = True
+            changed = True
+        if border_hex != self._border_hex:
+            self._border_hex = border_hex
+            self._border_color = _qcolor(border_hex)
+            theme_changed = True
+            changed = True
+        if radius != self._radius:
+            self._radius = float(radius)
+            changed = True
+        if theme_changed:
+            self.setStyleSheet(
+                f"QWidget#islandContainer {{ background: transparent; }}"
+                f" /* theme-bg: {bg_hex}; border: {border_hex}; */"
+            )
+        if changed:
+            self.update()
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        pen = QPen(self._border_color)
+        pen.setWidthF(1.0)
+        p.setPen(pen)
+        p.setBrush(self._bg_color)
+        p.drawRoundedRect(rect, self._radius, self._radius)
+        p.end()
+
+
 class _DotIndicator(QWidget):
     """Dual-channel status glyph (color + distinct geometric form) for the island."""
+
+    _TICK_MS = 60
 
     def __init__(self, color: str = "", parent=None):
         super().__init__(parent)
@@ -111,16 +162,19 @@ class _DotIndicator(QWidget):
         self._pulse = 0.0
         self._pulsing = False
         self._suspended = False
+        self._last_visual_key: tuple[int, int] | None = None
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self.setFixedSize(16, 16)
 
     def set_color(self, color: str):
         self._color = _qcolor(color)
+        self._last_visual_key = None
         self.update()
 
     def set_state_token(self, token: str) -> None:
         self._state_token = token or "STATE_RECORD"
+        self._last_visual_key = None
         self.update()
 
     def state_glyph_kind(self) -> str:
@@ -131,17 +185,20 @@ class _DotIndicator(QWidget):
         if prefers_reduced_motion():
             self._timer.stop()
             self._pulse = 0.0
+            self._last_visual_key = None
             self.update()
             return
         if self._suspended or self._timer.isActive():
             return
         self._pulse = 0.0
-        self._timer.start(50)
+        self._last_visual_key = None
+        self._timer.start(self._TICK_MS)
 
     def stop_pulse(self):
         self._pulsing = False
         self._timer.stop()
         self._pulse = 0.0
+        self._last_visual_key = None
         self.update()
 
     def set_suspended(self, suspended: bool) -> None:
@@ -149,15 +206,25 @@ class _DotIndicator(QWidget):
         if self._suspended or prefers_reduced_motion():
             self._timer.stop()
         elif self._pulsing and not self._timer.isActive():
-            self._timer.start(50)
+            self._timer.start(self._TICK_MS)
 
     def _tick(self):
         if prefers_reduced_motion():
             self._timer.stop()
+            self._last_visual_key = None
             self.update()
             return
-        self._pulse += 0.15
-        self.update()
+        self._pulse += 0.18
+        alpha_step = int(40 + 40 * abs(math.sin(self._pulse))) // 2
+        angle_step = (
+            int(round(((45.0 - math.degrees(self._pulse) * 2.5) % 360.0) * 2))
+            if self.state_glyph_kind() == "recognize"
+            else 0
+        )
+        visual_key = (alpha_step, angle_step)
+        if visual_key != self._last_visual_key:
+            self._last_visual_key = visual_key
+            self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -239,6 +306,7 @@ class WaveformWidget(QWidget):
     NUM_BARS = 14
     _SILENT_VOLUME_EPS = 0.005
     _SILENT_BAR_EPS = 0.01
+    _TICK_MS = 60
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -249,6 +317,7 @@ class WaveformWidget(QWidget):
         self._visible_bars = self.NUM_BARS
         self._running = False
         self._suspended = False
+        self._last_pixel_key: tuple | None = None
         self.setFixedHeight(18)
         self.setFixedWidth(72)
 
@@ -257,22 +326,26 @@ class WaveformWidget(QWidget):
 
     def set_accent(self, color: str):
         self._accent = _qcolor(color)
+        self._last_pixel_key = None
 
     def start(self):
         self._running = True
         if prefers_reduced_motion():
             self._timer.stop()
+            self._last_pixel_key = None
             self.update()
             return
         if self._suspended or self._timer.isActive():
             return
         self._phase = 0.0
-        self._timer.start(50)
+        self._last_pixel_key = None
+        self._timer.start(self._TICK_MS)
 
     def stop(self):
         self._running = False
         self._timer.stop()
         self._bar_heights = [0.0] * self.NUM_BARS
+        self._last_pixel_key = None
         self.update()
 
     def set_suspended(self, suspended: bool) -> None:
@@ -280,10 +353,11 @@ class WaveformWidget(QWidget):
         if self._suspended or prefers_reduced_motion():
             self._timer.stop()
         elif self._running and not self._timer.isActive():
-            self._timer.start(50)
+            self._timer.start(self._TICK_MS)
 
     def set_compact(self, compact: bool) -> None:
         self._visible_bars = 5 if compact else self.NUM_BARS
+        self._last_pixel_key = None
         self.setFixedWidth(28 if compact else 72)
 
     def set_volume(self, volume: float):
@@ -292,17 +366,19 @@ class WaveformWidget(QWidget):
             self._timer.stop()
             level = self._volume if self._running else 0.0
             self._bar_heights = [level * 0.7] * self.NUM_BARS
+            self._last_pixel_key = None
             self.update()
             return
         if self._running and not self._suspended and self._volume >= self._SILENT_VOLUME_EPS and not self._timer.isActive():
-            self._timer.start(50)
+            self._timer.start(self._TICK_MS)
 
     def _animate(self):
         if prefers_reduced_motion():
             self._timer.stop()
+            self._last_pixel_key = None
             self.update()
             return
-        self._phase += 0.3
+        self._phase += 0.36
         peak = 0.0
         for i in range(self.NUM_BARS):
             wave = math.sin(self._phase + i * 0.5) * 0.5 + 0.5
@@ -314,7 +390,14 @@ class WaveformWidget(QWidget):
         if self._volume < self._SILENT_VOLUME_EPS and peak < self._SILENT_BAR_EPS:
             self._bar_heights = [0.0] * self.NUM_BARS
             self._timer.stop()
-        self.update()
+        h = max(4, self.height() - 2)
+        pixel_key = tuple(
+            (max(3, int(bh * h)), int(100 + bh * 155) // 4)
+            for bh in self._bar_heights[: self._visible_bars]
+        )
+        if pixel_key != self._last_pixel_key:
+            self._last_pixel_key = pixel_key
+            self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -537,6 +620,35 @@ class FloatingWindow(QWidget):
     def _apply_action_button_styles(self) -> None:
         from sayink.ui import design_tokens as tok
 
+        style_key = (
+            tok.CHIP_BG,
+            tok.FLOAT_TEXT,
+            tok.FLOAT_BORDER,
+            tok.STATE_RECORD,
+            tok.PRIMARY_CONTAINER,
+            bool(self._meeting_active),
+        )
+        if getattr(self, "_action_btn_style_key", None) == style_key:
+            return
+        self._action_btn_style_key = style_key
+
+        if hasattr(self, "_dismiss_btn"):
+            self._set_btn_css(self._dismiss_btn, f"""
+                QPushButton {{
+                    background: transparent;
+                    color: {tok.FLOAT_TEXT_SEC};
+                    border: none;
+                    font-size: 14px;
+                    font-weight: 700;
+                    border-radius: 11px;
+                    padding: 0px;
+                }}
+                QPushButton:hover {{
+                    background: {tok.ROW_HOVER};
+                    color: {tok.FLOAT_TEXT};
+                }}
+            """)
+
         self._set_btn_css(self._cancel_btn, f"""
             QPushButton {{
                 background: {tok.CHIP_BG};
@@ -641,11 +753,7 @@ class FloatingWindow(QWidget):
 
     def _paint_container(self) -> None:
         radius = 16 if self._mode == "excerpt" else BAR_HEIGHT // 2
-        self._set_widget_css(
-            self._container,
-            f"QWidget#islandContainer {{ background: {tok.FLOAT_BG};"
-            f" border: 1px solid {tok.FLOAT_BORDER}; border-radius: {radius}px; }}",
-        )
+        self._container.sync_colors_and_radius(tok.FLOAT_BG, tok.FLOAT_BORDER, radius)
 
     def _setup_window(self):
         self.setWindowFlags(island_window_flags() | Qt.WindowType.WindowDoesNotAcceptFocus)
@@ -658,8 +766,7 @@ class FloatingWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self._container = QWidget()
-        self._container.setObjectName("islandContainer")
+        self._container = _IslandContainer()
 
         container_layout = QVBoxLayout(self._container)
         container_layout.setContentsMargins(10, 6, 8, 6)
@@ -719,9 +826,20 @@ class FloatingWindow(QWidget):
         self._mark_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._mark_btn.clicked.connect(self.meeting_mark_requested.emit)
         self._mark_btn.hide()
+
+        self._dismiss_btn = QPushButton("×")
+        self._dismiss_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._dismiss_btn.setFixedSize(22, 22)
+        self._dismiss_btn.setAccessibleName("隐藏悬浮提示")
+        self._dismiss_btn.setToolTip("隐藏悬浮窗")
+        self._dismiss_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._dismiss_btn.clicked.connect(self._on_close_clicked)
+        self._dismiss_btn.hide()
+
         actions_row.addWidget(self._cancel_btn)
         actions_row.addWidget(self._mark_btn)
         actions_row.addWidget(self._end_btn)
+        actions_row.addWidget(self._dismiss_btn)
         header_row.addLayout(actions_row)
         container_layout.addLayout(header_row)
 
@@ -750,12 +868,12 @@ class FloatingWindow(QWidget):
         if not self._waveform.isHidden():
             used += self._waveform.width() + 8
         visible_btns = [
-            btn for btn in (self._cancel_btn, self._mark_btn, self._end_btn)
+            btn for btn in (self._cancel_btn, self._mark_btn, self._end_btn, self._dismiss_btn)
             if not btn.isHidden()
         ]
         if visible_btns:
             used += 8 + 2 + sum(
-                max(btn.minimumWidth(), QFontMetrics(btn.font()).horizontalAdvance(btn.text()) + 20)
+                btn.width() if btn is self._dismiss_btn else max(btn.minimumWidth(), QFontMetrics(btn.font()).horizontalAdvance(btn.text()) + 20)
                 for btn in visible_btns
             )
             used += 14 * max(0, len(visible_btns) - 1)
@@ -955,11 +1073,22 @@ class FloatingWindow(QWidget):
         if self.x() != x or self.y() != y:
             self.move(x, y)
 
+    def _is_passive_overlay(self) -> bool:
+        return not (self._listening_active or self._capture_active or self._meeting_active)
+
+    def hide_passive_overlay(self) -> bool:
+        """Hide passive overlay states (toast/error/loading) without disturbing active capture."""
+        if not self._is_passive_overlay():
+            return False
+        self.dismiss_if_idle()
+        return True
+
     def _present(self) -> None:
         self._hide_timer.stop()
         self._end_btn.setVisible(self._listening_active)
         self._mark_btn.setVisible(self._meeting_active)
         self._sync_cancel_button()
+        self._dismiss_btn.setVisible(self._is_passive_overlay())
         self._apply_action_button_styles()
         self._update_status_elision()
         self._dot.set_suspended(False)
@@ -1039,6 +1168,9 @@ class FloatingWindow(QWidget):
         menu.addSeparator()
         reset_action = menu.addAction("重置悬浮窗位置")
         reset_action.triggered.connect(self.reset_to_default_position)
+        if self.isVisible() and self._is_passive_overlay():
+            hide_action = menu.addAction("隐藏悬浮窗")
+            hide_action.triggered.connect(self.dismiss_if_idle)
         return menu
 
     def _show_position_menu(self, global_pos: QPoint) -> None:

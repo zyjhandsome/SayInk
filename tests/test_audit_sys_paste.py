@@ -488,7 +488,10 @@ class TestOnboardingFixes:
 
         monkeypatch.setattr(QDialog, "exec", fake_exec)
         ctl.show_setup()
-        assert welcomed == [True]
+        # S-POP-03: _SetupDialog already presents usage_hint + inline history opt-in,
+        # so completing setup marks first_run_welcome_seen directly without chaining QMessageBoxes.
+        assert welcomed == []
+        assert cfg.get("first_run_welcome_seen") is True
 
     def test_capture_generation_guard_and_early_finish_trial(self, monkeypatch):
         _qapp = QApplication.instance() or QApplication(sys.argv)

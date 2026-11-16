@@ -2,17 +2,17 @@
 ; Creates a professional Windows installer with custom installation path
 ;
 ; Constants are normally passed by build_installer.py:
-;   ISCC /DAppVersionStr=3.0.3 /DAppVersionQuad=3.0.3.0 SayInk-Setup.iss
+;   ISCC /DAppVersionStr=3.0.4 /DAppVersionQuad=3.0.4.0 SayInk-Setup.iss
 ; Both installers copy dist\SayInk\models\. Lite has CAM++, Silero VAD and
 ; the experimental speaker-activity model; the app downloads Fun-ASR-Nano on
 ; first start. Full installer:
 ; /DOutputSuffix=-full, and models\ also contains Fun-ASR-Nano.
 ; The in-app updater only downloads the lite name (sayink/updater.py).
 #ifndef AppVersionStr
-#define AppVersionStr "3.0.3"
+#define AppVersionStr "3.0.4"
 #endif
 #ifndef AppVersionQuad
-#define AppVersionQuad "3.0.3.0"
+#define AppVersionQuad "3.0.4.0"
 #endif
 #ifndef OutputSuffix
 #define OutputSuffix ""
@@ -195,7 +195,7 @@ begin
   if (CurStep = ssPostInstall) and WizardIsTaskSelected('autostart') then
     RunAsUser(ExpandConstant('{sys}\reg.exe'),
       'add "HKCU\' + RunKey + '" /v SayInk /t REG_SZ /d "\"' +
-      ExpandConstant('{app}') + '\SayInk.exe\"" /f');
+      ExpandConstant('{app}') + '\SayInk.exe\" --autostart" /f');
 end;
 
 // The app writes its own Run value (settings → 开机自启) and a Start Menu

@@ -352,7 +352,9 @@ class TestReadmeAutoStart:
         monkeypatch.delattr(sys, "frozen", raising=False)
         monkeypatch.delattr(sys, "_MEIPASS", raising=False)
         command = auto_start_command()
-        parts = [p for p in command.split('"') if p.strip()]
+        assert command.endswith(" --autostart")
+        quoted_portion = command[: -len(" --autostart")]
+        parts = [p for p in quoted_portion.split('"') if p.strip()]
         assert all(os.path.isabs(p) for p in parts)
         assert parts[-1].endswith("run.py")
 
@@ -363,17 +365,22 @@ class TestReadmeContinuousMode:
     def test_stt_ready_does_not_auto_start_continuous(self):
         with app_harness({"audio.trigger_mode": "continuous", "hotkey": "ctrl+space"}) as h:
             with patch.object(h["app"], "_start_continuous_listening") as start_cont:
+                # Cold boot ready stays completely silent (no floating bar, no tray toast).
                 h["app"]._on_stt_ready()
                 start_cont.assert_not_called()
                 h["floating"].show_continuous_idle.assert_not_called()
                 h["floating"].clear_model_loading_lock.assert_called()
                 h["floating"].dismiss_if_idle.assert_called()
-                h["tray"].showMessage.assert_called()
-                msg = h["tray"].showMessage.call_args[0][1]
-                assert "持续转写" in msg or "监听" in msg
-                assert "Esc 或转写条「结束」" in msg
-                assert "浮窗" not in msg
-                assert "×" not in msg
+                h["tray"].showMessage.assert_not_called()
+
+                # When user explicitly awaited model readiness, single-surface HUD shows stop hint without tray duplicate.
+                h["app"]._reload_coordinator().user_awaited_model_ready = True
+                h["app"]._on_stt_ready()
+                h["floating"].show_success.assert_called_once()
+                title, subtitle = h["floating"].show_success.call_args.args
+                assert "持续转写" in title
+                assert "Esc 或转写条「结束」" in subtitle
+                h["tray"].showMessage.assert_not_called()
 
     def test_continuous_short_tap_does_not_show_idle_float(self):
         with app_harness({"audio.trigger_mode": "continuous", "hotkey": "ctrl+space"}) as h:
@@ -406,12 +413,19 @@ class TestReadmeContinuousMode:
     def test_stt_ready_shows_hotkey_hint_in_hotkey_mode(self):
         with app_harness({"audio.trigger_mode": "hotkey", "hotkey": "ctrl+space"}) as h:
             with patch.object(h["app"], "_start_continuous_listening") as start_cont:
+                # Cold boot ready stays silent.
                 h["app"]._on_stt_ready()
                 start_cont.assert_not_called()
+                h["floating"].show_success.assert_not_called()
+                h["tray"].showMessage.assert_not_called()
+
+                # User awaited model load -> shows hotkey hint on FloatingWindow without duplicating tray toast.
+                h["app"]._reload_coordinator().user_awaited_model_ready = True
+                h["app"]._on_stt_ready()
                 h["floating"].show_success.assert_called_once()
-                h["tray"].showMessage.assert_called()
-                msg = h["tray"].showMessage.call_args[0][1]
+                msg = " ".join(h["floating"].show_success.call_args.args)
                 assert "Ctrl" in msg or "ctrl" in msg.lower()
+                h["tray"].showMessage.assert_not_called()
 
     def test_settings_switch_stops_continuous_listening(self):
         with app_harness({"audio.trigger_mode": "hotkey"}) as h:

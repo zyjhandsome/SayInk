@@ -70,6 +70,8 @@ class ReloadCoordinator:
         sync_settings_runtime_status: Callable[..., None] | None = None,
         sync_recognition_runtime_status: Callable[[], None] | None = None,
         sync_tray_status_summary: Callable[..., None] | None = None,
+        onboarding_active: Callable[[], bool] | None = None,
+        main_window_visible: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         self.recorder = recorder
@@ -103,11 +105,15 @@ class ReloadCoordinator:
         self.sync_settings_runtime_status = sync_settings_runtime_status or (lambda _s=None: None)
         self.sync_recognition_runtime_status = sync_recognition_runtime_status or (lambda: None)
         self.sync_tray_status_summary = sync_tray_status_summary or (lambda _s=None: None)
+        self.onboarding_active = onboarding_active or (lambda: False)
+        self.main_window_visible = main_window_visible or (lambda: False)
 
         self.recognition_change_pending: bool = False
         self.models_reload_pending: bool = False
         self.deferred_audio_settings: bool = False
         self.settings_after_recovery: bool = False
+        self.cold_boot_load_quiet: bool = False
+        self.user_awaited_model_ready: bool = False
         self.applied_audio_key: tuple[str, int, int] | None = None
         self.applied_recognition_key: tuple | None = None
         self.applied_speaker_aux: tuple = ()
@@ -284,7 +290,7 @@ class ReloadCoordinator:
             and loader in {"fire_red_asr_ctc", "zipformer_ctc"}
         )
 
-    def configure_stt(self) -> None:
+    def configure_stt(self, *, boot: bool = False) -> None:
         configured = self.config.get("stt.model_id", DEFAULT_MODEL_ID)
         model_id = self._resolve_startup_model_id(configured)
         if model_id and model_id != configured and self._is_model_downloaded(model_id):
@@ -310,27 +316,54 @@ class ReloadCoordinator:
                 and self.recognizer.is_ready
             )
             if needs_load and not self.recognizer.is_loading:
-                self.floating.show_model_loading(
-                    f"正在将 {name} 载入内存，请稍候（{self.load_eta_text(model_id)}）…"
+                quiet_surface = bool(
+                    boot
+                    or self.onboarding_active()
+                    or self.main_window_visible()
                 )
+                self.cold_boot_load_quiet = quiet_surface
+                if not quiet_surface:
+                    self.user_awaited_model_ready = True
+                    self.floating.show_model_loading(
+                        f"正在将 {name} 载入内存，请稍候（{self.load_eta_text(model_id)}）…"
+                    )
+                else:
+                    self.user_awaited_model_ready = False
                 self.tray.set_activity_tooltip("loading")
                 self.sync_settings_runtime_status()
             self.recognizer.configure(model_id, num_threads, hotwords=hotwords, language=language)
         else:
+            self.cold_boot_load_quiet = False
+            self.user_awaited_model_ready = False
             info = get_model_info(model_id) if model_id else None
             name = info["name"] if info else (model_id or DEFAULT_MODEL_ID)
             log.warning("语音模型 %s 未下载，请在设置中下载模型", name)
             hint = (
                 f"请下载语音模型「{name}」。"
-                "Windows 可双击托盘打开主窗口，再到设置 → 引擎；或右键托盘 → 打开 SayInk。"
+                "Windows 可点击托盘图标打开主窗口，再到设置 → 引擎；或右键托盘 → 打开 SayInk。"
             )
-            self.floating.show_error(hint)
-            self.tray.showMessage(
-                "SayInk",
-                hint,
-                QSystemTrayIcon.MessageIcon.Warning,
-                6000,
+            first_run_setup = boot and (
+                not bool(self.config.get("first_run_welcome_seen", True))
+                or self.onboarding_active()
             )
+            if not first_run_setup:
+                if boot:
+                    # Single-surface notice on cold boot instead of floating error + tray toast.
+                    self.tray.showMessage(
+                        "SayInk",
+                        hint,
+                        QSystemTrayIcon.MessageIcon.Warning,
+                        6000,
+                    )
+                else:
+                    if not self.main_window_visible():
+                        self.floating.show_error(hint)
+                    self.tray.showMessage(
+                        "SayInk",
+                        hint,
+                        QSystemTrayIcon.MessageIcon.Warning,
+                        6000,
+                    )
         self.applied_recognition_key = self.recognition_runtime_key()
 
     def load_eta_text(self, model_id: str) -> str:

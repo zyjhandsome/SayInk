@@ -29,7 +29,7 @@ def set_windows_app_user_model_id() -> None:
         log.debug("AppUserModelID 设置失败: %s", exc)
 
 
-def configure_windows_app_identity(app) -> None:
+def configure_windows_app_identity(app, *, background_shortcut: bool = False) -> None:
     """Qt display name + Start Menu shortcut for friendly shell labels."""
     app.setOrganizationName(APP_DISPLAY_NAME)
     app.setApplicationDisplayName(APP_DISPLAY_NAME)
@@ -37,7 +37,35 @@ def configure_windows_app_identity(app) -> None:
     if sys.platform != "win32":
         return
 
-    _ensure_start_menu_shortcut()
+    if not background_shortcut:
+        _ensure_start_menu_shortcut()
+        return
+
+    import threading
+
+    def _run_background() -> None:
+        com_inited = False
+        try:
+            import pythoncom
+
+            pythoncom.CoInitialize()
+            com_inited = True
+        except Exception:
+            pass
+        try:
+            _ensure_start_menu_shortcut()
+        finally:
+            if com_inited:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+    threading.Thread(
+        target=_run_background,
+        name="sayink-shortcut-sync",
+        daemon=True,
+    ).start()
 
 
 def _project_root() -> Path:

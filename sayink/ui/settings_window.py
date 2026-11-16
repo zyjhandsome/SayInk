@@ -52,6 +52,7 @@ from sayink.ui.settings_pages.general import (
     set_combo_by_data,
     without_scroll_jump,
 )
+from sayink.ui.native_dialog import native_file_dialog
 from sayink.ui.theme import normalize_theme_mode
 
 log = logging.getLogger("SayInk")
@@ -268,7 +269,7 @@ class SettingsWindow(QWidget):
         self._minutes_test_worker: QThread | None = None
         self._llm_test_stamp: tuple | None = None
         self._llm_url_error = ""
-        self._mic_test_recorder = AudioRecorder(self)
+        self._mic_test_recorder_instance: AudioRecorder | None = None
         self._mic_probe_active = False
         self._mic_probe_max = 0.0
         self._mic_probe_mic_max = 0.0
@@ -557,7 +558,8 @@ class SettingsWindow(QWidget):
         if any(w.isRunning() for w in self._move_workers):
             return
         cur = str(self._config.models_dir)
-        d = QFileDialog.getExistingDirectory(self, "选择模型存储目录", cur)
+        with native_file_dialog(self):
+            d = QFileDialog.getExistingDirectory(self, "选择模型存储目录", cur)
         if not d:
             return
         new_p = Path(d)
@@ -984,11 +986,26 @@ class SettingsWindow(QWidget):
             self._set_mic_test_status("测试会临时采集约 2 秒声音，不保存音频或转写文本。")
         self.general_page.update_audio_device_summary()
 
+    @property
+    def _mic_test_recorder(self) -> AudioRecorder:
+        rec = self.__dict__.get("_mic_test_recorder_instance")
+        if rec is None:
+            rec = AudioRecorder(self)
+            self.__dict__["_mic_test_recorder_instance"] = rec
+        return rec
+
+    @_mic_test_recorder.setter
+    def _mic_test_recorder(self, value: AudioRecorder) -> None:
+        self.__dict__["_mic_test_recorder_instance"] = value
+
     def _disconnect_mic_probe_signals(self) -> None:
+        rec = self.__dict__.get("_mic_test_recorder_instance")
+        if rec is None:
+            return
         for sig, slot in (
-            (self._mic_test_recorder.volume_changed, self._on_mic_probe_volume),
-            (self._mic_test_recorder.error, self._on_mic_probe_error),
-            (self._mic_test_recorder.warning, self._on_mic_probe_warning),
+            (rec.volume_changed, self._on_mic_probe_volume),
+            (rec.error, self._on_mic_probe_error),
+            (rec.warning, self._on_mic_probe_warning),
         ):
             try:
                 sig.disconnect(slot)
@@ -1134,13 +1151,14 @@ class SettingsWindow(QWidget):
             )
 
     def _cancel_mic_probe_if_active(self) -> None:
-        if not self._mic_probe_active and not self._mic_test_recorder.is_recording:
+        rec = self.__dict__.get("_mic_test_recorder_instance")
+        if not self._mic_probe_active and not (rec is not None and rec.is_recording):
             return
         self._mic_probe_active = False
         self._mic_probe_timer.stop()
         self._disconnect_mic_probe_signals()
-        if self._mic_test_recorder.is_recording:
-            self._mic_test_recorder.cancel()
+        if rec is not None and rec.is_recording:
+            rec.cancel()
         self.general_page.set_probe_controls_enabled(True)
         self.general_page.hide_probe_meters()
 

@@ -33,6 +33,13 @@ from sayink.runtime_status import MEETING_STATE_LABELS, RuntimeState, coerce_run
 from sayink.ui import design_tokens as tok
 from sayink.ui.settings_components import _qcolor, sync_group_tab_stop
 
+if sys.platform == "win32":
+    from ctypes import wintypes as _win32_wintypes
+
+    _WIN32_MSG_TYPE = _win32_wintypes.MSG
+else:
+    _WIN32_MSG_TYPE = None
+
 _STATE_TONES = {
     RuntimeState.READY: "GREEN",
     RuntimeState.LOADING: "AMBER",
@@ -80,6 +87,8 @@ _WM_WINDOWPOSCHANGING = 0x0046
 # following erase is the full-window flash on an edge or corner drag.
 _SWP_NOSIZE = 0x0001
 _SWP_NOCOPYBITS = 0x0100
+_SWP_SHOWWINDOW = 0x0040
+_DWMWA_CLOAK = 13
 # DWMWA_USE_IMMERSIVE_DARK_MODE (20) and the pre-20H1 value (19).
 _DWMWA_TRANSITIONS_FORCEDISABLED = 3
 _DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19
@@ -260,7 +269,12 @@ class MainWindow(QWidget):
         # Build the native frame while the window is still hidden. Doing it
         # from showEvent runs after Windows has already painted the default
         # caption, which is the white flash on the first open.
+        self._native_dialog_depth = 0
+        self._close_hold = False
         self._prepare_presentation()
+        # Creating the native surface can also create the small system caption.
+        # Bury it before anything shows the window.
+        self._bury_surrogate_titlebars()
         # No programmatic focus on a nav button: the focus ring must only
         # appear for keyboard navigation, never as a second "selected" state.
 
@@ -745,11 +759,84 @@ class MainWindow(QWidget):
         # The native frame is applied while the widget is still hidden.
         # SetWindowPos(SWP_FRAMECHANGED) after the window is on screen is the
         # flash where the system caption appears and disappears.
-        if not self.isVisible():
+        presenting = not self.isVisible()
+        if presenting:
+            # Startup double-click shows this window at the system caption
+            # size (~264×143: app icon, maximize, close, white client) and only
+            # then grows it. Keep that frame out of DWM until it is page-sized.
             self._prepare_presentation()
             self._bury_surrogate_titlebars()
             self._sync_native_size()
+            self._set_presentation_cloak(True)
         super().show()
+        if presenting:
+            self._present_attempts = 0
+            self._finish_presentation()
+
+    def _set_presentation_cloak(self, cloaked: bool) -> None:
+        if not self._uses_win32_surface():
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            hwnd = int(self.winId() or 0)
+            if not hwnd:
+                return
+            dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+            dwmapi.DwmSetWindowAttribute.argtypes = [
+                wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+            ]
+            dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+            value = ctypes.c_int(1 if cloaked else 0)
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, _DWMWA_CLOAK, ctypes.byref(value), ctypes.sizeof(value),
+            )
+        except Exception:
+            return
+
+    def _native_frame_is_page_sized(self) -> bool:
+        if not self._uses_win32_surface():
+            return True
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", wintypes.LONG),
+                    ("top", wintypes.LONG),
+                    ("right", wintypes.LONG),
+                    ("bottom", wintypes.LONG),
+                ]
+
+            user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+            hwnd = int(self.winId() or 0)
+            if not hwnd:
+                return True
+            rect = RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return True
+            ratio = self.devicePixelRatioF() or 1.0
+            want_w = max(1, round(self.width() * ratio))
+            want_h = max(1, round(self.height() * ratio))
+            return rect.right - rect.left + 8 >= want_w and rect.bottom - rect.top + 8 >= want_h
+        except Exception:
+            return True
+
+    def _finish_presentation(self) -> None:
+        self._sync_native_size()
+        attempt = int(getattr(self, "_present_attempts", 0)) + 1
+        self._present_attempts = attempt
+        if self._native_frame_is_page_sized() or attempt >= 15 or not self.isVisible():
+            self._set_presentation_cloak(False)
+            self._present_attempts = 0
+            return
+        from PyQt6.QtCore import QTimer
+
+        QTimer.singleShot(0, self._finish_presentation)
 
     def _prepare_presentation(self) -> None:
         """Native frame, theme colors, and mask, safe to run before show."""
@@ -1138,8 +1225,34 @@ class MainWindow(QWidget):
         finally:
             self._hiding = False
 
+    def begin_native_dialog(self) -> None:
+        """A system file dialog is opening. Keep this window on screen."""
+        self._native_dialog_depth = getattr(self, "_native_dialog_depth", 0) + 1
+        self._bury_surrogate_titlebars()
+
+    def end_native_dialog(self) -> None:
+        """The file dialog returned. A close it already queued must not hide us."""
+        self._native_dialog_depth = max(0, getattr(self, "_native_dialog_depth", 1) - 1)
+        if self._native_dialog_depth == 0:
+            self._close_hold = True
+            self._schedule_close_hold_release()
+        self._bury_surrogate_titlebars()
+        self._schedule_bury_surrogates()
+
+    def _schedule_close_hold_release(self) -> None:
+        from PyQt6.QtCore import QTimer
+
+        QTimer.singleShot(0, self._release_close_hold)
+
+    def _release_close_hold(self) -> None:
+        if getattr(self, "_native_dialog_depth", 0):
+            return
+        self._close_hold = False
+
     def closeEvent(self, event) -> None:
         event.ignore()
+        if getattr(self, "_native_dialog_depth", 0) or getattr(self, "_close_hold", False):
+            return
         self._hide_window()
 
     def reapply_theme(self) -> None:
@@ -1232,13 +1345,18 @@ class MainWindow(QWidget):
         edge = self._hit_test_edge(x, y)
         if edge is not None:
             return edge
-        if not hasattr(self, "_caption"):
+        caption = getattr(self, "_caption", None)
+        if caption is None:
+            return None
+        # Fast-path interior coordinates below the caption strip to avoid per-pixel
+        # QPoint allocation and 4x widget.mapTo() calls on WM_NCHITTEST.
+        if y > caption.height() + 12:
             return None
         point = QPoint(x, y)
         buttons = (self._min_btn, self._max_btn, self._close_btn)
         if any(self._widget_rect(btn).contains(point) for btn in buttons):
             return None
-        if self._widget_rect(self._caption).contains(point):
+        if self._widget_rect(caption).contains(point):
             return _HTCAPTION
         return None
 
@@ -1258,6 +1376,10 @@ class MainWindow(QWidget):
             hwnd = int(self.winId())
             if not hwnd:
                 return
+            # The open animation draws a small system caption. Disable it
+            # before WS_CAPTION exists, or the first tray click holds that
+            # caption on screen until the cold-start build finishes.
+            self._apply_dwm_theme_colors()
             get_long = windll.user32.GetWindowLongPtrW
             set_long = windll.user32.SetWindowLongPtrW
             set_pos = windll.user32.SetWindowPos
@@ -1396,6 +1518,72 @@ class MainWindow(QWidget):
             return False
         pos.flags &= ~_SWP_NOCOPYBITS
         return True
+
+    def _expand_caption_sized_show(self, msg) -> None:
+        """Show the page at its real size instead of the tiny system caption.
+
+        A startup tray double-click otherwise presents the main window at
+        about 264×143 — the app icon, a maximize box, close, and a white
+        client — and only afterwards grows it to the page.
+        """
+        if (
+            self._live_resizing
+            or self.isMaximized()
+            or self.isFullScreen()
+            or self.isMinimized()
+            or self.width() < 400
+            or self.height() < 240
+        ):
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        class WINDOWPOS(ctypes.Structure):
+            _fields_ = [
+                ("hwnd", wintypes.HWND),
+                ("hwndInsertAfter", wintypes.HWND),
+                ("x", ctypes.c_int),
+                ("y", ctypes.c_int),
+                ("cx", ctypes.c_int),
+                ("cy", ctypes.c_int),
+                ("flags", ctypes.c_uint),
+            ]
+
+        bits = ctypes.sizeof(ctypes.c_void_p) * 8
+        base = int(msg.lParam) & ((1 << bits) - 1)
+        if not base:
+            return
+        flags = ctypes.c_uint.from_address(base + WINDOWPOS.flags.offset)
+        cx = ctypes.c_int.from_address(base + WINDOWPOS.cx.offset)
+        cy = ctypes.c_int.from_address(base + WINDOWPOS.cy.offset)
+        ratio = self.devicePixelRatioF() or 1.0
+        want_w = max(1, round(self.width() * ratio))
+        want_h = max(1, round(self.height() * ratio))
+        width, height = cx.value, cy.value
+        if flags.value & _SWP_NOSIZE or width <= 0 or height <= 0:
+            user32 = ctypes.windll.user32
+
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", wintypes.LONG),
+                    ("top", wintypes.LONG),
+                    ("right", wintypes.LONG),
+                    ("bottom", wintypes.LONG),
+                ]
+
+            user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+            rect = RECT()
+            if not user32.GetWindowRect(int(msg.hWnd), ctypes.byref(rect)):
+                return
+            width, height = rect.right - rect.left, rect.bottom - rect.top
+        if width + 16 >= want_w and height + 16 >= want_h:
+            return
+        # A drag stays near the page. The startup frame is the caption-sized one.
+        if width > max(480, want_w // 2) and height > max(240, want_h // 2):
+            return
+        flags.value &= ~_SWP_NOSIZE
+        cx.value = want_w
+        cy.value = want_h
 
     def _client_alignment(self) -> int:
         """Anchor existing pixels to the edges that are not being dragged.
@@ -1729,9 +1917,7 @@ class MainWindow(QWidget):
         # QWidget's default is a no-op, so (False, 0) is equivalent.
         if sys.platform == "win32" and event_type in (b"windows_generic_MSG", "windows_generic_MSG"):
             try:
-                from ctypes import wintypes
-
-                msg = wintypes.MSG.from_address(int(message))
+                msg = _WIN32_MSG_TYPE.from_address(int(message))
                 if msg.message == _WM_ERASEBKGND:
                     # Windows erases with the light class brush before Qt paints.
                     # That full-window white is the flash on show. During a drag
@@ -1739,8 +1925,10 @@ class MainWindow(QWidget):
                     if not self._live_resizing:
                         self._erase_background(msg)
                     return True, 1
-                if msg.message == _WM_WINDOWPOSCHANGING and self._keep_resize_bits(msg):
-                    return True, 0
+                if msg.message == _WM_WINDOWPOSCHANGING:
+                    self._expand_caption_sized_show(msg)
+                    if self._keep_resize_bits(msg):
+                        return True, 0
                 if msg.message == _WM_NCPAINT:
                     # WS_CAPTION is on for snap. Painting that non-client frame
                     # is the small system caption (icon, maximize, close).

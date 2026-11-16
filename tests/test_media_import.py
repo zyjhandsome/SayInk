@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import threading
 import time
 from pathlib import Path
 
@@ -441,21 +442,23 @@ def test_cancel_before_reading_does_not_open_the_file(monkeypatch):
 
 
 def test_media_import_blocks_dictation_meeting_and_recovery():
+    """M-UX-05: Live meetings, mic test, and audio recovery stay blocked during media import,
+    while hotkey/continuous dictation and recognition reload deferral coexist cleanly."""
     with app_harness({"audio.trigger_mode": "hotkey"}) as harness:
         app = harness["app"]
         assert app.meeting.begin_media_import() == ""
         assert app.start_meeting(MeetingOptions()) is False
         assert "导入音视频" in harness["floating"].show_error.call_args[0][0]
         harness["recorder"].start.reset_mock()
+        harness["floating"].show_error.reset_mock()
         app._on_recording_start()
-        harness["recorder"].start.assert_not_called()
-        assert "导入音视频" in harness["floating"].show_error.call_args[0][0]
+        harness["recorder"].start.assert_called_once_with(continuous=False)
+        assert not app._pipeline_busy()
+        assert app._reload_coordinator().pipeline_busy() is True
 
     with app_harness({"audio.trigger_mode": "continuous"}) as harness:
         app = harness["app"]
         app.meeting.begin_media_import()
-        app._start_continuous_listening()
-        harness["recorder"].start_continuous.assert_not_called()
         from unittest.mock import patch
         with patch("sayink.ui.audio_recovery_dialog.AudioRecoveryDialog") as dialog:
             app._show_audio_recovery()
@@ -463,8 +466,9 @@ def test_media_import_blocks_dictation_meeting_and_recovery():
         cleared = []
         app._clear_live_transcript = lambda: cleared.append(True)
         app._on_continuous_hotkey_start()
-        assert cleared == []
-        harness["recorder"].start_continuous.assert_not_called()
+        assert cleared == [True]
+        assert app._continuous_start_pending is True
+        app._stop_continuous_listening()
         harness["floating"].show_error.reset_mock()
         opened = []
         app._show_main_window = lambda *_args, **_kwargs: opened.append(True)
@@ -637,3 +641,165 @@ def test_recognize_file_streams_non_wav_with_delayed_origin_and_pts_gap(tmp_path
     assert result.turns[1].duration_ms == 1_500
     assert result.audio_ms == 615_000
     assert pcts[0] == 0 and 30 in pcts and pcts[-1] == 100
+
+
+def test_media_import_dialog_natural_sort_reorder_and_duplicate_hint(config, tmp_path, qapp):
+    """M-UX-02 & M-ORD-03: MediaImportDialog naturally sorts filenames, flags duplicates, and supports reordering."""
+    from sayink.ui.media_import_dialog import MediaImportDialog
+
+    p10 = tmp_path / "part_10.mp3"
+    p2 = tmp_path / "part_2.mp3"
+    p1 = tmp_path / "part_1.mp3"
+    for p in (p10, p2, p1):
+        p.write_bytes(b"audio")
+
+    dlg = MediaImportDialog(
+        [p10, p2, p1],
+        config=config,
+        existing_audio_paths={str(p2)},
+    )
+    try:
+        assert [p.name for p in dlg.paths()] == ["part_1.mp3", "part_2.mp3", "part_10.mp3"]
+        assert not dlg._dup_hint.isHidden()
+        assert "1 个文件此前已导入过" in dlg._dup_hint.text()
+        # Move part_10 up above part_2
+        dlg._list.setCurrentRow(2)
+        dlg._move_current(-1)
+        assert [p.name for p in dlg.paths()] == ["part_1.mp3", "part_10.mp3", "part_2.mp3"]
+        # Remove part_2 -> duplicate hint disappears
+        dlg._list.setCurrentRow(2)
+        dlg._remove_current()
+        assert [p.name for p in dlg.paths()] == ["part_1.mp3", "part_10.mp3"]
+        assert dlg._dup_hint.isHidden()
+
+        dlg._lang_combo.setCurrentIndex(dlg._lang_combo.findData("en"))
+        reqs = dlg.import_requests()
+        assert [r[1] for r in reqs] == ["part_1", "part_10"]
+        assert reqs[0][2]["language"] == "en"
+        assert reqs[1][2]["started_at"] > reqs[0][2]["started_at"]
+    finally:
+        dlg.deleteLater()
+
+
+def test_batch_queue_preserves_audio_paths_detail_watching_and_skip_vs_cancel_all(config, tmp_path, qapp):
+    """M-ORD-02 & M-UX-07: Queued batch jobs bind each file's own audio_path, keep watching detail until the end,
+    and support skip-current vs cancel-all."""
+    from PyQt6.QtWidgets import QPushButton
+    from unittest.mock import patch
+    from sayink.ui.meeting_page import MeetingPage
+
+    controller, history = _controller(config, tmp_path)
+    page = MeetingPage(config, controller)
+    try:
+        gates = {name: threading.Event() for name in ("part_1.wav", "part_2.wav", "part_3.wav")}
+        started_events = {name: threading.Event() for name in ("part_1.wav", "part_2.wav", "part_3.wav")}
+
+        def runner(path, cancel, progress):
+            name = Path(path).name
+            started_events[name].set()
+            progress("正在识别 1/2 段（60%）")
+            gates[name].wait(3.0)
+            if cancel():
+                return RecognitionResult((), cancelled=True, audio_path=str(path))
+            return RecognitionResult(
+                (MediaTurn(1, 0, 1000, f"内容-{Path(path).stem}"),),
+                cancelled=False,
+                audio_path=str(path),
+            )
+
+        controller.set_media_runner(runner)
+        f1 = tmp_path / "part_1.wav"
+        f2 = tmp_path / "part_2.wav"
+        f3 = tmp_path / "part_3.wav"
+        for f in (f1, f2, f3):
+            f.write_bytes(b"RIFF")
+
+        # Natural sort check via _begin_media_paths([f3, f1, f2]) -> part_1, part_2, part_3
+        assert page._begin_media_paths([f3, f1, f2]) == ""
+        assert _wait_until(lambda: started_events["part_1.wav"].is_set())
+        qapp.processEvents()
+        assert page._import_owns_detail is True
+
+        # Finish part_1 -> part_2 starts automatically; page stays watching import detail!
+        gates["part_1.wav"].set()
+        assert _wait_until(lambda: started_events["part_2.wav"].is_set())
+        assert _wait_until(lambda: page._media_import_title == "part_2")
+        assert page._import_owns_detail is True
+
+        # Skip only current file (part_2) while part_3 remains queued!
+        cancel_btn = next(b for b in page.findChildren(QPushButton) if b.accessibleName() == "取消导入音视频")
+        with patch("sayink.ui.meeting_page.QMessageBox") as box_cls:
+            stay_btn, skip_btn, stop_all_btn = object(), object(), object()
+            box_cls.return_value.addButton.side_effect = [stay_btn, skip_btn, stop_all_btn]
+            box_cls.return_value.clickedButton.return_value = skip_btn
+            cancel_btn.click()
+        gates["part_2.wav"].set()
+        assert _wait_until(lambda: started_events["part_3.wav"].is_set())
+
+        # Finish part_3 -> queue drains and page opens part_3 with exact per-meeting audio_path bindings!
+        gates["part_3.wav"].set()
+        assert _wait_until(lambda: not controller.importing_media and not controller.queued_media())
+        qapp.processEvents()
+        records = {r.title: r for r in controller.store.list_meetings()}
+        assert set(records.keys()) == {"part_1", "part_3"}
+        assert page._meeting_audio_paths[records["part_1"].id] == str(f1)
+        assert page._meeting_audio_paths[records["part_3"].id] == str(f3)
+        assert page.current_meeting_id == records["part_3"].id
+    finally:
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_batch_media_import_reuses_dedicated_recognizer_until_queue_drains(tmp_path, monkeypatch):
+    """M-PERF-02: Dedicated import recognizer loads once across a multi-file queue and releases on drain."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from sayink.speech_recognizer import SpeechRecognizer
+
+    f1 = tmp_path / "a.wav"
+    f2 = tmp_path / "b.wav"
+    f1.write_bytes(b"RIFF")
+    f2.write_bytes(b"RIFF")
+
+    with app_harness() as harness:
+        app = harness["app"]
+        monkeypatch.setattr("sayink.app.SpeechRecognizer", SpeechRecognizer)
+
+        class _Resident(SpeechRecognizer):
+            current_model_id = "sense-voice"
+            is_ready = True
+
+            def __init__(self) -> None:
+                super().__init__()
+                self._recognizer = object()
+                self._decode_lock = MagicMock()
+
+        resident = _Resident()
+        try:
+            app._recognizer = resident
+            app._resolve_media_import_model_id = lambda: "funasr-nano"
+            monkeypatch.setattr("sayink.speech_recognizer.has_ram_for_warm_swap", lambda _m: True)
+            created: list[str] = []
+            monkeypatch.setattr(
+                "sayink.speech_recognizer._create_recognizer",
+                lambda mid, *_a, **_kw: created.append(mid) or object(),
+            )
+            monkeypatch.setattr(
+                "sayink.media_import.recognize_file",
+                lambda _p, **_kw: SimpleNamespace(segments=[], speaker_count=0, error=""),
+            )
+
+            # Simulate file 1 running while file 2 is still waiting in _media_queue
+            app._meeting._media_queue.append((str(f2), "b"))
+            app._run_media_import(f1, lambda: False, None)
+            assert created == ["funasr-nano"]
+            assert app._cached_media_import_recognizer is not None
+
+            # Simulate file 2 popped and running as the last item in queue
+            app._meeting._media_queue.clear()
+            app._run_media_import(f2, lambda: False, None)
+            assert created == ["funasr-nano"]  # Reused without a 2nd cold model load!
+            assert app._cached_media_import_recognizer is None  # Released immediately when queue drained!
+        finally:
+            resident.deleteLater()

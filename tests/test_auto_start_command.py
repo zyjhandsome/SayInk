@@ -22,16 +22,18 @@ def _unquote_parts(command: str) -> list[str]:
 
 
 class TestAutoStartCommand:
-    def test_frozen_build_runs_the_exe_alone(self, monkeypatch):
+    def test_frozen_build_runs_the_exe_with_autostart_flag(self, monkeypatch):
         monkeypatch.setattr(sys, "frozen", True, raising=False)
         monkeypatch.setattr(sys, "executable", r"C:\Program Files\SayInk\SayInk.exe")
-        assert auto_start_command() == r'"C:\Program Files\SayInk\SayInk.exe"'
+        assert auto_start_command() == r'"C:\Program Files\SayInk\SayInk.exe" --autostart'
 
-    def test_source_checkout_runs_run_py_through_the_interpreter(self, monkeypatch):
+    def test_source_checkout_runs_run_py_through_the_interpreter_with_autostart_flag(self, monkeypatch):
         monkeypatch.delattr(sys, "frozen", raising=False)
         monkeypatch.delattr(sys, "_MEIPASS", raising=False)
         monkeypatch.setattr(sys, "executable", "python.exe")
-        parts = _unquote_parts(auto_start_command())
+        cmd = auto_start_command()
+        assert cmd.endswith(" --autostart")
+        parts = _unquote_parts(cmd[: -len(" --autostart")])
         assert len(parts) == 2
         exe, script = parts
         assert os.path.isabs(exe) and exe.lower().endswith("python.exe")

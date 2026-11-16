@@ -281,6 +281,27 @@ def _install_exception_hooks(log: logging.Logger):
     threading.excepthook = _threading_excepthook
 
 
+_SILENT_LAUNCH_FLAGS = frozenset({"--autostart", "--silent", "--minimized", "-m"})
+
+
+def is_silent_launch(argv: list[str] | tuple[str, ...] | None = None) -> bool:
+    """True when launched via Windows auto-start or explicit silent/minimized flag."""
+    args = sys.argv[1:] if argv is None else argv
+    return any(str(arg).strip().lower() in _SILENT_LAUNCH_FLAGS for arg in args)
+
+
+def _windows_session_suffix() -> str:
+    if sys.platform != "win32":
+        return ""
+    try:
+        sid = wintypes.DWORD(0)
+        if ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid)):
+            return f"-s{int(sid.value)}"
+    except Exception:
+        pass
+    return ""
+
+
 def activation_server_name() -> str:
     import getpass
 
@@ -288,8 +309,8 @@ def activation_server_name() -> str:
         user = getpass.getuser()
     except Exception:
         user = "default"
-    # Named pipes are machine-wide; the single-instance mutex is per session.
-    return f"SayInk-activate-{user}"
+    # Scope the pipe to the current Windows desktop session so it matches the Local\ mutex.
+    return f"SayInk-activate-{user}{_windows_session_suffix()}"
 
 
 def _activate_running_instance(*, retries: int = 1, retry_delay_s: float = 0.25) -> bool:
@@ -357,13 +378,48 @@ def _notify_already_running(reason: str | None = None, *, message_box=None) -> s
     return msg
 
 
-def _handle_existing_instance(*, retries: int = 6, retry_delay_s: float = 0.25, message_box=None) -> bool:
-    """Wake the running instance if reachable, otherwise notify the user why startup exited."""
-    reason = last_block_reason()
-    if reason != "legacy_voiceink":
-        if _activate_running_instance(retries=retries, retry_delay_s=retry_delay_s):
+def _focus_existing_sayink_window() -> bool:
+    """Best-effort Win32 fallback to bring an existing SayInk MainWindow forward."""
+    if sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        hwnd = user32.FindWindowW(None, "SayInk")
+        if hwnd and user32.IsWindow(hwnd):
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            else:
+                user32.ShowWindow(hwnd, 5)  # SW_SHOW
+            user32.SetForegroundWindow(hwnd)
             return True
-    _notify_already_running(reason, message_box=message_box)
+    except Exception:
+        pass
+    return False
+
+
+def _handle_existing_instance(
+    *,
+    retries: int = 20,
+    retry_delay_s: float = 0.25,
+    message_box=None,
+    silent: bool = False,
+) -> bool:
+    """Wake the running instance if reachable; avoid blocking modal popups for normal relaunches."""
+    reason = last_block_reason()
+    if reason == "legacy_voiceink":
+        _notify_already_running(reason, message_box=message_box)
+        return False
+    if silent:
+        _log.info("检测到 SayInk 已在后台运行，开机自启进程静默退出")
+        return True
+    if _activate_running_instance(retries=retries, retry_delay_s=retry_delay_s):
+        return True
+    if _focus_existing_sayink_window():
+        return True
+    if message_box is not None:
+        _notify_already_running(reason, message_box=message_box)
+    else:
+        _log.warning("SayInk 已在运行但管道唤醒超时，静默退出而不弹出阻塞提示框")
     return False
 
 
@@ -372,10 +428,20 @@ def start_activation_server(on_activate):
 
     server = QLocalServer()
     name = activation_server_name()
-    QLocalServer.removeServer(name)
     if not server.listen(name):
-        _log.warning("唤起服务启动失败: %s", server.errorString())
-        return None
+        probe = QLocalSocket()
+        live_peer = False
+        try:
+            probe.connectToServer(name)
+            live_peer = bool(probe.waitForConnected(80))
+        finally:
+            probe.abort()
+        if not live_peer:
+            QLocalServer.removeServer(name)
+            server.listen(name)
+        if not server.isListening():
+            _log.warning("唤起服务启动失败: %s", server.errorString())
+            return None
 
     def _on_connection():
         while server.hasPendingConnections():
@@ -449,7 +515,11 @@ def setup_logging(directory: str | None = None) -> str | None:
         console = logging.StreamHandler(sys.stderr)
         console.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
         handlers.append(console)
-    logging.basicConfig(level=_configured_log_level(), handlers=handlers, force=True)
+    level = _configured_log_level()
+    logging.basicConfig(level=level, handlers=handlers, force=True)
+    if level > logging.DEBUG:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
     return log_path
 
 
@@ -480,24 +550,37 @@ def main():
     setup_logging()
     log = logging.getLogger("SayInk")
     _install_exception_hooks(log)
+    silent_launch = is_silent_launch(sys.argv[1:])
 
     if not check_single_instance():
-        _handle_existing_instance()
+        _handle_existing_instance(silent=silent_launch)
         sys.exit(0)
 
     atexit.register(cleanup_lock)
-    log.info("SayInk 启动中...")
+    log.info("SayInk 启动中 (silent=%s)...", silent_launch)
 
     if sys.platform == "win32":
         from sayink.platform.windows_identity import set_windows_app_user_model_id
+        from sayink.ui.tray_icon import _install_helper_creation_guard
 
+        # Before QApplication. Its constructor creates captioned observer
+        # windows, and a tray click while startup is still busy shows one.
         set_windows_app_user_model_id()
+        _install_helper_creation_guard()
 
     from PyQt6.QtWidgets import QApplication
 
-    app = QApplication(sys.argv)
+    qt_argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:] if str(arg).strip().lower() not in _SILENT_LAUNCH_FLAGS
+    ]
+    app = QApplication(qt_argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("SayInk")
+    if sys.platform == "win32":
+        from sayink.ui.tray_icon import _bind_helper_guard, _hide_tray_message_window
+
+        _bind_helper_guard()
+        _hide_tray_message_window()
 
     say_ink = None
     _early_activate_requested = False
@@ -514,9 +597,9 @@ def main():
     from sayink.ui.tray_icon import create_microphone_icon
     app.setWindowIcon(create_microphone_icon(recording=False, size=64))
 
-    # Windows: AppUserModelID + Start Menu shortcut for taskbar icon and friendly toast title
+    # Windows: AppUserModelID + Start Menu shortcut (deferred off main thread)
     from sayink.platform.windows_identity import configure_windows_app_identity
-    configure_windows_app_identity(app)
+    configure_windows_app_identity(app, background_shortcut=True)
 
     from PyQt6.QtCore import Qt
 
@@ -547,10 +630,9 @@ def main():
     # Reuse it: a second Config would not see a plaintext API key the first one
     # already moved out of config.json when Credential Manager was unreadable.
     say_ink = App(_boot_config, on_release_instance_lock=_release_once)
-    say_ink.start()
-    if _early_activate_requested:
-        _early_activate_requested = False
-        say_ink.show_main_window()
+    open_window_on_boot = (not silent_launch) or _early_activate_requested
+    _early_activate_requested = False
+    say_ink.start(show_main=open_window_on_boot)
 
     exit_code = app.exec()
     _release_once()

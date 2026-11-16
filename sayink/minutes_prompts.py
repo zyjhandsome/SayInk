@@ -237,6 +237,10 @@ def render_srt(
             end = min(max(start + 1000, int(usable[index + 1].offset_ms)), start + 10_000)
         else:
             end = start + 3000
+        if index + 1 < len(usable):
+            next_start = max(0, int(usable[index + 1].offset_ms))
+            if next_start > start:
+                end = min(end, next_start)
         if end <= start:
             end = start + 1000
         if show_speakers and (label_unknown or int(line.speaker_id) > 0):

@@ -27,6 +27,7 @@ import logging
 from pathlib import Path
 import re
 import tempfile
+import threading
 import time
 import wave
 import weakref
@@ -83,7 +84,16 @@ from sayink.meeting_session import (
     resolve_capabilities,
     safe_filename,
 )
-from sayink.meeting_store import STATUS_ENDED, STATUS_INTERRUPTED, STATUS_LIVE, MeetingRecord, QueuedGeneration, now_ms
+from sayink.meeting_store import (
+    SORT_RECENT,
+    SORT_STARTED_AT,
+    STATUS_ENDED,
+    STATUS_INTERRUPTED,
+    STATUS_LIVE,
+    MeetingRecord,
+    QueuedGeneration,
+    now_ms,
+)
 from sayink.minutes_prompts import describe_template, format_timestamp, get_template, list_templates, transcript_lines
 from sayink.media_import import MEDIA_SOURCE, file_dialog_filter
 from sayink.transcript_import import IMPORT_SOURCE
@@ -121,9 +131,13 @@ from sayink.ui.meeting_views import (
     notes_for_display,
     speaker_color as speaker_color,
 )
+from sayink.ui.media_import_dialog import MediaImportDialog, natural_media_sort_key
 from sayink.ui.prompts import alert_error, style_message_box
 
 log = logging.getLogger("SayInk")
+
+_ORIG_GET_OPEN_FILE_NAME = QFileDialog.getOpenFileName
+_ORIG_GET_OPEN_FILE_NAMES = QFileDialog.getOpenFileNames
 
 PAGE_BROWSE = 0
 PAGE_START = 1
@@ -381,6 +395,8 @@ class _AudioPlayerBar(QFrame):
     """Lightweight embedded audio playback bar for local meeting / imported / recovery audio."""
 
     playback_error = pyqtSignal(str)
+    _async_wav_ready = pyqtSignal(int, str, str, str)
+    _ASYNC_F32_BYTES = 2 * 1024 * 1024
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -390,6 +406,8 @@ class _AudioPlayerBar(QFrame):
         self._duration_ms = 0
         self._position_ms = 0
         self._playing = False
+        self._preparing_async = False
+        self._prepare_token = 0
         self._rate = 1.0
         self._dragging_slider = False
         self._allow_headless_fallback: bool = False
@@ -399,11 +417,15 @@ class _AudioPlayerBar(QFrame):
         self._audio_out = None
         self._session_temp_wavs: set[Path] = set()
         self._temp_wavs_by_source: dict[str, set[Path]] = {}
-        _prune_stale_playback_wavs(
-            Path(tempfile.gettempdir()) / "sayink-playback",
-            exclude=self._session_temp_wavs,
-        )
+        self._async_wav_ready.connect(self._on_async_wav_ready)
         session_temp_wavs = self._session_temp_wavs
+        threading.Thread(
+            target=_prune_stale_playback_wavs,
+            args=(Path(tempfile.gettempdir()) / "sayink-playback",),
+            kwargs={"exclude": set(session_temp_wavs)},
+            daemon=True,
+            name="sayink-playback-prune",
+        ).start()
 
         def _cleanup_on_destroy(*_args, _paths=session_temp_wavs) -> None:
             for wav_path in list(_paths):
@@ -637,6 +659,33 @@ class _AudioPlayerBar(QFrame):
             force=True,
         )
 
+    @staticmethod
+    def _convert_raw_f32_to_wav(raw_f32: Path, wav_path: Path) -> None:
+        import numpy as np
+
+        out_dir = wav_path.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if wav_path.is_file():
+            return
+        tmp_path = out_dir / f"{wav_path.name}.{threading.get_ident()}.tmp"
+        chunk_bytes = 262_144 * 4
+        try:
+            with raw_f32.open("rb") as src_fp, wave.open(str(tmp_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                while raw_chunk := src_fp.read(chunk_bytes):
+                    usable = len(raw_chunk) - (len(raw_chunk) % 4)
+                    if usable <= 0:
+                        break
+                    samples = np.frombuffer(memoryview(raw_chunk)[:usable], dtype="<f4")
+                    pcm = (np.clip(np.nan_to_num(samples), -1.0, 1.0) * 32767.0).astype("<i2")
+                    wf.writeframes(pcm.tobytes())
+            tmp_path.replace(wav_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
     def _materialize_playable_path(self) -> str:
         if self._playable_path and Path(self._playable_path).is_file():
             return self._playable_path
@@ -648,38 +697,62 @@ class _AudioPlayerBar(QFrame):
             return self._playable_path
         # Export raw float32 journal / cache to a temporary PCM WAV on demand.
         try:
-            import numpy as np
-
             raw_f32 = src / "audio.f32" if src.is_dir() else src
             if not raw_f32.is_file():
                 return ""
             wav_path = self._temp_wav_path_for_raw_f32(raw_f32)
-            out_dir = wav_path.parent
-            out_dir.mkdir(parents=True, exist_ok=True)
-            if not wav_path.is_file():
-                tmp_path = out_dir / f"{wav_path.name}.tmp"
-                chunk_bytes = 262_144 * 4
-                try:
-                    with raw_f32.open("rb") as src_fp, wave.open(str(tmp_path), "wb") as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(16000)
-                        while raw_chunk := src_fp.read(chunk_bytes):
-                            usable = len(raw_chunk) - (len(raw_chunk) % 4)
-                            if usable <= 0:
-                                break
-                            samples = np.frombuffer(memoryview(raw_chunk)[:usable], dtype="<f4")
-                            pcm = (np.clip(np.nan_to_num(samples), -1.0, 1.0) * 32767.0).astype("<i2")
-                            wf.writeframes(pcm.tobytes())
-                    tmp_path.replace(wav_path)
-                except Exception:
-                    tmp_path.unlink(missing_ok=True)
-                    raise
+            self._convert_raw_f32_to_wav(raw_f32, wav_path)
             self._register_temp_wav(self._source_path, raw_f32, wav_path)
             self._playable_path = str(wav_path)
             return self._playable_path
         except Exception:
             return ""
+
+    def _maybe_prepare_playable_async(self) -> bool:
+        if self._playable_path and Path(self._playable_path).is_file():
+            return False
+        if not self._source_path or self._allow_headless_fallback or not self.isVisible():
+            return False
+        src = Path(self._source_path)
+        if src.is_file() and src.suffix.lower() != ".f32":
+            return False
+        raw_f32 = src / "audio.f32" if src.is_dir() else src
+        try:
+            if not raw_f32.is_file() or raw_f32.stat().st_size < self._ASYNC_F32_BYTES:
+                return False
+            wav_path = self._temp_wav_path_for_raw_f32(raw_f32)
+            if wav_path.is_file():
+                return False
+        except OSError:
+            return False
+        self._prepare_token += 1
+        token = self._prepare_token
+        source_snapshot = self._source_path
+        self._preparing_async = True
+        self._sync_ui()
+
+        def _bg() -> None:
+            try:
+                self._convert_raw_f32_to_wav(raw_f32, wav_path)
+                self._async_wav_ready.emit(token, source_snapshot, str(raw_f32), str(wav_path))
+            except Exception as exc:
+                self._async_wav_ready.emit(token, source_snapshot, "", f"无法播放该音频文件：{exc}")
+
+        threading.Thread(target=_bg, daemon=True, name="sayink-f32-wav").start()
+        return True
+
+    def _on_async_wav_ready(self, token: int, source_path: str, raw_f32_str: str, result_or_err: str) -> None:
+        if token != self._prepare_token or source_path != self._source_path:
+            return
+        self._preparing_async = False
+        if not raw_f32_str:
+            self._fail_playback(result_or_err)
+            return
+        wav_path = Path(result_or_err)
+        self._register_temp_wav(source_path, Path(raw_f32_str), wav_path)
+        self._playable_path = str(wav_path)
+        self._sync_ui()
+        self.play()
 
     def load_audio(self, path: str | Path | None, *, fallback_duration_ms: int = 0) -> bool:
         resolved = str(path or "").strip()
@@ -720,12 +793,14 @@ class _AudioPlayerBar(QFrame):
             self.play()
 
     def play(self) -> None:
-        if not self._source_path:
+        if not self._source_path or self._preparing_async:
             return
         if self._duration_ms > 0 and self._position_ms >= self._duration_ms:
             self._position_ms = 0
             if self._pending_seek_ms is not None and self._pending_seek_ms >= self._duration_ms:
                 self._pending_seek_ms = 0
+        if self._maybe_prepare_playable_async():
+            return
         playable = self._materialize_playable_path()
         if not playable:
             if self._allow_headless_fallback:
@@ -768,6 +843,8 @@ class _AudioPlayerBar(QFrame):
         self._sync_ui()
 
     def pause(self) -> None:
+        self._prepare_token += 1
+        self._preparing_async = False
         self._playing = False
         self._fallback_timer.stop()
         if self._player is not None:
@@ -778,6 +855,8 @@ class _AudioPlayerBar(QFrame):
         self._sync_ui()
 
     def stop(self) -> None:
+        self._prepare_token += 1
+        self._preparing_async = False
         self._playing = False
         self._fallback_timer.stop()
         self._pending_seek_ms = None
@@ -937,7 +1016,12 @@ class _AudioPlayerBar(QFrame):
                 pass
 
     def _sync_ui(self) -> None:
-        self._play_btn.setText("暂停" if self._playing else "播放")
+        if getattr(self, "_preparing_async", False):
+            self._play_btn.setText("准备中…")
+            self._play_btn.setEnabled(False)
+        else:
+            self._play_btn.setText("暂停" if self._playing else "播放")
+            self._play_btn.setEnabled(bool(self._source_path))
         upper = max(self._duration_ms, self._position_ms, 0)
         self._slider.blockSignals(True)
         self._slider.setRange(0, upper)
@@ -1031,6 +1115,9 @@ class MeetingPage(QWidget):
         self._ctrl.generation_failed.connect(self._on_generation_failed)
         self._ctrl.generation_cancelled.connect(self._on_generation_cancelled)
         self._ctrl.generation_queued.connect(self._on_generation_queued)
+        started = getattr(self._ctrl, "media_import_started", None)
+        if hasattr(started, "connect"):
+            started.connect(self._on_media_started)
         self._ctrl.media_import_progress.connect(self._on_media_progress)
         preview = getattr(self._ctrl, "media_import_preview", None)
         if hasattr(preview, "connect"):
@@ -1202,6 +1289,12 @@ class MeetingPage(QWidget):
         self._list_summary = QLabel()
         self._list_summary.setContentsMargins(4, 0, 0, 0)
         self._summary_row.add(self._list_summary, role="flex")
+        self._sort_btn = QPushButton()
+        self._sort_btn.setAccessibleName("切换会议排序")
+        self._sort_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sort_btn.clicked.connect(self._toggle_list_sort)
+        self._sync_sort_button()
+        self._summary_row.add(self._sort_btn, role="right")
         self._selection_mode_btn = QPushButton("选择")
         self._selection_mode_btn.setCheckable(True)
         self._selection_mode_btn.setAccessibleName("选择会议")
@@ -2104,13 +2197,13 @@ class MeetingPage(QWidget):
                     self._system_silent_dismiss_btn,
                     self._manage_templates_btn, self._live_correct_speaker_btn,
                     self._card_dl_btn, self._live_dl_btn, self._load_more_btn, self._materials_toggle,
-                    self._selection_mode_btn, self._batch_all_btn, self._batch_export_btn, self._batch_generate_btn,
+                    self._sort_btn, self._selection_mode_btn, self._batch_all_btn, self._batch_export_btn, self._batch_generate_btn,
                     self._import_btn, self._media_btn, self._media_retry_btn, self._media_again_btn):
             btn.setStyleSheet(ss.BTN_GHOST_SM)
         self._media_cancel_btn.setStyleSheet(ss.BTN_DANGER_SM)
         self._batch_delete_btn.setStyleSheet(ss.BTN_DANGER_SM)
         for btn in (
-            self._selection_mode_btn, self._batch_all_btn, self._batch_export_btn,
+            self._sort_btn, self._selection_mode_btn, self._batch_all_btn, self._batch_export_btn,
             self._batch_generate_btn, self._batch_delete_btn,
         ):
             fit_action_button(btn)
@@ -2253,8 +2346,47 @@ class MeetingPage(QWidget):
             self._template_combo.setCurrentIndex(self._template_combo.findData(dialog.selected_template_id))
             self._on_template_changed(self._template_combo.currentIndex())
 
+    def _list_sort_mode(self) -> str:
+        raw = str(self._config.get("meeting.list_sort", SORT_RECENT) or SORT_RECENT)
+        return SORT_STARTED_AT if raw == SORT_STARTED_AT else SORT_RECENT
+
+    def _sync_sort_button(self) -> None:
+        if not hasattr(self, "_sort_btn"):
+            return
+        mode = self._list_sort_mode()
+        if mode == SORT_STARTED_AT:
+            self._sort_btn.setText("按会议时间")
+            self._sort_btn.setToolTip("当前按会议发生时间排序；点击切换为按最近添加排序")
+        else:
+            self._sort_btn.setText("最近添加")
+            self._sort_btn.setToolTip("当前按最近添加/开会排序（新导入的会议始终在最上方）；点击切换为按会议时间排序")
+        fit_action_button(self._sort_btn)
+
+    def _toggle_list_sort(self) -> None:
+        if not self._flush_bound_title(sync=True) or not self._save_notes_draft() or not self._save_record_notes():
+            return
+        next_mode = SORT_STARTED_AT if self._list_sort_mode() == SORT_RECENT else SORT_RECENT
+        self._config.set("meeting.list_sort", next_mode)
+        self._sync_sort_button()
+        self.refresh()
+
+    def _query_list_meetings(self, *, limit: int) -> list[MeetingRecord]:
+        sort_by = self._list_sort_mode()
+        try:
+            return self._store.list_meetings(limit=limit, sort_by=sort_by)
+        except TypeError:
+            return self._store.list_meetings(limit=limit)
+
+    def _query_search_meetings(self, query: str, *, limit: int) -> list[MeetingRecord]:
+        sort_by = self._list_sort_mode()
+        try:
+            return self._store.search_meetings(query, limit=limit, sort_by=sort_by)
+        except TypeError:
+            return self._store.search_meetings(query, limit=limit)
+
     def refresh(self) -> None:
         self._reload_templates()
+        self._sync_sort_button()
         if self._store.disabled:
             self._list_summary.setText("历史数据库不可用，会议记录无法保存")
             return
@@ -2262,11 +2394,11 @@ class MeetingPage(QWidget):
         batch_selected = set(self._selected_meeting_ids()) if self._batch_mode else set()
         has_more_search = False
         if self._search_query:
-            matched = self._store.search_meetings(self._search_query, limit=self._list_limit + 1)
+            matched = self._query_search_meetings(self._search_query, limit=self._list_limit + 1)
             has_more_search = len(matched) > self._list_limit
             records = matched[:self._list_limit]
         else:
-            records = self._store.list_meetings(limit=self._list_limit)
+            records = self._query_list_meetings(limit=self._list_limit)
         if (keep and not self._search_query and records
                 and all(record.id != keep for record in records)
                 and self._store.get_meeting(keep) is not None):
@@ -2274,11 +2406,12 @@ class MeetingPage(QWidget):
             total = self._store.count_meetings()
             if total > self._list_limit:
                 self._list_limit = total
-                records = self._store.list_meetings(limit=self._list_limit)
+                records = self._query_list_meetings(limit=self._list_limit)
         records = self._drafts.apply_optimistic_titles(records)
         self._records = {r.id: r for r in records}
         minutes = self._minutes_markers()
         rows_key = (
+            self._list_sort_mode(),
             tuple((record.id, record.title, record.status, record.source, record.started_at, record.ended_at) for record in records),
             tok.FONT, tok.TEXT, tok.TEXT_SEC, tok.TEXT_DIM,
         )
@@ -2312,6 +2445,7 @@ class MeetingPage(QWidget):
                     if item.data(Qt.ItemDataRole.UserRole) == keep:
                         item.setSelected(True)
                         self._list.setCurrentItem(item)
+                        self._list.scrollToItem(item)
                         break
             elif getattr(self._ctrl, "importing_media", False) and self._import_owns_detail:
                 self._list.clearSelection()
@@ -2358,6 +2492,9 @@ class MeetingPage(QWidget):
             self._render_detail()
         elif records:
             self._list.setCurrentRow(0)
+            first_item = self._list.item(0)
+            if first_item is not None:
+                self._list.scrollToItem(first_item)
         elif not records and not getattr(self._ctrl, "importing_media", False):
             if not self._flush_bound_title(sync=True) or not self._save_notes_draft() or not self._save_record_notes():
                 return
@@ -2585,6 +2722,7 @@ class MeetingPage(QWidget):
             self._detail_id = meeting_id
             self._notes_view.restore_reading_position(0)
             self._transcript_view.restore_reading_position(0)
+            self._apply_landing_tab_for_meeting(meeting_id, from_list=True)
             self._render_detail()
             if self._detail_find_bar.isVisible() and self._detail_find_edit.text().strip():
                 self._find_detail_text(restart=True)
@@ -2630,6 +2768,7 @@ class MeetingPage(QWidget):
                     if item.data(Qt.ItemDataRole.UserRole) == self._detail_id:
                         item.setSelected(True)
                         self._list.setCurrentItem(item)
+                        self._list.scrollToItem(item)
                         break
             finally:
                 self._list.blockSignals(False)
@@ -2838,7 +2977,7 @@ class MeetingPage(QWidget):
         self._search_edit.clear()
         self._search_edit.blockSignals(False)
         if meeting_id and self._store.get_meeting(meeting_id) is not None:
-            visible = self._store.list_meetings(limit=self._list_limit)
+            visible = self._query_list_meetings(limit=self._list_limit)
             if all(item.id != meeting_id for item in visible):
                 self._list_limit = max(self._list_limit, self._store.count_meetings())
         self._transcript_highlight = -1
@@ -2848,6 +2987,7 @@ class MeetingPage(QWidget):
         self._detail_id = meeting_id
         self._notes_view.restore_reading_position(0)
         self._transcript_view.restore_reading_position(0)
+        self._apply_landing_tab_for_meeting(meeting_id, from_list=False)
         self._stack.setCurrentIndex(PAGE_BROWSE)
         self._start_btn.setVisible(True)
         if self._batch_mode:
@@ -2857,7 +2997,43 @@ class MeetingPage(QWidget):
         self.refresh()
         self._sync_media_buttons()
 
-    def _ask_import(self) -> tuple[str, str, bool] | None:
+    def _preferred_tab_for_meeting(self, meeting_id: str) -> int | None:
+        if not meeting_id:
+            return None
+        record = self._store.get_meeting(meeting_id)
+        if record is None or record.source not in (IMPORT_SOURCE, MEDIA_SOURCE):
+            return None
+        notes = self._store.get_notes(meeting_id)
+        if notes is not None and notes.markdown:
+            return 0
+        if self._ctrl.generating_for == meeting_id:
+            return 0
+        job = self._ctrl.queued_generation(meeting_id)
+        if job is not None and not job.failed:
+            return 0
+        return 1
+
+    def _apply_landing_tab_for_meeting(self, meeting_id: str, *, from_list: bool) -> None:
+        if self._editing_notes:
+            return
+        pref = self._preferred_tab_for_meeting(meeting_id)
+        if pref is not None:
+            if not from_list or pref == 1 or getattr(self, "_tab_auto_switched", False):
+                self._switch_tab(pref, _auto=(pref == 1))
+        elif getattr(self, "_tab_auto_switched", False):
+            self._switch_tab(0, _auto=False)
+
+    def _imported_status_message(self, meeting_id: str, kind_label: str) -> str:
+        if self._ctrl.generating_for == meeting_id:
+            return f"已导入{kind_label}，正在自动生成纪要。"
+        job = self._ctrl.queued_generation(meeting_id)
+        if job is not None and not job.failed:
+            return f"已导入{kind_label}，已自动加入纪要生成队列。"
+        if kind_label == "音视频":
+            return "已导入音视频。可先核对文字稿，或切换到「纪要」点击「生成纪要」。"
+        return "已导入文字稿。确认内容后，可切换到「纪要」点击「生成纪要」。"
+
+    def _ask_import(self) -> tuple | None:
         from sayink.ui.transcript_import_dialog import TranscriptImportDialog
 
         dialog = TranscriptImportDialog(self)
@@ -2870,6 +3046,7 @@ class MeetingPage(QWidget):
             dialog.meeting_title(),
             dialog.detect_structure(),
             dialog.meeting_started_ms(),
+            dialog.parsed(),
         )
 
     def _import_transcript(self) -> None:
@@ -2881,14 +3058,20 @@ class MeetingPage(QWidget):
             return
         text, title, detect = asked[:3]
         started = asked[3] if len(asked) > 3 else None
-        record = self._ctrl.import_transcript(
-            text, title=title, detect_structure=detect, started_at=started,
-        )
+        preparsed = asked[4] if len(asked) > 4 else None
+        try:
+            record = self._ctrl.import_transcript(
+                text, title=title, detect_structure=detect, started_at=started, parsed=preparsed,
+            )
+        except TypeError:
+            record = self._ctrl.import_transcript(
+                text, title=title, detect_structure=detect, started_at=started,
+            )
         if record is None:
             self._set_status(getattr(self._ctrl, "transcript_import_notice", "") or "没有可导入的文字")
             return
         self.show_meeting(record.id)
-        self._set_status("已导入文字稿。确认内容后，再点击「生成纪要」。")
+        self._set_status(self._imported_status_message(record.id, "文字稿"))
 
     def _import_is_recognizing(self) -> bool:
         return "正在识别" in (getattr(self, "_media_progress_text", "") or "")
@@ -2995,44 +3178,125 @@ class MeetingPage(QWidget):
             self._import_filename.hide()
         self._sync_import_queue(queued if busy else ())
 
+    def _existing_media_audio_paths(self) -> set[str]:
+        existing: set[str] = set()
+        for rec in getattr(self, "_records", ()) or ():
+            ap = str(getattr(rec, "audio_path", "") or "").strip()
+            if ap:
+                existing.add(ap)
+        for ap in getattr(self, "_meeting_audio_paths", {}).values():
+            if ap:
+                existing.add(str(ap))
+        cur_src = str(getattr(self._ctrl, "_media_source_path", "") or "").strip()
+        if cur_src:
+            existing.add(cur_src)
+        for queued_path, _title in self._queued_media():
+            if queued_path:
+                existing.add(str(queued_path))
+        return existing
+
     def _import_media(self) -> None:
         if not getattr(self._ctrl, "importing_media", False):
             reason = self._ctrl.media_block_reason()
             if reason:
                 self._set_status(reason, tone="error")
                 return
-        with native_file_dialog(self):
-            path, _selected = QFileDialog.getOpenFileName(self, "导入音视频", "", file_dialog_filter())
-        if not path:
+        if QFileDialog.getOpenFileName is not _ORIG_GET_OPEN_FILE_NAME:
+            with native_file_dialog(self):
+                path, _selected = QFileDialog.getOpenFileName(
+                    self, "导入音视频", "", file_dialog_filter()
+                )
+            if not path:
+                return
+            self._begin_media_paths([Path(path)])
             return
-        self._begin_media_paths([Path(path)])
+        with native_file_dialog(self):
+            paths, _selected = QFileDialog.getOpenFileNames(
+                self, "导入音视频", "", file_dialog_filter()
+            )
+        if not paths:
+            return
+        self._confirm_and_begin_media_paths([Path(p) for p in paths])
+
+    def _confirm_and_begin_media_paths(self, paths: list[Path]) -> tuple[bool, str]:
+        dialog = MediaImportDialog(
+            paths,
+            config=self._config,
+            existing_audio_paths=self._existing_media_audio_paths(),
+            queueing=bool(getattr(self._ctrl, "importing_media", False)),
+            parent=self,
+        )
+        with _quiet_tooltips(self):
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if not accepted:
+            return False, ""
+        requests = dialog.import_requests()
+        if not requests:
+            return False, ""
+        return True, self._begin_media_requests(requests)
 
     def _begin_media_paths(self, paths: list[Path]) -> str:
-        for path in paths:
-            message = self._ctrl.start_media_import(str(path), title=path.stem)
+        ordered = sorted(paths, key=natural_media_sort_key) if len(paths) > 1 else list(paths)
+        return self._begin_media_requests([(path, path.stem, {}) for path in ordered])
+
+    def _begin_media_requests(self, requests: list[tuple[Path, str, dict]]) -> str:
+        if not getattr(self._ctrl, "importing_media", False):
+            self._last_batch_saved_id = ""
+        for path, title, opts in requests:
+            was_importing = bool(getattr(self._ctrl, "importing_media", False))
+            kwargs: dict = {"title": title or path.stem}
+            if opts:
+                for key in ("language", "model_id", "started_at"):
+                    if key in opts and opts[key] not in ("", None):
+                        kwargs[key] = opts[key]
+            try:
+                message = self._ctrl.start_media_import(str(path), **kwargs)
+            except TypeError:
+                message = self._ctrl.start_media_import(str(path), title=title or path.stem)
             if message:
                 self._set_status(message, tone="error")
                 return message
             notice = str(getattr(self._ctrl, "media_queue_notice", "") or "")
-            if notice:
+            if notice or was_importing:
                 self._ctrl.media_queue_notice = ""
-                self._set_status(notice)
+                if notice:
+                    self._set_status(notice)
                 self._sync_media_buttons()
                 continue
-            self._arm_import_view(path)
+            self._arm_import_view(path, title=title or path.stem)
         return ""
 
-    def _arm_import_view(self, path: Path) -> None:
+    def _clear_import_live(self) -> None:
+        self._last_media_preview_text = ""
+        self._import_live.clear()
+
+    def _arm_import_view(self, path: Path, *, title: str = "") -> None:
         self._failed_media_path = ""
         self._media_cancel_pending = False
         self._pending_media_import_path = str(path)
         self._media_import_started = time.monotonic()
         self._import_owns_detail = True
-        self._media_import_title = path.stem
+        self._media_import_title = (title or path.stem).strip()
         self._media_progress_text = "正在读取音频…"
-        self._import_live.clear()
+        self._clear_import_live()
         self._sync_media_buttons()
         self._show_import_detail()
+
+    def _on_media_started(self, path: str, title: str) -> None:
+        resolved_title = (title or (Path(path).stem if path else "")).strip()
+        self._failed_media_path = ""
+        self._media_cancel_pending = False
+        self._pending_media_import_path = str(path or "")
+        self._media_import_started = time.monotonic()
+        if resolved_title:
+            self._media_import_title = resolved_title
+        self._media_progress_text = "正在读取音频…"
+        self._clear_import_live()
+        if self._import_owns_detail or not self._detail_id:
+            self._show_import_detail()
+        else:
+            self._detail_pane.setVisible(True)
+            self._paint_import_banner()
 
     def _apply_progress_widgets(self) -> None:
         raw_text = getattr(self, "_media_progress_text", "") or "正在读取音频…"
@@ -3097,7 +3361,9 @@ class MeetingPage(QWidget):
         self._detail_title.setReadOnly(True)
         self._detail_title.hide()
         self._detail_meta.setVisible(True)
-        self._detail_meta.setText("点左侧其他会议可以先看。识别会继续；听写和开始会议要等它结束。")
+        self._detail_meta.setText(
+            "点左侧其他会议可以先看。识别会在后台继续（支持随时按快捷键语音输入）；开始新会议需等导入结束。"
+        )
         self._list.blockSignals(True)
         self._list.clearSelection()
         self._list.setCurrentItem(None)
@@ -3122,6 +3388,28 @@ class MeetingPage(QWidget):
 
     def _cancel_media_import(self) -> None:
         if self._media_cancel_pending:
+            return
+        queued = self._queued_media()
+        if queued:
+            action = self._confirm_cancel_queued_import(len(queued))
+            if not action:
+                return
+            self._media_cancel_pending = True
+            if action == "cancel_all":
+                cancel_all = getattr(self._ctrl, "cancel_all_media_imports", None)
+                if callable(cancel_all):
+                    cancel_all()
+                else:
+                    self._ctrl.cancel_media_import()
+                self._queue_signature = None
+            else:
+                skip_cur = getattr(self._ctrl, "skip_current_media_import", None)
+                if callable(skip_cur):
+                    skip_cur()
+                else:
+                    self._ctrl.cancel_media_import()
+            self._sync_media_buttons()
+            self._apply_progress_widgets()
             return
         if self._stop_needs_confirm() and not self._confirm_cancel_import():
             return
@@ -3149,13 +3437,37 @@ class MeetingPage(QWidget):
             box.exec()
         return box.clickedButton() is stop
 
+    def _confirm_cancel_queued_import(self, queued_count: int) -> str:
+        box = QMessageBox(self)
+        box.setWindowTitle("停止或跳过当前文件")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"当前后面还有 {queued_count} 个文件在排队，要怎样处理？")
+        box.setInformativeText(
+            "可以选择仅跳过当前正在处理的文件并继续后续排队任务，或一次性全部停止并清空排队列表。"
+        )
+        stay = box.addButton("继续识别", QMessageBox.ButtonRole.RejectRole)
+        skip_one = box.addButton("仅跳过当前文件", QMessageBox.ButtonRole.ActionRole)
+        stop_all = box.addButton(
+            f"全部停止并清空排队（共 {queued_count} 个）",
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        box.setDefaultButton(stay)
+        with _quiet_tooltips(self):
+            box.exec()
+        clicked = box.clickedButton()
+        if clicked is skip_one:
+            return "skip_current"
+        if clicked is stop_all:
+            return "cancel_all"
+        return ""
+
     def _on_media_progress(self, text: str) -> None:
         if not text:
             return
         title = str(getattr(self._ctrl, "_media_title", "") or "")
         if title and title != getattr(self, "_media_import_title", ""):
             self._media_import_started = time.monotonic()
-            self._import_live.clear()
+            self._clear_import_live()
         if title:
             self._media_import_title = title
         self._media_progress_text = text
@@ -3168,29 +3480,65 @@ class MeetingPage(QWidget):
             self._paint_import_banner()
 
     def _on_media_preview(self, text: str) -> None:
-        self._import_live.setPlainText(text or "")
-        visible = bool(text) and bool(getattr(self._ctrl, "importing_media", False))
+        incoming = text or ""
+        prev = getattr(self, "_last_media_preview_text", "")
+        sb = self._import_live.verticalScrollBar()
+        at_bottom = (not prev) or (sb.maximum() <= 0) or (sb.value() >= max(0, sb.maximum() - 24))
+        saved_scroll = sb.value()
+        if incoming != prev:
+            if prev and incoming.startswith(prev):
+                delta = incoming[len(prev):]
+                cursor = QTextCursor(self._import_live.document())
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.insertText(delta)
+            else:
+                self._import_live.setPlainText(incoming)
+            self._last_media_preview_text = incoming
+            if at_bottom:
+                sb.setValue(sb.maximum())
+            else:
+                sb.setValue(saved_scroll)
+        visible = bool(incoming) and bool(getattr(self._ctrl, "importing_media", False))
         self._import_live.setVisible(visible)
         self._import_live_caption.setVisible(visible)
 
     def _on_media_finished(self, meeting_id: str) -> None:
-        imported_path = self._pending_media_import_path
+        imported_path = str(
+            getattr(self._ctrl, "last_imported_audio_path", "")
+            or self._pending_media_import_path
+            or ""
+        )
         was_watching = self._import_owns_detail
+        more_queued = bool(self._queued_media()) and not getattr(self._ctrl, "_unsaved_media", None)
         self._pending_media_import_path = ""
         if not self._failed_media_path or self._failed_media_path == imported_path:
             self._failed_media_path = ""
         self._media_cancel_pending = False
+        if meeting_id:
+            self._last_batch_saved_id = meeting_id
+            if imported_path:
+                self._meeting_audio_paths[meeting_id] = imported_path
+        if more_queued:
+            self._import_owns_detail = was_watching
+            self.refresh()
+            notice = getattr(self._ctrl, "media_import_notice", "") or ""
+            if notice:
+                self._set_status(notice, tone="error" if "失败" in notice else "info")
+            return
         self._import_owns_detail = False
         self._hide_import_chrome()
         self._sync_media_buttons()
+        last_batch_id = getattr(self, "_last_batch_saved_id", "")
+        self._last_batch_saved_id = ""
         if not meeting_id:
-            self._render_detail()
-            self._detail_pane.setVisible(bool(self._records) or self._editing_notes)
+            if was_watching and last_batch_id and self._store.get_meeting(last_batch_id) is not None:
+                self.show_meeting(last_batch_id)
+            else:
+                self._render_detail()
+                self._detail_pane.setVisible(bool(self._records) or self._editing_notes)
             notice = getattr(self._ctrl, "media_import_notice", "") or "没有识别到文字"
             self._set_status(notice, tone="error" if "失败" in notice else "info")
             return
-        if imported_path:
-            self._meeting_audio_paths[meeting_id] = imported_path
         if was_watching:
             self.show_meeting(meeting_id)
         else:
@@ -3203,7 +3551,7 @@ class MeetingPage(QWidget):
         if record is not None and record.status == STATUS_INTERRUPTED:
             self._set_status("已停止识别。已识别的部分保留为已中断的会议。")
         elif was_watching:
-            self._set_status("已导入音视频。确认文字稿后，再点击「生成纪要」。", tone="ok")
+            self._set_status(self._imported_status_message(meeting_id, "音视频"), tone="ok")
         else:
             self._set_status("识别完成，可在列表中打开。", tone="ok")
 
@@ -3224,15 +3572,30 @@ class MeetingPage(QWidget):
         self._begin_media_paths([Path(path)])
 
     def _on_media_failed(self, message: str) -> None:
-        failed = self._pending_media_import_path or str(getattr(self._ctrl, "_media_source_path", "") or "")
+        failed = str(
+            getattr(self._ctrl, "last_failed_audio_path", "")
+            or self._pending_media_import_path
+            or getattr(self._ctrl, "_media_source_path", "")
+            or ""
+        )
         self._failed_media_path = failed
         self._pending_media_import_path = ""
         self._media_cancel_pending = False
+        more_queued = bool(self._queued_media()) and not getattr(self._ctrl, "_unsaved_media", None)
+        if more_queued:
+            self._set_status(message or "导入音视频失败", tone="error")
+            return
+        was_watching = self._import_owns_detail
         self._import_owns_detail = False
         self._hide_import_chrome()
         self._sync_media_buttons()
-        self._render_detail()
-        self._detail_pane.setVisible(bool(self._records) or self._editing_notes)
+        last_batch_id = getattr(self, "_last_batch_saved_id", "")
+        self._last_batch_saved_id = ""
+        if was_watching and last_batch_id and self._store.get_meeting(last_batch_id) is not None:
+            self.show_meeting(last_batch_id)
+        else:
+            self._render_detail()
+            self._detail_pane.setVisible(bool(self._records) or self._editing_notes)
         self._set_status(message or "导入音视频失败", tone="error")
 
     def _show_ended_meeting(self, meeting_id: str, *, unsaved_live: bool = False) -> None:
@@ -3263,7 +3626,7 @@ class MeetingPage(QWidget):
         self._search_edit.clear()
         self._search_edit.blockSignals(False)
         if meeting_id and self._store.get_meeting(meeting_id) is not None:
-            visible = self._store.list_meetings(limit=self._list_limit)
+            visible = self._query_list_meetings(limit=self._list_limit)
             if all(item.id != meeting_id for item in visible):
                 self._list_limit = max(self._list_limit, self._store.count_meetings())
         self._transcript_highlight = -1
@@ -3823,12 +4186,34 @@ class MeetingPage(QWidget):
             return
         if not self._transcript_offsets:
             return
-        index = bisect.bisect_right(self._transcript_offsets, offset_ms + 999) - 1
-        if index < 0:
-            index = 0
-        if index < len(self._transcript_time_known) and not self._transcript_time_known[index]:
+        timed_indices = [
+            idx for idx in range(len(self._transcript_offsets))
+            if idx >= len(self._transcript_time_known) or self._transcript_time_known[idx]
+        ]
+        if not timed_indices:
             self._set_status("这一段没有时间戳，无法跳转", transient=True)
             return
+        timed_offsets = [self._transcript_offsets[idx] for idx in timed_indices]
+        is_monotonic = all(
+            timed_offsets[i] >= timed_offsets[i - 1] for i in range(1, len(timed_offsets))
+        )
+        target_limit = offset_ms + 999
+        if is_monotonic:
+            pos = bisect.bisect_right(timed_offsets, target_limit) - 1
+            index = timed_indices[pos] if pos >= 0 else timed_indices[0]
+        else:
+            le_candidates = [
+                (abs(offset_ms - self._transcript_offsets[idx]), idx)
+                for idx in timed_indices
+                if self._transcript_offsets[idx] <= target_limit
+            ]
+            if le_candidates:
+                _, index = min(le_candidates)
+            else:
+                _, index = min(
+                    (abs(self._transcript_offsets[idx] - offset_ms), idx)
+                    for idx in timed_indices
+                )
         if self._content_stack.currentIndex() == 0:
             self._citation_return = (self._detail_id, self._notes_view.verticalScrollBar().value())
         self._transcript_highlight = index
@@ -4120,7 +4505,8 @@ class MeetingPage(QWidget):
             return
         self._set_status(f"已恢复上一版{self._result_label()}；再次恢复可切回刚才的版本。")
 
-    def _switch_tab(self, index: int) -> None:
+    def _switch_tab(self, index: int, *, _auto: bool = False) -> None:
+        self._tab_auto_switched = bool(_auto)
         self._tab_group.button(index).setChecked(True)
         self._content_stack.setCurrentIndex(index)
         self._tab_tools.setCurrentIndex(index)
@@ -4399,16 +4785,30 @@ class MeetingPage(QWidget):
         super().keyPressEvent(event)
 
     def _install_import_drop_targets(self) -> None:
-        self._import_drop_widgets = (
+        candidates = (
             self._list.viewport(),
             self._search_edit,
             self._browse_left,
             self._empty_label,
             self._splitter,
+            self._detail_pane,
+            self._notes_stack,
+            self._notes_view,
+            self._notes_view.viewport(),
+            self._notes_empty,
+            self._transcript_view,
+            self._transcript_view.viewport(),
+            self._import_live,
+            self._import_live.viewport(),
         )
+        self._import_drop_widgets = tuple(w for w in candidates if w is not None)
         for widget in self._import_drop_widgets:
             widget.setAcceptDrops(True)
             widget.installEventFilter(self)
+
+    def dragLeaveEvent(self, event) -> None:
+        self._drag_url_cache = None
+        super().dragLeaveEvent(event)
 
     def dragEnterEvent(self, event) -> None:
         if not self._handle_import_drag(event, dropping=False):
@@ -4426,13 +4826,20 @@ class MeetingPage(QWidget):
         mime = event.mimeData()
         if mime is None or not mime.hasUrls():
             return False
-        paths: list[Path] = []
-        for url in mime.urls():
-            if not url.isLocalFile():
-                continue
-            path = Path(url.toLocalFile())
-            if path.is_file():
-                paths.append(path)
+        raw_urls = tuple(url.toString() for url in mime.urls())
+        cache = getattr(self, "_drag_url_cache", None)
+        refresh = dropping or event.type() == QEvent.Type.DragEnter or cache is None or cache[0] != raw_urls
+        if not refresh:
+            paths = list(cache[1])
+        else:
+            paths = []
+            for url in mime.urls():
+                if not url.isLocalFile():
+                    continue
+                path = Path(url.toLocalFile())
+                if path.is_file():
+                    paths.append(path)
+            self._drag_url_cache = None if dropping else (raw_urls, list(paths))
         if not paths:
             return False
         event.acceptProposedAction()
@@ -4448,7 +4855,12 @@ class MeetingPage(QWidget):
         texts = [path for path in paths if path.suffix.lower() in text_suffixes]
         if media:
             ignored = len(paths) - len(media)
-            error = self._begin_media_paths(media)
+            if self.isVisible():
+                accepted, error = self._confirm_and_begin_media_paths(media)
+                if not accepted:
+                    return
+            else:
+                error = self._begin_media_paths(media)
             if error:
                 if ignored:
                     self._set_status(f"{error} 已忽略 {ignored} 个不是音视频的文件。", tone="error")
@@ -4482,17 +4894,26 @@ class MeetingPage(QWidget):
             accepted = dialog.exec() == QDialog.DialogCode.Accepted
         if not accepted:
             return
-        record = self._ctrl.import_transcript(
-            dialog.transcript_text(),
-            title=dialog.meeting_title(),
-            detect_structure=dialog.detect_structure(),
-            started_at=dialog.meeting_started_ms(),
-        )
+        try:
+            record = self._ctrl.import_transcript(
+                dialog.transcript_text(),
+                title=dialog.meeting_title(),
+                detect_structure=dialog.detect_structure(),
+                started_at=dialog.meeting_started_ms(),
+                parsed=dialog.parsed(),
+            )
+        except TypeError:
+            record = self._ctrl.import_transcript(
+                dialog.transcript_text(),
+                title=dialog.meeting_title(),
+                detect_structure=dialog.detect_structure(),
+                started_at=dialog.meeting_started_ms(),
+            )
         if record is None:
             self._set_status(getattr(self._ctrl, "transcript_import_notice", "") or "没有可导入的文字", tone="error")
             return
         self.show_meeting(record.id)
-        self._set_status("已导入文字稿。确认内容后，再点击「生成纪要」。", tone="ok")
+        self._set_status(self._imported_status_message(record.id, "文字稿"), tone="ok")
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop):

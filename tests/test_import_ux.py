@@ -532,3 +532,300 @@ def test_closing_a_failed_transcript_drop_does_not_import(config, tmp_path, qapp
         page.deleteLater()
         controller.shutdown()
         history.close(timeout=2)
+
+
+def test_transcript_dialog_only_prompts_discard_when_text_edited(tmp_path, qapp, monkeypatch):
+    """M-UX-06: Changing time on an empty dialog or loading an untouched file closes without a nagging popup."""
+    from PyQt6.QtCore import QDateTime
+
+    sample = tmp_path / "weekly.txt"
+    sample.write_text("张三：内容一\n李四：内容二", encoding="utf-8")
+
+    asked = []
+    monkeypatch.setattr(TranscriptImportDialog, "_confirm_discard", lambda self: asked.append(True) or False)
+
+    # 1. Empty dialog with edited clock -> closes cleanly without asking
+    d1 = TranscriptImportDialog()
+    try:
+        d1._when.setDateTime(QDateTime.currentDateTime().addSecs(-3600))
+        d1.reject()
+        assert asked == []
+        assert d1.result() == QDialog.DialogCode.Rejected
+    finally:
+        d1.deleteLater()
+
+    # 2. Loaded file without manual edits -> closes cleanly without asking
+    d2 = TranscriptImportDialog()
+    try:
+        assert d2._load_file_path(sample) is True
+        d2.reject()
+        assert asked == []
+        assert d2.result() == QDialog.DialogCode.Rejected
+    finally:
+        d2.deleteLater()
+
+    # 3. User edits text after loading -> prompts before discarding
+    d3 = TranscriptImportDialog()
+    try:
+        assert d3._load_file_path(sample) is True
+        d3._edit.setPlainText("张三：手动改过的内容")
+        d3.reject()
+        assert asked == [True]
+    finally:
+        d3._close_confirmed = True
+        d3.deleteLater()
+
+
+def test_transcript_load_and_import_parses_once_and_drag_move_caches_urls(
+    config, tmp_path, qapp, monkeypatch
+):
+    """M-PERF-01 & M-PERF-04: Single parse across file load + import, and cached DragMove validation."""
+    from PyQt6.QtCore import QEvent, QMimeData, QUrl
+    import sayink.transcript_import as ti
+
+    sample = tmp_path / "meeting.txt"
+    sample.write_text("张三：第一句\n李四：第二句", encoding="utf-8")
+
+    parse_calls = 0
+    real_parse = ti.parse_transcript
+
+    def counting_parse(text, *, detect_structure=True):
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_parse(text, detect_structure=detect_structure)
+
+    monkeypatch.setattr("sayink.ui.transcript_import_dialog.parse_transcript", counting_parse)
+    monkeypatch.setattr("sayink.meeting_session.parse_transcript", counting_parse)
+
+    controller, history = _controller(config, tmp_path)
+    page = MeetingPage(config, controller)
+    dialog = TranscriptImportDialog()
+    try:
+        assert dialog._load_file_path(sample) is True
+        assert parse_calls == 1
+
+        monkeypatch.setattr(
+            page,
+            "_ask_import",
+            lambda: (
+                dialog.transcript_text(),
+                dialog.meeting_title(),
+                dialog.detect_structure(),
+                dialog.meeting_started_ms(),
+                dialog.parsed(),
+            ),
+        )
+        page._import_transcript()
+        assert parse_calls == 1
+
+        # DragEnter validates & paints border once; DragMove reuses cache without re-statting or re-painting
+        stat_calls = 0
+        paint_calls = 0
+        orig_dropped = TranscriptImportDialog._dropped_local_files
+        orig_paint = dialog._paint_drag_border
+
+        def counting_dropped(mime):
+            nonlocal stat_calls
+            stat_calls += 1
+            return orig_dropped(mime)
+
+        def counting_paint():
+            nonlocal paint_calls
+            paint_calls += 1
+            orig_paint()
+
+        monkeypatch.setattr(TranscriptImportDialog, "_dropped_local_files", staticmethod(counting_dropped))
+        monkeypatch.setattr(dialog, "_paint_drag_border", counting_paint)
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(sample))])
+
+        class _FakeDragEvent:
+            def __init__(self, ev_type):
+                self._type = ev_type
+                self.accepted = False
+
+            def type(self):
+                return self._type
+
+            def mimeData(self):
+                return mime
+
+            def acceptProposedAction(self):
+                self.accepted = True
+
+        assert dialog._handle_drag_enter(_FakeDragEvent(QEvent.Type.DragEnter)) is True
+        assert dialog._handle_drag_enter(_FakeDragEvent(QEvent.Type.DragMove)) is True
+        assert dialog._handle_drag_enter(_FakeDragEvent(QEvent.Type.DragMove)) is True
+        assert stat_calls == 1
+        assert paint_calls == 1
+    finally:
+        dialog._close_confirmed = True
+        dialog.deleteLater()
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_media_preview_incremental_append_and_scroll_preservation(config, tmp_path, qapp):
+    """M-PERF-03: Incremental delta append keeps bottom when at bottom, and preserves scroll when scrolled up."""
+    controller, history = _controller(config, tmp_path)
+    page = MeetingPage(config, controller)
+    page.resize(960, 520)
+    page.show()
+    try:
+        controller._importing_media = True
+        page._show_import_detail()
+        chunk_1 = "\n".join(f"第 {i} 行实时识别内容预览文本" for i in range(60))
+        page._on_media_preview(chunk_1)
+        qapp.processEvents()
+        sb = page._import_live.verticalScrollBar()
+        assert sb.maximum() > 0
+        assert sb.value() == sb.maximum()
+
+        # User scrolls up to the top to read early lines
+        sb.setValue(0)
+        qapp.processEvents()
+        chunk_2 = chunk_1 + "\n" + "\n".join(f"新增第 {i} 行内容" for i in range(60, 90))
+        page._on_media_preview(chunk_2)
+        qapp.processEvents()
+        assert page._import_live.toPlainText() == chunk_2
+        assert sb.value() == 0
+    finally:
+        controller._importing_media = False
+        page.hide()
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_right_detail_pane_accepts_drag_and_drop_imports(config, tmp_path, qapp, monkeypatch):
+    """M-UX-03: Dragging onto right-hand detail widgets triggers file import."""
+    from PyQt6.QtCore import QEvent, QMimeData, QUrl
+
+    controller, history = _controller(config, tmp_path)
+    page = MeetingPage(config, controller)
+    try:
+        sample = tmp_path / "clip.wav"
+        sample.write_bytes(b"RIFF")
+        dropped_targets: list[list[Path]] = []
+        monkeypatch.setattr(page, "_accept_dropped_files", lambda paths: dropped_targets.append(list(paths)))
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(sample))])
+
+        class _FakeDrop:
+            def type(self):
+                return QEvent.Type.Drop
+
+            def mimeData(self):
+                return mime
+
+            def acceptProposedAction(self):
+                pass
+
+        for widget in (page._detail_pane, page._notes_view.viewport(), page._transcript_view.viewport()):
+            assert widget in page._import_drop_widgets
+            assert page.eventFilter(widget, _FakeDrop()) is True
+        assert len(dropped_targets) == 3
+    finally:
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_imported_meetings_honor_auto_generate_and_land_on_transcript_tab_when_empty(
+    config, tmp_path, qapp, monkeypatch
+):
+    """M-UX-04: Without auto-generate, imported meetings open on 文字稿 tab; with auto-generate + >=200 chars,
+    both transcript and media imports enqueue AI minutes and stay on 纪要 tab."""
+    controller, history = _controller(config, tmp_path)
+    page = MeetingPage(config, controller)
+    try:
+        # Case 1: auto_generate=False -> lands directly on 文字稿 tab (index 1)
+        config.set("meeting.auto_generate", False)
+        short_rec = controller.import_transcript("张三：这是一段导入的文字稿。\n李四：收到。")
+        assert short_rec is not None
+        page.show_meeting(short_rec.id)
+        assert page._content_stack.currentIndex() == 1
+        assert page._tab_transcript.isChecked()
+
+        # Case 2: auto_generate=True + LLM configured + >= 200 chars -> auto-enqueues & opens on 纪要 tab (index 0)
+        config.set("meeting.auto_generate", True)
+        config.set("llm.api_url", "https://api.example.com/v1")
+        config.set("llm.api_key", "sk-test")
+        config.set("llm.model_name", "gpt-test")
+        controller.confirm_remote_host("https://api.example.com")
+        started_gen: list[str] = []
+        monkeypatch.setattr(controller, "_start", lambda mid, *_a, **_kw: started_gen.append(mid) or "")
+
+        long_body = "\n".join(f"张三：这是第 {i} 条完整的项目进度讨论记录与技术方案复盘。" for i in range(15))
+        assert len(long_body) >= 200
+        auto_text_rec = controller.import_transcript(long_body, title="长文字稿")
+        assert auto_text_rec is not None
+        assert auto_text_rec.id in started_gen
+        assert controller.queued_generation(auto_text_rec.id) is not None
+        page.show_meeting(auto_text_rec.id)
+        assert page._content_stack.currentIndex() == 0
+        assert page._tab_notes.isChecked()
+        controller._store.dequeue_generation(auto_text_rec.id)
+        controller._store.flush()
+
+        # Media import >= 200 chars also auto-enqueues!
+        media_turns = tuple(
+            MediaTurn(1, idx * 2000, 1500, f"这是第 {idx} 段足够长的音视频转写内容用于触发自动生成纪要。")
+            for idx in range(12)
+        )
+        auto_media_rec = controller.commit_media_import(
+            RecognitionResult(media_turns, cancelled=False, audio_ms=24_000),
+            "长录音导入",
+        )
+        assert auto_media_rec is not None
+        assert auto_media_rec.id in started_gen
+        assert controller.queued_generation(auto_media_rec.id) is not None
+    finally:
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_foreground_main_window_suppresses_redundant_media_tray_notifications():
+    """M-UX-01: Active visible MainWindow suppresses duplicate tray toast; hidden window notifies on queue drain."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    with app_harness() as harness:
+        app = harness["app"]
+        fake_tray = MagicMock()
+        app._tray = fake_tray
+        fake_rec = SimpleNamespace(display_title="评审录音")
+        app._meeting = SimpleNamespace(
+            store=SimpleNamespace(get_meeting=lambda _mid: fake_rec),
+            media_import_notice="",
+            queued_media=lambda: (),
+            importing_media=False,
+        )
+        # Foreground active MainWindow -> suppressed!
+        app._main = SimpleNamespace(
+            isVisible=lambda: True,
+            isMinimized=lambda: False,
+            isActiveWindow=lambda: True,
+        )
+        app._on_media_import_settled("m1")
+        app._on_media_import_failed_notify("解码失败")
+        assert fake_tray.showMessage.call_count == 0
+
+        # Background / hidden MainWindow with remaining queue -> waits until queue drains!
+        app._main = SimpleNamespace(
+            isVisible=lambda: False,
+            isMinimized=lambda: False,
+            isActiveWindow=lambda: False,
+        )
+        app._meeting.queued_media = lambda: (("b.wav", "b"),)
+        app._on_media_import_settled("m1")
+        assert fake_tray.showMessage.call_count == 0
+
+        # Queue drained in background -> sends single tray notification!
+        app._meeting.queued_media = lambda: ()
+        app._on_media_import_settled("m1")
+        assert fake_tray.showMessage.call_count == 1

@@ -59,27 +59,27 @@ class TestTrayActivation:
         assert len(emitted) == 1
         assert not tray._single_click_timer.isActive()
 
-    def test_windows_single_click_opens_after_double_click_interval(self, tray, monkeypatch):
+    def test_windows_single_click_opens_immediately_without_double_click_delay(self, tray, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
         emitted: list[object] = []
         tray.wake_island.connect(lambda: emitted.append(True))
 
         tray._on_activated(QSystemTrayIcon.ActivationReason.Trigger)
-        assert emitted == []
-        assert tray._single_click_timer.isActive()
-        tray._single_click_timer.stop()
-        tray._single_click_timer.timeout.emit()
 
         assert len(emitted) == 1
+        assert not tray._single_click_timer.isActive()
 
-    def test_right_click_cancels_the_pending_single_click(self, tray, monkeypatch):
+    def test_right_click_cancels_queued_wake(self, tray, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
-        tray._on_activated(QSystemTrayIcon.ActivationReason.Trigger)
-        assert tray._single_click_timer.isActive()
+        emitted: list[object] = []
+        tray.wake_island.connect(lambda: emitted.append(True))
+        tray._request_wake(defer_from_sync_win32=True)
+        assert tray._wake_queued is True
 
         tray._on_activated(QSystemTrayIcon.ActivationReason.Context)
 
-        assert not tray._single_click_timer.isActive()
+        assert tray._wake_queued is False
+        assert emitted == []
 
     def test_double_click_waits_until_the_context_menu_closes(self, tray, qapp, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
@@ -256,6 +256,284 @@ def test_microphone_icon_includes_windows_small_sizes():
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Win32 helper window")
+def test_guarded_tray_delivers_native_double_click_once(qapp):
+    import ctypes
+    import os
+    from ctypes import wintypes
+
+    if qapp.platformName() != "windows":
+        pytest.skip("requires the native Windows Qt platform")
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    owners = []
+
+    @callback_type
+    def collect(hwnd, _):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        name = ctypes.create_unicode_buffer(96)
+        user32.GetClassNameW(hwnd, name, len(name))
+        if pid.value == os.getpid() and name.value.endswith("TrayIconMessageWindowClass"):
+            owners.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(collect, 0)
+    previous_owners = set(owners)
+    owners.clear()
+    tray = TrayIcon()
+    try:
+        tray.show()
+        user32.EnumWindows(collect, 0)
+        owners[:] = [hwnd for hwnd in owners if hwnd not in previous_owners]
+        assert len(owners) == 1
+        opened = []
+        tray.wake_island.connect(lambda: opened.append(True))
+        # Qt's native tray callback: NIN_SELECT, WM_LBUTTONDBLCLK, NIN_SELECT.
+        # This crosses the subclassed Win32 procedure, not just the Python slot.
+        for message in (0x0400, 0x0203, 0x0400):
+            user32.SendMessageW(owners[0], 0x8065, 0, message)
+        qapp.processEvents()
+        assert opened == [True]
+        assert not tray._single_click_timer.isActive()
+        assert not user32.IsWindowVisible(owners[0])
+    finally:
+        tray.hide()
+        tray.deleteLater()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 helper window")
+def test_tray_owner_is_created_without_a_caption(qapp):
+    """The shell can show the tray owner before our subclass exists.
+
+    Windows assigns the class procedure after HCBT_CREATEWND, which wipes a
+    subclass installed there. The caption has to be gone from CREATESTRUCT
+    itself, or the first double-click after startup paints it and only hides
+    it once the cold-start window build returns.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    from sayink.ui.tray_icon import _remove_helper_creation_guard
+
+    if qapp.platformName() != "windows":
+        pytest.skip("requires the native Windows Qt platform")
+    # Earlier tests leave the creation guard installed. A hook added after it
+    # runs first and reads CREATESTRUCT before the rewrite. Drop that guard so
+    # TrayIcon() installs a fresh one in front of this test's hook.
+    _remove_helper_creation_guard()
+
+    class CREATESTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("lpCreateParams", ctypes.c_void_p),
+            ("hInstance", ctypes.c_void_p),
+            ("hMenu", ctypes.c_void_p),
+            ("hwndParent", wintypes.HWND),
+            ("cy", ctypes.c_int),
+            ("cx", ctypes.c_int),
+            ("y", ctypes.c_int),
+            ("x", ctypes.c_int),
+            ("style", ctypes.c_long),
+            ("lpszName", ctypes.c_void_p),
+            ("lpszClass", ctypes.c_void_p),
+            ("dwExStyle", ctypes.c_uint),
+        ]
+
+    class CBT_CREATEWND(ctypes.Structure):
+        _fields_ = [
+            ("lpcs", ctypes.POINTER(CREATESTRUCTW)),
+            ("hwndInsertAfter", wintypes.HWND),
+        ]
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    hook_type = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
+    )
+    user32.SetWindowsHookExW.argtypes = [
+        ctypes.c_int, hook_type, wintypes.HINSTANCE, wintypes.DWORD,
+    ]
+    user32.SetWindowsHookExW.restype = wintypes.HANDLE
+    user32.CallNextHookEx.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+    user32.CallNextHookEx.restype = ctypes.c_ssize_t
+    user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    seen: list[tuple[int, int, int, int]] = []
+
+    @hook_type
+    def on_create(code, wparam, lparam):
+        result = user32.CallNextHookEx(None, code, wparam, lparam)
+        if code == 3 and lparam:
+            name = ctypes.create_unicode_buffer(96)
+            user32.GetClassNameW(wparam, name, len(name))
+            if name.value.endswith("TrayIconMessageWindowClass"):
+                created = ctypes.cast(lparam, ctypes.POINTER(CBT_CREATEWND)).contents
+                cs = created.lpcs.contents
+                seen.append((int(cs.style), int(cs.dwExStyle), int(cs.x), int(cs.y)))
+        return result
+
+    thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+    handle = user32.SetWindowsHookExW(5, on_create, None, thread_id)
+    tray = TrayIcon()
+    try:
+        assert handle
+        tray.show()
+        qapp.processEvents()
+        assert seen, "tray owner was not created"
+        style, exstyle, x, y = seen[-1]
+        assert style & 0x00C00000 == 0
+        assert style & 0x80000000
+        assert exstyle & 0x00000080
+        assert exstyle & 0x08000000
+        assert (x, y) == (-32000, -32000)
+    finally:
+        if handle:
+            user32.UnhookWindowsHookEx(handle)
+        tray.hide()
+        tray.deleteLater()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 helper window")
+def test_replaced_tray_procedure_still_cannot_show_the_owner(qapp):
+    """A double-click shows the owner through DefWindowProc once Qt restores it."""
+    import ctypes
+    import os
+    from ctypes import wintypes
+
+    if qapp.platformName() != "windows":
+        pytest.skip("requires the native Windows Qt platform")
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+    user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    kernel32.GetProcAddress.argtypes = [wintypes.HMODULE, wintypes.LPCSTR]
+    kernel32.GetProcAddress.restype = ctypes.c_void_p
+    owners = []
+
+    @callback_type
+    def collect(hwnd, _):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        name = ctypes.create_unicode_buffer(96)
+        user32.GetClassNameW(hwnd, name, len(name))
+        if pid.value == os.getpid() and name.value.endswith("TrayIconMessageWindowClass"):
+            owners.append(int(hwnd))
+        return True
+
+    previous = set()
+    user32.EnumWindows(collect, 0)
+    previous.update(owners)
+    owners.clear()
+    tray = TrayIcon()
+    try:
+        tray.show()
+        qapp.processEvents()
+        user32.EnumWindows(collect, 0)
+        owners[:] = [hwnd for hwnd in owners if hwnd not in previous]
+        assert len(owners) == 1
+        defproc = kernel32.GetProcAddress(kernel32.GetModuleHandleW("user32"), b"DefWindowProcW")
+        assert defproc
+        user32.SetWindowLongPtrW(owners[0], -4, int(defproc))
+        user32.ShowWindow(owners[0], 5)
+        qapp.processEvents()
+        # IsWindowVisible can stay set. The window is still the off-screen
+        # captionless popup created above, so the shell cannot paint the
+        # microphone / maximize / close box on the desktop.
+        style = int(user32.GetWindowLongPtrW(owners[0], -16) or 0)
+        assert style & 0x00C00000 == 0
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long),
+            ]
+
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+        rect = RECT()
+        assert user32.GetWindowRect(owners[0], ctypes.byref(rect))
+        assert rect.left <= -16000
+        assert rect.top <= -16000
+    finally:
+        tray.hide()
+        tray.deleteLater()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 helper window")
+def test_startup_guards_titlebars_created_after_the_tray(qapp, tray):
+    """Qt can create and show its titlebar before our main-window scan runs."""
+    import ctypes
+    import os
+    from ctypes import wintypes
+
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QWindow
+
+    from sayink.ui.tray_icon import _PINNED_HWNDS
+
+    if qapp.platformName() != "windows":
+        pytest.skip("requires the native Windows Qt platform")
+    expanded = getattr(Qt.WindowType, "ExpandedClientAreaHint", None)
+    if expanded is None:
+        pytest.skip("this Qt version does not create the titlebar helper")
+
+    # Use an independent DLL binding: production code also binds Win32 APIs.
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumChildWindows.argtypes = [wintypes.HWND, callback_type, wintypes.LPARAM]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+
+    tray.show()
+    window = QWindow()
+    window.setFlags(Qt.WindowType.Window | expanded)
+    helpers = []
+
+    @callback_type
+    def collect(hwnd, _):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        name = ctypes.create_unicode_buffer(96)
+        user32.GetClassNameW(hwnd, name, len(name))
+        if pid.value == os.getpid() and name.value == "_q_titlebar":
+            helpers.append(int(hwnd))
+        return True
+
+    try:
+        window.create()
+        user32.EnumChildWindows(int(window.winId()), collect, 0)
+        assert helpers, "Qt must have created a real titlebar for this regression"
+        # Check WS_VISIBLE, even while its owner is hidden; IsWindowVisible
+        # would conceal the pending popup until the owner is first shown.
+        assert all(user32.GetWindowLongPtrW(h, -16) & 0x10000000 == 0 for h in helpers)
+        window.show()
+        qapp.processEvents()
+        assert window.isVisible()
+        assert all(user32.GetWindowLongPtrW(h, -16) & 0x10000000 == 0 for h in helpers)
+    finally:
+        window.destroy()
+    assert all(h not in _PINNED_HWNDS for h in helpers)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 helper window")
 def test_pinned_caption_window_stays_hidden_when_shown():
     """A double-click shows Qt's captioned tray owner unless the show is refused."""
     import ctypes
@@ -295,6 +573,71 @@ def test_pinned_caption_window_stays_hidden_when_shown():
         user32.DestroyWindow(hwnd)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 helper window")
+def test_startup_observers_cannot_appear_as_a_caption(qapp):
+    """QApplication creates captioned observers before the tray exists.
+
+    A double-click while startup is still busy shows that caption and leaves
+    it up until the UI thread is free. Burying them with the tray must stick.
+    """
+    import ctypes
+    import os
+    from ctypes import wintypes
+
+    if qapp.platformName() != "windows":
+        pytest.skip("requires the native Windows Qt platform")
+    from sayink.ui.tray_icon import TrayIcon, _hide_tray_message_window
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+    observers = []
+
+    @callback_type
+    def collect(hwnd, _):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        name = ctypes.create_unicode_buffer(128)
+        user32.GetClassNameW(hwnd, name, len(name))
+        if pid.value == os.getpid() and "ObserverWindow" in name.value:
+            observers.append(int(hwnd))
+        return True
+
+    tray = TrayIcon()
+    try:
+        tray.show()
+        _hide_tray_message_window()
+        user32.EnumWindows(collect, 0)
+        assert observers, "Qt did not create its screen/theme observer windows"
+        for hwnd in observers:
+            assert user32.GetWindowLongPtrW(hwnd, -16) & 0x00C00000 == 0
+            rect = RECT()
+            assert user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            assert rect.left <= -16000 and rect.top <= -16000
+            user32.ShowWindow(hwnd, 5)
+            assert user32.IsWindowVisible(hwnd) == 0
+    finally:
+        tray.hide()
+        tray.deleteLater()
+
+
 def test_idle_mic_uses_text_token():
     from PyQt6.QtGui import QColor
 
@@ -309,3 +652,56 @@ def test_idle_mic_uses_text_token():
     assert abs(pixel.red() - expected.red()) <= 2
     assert abs(pixel.green() - expected.green()) <= 2
     assert abs(pixel.blue() - expected.blue()) <= 2
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 SendMessage")
+def test_native_double_click_defers_wake_out_of_win32_send_message(qapp):
+    """Wake must run after WndProc returns so OLE/COM never hits 0x8001010D."""
+    import ctypes
+    import os
+    from ctypes import wintypes
+
+    from sayink.ui.tray_icon import in_win32_input_sync_call
+
+    if qapp.platformName() != "windows":
+        pytest.skip("requires the native Windows Qt platform")
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    owners: list[int] = []
+
+    @callback_type
+    def collect(hwnd, _):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        name = ctypes.create_unicode_buffer(96)
+        user32.GetClassNameW(hwnd, name, len(name))
+        if pid.value == os.getpid() and name.value.endswith("TrayIconMessageWindowClass"):
+            owners.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(collect, 0)
+    before = set(owners)
+    owners.clear()
+    tray = TrayIcon()
+    try:
+        tray.show()
+        user32.EnumWindows(collect, 0)
+        owners[:] = [h for h in owners if h not in before]
+        assert len(owners) == 1
+        in_sync_during_slot: list[bool] = []
+        tray.wake_island.connect(lambda: in_sync_during_slot.append(in_win32_input_sync_call()))
+
+        for message in (0x0400, 0x0203, 0x0400):
+            user32.SendMessageW(owners[0], 0x8065, 0, message)
+        # Must NOT have fired synchronously inside SendMessageW / hook.
+        assert in_sync_during_slot == []
+        qapp.processEvents()
+        assert in_sync_during_slot == [False]
+    finally:
+        tray.hide()
+        tray.deleteLater()

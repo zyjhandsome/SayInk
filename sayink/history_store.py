@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS meetings (
   ended_at      INTEGER,
   status        TEXT NOT NULL DEFAULT 'live',
   deleted_at    INTEGER,
-  audio_path    TEXT NOT NULL DEFAULT ''
+  audio_path    TEXT NOT NULL DEFAULT '',
+  created_at    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_meetings_started ON meetings(started_at);
 CREATE TABLE IF NOT EXISTS meeting_marks (
@@ -140,6 +141,11 @@ def _ensure_meeting_note_columns(conn: sqlite3.Connection) -> None:
     meeting_columns = {row[1] for row in conn.execute("PRAGMA table_info(meetings)")}
     if meeting_columns and "audio_path" not in meeting_columns:
         conn.execute("ALTER TABLE meetings ADD COLUMN audio_path TEXT NOT NULL DEFAULT ''")
+    if meeting_columns and "created_at" not in meeting_columns:
+        conn.execute("ALTER TABLE meetings ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0")
+    if meeting_columns:
+        conn.execute("UPDATE meetings SET created_at = started_at WHERE created_at = 0 AND started_at > 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_meetings_created ON meetings(created_at)")
     speaker_columns = {row[1] for row in conn.execute("PRAGMA table_info(meeting_speakers)")}
     if speaker_columns and "name_locked" not in speaker_columns:
         conn.execute("ALTER TABLE meeting_speakers ADD COLUMN name_locked INTEGER NOT NULL DEFAULT 0")

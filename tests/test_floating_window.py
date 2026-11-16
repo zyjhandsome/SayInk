@@ -675,11 +675,35 @@ def test_cold_start_floating_animated_loading_and_prebuild_deferral(win, monkeyp
 
         h["recognizer"].is_loading = True
         h["recognizer"].is_silent_loading = False
+        h["floating"].isVisible = lambda: True
         app._prebuild_main_window()
         assert built == []
-        assert scheduled == [(400, app._prebuild_main_window)]
+        assert scheduled == [(500, app._prebuild_main_window)]
 
+        # Continues yielding while model is still actively loading (< max deferrals).
         scheduled.clear()
+        app._prebuild_main_window()
+        assert built == []
+        assert scheduled == [(500, app._prebuild_main_window)]
+
+        # Builds immediately once model loading settles.
         h["recognizer"].is_loading = False
+        scheduled.clear()
         app._prebuild_main_window()
         assert built == ["built"]
+
+
+def test_passive_floating_shows_close_button_and_context_hide_action(win):
+    win.show_error("模型未就绪：请稍候重试")
+    assert win._dismiss_btn.isVisible()
+    passive_actions = [a.text() for a in win._position_menu().actions() if not a.isSeparator()]
+    assert "隐藏悬浮窗" in passive_actions
+
+    win._dismiss_btn.click()
+    assert not win.isVisible()
+
+    # Active listening/recording/meeting hides passive × button in favor of explicit session controls.
+    win.show_listening()
+    assert not win._dismiss_btn.isVisible()
+    win.show_recording()
+    assert not win._dismiss_btn.isVisible()

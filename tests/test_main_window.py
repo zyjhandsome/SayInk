@@ -35,6 +35,108 @@ def _use_screen(monkeypatch, width, height):
     monkeypatch.setattr(MainWindow, "screen", lambda self: screen)
 
 
+def test_file_dialog_close_keeps_the_main_window(qapp, tmp_path, monkeypatch):
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    hidden = []
+    win._hide_window = lambda: hidden.append(True)
+    try:
+        win.begin_native_dialog()
+        win.close()
+        assert hidden == []
+        win.end_native_dialog()
+        win.close()
+        assert hidden == []
+        win._release_close_hold()
+        win.close()
+        assert hidden == [True]
+    finally:
+        store.close()
+        win.deleteLater()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 presentation")
+def test_first_show_is_the_page_not_a_caption_sized_frame(qapp, tmp_path, monkeypatch):
+    """Startup used to present the main window at ~264×143, then grow it."""
+    import ctypes
+    import threading
+    import time
+    from ctypes import wintypes
+
+    if qapp.platformName() != "windows":
+        pytest.skip("requires the native Windows Qt platform")
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+    hook_type = ctypes.WINFUNCTYPE(
+        None, ctypes.c_void_p, wintypes.DWORD, wintypes.HWND,
+        ctypes.c_long, ctypes.c_long, wintypes.DWORD, wintypes.DWORD,
+    )
+    user32.SetWinEventHook.argtypes = [
+        wintypes.UINT, wintypes.UINT, wintypes.HMODULE, hook_type,
+        wintypes.DWORD, wintypes.DWORD, wintypes.UINT,
+    ]
+    user32.SetWinEventHook.restype = ctypes.c_void_p
+    user32.UnhookWinEvent.argtypes = [ctypes.c_void_p]
+    user32.PeekMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT,
+    ]
+    sizes: list[tuple[int, int]] = []
+
+    @hook_type
+    def on_show(_hook, _event, hwnd, obj, child, _thread, _when):
+        if obj != 0 or child != 0:
+            return
+        name = ctypes.create_unicode_buffer(120)
+        user32.GetClassNameW(hwnd, name, 120)
+        if "QWindowIcon" not in name.value:
+            return
+        rect = RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        sizes.append((rect.right - rect.left, rect.bottom - rect.top))
+
+    stop = threading.Event()
+
+    def pump():
+        hook = user32.SetWinEventHook(0x8002, 0x8002, None, on_show, 0, 0, 0)
+        message = wintypes.MSG()
+        while not stop.is_set():
+            while user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 1):
+                user32.TranslateMessage(ctypes.byref(message))
+                user32.DispatchMessageW(ctypes.byref(message))
+            time.sleep(0.005)
+        user32.UnhookWinEvent(hook)
+
+    thread = threading.Thread(target=pump, daemon=True)
+    thread.start()
+    time.sleep(0.15)
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        win.show()
+        qapp.processEvents()
+        time.sleep(0.2)
+        ratio = win.devicePixelRatioF() or 1.0
+        floor_w = int(win.width() * ratio) - 32
+        floor_h = int(win.height() * ratio) - 32
+        assert sizes, "the main window never became visible"
+        assert all(width >= floor_w and height >= floor_h for width, height in sizes)
+    finally:
+        stop.set()
+        thread.join(1)
+        win.hide()
+        store.close()
+        win.deleteLater()
+
+
 @pytest.mark.parametrize("source,mode", [
     ("microphone", "hotkey"), ("system", "hotkey"), ("mixed", "hotkey"),
     ("microphone", "continuous"), ("system", "continuous"), ("mixed", "continuous"),

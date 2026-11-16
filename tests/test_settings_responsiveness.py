@@ -77,7 +77,7 @@ def test_reopen_paints_before_reload_and_skips_theme_and_device_scan():
     assert {"refresh_devices": False, "heavy": False} in order
 
 
-def test_prebuilt_window_refreshes_while_hidden_then_shows():
+def test_prebuilt_window_shows_before_settings_refresh():
     from sayink.app import App
 
     app = App.__new__(App)
@@ -93,7 +93,9 @@ def test_prebuilt_window_refreshes_while_hidden_then_shows():
 
     app._show_main_window(None)
 
-    assert order == [{"refresh_devices": False, "heavy": False}, "show", "status"]
+    assert order[0] == "show"
+    assert {"refresh_devices": False, "heavy": False} in order
+    assert order.index("show") < order.index({"refresh_devices": False, "heavy": False})
 
 
 def test_start_schedules_the_hidden_main_window():

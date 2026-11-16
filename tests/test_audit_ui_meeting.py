@@ -263,11 +263,14 @@ def test_c11_m28_transcript_import_dialog_contrast_height_debounce_and_drop(tmp_
                 Qt.MouseButton.LeftButton,
                 Qt.KeyboardModifier.NoModifier,
             )
-            dlg.dropEvent(drop_ev)
+            with patch.object(dlg, "_confirm_replace", return_value=True):
+                dlg.dropEvent(drop_ev)
             assert "file:///" not in dlg.transcript_text()
             assert "拖放文件直接导入正文" in dlg.transcript_text()
             assert dlg._ok.isEnabled()
         finally:
+            dlg._edit.clear()
+            dlg._title.clear()
             dlg.close()
             dlg.deleteLater()
 

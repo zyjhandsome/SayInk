@@ -321,9 +321,9 @@ def describe_import(parsed: ImportedTranscript) -> str:
         who = f"{len(speakers)} 位发言人" if speakers else "未区分说话人"
         when = "含时间戳" if parsed.has_timestamps else "无时间戳"
         lines.append(f"{parsed.format_label} · {len(parsed.turns)} 段 · {who} · {when}")
-        for turn in parsed.turns[:3]:
+        for turn in parsed.turns[:6]:
             speaker = turn.speaker_label.strip() or "未标发言人"
-            body = turn.text.splitlines()[0][:40]
+            body = turn.text.splitlines()[0][:80]
             lines.append(f"{_preview_clock(turn.offset_ms)}{speaker}：{body}")
     if parsed.discarded:
         lines.append(f"有 {parsed.discarded} 条字幕没有导入。")
@@ -560,15 +560,26 @@ def _parse_cues(text: str, *, vtt: bool) -> ImportedTranscript:
             continue
         duration = end - start
         turns.append(ImportedTurn(speaker, start, duration if duration > 0 else 1000, content))
+    if any(
+        turns[i].offset_ms is not None
+        and turns[i - 1].offset_ms is not None
+        and turns[i].offset_ms < turns[i - 1].offset_ms
+        for i in range(1, len(turns))
+    ):
+        turns.sort(key=lambda t: int(t.offset_ms or 0))
     return ImportedTranscript(
         "", tuple(turns), "WebVTT 字幕" if vtt else "SRT 字幕",
         discarded=len(skipped), skipped=tuple(skipped),
     )
 
 
+_MAX_CLOCK_SKEW_MS = 600_000  # <= 10 minutes backward drift across multi-client logs
+
+
 def normalize_wall_clock_turns(turns: Sequence[ImportedTurn]) -> tuple[ImportedTurn, ...]:
     """Rebase absolute time-of-day turns onto a relative 0-based meeting clock,
-    handling midnight rollovers (e.g. 23:58 -> 00:03) without distorting durations."""
+    handling midnight rollovers (e.g. 23:58 -> 00:03) and minor client clock skew
+    without shifting the opening utterance away from 00:00:00."""
     day_wrap_ms = 0
     prev_unwrapped: int | None = None
     unwrapped: list[int | None] = []
@@ -577,15 +588,20 @@ def normalize_wall_clock_turns(turns: Sequence[ImportedTurn]) -> tuple[ImportedT
             unwrapped.append(None)
             continue
         cur = int(turn.offset_ms) + day_wrap_ms
-        if prev_unwrapped is not None and cur < prev_unwrapped and (prev_unwrapped - cur) >= 43_200_000:
-            day_wrap_ms += 86_400_000
-            cur = int(turn.offset_ms) + day_wrap_ms
+        if prev_unwrapped is not None and cur < prev_unwrapped:
+            back_ms = prev_unwrapped - cur
+            if back_ms >= 43_200_000:
+                days = (back_ms // 86_400_000) + 1
+                day_wrap_ms += days * 86_400_000
+                cur = int(turn.offset_ms) + day_wrap_ms
+            elif back_ms <= _MAX_CLOCK_SKEW_MS:
+                cur = prev_unwrapped
         prev_unwrapped = cur
         unwrapped.append(cur)
     known = [val for val in unwrapped if val is not None]
     if not known:
         return tuple(turns)
-    base_ms = min(known)
+    base_ms = known[0] if all(val >= known[0] for val in known) else min(known)
     rebased = [
         turn if val is None else ImportedTurn(turn.speaker_label, val - base_ms, 0, turn.text)
         for turn, val in zip(turns, unwrapped, strict=True)
@@ -790,6 +806,43 @@ def _json_safe_text(value: str) -> str:
     return re.sub(r"[\ud800-\udfff]", lambda match: ascii(match[0])[1:-1], value)
 
 
+def _json_session_clock(session_obj: dict[str, Any]) -> int | None:
+    for key in ("started_at", "session_created", "created_at", "captured_at"):
+        val = _json_millis(session_obj.get(key))
+        if val is not None and val > 0:
+            return val
+    segs = session_obj.get("segments")
+    if isinstance(segs, list):
+        seg_clocks: list[int] = []
+        for seg in segs:
+            if not isinstance(seg, dict):
+                continue
+            cap = _json_millis(seg.get("captured_at"))
+            cre = _json_millis(seg.get("created_at"))
+            clock = cap if (cap is not None and cap > 0) else (cre if (cre is not None and cre > 0) else None)
+            if clock is not None:
+                seg_clocks.append(clock)
+        if seg_clocks:
+            return min(seg_clocks)
+    return None
+
+
+def _sort_json_sessions_chronologically(sessions: list[Any]) -> list[dict[str, Any]]:
+    dict_sessions = [entry for entry in sessions if isinstance(entry, dict)]
+    if len(dict_sessions) < 2:
+        return dict_sessions
+    clocks = [_json_session_clock(entry) for entry in dict_sessions]
+    if all(clock is not None for clock in clocks):
+        return [
+            entry
+            for _clock, _idx, entry in sorted(
+                (int(clock or 0), idx, entry)
+                for idx, (clock, entry) in enumerate(zip(clocks, dict_sessions, strict=True))
+            )
+        ]
+    return dict_sessions
+
+
 def _parse_json_transcript(text: str) -> ImportedTranscript | None:
     stripped = text.strip()
     if len(stripped) < 2:
@@ -810,9 +863,10 @@ def _parse_json_transcript(text: str) -> ImportedTranscript | None:
     items: list[dict[str, Any]] = []
 
     if isinstance(payload, list):
-        for entry in payload:
-            if not isinstance(entry, dict):
-                continue
+        dict_entries = [entry for entry in payload if isinstance(entry, dict)]
+        if len(dict_entries) >= 2 and all(isinstance(e.get("segments"), list) for e in dict_entries):
+            dict_entries = _sort_json_sessions_chronologically(dict_entries)
+        for entry in dict_entries:
             nested_segs = entry.get("segments")
             if isinstance(nested_segs, list) and nested_segs:
                 for seg in nested_segs:
@@ -839,9 +893,7 @@ def _parse_json_transcript(text: str) -> ImportedTranscript | None:
                 preview = sessions[0].get("title") or sessions[0].get("preview")
                 if isinstance(preview, str) and preview.strip():
                     title = preview.strip()[:80]
-            for session_obj in sessions:
-                if not isinstance(session_obj, dict):
-                    continue
+            for session_obj in _sort_json_sessions_chronologically(sessions):
                 segs = session_obj.get("segments")
                 if isinstance(segs, list) and segs:
                     for seg in segs:

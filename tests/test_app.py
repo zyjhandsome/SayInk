@@ -87,11 +87,21 @@ class TestIslandUserCopy:
         with app_harness() as h:
             h["recognizer"].is_ready = False
             h["recognizer"].is_loading = False
+            # Hidden MainWindow: single-surface floating error without duplicate tray balloon.
             h["app"]._show_model_not_ready()
-            msg = h["tray"].showMessage.call_args[0][1]
+            msg = h["floating"].show_error.call_args[0][0]
             assert "打开 SayInk" in msg and "→ 引擎" in msg
             assert "右键托盘图标 → 设置" not in msg
             assert "设置 → 模型" not in msg
+            h["tray"].showMessage.assert_not_called()
+
+            # Visible MainWindow: single-surface tray message without extra floating popup.
+            h["floating"].show_error.reset_mock()
+            h["app"]._main = type("MainSpy", (), {"isVisible": lambda self: True})()
+            h["app"]._show_model_not_ready()
+            tray_msg = h["tray"].showMessage.call_args[0][1]
+            assert "打开 SayInk" in tray_msg and "→ 引擎" in tray_msg
+            h["floating"].show_error.assert_not_called()
 
     def test_model_load_failure_publishes_unavailable_state(self):
         with app_harness() as h:
@@ -160,7 +170,7 @@ class TestAppSignals:
     def test_island_signals_connected(self):
         with app_harness() as h:
             app = h["app"]
-            h["tray"].wake_island.connect.assert_called_with(app._show_main_window)
+            h["tray"].wake_island.connect.assert_called_with(app._on_tray_wake)
             h["floating"].settings_requested.connect.assert_called_with(
                 app._show_settings
             )
@@ -966,11 +976,19 @@ def test_continuous_ready_notice_uses_the_real_pause():
 
     with app_harness({"audio.trigger_mode": "continuous"}) as h:
         h["recognizer"].is_ready = True
+        # Cold-boot ready stays quiet.
+        h["app"]._on_stt_ready()
+        h["floating"].show_success.assert_not_called()
+        h["tray"].showMessage.assert_not_called()
+
+        # Awaited ready notice uses the real pause duration on single-surface FloatingWindow.
+        h["app"]._reload_coordinator().user_awaited_model_ready = True
         h["app"]._on_stt_ready()
         text = " ".join(
-            str(part) for call in h["tray"].showMessage.call_args_list for part in call.args
+            str(part) for call in h["floating"].show_success.call_args_list for part in call.args
         )
         assert f"{SILENCE_HOLD_SEC:g} 秒" in text
+        h["tray"].showMessage.assert_not_called()
 
 
 def test_sync_models_dir_uses_only_an_explicit_folder(tmp_path, monkeypatch):

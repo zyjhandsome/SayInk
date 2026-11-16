@@ -570,10 +570,17 @@ class _TranscriptView(_ReadingView):
         "live-segment:", "segment:", "edited-segment:",
     )
 
+    _INITIAL_LAYOUT_BLOCKS = 400
+    _INCREMENTAL_LAYOUT_BATCH = 250
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._action_block = None
         self._keyboard_actions = False
+        self._next_layout_block_num = 0
+        self._layout_timer = QTimer(self)
+        self._layout_timer.setSingleShot(True)
+        self._layout_timer.timeout.connect(self._layout_next_batch)
         self.setMouseTracking(True)
         self.cursorPositionChanged.connect(self._reveal_cursor_actions)
 
@@ -613,11 +620,47 @@ class _TranscriptView(_ReadingView):
         self._restore_body_selection(saved)
 
     def _layout_every_block(self) -> None:
-        layout = self.document().documentLayout()
-        block = self.document().begin()
-        while block.isValid():
+        self._layout_timer.stop()
+        doc = self.document()
+        layout = doc.documentLayout()
+        block = doc.begin()
+        count = 0
+        while block.isValid() and count < self._INITIAL_LAYOUT_BLOCKS:
             layout.blockBoundingRect(block)
             block = block.next()
+            count += 1
+        if block.isValid():
+            self._next_layout_block_num = block.blockNumber()
+            self._layout_timer.start(0)
+        else:
+            self._next_layout_block_num = 0
+
+    def _layout_next_batch(self) -> None:
+        doc = self.document()
+        layout = doc.documentLayout()
+        block = doc.findBlockByNumber(self._next_layout_block_num)
+        count = 0
+        while block.isValid() and count < self._INCREMENTAL_LAYOUT_BATCH:
+            layout.blockBoundingRect(block)
+            block = block.next()
+            count += 1
+        if block.isValid():
+            self._next_layout_block_num = block.blockNumber()
+            self._layout_timer.start(0)
+        else:
+            self._next_layout_block_num = 0
+
+    def scrollToAnchor(self, name: str) -> None:
+        if self._layout_timer.isActive():
+            self._layout_timer.stop()
+            doc = self.document()
+            layout = doc.documentLayout()
+            block = doc.findBlockByNumber(self._next_layout_block_num)
+            while block.isValid():
+                layout.blockBoundingRect(block)
+                block = block.next()
+            self._next_layout_block_num = 0
+        super().scrollToAnchor(name)
 
     def _seq_in_block(self, block) -> int | None:
         it = block.begin()

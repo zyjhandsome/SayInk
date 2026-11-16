@@ -265,6 +265,31 @@ class TestActivation:
         monkeypatch.setattr(main, "activation_server_name", lambda: "SayInk-activate-none")
         assert main._activate_running_instance() is False
 
+    def test_is_silent_launch_recognizes_autostart_and_minimized_flags(self):
+        assert main.is_silent_launch(["SayInk.exe"]) is False
+        assert main.is_silent_launch(["SayInk.exe", "--autostart"]) is True
+        assert main.is_silent_launch(["SayInk.exe", "--silent"]) is True
+        assert main.is_silent_launch(["SayInk.exe", "-m"]) is True
+
+    def test_existing_instance_suppresses_modal_unless_legacy_voiceink(self, monkeypatch):
+        popped = []
+        monkeypatch.setattr(main, "_activate_running_instance", lambda **_: False)
+        monkeypatch.setattr(main, "_focus_existing_sayink_window", lambda: False)
+        monkeypatch.setattr(main, "_last_block_reason", "sayink")
+        # Default manual relaunch does not pop blocking MessageBoxW for same-app SayInk.
+        main._handle_existing_instance(retries=1, retry_delay_s=0.0)
+        assert popped == []
+
+        # Legacy VoiceInk conflict still notifies via message box.
+        monkeypatch.setattr(main, "_last_block_reason", "legacy_voiceink")
+        main._handle_existing_instance(
+            retries=1,
+            retry_delay_s=0.0,
+            message_box=popped.append,
+        )
+        assert len(popped) == 1
+        assert "VoiceInk" in popped[0]
+
 
 class TestExceptionHooks:
     def test_hooks_installed(self, monkeypatch):

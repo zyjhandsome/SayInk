@@ -27,13 +27,187 @@ _WS_EX_TOOLWINDOW = 0x00000080
 _WS_EX_NOACTIVATE = 0x08000000
 _PINNED_PROCS: list = []
 _PINNED_HWNDS: dict[int, int] = {}
+_HELPER_HWNDS: set[int] = set()
+_NON_HELPER_HWNDS: set[int] = set()
+_PENDING_SUBCLASS_HWNDS: set[int] = set()
+_CLOAKED_HWNDS: set[int] = set()
+_HELPER_CREATION_GUARD = None
+_TRANSIENT_CALL_GUARD = None
+_DWMWA_CLOAK = 13
+_ISMEX_PENDING_MASK = 0x00000007  # ISMEX_SEND | ISMEX_NOTIFY | ISMEX_CALLBACK
+_IN_NATIVE_TRAY_PROC = 0
 
 
-def _win32_user32():
+def _is_helper_class(name: str) -> bool:
+    if not name:
+        return False
+    if name == "_q_titlebar" or name.startswith("QEventDispatcherWin32_Internal_Widget"):
+        return True
+    return name.endswith((
+        "TrayIconMessageWindowClass",
+        "PowerDummyWindow",
+        "ClipboardView",
+        "ThemeChangeObserverWindow",
+        "ScreenChangeObserverWindow",
+    ))
+
+
+def _cwpstruct_type():
     import ctypes
     from ctypes import wintypes
 
-    user32 = ctypes.windll.user32
+    cached = getattr(_cwpstruct_type, "cls", None)
+    if cached is not None:
+        return cached
+
+    class CWPSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("lParam", ctypes.c_ssize_t),
+            ("wParam", ctypes.c_size_t),
+            ("message", ctypes.c_uint),
+            ("hwnd", wintypes.HWND),
+        ]
+
+    _cwpstruct_type.cls = CWPSTRUCT
+    return CWPSTRUCT
+
+
+def _windowpos_type():
+    import ctypes
+    from ctypes import wintypes
+
+    cached = getattr(_windowpos_type, "cls", None)
+    if cached is not None:
+        return cached
+
+    class WINDOWPOS(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("hwndInsertAfter", wintypes.HWND),
+            ("x", ctypes.c_int),
+            ("y", ctypes.c_int),
+            ("cx", ctypes.c_int),
+            ("cy", ctypes.c_int),
+            ("flags", ctypes.c_uint),
+        ]
+
+    _windowpos_type.cls = WINDOWPOS
+    return WINDOWPOS
+
+
+def _pointer_address(value) -> int:
+    import ctypes
+
+    bits = ctypes.sizeof(ctypes.c_void_p) * 8
+    return int(value) & ((1 << bits) - 1)
+
+
+def _force_hide_pos(lparam) -> None:
+    """Turn this position change into a hide, before the window is painted."""
+    if not lparam:
+        return
+    base = _pointer_address(lparam)
+    windowpos = _windowpos_type()
+    import ctypes
+
+    flags = ctypes.c_uint.from_address(base + windowpos.flags.offset)
+    flags.value = (flags.value & ~(_SWP_SHOWWINDOW | _SWP_NOMOVE)) | (
+        _SWP_HIDEWINDOW | _SWP_NOACTIVATE
+    )
+    ctypes.c_int.from_address(base + windowpos.x.offset).value = -32000
+    ctypes.c_int.from_address(base + windowpos.y.offset).value = -32000
+
+
+def _class_name(user32, hwnd: int) -> str:
+    import ctypes
+
+    name = ctypes.create_unicode_buffer(128)
+    user32.GetClassNameW(hwnd, name, len(name))
+    return name.value
+
+
+def _cloak_hwnd(hwnd: int) -> None:
+    """Keep DWM from presenting the helper, including as a tray preview."""
+    if not hwnd or hwnd in _CLOAKED_HWNDS:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+        dwmapi.DwmSetWindowAttribute.argtypes = [
+            wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+        ]
+        dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+        cloaked = ctypes.c_int(1)
+        hr = dwmapi.DwmSetWindowAttribute(
+            hwnd, _DWMWA_CLOAK, ctypes.byref(cloaked), ctypes.sizeof(cloaked),
+        )
+        if hr == 0:
+            _CLOAKED_HWNDS.add(int(hwnd))
+    except Exception:
+        return
+
+
+def _bury_helper_create_struct(lparam) -> None:
+    """Make the helper a captionless popup before Windows builds its frame.
+
+    HCBT_CREATEWND runs before the class window procedure is assigned, so a
+    subclass installed here is wiped. The style written into CREATESTRUCT is
+    not: the window is never the overlapped caption that later paints the
+    microphone, maximize box, close mark, and white client.
+    """
+    if not lparam:
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    class CREATESTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("lpCreateParams", ctypes.c_void_p),
+            ("hInstance", ctypes.c_void_p),
+            ("hMenu", ctypes.c_void_p),
+            ("hwndParent", wintypes.HWND),
+            ("cy", ctypes.c_int),
+            ("cx", ctypes.c_int),
+            ("y", ctypes.c_int),
+            ("x", ctypes.c_int),
+            ("style", ctypes.c_long),
+            ("lpszName", ctypes.c_void_p),
+            ("lpszClass", ctypes.c_void_p),
+            ("dwExStyle", ctypes.c_uint),
+        ]
+
+    class CBT_CREATEWND(ctypes.Structure):
+        _fields_ = [
+            ("lpcs", ctypes.POINTER(CREATESTRUCTW)),
+            ("hwndInsertAfter", wintypes.HWND),
+        ]
+
+    cbt = ctypes.cast(lparam, ctypes.POINTER(CBT_CREATEWND)).contents
+    if not cbt.lpcs:
+        return
+    base = _pointer_address(ctypes.cast(cbt.lpcs, ctypes.c_void_p).value or 0)
+    if not base:
+        return
+    style = ctypes.c_long.from_address(base + CREATESTRUCTW.style.offset)
+    style.value = (style.value & ~_WS_CAPTION_BITS & ~0x10000000) | _WS_POPUP
+    exstyle = ctypes.c_uint.from_address(base + CREATESTRUCTW.dwExStyle.offset)
+    exstyle.value = exstyle.value | _WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE
+    ctypes.c_int.from_address(base + CREATESTRUCTW.x.offset).value = -32000
+    ctypes.c_int.from_address(base + CREATESTRUCTW.y.offset).value = -32000
+
+
+def _win32_user32():
+    cached = getattr(_win32_user32, "_dll", None)
+    if cached is not None:
+        return cached
+    import ctypes
+    from ctypes import wintypes
+
+    # Keep these signatures private. Other UI modules bind the same APIs
+    # with their own ctypes structures while a native callback is in flight.
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
     wndenumproc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     if hasattr(user32.EnumWindows, "argtypes"):
         user32.EnumWindows.argtypes = [wndenumproc, wintypes.LPARAM]
@@ -59,7 +233,192 @@ def _win32_user32():
         ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
     ]
     user32.CallWindowProcW.restype = ctypes.c_ssize_t
+    if hasattr(user32, "InSendMessageEx") and hasattr(user32.InSendMessageEx, "argtypes"):
+        user32.InSendMessageEx.argtypes = [wintypes.LPVOID]
+        user32.InSendMessageEx.restype = wintypes.DWORD
+    _win32_user32._dll = user32
     return user32
+
+
+def in_win32_input_sync_call() -> bool:
+    """True while dispatching a native tray message or cross-thread Win32 SendMessage.
+
+    Constructing or showing MainWindow inside an input-synchronous message from
+    Explorer triggers COM RPC_E_CANTCALLOUT_ININPUTSYNCCALL (0x8001010D).
+    """
+    if sys.platform != "win32":
+        return False
+    if _IN_NATIVE_TRAY_PROC > 0:
+        return True
+    try:
+        user32 = _win32_user32()
+        in_send = getattr(user32, "InSendMessageEx", None)
+        if callable(in_send):
+            return bool(int(in_send(None)) & _ISMEX_PENDING_MASK)
+    except Exception:
+        return False
+    return False
+
+
+def _disarm_transient_call_guard() -> None:
+    global _TRANSIENT_CALL_GUARD
+    guard = _TRANSIENT_CALL_GUARD
+    _TRANSIENT_CALL_GUARD = None
+    if guard is None:
+        return
+    user32, handle, _callback = guard
+    try:
+        user32.UnhookWindowsHookEx(handle)
+    except Exception:
+        pass
+
+
+def _install_helper_creation_guard() -> None:
+    """Pin new Qt helpers before their first show, on the UI thread only.
+
+    Install this before ``QApplication``: Qt creates captioned observer
+    windows inside that constructor, and a tray click during startup
+    shows one of them until the UI thread is free to hide it.
+
+    Performance note: ``WH_CBT`` only runs on window lifecycle events
+    (never on mouse move / hit-test / paint / timers). ``WH_CALLWNDPROC`` is
+    armed ONLY transiently during ``CreateWindowExW`` of a helper window so its
+    per-HWND ``GWLP_WNDPROC`` subclass is installed right after Windows assigns
+    the class procedure, then unhooked immediately—zero steady-state GIL overhead.
+    """
+    global _HELPER_CREATION_GUARD
+    if sys.platform != "win32" or _HELPER_CREATION_GUARD is not None:
+        return
+    import ctypes
+    import logging
+    from ctypes import wintypes
+
+    try:
+        user32 = _win32_user32()
+        hook_type = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
+        )
+        user32.SetWindowsHookExW.argtypes = [
+            ctypes.c_int, hook_type, wintypes.HINSTANCE, wintypes.DWORD,
+        ]
+        user32.SetWindowsHookExW.restype = wintypes.HANDLE
+        user32.CallNextHookEx.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
+        ]
+        user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
+        user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+        thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+
+        @hook_type
+        def on_call(code, wparam, lparam):
+            try:
+                if code == 0 and lparam:  # HC_ACTION
+                    info = ctypes.cast(lparam, ctypes.POINTER(_cwpstruct_type())).contents
+                    hwnd = int(info.hwnd)
+                    if hwnd in _PENDING_SUBCLASS_HWNDS:
+                        _PENDING_SUBCLASS_HWNDS.discard(hwnd)
+                        _install_hide_hook(user32, hwnd)
+                        _cloak_hwnd(hwnd)
+                        if not _PENDING_SUBCLASS_HWNDS:
+                            _disarm_transient_call_guard()
+                    if info.message == _WM_WINDOWPOSCHANGING and info.lParam and hwnd in _HELPER_HWNDS:
+                        _cloak_hwnd(hwnd)
+                        windowpos = _windowpos_type()
+                        base = _pointer_address(info.lParam)
+                        flags = ctypes.c_uint.from_address(base + windowpos.flags.offset).value
+                        visible = bool(user32.IsWindowVisible(hwnd))
+                        if flags & _SWP_SHOWWINDOW or (visible and not flags & _SWP_HIDEWINDOW):
+                            _force_hide_pos(info.lParam)
+                    elif not _PENDING_SUBCLASS_HWNDS:
+                        _disarm_transient_call_guard()
+            except Exception:
+                logging.getLogger("SayInk").debug("拦截辅助窗口显示失败", exc_info=True)
+            return user32.CallNextHookEx(None, code, wparam, lparam)
+
+        def _arm_transient_call_guard() -> None:
+            global _TRANSIENT_CALL_GUARD
+            if _TRANSIENT_CALL_GUARD is not None:
+                return
+            handle = user32.SetWindowsHookExW(4, on_call, None, thread_id)  # WH_CALLWNDPROC
+            if handle:
+                _TRANSIENT_CALL_GUARD = (user32, handle, on_call)
+
+        @hook_type
+        def on_create(code, wparam, lparam):
+            try:
+                if code == 3:  # HCBT_CREATEWND; wparam is the new HWND.
+                    hwnd = int(wparam)
+                    name = _class_name(user32, hwnd)
+                    if _is_helper_class(name):
+                        _NON_HELPER_HWNDS.discard(hwnd)
+                        _HELPER_HWNDS.add(hwnd)
+                        if name == "_q_titlebar" or name.endswith("TrayIconMessageWindowClass"):
+                            _bury_helper_create_struct(lparam)
+                        _cloak_hwnd(hwnd)
+                        _PENDING_SUBCLASS_HWNDS.add(hwnd)
+                        _arm_transient_call_guard()
+                    else:
+                        _NON_HELPER_HWNDS.add(hwnd)
+                elif code == 4:  # HCBT_DESTROYWND
+                    hwnd = int(wparam)
+                    _NON_HELPER_HWNDS.discard(hwnd)
+                    _HELPER_HWNDS.discard(hwnd)
+                    _CLOAKED_HWNDS.discard(hwnd)
+                    if hwnd in _PENDING_SUBCLASS_HWNDS:
+                        _PENDING_SUBCLASS_HWNDS.discard(hwnd)
+                        if not _PENDING_SUBCLASS_HWNDS:
+                            _disarm_transient_call_guard()
+                elif code == 5:  # HCBT_ACTIVATE
+                    hwnd = int(wparam)
+                    if hwnd in _HELPER_HWNDS:
+                        return 1
+                    if hwnd not in _NON_HELPER_HWNDS:
+                        if _is_helper_class(_class_name(user32, hwnd)):
+                            _HELPER_HWNDS.add(hwnd)
+                            return 1
+                        _NON_HELPER_HWNDS.add(hwnd)
+            except Exception:
+                logging.getLogger("SayInk").debug("保护新建辅助窗口失败", exc_info=True)
+            return user32.CallNextHookEx(None, code, wparam, lparam)
+
+        cbt = user32.SetWindowsHookExW(5, on_create, None, thread_id)  # WH_CBT
+        if not cbt:
+            raise ctypes.WinError(ctypes.get_last_error())
+        # ctypes callbacks must outlive their native registrations.
+        _HELPER_CREATION_GUARD = (user32, (cbt,), (on_create, on_call))
+        _bind_helper_guard()
+    except Exception:
+        logging.getLogger("SayInk").warning("安装辅助窗口保护失败", exc_info=True)
+
+
+def _bind_helper_guard() -> None:
+    """Drop the hooks when the application exits. Safe before it exists."""
+    if sys.platform != "win32" or _HELPER_CREATION_GUARD is None:
+        return
+    if getattr(_bind_helper_guard, "bound", False):
+        return
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None or app.platformName() != "windows":
+        return
+    app.aboutToQuit.connect(_remove_helper_creation_guard)
+    app.destroyed.connect(_remove_helper_creation_guard)
+    _bind_helper_guard.bound = True
+
+
+def _remove_helper_creation_guard() -> None:
+    global _HELPER_CREATION_GUARD
+    _disarm_transient_call_guard()
+    _PENDING_SUBCLASS_HWNDS.clear()
+    guard = _HELPER_CREATION_GUARD
+    _HELPER_CREATION_GUARD = None
+    if guard is None:
+        return
+    user32, handles, _callbacks = guard
+    for handle in handles:
+        user32.UnhookWindowsHookEx(handle)
 
 
 def keep_hwnd_hidden(hwnd: int) -> None:
@@ -75,6 +434,8 @@ def keep_hwnd_hidden(hwnd: int) -> None:
         if not user32.IsWindow(hwnd):
             return
         _install_hide_hook(user32, int(hwnd))
+        _HELPER_HWNDS.add(int(hwnd))
+        _cloak_hwnd(int(hwnd))
         style = user32.GetWindowLongPtrW(hwnd, _GWL_STYLE)
         buried = (style & ~_WS_CAPTION_BITS) | _WS_POPUP
         if buried != style:
@@ -100,17 +461,6 @@ def _install_hide_hook(user32, hwnd: int) -> None:
     if not current or _PINNED_HWNDS.get(hwnd) == current:
         return
 
-    class WINDOWPOS(ctypes.Structure):
-        _fields_ = [
-            ("hwnd", wintypes.HWND),
-            ("hwndInsertAfter", wintypes.HWND),
-            ("x", ctypes.c_int),
-            ("y", ctypes.c_int),
-            ("cx", ctypes.c_int),
-            ("cy", ctypes.c_int),
-            ("flags", ctypes.c_uint),
-        ]
-
     original = ctypes.c_void_p(current)
     wndproc = ctypes.WINFUNCTYPE(
         ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
@@ -121,20 +471,28 @@ def _install_hide_hook(user32, hwnd: int) -> None:
         try:
             if msg == 0x0082:  # WM_NCDESTROY
                 _PINNED_HWNDS.pop(int(h), None)
+                _HELPER_HWNDS.discard(int(h))
+                _CLOAKED_HWNDS.discard(int(h))
             elif msg == _WM_WINDOWPOSCHANGING and lparam:
-                pos = ctypes.cast(lparam, ctypes.POINTER(WINDOWPOS)).contents
-                if pos.flags & _SWP_SHOWWINDOW or _user.IsWindowVisible(h):
-                    pos.flags = (pos.flags & ~(_SWP_SHOWWINDOW | _SWP_NOMOVE)) | (
-                        _SWP_HIDEWINDOW | _SWP_NOACTIVATE
-                    )
-                    pos.x = -32000
-                    pos.y = -32000
+                import ctypes
+
+                windowpos = _windowpos_type()
+                base = _pointer_address(lparam)
+                flags = ctypes.c_uint.from_address(base + windowpos.flags.offset).value
+                if flags & _SWP_SHOWWINDOW or (
+                    _user.IsWindowVisible(h) and not flags & _SWP_HIDEWINDOW
+                ):
+                    _force_hide_pos(lparam)
         except Exception:
             pass
+        global _IN_NATIVE_TRAY_PROC
+        _IN_NATIVE_TRAY_PROC += 1
         try:
             return _user.CallWindowProcW(_orig, h, msg, wparam, lparam)
         except Exception:
             return 0
+        finally:
+            _IN_NATIVE_TRAY_PROC = max(0, _IN_NATIVE_TRAY_PROC - 1)
 
     _PINNED_PROCS.append(hook)
     user32.SetWindowLongPtrW(
@@ -169,7 +527,7 @@ def _hide_tray_message_window() -> None:
                 return True
             name = ctypes.create_unicode_buffer(96)
             user32.GetClassNameW(hwnd, name, 96)
-            if name.value.endswith("TrayIconMessageWindowClass"):
+            if _is_helper_class(name.value):
                 found.append(int(hwnd))
             return True
 
@@ -547,6 +905,10 @@ class TrayIcon(QSystemTrayIcon):
     meetings_requested = pyqtSignal()
 
     def __init__(self, parent=None):
+        # Before QSystemTrayIcon builds its message window. That window is an
+        # overlapped CW_USEDEFAULT caption; the shell shows it on the first
+        # double-click, and it stays up while the cold-start window is built.
+        _install_helper_creation_guard()
         super().__init__(parent)
 
         self._icon_kind = "normal"
@@ -559,11 +921,17 @@ class TrayIcon(QSystemTrayIcon):
         self._flash_timer = None
         self._flash_restore_recording = False
 
+        from PyQt6.QtCore import QTimer
+
         self._model_menu = None
         self._model_group = None
         self._menu = None
         self._menu_is_open = False
         self._wake_after_menu = False
+        self._wake_queued = False
+        self._suppress_wake_until = 0.0
+        self._single_click_timer = QTimer(self)
+        self._single_click_timer.setSingleShot(True)
         self._notice_kind = ""
         self._setup_menu()
         self.activated.connect(self._on_activated)
@@ -581,6 +949,7 @@ class TrayIcon(QSystemTrayIcon):
         self.setIcon(_fresh_microphone_icon(kind))
 
     def show(self) -> None:
+        _install_helper_creation_guard()
         super().show()
         self._schedule_icon_republish()
         _hide_tray_message_window()
@@ -751,28 +1120,44 @@ class TrayIcon(QSystemTrayIcon):
             lambda a: self.model_switched.emit(a.data())
         )
 
+    @staticmethod
+    def _double_click_window_s() -> float:
+        from PyQt6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        interval_ms = app.doubleClickInterval() if app is not None else 400
+        return max(0.18, min(0.55, float(interval_ms) / 1000.0))
+
     @pyqtSlot(QSystemTrayIcon.ActivationReason)
     def _on_activated(self, reason):
-        # Windows emits Trigger on the first click of a double-click, then
-        # DoubleClick. Most users single-click a tray icon, so respond to a
-        # single click too — but defer it by the double-click interval so a
-        # double-click still opens the window exactly once.
+        import time
+
+        # Respond immediately on the first left-click (Trigger) with zero
+        # doubleClickInterval delay, and debounce any follow-up DoubleClick /
+        # trailing NIN_SELECT within the double-click window so a double-click
+        # still opens the window exactly once without toggling it back shut.
         if sys.platform == "win32":
             if reason == QSystemTrayIcon.ActivationReason.Context:
-                # Right-click owns the modal menu. Don't also open the window
-                # from the left click that arrived in the same gesture.
                 self._disarm_single_click()
                 return
+            _hide_tray_message_window()
+            now = time.monotonic()
             if reason == QSystemTrayIcon.ActivationReason.Trigger:
-                self._arm_single_click()
+                if now < getattr(self, "_suppress_wake_until", 0.0):
+                    return
+                self._suppress_wake_until = now + self._double_click_window_s()
+                self._request_wake()
             elif reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-                self._disarm_single_click()
+                if now < getattr(self, "_suppress_wake_until", 0.0):
+                    self._suppress_wake_until = max(self._suppress_wake_until, now + 0.25)
+                    return
+                self._suppress_wake_until = now + 0.25
                 self._request_wake()
             return
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self._request_wake()
 
-    def _request_wake(self) -> None:
+    def _request_wake(self, *, defer_from_sync_win32: bool = False) -> None:
         """Open the main window after the tray menu releases the UI thread.
 
         A visible tray menu runs a modal loop on Windows. Showing or activating
@@ -789,6 +1174,26 @@ class TrayIcon(QSystemTrayIcon):
             menu = self._menu
             if menu is not None and menu.isVisible():
                 menu.close()
+            return
+        if defer_from_sync_win32 or in_win32_input_sync_call():
+            self._queue_wake()
+            return
+        self.wake_island.emit()
+
+    def _queue_wake(self) -> None:
+        if getattr(self, "_wake_queued", False):
+            return
+        self._wake_queued = True
+        from PyQt6.QtCore import QTimer
+
+        QTimer.singleShot(0, self._emit_queued_wake)
+
+    def _emit_queued_wake(self) -> None:
+        if not getattr(self, "_wake_queued", False):
+            return
+        self._wake_queued = False
+        if self._menu_is_open:
+            self._wake_after_menu = True
             return
         self.wake_island.emit()
 
@@ -812,21 +1217,9 @@ class TrayIcon(QSystemTrayIcon):
 
         QTimer.singleShot(0, self.wake_island.emit)
 
-    def _arm_single_click(self) -> None:
-        from PyQt6.QtCore import QTimer
-        from PyQt6.QtWidgets import QApplication
-
-        timer = getattr(self, "_single_click_timer", None)
-        if timer is None:
-            timer = QTimer(self)
-            timer.setSingleShot(True)
-            timer.timeout.connect(self._request_wake)
-            self._single_click_timer = timer
-        app = QApplication.instance()
-        interval = app.doubleClickInterval() if app is not None else 400
-        timer.start(max(150, int(interval)))
-
     def _disarm_single_click(self) -> None:
+        self._wake_queued = False
+        self._suppress_wake_until = 0.0
         timer = getattr(self, "_single_click_timer", None)
         if timer is not None:
             timer.stop()

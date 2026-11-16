@@ -131,22 +131,25 @@ class AboutSettingsPage(SettingsPage):
         status_lay = QVBoxLayout()
         status_lay.setSpacing(4)
         status_lay.addWidget(self.about_version_label)
-        self.about_update_status = QLabel("本次启动尚未检查。自动检查至少隔 24 小时，不自动下载。")
+        self.about_update_status = QLabel(
+            "本次启动尚未检查。自动检查至少隔 24 小时，不自动下载。",
+            update_row,
+        )
         self.about_update_status.setObjectName("aboutUpdateStatus")
         self.about_update_status.setWordWrap(True)
         self.about_update_status.setTextFormat(Qt.TextFormat.PlainText)
-        self.about_update_checked_at = QLabel()
+        self.about_update_checked_at = QLabel(update_row)
         self.about_update_checked_at.setWordWrap(True)
-        self.refresh_update_check_time(config)
         status_lay.addWidget(self.about_update_status)
         status_lay.addWidget(self.about_update_checked_at)
         update_lay.addLayout(status_lay, 1)
-        self.about_update_btn = QPushButton("检查更新")
+        self.about_update_btn = QPushButton("检查更新", update_row)
         self.about_update_btn.setObjectName("aboutUpdateButton")
         self.about_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.about_update_btn.clicked.connect(self._handle_update_button)
         update_lay.addWidget(self.about_update_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         self.about_info_lay.addWidget(update_row)
+        self.refresh_update_check_time(config)
         self.about_info_lay.addWidget(group_divider())
         self.about_auto_update_row = ToggleOptionRow(
             "自动检查更新", "启动时检查，距上次检查至少 24 小时；不自动下载。",

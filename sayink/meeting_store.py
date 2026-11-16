@@ -18,6 +18,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -53,6 +54,9 @@ QUEUE_PENDING = "pending"
 # Needs the user (key, quota, unconfirmed host…); never retried on its own.
 QUEUE_FAILED = "failed"
 
+SORT_RECENT = "recent"
+SORT_STARTED_AT = "started_at"
+
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -81,6 +85,7 @@ class MeetingRecord:
     status: str = STATUS_LIVE
     deleted_at: int | None = None
     audio_path: str = ""
+    created_at: int = 0
 
     @property
     def duration_ms(self) -> int:
@@ -178,7 +183,7 @@ def _row_to_queued(r: tuple) -> QueuedGeneration:
 
 _MEETING_COLUMNS = (
     "id, title, participants, agenda, notes_user, source, model_id, vad, glossary, "
-    "started_at, ended_at, status, deleted_at, audio_path"
+    "started_at, ended_at, status, deleted_at, audio_path, created_at"
 )
 
 _NOTE_METADATA_COLUMNS = ("template_id", "model", "json_payload", "generated_at", "duration_ms", "chunked", "user_edited")
@@ -341,6 +346,8 @@ def _row_to_meeting(r: tuple) -> MeetingRecord:
         glossary = json.loads(r[8]) if r[8] else []
     except ValueError:
         glossary = []
+    started = int(r[9] or 0)
+    raw_created = int(r[14] or 0) if len(r) > 14 and r[14] is not None else 0
     return MeetingRecord(
         id=r[0],
         title=r[1] or "",
@@ -351,11 +358,12 @@ def _row_to_meeting(r: tuple) -> MeetingRecord:
         model_id=r[6] or "",
         vad=r[7] or "",
         glossary=glossary if isinstance(glossary, list) else [],
-        started_at=int(r[9] or 0),
+        started_at=started,
         ended_at=int(r[10]) if r[10] is not None else None,
         status=r[11] or STATUS_LIVE,
         deleted_at=int(r[12]) if r[12] is not None else None,
         audio_path=(r[13] or "") if len(r) > 13 else "",
+        created_at=raw_created if raw_created > 0 else started,
     )
 
 
@@ -365,6 +373,16 @@ class MeetingStore:
     def __init__(self, history: HistoryStore):
         self._history = history
         self._pending_write_ticket: int | None = None
+        self._created_clock_lock = threading.Lock()
+        self._last_created_ms = 0
+
+    def _next_created_ms(self, hint_ms: int | None = None) -> int:
+        candidate = now_ms() if hint_ms is None else max(1, int(hint_ms))
+        with self._created_clock_lock:
+            if candidate <= self._last_created_ms:
+                candidate = self._last_created_ms + 1
+            self._last_created_ms = candidate
+            return candidate
 
     @property
     def disabled(self) -> bool:
@@ -401,6 +419,12 @@ class MeetingStore:
         meeting_id: str | None = None,
         audio_path: str = "",
     ) -> MeetingRecord:
+        now = now_ms()
+        started = now if started_at is None else int(started_at)
+        if started_at is not None and started < now:
+            created = max(1, started)
+        else:
+            created = self._next_created_ms()
         record = MeetingRecord(
             id=meeting_id or uuid.uuid4().hex,
             title=title,
@@ -410,19 +434,21 @@ class MeetingStore:
             model_id=model_id,
             vad=vad,
             glossary=list(glossary or []),
-            started_at=now_ms() if started_at is None else int(started_at),
+            started_at=started,
             status=STATUS_LIVE,
             audio_path=str(audio_path or ""),
+            created_at=created,
         )
 
         def _insert(conn: sqlite3.Connection) -> None:
             conn.execute(
-                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.id, record.title, record.participants, record.agenda,
                     record.notes_user, record.source, record.model_id, record.vad,
                     json.dumps(record.glossary, ensure_ascii=False),
                     record.started_at, None, record.status, None, record.audio_path,
+                    record.created_at,
                 ),
             )
 
@@ -472,6 +498,7 @@ class MeetingStore:
         if not title.strip():
             title = f"{stamp_str} 转写整理" if len(ids) == 1 else f"{stamp_str} 等 {len(ids)} 条转写整理"
 
+        created = self._next_created_ms()
         record = MeetingRecord(
             id=meeting_id or uuid.uuid4().hex,
             title=title.strip(),
@@ -480,16 +507,18 @@ class MeetingStore:
             started_at=started_at,
             ended_at=ended_at,
             status=STATUS_ENDED,
+            created_at=created,
         )
 
         def _promote(conn: sqlite3.Connection) -> None:
             conn.execute(
-                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.id, record.title, record.participants, record.agenda,
                     record.notes_user, record.source, record.model_id, record.vad,
                     json.dumps(record.glossary, ensure_ascii=False),
                     record.started_at, record.ended_at, record.status, None, record.audio_path,
+                    record.created_at,
                 ),
             )
             conn.executemany(
@@ -562,6 +591,7 @@ class MeetingStore:
         else:
             ended = None
         meeting_title = title.strip() if title and title.strip() else transcript.title.strip()
+        created = self._next_created_ms()
         record = MeetingRecord(
             id=meeting_id or uuid.uuid4().hex,
             title=meeting_title,
@@ -569,16 +599,18 @@ class MeetingStore:
             started_at=started,
             ended_at=ended,
             status=STATUS_ENDED,
+            created_at=created,
         )
 
         def _insert(conn: sqlite3.Connection) -> None:
             conn.execute(
-                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.id, record.title, record.participants, record.agenda,
                     record.notes_user, record.source, record.model_id, record.vad,
                     json.dumps(record.glossary, ensure_ascii=False),
                     record.started_at, record.ended_at, record.status, None, record.audio_path,
+                    record.created_at,
                 ),
             )
             rows = []
@@ -651,6 +683,7 @@ class MeetingStore:
             span = max(span, int(turn.offset_ms) + int(turn.duration_ms or 0))
         if status == STATUS_ENDED:
             span = max(span, int(audio_ms or 0))
+        created = self._next_created_ms()
         record = MeetingRecord(
             id=meeting_id or uuid.uuid4().hex,
             title=title.strip(),
@@ -662,18 +695,20 @@ class MeetingStore:
             ended_at=started + span,
             status=status,
             audio_path=str(audio_path or ""),
+            created_at=created,
         )
 
         def _insert(conn: sqlite3.Connection) -> None:
             if conn.execute("SELECT 1 FROM meetings WHERE id = ?", (record.id,)).fetchone() is not None:
                 return
             conn.execute(
-                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO meetings ({_MEETING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.id, record.title, record.participants, record.agenda,
                     record.notes_user, record.source, record.model_id, record.vad,
                     json.dumps(record.glossary, ensure_ascii=False),
                     record.started_at, record.ended_at, record.status, None, record.audio_path,
+                    record.created_at,
                 ),
             )
             rows = []
@@ -1381,13 +1416,29 @@ class MeetingStore:
 
     # -- reads -------------------------------------------------------------
 
-    def list_meetings(self, limit: int = 100, offset: int = 0) -> list[MeetingRecord]:
+    @staticmethod
+    def _order_by_sql(sort_by: str, alias: str = "") -> str:
+        prefix = f"{alias}." if alias else ""
+        created_expr = f"COALESCE(NULLIF({prefix}created_at, 0), {prefix}started_at)"
+        if sort_by == SORT_STARTED_AT:
+            return f"{prefix}started_at DESC, {created_expr} DESC, {prefix}rowid DESC"
+        return f"{created_expr} DESC, {prefix}started_at DESC, {prefix}rowid DESC"
+
+    def list_meetings(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        *,
+        sort_by: str = SORT_RECENT,
+    ) -> list[MeetingRecord]:
+        order_sql = self._order_by_sql(sort_by)
+
         def _q(conn: sqlite3.Connection) -> list[MeetingRecord]:
             rows = conn.execute(
                 f"""
                 SELECT {_MEETING_COLUMNS} FROM meetings
                 WHERE status != ?
-                ORDER BY started_at DESC
+                ORDER BY {order_sql}
                 LIMIT ? OFFSET ?
                 """,
                 (STATUS_DELETED, limit, offset),
@@ -1408,15 +1459,22 @@ class MeetingStore:
 
         return int(self._history.read(_q, default=0) or 0)
 
-    def search_meetings(self, q: str, limit: int = 200) -> list[MeetingRecord]:
+    def search_meetings(
+        self,
+        q: str,
+        limit: int = 200,
+        *,
+        sort_by: str = SORT_RECENT,
+    ) -> list[MeetingRecord]:
         raw_q = q.strip()
         if not raw_q:
-            return self.list_meetings(limit=limit)
+            return self.list_meetings(limit=limit, sort_by=sort_by)
         q = raw_q.replace("\u200b", "").strip()
         if not q or limit <= 0:
             return []
 
         pattern = f"%{escape_like(q)}%"
+        order_sql = self._order_by_sql(sort_by, alias="m")
 
         def _q(conn: sqlite3.Connection) -> list[MeetingRecord]:
             rows = conn.execute(
@@ -1446,7 +1504,7 @@ class MeetingStore:
                          OR (display_name = '' AND name_locked = 0 AND suggested_name LIKE ? ESCAPE '\\')
                     )
                   )
-                ORDER BY m.started_at DESC
+                ORDER BY {order_sql}
                 LIMIT ?
                 """,
                 (

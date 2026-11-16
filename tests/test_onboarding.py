@@ -357,3 +357,27 @@ def test_closing_setup_schedules_the_history_question(monkeypatch):
     ctl.show_setup()
     assert shots == []
     assert cfg.get("first_run_welcome_seen") is False
+
+
+def test_completing_setup_applies_inline_history_choice_without_chaining_extra_modals(monkeypatch):
+    from PyQt6.QtWidgets import QDialog
+
+    cfg = _Config(first_run_welcome_seen=False)
+    cfg.set("history.onboarded", False)
+    cfg.set("history.enabled", True)
+    ctl = _controller(cfg, model_installed=True)
+    shots = []
+    monkeypatch.setattr(onboarding_module.QTimer, "singleShot", lambda ms, fn: shots.append((ms, fn)))
+
+    def accept_after_unchecking(dialog):
+        assert not dialog.history_checkbox.isHidden()
+        assert dialog.history_checkbox.isVisibleTo(dialog)
+        dialog.history_checkbox.setChecked(False)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(QDialog, "exec", accept_after_unchecking)
+    ctl.show_setup()
+    assert shots == []
+    assert cfg.get("first_run_welcome_seen") is True
+    assert cfg.get("history.onboarded") is True
+    assert cfg.get("history.enabled") is False

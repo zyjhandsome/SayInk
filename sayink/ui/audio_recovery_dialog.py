@@ -21,6 +21,7 @@ from sayink.speech_recognizer import (
 from sayink.vad_segmenter import SpeechSegmenter, make_speech_gate
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles
+from sayink.ui.native_dialog import native_file_dialog
 from sayink.ui.prompts import confirm
 from sayink.ui.settings_components import ElidedComboBox, _qcolor
 
@@ -416,7 +417,8 @@ class AudioRecoveryDialog(QDialog):
 
     def _export(self):
         if item := self._selected():
-            target, _ = QFileDialog.getSaveFileName(self, "导出录音", "恢复录音.wav", "WAV (*.wav)")
+            with native_file_dialog(self):
+                target, _ = QFileDialog.getSaveFileName(self, "导出录音", "恢复录音.wav", "WAV (*.wav)")
             if target:
                 self._start(RecoveryWorker(item, target=Path(target)))
 
@@ -449,7 +451,8 @@ class AudioRecoveryDialog(QDialog):
                 self.status.setText(str(exc))
 
     def _save_text(self):
-        target, _ = QFileDialog.getSaveFileName(self, "另存恢复文字", "恢复文字.txt", "Text (*.txt)")
+        with native_file_dialog(self):
+            target, _ = QFileDialog.getSaveFileName(self, "另存恢复文字", "恢复文字.txt", "Text (*.txt)")
         if target:
             try:
                 Path(target).write_text(self.output.toPlainText(), encoding="utf-8")

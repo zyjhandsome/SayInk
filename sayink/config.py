@@ -143,6 +143,7 @@ DEFAULT_CONFIG = {
         "template_id": "general",
         # 会议结束后按默认模板在后台排队生成纪要；会把文字稿发给 AI 服务，故默认关闭。
         "auto_generate": False,
+        "list_sort": "recent",     # recent = 按最近添加/开会置顶；started_at = 按会议时间排序
         "custom_templates": [],
         "output_language": "auto",
         "aux_prompted": False,     # 首次开会缺辅助模型时问过一次「现在下载？」
@@ -571,6 +572,69 @@ class Config:
                 return text[1:end].strip()
         return text.split()[0].strip('"')
 
+    @classmethod
+    def _extract_command_args(cls, command: str) -> list[str]:
+        text = (command or "").strip()
+        if not text:
+            return []
+        parts: list[str] = []
+        i = 0
+        n = len(text)
+        while i < n:
+            while i < n and text[i].isspace():
+                i += 1
+            if i >= n:
+                break
+            if text[i] == '"':
+                end = text.find('"', i + 1)
+                if end == -1:
+                    parts.append(text[i + 1 :].strip())
+                    break
+                parts.append(text[i + 1 : end].strip())
+                i = end + 1
+            else:
+                end = i
+                while end < n and not text[end].isspace():
+                    end += 1
+                parts.append(text[i:end].strip('"'))
+                i = end
+        return [p for p in parts if p]
+
+    @classmethod
+    def _command_target_exists(cls, command: str) -> bool:
+        parts = cls._extract_command_args(command)
+        if not parts:
+            return False
+        exe = parts[0]
+        if not exe or not os.path.isabs(exe) or not os.path.exists(exe):
+            return False
+        if os.path.basename(exe).lower().startswith("python"):
+            if len(parts) < 2:
+                return False
+            script = parts[1]
+            if not script or not os.path.isabs(script) or not os.path.exists(script):
+                return False
+        return True
+
+    @classmethod
+    def _is_dev_or_staging_command(cls, command: str) -> bool:
+        exe = cls._extract_command_exe(command)
+        if not exe:
+            return False
+        if os.path.basename(exe).lower().startswith("python"):
+            return True
+        norm_parts = [p.lower() for p in os.path.normpath(exe).split(os.sep) if p]
+        # PyInstaller staging output lives at <repo>/dist/<app>/SayInk.exe.
+        return len(norm_parts) >= 3 and norm_parts[-3] == "dist"
+
+    @classmethod
+    def _should_repair_auto_start_command(cls, reg_value: str, expected_cmd: str) -> bool:
+        if not cls._command_target_exists(reg_value):
+            return True
+        if cls._is_dev_or_staging_command(expected_cmd):
+            return False
+        return True
+
     def _sync_registry_auto_start(self):
         """Sync auto_start setting with Windows registry, respecting EXE path & StartupApproved."""
         if sys.platform != "win32":
@@ -610,13 +674,14 @@ class Config:
                 if norm_reg != norm_expected:
                     reg_exe = self._extract_command_exe(reg_value)
                     if self._config.get("auto_start", False):
-                        self._write_auto_start_value(winreg, key_path)
-                        log.info("已修复注册表开机自启路径为当前可执行文件")
+                        if self._should_repair_auto_start_command(reg_value, expected_cmd):
+                            self._write_auto_start_value(winreg, key_path)
+                            log.info("已修复注册表开机自启路径为当前可执行文件")
                     elif getattr(sys, "frozen", False):
                         # Frozen build: ignore a Run entry pointing at another/deleted install.
                         if not reg_exe or os.path.normcase(reg_exe) != os.path.normcase(sys.executable):
                             registered = False
-                    elif reg_exe and os.path.isabs(reg_exe) and not os.path.exists(reg_exe):
+                    elif not self._command_target_exists(reg_value):
                         registered = False
 
             if registered and not self._config.get("auto_start", False):

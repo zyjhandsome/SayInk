@@ -7,6 +7,7 @@ import shutil
 import sys
 import threading
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
@@ -1516,6 +1517,7 @@ class TranscribeWorker(QThread):
         overlap_sec: float = CONTEXT_SLICE_OVERLAP_SEC,
         retry_empty: bool = False,
         turn_analyzer=None,
+        on_audio_progress: Callable[[int, int], None] | None = None,
     ):
         super().__init__()
         self._recognizer = recognizer
@@ -1525,6 +1527,7 @@ class TranscribeWorker(QThread):
         self._overlap_sec = overlap_sec
         self._retry_empty = retry_empty
         self._turn_analyzer = turn_analyzer
+        self._on_audio_progress = on_audio_progress
         self.native_lock = None
         self.quiet_speech: bool | None = None
         self._segment_noise_floor: float | None = getattr(audio_data, "noise_floor", None)
@@ -1655,7 +1658,14 @@ class TranscribeWorker(QThread):
             log.error("识别失败: %s", e)
             self.error.emit(f"识别失败：{e}")
 
+    def _report_audio_progress(self, done: int, total: int) -> None:
+        callback = self._on_audio_progress
+        if callback is None or total <= 0:
+            return
+        callback(max(0, min(int(total), int(done))), int(total))
+
     def _run_meeting(self, audio: np.ndarray) -> None:
+        self._report_audio_progress(0, len(audio))
         turns = analyze_turns(audio, self._turn_analyzer, cancelled=self._is_cancelled)
         if self._is_cancelled():
             return
@@ -1670,12 +1680,16 @@ class TranscribeWorker(QThread):
             pieces = (plan_audio_slices(part, SAMPLE_RATE, self._max_slice_sec, self._overlap_sec)
                       if self._max_slice_sec and len(part) > int(self._max_slice_sec * SAMPLE_RATE) else [part])
             texts = []
+            covered = int(turn.start)
             for piece in pieces:
                 if self._is_cancelled():
                     return
                 texts.append(self._decode_slice(piece))
+                covered = min(int(turn.stop), covered + int(len(piece)))
+                self._report_audio_progress(covered, len(audio))
             text = merge_slice_texts(texts) if len(texts) > 1 else texts[0]
             results.append(RecognizedTurn(turn.start, turn.stop, text, turn.embedding, turn.learnable))
+            self._report_audio_progress(int(turn.stop), len(audio))
             preview = join_segment_texts([t.text for t in results])
             if preview:
                 self.partial_ready.emit(preview)
@@ -2022,7 +2036,14 @@ class SpeechRecognizer(QObject):
         self._workers.append(worker)
         worker.start()
 
-    def decode_meeting_blocking(self, audio: np.ndarray, *, turn_analyzer, cancelled) -> tuple[list, str]:
+    def decode_meeting_blocking(
+        self,
+        audio: np.ndarray,
+        *,
+        turn_analyzer,
+        cancelled,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> tuple[list, str]:
         """Decode one meeting slice on the caller thread.
 
         Uses the resident decoder lock so a file import cannot start a second
@@ -2042,7 +2063,12 @@ class SpeechRecognizer(QObject):
         window = slice_window_for_loader(info.get("loader", "") if info else "")
         slice_args = {} if window is None else {"max_slice_sec": window[0], "overlap_sec": window[1]}
         worker = TranscribeWorker(
-            self._recognizer, audio, retry_empty=True, turn_analyzer=turn_analyzer, **slice_args,
+            self._recognizer,
+            audio,
+            retry_empty=True,
+            turn_analyzer=turn_analyzer,
+            on_audio_progress=on_progress,
+            **slice_args,
         )
         worker.native_lock = self._decode_lock
         worker.quiet_speech = self.quiet_speech

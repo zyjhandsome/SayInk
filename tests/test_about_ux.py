@@ -193,3 +193,19 @@ def test_busy_update_button_prevents_duplicate_actions_and_recovers(about_window
     assert installs == [True]
     settings.set_update_status("正在下载 5 / 10 MB", action="busy")
     assert not settings._about_update_btn.isEnabled()
+
+
+def test_about_page_init_with_saved_check_timestamp_never_creates_top_level_label(config, _qapp_session):
+    from sayink.ui.settings_pages.about import AboutSettingsPage
+
+    config.set("update.last_check_at", 1_760_000_000.0)
+    page = AboutSettingsPage(config)
+    try:
+        label = page.about_update_checked_at
+        assert label.parentWidget() is not None
+        assert not label.isWindow()
+        assert not label.testAttribute(Qt.WidgetAttribute.WA_WState_Created)
+        assert not label.isHidden()
+        assert "上次检查：" in label.text()
+    finally:
+        page.deleteLater()

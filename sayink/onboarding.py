@@ -12,6 +12,7 @@ from typing import Callable
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -76,6 +77,7 @@ class OnboardingController(QObject):
         self._show_main_window = show_main_window
         self._model_installed = model_installed
         self._ready_signal = None
+        self._show_main_planned = False
         self._welcome_scheduled = False
         self._setup_dialog: _SetupDialog | None = None
         self._setup_closed = False
@@ -141,9 +143,10 @@ class OnboardingController(QObject):
 
     # ── Scheduling ─────────────────────────────────────
 
-    def schedule(self, ready_signal) -> None:
+    def schedule(self, ready_signal, *, show_main_planned: bool = False) -> None:
         """Called once from App.start(); ``ready_signal`` is the recognizer's ``ready``."""
         self._ready_signal = ready_signal
+        self._show_main_planned = bool(show_main_planned)
         if not self._config.get("first_run_welcome_seen", True):
             if not self._model_installed():
                 QTimer.singleShot(WELCOME_DELAY_MS, self.show_setup_once)
@@ -220,7 +223,7 @@ class OnboardingController(QObject):
             + f"{mode_tip}\n\n"
             + result_tip + "\n\n"
             "音源与结果去向：通用页。\n"
-            "双击托盘图标可打开主窗口。"
+            "点击托盘图标可打开主窗口。"
         )
 
     def _dismiss_idle_floating(self) -> None:
@@ -236,7 +239,6 @@ class OnboardingController(QObject):
         if any(
             getattr(floating, flag, False) is True
             for flag in (
-                "_model_loading_active",
                 "_listening_active",
                 "_capture_active",
                 "_meeting_active",
@@ -433,14 +435,19 @@ class OnboardingController(QObject):
             self._setup_watch = None
         dialog = self._setup_dialog
         self._setup_dialog = None
+        history_checked = bool(self._config.get("history.enabled", True))
         if dialog is not None:
+            if hasattr(dialog, "history_checkbox"):
+                history_checked = bool(dialog.history_checkbox.isChecked())
             dialog.hide()
             dialog.deleteLater()
-        if not self._config.get("first_run_welcome_seen", False):
-            self._welcome_scheduled = False
-            QTimer.singleShot(WELCOME_DELAY_MS, self.show_welcome)
-        elif not self._config.get("history.onboarded", False):
-            QTimer.singleShot(HISTORY_AFTER_WELCOME_MS, self.show_history_onboarding)
+        # Consolidate setup completion: user already saw hotkey usage & history opt-in
+        # inside _SetupDialog, so avoid chaining 2 extra modal QMessageBoxes.
+        self._config.set("first_run_welcome_seen", True)
+        self._welcome_scheduled = False
+        if not self._config.get("history.onboarded", False):
+            self._config.set("history.enabled", history_checked)
+            self._config.set("history.onboarded", True)
 
     def _stop_countdown(self) -> None:
         if self._countdown_timer is not None:
@@ -898,11 +905,17 @@ class _SetupDialog(QDialog):
         hotkey_label = format_hotkey(controller._config.get("hotkey", DEFAULT_HOTKEY))
         self.usage_hint = QLabel(
             f"使用提示：先把光标放到要输入文字的位置，按住 {hotkey_label} 说话、松开上屏；"
-            "双击托盘图标可打开主窗口。"
+            "点击托盘图标可打开主窗口。"
         )
         self.usage_hint.setObjectName("setupUsageHint")
         self.usage_hint.setWordWrap(True)
         layout.addWidget(self.usage_hint)
+
+        self.history_checkbox = QCheckBox("在本机保存转写历史（仅存本地，可随时在设置中关闭）")
+        self.history_checkbox.setObjectName("setupHistoryCheckbox")
+        self.history_checkbox.setChecked(bool(controller._config.get("history.enabled", True)))
+        self.history_checkbox.setVisible(not bool(controller._config.get("history.onboarded", False)))
+        layout.addWidget(self.history_checkbox)
 
         layout.addStretch(1)
         footer_row = QHBoxLayout()

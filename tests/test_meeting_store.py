@@ -544,3 +544,32 @@ class TestMeetingStore:
             assert history.flush() is True
         finally:
             history.close(timeout=2.0)
+
+    def test_recent_sort_pins_newly_imported_archive_meetings_until_switched_to_started_at(self, meetings):
+        from sayink.meeting_store import SORT_RECENT, SORT_STARTED_AT
+
+        live_recent = meetings.create_meeting(title="今天的会议", started_at=2_000_000_000_000)
+        archived_import = meetings.create_meeting_from_media(
+            [MediaTurn(1, 0, 1000, "两年前录音")],
+            title="归档录音",
+            started_at=1_600_000_000_000,
+        )
+        assert archived_import is not None
+        assert meetings.flush()
+        assert archived_import.created_at > live_recent.created_at
+
+        by_recent = [m.id for m in meetings.list_meetings(sort_by=SORT_RECENT)]
+        assert by_recent == [archived_import.id, live_recent.id]
+        assert [m.id for m in meetings.list_meetings()] == by_recent
+
+        by_started = [m.id for m in meetings.list_meetings(sort_by=SORT_STARTED_AT)]
+        assert by_started == [live_recent.id, archived_import.id]
+
+        # Shifting meeting occurrence clock keeps created_at intact.
+        meetings.shift_meeting_start(archived_import.id, 1_500_000_000_000)
+        assert meetings.flush()
+        shifted = meetings.get_meeting(archived_import.id)
+        assert shifted is not None
+        assert shifted.started_at == 1_500_000_000_000
+        assert shifted.created_at == archived_import.created_at
+        assert [m.id for m in meetings.list_meetings(sort_by=SORT_RECENT)] == [archived_import.id, live_recent.id]
