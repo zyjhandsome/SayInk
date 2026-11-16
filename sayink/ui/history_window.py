@@ -66,6 +66,7 @@ from sayink.ui import design_tokens as tok
 from sayink.ui.clipboard import COPY_FAILED_TEXT as COPY_FAILED_TEXT, copy_text
 from sayink.ui.flow_layout import FlowLayout, WrappingToolBar, defer_while_live_resize
 from sayink.ui.native_dialog import native_file_dialog
+from sayink.ui.prompts import alert_error
 from sayink.ui.reading import fit_reading_width
 
 logger = logging.getLogger(__name__)
@@ -2789,7 +2790,7 @@ class HistoryWindow(QWidget):
                 text = build_single_session_markdown(session, segments, prefer_raw=prefer_raw)
             Path(path).write_text(text, encoding="utf-8")
         except OSError as exc:
-            QMessageBox.critical(self, "导出失败", f"无法写入文件：{exc}")
+            alert_error(self, "导出失败", f"无法写入文件：{exc}")
             return
         self._show_feedback("已导出历史")
 
@@ -2815,7 +2816,7 @@ class HistoryWindow(QWidget):
         path = _with_history_export_suffix(raw_path, kind)
         if not self._confirm_adjusted_overwrite(raw_path, path):
             return
-        prefer_raw = not self._view_polished
+        prefer_raw = False
         segments_by_session = {
             s.session_id: self._get_session_segments_effective(s.session_id)
             for s in sessions
@@ -2829,6 +2830,6 @@ class HistoryWindow(QWidget):
                 text = build_batch_export_markdown(sessions, segments_by_session, prefer_raw=prefer_raw)
             Path(path).write_text(text, encoding="utf-8")
         except OSError as exc:
-            QMessageBox.critical(self, "导出失败", f"无法写入文件：{exc}")
+            alert_error(self, "导出失败", f"无法写入文件：{exc}")
             return
         self._show_feedback("已导出历史")

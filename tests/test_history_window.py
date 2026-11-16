@@ -1021,13 +1021,14 @@ def test_export_failure_shows_error_message(qapp, monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         QMessageBox,
-        "critical",
-        lambda *args, **kwargs: errors.append(args[2]),
+        "exec",
+        lambda box: errors.append((box.text(), [btn.text() for btn in box.buttons()])) or 0,
     )
 
     window._export_selected()
 
-    assert errors and "disk full" in errors[0]
+    assert errors and "disk full" in errors[0][0]
+    assert errors[0][1] == ["确定"]
 
 
 def test_clear_all_history_uses_store_enqueue_after_confirmation(qapp, monkeypatch):
