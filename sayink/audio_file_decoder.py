@@ -551,6 +551,62 @@ def _iter_mf_timed(
         gen.close()
 
 
+def _probe_wav_duration_ms(path: Path) -> int:
+    try:
+        with wave.open(str(path), "rb") as handle:
+            rate = int(handle.getframerate() or 0)
+            frames = int(handle.getnframes() or 0)
+            if rate > 0 and 0 < frames < 0x7FFFFFFF:
+                return int(frames * 1000 // rate)
+    except Exception:
+        pass
+    try:
+        with path.open("rb") as fh:
+            header = fh.read(12)
+            if len(header) < 12 or header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+                return 0
+            rate = channels = bits = block_align = 0
+            data_size = -1
+            while True:
+                chunk_hdr = fh.read(8)
+                if len(chunk_hdr) < 8:
+                    break
+                chunk_id, chunk_len = struct.unpack("<4sI", chunk_hdr)
+                chunk_pos = fh.tell()
+                if chunk_id == b"fmt " and chunk_len >= 16:
+                    fmt_bytes = fh.read(16)
+                    if len(fmt_bytes) == 16:
+                        _tag, channels, rate, _br, block_align, bits = struct.unpack("<HHIIHH", fmt_bytes)
+                elif chunk_id == b"data":
+                    data_size = chunk_len
+                if rate > 0 and data_size >= 0:
+                    break
+                fh.seek(chunk_pos + chunk_len + (chunk_len & 1))
+            frame_bytes = max(block_align, channels * max(1, bits // 8))
+            if rate > 0 and frame_bytes > 0 and 0 < data_size < 0xFFFFFFFF:
+                return int((data_size // frame_bytes) * 1000 // rate)
+    except Exception:
+        pass
+    return 0
+
+
+def probe_media_duration_ms(path: str | Path) -> int:
+    """Best-effort header/container duration probe in milliseconds (0 if unknown)."""
+    source = Path(path)
+    suffix = source.suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS or not source.is_file():
+        return 0
+    if suffix == ".wav":
+        wav_ms = _probe_wav_duration_ms(source)
+        if wav_ms > 0:
+            return wav_ms
+    if sys.platform != "win32":
+        return 0
+    from sayink.media_foundation import probe_duration_ms
+
+    return probe_duration_ms(source)
+
+
 def iter_media_pcm_timed(
     path: str | Path,
     *,

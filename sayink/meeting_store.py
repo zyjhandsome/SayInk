@@ -222,6 +222,124 @@ def _is_dedicated_journal_dir(directory: Path, allowed_roots: list[Path]) -> boo
         return False
 
 
+def _allowed_cleanup_roots(db_root: Path, temp_root: Path) -> list[Path]:
+    allowed_roots: list[Path] = [db_root]
+    for extra in (Path.home() / ".sayink", temp_root / "SayInk", temp_root / "sayink"):
+        try:
+            allowed_roots.append(extra.resolve())
+        except OSError:
+            continue
+    return allowed_roots
+
+
+def _session_json_matches_meeting(meta_file: Path, meeting_id: str) -> bool:
+    if not meta_file.is_file() or meta_file.is_symlink():
+        return False
+    try:
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(meta, dict):
+        return False
+    return any(
+        str(meta.get(k) or "").strip() == meeting_id
+        for k in ("session_id", "meeting_id", "history_id", "id")
+    )
+
+
+def _cleanup_recovery_journals(recovery_root: Path, meeting_id: str, raw: str) -> set[str]:
+    journal_names: set[str] = set()
+    try:
+        if not recovery_root.is_dir() or recovery_root.is_symlink():
+            return journal_names
+        rec_resolved = recovery_root.resolve()
+        if raw:
+            try:
+                cand_resolved = Path(raw).resolve()
+                if cand_resolved != rec_resolved and cand_resolved.is_relative_to(rec_resolved):
+                    rel_parts = cand_resolved.relative_to(rec_resolved).parts
+                    if rel_parts and len(rel_parts[0]) == 32:
+                        journal_names.add(rel_parts[0])
+            except OSError:
+                pass
+        for child in list(recovery_root.iterdir()):
+            if not child.is_dir() or child.is_symlink() or len(child.name) != 32:
+                continue
+            if child.name.lower() == meeting_id.lower() or _session_json_matches_meeting(
+                child / "session.json", meeting_id
+            ):
+                journal_names.add(child.name)
+        delete_session_recovery_files(meeting_id, base_dir=recovery_root)
+        for jname in list(journal_names):
+            delete_session_recovery_files(jname, base_dir=recovery_root)
+    except OSError:
+        pass
+    return journal_names
+
+
+def _remove_owned_audio_candidate(
+    raw: str,
+    *,
+    db_resolved: Path,
+    db_root: Path,
+    allowed_roots: list[Path],
+    journal_names: set[str],
+) -> None:
+    try:
+        candidate = Path(raw)
+        if candidate.is_symlink():
+            return
+        resolved = candidate.resolve()
+        in_allowed = any(
+            resolved != root and resolved.is_relative_to(root)
+            for root in allowed_roots
+        )
+        if not in_allowed or resolved == db_resolved:
+            return
+        if candidate.is_file() and candidate.suffix.lower() in _OWNED_AUDIO_SUFFIXES:
+            if (
+                candidate.name.lower() == "audio.f32"
+                and candidate.parent != db_root
+                and _is_dedicated_journal_dir(candidate.parent, allowed_roots)
+            ):
+                journal_names.add(candidate.parent.name)
+                quota_root = candidate.parent.parent
+                shutil.rmtree(candidate.parent, ignore_errors=True)
+                _invalidate_pending_bytes_cache(quota_root)
+                return
+            if candidate.stem and candidate.stem.lower() not in _JOURNAL_FILE_NAMES:
+                journal_names.add(candidate.stem)
+            if candidate.parent != db_root and candidate.parent.name.lower() not in _CACHE_DIR_NAMES:
+                journal_names.add(candidate.parent.name)
+            candidate.unlink(missing_ok=True)
+            if candidate.suffix.lower() == ".f32":
+                _invalidate_pending_bytes_cache(candidate.parent)
+        elif candidate.is_dir() and _is_dedicated_journal_dir(candidate, allowed_roots):
+            journal_names.add(candidate.name)
+            quota_root = candidate.parent
+            shutil.rmtree(candidate, ignore_errors=True)
+            _invalidate_pending_bytes_cache(quota_root)
+    except OSError:
+        pass
+
+
+def _cleanup_playback_wavs(temp_root: Path, journal_names: set[str]) -> None:
+    if not journal_names:
+        return
+    playback_dir = temp_root / "sayink-playback"
+    try:
+        if not playback_dir.is_dir() or playback_dir.is_symlink():
+            return
+        for jname in journal_names:
+            if not jname:
+                continue
+            for wav_file in list(playback_dir.glob(f"{glob.escape(jname)}-*.wav")):
+                if wav_file.is_file() and not wav_file.is_symlink():
+                    wav_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, audio_path: str) -> None:
     """Best-effort removal of SayInk-owned cached audio for a deleted meeting.
 
@@ -233,105 +351,21 @@ def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, au
     except OSError:
         return
 
-    allowed_roots: list[Path] = [db_root]
     temp_root = Path(tempfile.gettempdir())
-    for extra in (Path.home() / ".sayink", temp_root / "SayInk", temp_root / "sayink"):
-        try:
-            allowed_roots.append(extra.resolve())
-        except OSError:
-            continue
-
-    recovery_root = db_root / "audio-recovery"
-    journal_names: set[str] = set()
+    allowed_roots = _allowed_cleanup_roots(db_root, temp_root)
     # Media import records the user's original path even when it is inside
     # the app directory or a folder named "cache".
     raw = (audio_path or "").strip() if source not in (MEDIA_SOURCE, IMPORT_SOURCE) else ""
-    try:
-        if recovery_root.is_dir() and not recovery_root.is_symlink():
-            rec_resolved = recovery_root.resolve()
-            if raw:
-                try:
-                    cand_resolved = Path(raw).resolve()
-                    if cand_resolved != rec_resolved and cand_resolved.is_relative_to(rec_resolved):
-                        rel_parts = cand_resolved.relative_to(rec_resolved).parts
-                        if rel_parts and len(rel_parts[0]) == 32:
-                            journal_names.add(rel_parts[0])
-                except OSError:
-                    pass
-            for child in list(recovery_root.iterdir()):
-                if not child.is_dir() or child.is_symlink() or len(child.name) != 32:
-                    continue
-                if child.name.lower() == meeting_id.lower():
-                    journal_names.add(child.name)
-                    continue
-                meta_file = child / "session.json"
-                if meta_file.is_file() and not meta_file.is_symlink():
-                    try:
-                        meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                        if isinstance(meta, dict) and any(
-                            str(meta.get(k) or "").strip() == meeting_id
-                            for k in ("session_id", "meeting_id", "history_id", "id")
-                        ):
-                            journal_names.add(child.name)
-                    except (OSError, ValueError):
-                        pass
-            delete_session_recovery_files(meeting_id, base_dir=recovery_root)
-            for jname in list(journal_names):
-                delete_session_recovery_files(jname, base_dir=recovery_root)
-    except OSError:
-        pass
-
+    journal_names = _cleanup_recovery_journals(db_root / "audio-recovery", meeting_id, raw)
     if raw:
-        try:
-            candidate = Path(raw)
-            if not candidate.is_symlink():
-                resolved = candidate.resolve()
-                in_allowed = any(
-                    resolved != root and resolved.is_relative_to(root)
-                    for root in allowed_roots
-                )
-                if in_allowed and resolved != db_resolved:
-                    if candidate.is_file() and candidate.suffix.lower() in _OWNED_AUDIO_SUFFIXES:
-                        if (
-                            candidate.name.lower() == "audio.f32"
-                            and candidate.parent != db_root
-                            and _is_dedicated_journal_dir(candidate.parent, allowed_roots)
-                        ):
-                            journal_names.add(candidate.parent.name)
-                            quota_root = candidate.parent.parent
-                            shutil.rmtree(candidate.parent, ignore_errors=True)
-                            _invalidate_pending_bytes_cache(quota_root)
-                        else:
-                            if candidate.stem and candidate.stem.lower() not in _JOURNAL_FILE_NAMES:
-                                journal_names.add(candidate.stem)
-                            if (
-                                candidate.parent != db_root
-                                and candidate.parent.name.lower() not in _CACHE_DIR_NAMES
-                            ):
-                                journal_names.add(candidate.parent.name)
-                            candidate.unlink(missing_ok=True)
-                            if candidate.suffix.lower() == ".f32":
-                                _invalidate_pending_bytes_cache(candidate.parent)
-                    elif candidate.is_dir() and _is_dedicated_journal_dir(candidate, allowed_roots):
-                        journal_names.add(candidate.name)
-                        quota_root = candidate.parent
-                        shutil.rmtree(candidate, ignore_errors=True)
-                        _invalidate_pending_bytes_cache(quota_root)
-        except OSError:
-            pass
-
-    if journal_names:
-        playback_dir = temp_root / "sayink-playback"
-        try:
-            if playback_dir.is_dir() and not playback_dir.is_symlink():
-                for jname in journal_names:
-                    if not jname:
-                        continue
-                    for wav_file in list(playback_dir.glob(f"{glob.escape(jname)}-*.wav")):
-                        if wav_file.is_file() and not wav_file.is_symlink():
-                            wav_file.unlink(missing_ok=True)
-        except OSError:
-            pass
+        _remove_owned_audio_candidate(
+            raw,
+            db_resolved=db_resolved,
+            db_root=db_root,
+            allowed_roots=allowed_roots,
+            journal_names=journal_names,
+        )
+    _cleanup_playback_wavs(temp_root, journal_names)
 
 
 def _note_metadata(conn: sqlite3.Connection, meeting_id: str) -> dict[str, Any]:

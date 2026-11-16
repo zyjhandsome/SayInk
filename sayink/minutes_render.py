@@ -27,6 +27,7 @@ from sayink.minutes_prompts import (
     parse_timestamp,
     speaker_label,
 )
+from sayink.polish_fidelity import normalize_fact_lookup_text
 from sayink.text_polisher import strip_model_thinking
 
 EMPTY_SECTION_TEXT = "本场未识别到"
@@ -140,15 +141,36 @@ def strip_clock_citations(text: str) -> str:
 
 
 _CHECKABLE_RE = re.compile(
-    r"\d{4}[-/年]\d{1,2}([-/月]\d{1,2}日?)?"       # 2026-03-01 / 2026年3月1日
-    r"|\d{1,2}月\d{1,2}日"                         # 3月1日
-    r"|(?:周|星期|礼拜)[一二三四五六日天]"           # 周三
-    r"|\d+(?:\.\d+)?\s*(?:%|万|亿|千|百|人|天|周|个月|小时|分钟|元|块|美元|k|K|w|W)"  # amounts
+    r"(?:[零〇一二三四五六七八九]{4}|\d{4})[-/年](?:[一二三四五六七八九十]{1,2}|\d{1,2})"
+    r"(?:[-/月](?:[一二三四五六七八九十]{1,3}|\d{1,2})[日号]?)?"                     # 2026-03-01 / 二零二六年三月五日
+    r"|(?:[一二三四五六七八九十]{1,2}|\d{1,2})月(?:[一二三四五六七八九十]{1,3}|\d{1,2})[日号]"  # 3月1日 / 三月五日
+    r"|(?:周|星期|礼拜)[一二三四五六日天]"                                            # 周三 / 星期三
+    r"|百分之\s*(?:百|[零〇一二两三四五六七八九十百千万亿\d.点]+)"                     # 百分之三十
+    r"|\d+(?:,\d{3})*(?:\.\d+)?\s*(?:%|％|万|亿|千|百|人|天|周|个月|小时|分钟|元|块(?!儿)|美元|k|K|w|W)"  # amounts
+    r"|[一二两三四五六七八九十][零〇一二两三四五六七八九十百千万亿\d点]*\s*(?:万元|亿元|千元|百元|元|块钱|块(?!儿)|美元)"
 )
+_GENERIC_OWNER_PLACEHOLDERS = frozenset({
+    "未指定", "未提及", "待定", "未定", "待确认", "说话人待确认", "未知", "无", "暂无", "不详",
+    "全体", "全员", "所有人", "全组", "团队", "大家", "双方", "各方", "我方", "对方", "客户",
+    "all", "everyone", "everybody", "team", "tbd", "tba", "n/a", "na", "none", "null",
+    "unassigned", "unknown",
+})
+_OWNER_SPLIT_RE = re.compile(r"[、,，/／;；&]+")
+_PARTICIPANTS_LINE_RE = re.compile(r"^参会人\s*[：:]\s*(.+)$")
 
 
 def _normalize_for_lookup(text: str) -> str:
-    return re.sub(r"[\s,，。、；;:：]", "", text or "")
+    return normalize_fact_lookup_text(text)
+
+
+def _needle_in_haystack(needle: str, haystack: str) -> bool:
+    if not needle:
+        return True
+    if not needle[0].isdigit() and not needle[-1].isdigit():
+        return needle in haystack
+    head = r"(?<![\d.])" if needle[0].isdigit() else ""
+    tail = r"(?![\d.])" if needle[-1].isdigit() else ""
+    return bool(re.search(f"{head}{re.escape(needle)}{tail}", haystack))
 
 
 def flag_unverified(
@@ -158,7 +180,7 @@ def flag_unverified(
     _normalized_transcript: str | None = None,
 ) -> str:
     """Append 「待核对」 when a date / amount in ``text`` is absent from the transcript."""
-    if not text or (not transcript_text and not _normalized_transcript):
+    if not text or text.endswith(UNVERIFIED_MARK) or (not transcript_text and not _normalized_transcript):
         return text
     matches = list(_CHECKABLE_RE.finditer(text))
     if not matches:
@@ -170,9 +192,58 @@ def flag_unverified(
     )
     for match in matches:
         needle = _normalize_for_lookup(match.group(0))
-        if needle and needle not in haystack:
+        if needle and not _needle_in_haystack(needle, haystack):
             return text + UNVERIFIED_MARK
     return text
+
+
+def _flag_unverified_owner(
+    owner: str,
+    *,
+    speaker_names: Mapping[int, str] | None,
+    meta_lines: Sequence[str],
+    transcript_text: str,
+) -> str:
+    if not owner or owner.endswith(UNVERIFIED_MARK):
+        return owner
+    known_names = {
+        re.sub(r"\s+", "", str(v)).casefold()
+        for v in (speaker_names or {}).values()
+        if str(v or "").strip()
+    }
+    known_ids = {
+        int(k)
+        for k, v in (speaker_names or {}).items()
+        if str(k).lstrip("-").isdigit() and int(k) > 0 and str(v or "").strip()
+    }
+    participant_blobs = [
+        m.group(1).strip()
+        for line in (meta_lines or ())
+        if line and (m := _PARTICIPANTS_LINE_RE.match(str(line).strip()))
+    ]
+    if not transcript_text and not known_names and not participant_blobs:
+        return owner
+    compact_transcript = re.sub(r"\s+", "", transcript_text or "").casefold()
+    compact_participants = " ".join(re.sub(r"\s+", "", p).casefold() for p in participant_blobs)
+    parts = [p.lstrip("@").strip() for p in _OWNER_SPLIT_RE.split(owner) if p.lstrip("@").strip()]
+    for part in parts:
+        folded = re.sub(r"\s+", "", part).casefold()
+        if not folded or folded in _GENERIC_OWNER_PLACEHOLDERS or part in _GENERIC_OWNER_PLACEHOLDERS:
+            continue
+        spk_match = _SPEAKER_LABEL_FULL_RE.match(part)
+        if spk_match is not None:
+            sid = int(spk_match.group(1))
+            if sid in known_ids or re.search(rf"(?<!\d)说话人\s*0*{sid}(?!\d)", transcript_text or ""):
+                continue
+            return owner + UNVERIFIED_MARK
+        if (
+            folded in known_names
+            or (compact_participants and folded in compact_participants)
+            or (compact_transcript and folded in compact_transcript)
+        ):
+            continue
+        return owner + UNVERIFIED_MARK
+    return owner
 
 
 def apply_speaker_names(text: str, names: Mapping[int, str] | None) -> str:
@@ -267,6 +338,7 @@ def render_markdown(
             transcript_text,
             speaker_names,
             normalized_transcript=normalized_transcript,
+            meta_lines=meta_lines,
         )
         out.append(body if body else EMPTY_SECTION_TEXT)
 
@@ -325,6 +397,8 @@ def _render_action_items_section(
     fix: Callable[[str], str],
     *,
     normalized_transcript: str | None = None,
+    speaker_names: Mapping[int, str] | None = None,
+    meta_lines: Sequence[str] = (),
 ) -> str:
     lines = []
     for item in _as_list(payload.get("action_items")):
@@ -334,7 +408,15 @@ def _render_action_items_section(
         if not task:
             continue
         task = flag_unverified(task, transcript_text, _normalized_transcript=normalized_transcript)
-        owner = fix(_as_text(item.get("owner"))) or "未指定"
+        raw_owner = _as_text(item.get("owner")).lstrip("@").strip()
+        owner = fix(raw_owner) if raw_owner else "未指定"
+        if raw_owner:
+            owner = _flag_unverified_owner(
+                owner,
+                speaker_names=speaker_names,
+                meta_lines=meta_lines,
+                transcript_text=transcript_text,
+            )
         due = _as_text(item.get("due")) or "未提及"
         if due != "未提及":
             due = flag_unverified(due, transcript_text, _normalized_transcript=normalized_transcript)
@@ -403,6 +485,7 @@ def _render_section(
     names: Mapping[int, str] | None,
     *,
     normalized_transcript: str | None = None,
+    meta_lines: Sequence[str] = (),
 ) -> str:
     def fix(text: str) -> str:
         return apply_speaker_names(text, names)
@@ -417,7 +500,13 @@ def _render_section(
         )
     if key == SECTION_ACTION_ITEMS:
         return _render_action_items_section(
-            payload, duration_ms, transcript_text, fix, normalized_transcript=normalized_transcript
+            payload,
+            duration_ms,
+            transcript_text,
+            fix,
+            normalized_transcript=normalized_transcript,
+            speaker_names=names,
+            meta_lines=meta_lines,
         )
     if key == SECTION_CHAPTERS:
         return _render_chapters_section(payload, duration_ms, fix)

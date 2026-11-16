@@ -688,6 +688,190 @@ class OutputPipeline:
         else:
             self.floating.show_success(title, hint)
 
+    @staticmethod
+    def _unpack_paste_result(result: PasteResult | str) -> tuple[str, str, str]:
+        if isinstance(result, PasteResult):
+            return result.status, result.target_app, result.detail
+        # Compatibility for tests and third-party integrations using the old callback.
+        return result.split(":", 1)[0], "", result.partition(":")[2]
+
+    def _update_post_paste_tray_tooltip(self) -> None:
+        if getattr(self.recorder, "is_recording", False) and not getattr(
+            self.recorder, "is_continuous", False
+        ):
+            # The next hold is already being recorded.
+            self.tray.set_activity_tooltip("recording")
+        elif self.meeting_active():
+            # Preserve active meeting tooltip while draining leftover segments.
+            return
+        else:
+            self.tray.set_activity_tooltip(
+                "listening" if self.continuous_session_active() else None
+            )
+
+    def _show_recorded_paste_feedback(
+        self,
+        *,
+        record: SegmentRecord | None,
+        error_detail: str,
+        polish_failed: bool,
+        degraded_from_polish: bool,
+        dropped: int,
+        dropped_suffix: str,
+    ) -> None:
+        saved = error_detail != "history_disabled"
+        meeting_row = getattr(record, "trigger_mode", None) == TRIGGER_MODE_MEETING
+        if self.meeting_active() and not meeting_row:
+            # Leftover dictation segment archived silently without disturbing meeting bar.
+            log.info("会议进行中：遗留口述分片已归档至历史（不发送粘贴键）")
+            return
+        done = "已记录" if meeting_row else "已保存到历史"
+        if polish_failed:
+            suffix = " · 润色未生效（密钥/网络异常），已保留原文"
+        elif degraded_from_polish:
+            suffix = "（原文）"
+        else:
+            suffix = ""
+        title = (done if saved else "未保存 · 历史已关闭") + suffix
+        if not saved:
+            hint = "当前为「仅保存到历史」，但历史已关闭；请在设置中打开历史或改为输入当前光标"
+        else:
+            hint = "" if meeting_row else "未输入其他应用"
+        if dropped and not meeting_row:
+            hint = f"{hint}{dropped_suffix}" if hint else f"有 {dropped} 段未识别"
+        self.show_post_output_floating(
+            title,
+            hint,
+            stopped_text=f"剩余内容：{title}",
+            use_info=not (saved and not degraded_from_polish and not polish_failed) or bool(dropped and not meeting_row),
+            refresh_ms=RESULT_TOAST_MS,
+        )
+
+    def _show_unverified_paste_feedback(
+        self,
+        *,
+        error_detail: str,
+        target_app: str,
+        paste_hint: str,
+        polish_failed: bool,
+        dropped: int,
+        dropped_suffix: str,
+    ) -> None:
+        # Ctrl+V already went out, then the foreground changed. Saying
+        # 「已复制」 here invites a second manual paste of the same words.
+        log.info("已发送粘贴快捷键，但焦点随后切换，无法确认是否已插入")
+        if error_detail == "clipboard_changed_after_send":
+            unverified_hint = "焦点已切换，剪贴板内容已变化或无法核对"
+        else:
+            unverified_hint = (
+                f"焦点已切换，若 {target_app} 未出字{paste_hint}"
+                if target_app else f"焦点已切换，若未出字{paste_hint}"
+            )
+        if polish_failed:
+            unverified_hint = f"{unverified_hint} · 润色未生效（密钥/网络异常）"
+        if dropped:
+            unverified_hint = f"{unverified_hint}{dropped_suffix}"
+        self.show_post_output_floating(
+            "已发送 · 未确认",
+            unverified_hint,
+            stopped_text=f"剩余内容：已发送 · 未确认 · {unverified_hint}",
+            use_info=True,
+            refresh_ms=RESULT_TOAST_WITH_HINT_MS,
+        )
+
+    def _show_skipped_paste_feedback(
+        self,
+        *,
+        record: SegmentRecord | None,
+        error_detail: str,
+        target_app: str,
+        polish_failed: bool,
+        dropped_suffix: str,
+    ) -> None:
+        reason = "剪贴板已变化" if error_detail == "clipboard_changed" else "无法核对剪贴板"
+        title = f"{reason}，已取消自动粘贴"
+        log.info("%s%s", title, f"（目标：{target_app}）" if target_app else "")
+        if record is not None and self.config.get("history.enabled", True) and not self.history.disabled:
+            hint = "本次转写可在历史中复制"
+        else:
+            hint = "本次转写未保存到历史，可重新转写"
+        if polish_failed:
+            hint += " · 润色未生效（密钥/网络异常）"
+        hint += dropped_suffix
+        self.show_post_output_floating(
+            title,
+            hint,
+            stopped_text=f"剩余内容：{title} · {hint}",
+            use_info=True,
+            refresh_ms=RESULT_TOAST_WITH_HINT_MS,
+        )
+
+    def _show_clipboard_paste_feedback(
+        self,
+        *,
+        error_detail: str,
+        target_app: str,
+        paste_key: str,
+        paste_hint: str,
+        polish_failed: bool,
+        dropped: int,
+        dropped_suffix: str,
+    ) -> None:
+        contextual = {
+            "elevated": (
+                "目标窗口为管理员权限，已复制到剪贴板",
+                f"目标为管理员窗口，已复制，请按 {paste_key}",
+            ),
+            "ime_active": (
+                "检测到输入法候选窗活跃，已复制到剪贴板",
+                f"检测到正在拼音选词，已复制，请按 {paste_key}",
+            ),
+            "session_changed": (
+                "桌面会话已切换或锁屏，已复制到剪贴板",
+                f"桌面会话已切换，已复制，请按 {paste_key}",
+            ),
+        }
+        if error_detail in contextual:
+            log_msg, title = contextual[error_detail]
+            log.info(log_msg)
+            hint = (f"目标应用：{target_app}" if target_app else paste_hint) + dropped_suffix
+            if polish_failed:
+                hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
+            self.show_post_output_floating(
+                title,
+                hint,
+                stopped_text=f"剩余内容：{title}",
+                use_info=True,
+                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
+            )
+            return
+        if error_detail == "focus_changed":
+            log.info("开口后的目标窗口已变化，未发送粘贴键")
+            title = f"未输入到 {target_app}" if target_app else "未输入到原来的窗口"
+            hint = paste_hint + dropped_suffix
+            if polish_failed:
+                hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
+            self.show_post_output_floating(
+                title,
+                hint,
+                stopped_text=f"剩余内容：{title} · {hint}",
+                use_info=True,
+                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
+            )
+            return
+        log.info("已复制到剪贴板（粘贴未确认成功）")
+        idle_title = "已复制" if self.continuous_session_active() else "已复制到剪贴板"
+        hint = paste_hint + dropped_suffix
+        if polish_failed:
+            hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
+        self.show_post_output_floating(
+            idle_title,
+            hint,
+            stopped_text=f"剩余内容：已复制 · {hint}",
+            use_info=polish_failed or bool(dropped),
+            refresh_ms=RESULT_TOAST_WITH_HINT_MS,
+        )
+
     def handle_paste_result(
         self,
         result: PasteResult | str,
@@ -716,20 +900,11 @@ class OutputPipeline:
         self.stage = OutputStage.IDLE
         self.stage_text = ""
         self.stage_record = None
-        if isinstance(result, PasteResult):
-            status = result.status
-            target_app = result.target_app
-            error_detail = result.detail
-        else:
-            # Compatibility for tests and third-party integrations using the old callback.
-            status = result.split(":", 1)[0]
-            target_app = ""
-            error_detail = result.partition(":")[2]
+        status, target_app, error_detail = self._unpack_paste_result(result)
         paste_key = "Cmd+V" if self.platform_name() == "darwin" else "Ctrl+V"
         paste_hint = f"可按 {paste_key} 粘贴"
-        polish_fail_notice = "润色未生效（密钥/网络异常），已发送原文"
         if polish_failed:
-            success_msg = polish_fail_notice
+            success_msg = "润色未生效（密钥/网络异常），已发送原文"
         else:
             success_msg = "已发送（原文）" if degraded_from_polish else "已发送"
         target_hint = f"发送到 {target_app}" if target_app else "请确认目标应用已接收"
@@ -740,18 +915,7 @@ class OutputPipeline:
             # A slice of the hold failed to recognise and was left out; the
             # user would otherwise only notice the gap in the pasted text.
             target_hint = f"{target_hint}{dropped_suffix}"
-        if getattr(self.recorder, "is_recording", False) and not getattr(
-            self.recorder, "is_continuous", False
-        ):
-            # The next hold is already being recorded.
-            self.tray.set_activity_tooltip("recording")
-        elif self.meeting_active():
-            # Preserve active meeting tooltip while draining leftover segments.
-            pass
-        else:
-            self.tray.set_activity_tooltip(
-                "listening" if self.continuous_session_active() else None
-            )
+        self._update_post_paste_tray_tooltip()
 
         if status in {"sent", "pasted"}:
             log.info("已向目标窗口发送粘贴快捷键%s", f": {target_app}" if target_app else "")
@@ -763,137 +927,40 @@ class OutputPipeline:
                 refresh_ms=RESULT_TOAST_WITH_HINT_MS if polish_failed else RESULT_TOAST_MS,
             )
         elif status == "recorded":
-            saved = error_detail != "history_disabled"
-            meeting_row = getattr(record, "trigger_mode", None) == TRIGGER_MODE_MEETING
-            if self.meeting_active() and not meeting_row:
-                # Leftover dictation segment archived silently without disturbing meeting bar.
-                log.info("会议进行中：遗留口述分片已归档至历史（不发送粘贴键）")
-            else:
-                done = "已记录" if meeting_row else "已保存到历史"
-                if polish_failed:
-                    suffix = " · 润色未生效（密钥/网络异常），已保留原文"
-                elif degraded_from_polish:
-                    suffix = "（原文）"
-                else:
-                    suffix = ""
-                title = (done if saved else "未保存 · 历史已关闭") + suffix
-                if not saved:
-                    hint = "当前为「仅保存到历史」，但历史已关闭；请在设置中打开历史或改为输入当前光标"
-                else:
-                    hint = "" if meeting_row else "未输入其他应用"
-                if dropped and not meeting_row:
-                    hint = f"{hint}{dropped_suffix}" if hint else f"有 {dropped} 段未识别"
-                self.show_post_output_floating(
-                    title,
-                    hint,
-                    stopped_text=f"剩余内容：{title}",
-                    use_info=not (saved and not degraded_from_polish and not polish_failed) or bool(dropped and not meeting_row),
-                    refresh_ms=RESULT_TOAST_MS,
-                )
+            self._show_recorded_paste_feedback(
+                record=record,
+                error_detail=error_detail,
+                polish_failed=polish_failed,
+                degraded_from_polish=degraded_from_polish,
+                dropped=dropped,
+                dropped_suffix=dropped_suffix,
+            )
         elif status == "unverified":
-            # Ctrl+V already went out, then the foreground changed. Saying
-            # 「已复制」 here invites a second manual paste of the same words.
-            log.info("已发送粘贴快捷键，但焦点随后切换，无法确认是否已插入")
-            if error_detail == "clipboard_changed_after_send":
-                unverified_hint = "焦点已切换，剪贴板内容已变化或无法核对"
-            else:
-                unverified_hint = (
-                    f"焦点已切换，若 {target_app} 未出字{paste_hint}"
-                    if target_app else f"焦点已切换，若未出字{paste_hint}"
-                )
-            if polish_failed:
-                unverified_hint = f"{unverified_hint} · 润色未生效（密钥/网络异常）"
-            if dropped:
-                unverified_hint = f"{unverified_hint}{dropped_suffix}"
-            self.show_post_output_floating(
-                "已发送 · 未确认",
-                unverified_hint,
-                stopped_text=f"剩余内容：已发送 · 未确认 · {unverified_hint}",
-                use_info=True,
-                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
+            self._show_unverified_paste_feedback(
+                error_detail=error_detail,
+                target_app=target_app,
+                paste_hint=paste_hint,
+                polish_failed=polish_failed,
+                dropped=dropped,
+                dropped_suffix=dropped_suffix,
             )
         elif status == "skipped" and error_detail in {"clipboard_changed", "clipboard_unavailable"}:
-            reason = "剪贴板已变化" if error_detail == "clipboard_changed" else "无法核对剪贴板"
-            title = f"{reason}，已取消自动粘贴"
-            log.info("%s%s", title, f"（目标：{target_app}）" if target_app else "")
-            if record is not None and self.config.get("history.enabled", True) and not self.history.disabled:
-                hint = "本次转写可在历史中复制"
-            else:
-                hint = "本次转写未保存到历史，可重新转写"
-            if polish_failed:
-                hint += " · 润色未生效（密钥/网络异常）"
-            hint += dropped_suffix
-            self.show_post_output_floating(
-                title,
-                hint,
-                stopped_text=f"剩余内容：{title} · {hint}",
-                use_info=True,
-                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
-            )
-        elif status == "clipboard" and error_detail == "elevated":
-            log.info("目标窗口为管理员权限，已复制到剪贴板")
-            title = f"目标为管理员窗口，已复制，请按 {paste_key}"
-            hint = (f"目标应用：{target_app}" if target_app else paste_hint) + dropped_suffix
-            if polish_failed:
-                hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
-            self.show_post_output_floating(
-                title,
-                hint,
-                stopped_text=f"剩余内容：{title}",
-                use_info=True,
-                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
-            )
-        elif status == "clipboard" and error_detail == "ime_active":
-            log.info("检测到输入法候选窗活跃，已复制到剪贴板")
-            title = f"检测到正在拼音选词，已复制，请按 {paste_key}"
-            hint = (f"目标应用：{target_app}" if target_app else paste_hint) + dropped_suffix
-            if polish_failed:
-                hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
-            self.show_post_output_floating(
-                title,
-                hint,
-                stopped_text=f"剩余内容：{title}",
-                use_info=True,
-                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
-            )
-        elif status == "clipboard" and error_detail == "session_changed":
-            log.info("桌面会话已切换或锁屏，已复制到剪贴板")
-            title = f"桌面会话已切换，已复制，请按 {paste_key}"
-            hint = (f"目标应用：{target_app}" if target_app else paste_hint) + dropped_suffix
-            if polish_failed:
-                hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
-            self.show_post_output_floating(
-                title,
-                hint,
-                stopped_text=f"剩余内容：{title}",
-                use_info=True,
-                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
-            )
-        elif status == "clipboard" and error_detail == "focus_changed":
-            log.info("开口后的目标窗口已变化，未发送粘贴键")
-            title = f"未输入到 {target_app}" if target_app else "未输入到原来的窗口"
-            hint = paste_hint + dropped_suffix
-            if polish_failed:
-                hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
-            self.show_post_output_floating(
-                title,
-                hint,
-                stopped_text=f"剩余内容：{title} · {hint}",
-                use_info=True,
-                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
+            self._show_skipped_paste_feedback(
+                record=record,
+                error_detail=error_detail,
+                target_app=target_app,
+                polish_failed=polish_failed,
+                dropped_suffix=dropped_suffix,
             )
         elif status == "clipboard":
-            log.info("已复制到剪贴板（粘贴未确认成功）")
-            idle_title = "已复制" if self.continuous_session_active() else "已复制到剪贴板"
-            hint = paste_hint + dropped_suffix
-            if polish_failed:
-                hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
-            self.show_post_output_floating(
-                idle_title,
-                hint,
-                stopped_text=f"剩余内容：已复制 · {hint}",
-                use_info=polish_failed or bool(dropped),
-                refresh_ms=RESULT_TOAST_WITH_HINT_MS,
+            self._show_clipboard_paste_feedback(
+                error_detail=error_detail,
+                target_app=target_app,
+                paste_key=paste_key,
+                paste_hint=paste_hint,
+                polish_failed=polish_failed,
+                dropped=dropped,
+                dropped_suffix=dropped_suffix,
             )
         else:
             log.error("输出失败: %s", error_detail)
