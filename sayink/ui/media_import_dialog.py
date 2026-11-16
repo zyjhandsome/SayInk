@@ -8,7 +8,7 @@ from typing import Any, Sequence
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QComboBox,
+    QApplication,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -28,6 +28,8 @@ from sayink.speech_recognizer import MODEL_REGISTRY, is_model_downloaded
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles as ss
 from sayink.ui.native_dialog import native_file_dialog
+from sayink.ui.settings_components import ElidedComboBox
+from sayink.ui.theme import apply_window_dark_titlebar
 
 _NATURAL_SPLIT_RE = re.compile(r"(\d+)")
 
@@ -77,7 +79,6 @@ class MediaImportDialog(QDialog):
         self.setWindowTitle("加入音视频识别队列" if self._queueing else "导入音视频")
         self.setObjectName("mediaImportDialog")
         self.setAcceptDrops(True)
-        self.resize(560, 440)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 16, 20, 16)
@@ -121,6 +122,16 @@ class MediaImportDialog(QDialog):
         self._list = QListWidget()
         self._list.setAccessibleName("待导入音视频列表")
         self._list.currentRowChanged.connect(lambda _row: self._sync_controls())
+        self._empty_list_hint = QLabel(
+            "还没有添加音视频文件\n点击右上角「继续添加…」选择文件，或直接将音视频拖入此窗口"
+        )
+        self._empty_list_hint.setObjectName("mediaImportEmptyHint")
+        self._empty_list_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_list_hint.setWordWrap(True)
+        self._empty_list_hint.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        list_overlay = QVBoxLayout(self._list)
+        list_overlay.setContentsMargins(16, 16, 16, 16)
+        list_overlay.addWidget(self._empty_list_hint, 1, Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._list, 1)
 
         self._dup_hint = QLabel("")
@@ -147,13 +158,13 @@ class MediaImportDialog(QDialog):
         self._lang_label = QLabel("识别语言")
         self._lang_label.setObjectName("mediaImportHint")
         lang_col.addWidget(self._lang_label)
-        self._lang_combo = QComboBox()
+        self._lang_combo = ElidedComboBox()
         self._lang_combo.setAccessibleName("导入识别语言")
         for label, code in (
             ("跟随设置 / 自动检测", ""),
             ("中文", "zh"),
-            ("英语", "en"),
-            ("日语", "ja"),
+            ("English", "en"),
+            ("日本語", "ja"),
         ):
             self._lang_combo.addItem(label, code)
         lang_col.addWidget(self._lang_combo)
@@ -164,7 +175,7 @@ class MediaImportDialog(QDialog):
         self._model_label = QLabel("语音模型")
         self._model_label.setObjectName("mediaImportHint")
         model_col.addWidget(self._model_label)
-        self._model_combo = QComboBox()
+        self._model_combo = ElidedComboBox()
         self._model_combo.setAccessibleName("导入语音模型")
         self._model_combo.addItem("跟随会议 / 默认模型", "")
         for info in MODEL_REGISTRY:
@@ -179,7 +190,7 @@ class MediaImportDialog(QDialog):
         self._time_label = QLabel("会议时间")
         self._time_label.setObjectName("mediaImportHint")
         time_col.addWidget(self._time_label)
-        self._time_combo = QComboBox()
+        self._time_combo = ElidedComboBox()
         self._time_combo.setAccessibleName("导入会议时间策略")
         self._time_combo.addItem("当前时间（推荐）", "now")
         self._time_combo.addItem("使用文件修改时间", "mtime")
@@ -200,8 +211,33 @@ class MediaImportDialog(QDialog):
         buttons.addWidget(self._ok_btn)
         layout.addLayout(buttons)
 
+        self._fit_to_screen(580, 460)
         self.add_paths(paths, sort_added=True)
         self.reapply_theme()
+
+    def _fit_to_screen(self, target_w: int, target_h: int) -> None:
+        parent = self.parentWidget()
+        screen = (
+            self.screen()
+            or (parent.screen() if parent is not None else None)
+            or QApplication.primaryScreen()
+        )
+        if screen is None:
+            self.resize(target_w, target_h)
+            return
+        avail = screen.availableGeometry()
+        if avail.isEmpty():
+            self.resize(target_w, target_h)
+            return
+        max_w = max(360, avail.width() - 24)
+        max_h = max(320, avail.height() - 24)
+        self.setMinimumSize(min(460, max_w), min(360, max_h))
+        self.setMaximumSize(max_w, max_h)
+        self.resize(min(target_w, max_w), min(target_h, max_h))
+
+    def showEvent(self, event) -> None:
+        self._fit_to_screen(self.width() or 580, self.height() or 460)
+        super().showEvent(event)
 
     # -- public API -----------------------------------------------------------
 
@@ -294,6 +330,8 @@ class MediaImportDialog(QDialog):
         total = len(self._paths)
         row = self._list.currentRow()
         self._count_label.setText(f"待导入文件（{total}）")
+        if hasattr(self, "_empty_list_hint"):
+            self._empty_list_hint.setVisible(total == 0)
         self._sort_btn.setEnabled(total > 1)
         self._up_btn.setEnabled(total > 1 and row > 0)
         self._down_btn.setEnabled(total > 1 and 0 <= row < total - 1)
@@ -381,13 +419,20 @@ class MediaImportDialog(QDialog):
 
     def reapply_theme(self) -> None:
         self.setStyleSheet(
-            f"""
+            ss.WINDOW_CSS
+            + ss.build_combo_css()
+            + f"""
             QDialog#mediaImportDialog {{
                 background: {tok.BG};
                 color: {tok.TEXT};
             }}
             QLabel#mediaImportHint {{
                 color: {tok.TEXT_SEC};
+                font-size: {tok.TYPE_FOOTNOTE}px;
+                background: transparent;
+            }}
+            QLabel#mediaImportEmptyHint {{
+                color: {tok.TEXT_DIM};
                 font-size: {tok.TYPE_FOOTNOTE}px;
                 background: transparent;
             }}
@@ -406,23 +451,24 @@ class MediaImportDialog(QDialog):
                 border-radius: {tok.RADIUS_MD}px;
                 padding: 4px;
                 font-size: {tok.TYPE_BODY_SM}px;
+                outline: none;
             }}
             QListWidget::item {{
                 padding: 6px 8px;
-                border-radius: 4px;
+                border-radius: {tok.RADIUS_SM}px;
+            }}
+            QListWidget::item:hover:!selected {{
+                background: {tok.ROW_HOVER};
+                color: {tok.TEXT};
             }}
             QListWidget::item:selected {{
                 background: {tok.ACCENT_SOFT};
                 color: {tok.TEXT};
             }}
-            QLineEdit, QComboBox {{
-                background: {tok.INPUT_BG};
-                color: {tok.TEXT};
-                border: 1px solid {tok.CONTROL_BORDER};
-                border-radius: {tok.RADIUS_MD}px;
-                padding: 5px 10px;
-                min-height: {tok.CONTROL_FIELD_HEIGHT - 14}px;
-                font-size: {tok.TYPE_BODY_SM}px;
+            QLineEdit:disabled {{
+                color: {tok.TEXT_DIM};
+                background: {tok.SURFACE_PEARL};
+                border-color: {tok.HAIRLINE};
             }}
             """
         )
@@ -431,3 +477,4 @@ class MediaImportDialog(QDialog):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._ok_btn.setStyleSheet(ss.BTN_ACCENT_SM)
         self._ok_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_window_dark_titlebar(self, getattr(tok, "ACTIVE_THEME", "light") == "dark")

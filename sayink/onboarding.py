@@ -12,7 +12,6 @@ from typing import Callable
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer
 from PyQt6.QtWidgets import (
-    QCheckBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -24,6 +23,9 @@ from PyQt6.QtWidgets import (
 
 from sayink.config import DEFAULT_HOTKEY, format_hotkey
 from sayink.speech_recognizer import DEFAULT_MODEL_ID, get_model_info
+from sayink.ui.prompts import style_message_box
+from sayink.ui.settings_components import ThemedCheckBox
+from sayink.ui.theme import apply_window_dark_titlebar
 
 log = logging.getLogger("SayInk")
 
@@ -261,7 +263,8 @@ class OnboardingController(QObject):
         download_btn = None
         if model_missing:
             download_btn = box.addButton("去下载模型", QMessageBox.ButtonRole.ActionRole)
-        box.addButton("知道了", QMessageBox.ButtonRole.AcceptRole)
+        ok_btn = box.addButton("知道了", QMessageBox.ButtonRole.AcceptRole)
+        style_message_box(box, primary=download_btn or ok_btn)
         box.exec()
         self._config.set("first_run_welcome_seen", True)
         if download_btn is not None and box.clickedButton() is download_btn:
@@ -288,6 +291,7 @@ class OnboardingController(QObject):
         enable_btn = box.addButton("开启", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("暂不开启", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(enable_btn)
+        style_message_box(box, primary=enable_btn)
         box.exec()
         return box.clickedButton() == enable_btn
 
@@ -911,7 +915,7 @@ class _SetupDialog(QDialog):
         self.usage_hint.setWordWrap(True)
         layout.addWidget(self.usage_hint)
 
-        self.history_checkbox = QCheckBox("在本机保存转写历史（仅存本地，可随时在设置中关闭）")
+        self.history_checkbox = ThemedCheckBox("在本机保存转写历史（仅存本地，可随时在设置中关闭）")
         self.history_checkbox.setObjectName("setupHistoryCheckbox")
         self.history_checkbox.setChecked(bool(controller._config.get("history.enabled", True)))
         self.history_checkbox.setVisible(not bool(controller._config.get("history.onboarded", False)))
@@ -932,8 +936,22 @@ class _SetupDialog(QDialog):
         footer_row.addWidget(self.finish_btn, 1)
         layout.addLayout(footer_row)
 
+        for btn in (
+            self.download_btn,
+            self.cancel_download_btn,
+            self.engine_btn,
+            self.mic_btn,
+            self.trial_btn,
+            self.close_btn,
+            self.finish_btn,
+        ):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
         self.apply_theme_styles()
         self.download_btn.setFocus()
+
+    def reapply_theme(self) -> None:
+        self.apply_theme_styles()
 
     def apply_theme_styles(self) -> None:
         if getattr(self, "_applying_theme", False):
@@ -962,6 +980,12 @@ class _SetupDialog(QDialog):
             self.trial_btn.setStyleSheet(ss.BTN_GHOST)
             self.close_btn.setStyleSheet(ss.BTN_GHOST)
             self.finish_btn.setStyleSheet(ss.BTN_PRIMARY)
+            font = self.history_checkbox.font()
+            font.setFamily(tok.UI_FONT_FAMILY)
+            font.setPixelSize(tok.TYPE_BODY_SM)
+            self.history_checkbox.setFont(font)
+            self.history_checkbox.update()
+            apply_window_dark_titlebar(self, getattr(tok, "ACTIVE_THEME", "light") == "dark")
         finally:
             self._applying_theme = False
 

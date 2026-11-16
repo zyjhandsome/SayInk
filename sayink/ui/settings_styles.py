@@ -408,7 +408,7 @@ def build_btn_danger_sm() -> str:
     QPushButton:focus {{
         border: 2px solid {t.ACCENT_FOCUS}; padding: 0px {focus_pad_h}px;
     }}
-    QPushButton:disabled {{ color: {t.TEXT_DIM}; background: transparent; border-color: {t.HAIRLINE}; }}
+    QPushButton:disabled {{ color: {t.TEXT_DIM}; background: {t.SURFACE_PEARL}; border: 1px solid {t.HAIRLINE}; font-weight: 400; }}
 """
 
 

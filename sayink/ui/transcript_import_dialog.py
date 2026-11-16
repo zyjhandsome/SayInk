@@ -26,9 +26,12 @@ from sayink.transcript_import import (
     read_transcript_file,
 )
 from sayink.ui import design_tokens as tok
+from sayink.ui.app_styles import install_spinbox_wheel_guard
 from sayink.ui.native_dialog import native_file_dialog
+from sayink.ui.prompts import style_message_box
 from sayink.ui import settings_styles as ss
 from sayink.ui.settings_components import ThemedCheckBox
+from sayink.ui.theme import apply_window_dark_titlebar
 
 _MAX_CHARS = 2_000_000
 _MAX_FILE_BYTES = _MAX_CHARS * 4
@@ -118,7 +121,7 @@ class TranscriptImportDialog(QDialog):
 
         self._hint = QLabel(
             "粘贴文字稿，或打开 / 拖入 .txt、.md、.srt、.vtt、.json。"
-            "最多约 200 万字。导入后可生成会议纪要（开启自动生成时将自动排队）。"
+            "最多约 200 万字。导入后可在会议页生成纪要。"
         )
         self._hint.setWordWrap(True)
         self._hint.setObjectName("transcriptImportHint")
@@ -144,7 +147,9 @@ class TranscriptImportDialog(QDialog):
         self._when = QDateTimeEdit(QDateTime.currentDateTime())
         self._when.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
         self._when.setCalendarPopup(True)
+        self._when.setMinimumWidth(204)
         self._when.setAccessibleName("导入会议时间")
+        install_spinbox_wheel_guard(self._when)
         self._when.dateTimeChanged.connect(self._on_when_edited)
         when_col.addWidget(self._when)
         identity.addLayout(when_col, 0)
@@ -289,6 +294,7 @@ class TranscriptImportDialog(QDialog):
         stay = box.addButton("继续编辑", QMessageBox.ButtonRole.RejectRole)
         discard = box.addButton("放弃", QMessageBox.ButtonRole.DestructiveRole)
         box.setDefaultButton(stay)
+        style_message_box(box, primary=discard, destructive=True)
         box.exec()
         return box.clickedButton() is discard
 
@@ -301,12 +307,14 @@ class TranscriptImportDialog(QDialog):
         stay = box.addButton("保留当前文字", QMessageBox.ButtonRole.RejectRole)
         replace = box.addButton("替换", QMessageBox.ButtonRole.AcceptRole)
         box.setDefaultButton(stay)
+        style_message_box(box, primary=replace)
         box.exec()
         return box.clickedButton() is replace
 
     def reapply_theme(self) -> None:
         self.setStyleSheet(
             ss.WINDOW_CSS
+            + ss.build_date_time_edit_css()
             + f"""
             QDialog#transcriptImport {{
                 background: {tok.BG};
@@ -333,15 +341,18 @@ class TranscriptImportDialog(QDialog):
             }}
             """
         )
+        self._when.setStyleSheet(ss.build_date_time_edit_css())
         self._file_btn.setStyleSheet(ss.BTN_GHOST_SM)
         self._use_file_time_btn.setStyleSheet(ss.BTN_GHOST_SM)
         self._keep_current_btn.setStyleSheet(ss.BTN_GHOST_SM)
         self._cancel_btn.setStyleSheet(ss.BTN_GHOST_SM)
         self._ok.setStyleSheet(ss.BTN_PRIMARY)
+        self._detect.update()
         text_len = max(0, self._edit.document().characterCount() - 1)
         self._style_preview(error=bool(self._file_error) or text_len > _MAX_CHARS)
         if self._drag_over:
             self._paint_drag_border()
+        apply_window_dark_titlebar(self, getattr(tok, "ACTIVE_THEME", "light") == "dark")
 
     def _style_preview(self, *, error: bool) -> None:
         color = tok.RED if error else tok.TEXT
