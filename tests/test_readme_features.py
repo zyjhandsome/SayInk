@@ -879,3 +879,50 @@ class TestReadmeMeetingNotes:
             assert all(s.session_id != record.id for s in history.list_sessions())
         finally:
             history.close(timeout=2.0)
+
+    def test_readme_and_terminology_sync_with_code_constants(self):
+        from pathlib import Path
+
+        from sayink.audio_recovery import (
+            INCOMPLETE_QUOTA_GRACE_SECONDS,
+            INCOMPLETE_RETENTION_SECONDS,
+            MAX_RECOVERY_BYTES,
+            MIN_FREE_BYTES,
+            RETENTION_SECONDS,
+        )
+        from sayink.config import DEFAULT_CONFIG
+        from sayink.reload_coordinator import DEFERRED_APPLY_NOTICE
+        from sayink.speech_recognizer import MAX_HOTWORD_CHARS, MAX_HOTWORDS
+
+        root = Path(__file__).resolve().parents[1]
+        text = (root / "README.md").read_text(encoding="utf-8")
+        terminology = (root / "docs" / "terminology.md").read_text(encoding="utf-8")
+
+        recovery_gb = MAX_RECOVERY_BYTES // (1024**3)
+        assert recovery_gb == 5
+        assert f"总量上限 {recovery_gb} GB" in text
+        assert "录音缓存上限 2 GB" not in text
+        assert "异常中断缓存需手动删除" not in text
+
+        grace_hours = INCOMPLETE_QUOTA_GRACE_SECONDS // 3600
+        incomplete_days = INCOMPLETE_RETENTION_SECONDS // 86400
+        complete_days = RETENTION_SECONDS // 86400
+        free_mb = MIN_FREE_BYTES // (1024**2)
+        assert grace_hours == 24 and f"{grace_hours} 小时保护期" in text
+        assert incomplete_days == 30 and f"超 {incomplete_days} 天自动清理" in text
+        assert complete_days == 7 and f"保留 {complete_days} 天" in text
+        assert free_mb == 128 and f"低于约 {free_mb} MB" in text
+
+        # Lite installer size must be unified across Quick Start and FAQ.
+        assert text.count("约 89 MB") >= 2
+        assert "约 81 MB" not in text
+
+        #Glossary & History defaults match truth-source constants.
+        assert f"最多 {MAX_HOTWORDS} 条、每条 {MAX_HOTWORD_CHARS} 字" in text
+        assert f"默认保留 **{DEFAULT_CONFIG['history']['retention_days']} 天**" in text
+        assert f"最多 **{DEFAULT_CONFIG['history']['max_entries']} 场**" in text
+
+        # Deferred-apply notice is documented consistently in README and terminology.md.
+        assert DEFERRED_APPLY_NOTICE in text
+        assert DEFERRED_APPLY_NOTICE in terminology
+        assert "reload_coordinator.DEFERRED_APPLY_NOTICE" in terminology

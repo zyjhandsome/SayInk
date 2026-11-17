@@ -51,19 +51,21 @@ def test_finish_quit_flushes_debounced_config_immediately_while_native_worker_dr
                 patch("sayink.app.QApplication.quit") as quit_app,
             ):
                 app._finish_quit()
-                # Process has NOT quit yet because native worker is still running...
+                # Process has NOT quit yet because native worker is still running,
+                # and persistence stays open until workers finish draining so in-flight
+                # media imports / minutes checkpoints do not lose data!
                 quit_app.assert_not_called()
                 assert later.called
-                # ...but history is closed AND config.json is ALREADY flushed to disk!
-                assert events == ["history.close"]
-                assert real_cfg._save_timer.isActive() is False
-                saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
-                assert saved["update"]["last_check_at"] == "2026-11-11T15:00:00Z"
+                assert events == []
 
                 gate.set()
                 assert worker.wait(2000)
                 later.call_args.args[1]()
                 quit_app.assert_called_once()
+                assert events == ["history.close"]
+                assert real_cfg._save_timer.isActive() is False
+                saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+                assert saved["update"]["last_check_at"] == "2026-11-11T15:00:00Z"
     finally:
         gate.set()
         assert worker.wait(2000)

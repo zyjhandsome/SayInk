@@ -758,6 +758,12 @@ def download_installer(
         ).strip()
         if not is_trusted_installer_url(resolved_sig_url):
             raise InstallerSignatureError("安装包签名地址不受信任")
+    else:
+        log.warning(
+            "更新签名公钥未配置（RELEASE_SIGNING_PUBLIC_KEY / %s 为空）："
+            "跳过分离 .sig 数字签名校验，已强制执行受信任 GitHub 域名白名单与 SHA-256 摘要校验",
+            PUBLIC_KEY_ENV_VAR,
+        )
     normalized_sha = sha256.lower()
     sig_dest = dest.with_name(dest.name + ".sig")
 

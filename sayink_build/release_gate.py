@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Callable
 
@@ -171,6 +172,102 @@ def _installer_version_problem(_run: Runner) -> str | None:
     return None
 
 
+def _pinned_signing_key_problem(_run: Runner) -> str | None:
+    """Block release if a hardcoded RELEASE_SIGNING_PUBLIC_KEY is malformed (empty stays allowed)."""
+    from sayink.updater import (
+        RELEASE_SIGNING_PUBLIC_KEY,
+        InstallerSignatureError,
+        resolve_signing_public_key,
+    )
+
+    if not (RELEASE_SIGNING_PUBLIC_KEY or "").strip():
+        return None
+    try:
+        resolve_signing_public_key(RELEASE_SIGNING_PUBLIC_KEY)
+    except InstallerSignatureError as exc:
+        return f"sayink/updater.py RELEASE_SIGNING_PUBLIC_KEY is invalid: {exc}"
+    return None
+
+
+def release_advisories(
+    *,
+    env: Mapping[str, str] | None = None,
+    public_key_hex: str | None = None,
+) -> list[str]:
+    """Non-blocking supply-chain signing advisories for release builders."""
+    from sayink.updater import (
+        PUBLIC_KEY_ENV_VAR,
+        RELEASE_SIGNING_PUBLIC_KEY,
+        InstallerSignatureError,
+        resolve_signing_public_key,
+    )
+    from sayink_build.release_signing import (
+        PRIVATE_KEY_ENV_VAR,
+        SIGNTOOL_ENV_VAR,
+        SigningError,
+        _parse_private_seed,
+        ed25519_public_key_from_seed,
+    )
+
+    environ = os.environ if env is None else env
+    raw_pub = (
+        public_key_hex
+        if public_key_hex is not None
+        else (environ.get(PUBLIC_KEY_ENV_VAR, "") or RELEASE_SIGNING_PUBLIC_KEY)
+    )
+    notes: list[str] = []
+    pub_bytes: bytes | None = None
+    try:
+        pub_bytes = resolve_signing_public_key(raw_pub)
+    except InstallerSignatureError as exc:
+        notes.append(
+            f"Updater Ed25519 public key (RELEASE_SIGNING_PUBLIC_KEY / {PUBLIC_KEY_ENV_VAR}) is invalid: {exc}"
+        )
+    else:
+        if pub_bytes is None:
+            notes.append(
+                f"Updater Ed25519 public key (RELEASE_SIGNING_PUBLIC_KEY / {PUBLIC_KEY_ENV_VAR}) is unconfigured: "
+                "detached .sig verification is disabled; updater enforces trusted HTTPS GitHub host allowlist + SHA-256 asset digest."
+            )
+
+    raw_priv = (environ.get(PRIVATE_KEY_ENV_VAR) or "").strip()
+    if not raw_priv:
+        notes.append(
+            f"{PRIVATE_KEY_ENV_VAR} is unset: release build will not emit detached Ed25519 .sig sidecars."
+        )
+    else:
+        try:
+            seed = _parse_private_seed(raw_priv)
+            derived_pub = ed25519_public_key_from_seed(seed)
+            if pub_bytes is not None and derived_pub != pub_bytes:
+                notes.append(
+                    f"{PRIVATE_KEY_ENV_VAR} public key ({derived_pub.hex()[:16]}…) does not match "
+                    f"configured updater public key ({pub_bytes.hex()[:16]}…)."
+                )
+        except SigningError as exc:
+            notes.append(f"{PRIVATE_KEY_ENV_VAR} is invalid: {exc}")
+
+    if not (environ.get(SIGNTOOL_ENV_VAR) or "").strip():
+        notes.append(
+            f"{SIGNTOOL_ENV_VAR} is unset: Windows Authenticode code signing is skipped for this build."
+        )
+    return notes
+
+
+def release_signing_report(
+    *,
+    env: Mapping[str, str] | None = None,
+    public_key_hex: str | None = None,
+) -> str:
+    """Format a human-readable, non-blocking signing status summary for release builders."""
+    advisories = release_advisories(env=env, public_key_hex=public_key_hex)
+    if not advisories:
+        return "Release signing status: Authenticode and Ed25519 detached signing keys are configured."
+    lines = ["Release signing advisories (non-blocking for unsigned open-source builds):"]
+    lines.extend(f"  - {item}" for item in advisories)
+    return "\n".join(lines)
+
+
 def release_problems(version: str, run: Runner = _run) -> list[str]:
     """Everything that stops ``version`` from being released; empty when ready."""
     problems = []
@@ -185,6 +282,7 @@ def release_problems(version: str, run: Runner = _run) -> list[str]:
 
     check(_uncommitted)
     check(_installer_version_problem)
+    check(_pinned_signing_key_problem)
     check(_ruff_problem)
     check(_readme_contract_problem)
     try:

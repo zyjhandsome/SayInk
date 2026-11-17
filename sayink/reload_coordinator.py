@@ -34,6 +34,7 @@ log = logging.getLogger("SayInk")
 
 # Top-level extra key persisted in Config._extra_keys for cross-session model load ETA.
 LOAD_SECONDS_KEY = "stt_load_seconds"
+DEFERRED_APPLY_NOTICE = "已保存，待本场结束后生效"
 
 
 class ReloadCoordinator:
@@ -69,6 +70,7 @@ class ReloadCoordinator:
         sync_hotkey_trigger_mode: Callable[[], None] | None = None,
         sync_settings_runtime_status: Callable[..., None] | None = None,
         sync_recognition_runtime_status: Callable[[], None] | None = None,
+        sync_deferred_settings_notice: Callable[[str], None] | None = None,
         sync_tray_status_summary: Callable[..., None] | None = None,
         onboarding_active: Callable[[], bool] | None = None,
         main_window_visible: Callable[[], bool] | None = None,
@@ -104,6 +106,7 @@ class ReloadCoordinator:
         self.sync_hotkey_trigger_mode = sync_hotkey_trigger_mode or (lambda: None)
         self.sync_settings_runtime_status = sync_settings_runtime_status or (lambda _s=None: None)
         self.sync_recognition_runtime_status = sync_recognition_runtime_status or (lambda: None)
+        self.sync_deferred_settings_notice = sync_deferred_settings_notice or (lambda _n="": None)
         self.sync_tray_status_summary = sync_tray_status_summary or (lambda _s=None: None)
         self.onboarding_active = onboarding_active or (lambda: False)
         self.main_window_visible = main_window_visible or (lambda: False)
@@ -111,6 +114,7 @@ class ReloadCoordinator:
         self.recognition_change_pending: bool = False
         self.models_reload_pending: bool = False
         self.deferred_audio_settings: bool = False
+        self.deferred_meeting_audio_settings: bool = False
         self.settings_after_recovery: bool = False
         self.cold_boot_load_quiet: bool = False
         self.user_awaited_model_ready: bool = False
@@ -472,6 +476,23 @@ class ReloadCoordinator:
         asr_changed = new_asr_key != old_asr_key or models_changed
         return speaker_changed, segmenter_changed, asr_changed
 
+    @property
+    def has_deferred_settings(self) -> bool:
+        return bool(
+            self.recognition_change_pending
+            or self.models_reload_pending
+            or self.deferred_audio_settings
+            or self.deferred_meeting_audio_settings
+            or self.settings_after_recovery
+        )
+
+    @property
+    def pending_apply_notice(self) -> str:
+        return DEFERRED_APPLY_NOTICE if self.has_deferred_settings else ""
+
+    def _publish_deferred_notice(self) -> None:
+        self.sync_deferred_settings_notice(self.pending_apply_notice)
+
     def on_models_changed(self) -> None:
         """Keep current speech intact; apply the latest settings when idle."""
         if self.exit_started():
@@ -480,11 +501,13 @@ class ReloadCoordinator:
         self.recognition_change_pending = True
         self.apply_pending_recognition_settings()
         self.sync_recognition_runtime_status()
+        self._publish_deferred_notice()
         self.update_tray_models()
 
     def apply_pending_recognition_settings(self) -> None:
         if self.exit_started():
             return
+        was_deferred = self.has_deferred_settings
         if self.recognition_change_pending:
             old = self.applied_recognition_settings
             new = RecognitionSettings.from_config(self.config)
@@ -530,6 +553,8 @@ class ReloadCoordinator:
                         self.configure_stt()
                     self.sync_recognition_runtime_status()
         self.apply_deferred_audio_settings()
+        if was_deferred and not self.has_deferred_settings:
+            self._publish_deferred_notice()
 
     def apply_deferred_audio_settings(self) -> None:
         """Finish a settings save that arrived while hold-to-talk was open.
@@ -559,6 +584,7 @@ class ReloadCoordinator:
         self.recognition_change_pending = True
         self.apply_pending_recognition_settings()
         self.sync_recognition_runtime_status()
+        self._publish_deferred_notice()
         if str(self.config.get("stt.model_id", "") or "") != old_model_id:
             self.update_tray_models()
 
@@ -572,6 +598,8 @@ class ReloadCoordinator:
             return
         if self.recovery_busy():
             self.settings_after_recovery = True
+            self.sync_recognition_runtime_status()
+            self._publish_deferred_notice()
             return
         # Drop only what the confirmation counted; the sentence cut off by
         # stopping below is still the user's speech and gets transcribed.
@@ -579,9 +607,12 @@ class ReloadCoordinator:
             # The meeting keeps its device, model and queue; audio / engine
             # changes apply when it ends (_on_meeting_ended reconfigures).
             log.info("会议进行中，音频与引擎设置将在会议结束后生效")
+            self.deferred_meeting_audio_settings = True
             self.apply_immediate_preferences()
             self.sync_models_dir()
             self.update_tray_models()
+            self.sync_recognition_runtime_status()
+            self._publish_deferred_notice()
             return
         if getattr(self.recorder, "is_recording", False):
             # Rebuilding the segmenter under an open hold resets the audio
@@ -589,6 +620,8 @@ class ReloadCoordinator:
             log.info("单次录音进行中，音频与引擎设置将在本次录音结束后生效")
             self.deferred_audio_settings = True
             self.apply_immediate_preferences()
+            self.sync_recognition_runtime_status()
+            self._publish_deferred_notice()
             return
         self.commit_audio_settings(clear_queue=True)
 
@@ -629,7 +662,10 @@ class ReloadCoordinator:
             self.update_tray_models()
         self.recognition_change_pending = False
         self.models_reload_pending = False
+        self.deferred_audio_settings = False
+        self.deferred_meeting_audio_settings = False
         self.sync_recognition_runtime_status()
+        self._publish_deferred_notice()
         self.sync_hotkey_trigger_mode()
 
     def on_tray_model_switch(self, model_id: str) -> None:
@@ -650,11 +686,16 @@ class ReloadCoordinator:
             self.settings_after_recovery = False
             self.on_settings_changed()
         self.apply_pending_recognition_settings()
+        if not self.has_deferred_settings:
+            self._publish_deferred_notice()
 
     def reset_for_meeting_end(self) -> None:
         """Hand the pipeline back to dictation once a meeting finishes."""
         self.recognition_change_pending = False
         self.models_reload_pending = False
+        self.deferred_audio_settings = False
+        self.deferred_meeting_audio_settings = False
         self.apply_audio_options()
         self.apply_audio_config()
         self.configure_stt()
+        self._publish_deferred_notice()

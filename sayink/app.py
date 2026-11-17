@@ -98,7 +98,7 @@ from sayink.output_pipeline import (
     _QueuedSegment,
     _SegmentContext,
 )
-from sayink.reload_coordinator import ReloadCoordinator
+from sayink.reload_coordinator import DEFERRED_APPLY_NOTICE, ReloadCoordinator
 
 log = logging.getLogger("SayInk")
 
@@ -219,6 +219,10 @@ class App(QObject):
     _recognition_change_pending = _delegate_attr("_reload_coordinator", "recognition_change_pending")
     _models_reload_pending = _delegate_attr("_reload_coordinator", "models_reload_pending")
     _deferred_audio_settings = _delegate_attr("_reload_coordinator", "deferred_audio_settings")
+    _deferred_meeting_audio_settings = _delegate_attr(
+        "_reload_coordinator", "deferred_meeting_audio_settings"
+    )
+    _pending_apply_notice = _delegate_attr("_reload_coordinator", "pending_apply_notice")
     _settings_after_recovery = _delegate_attr("_reload_coordinator", "settings_after_recovery")
     _applied_audio_key = _delegate_attr("_reload_coordinator", "applied_audio_key")
     _applied_recognition_key = _delegate_attr("_reload_coordinator", "applied_recognition_key")
@@ -572,6 +576,7 @@ class App(QObject):
             sync_hotkey_trigger_mode=lambda: self._sync_hotkey_trigger_mode(),
             sync_settings_runtime_status=lambda status=None: self._sync_settings_runtime_status(status),
             sync_recognition_runtime_status=lambda: self._sync_recognition_runtime_status(),
+            sync_deferred_settings_notice=lambda notice="": self._sync_deferred_settings_notice(notice),
             sync_tray_status_summary=lambda status=None: self._sync_tray_status_summary(status),
             onboarding_active=lambda: getattr(self._safe_attr("_onboarding"), "_setup_dialog", None) is not None,
             main_window_visible=lambda: self._visible_main_window() is not None,
@@ -2724,6 +2729,8 @@ class App(QObject):
 
     def _on_media_import_settled(self, meeting_id: str = "") -> None:
         self._release_cached_media_import_recognizer_if_idle()
+        if self._safe_attr("_exit_started", False):
+            return
         self._apply_pending_recognition_settings()
         tray = self._safe_attr("_tray")
         show = getattr(tray, "showMessage", None)
@@ -2748,6 +2755,8 @@ class App(QObject):
 
     def _on_media_import_failed_notify(self, message: str = "") -> None:
         self._release_cached_media_import_recognizer_if_idle()
+        if self._safe_attr("_exit_started", False):
+            return
         self._apply_pending_recognition_settings()
         visible_main = self._visible_main_window()
         if visible_main is not None and not visible_main.isMinimized() and visible_main.isActiveWindow():
@@ -3286,17 +3295,102 @@ class App(QObject):
 
     def _sync_recognition_runtime_status(self) -> None:
         settings = self._settings_widget()
-        status = self._recorder.segmentation_status
-        if settings is None or not isinstance(status, SegmentationStatus):
-            return
         coord = self._reload_coordinator()
-        speaker = coord.speaker_runtime_status_text(
-            active_meeting=self._meeting_or_none(),
-            dictation_embedder=self._embedder,
-        )
-        settings.set_recognition_runtime_status(
-            status, speaker_status=speaker, pending=coord.recognition_change_pending,
-        )
+        if settings is None:
+            return
+        status = getattr(self._safe_attr("_recorder"), "segmentation_status", None)
+        if isinstance(status, SegmentationStatus):
+            speaker = coord.speaker_runtime_status_text(
+                active_meeting=self._meeting_or_none(),
+                dictation_embedder=self._embedder,
+            )
+            settings.set_recognition_runtime_status(
+                status, speaker_status=speaker, pending=coord.has_deferred_settings,
+            )
+        elif hasattr(settings, "_recognition_pending"):
+            settings._recognition_pending = coord.has_deferred_settings
+        self._sync_deferred_settings_notice(coord.pending_apply_notice)
+
+    def _reassert_deferred_settings_notice(self) -> None:
+        if self._safe_attr("_exit_started", False):
+            return
+        notice = self._reload_coordinator().pending_apply_notice
+        if notice:
+            self._apply_deferred_settings_notice_now(notice)
+
+    def _sync_deferred_settings_notice(self, notice: str = "") -> None:
+        self._apply_deferred_settings_notice_now(notice)
+        if notice and not self._safe_attr("_exit_started", False):
+            self._later(0, self._reassert_deferred_settings_notice)
+
+    def _apply_deferred_settings_notice_now(self, notice: str = "") -> None:
+        settings = self._settings_widget()
+        if settings is None:
+            return
+        setter = getattr(settings, "set_pending_apply_notice", None)
+        if callable(setter):
+            setter(notice)
+        from sayink.ui import design_tokens as tok
+
+        coord = self._reload_coordinator()
+        gp = getattr(settings, "general_page", None)
+        if gp is not None:
+            audio_deferred = bool(
+                coord.deferred_audio_settings
+                or coord.deferred_meeting_audio_settings
+                or coord.settings_after_recovery
+            )
+            mic_status = getattr(gp, "mic_test_status", None)
+            if mic_status is not None and not bool(getattr(settings, "_mic_probe_active", False)):
+                if audio_deferred and notice:
+                    mic_status.setText(notice)
+                    mic_status.setStyleSheet(
+                        f"color: {tok.AMBER_TEXT}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
+                    )
+                elif mic_status.text() == DEFERRED_APPLY_NOTICE:
+                    mic_status.setText("测试会临时采集约 2 秒声音，不保存音频或转写文本。")
+                    mic_status.setStyleSheet(
+                        f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
+                    )
+            apply_lbl = getattr(gp, "recognition_apply_label", None)
+            save_failed = getattr(self._safe_attr("_config"), "last_save_failed", False) is True
+            if apply_lbl is not None and not save_failed:
+                cur_text = apply_lbl.text()
+                legacy_prefix = "已保存 · 待本场结束且已录语音处理完成后生效。"
+                if notice:
+                    if cur_text.startswith(legacy_prefix):
+                        suffix = cur_text[len(legacy_prefix):].strip()
+                        updated = f"{notice} {suffix}".strip()
+                    elif DEFERRED_APPLY_NOTICE in cur_text:
+                        updated = cur_text
+                    elif cur_text:
+                        updated = f"{notice} {cur_text}"
+                    else:
+                        updated = notice
+                    apply_lbl.setStyleSheet(
+                        f"color: {tok.AMBER_TEXT}; font-size: {tok.TYPE_FOOTNOTE}px;"
+                        " font-weight: 400; background: transparent;"
+                    )
+                    apply_lbl.setText(updated)
+                    apply_lbl.setVisible(True)
+                    apply_row = apply_lbl.parentWidget()
+                    if apply_row is not None:
+                        apply_row.setVisible(True)
+                elif cur_text == DEFERRED_APPLY_NOTICE:
+                    apply_lbl.setText("")
+                    apply_lbl.setVisible(False)
+                    apply_row = apply_lbl.parentWidget()
+                    if apply_row is not None:
+                        apply_row.setVisible(False)
+        mp = getattr(settings, "model_page", None)
+        if mp is not None:
+            show_notice = getattr(mp, "show_notice", None)
+            notice_lbl = getattr(mp, "model_notice_label", None)
+            if callable(show_notice):
+                if notice and (coord.recognition_change_pending or coord.models_reload_pending):
+                    show_notice(notice, "warn")
+                elif not notice and notice_lbl is not None and notice_lbl.text() == DEFERRED_APPLY_NOTICE:
+                    show_notice("", "idle")
 
     def _ensure_main_window(self):
         """Create the main window without showing it.
@@ -3376,6 +3470,7 @@ class App(QObject):
         if download_notice is not None:
             download_notice.connect(self._on_download_completed_notice)
         self._main.installEventFilter(self)
+        self._sync_settings_runtime_status()
         return self._main
 
     def _visible_main_window(self):
@@ -3416,6 +3511,7 @@ class App(QObject):
             reload(refresh_devices=False, heavy=False)
         except TypeError:
             reload()
+        self._sync_deferred_settings_notice(self._reload_coordinator().pending_apply_notice)
 
     def _dismiss_passive_floating_for_main_window(self) -> None:
         floating = self._safe_attr("_floating")
@@ -3983,12 +4079,34 @@ class App(QObject):
             except Exception:
                 log.exception("提前释放单实例锁失败")
 
+    def _finalize_quit_persistence(self) -> None:
+        """Close HistoryStore and flush Config only after storage and workers finish draining."""
+        if self._safe_attr("_quit_persistence_finalized", False):
+            return
+        self._quit_persistence_finalized = True
+        try:
+            from PyQt6.QtCore import QCoreApplication
+
+            if QCoreApplication.instance() is not None:
+                QCoreApplication.sendPostedEvents(None, int(QEvent.Type.MetaCall.value))
+        except Exception:
+            log.debug("退出前派发待处理跨线程信号失败", exc_info=True)
+        history = self._safe_attr("_history")
+        close_history = getattr(history, "close", None)
+        if callable(close_history):
+            close_history()
+        config = self._safe_attr("_config")
+        save_config = getattr(config, "save_immediate", None)
+        if callable(save_config):
+            save_config()
+
     def _finish_quit(self):
         """Release resources after the user has accepted any pending loss."""
         if self._exit_started:
             return
         self._exit_started = True
         self._quit_drain_deadline = None
+        self._quit_persistence_finalized = False
         from sayink.ui.theme import unwatch_system_color_scheme
 
         unwatch_system_color_scheme()
@@ -4054,10 +4172,6 @@ class App(QObject):
         if snd is not None and callable(getattr(snd, "shutdown", None)):
             snd.shutdown()
         self._tray.hide()
-        # Queued history writes and debounced config edits finish immediately,
-        # before any external installer (taskkill /F) or native worker drain.
-        self._history.close()
-        self._config.save_immediate()
         self._complete_quit_when_idle()
 
     def _check_quit_drain_deadline(self) -> tuple[bool, float]:
@@ -4078,24 +4192,25 @@ class App(QObject):
             if not expired:
                 self._later(QUIT_POLL_MS, self._complete_quit_when_idle)
                 return
-            save_timer = getattr(self._safe_attr("_config"), "_save_timer", None)
-            if getattr(save_timer, "isActive", lambda: False)() is True:
-                self._config.save_immediate()
             log.warning(
                 "退出等待录音缓存落盘超时（%.1fs），强制结束进程",
                 timeout_s,
             )
+            self._finalize_quit_persistence()
             self._release_instance_lock_once()
             QApplication.quit()
             _force_process_exit(0)
             return
-        save_timer = getattr(self._config, "_save_timer", None)
-        if getattr(save_timer, "isActive", lambda: False)() is True:
-            self._config.save_immediate()
+        meeting = self._safe_attr("_meeting")
+        meeting_workers = [
+            worker
+            for worker in getattr(meeting, "running_workers", ())
+            if isinstance(worker, QThread) and worker.isRunning()
+        ]
         updating_to_installer = bool(self._safe_attr("_updating_to_installer", False))
-        if not updating_to_installer:
+        if not updating_to_installer and not meeting_workers:
             self._release_instance_lock_once()
-        owners = [self._recognizer, self._polisher, self._meeting, self._updates, self._settings_widget()]
+        owners = [self._recognizer, self._polisher, meeting, self._updates, self._settings_widget()]
         owners.extend(
             (
                 self._safe_attr("_recovery_dialog"),
@@ -4106,9 +4221,8 @@ class App(QObject):
         if self._main is not None:
             owners.append(self._main.meeting_panel)
             owners.append(getattr(self._main, "history_panel", None))
-        # Native model loading cannot safely be force-terminated. Keep the Qt
-        # event loop and each owner's worker references alive until it exits,
-        # up to a bounded drain deadline so a wedged C++ call cannot linger forever.
+        # Native model loading and in-flight import/minutes workers cannot safely be
+        # force-terminated; keep HistoryStore open until running_workers drain.
         pending = [worker for owner in owners if owner is not None
                    for worker in getattr(owner, "running_workers", ())
                    if isinstance(worker, QThread) and worker.isRunning()]
@@ -4122,10 +4236,12 @@ class App(QObject):
                 timeout_s,
                 len(pending),
             )
+            self._finalize_quit_persistence()
             self._release_instance_lock_once()
             QApplication.quit()
             _force_process_exit(0)
             return
+        self._finalize_quit_persistence()
         self._release_instance_lock_once()
         QApplication.quit()
 

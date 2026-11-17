@@ -737,8 +737,8 @@ def test_right_detail_pane_accepts_drag_and_drop_imports(config, tmp_path, qapp,
 def test_imported_meetings_honor_auto_generate_and_land_on_transcript_tab_when_empty(
     config, tmp_path, qapp, monkeypatch
 ):
-    """M-UX-04: Without auto-generate, imported meetings open on 文字稿 tab; with auto-generate + >=200 chars,
-    both transcript and media imports enqueue AI minutes and stay on 纪要 tab."""
+    """M-UX-04 + Privacy Contract: Imported transcripts and media NEVER auto-enqueue AI minutes by default
+    even when ``meeting.auto_generate=True`` (landing on 文字稿 tab); explicit ``auto_generate=True`` opts in."""
     controller, history = _controller(config, tmp_path)
     page = MeetingPage(config, controller)
     try:
@@ -750,7 +750,8 @@ def test_imported_meetings_honor_auto_generate_and_land_on_transcript_tab_when_e
         assert page._content_stack.currentIndex() == 1
         assert page._tab_transcript.isChecked()
 
-        # Case 2: auto_generate=True + LLM configured + >= 200 chars -> auto-enqueues & opens on 纪要 tab (index 0)
+        # Case 2: meeting.auto_generate=True + LLM configured + >= 200 chars -> default imports STILL
+        # do NOT auto-enqueue remote LLM generation and land on 文字稿 tab (index 1)!
         config.set("meeting.auto_generate", True)
         config.set("llm.api_url", "https://api.example.com/v1")
         config.set("llm.api_key", "sk-test")
@@ -761,28 +762,48 @@ def test_imported_meetings_honor_auto_generate_and_land_on_transcript_tab_when_e
 
         long_body = "\n".join(f"张三：这是第 {i} 条完整的项目进度讨论记录与技术方案复盘。" for i in range(15))
         assert len(long_body) >= 200
-        auto_text_rec = controller.import_transcript(long_body, title="长文字稿")
-        assert auto_text_rec is not None
-        assert auto_text_rec.id in started_gen
-        assert controller.queued_generation(auto_text_rec.id) is not None
-        page.show_meeting(auto_text_rec.id)
-        assert page._content_stack.currentIndex() == 0
-        assert page._tab_notes.isChecked()
-        controller._store.dequeue_generation(auto_text_rec.id)
-        controller._store.flush()
+        default_text_rec = controller.import_transcript(long_body, title="长文字稿")
+        assert default_text_rec is not None
+        assert default_text_rec.id not in started_gen
+        assert controller.queued_generation(default_text_rec.id) is None
+        page.show_meeting(default_text_rec.id)
+        assert page._content_stack.currentIndex() == 1
+        assert page._tab_transcript.isChecked()
 
-        # Media import >= 200 chars also auto-enqueues!
         media_turns = tuple(
-            MediaTurn(1, idx * 2000, 1500, f"这是第 {idx} 段足够长的音视频转写内容用于触发自动生成纪要。")
+            MediaTurn(1, idx * 2000, 1500, f"这是第 {idx} 段足够长的音视频转写内容用于验证默认不自动生成。")
             for idx in range(12)
         )
-        auto_media_rec = controller.commit_media_import(
+        default_media_rec = controller.commit_media_import(
             RecognitionResult(media_turns, cancelled=False, audio_ms=24_000),
             "长录音导入",
         )
-        assert auto_media_rec is not None
-        assert auto_media_rec.id in started_gen
-        assert controller.queued_generation(auto_media_rec.id) is not None
+        assert default_media_rec is not None
+        assert default_media_rec.id not in started_gen
+        assert controller.queued_generation(default_media_rec.id) is None
+        page.show_meeting(default_media_rec.id)
+        assert page._content_stack.currentIndex() == 1
+        assert page._tab_transcript.isChecked()
+
+        # Case 3: Explicit opt-in ``auto_generate=True`` enqueues AI minutes and opens on 纪要 tab (index 0).
+        opt_in_text_rec = controller.import_transcript(long_body, title="显式开启文字稿", auto_generate=True)
+        assert opt_in_text_rec is not None
+        assert opt_in_text_rec.id in started_gen
+        assert controller.queued_generation(opt_in_text_rec.id) is not None
+        page.show_meeting(opt_in_text_rec.id)
+        assert page._content_stack.currentIndex() == 0
+        assert page._tab_notes.isChecked()
+        controller._store.dequeue_generation(opt_in_text_rec.id)
+        controller._store.flush()
+
+        opt_in_media_rec = controller.commit_media_import(
+            RecognitionResult(media_turns, cancelled=False, audio_ms=24_000),
+            "显式开启录音导入",
+            auto_generate=True,
+        )
+        assert opt_in_media_rec is not None
+        assert opt_in_media_rec.id in started_gen
+        assert controller.queued_generation(opt_in_media_rec.id) is not None
     finally:
         page.deleteLater()
         controller.shutdown()
