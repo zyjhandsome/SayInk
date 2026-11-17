@@ -88,13 +88,13 @@ def test_speaker_policy_change_waits_until_capture_and_existing_work_are_finishe
         recorder.is_recording, recorder.is_continuous = True, False
         app._config.set("stt.debug_force_speaker_model", True)
         app._on_recognition_settings_changed()
-        assert app._recognition_change_pending
-        assert not app._applied_recognition_settings.speaker_activity_enabled
+        assert app.reload_snapshot.recognition_change_pending
+        assert not app.applied_recognition_settings.speaker_activity_enabled
         recorder.is_recording = False
         app._apply_pending_recognition_settings()
-        assert not app._recognition_change_pending
-        assert app._applied_recognition_settings.speaker_model_enabled
-        assert app._applied_recognition_settings.speaker_activity_enabled
+        assert not app.reload_snapshot.recognition_change_pending
+        assert app.applied_recognition_settings.speaker_model_enabled
+        assert app.applied_recognition_settings.speaker_activity_enabled
 
 
 def test_explicit_energy_choice_does_not_claim_silero_is_missing(config, monkeypatch):
@@ -141,7 +141,7 @@ def test_recognition_changes_wait_for_capture_and_queued_speech(continuous):
         app._config.set("stt.debug_force_quiet_speech", False)
         app._config.set("stt.language", "en")
         app._on_recognition_settings_changed()
-        assert app._recognition_change_pending
+        assert app.reload_snapshot.recognition_change_pending
         recorder.set_segmenter_profile.assert_not_called()
         recorder.stop_continuous.assert_not_called()
         h["recognizer"].configure.assert_not_called()
@@ -150,7 +150,7 @@ def test_recognition_changes_wait_for_capture_and_queued_speech(continuous):
         app._on_segment_ready(np.ones(3200, dtype=np.float32))
         recorder.is_recording = recorder.is_continuous = False
         app._apply_pending_recognition_settings()
-        assert app._recognition_change_pending  # recognition and queue still belong to this session
+        assert app.reload_snapshot.recognition_change_pending  # recognition and queue still belong to this session
         paste_count = 0
         for text in ("第一句", "第二句"):
             app._on_final_result(text)
@@ -160,7 +160,7 @@ def test_recognition_changes_wait_for_capture_and_queued_speech(continuous):
             app._pump_segment_queue()
         saved = "".join(call.args[0].raw_text for call in h["history"].enqueue.call_args_list)
         assert "第一句" in saved and "第二句" in saved
-        assert not app._recognition_change_pending
+        assert not app.reload_snapshot.recognition_change_pending
         recorder.set_segmenter_profile.assert_called_once_with(vad="silero", vad_model_path=None, meeting=False)
         assert h["recognizer"].configure.call_args.kwargs["language"] == "en"
 
@@ -177,7 +177,7 @@ def test_model_switch_goes_through_when_the_current_model_failed_to_load():
 
         app._on_tray_model_switch("sensevoice")
 
-        assert not app._recognition_change_pending
+        assert not app.reload_snapshot.recognition_change_pending
         recognizer.configure.assert_called_once()
         assert len(app._segment_queue) == 1  # the audio still waits for the new model
 
@@ -186,7 +186,7 @@ def test_model_switch_goes_through_when_the_current_model_failed_to_load():
         recognizer.is_loading = True
         app._config.set("stt.language", "en")
         app._on_recognition_settings_changed()
-        assert app._recognition_change_pending
+        assert app.reload_snapshot.recognition_change_pending
 
 
 def test_meeting_uses_actual_gate_when_downloaded_model_fails():
@@ -211,7 +211,7 @@ def test_meeting_validates_the_session_model_override():
 def test_pending_model_change_keeps_captured_segments_on_the_old_model():
     with app_harness({"audio.trigger_mode": "continuous"}) as h:
         app = h["app"]
-        old_model = app._applied_recognition_settings.model_id
+        old_model = app.applied_recognition_settings.model_id
         h["recorder"].is_recording = True
         h["recorder"].is_continuous = True
         app._on_tray_model_switch("sensevoice")
@@ -227,12 +227,12 @@ def test_meeting_keeps_settings_until_finalize():
         recorder.set_segmenter_profile.reset_mock()
         app._config.set("stt.debug_force_quiet_speech", False)
         app._on_recognition_settings_changed()
-        assert app._recognition_change_pending
+        assert app.reload_snapshot.recognition_change_pending
         recorder.set_segmenter_profile.assert_not_called()
         recorder.is_recording = recorder.is_continuous = False
         with patch("sayink.app.aux_model_path", return_value=None):
             app.meeting.finalize()
-        assert not app._recognition_change_pending
+        assert not app.reload_snapshot.recognition_change_pending
         recorder.set_segmenter_profile.assert_called_with(vad="silero", vad_model_path=None, meeting=False)
 
 

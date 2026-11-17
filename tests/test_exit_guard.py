@@ -19,7 +19,7 @@ def test_return_from_exit_preserves_pending_work(pending):
         elif pending == "asr":
             app._is_transcribing = True
         elif pending == "polish":
-            app._output_busy = True
+            app.output_pipeline.busy = True
         else:
             app._enqueue_audio(np.ones(1600, dtype=np.float32))
         before = list(app._segment_queue)
@@ -178,7 +178,7 @@ def test_native_confirmation_defaults_to_return():
 
 def test_update_does_not_launch_installer_when_exit_is_cancelled():
     with app_harness() as h:
-        h["app"]._output_busy = True
+        h["app"].output_pipeline.busy = True
         with patch("sayink.app.QMessageBox") as boxes, patch("sayink.updater.launch_installer") as launch:
             dialog = boxes.return_value
             dialog.addButton.side_effect = ["return", "discard"]

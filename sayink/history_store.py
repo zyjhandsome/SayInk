@@ -170,32 +170,47 @@ def _ensure_meeting_note_columns(conn: sqlite3.Connection) -> None:
         )
 
 
-_SESSION_SUMMARY_SQL = """
+_PAGED_SESSION_SUMMARY_SQL = """
+WITH paged AS (
+  SELECT
+    h.session_id,
+    MIN(CASE WHEN h.captured_at > 0 THEN h.captured_at ELSE h.created_at END) AS session_created,
+    COUNT(*) AS segment_count
+  FROM history h
+  WHERE h.trigger_mode != ?
+  GROUP BY h.session_id
+  ORDER BY session_created DESC
+  LIMIT ? OFFSET ?
+),
+ranked AS (
+  SELECT
+    h.session_id,
+    h.source,
+    h.target_app,
+    CASE WHEN h.polished_text != '' THEN h.polished_text ELSE h.raw_text END AS eff_text,
+    h.polished_text,
+    ROW_NUMBER() OVER (PARTITION BY h.session_id ORDER BY h.seq ASC, h.id ASC) AS rn_all,
+    ROW_NUMBER() OVER (
+      PARTITION BY h.session_id, (h.polished_text != ?)
+      ORDER BY h.seq ASC, h.id ASC
+    ) AS rn_vis
+  FROM history h
+  INNER JOIN paged p ON p.session_id = h.session_id
+)
 SELECT
-  h.session_id,
-  MIN(CASE WHEN h.captured_at > 0 THEN h.captured_at ELSE h.created_at END) AS session_created,
-  COUNT(*) AS segment_count,
-  (
-    SELECT source FROM history h2
-    WHERE h2.session_id = h.session_id
-    ORDER BY h2.seq ASC LIMIT 1
-  ) AS source,
-  (
-    SELECT target_app FROM history h2
-    WHERE h2.session_id = h.session_id
-    ORDER BY h2.seq ASC LIMIT 1
-  ) AS target_app,
-  COALESCE((
-    SELECT CASE
-      WHEN polished_text != '' THEN polished_text
-      ELSE raw_text
-    END
-    FROM history h2
-    WHERE h2.session_id = h.session_id
-      AND h2.polished_text != '\u200b'
-    ORDER BY h2.seq ASC LIMIT 1
-  ), '') AS preview
-FROM history h
+  p.session_id,
+  p.session_created,
+  p.segment_count,
+  COALESCE(MAX(CASE WHEN r.rn_all = 1 THEN r.source END), '') AS source,
+  COALESCE(MAX(CASE WHEN r.rn_all = 1 THEN r.target_app END), '') AS target_app,
+  COALESCE(
+    MAX(CASE WHEN r.polished_text != ? AND r.rn_vis = 1 THEN r.eff_text END),
+    ''
+  ) AS preview
+FROM paged p
+LEFT JOIN ranked r ON r.session_id = p.session_id
+GROUP BY p.session_id, p.session_created, p.segment_count
+ORDER BY p.session_created DESC
 """
 
 
@@ -700,14 +715,14 @@ class HistoryStore:
         try:
             with self._read_conn() as conn:
                 rows = conn.execute(
-                    _SESSION_SUMMARY_SQL
-                    + """
-                    WHERE h.trigger_mode != ?
-                    GROUP BY h.session_id
-                    ORDER BY session_created DESC
-                    LIMIT ? OFFSET ?
-                    """,
-                    (MEETING_TRIGGER_MODE, limit, offset),
+                    _PAGED_SESSION_SUMMARY_SQL,
+                    (
+                        MEETING_TRIGGER_MODE,
+                        limit,
+                        offset,
+                        _SUPPRESSED_POLISHED_MARKER,
+                        _SUPPRESSED_POLISHED_MARKER,
+                    ),
                 ).fetchall()
             return _rows_to_summaries(rows)
         except Exception:

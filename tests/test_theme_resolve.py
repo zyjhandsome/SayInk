@@ -133,7 +133,7 @@ class TestSettingsAppearanceEntry:
             assert not hasattr(win, "_island_title")
             assert not hasattr(win, "_close_btn")
             assert not hasattr(win, "_sheet")
-            assert "TRANSPARENT" in win._pages_host.styleSheet().upper()
+            assert tok.BG.upper() in win._pages_host.styleSheet().upper()
         finally:
             win.close()
             apply_theme(mode="light")
@@ -224,7 +224,8 @@ class TestSettingsAppearanceEntry:
             apply_theme(mode="light", surfaces=(win,))
             card.reapply_styles()
             assert tok.BG.upper() == "#FFFFFF"
-            assert "TRANSPARENT" in win._pages_host.styleSheet().upper()
+            assert tok.BG.upper() in win._pages_host.styleSheet().upper()
+            assert "#181818" not in win._pages_host.styleSheet().upper()
             assert "#111827" not in win._pages_host.styleSheet().upper()
             assert not hasattr(win, "_sheet")
 

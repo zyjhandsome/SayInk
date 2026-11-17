@@ -186,7 +186,7 @@ def test_variant_only_edit_applies_in_zero_seconds_without_reloading_stt_or_embe
         )
         app._on_recognition_settings_changed()
 
-        assert not app._recognition_change_pending
+        assert not app.reload_snapshot.recognition_change_pending
         h["recognizer"].configure.assert_not_called()
         h["recorder"].set_segmenter_profile.assert_not_called()
         assert app._embedder is embedder_before

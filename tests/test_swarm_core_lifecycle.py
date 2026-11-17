@@ -259,7 +259,9 @@ def test_exit_drain_timeout_closes_history_and_saves_config_before_force_exit(tm
 
     class _WedgedWorker(QThread):
         def run(self) -> None:
-            gate.wait(5.0)
+            # Stay wedged until the test releases the gate. A short timeout
+            # expires while App construction is slow and the drain never starts.
+            gate.wait()
 
     worker = _WedgedWorker()
     worker.start()
@@ -404,7 +406,7 @@ def test_deferred_settings_notice_shown_on_settings_panel_during_recording_and_m
             panel.settings_changed.emit()
             qapp.processEvents()
 
-            assert app._pending_apply_notice == DEFERRED_APPLY_NOTICE
+            assert app.reload_snapshot.pending_apply_notice == DEFERRED_APPLY_NOTICE
             assert panel.general_page.mic_test_status.text() == DEFERRED_APPLY_NOTICE
             assert DEFERRED_APPLY_NOTICE in panel.general_page.recognition_apply_label.text()
 
@@ -418,7 +420,7 @@ def test_deferred_settings_notice_shown_on_settings_panel_during_recording_and_m
             h["recorder"].is_recording = False
             app._apply_pending_recognition_settings()
             qapp.processEvents()
-            assert app._pending_apply_notice == ""
+            assert app.reload_snapshot.pending_apply_notice == ""
             assert panel.general_page.mic_test_status.text() != DEFERRED_APPLY_NOTICE
             assert panel.general_page.recognition_apply_label.text() == ""
             assert panel.model_page.model_notice_label.text() == ""
@@ -435,7 +437,7 @@ def test_deferred_settings_notice_shown_on_settings_panel_during_recording_and_m
             panel.general_page.meeting_language_combo.setCurrentIndex(idx)
             qapp.processEvents()
 
-            assert app._deferred_meeting_audio_settings is True
+            assert app.reload_snapshot.deferred_meeting_audio_settings is True
             assert panel.general_page.mic_test_status.text() == DEFERRED_APPLY_NOTICE
             assert DEFERRED_APPLY_NOTICE in panel.general_page.recognition_apply_label.text()
 
@@ -443,8 +445,8 @@ def test_deferred_settings_notice_shown_on_settings_panel_during_recording_and_m
             h["recorder"].is_continuous = False
             app._end_meeting()
             qapp.processEvents()
-            assert app._deferred_meeting_audio_settings is False
-            assert app._pending_apply_notice == ""
+            assert app.reload_snapshot.deferred_meeting_audio_settings is False
+            assert app.reload_snapshot.pending_apply_notice == ""
             assert panel.general_page.mic_test_status.text() != DEFERRED_APPLY_NOTICE
         finally:
             for sig, slot in (

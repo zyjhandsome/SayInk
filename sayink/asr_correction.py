@@ -29,6 +29,8 @@ import threading
 import unicodedata
 from collections.abc import Iterable
 
+from typing import Any
+
 from sayink.polish_fidelity import polish_rejection_reason
 
 log = logging.getLogger("SayInk")
@@ -36,9 +38,10 @@ log = logging.getLogger("SayInk")
 # ``术语=误写1、误写2``; full-width ＝ is what a Chinese IME produces.
 _GLOSSARY_SEPARATOR_RE = re.compile(r"\s*[=＝]\s*")
 _VARIANT_SPLIT_RE = re.compile(r"\s*[,，、;；]\s*")
+MAX_GLOSSARY_ENTRIES = 500
 MAX_GLOSSARY_VARIANTS = 5
 MAX_GLOSSARY_VARIANT_CHARS = 20
-# Entries sent to the model; matches the hotword cap so both lists agree.
+# Entries sent to the LLM correction prompt (keeps token budget bounded even with 500 local entries).
 MAX_PROMPT_GLOSSARY_ENTRIES = 50
 # Edit budget for an accepted correction, on compacted text.
 CORRECTION_MAX_EDIT_RATIO = 0.2
@@ -150,60 +153,49 @@ _LOGGED_GLOSSARY_CONFLICTS: set[str] = set()
 _GLOSSARY_CONFLICT_LOCK = threading.Lock()
 
 
-def glossary_variant_map_with_conflicts(
-    glossary: Iterable,
-) -> tuple[list[tuple[str, str]], list[str]]:
-    """Return ``(pairs, conflicts)`` where ``conflicts`` records shadowed rules."""
-    entries = [_entry_parts(e) for e in glossary or ()]
-    terms_orig = [term for term, _ in entries if term]
-    terms = [term.casefold() for term in terms_orig]
-    term_by_cf = {term.casefold(): term for term in terms_orig}
-    term_set = set(terms)
-    pairs: dict[str, tuple[str, str]] = {}
-    conflicts: list[str] = []
-    for term, variants in entries:
-        if not term:
-            continue
-        term_cf = term.casefold()
-        for variant in variants:
-            key = variant.casefold()
-            if len(variant) == 1 and re.fullmatch(r"[\u4e00-\u9fff]", variant):
-                msg = f"单字误写「{variant}→{term}」已忽略（易误伤常用字）"
-                if msg not in conflicts:
-                    conflicts.append(msg)
-                continue
-            if key == term_cf:
-                other_terms = [
-                    orig for orig, cf in zip(terms_orig, terms, strict=True)
-                    if cf == key and orig != term
-                ]
-                if other_terms:
-                    msg = f"误写「{variant}→{term}」与术语「{other_terms[0]}」同名，已跳过"
-                    if msg not in conflicts:
-                        conflicts.append(msg)
-                    continue
-                if key not in pairs:
-                    pairs[key] = (variant, term)
-                continue
-            if key in term_set:
-                other = term_by_cf.get(key, variant)
-                msg = f"误写「{variant}→{term}」与术语「{other}」同名，已跳过"
-                if msg not in conflicts:
-                    conflicts.append(msg)
-                continue
-            if key in pairs:
-                kept_term = pairs[key][1]
-                msg = f"误写「{variant}」同时指向「{kept_term}」与「{term}」，保留「{kept_term}」"
-                if msg not in conflicts:
-                    conflicts.append(msg)
-                continue
-            containing = [orig for orig, cf in zip(terms_orig, terms, strict=True) if key in cf]
-            if containing:
-                msg = f"误写「{variant}→{term}」被术语「{containing[0]}」包含，已跳过以防重复替换"
-                if msg not in conflicts:
-                    conflicts.append(msg)
-                continue
-            pairs[key] = (variant, term)
+def _append_unique_conflict(conflicts: list[str], message: str) -> None:
+    if message and message not in conflicts:
+        conflicts.append(message)
+
+
+def _classify_variant_entry(
+    term: str,
+    term_cf: str,
+    variant: str,
+    *,
+    terms_orig: list[str],
+    terms_cf: list[str],
+    term_by_cf: dict[str, str],
+    term_set: set[str],
+    pairs: dict[str, tuple[str, str]],
+) -> tuple[tuple[str, str] | None, str]:
+    """Return ``((variant, term), "")`` when usable, or ``(None, conflict_msg)``."""
+    key = variant.casefold()
+    if len(variant) == 1 and re.fullmatch(r"[\u4e00-\u9fff]", variant):
+        return None, f"单字误写「{variant}→{term}」已忽略（易误伤常用字）"
+    if key == term_cf:
+        other_terms = [
+            orig for orig, cf in zip(terms_orig, terms_cf, strict=True)
+            if cf == key and orig != term
+        ]
+        if other_terms:
+            return None, f"误写「{variant}→{term}」与术语「{other_terms[0]}」同名，已跳过"
+        return ((variant, term), "") if key not in pairs else (None, "")
+    if key in term_set:
+        other = term_by_cf.get(key, variant)
+        return None, f"误写「{variant}→{term}」与术语「{other}」同名，已跳过"
+    if key in pairs:
+        kept_term = pairs[key][1]
+        return None, f"误写「{variant}」同时指向「{kept_term}」与「{term}」，保留「{kept_term}」"
+    containing = [orig for orig, cf in zip(terms_orig, terms_cf, strict=True) if key in cf]
+    if containing:
+        return None, f"误写「{variant}→{term}」被术语「{containing[0]}」包含，已跳过以防重复替换"
+    return (variant, term), ""
+
+
+def _log_new_glossary_conflicts(conflicts: list[str]) -> None:
+    if not conflicts:
+        return
     with _GLOSSARY_CONFLICT_LOCK:
         for msg in conflicts:
             if msg not in _LOGGED_GLOSSARY_CONFLICTS:
@@ -211,6 +203,39 @@ def glossary_variant_map_with_conflicts(
                     _LOGGED_GLOSSARY_CONFLICTS.clear()
                 _LOGGED_GLOSSARY_CONFLICTS.add(msg)
                 log.warning("词库冲突提示: %s", msg)
+
+
+def glossary_variant_map_with_conflicts(
+    glossary: Iterable,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Return ``(pairs, conflicts)`` where ``conflicts`` records shadowed rules."""
+    entries = [_entry_parts(e) for e in glossary or ()]
+    terms_orig = [term for term, _ in entries if term]
+    terms_cf = [term.casefold() for term in terms_orig]
+    term_by_cf = {term.casefold(): term for term in terms_orig}
+    term_set = set(terms_cf)
+    pairs: dict[str, tuple[str, str]] = {}
+    conflicts: list[str] = []
+    for term, variants in entries:
+        if not term:
+            continue
+        term_cf = term.casefold()
+        for variant in variants:
+            pair, conflict = _classify_variant_entry(
+                term,
+                term_cf,
+                variant,
+                terms_orig=terms_orig,
+                terms_cf=terms_cf,
+                term_by_cf=term_by_cf,
+                term_set=term_set,
+                pairs=pairs,
+            )
+            if conflict:
+                _append_unique_conflict(conflicts, conflict)
+            elif pair is not None:
+                pairs[variant.casefold()] = pair
+    _log_new_glossary_conflicts(conflicts)
     ordered = sorted(pairs.items(), key=lambda kv: (-len(kv[0]), kv[0]))
     return [pair for _, pair in ordered], conflicts
 
@@ -364,3 +389,243 @@ def correction_rejection_reason(raw: str, corrected: str, glossary: Iterable = (
     if _edit_distance(a, b, limit) > limit:
         return "改动过多"
     return ""
+
+
+# ── self-learning glossary flywheel ──────────────────────────────────────────
+
+_ASCII_WORD_CHAR_RE = re.compile(r"[A-Za-z0-9._+-]")
+_CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
+_PUNCT_STRIP_CHARS = " \t\r\n,，.。!！?？;；:：'\"“”‘’()（）[]【】<>《》-—·、"
+_INTERNAL_PUNCT_RE = re.compile(r"[\r\n,，.。!！?？;；:：()（）\[\]【】<>《》]")
+_NUMERIC_ONLY_RE = re.compile(r"^[\d\s.,:%+\-/]+$")
+# Function particles / pronouns that should never be glued onto a 1-char CJK typo
+# when expanding a single-character diff into a 2-character lexical term.
+_CJK_BOUNDARY_STOP_CHARS = frozenset(
+    "的我你他她它们这那在是了着过吗呢吧啊呀哦嗯哈和与及或而但又也都很更最"
+    "不没未别莫已正将再才就还只刚先去来把被让给向从对跟比按用为因由到说看想"
+)
+
+
+def _is_cjk_content_char(ch: str) -> bool:
+    return bool(ch and _CJK_CHAR_RE.fullmatch(ch) and ch not in _CJK_BOUNDARY_STOP_CHARS)
+
+
+def _compact_case_sensitive(text: str) -> str:
+    return "".join(ch for ch in unicodedata.normalize("NFKC", text or "") if ch.isalnum())
+
+
+def _is_ascii_word(ch: str) -> bool:
+    return bool(ch and _ASCII_WORD_CHAR_RE.fullmatch(ch))
+
+
+def _expand_ascii_bounds(
+    before: str,
+    after: str,
+    start: int,
+    end_b: int,
+    end_a: int,
+) -> tuple[int, int, int]:
+    while start > 0 and _is_ascii_word(before[start - 1]):
+        in_word = (start < len(before) and _is_ascii_word(before[start])) or (
+            start < len(after) and _is_ascii_word(after[start])
+        )
+        if not in_word:
+            break
+        start -= 1
+    while end_b < len(before) and end_a < len(after) and _is_ascii_word(before[end_b]):
+        in_word = (end_b > 0 and _is_ascii_word(before[end_b - 1])) or (
+            end_a > 0 and _is_ascii_word(after[end_a - 1])
+        )
+        if not in_word:
+            break
+        end_b += 1
+        end_a += 1
+    return start, end_b, end_a
+
+
+def _expand_single_cjk_neighbor(
+    before: str,
+    after: str,
+    start: int,
+    end_b: int,
+    end_a: int,
+) -> tuple[int, int, int]:
+    raw_b, raw_a = before[start:end_b], after[start:end_a]
+    if not (
+        len(raw_b) == 1
+        and len(raw_a) == 1
+        and _CJK_CHAR_RE.fullmatch(raw_b)
+        and _CJK_CHAR_RE.fullmatch(raw_a)
+    ):
+        return start, end_b, end_a
+    if start > 0 and _is_cjk_content_char(before[start - 1]):
+        return start - 1, end_b, end_a
+    if end_b < len(before) and _is_cjk_content_char(before[end_b]):
+        return start, end_b + 1, end_a + 1
+    return start, end_b, end_a
+
+
+def _isolate_diff_span(before: str, after: str) -> tuple[str, str]:
+    """Isolate the minimal word-aligned changed span between ``before`` and ``after``."""
+    start = 0
+    limit = min(len(before), len(after))
+    while start < limit and before[start] == after[start]:
+        start += 1
+    end_b, end_a = len(before), len(after)
+    while end_b > start and end_a > start and before[end_b - 1] == after[end_a - 1]:
+        end_b -= 1
+        end_a -= 1
+    start, end_b, end_a = _expand_ascii_bounds(before, after, start, end_b, end_a)
+    start, end_b, end_a = _expand_single_cjk_neighbor(before, after, start, end_b, end_a)
+    return before[start:end_b].strip(_PUNCT_STRIP_CHARS), after[start:end_a].strip(_PUNCT_STRIP_CHARS)
+
+
+def _passes_lexical_pair_shape(term: str, variant: str) -> bool:
+    if not term or not variant or term == variant:
+        return False
+    if not (2 <= len(term) <= MAX_GLOSSARY_VARIANT_CHARS):
+        return False
+    if not (2 <= len(variant) <= MAX_GLOSSARY_VARIANT_CHARS):
+        return False
+    if abs(len(term) - len(variant)) > 8 or variant in _COMMON_DAILY_CJK_WORDS:
+        return False
+    if _INTERNAL_PUNCT_RE.search(term) or _INTERNAL_PUNCT_RE.search(variant):
+        return False
+    return not (_NUMERIC_ONLY_RE.fullmatch(term) or _NUMERIC_ONLY_RE.fullmatch(variant))
+
+
+def _is_valid_learned_pair(term: str, variant: str, existing_glossary: Iterable) -> bool:
+    if not _passes_lexical_pair_shape(term, variant):
+        return False
+    entries = [_entry_parts(e) for e in existing_glossary or ()]
+    if term.casefold() == variant.casefold():
+        return not any(t == term for t, _ in entries)
+    mapped = {v.casefold(): t for v, t in glossary_variant_map(existing_glossary)}
+    if mapped.get(variant.casefold()) == term:
+        return False
+    updated, changed = merge_glossary_learning(existing_glossary, term, variant)
+    if not changed:
+        return False
+    new_map = {v.casefold(): t for v, t in glossary_variant_map(updated)}
+    return new_map.get(variant.casefold()) == term
+
+
+def _single_changed_clause(orig: str, dest: str) -> tuple[str, str] | None:
+    orig_clauses = [c.strip() for c in _INTERNAL_PUNCT_RE.split(orig) if c.strip()]
+    dest_clauses = [c.strip() for c in _INTERNAL_PUNCT_RE.split(dest) if c.strip()]
+    if len(orig_clauses) != len(dest_clauses):
+        return None
+    changed = [
+        (o, d)
+        for o, d in zip(orig_clauses, dest_clauses, strict=True)
+        if _compact_case_sensitive(o) != _compact_case_sensitive(d)
+    ]
+    return changed[0] if len(changed) == 1 else None
+
+
+def extract_learned_correction_pair(
+    original: str,
+    edited: str,
+    existing_glossary: Iterable = (),
+) -> tuple[str, str] | None:
+    """Extract a ``(term, variant)`` glossary candidate from a user text edit."""
+    orig = (original or "").strip()
+    dest = (edited or "").strip()
+    if not orig or not dest or _compact_case_sensitive(orig) == _compact_case_sensitive(dest):
+        return None
+    variant, term = _isolate_diff_span(orig, dest)
+    if _is_valid_learned_pair(term, variant, existing_glossary):
+        return (term, variant)
+    clause_pair = _single_changed_clause(orig, dest)
+    if clause_pair is not None:
+        v2, t2 = _isolate_diff_span(clause_pair[0], clause_pair[1])
+        if _is_valid_learned_pair(t2, v2, existing_glossary):
+            return (t2, v2)
+    return None
+
+
+def format_glossary_suggestion_label(term: str, variant: str = "") -> str:
+    """Format ``term`` and ``variant`` as shown in UI feedback (``SayInk`` or ``张鑫=张新``)."""
+    clean_term = (term or "").strip()
+    clean_var = (variant or "").strip()
+    if not clean_var or clean_var.casefold() == clean_term.casefold():
+        return clean_term
+    return f"{clean_term}={clean_var}"
+
+
+def _normalize_glossary_for_merge(
+    glossary: Iterable,
+    clean_term_cf: str,
+) -> tuple[list[dict[str, Any]], int | None]:
+    normalized: list[dict[str, Any]] = []
+    target_idx: int | None = None
+    for item in glossary or ():
+        t, vars_list = _entry_parts(item)
+        if not t:
+            continue
+        entry: dict[str, Any] = {"term": t, "variants": list(vars_list)} if vars_list else {"term": t}
+        if t.casefold() == clean_term_cf and target_idx is None:
+            target_idx = len(normalized)
+        normalized.append(entry)
+    return normalized, target_idx
+
+
+def _merge_into_existing_entry(
+    existing: dict[str, Any],
+    clean_term: str,
+    clean_var: str,
+) -> tuple[dict[str, Any], bool]:
+    variants = list(existing.get("variants") or [])
+    if not clean_var:
+        if existing["term"] == clean_term:
+            return existing, False
+        updated = {"term": clean_term, "variants": variants} if variants else {"term": clean_term}
+        return updated, True
+    if clean_var in variants or len(variants) >= MAX_GLOSSARY_VARIANTS:
+        return existing, False
+    variants.append(clean_var)
+    return {"term": existing["term"], "variants": variants}, True
+
+
+def merge_glossary_learning(
+    glossary: Iterable,
+    term: str,
+    variant: str = "",
+) -> tuple[list[dict[str, Any]], bool]:
+    """Merge a learned ``(term, variant)`` rule into ``glossary`` without displacing top hotwords."""
+    clean_term = (term or "").strip()
+    clean_var = (variant or "").strip()
+    if not clean_term or len(clean_term) > MAX_GLOSSARY_VARIANT_CHARS:
+        return [], False
+    if len(clean_var) > MAX_GLOSSARY_VARIANT_CHARS or clean_var.casefold() == clean_term.casefold():
+        clean_var = ""
+
+    normalized, target_idx = _normalize_glossary_for_merge(glossary, clean_term.casefold())
+    if target_idx is not None:
+        merged, changed = _merge_into_existing_entry(normalized[target_idx], clean_term, clean_var)
+        if changed:
+            normalized[target_idx] = merged
+        return normalized, changed
+
+    if len(normalized) >= MAX_GLOSSARY_ENTRIES:
+        return normalized, False
+    new_entry: dict[str, Any] = (
+        {"term": clean_term, "variants": [clean_var]} if clean_var else {"term": clean_term}
+    )
+    normalized.append(new_entry)
+    return normalized, True
+
+
+def persist_glossary_learning(config: Any, term: str, variant: str = "") -> bool:
+    """Persist a learned glossary entry into ``config`` (``stt.glossary``) and return True if changed."""
+    if config is None or not callable(getattr(config, "get", None)):
+        return False
+    current = config.get("stt.glossary", []) or []
+    updated, changed = merge_glossary_learning(current, term, variant)
+    if not changed:
+        return False
+    config.set("stt.glossary", updated)
+    save_immediate = getattr(config, "save_immediate", None)
+    if callable(save_immediate):
+        save_immediate()
+    return True

@@ -362,9 +362,9 @@ class TestSettingsChangedQueue:
     def test_settings_discard_count_ignores_polish_and_a_live_meeting(self):
         with app_harness() as h:
             app = h["app"]
-            app._output_busy = True
+            app.output_pipeline.busy = True
             assert app._discardable_segment_count() == 0
-            app._output_busy = False
+            app.output_pipeline.busy = False
             app._segment_queue = _queued(np.zeros(1600, dtype=np.float32))
             assert app._discardable_segment_count() == 1
             app._meeting_active = lambda: True
@@ -378,7 +378,7 @@ class TestSettingsChangedQueue:
             h["recorder"].configure.reset_mock()
             app._on_settings_changed()
             assert app._segment_queue
-            assert app._deferred_audio_settings is True
+            assert app.reload_snapshot.deferred_audio_settings is True
             h["recorder"].configure.assert_not_called()
 
     def test_pending_segment_count_counts_queue_and_active(self):
@@ -623,7 +623,7 @@ class TestFinalResultFlow:
             app._on_recording_cancel()
 
             assert not app._is_transcribing
-            assert app._pending_record is None
+            assert app.output_pipeline.pending_record is None
             h["recorder"].cancel.assert_called_once()
             h["recorder"].is_recording = False
             h["floating"].show_error.reset_mock()
@@ -698,7 +698,7 @@ class TestFinalResultFlow:
             app._on_recording_stop()
             app._on_recording_finished(np.zeros(0, np.float32))
             app._on_final_result("今天下午三点开会")
-            assert app._output_busy
+            assert app.output_snapshot.busy
 
             app._on_recording_start()
             h["recorder"].is_recording = True

@@ -2,7 +2,6 @@ import hashlib
 import logging
 import os
 import sys
-import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -11,7 +10,15 @@ from typing import Callable, ClassVar
 import pyperclip
 from PyQt6.QtCore import QTimer
 
-from sayink.platform import SYNTHETIC_KEY_TAG
+from sayink.platform.window_input import (
+    TERMINAL_CTRL_SHIFT_V_EXES as _TERMINAL_CTRL_SHIFT_V_EXES,
+    TERMINAL_SHIFT_INSERT_EXES as _TERMINAL_SHIFT_INSERT_EXES,
+    _VK_MENU_MASK as _VK_MENU_MASK,
+    get_foreground_window_win32 as _get_foreground_window_win32,
+    held_stray_modifiers as _held_stray_modifiers,
+    is_ctrl_physically_held as _is_ctrl_physically_held,
+    send_paste_shortcut_win32,
+)
 
 log = logging.getLogger("SayInk")
 
@@ -41,21 +48,6 @@ _NAMED_SNAPSHOT_FORMATS = (
 )
 _GMEM_MOVEABLE = 0x0002
 _GCS_COMPSTR = 0x0008
-
-_TERMINAL_CTRL_SHIFT_V_EXES = frozenset({
-    "windowsterminal.exe",
-    "wt.exe",
-    "wezterm-gui.exe",
-    "alacritty.exe",
-    "kitty.exe",
-    "hyper.exe",
-    "tabby.exe",
-    "rio.exe",
-})
-_TERMINAL_SHIFT_INSERT_EXES = frozenset({
-    "mintty.exe",
-    "putty.exe",
-})
 
 
 @dataclass(frozen=True)
@@ -99,67 +91,11 @@ class PasteResult:
     detail: str = ""
 
 
-def _get_foreground_window_win32():
-    """Windows: get foreground window info via win32gui. Returns (hwnd, title, pid)."""
-    try:
-        import win32gui
-        import win32process
-        hwnd = win32gui.GetForegroundWindow()
-        title = win32gui.GetWindowText(hwnd)
-        _, pid = win32process.GetWindowThreadProcessId(hwnd)
-        return hwnd, title, pid
-    except Exception:
-        log.debug("读取前台窗口失败", exc_info=True)
-        return 0, "", 0
-
-
-def _get_foreground_window_macos():
-    """macOS: get frontmost process PID and name via osascript."""
-    try:
-        out = subprocess.check_output(
-            [
-                "osascript",
-                "-e",
-                'tell application "System Events" to tell (first process whose frontmost is true) '
-                "to return (unix id as text) & linefeed & name",
-            ],
-            timeout=2,
-            text=True,
-        )
-        pid_text, sep, app_name = out.partition("\n")
-        pid = int(pid_text.strip())
-        if pid <= 0 or not sep:
-            return 0, ""
-        return pid, app_name.strip()
-    except Exception:
-        log.debug("osascript 读取前台应用失败", exc_info=True)
-        return 0, ""
-
-
-def _get_foreground_window_linux():
-    """Linux/X11: get active window title via xdotool."""
-    try:
-        wid = subprocess.check_output(
-            ["xdotool", "getactivewindow"], timeout=2, text=True,
-        ).strip()
-        title = subprocess.check_output(
-            ["xdotool", "getactivewindow", "getwindowname"], timeout=2, text=True,
-        ).strip()
-        return int(wid), title
-    except Exception:
-        log.debug("xdotool 读取活动窗口失败", exc_info=True)
-        return 0, ""
-
-
-def get_foreground_window_info():
-    """Returns (handle, title) of the foreground window, cross-platform.
-    On Windows, also provides PID as 3rd element."""
+def get_foreground_window_info() -> tuple:
+    """Return ``(hwnd, title, pid)`` on Windows 10/11, or ``(0, "", 0)`` in headless non-Windows environments."""
     if sys.platform == "win32":
         return _get_foreground_window_win32()
-    elif sys.platform == "darwin":
-        return _get_foreground_window_macos()
-    else:
-        return _get_foreground_window_linux()
+    return 0, "", 0
 
 
 def _process_name_from_window_info(info: tuple) -> str:
@@ -846,131 +782,20 @@ def get_foreground_process_name() -> str:
     return _process_name_from_window_info(info)
 
 
-def _paste_shortcut():
-    """Trigger the system paste shortcut, platform-aware.
-
-    Does not use pyautogui: that import loads Pillow, and the frozen app
-    crashes while decompressing a Pillow module from the PyInstaller archive.
-    """
-    if sys.platform == "win32":
-        _paste_shortcut_win32()
-    elif sys.platform == "darwin":
-        subprocess.run(
-            [
-                "osascript",
-                "-e",
-                'tell application "System Events" to keystroke "v" using command down',
-            ],
-            timeout=2,
-            check=True,
-        )
-    else:
-        subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"], timeout=2, check=True)
+def _paste_shortcut() -> None:
+    """Trigger native Windows paste shortcut (raises OSError in headless non-Windows tests)."""
+    if sys.platform != "win32":
+        raise OSError("当前非 Windows 环境不支持原生按键粘贴")
+    _paste_shortcut_win32()
 
 
-# Sided VKs: re-pressing the generic VK_SHIFT / VK_MENU lands on the left key,
-# so a held right Alt would come back as a left Alt that is never released.
-_VK_LSHIFT, _VK_RSHIFT = 0xA0, 0xA1
-_VK_LCONTROL, _VK_RCONTROL = 0xA2, 0xA3
-_VK_LMENU, _VK_RMENU = 0xA4, 0xA5  # Alt
-_VK_LWIN, _VK_RWIN = 0x5B, 0x5C
-_VK_INSERT = 0x2D
-_SHIFT_VKS = (_VK_LSHIFT, _VK_RSHIFT)
-_CTRL_VKS = (0x11, _VK_LCONTROL, _VK_RCONTROL)
-_EXTENDED_VKS = frozenset((_VK_RCONTROL, _VK_RMENU, _VK_LWIN, _VK_RWIN, _VK_INSERT))
-_KEYEVENTF_EXTENDEDKEY = 0x0001
-# Unassigned VK AutoHotkey uses as a "menu mask": pressed between an Alt/Win
-# down and up it keeps Windows from opening the menu bar / Start on release.
-_VK_MENU_MASK = 0xE8
-_STRAY_MODIFIER_VKS = (_VK_LSHIFT, _VK_RSHIFT, _VK_LMENU, _VK_RMENU, _VK_LWIN, _VK_RWIN)
-
-
-def _held_stray_modifiers(user32) -> list[int]:
-    return [vk for vk in _STRAY_MODIFIER_VKS if user32.GetAsyncKeyState(vk) & 0x8000]
-
-
-def _is_ctrl_physically_held(user32) -> bool:
-    return any(bool(user32.GetAsyncKeyState(vk) & 0x8000) for vk in _CTRL_VKS)
-
-
-def _paste_shortcut_win32(mode: str | None = None):
-    """Send paste keystroke with the Win32 keyboard API.
-
-    Preserves physically held Ctrl (never forcefully releases user's physical Ctrl),
-    lifts stray Alt/Shift/Win modifiers around the shortcut, and supports
-    terminal modes (``ctrl_shift_v`` and ``shift_insert``).
-    """
-    import ctypes
-
-    effective_mode = mode or _ACTIVE_PASTE_MODE or "ctrl_v"
-    user32 = ctypes.windll.user32
-    from ctypes import wintypes
-
-    for _fn_name, _args, _res in (
-        ("MapVirtualKeyW", [wintypes.UINT, wintypes.UINT], wintypes.UINT),
-        ("GetAsyncKeyState", [ctypes.c_int], wintypes.SHORT),
-        (
-            "keybd_event",
-            [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t],
-            None,
-        ),
-    ):
-        _fn = getattr(user32, _fn_name, None)
-        if _fn is not None and hasattr(_fn, "argtypes"):
-            _fn.argtypes = _args
-            _fn.restype = _res
-    vk_control = 0x11
-    vk_shift = 0x10
-    vk_v = 0x56
-    key_up = 0x0002
-
-    def _tap(vk: int, flags: int) -> None:
-        scan = user32.MapVirtualKeyW(vk, 0)
-        if vk in _EXTENDED_VKS:
-            flags |= _KEYEVENTF_EXTENDEDKEY
-        user32.keybd_event(vk, scan, flags, SYNTHETIC_KEY_TAG)
-
-    held = _held_stray_modifiers(user32)
-    ctrl_held = _is_ctrl_physically_held(user32)
-    for vk in held:
-        _tap(vk, key_up)
-
-    if effective_mode == "shift_insert":
-        held_ctrls = (
-            [cvk for cvk in (_VK_LCONTROL, _VK_RCONTROL) if user32.GetAsyncKeyState(cvk) & 0x8000]
-            if ctrl_held
-            else []
-        )
-        for cvk in held_ctrls:
-            _tap(cvk, key_up)
-        _tap(vk_shift, 0)
-        _tap(_VK_INSERT, 0)
-        _tap(_VK_INSERT, key_up)
-        _tap(vk_shift, key_up)
-        for cvk in held_ctrls:
-            _tap(cvk, 0)
-    elif effective_mode == "ctrl_shift_v":
-        if not ctrl_held:
-            _tap(vk_control, 0)
-        _tap(vk_shift, 0)
-        _tap(vk_v, 0)
-        _tap(vk_v, key_up)
-        _tap(vk_shift, key_up)
-        if not ctrl_held:
-            _tap(vk_control, key_up)
-    else:
-        if not ctrl_held:
-            _tap(vk_control, 0)
-        _tap(vk_v, 0)
-        _tap(vk_v, key_up)
-        if not ctrl_held:
-            _tap(vk_control, key_up)
-
-    for vk in held:
-        _tap(vk, 0)
-    if any(vk not in _SHIFT_VKS for vk in held):
-        _tap(_VK_MENU_MASK, 0)
-        _tap(_VK_MENU_MASK, key_up)
+def _paste_shortcut_win32(mode: str | None = None) -> None:
+    """Send paste keystroke chord with the Win32 keyboard API."""
+    send_paste_shortcut_win32(
+        mode or _ACTIVE_PASTE_MODE or "ctrl_v",
+        held_modifiers_fn=_held_stray_modifiers,
+        ctrl_held_fn=_is_ctrl_physically_held,
+    )
 
 
 def _verify_paste_target(hwnd_before: int) -> bool:
@@ -1116,6 +941,94 @@ class TextPaster:
             return info_now, "ime_active"
         return info_now, ""
 
+    def _run_delayed_restore(
+        self,
+        seq: int,
+        old_snapshot: ClipboardSnapshot | None,
+        expected_clip_seq: int | None,
+        text: str,
+    ) -> None:
+        if seq != self._paste_seq:
+            return
+        self._clear_clipboard_restore()
+        if old_snapshot is None:
+            return
+        try:
+            if self._clipboard_paste_blocker(expected_clip_seq, text):
+                log.debug("剪贴板内容已变化或无法核对，跳过恢复旧剪贴板")
+                return
+            self._restore_clipboard_snapshot(old_snapshot, text)
+        except Exception:
+            log.debug("恢复原剪贴板失败", exc_info=True)
+
+    def _run_delayed_verify(
+        self,
+        seq: int,
+        hwnd: int,
+        target_app: str,
+        old_snapshot: ClipboardSnapshot | None,
+        expected_clip_seq: int | None,
+        text: str,
+        finish: Callable[[PasteResult], None],
+    ) -> None:
+        if seq != self._paste_seq:
+            return
+        if _verify_paste_target(hwnd):
+            if self.restore_clipboard and old_snapshot:
+                QTimer.singleShot(
+                    RESTORE_CLIPBOARD_DELAY_MS,
+                    lambda: self._run_delayed_restore(seq, old_snapshot, expected_clip_seq, text),
+                )
+            finish(PasteResult("sent", target_app=target_app))
+            return
+        log.info("粘贴键已发出，但随后焦点切换，无法确认是否已插入")
+        detail = (
+            "clipboard_changed_after_send"
+            if self._clipboard_paste_blocker(expected_clip_seq, text)
+            else "focus_changed_after_send"
+        )
+        finish(PasteResult("unverified", target_app=target_app, detail=detail))
+
+    def _run_delayed_paste(
+        self,
+        seq: int,
+        hwnd: int,
+        target_app: str,
+        baseline_snapshot: PasteTargetSnapshot | None,
+        old_snapshot: ClipboardSnapshot | None,
+        expected_clip_seq: int | None,
+        text: str,
+        finish: Callable[[PasteResult], None],
+    ) -> None:
+        global _ACTIVE_PASTE_MODE
+        if seq != self._paste_seq:
+            return
+        info_now, skip_now = self._recheck_target_before_send(hwnd, baseline_snapshot)
+        paste_mode = detect_terminal_paste_mode(info_now, target_app or "") if not skip_now else None
+        clipboard_blocker = self._clipboard_paste_blocker(expected_clip_seq, text)
+        if clipboard_blocker:
+            finish(PasteResult("skipped", target_app=target_app, detail=clipboard_blocker))
+            return
+        if skip_now:
+            finish(PasteResult("clipboard", target_app=target_app, detail=skip_now))
+            return
+        prev_mode = _ACTIVE_PASTE_MODE
+        _ACTIVE_PASTE_MODE = paste_mode
+        try:
+            _paste_shortcut()
+        except Exception as exc:
+            log.warning("模拟粘贴失败: %s", exc)
+            finish(PasteResult("clipboard", target_app=target_app))
+            return
+        finally:
+            _ACTIVE_PASTE_MODE = prev_mode
+        QTimer.singleShot(
+            VERIFY_AFTER_PASTE_MS,
+            lambda: self._run_delayed_verify(
+                seq, hwnd, target_app, old_snapshot, expected_clip_seq, text, finish
+            ),
+        )
+
     def paste_async(
         self,
         text: str,
@@ -1124,15 +1037,7 @@ class TextPaster:
         target_hwnd: int | None = None,
         target_app: str | None = None,
     ) -> None:
-        """
-        Copy text and attempt paste after a short delay, then verify focus
-        stayed on the target window. Invokes callback with result status.
-
-        ``target_hwnd is None`` keeps the legacy behaviour of reading the
-        foreground window now. A remembered handle is the window from the
-        start of the utterance: keys are sent only if that same window is
-        still in front and can accept them.
-        """
+        """Copy text, synthesize paste after a short delay, and verify target focus."""
         if not text:
             callback(PasteResult("error", detail="空文本"))
             return
@@ -1140,7 +1045,7 @@ class TextPaster:
         info = get_foreground_window_info()
         (
             hwnd,
-            target_app,
+            resolved_app,
             has_target,
             baseline_snapshot,
             skip_detail,
@@ -1151,85 +1056,41 @@ class TextPaster:
         seq = self._paste_seq
         old_snapshot = self._prepare_clipboard_backup()
 
-        report = callback
-
-        def callback(result: PasteResult) -> None:
+        def finish(result: PasteResult) -> None:
             restoring = bool(result.status == "sent" and self.restore_clipboard and old_snapshot)
             if not restoring and seq == self._paste_seq:
                 self._clear_clipboard_restore()
-            report(result)
+            callback(result)
 
         try:
             pyperclip.copy(text)
-        except Exception as e:
-            log.error("写入剪贴板失败: %s", e)
-            callback(PasteResult("error", target_app=target_app, detail=str(e)))
+        except Exception as exc:
+            log.error("写入剪贴板失败: %s", exc)
+            finish(PasteResult("error", target_app=resolved_app, detail=str(exc)))
             return
 
         expected_clip_seq = self._current_clipboard_seq()
         self._restore_expected = (expected_clip_seq, text) if old_snapshot else None
 
         if not has_target:
-            callback(PasteResult("clipboard", target_app=target_app or "", detail=skip_detail))
+            finish(PasteResult("clipboard", target_app=resolved_app or "", detail=skip_detail))
             return
 
         if not checked_uipi and target_rejects_synthetic_input(info):
             log.info("目标窗口以更高权限运行，系统会拦截模拟粘贴；已复制到剪贴板")
-            callback(PasteResult("clipboard", target_app=target_app, detail="elevated"))
+            finish(PasteResult("clipboard", target_app=resolved_app, detail="elevated"))
             return
 
-        def _restore_clipboard():
-            if seq != self._paste_seq:
-                return  # a later paste restores the same original
-            self._clear_clipboard_restore()
-            if old_snapshot is None:
-                return
-            try:
-                if self._clipboard_paste_blocker(expected_clip_seq, text):
-                    log.debug("剪贴板内容已变化或无法核对，跳过恢复旧剪贴板")
-                    return
-                self._restore_clipboard_snapshot(old_snapshot, text)
-            except Exception:
-                log.debug("恢复原剪贴板失败", exc_info=True)
-
-        def _do_paste():
-            global _ACTIVE_PASTE_MODE
-            if seq != self._paste_seq:
-                return
-            info_now, skip_now = self._recheck_target_before_send(hwnd, baseline_snapshot)
-            paste_mode = detect_terminal_paste_mode(info_now, target_app or "") if not skip_now else None
-            clipboard_blocker = self._clipboard_paste_blocker(expected_clip_seq, text)
-            if clipboard_blocker:
-                callback(PasteResult("skipped", target_app=target_app, detail=clipboard_blocker))
-                return
-            if skip_now:
-                callback(PasteResult("clipboard", target_app=target_app, detail=skip_now))
-                return
-            prev_mode = _ACTIVE_PASTE_MODE
-            _ACTIVE_PASTE_MODE = paste_mode
-            try:
-                _paste_shortcut()
-            except Exception as e:
-                log.warning("模拟粘贴失败: %s", e)
-                callback(PasteResult("clipboard", target_app=target_app))
-                return
-            finally:
-                _ACTIVE_PASTE_MODE = prev_mode
-            QTimer.singleShot(VERIFY_AFTER_PASTE_MS, _verify)
-
-        def _verify():
-            if seq != self._paste_seq:
-                return
-            if _verify_paste_target(hwnd):
-                if self.restore_clipboard and old_snapshot:
-                    QTimer.singleShot(RESTORE_CLIPBOARD_DELAY_MS, _restore_clipboard)
-                callback(PasteResult("sent", target_app=target_app))
-            else:
-                log.info("粘贴键已发出，但随后焦点切换，无法确认是否已插入")
-                detail = (
-                    "clipboard_changed_after_send" if self._clipboard_paste_blocker(expected_clip_seq, text)
-                    else "focus_changed_after_send"
-                )
-                callback(PasteResult("unverified", target_app=target_app, detail=detail))
-
-        QTimer.singleShot(PASTE_DELAY_MS, _do_paste)
+        QTimer.singleShot(
+            PASTE_DELAY_MS,
+            lambda: self._run_delayed_paste(
+                seq,
+                hwnd,
+                resolved_app,
+                baseline_snapshot,
+                old_snapshot,
+                expected_clip_seq,
+                text,
+                finish,
+            ),
+        )

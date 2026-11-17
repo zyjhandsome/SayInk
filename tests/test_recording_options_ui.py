@@ -24,12 +24,13 @@ def settings(config, monkeypatch):
 
 def test_optional_recording_controls_save_without_discarding_runtime_queue(settings, config):
     changes, runtime = QSignalSpy(settings.audio_options_changed), QSignalSpy(settings.settings_changed)
-    assert not settings._recovery_row.isChecked() and not settings._separate_lanes_row.isChecked()
-    settings._recovery_row.setChecked(True)
+    assert settings.general_page.meeting_save_audio_row.isChecked()
+    assert not settings._separate_lanes_row.isChecked()
+    settings.general_page.meeting_save_audio_row.setChecked(False)
     settings._separate_lanes_row.setChecked(True)
-    assert config.get("audio.recovery_enabled") is True
+    assert config.get("meeting.save_audio") is False
     assert config.get("audio.separate_lanes") is True
-    assert len(changes) == 2 and len(runtime) == 0
+    assert len(changes) == 1 and len(runtime) == 0
 
 
 def test_quiet_speech_switch_is_hidden_and_not_in_recording_or_recognition_sections(settings):
@@ -64,10 +65,10 @@ def test_recovery_dialog_selects_raw_tracks_and_recognizes_locally(tmp_path):
     dialog.deleteLater()
 
 
-def test_recovery_button_routes_to_app_without_enabling_recording(settings, config):
-    requested = QSignalSpy(settings.audio_recovery_requested)
-    settings._recovery_btn.click()
-    assert len(requested) == 1 and not config.get("audio.recovery_enabled")
+def test_meeting_save_audio_defaults_on_and_does_not_enable_dictation_cache(settings, config):
+    assert settings.general_page.meeting_save_audio_row.isChecked()
+    assert config.get("meeting.save_audio", True) is True
+    assert not config.get("audio.recovery_enabled")
 
 
 def test_recovery_dialog_accepts_adaptive_quiet_none(tmp_path):

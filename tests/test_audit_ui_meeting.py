@@ -363,25 +363,24 @@ def test_c08_h49_start_card_compact_910x472_and_model_combo_1024x680(tmp_path, m
             _settle(6)
 
             assert p._stack.currentIndex() == PAGE_START
-            assert p._opt_save_audio.isChecked() is True
+            assert not hasattr(p, "_opt_save_audio")
             assert p._opt_loopback_hint.isVisible()
             assert "Realtek" in p._opt_loopback_hint.text()
 
-            # Core combos and save_audio checkbox sit above the fold without scrolling on 910x472
+            # Core combos sit above the fold without scrolling on 910x472.
+            # Saving the recording is a settings default, not a start-card control.
             vp = p._start_scroll.viewport()
             vp_global = _global_rect(vp)
-            for core_widget in (p._opt_source, p._opt_model, p._opt_language, p._opt_save_audio):
+            for core_widget in (p._opt_source, p._opt_model, p._opt_language):
                 w_rect = _global_rect(core_widget)
                 assert vp_global.contains(w_rect), f"{core_widget.accessibleName()} clipped out of 910x472 fold: {w_rect} vs {vp_global}"
             assert p._card_start.isVisible()
 
-            # Toggling save_audio persists to config and MeetingOptions
-            p._opt_save_audio.setChecked(False)
-            assert cfg.get("meeting.save_audio") is False
             opts = p._options_from_card()
-            assert getattr(opts, "save_audio", None) is False
-            p._opt_save_audio.setChecked(True)
-            assert cfg.get("meeting.save_audio") is True
+            assert getattr(opts, "save_audio", None) is True
+            cfg.set("meeting.save_audio", False)
+            assert p._options_from_card().save_audio is False
+            cfg.set("meeting.save_audio", True)
 
             # Switching to microphone hides loopback hint
             mic_idx = p._opt_source.findData("microphone")

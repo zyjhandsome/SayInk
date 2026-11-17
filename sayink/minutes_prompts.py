@@ -565,6 +565,23 @@ class MeetingContext:
     glossary_terms: list[str] = field(default_factory=list)
 
 
+USER_NOTES_OUTLINE_DIRECTIVE = (
+    "【会中手记主干融合要求】用户在会中记录了以下提纲/手记。请优先以这些手记条目作为纪要的章节与议题主干骨架，"
+    "逐条对照文字稿补全对应的发言人、讨论结论、待办细节与出处时间戳；"
+    "手记中写明但文字稿未直接提及的事项必须保留，并在末尾标注「（待核对）」，严禁编造事实："
+)
+
+
+def extract_user_note_outline(notes_user: str) -> list[str]:
+    """Extract non-empty outline items from ``notes_user`` while preserving author order."""
+    items: list[str] = []
+    for raw in (notes_user or "").splitlines():
+        cleaned = raw.strip()
+        if cleaned:
+            items.append(cleaned)
+    return items
+
+
 def build_user_prompt(context: MeetingContext, transcript_text: str, *, chunk_label: str = "") -> str:
     head = ["会议信息："]
     head.append(f"- 标题：{context.title or '（未填写）'}")
@@ -578,6 +595,7 @@ def build_user_prompt(context: MeetingContext, transcript_text: str, *, chunk_la
     for offset_ms, note in context.marks:
         notes.append(f"- [{format_timestamp(offset_ms)}] 标记{('：' + note) if note else ''}")
     if context.notes_user.strip():
+        notes.append(USER_NOTES_OUTLINE_DIRECTIVE)
         notes.append(context.notes_user.strip())
     body = "\n".join(head)
     body += "\n\n用户标记与笔记：\n" + ("\n".join(notes) if notes else "（无）")

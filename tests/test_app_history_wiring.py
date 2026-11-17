@@ -96,7 +96,7 @@ def test_history_write_failure_warns_once_per_run() -> None:
         QApplication.processEvents()
         assert h["tray"].showMessage.call_count == 1
         assert "保存失败" in h["tray"].showMessage.call_args[0][1]
-        assert app._history_failure_notified is True
+        assert app.output_pipeline.history_failure_notified is True
 
 
 def test_quit_closes_history_before_saving_config() -> None:
@@ -286,7 +286,7 @@ def _backlog_session(h):
     _start_continuous_user_session(app)
     recorder.is_continuous = True
     recorder.stop_continuous.side_effect = lambda: setattr(recorder, "is_continuous", False)
-    app._output_busy = True
+    app.output_pipeline.busy = True
     return app
 
 
@@ -796,17 +796,17 @@ def test_stuck_polish_falls_back_to_raw_text() -> None:
         app._begin_transcription(_audio())
         app._on_final_result("AAA")
         app._enqueue_audio(_audio())
-        assert app._output_busy is True
+        assert app.output_snapshot.busy is True
         assert not paster.paste_async.called
 
-        app._output_pipeline().release_stuck_output(app._output_token)
+        app.output_pipeline.release_stuck_output(app.output_pipeline.token)
 
         # The raw words went to the paster as a degraded output ...
         assert paster.paste_async.call_args[0][0] == "AAA"
-        assert app._output_busy is True
+        assert app.output_snapshot.busy is True
         paster.paste_async.call_args[0][1]("pasted")
         # ... and the queue moves on once that paste reports back.
-        assert app._output_busy is False
+        assert app.output_snapshot.busy is False
         app._pump_segment_queue()
         assert h["recognizer"].transcribe_final.call_count == 2
         records = _enqueued_records(h["history"])
@@ -818,7 +818,7 @@ def test_polish_answering_after_the_timeout_is_not_pasted_again() -> None:
         app, paster = h["app"], h["paster"]
         app._begin_transcription(_audio())
         app._on_final_result("AAA")
-        app._output_pipeline().release_stuck_output(app._output_token)
+        app.output_pipeline.release_stuck_output(app.output_pipeline.token)
         assert h["polisher"].cancel.called
         paster.paste_async.call_args[0][1]("pasted")
 
@@ -836,9 +836,9 @@ def test_stuck_paste_releases_queue_and_keeps_words_on_clipboard() -> None:
         app._enqueue_audio(_audio())
         assert paster.paste_async.call_args[0][0] == "AAA。"
 
-        app._output_pipeline().release_stuck_output(app._output_token)
+        app.output_pipeline.release_stuck_output(app.output_pipeline.token)
 
-        assert app._output_busy is False
+        assert app.output_snapshot.busy is False
         copy.assert_called_once_with("AAA。")
         # No second paste attempt: Ctrl+V may already have landed.
         # A shortcut still waiting out its delay must not fire after this.
@@ -857,11 +857,11 @@ def test_stuck_paste_still_saves_the_sentence_to_history() -> None:
         app._on_polish_complete("AAA。")
         assert _enqueued_records(h["history"]) == []
 
-        app._output_pipeline().release_stuck_output(app._output_token)
+        app.output_pipeline.release_stuck_output(app.output_pipeline.token)
 
         records = _enqueued_records(h["history"])
         assert [(r.raw_text, r.polished_text) for r in records] == [("AAA", "AAA。")]
-        assert app._output_stage_record is None
+        assert app.output_pipeline.stage_record is None
 
 
 def test_polish_reply_that_normalises_to_nothing_outputs_raw() -> None:
@@ -877,20 +877,20 @@ def test_polish_reply_that_normalises_to_nothing_outputs_raw() -> None:
         paster.paste_async.call_args[0][1]("pasted")
         record = _enqueued_records(h["history"])[0]
         assert (record.raw_text, record.polished_text) == ("我们走吧", "我们走吧")
-        assert app._output_busy is False
-        assert app._output_stage is OutputStage.IDLE
+        assert app.output_snapshot.busy is False
+        assert app.output_snapshot.stage is OutputStage.IDLE
 
 
 def test_empty_output_releases_stage_and_pending_record() -> None:
     with app_harness({"llm.enabled": False}) as h:
         app = h["app"]
         app._begin_transcription(_audio())
-        app._output_stage = OutputStage.PASTE
+        app.output_pipeline.stage = OutputStage.PASTE
         app._output_text("   ")
 
-        assert app._output_busy is False
-        assert app._output_stage is OutputStage.IDLE
-        assert app._pending_record is None
+        assert app.output_snapshot.busy is False
+        assert app.output_snapshot.stage is OutputStage.IDLE
+        assert app.output_pipeline.pending_record is None
         assert not h["paster"].paste_async.called
         assert h["floating"].show_error.called
 
@@ -898,13 +898,13 @@ def test_empty_output_releases_stage_and_pending_record() -> None:
 def test_stale_watchdog_does_not_release_a_newer_output() -> None:
     with app_harness(_POLISH_ON) as h:
         app = h["app"]
-        app._output_pipeline().mark_busy()
-        stale = app._output_token
-        app._output_pipeline().mark_busy()
+        app.output_pipeline.mark_busy()
+        stale = app.output_pipeline.token
+        app.output_pipeline.mark_busy()
 
-        app._output_pipeline().release_stuck_output(stale)
+        app.output_pipeline.release_stuck_output(stale)
 
-        assert app._output_busy is True
+        assert app.output_snapshot.busy is True
 
 
 def test_polish_reply_far_longer_than_speech_falls_back_to_raw() -> None:
@@ -971,7 +971,7 @@ def test_history_only_output_records_without_pasting() -> None:
         assert [r.raw_text for r in records] == ["远端在说话"]
         assert records[0].target_app == ""
         assert h["floating"].show_success.call_args[0][0] == "已保存到历史"
-        assert app._output_busy is False
+        assert app.output_snapshot.busy is False
 
 
 def test_history_only_single_shot_says_where_the_words_went() -> None:
@@ -1177,7 +1177,7 @@ def test_model_load_hint_uses_last_measured_duration() -> None:
 
         app._on_model_load_progress(ModelLoadPhase.LOADING, "正在加载 SenseVoice…")
         assert "约 10–40 秒" in h["floating"].show_model_loading.call_args[0][0]
-        app._load_started_at -= 12.0
+        app.reload_coordinator.load_started_at -= 12.0
         app._on_model_load_progress(ModelLoadPhase.READY, "模型已就绪")
         assert round(h["store"]["stt_load_seconds"]["sensevoice"]) == 12
 

@@ -1528,21 +1528,32 @@ class FloatingWindow(QWidget):
         self._hide_timer.stop()
         self._present()
 
-    def show_recording(self):
-        continuing = self._hold_capture() and self._status_label.text() == "录音中" and self.isVisible()
+    @property
+    def status_text(self) -> str:
+        """Public un-elided status headline currently shown on the floating bar."""
+        return self._full_status_text or self._status_label.text()
+
+    @property
+    def excerpt_text(self) -> str:
+        """Public subtitle/excerpt line currently shown on the floating bar."""
+        return self._text_label.toolTip() or self._text_label.text()
+
+    def show_recording(self, *, title: str = "录音中", hint: str = ""):
+        continuing = self._hold_capture() and self._status_label.text() == title and self.isVisible()
         self._listening_active = False
         self._capture_active = True
         self._capture_released = False
         if self._live_text:
             self._show_capture_transcript(self._live_text)
             return
-        if continuing and "松开识别" in self._text_label.text():
+        excerpt = hint or "松开识别 · Esc 取消本次录音，不保留内容"
+        if continuing and excerpt in (self._text_label.toolTip() or self._text_label.text()):
             return
-        self._set_state("录音中", "STATE_RECORD", pulse=True)
+        self._set_state(title, "STATE_RECORD", pulse=True)
         self._waveform.set_compact(False)
         self._waveform.show()
         self._waveform.start()
-        self._apply_excerpt("松开识别 · Esc 取消本次录音，不保留内容")
+        self._apply_excerpt(excerpt)
         self._status_label.setToolTip("松开快捷键后识别；Esc 取消本次录音，不保留本次内容。")
         self._present()
 
@@ -1642,11 +1653,11 @@ class FloatingWindow(QWidget):
             self._apply_excerpt(display)
         self._present()
 
-    def show_polishing(self, text: str = "", *, action: str = "润色"):
-        """``action`` is the configured LLM step: 润色 or 纠错."""
+    def show_polishing(self, text: str = "", *, action: str = "润色", preset_label: str = ""):
+        """``action`` is the configured LLM step (润色 / 纠错 / 改写); ``preset_label`` shows active app preset."""
         if self._meeting_bar_stays(text or self._live_text):
             return
-        busy = f"{action}中"
+        busy = f"{action}中 · {preset_label}" if preset_label else f"{action}中"
         if self._hold_capture():
             if self._live_text:
                 self._show_capture_transcript(self._live_text)

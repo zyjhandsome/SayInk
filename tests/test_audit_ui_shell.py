@@ -608,7 +608,7 @@ class TestSettingsAccessibilityAndSafeguards:
         gp = fast_settings_window.general_page
         assert gp.advanced_mixing_panel.isHidden()
         assert gp.advanced_network_panel.isHidden()
-        assert gp.advanced_recovery_panel.isHidden()
+        assert gp.meeting_save_audio_row.isChecked()
 
         # Proxy link on Polish page jumps to General page & expands network panel
         fast_settings_window.show_page(2)

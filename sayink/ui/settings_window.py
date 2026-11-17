@@ -109,8 +109,7 @@ _GENERAL_LEGACY_NAMES = (
     "_llm_proxy_combo",
     "_llm_proxy_suffix_edit",
     "_listen_bar_autohide_row",
-    "_recovery_row",
-    "_recovery_btn",
+    "_meeting_save_audio_row",
     "_meeting_language_combo",
     "_meeting_glossary_edit",
     "_recognition_capability_label",
@@ -198,6 +197,13 @@ _LEGACY_PAGE_ATTRS: dict[str, tuple[str, str]] = {
 }
 
 
+def _host_surface(selector: str) -> str:
+    """Opaque page color for a settings host. Transparent hosts show the desktop."""
+    from sayink.ui import design_tokens as tok
+
+    return f"{selector} {{ background: {tok.BG}; }}"
+
+
 class _ModelDirMoveWorker(QThread):
     """Background worker moving model folders off the UI thread."""
 
@@ -228,9 +234,9 @@ class _ModelDirMoveWorker(QThread):
 
 class SettingsWindow(QWidget):
     hotkey_updated = pyqtSignal(str)
+    extra_hotkeys_updated = pyqtSignal()
     settings_changed = pyqtSignal()
     audio_options_changed = pyqtSignal()
-    audio_recovery_requested = pyqtSignal()
     auto_start_changed = pyqtSignal(bool)
     sound_enabled_changed = pyqtSignal(bool)
     restore_clipboard_changed = pyqtSignal(bool)
@@ -321,7 +327,7 @@ class SettingsWindow(QWidget):
         content_wrap = QWidget()
         self._content_wrap = content_wrap
         content_wrap.setObjectName("settingsContent")
-        content_wrap.setStyleSheet("QWidget#settingsContent { background: transparent; }")
+        content_wrap.setStyleSheet(_host_surface("QWidget#settingsContent"))
         content_lay = QVBoxLayout(content_wrap)
         content_lay.setContentsMargins(0, 0, 0, 0)
         content_lay.setSpacing(0)
@@ -329,7 +335,7 @@ class SettingsWindow(QWidget):
         pages_host = QWidget()
         self._pages_host = pages_host
         pages_host.setObjectName("settingsPagesHost")
-        pages_host.setStyleSheet("QWidget#settingsPagesHost { background: transparent; }")
+        pages_host.setStyleSheet(_host_surface("QWidget#settingsPagesHost"))
         pages_lay = QHBoxLayout(pages_host)
         pages_lay.setContentsMargins(6, 8, 6, 20)
         pages_lay.setSpacing(0)
@@ -337,7 +343,7 @@ class SettingsWindow(QWidget):
         self._pages = QStackedWidget()
         self._pages.setObjectName("settingsPages")
         self._pages.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._pages.setStyleSheet("QStackedWidget#settingsPages { background: transparent; }")
+        self._pages.setStyleSheet(_host_surface("QStackedWidget#settingsPages"))
 
         self.general_page = GeneralSettingsPage()
         self.model_page = ModelSettingsPage()
@@ -359,6 +365,12 @@ class SettingsWindow(QWidget):
         gp.hotkey_capture_ended.connect(self.hotkey_capture_ended.emit)
         gp.hotkey_changed.connect(self._apply_hotkey_setting)
         gp.hotkey_reset_requested.connect(self._restore_default_hotkey)
+        gp.paste_last_hotkey_changed.connect(
+            lambda hk: self._apply_optional_hotkey("audio.paste_last_hotkey", hk, gp.paste_last_hotkey_edit)
+        )
+        gp.rewrite_hotkey_changed.connect(
+            lambda hk: self._apply_optional_hotkey("audio.rewrite_hotkey", hk, gp.rewrite_hotkey_edit)
+        )
         gp.esc_stop_toggled.connect(self._on_esc_stop_toggled)
         gp.input_source_toggled.connect(self._on_input_source_radio_toggled)
         gp.output_mode_changed.connect(self._on_output_mode_changed)
@@ -386,8 +398,6 @@ class SettingsWindow(QWidget):
         gp.history_enabled_toggled.connect(self._on_history_enabled_toggled)
         gp.history_limits_changed.connect(self._on_history_limits_changed)
         gp.history_limits_editing_finished.connect(self._commit_pending_history_limits)
-        gp.recovery_toggled.connect(self._on_recovery_toggled)
-        gp.audio_recovery_requested.connect(self.audio_recovery_requested.emit)
 
         mp = self.model_page
         mp.change_model_dir_requested.connect(self._change_model_dir)
@@ -398,6 +408,7 @@ class SettingsWindow(QWidget):
         pp.llm_enable_toggled.connect(self._on_llm_enable_toggled)
         pp.llm_mode_changed.connect(self._on_llm_mode_changed)
         pp.llm_fields_edited.connect(self._flush_llm_fields)
+        pp.app_presets_edited.connect(self._flush_app_presets)
         pp.prompt_reset_requested.connect(self._reset_prompt)
         pp.llm_test_requested.connect(self._test_llm)
         pp.proxy_settings_requested.connect(self._open_proxy_settings)
@@ -423,9 +434,9 @@ class SettingsWindow(QWidget):
 
         _set_css(self, _settings_styles.WINDOW_CSS)
         if isinstance(self, SettingsWindow):
-            _set_css(self._content_wrap, "QWidget#settingsContent { background: transparent; }")
-            _set_css(self._pages_host, "QWidget#settingsPagesHost { background: transparent; }")
-            _set_css(self._pages, "QStackedWidget#settingsPages { background: transparent; }")
+            _set_css(self._content_wrap, _host_surface("QWidget#settingsContent"))
+            _set_css(self._pages_host, _host_surface("QWidget#settingsPagesHost"))
+            _set_css(self._pages, _host_surface("QStackedWidget#settingsPages"))
         _reapply_subtree(self)
         if isinstance(self, SettingsWindow):
             self.general_page.apply_theme()
@@ -1431,11 +1442,6 @@ class SettingsWindow(QWidget):
 
         without_scroll_jump(gp.history_enabled_row, change)
 
-    def _on_recovery_toggled(self, checked: bool) -> None:
-        if not self._loading:
-            self._config.set("audio.recovery_enabled", bool(checked))
-            self.audio_options_changed.emit()
-
     def _on_separate_lanes_toggled(self, checked: bool) -> None:
         if not self._loading:
             self._config.set("audio.separate_lanes", bool(checked))
@@ -1535,6 +1541,7 @@ class SettingsWindow(QWidget):
         self._config.set("meeting.input_source", str(gp.meeting_source_combo.currentData() or "mixed"))
         self._config.set("meeting.model_id", str(gp.meeting_model_combo.currentData() or ""))
         self._config.set("meeting.show_start_card", bool(gp.meeting_start_card_row.isChecked()))
+        self._config.set("meeting.save_audio", bool(gp.meeting_save_audio_row.isChecked()))
         self._refresh_meeting_defaults()
 
     def _on_recognition_setting_changed(self, *_args) -> None:
@@ -1651,6 +1658,64 @@ class SettingsWindow(QWidget):
             self.hotkey_updated.emit(hotkey)
         self._refresh_about_runtime_rows()
         self._refresh_hotkey_hint()
+
+    def _apply_optional_hotkey(self, config_key: str, raw_hotkey: str, edit_widget) -> None:
+        if self._loading:
+            return
+        cleaned = (raw_hotkey or "").strip().lower()
+        if not cleaned:
+            old = str(self._config.get(config_key, "") or "")
+            self._config.set(config_key, "")
+            self._config.save_immediate()
+            if old:
+                self.extra_hotkeys_updated.emit()
+            self.general_page.show_hotkey_feedback("", error=False)
+            return
+        parts = [p.strip() for p in cleaned.split("+") if p.strip()]
+        modifiers = {"ctrl", "alt", "shift", "win", "cmd"}
+        has_mod = any(p in modifiers for p in parts)
+        other_key = (
+            "audio.rewrite_hotkey"
+            if config_key == "audio.paste_last_hotkey"
+            else "audio.paste_last_hotkey"
+        )
+        primary = str(self._config.get("hotkey", DEFAULT_HOTKEY) or "").strip().lower()
+        sibling = str(self._config.get(other_key, "") or "").strip().lower()
+        problem = ""
+        if not has_mod or len(parts) < 2:
+            problem = "扩展快捷键须包含修饰键 + 主键（例如 Alt + V 或 Alt + R）。"
+        elif is_reserved_hotkey(cleaned):
+            problem = f"{format_hotkey(cleaned)} 是系统常用快捷键，请换一个组合。"
+        elif cleaned in {primary, sibling}:
+            problem = f"{format_hotkey(cleaned)} 已被其他功能绑定，请换一个组合。"
+        if problem:
+            prev = str(self._config.get(config_key, "") or "")
+            self._loading = True
+            try:
+                edit_widget.set_value(prev)
+            finally:
+                self._loading = False
+            self.general_page.show_hotkey_feedback(problem, error=True)
+            return
+        self._config.set(config_key, cleaned)
+        self._config.save_immediate()
+        self.general_page.show_hotkey_feedback("", error=False)
+        self.extra_hotkeys_updated.emit()
+
+    def _flush_app_presets(self) -> None:
+        if self._loading:
+            return
+        pp = self.polish_page
+        rules, note = pp.parse_app_presets()
+        self._config.set("llm.app_presets", rules)
+        if note:
+            pp.app_presets_status.show()
+            self._set_llm_status(pp.app_presets_status, note, "error")
+        elif rules:
+            pp.app_presets_status.show()
+            self._set_llm_status(pp.app_presets_status, f"已绑定 {len(rules)} 个应用预设规则。", "ok")
+        else:
+            pp.app_presets_status.hide()
 
     def _restore_default_hotkey(self) -> None:
         if not self._confirm(

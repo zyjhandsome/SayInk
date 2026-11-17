@@ -158,7 +158,7 @@ def test_all_subpage_type_annotations_carry_concrete_widget_instances(qapp, tmp_
     about = AboutSettingsPage(cfg)
 
     expected_counts = (
-        (GeneralSettingsPage, general, _GENERAL_LEGACY_NAMES, 71),
+            (GeneralSettingsPage, general, _GENERAL_LEGACY_NAMES, 70),
         (ModelSettingsPage, model, _MODEL_LEGACY_NAMES, 10),
         (PolishSettingsPage, polish, _POLISH_LEGACY_NAMES, 24),
         (AboutSettingsPage, about, _ABOUT_LEGACY_NAMES, 13),
@@ -231,7 +231,7 @@ def test_settings_window_holds_typed_pages_and_delegates_legacy_attrs_cleanly(
         assert win._pages.widget(3) is win.about_page
 
         # Legacy aliases are mapped to their subpages and never injected into SettingsWindow.
-        assert len(_LEGACY_PAGE_ATTRS) == 118
+        assert len(_LEGACY_PAGE_ATTRS) == 117
         assert set(_LEGACY_PAGE_ATTRS).isdisjoint(win.__dict__)
 
         for legacy_name, (page_attr, field_name) in _LEGACY_PAGE_ATTRS.items():

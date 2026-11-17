@@ -72,7 +72,16 @@ from sayink.meeting_session import (
     MeetingState,
     resolve_capabilities,
 )
-from sayink.text_polisher import TextPolisher
+from sayink.text_polisher import (
+    TextPolisher,
+    canonical_remote_origin,
+    polish_settings_complete,
+)
+from sayink.platform.window_input import (
+    HeadlessWindowInputBackend,
+    Win32WindowInputBackend,
+    is_terminal_process,
+)
 from sayink.asr_correction import apply_glossary_variants
 from sayink.text_paster import PasteResult, TextPaster
 from sayink.sound_manager import SoundManager
@@ -161,12 +170,14 @@ def _activity_state(embedder, requested: bool) -> str:
     return "未加载" if requested else "关"
 
 
-def _delegate_attr(owner_getter: str, attr_name: str):
-    """Forward legacy ``App._*`` state reads/writes to an extracted collaborator."""
-    return property(
-        lambda self: getattr(getattr(self, owner_getter)(), attr_name),
-        lambda self, value: setattr(getattr(self, owner_getter)(), attr_name, value),
-    )
+@dataclass(frozen=True)
+class _RewriteContext:
+    target_hwnd: int
+    target_app: str
+    selected_text: str
+    api_url: str
+    api_key: str
+    model_name: str
 
 
 @dataclass(frozen=True)
@@ -185,6 +196,8 @@ class AppModules:
     tray: TrayIcon | None = None
     updates: UpdateController | None = None
     onboarding: OnboardingController | None = None
+    window_input: Any = None
+    confirm_rewrite_remote_fn: Callable[[str], bool] | None = None
     aux_model_path_fn: Callable[[str], object] | None = None
     is_model_downloaded_fn: Callable[[str], bool] | None = None
     set_models_dir_fn: Callable[[str | None], bool] | None = None
@@ -197,40 +210,30 @@ class App(QObject):
     _history_committed = pyqtSignal()
     _history_failed = pyqtSignal(str)
 
-    # Delegated output-pipeline state (keeps legacy App._* access intact)
-    _output_busy = _delegate_attr("_output_pipeline", "busy")
-    _output_token = _delegate_attr("_output_pipeline", "token")
-    _output_raw_text = _delegate_attr("_output_pipeline", "raw_text")
-    _output_stage = _delegate_attr("_output_pipeline", "stage")
-    _output_stage_text = _delegate_attr("_output_pipeline", "stage_text")
-    _output_stage_record = _delegate_attr("_output_pipeline", "stage_record")
-    _output_pending_record = _delegate_attr("_output_pipeline", "output_pending_record")
-    _pending_record = _delegate_attr("_output_pipeline", "pending_record")
-    _output_llm_mode = _delegate_attr("_output_pipeline", "llm_mode")
-    _output_glossary = _delegate_attr("_output_pipeline", "glossary")
-    _last_output_text = _delegate_attr("_output_pipeline", "last_output_text")
-    _last_output_at = _delegate_attr("_output_pipeline", "last_output_at")
-    _output_dropped_slices = _delegate_attr("_output_pipeline", "dropped_slices")
-    _keep_unsaved_continuous_text = _delegate_attr("_output_pipeline", "keep_unsaved_continuous_text")
-    _history_failure_notified = _delegate_attr("_output_pipeline", "history_failure_notified")
+    @property
+    def output_pipeline(self) -> OutputPipeline:
+        """Public typed access to ``OutputPipeline`` collaborator."""
+        return self._output_pipeline()
 
-    # Delegated reload-coordinator state (keeps legacy App._* access intact)
-    _applied_recognition_settings = _delegate_attr("_reload_coordinator", "applied_recognition_settings")
-    _recognition_change_pending = _delegate_attr("_reload_coordinator", "recognition_change_pending")
-    _models_reload_pending = _delegate_attr("_reload_coordinator", "models_reload_pending")
-    _deferred_audio_settings = _delegate_attr("_reload_coordinator", "deferred_audio_settings")
-    _deferred_meeting_audio_settings = _delegate_attr(
-        "_reload_coordinator", "deferred_meeting_audio_settings"
-    )
-    _pending_apply_notice = _delegate_attr("_reload_coordinator", "pending_apply_notice")
-    _settings_after_recovery = _delegate_attr("_reload_coordinator", "settings_after_recovery")
-    _applied_audio_key = _delegate_attr("_reload_coordinator", "applied_audio_key")
-    _applied_recognition_key = _delegate_attr("_reload_coordinator", "applied_recognition_key")
-    _applied_speaker_aux = _delegate_attr("_reload_coordinator", "applied_speaker_aux")
-    _applied_vad_aux = _delegate_attr("_reload_coordinator", "applied_vad_aux")
-    _load_started_at = _delegate_attr("_reload_coordinator", "load_started_at")
-    _loading_model_id = _delegate_attr("_reload_coordinator", "loading_model_id")
-    _models_dir_notice = _delegate_attr("_reload_coordinator", "models_dir_notice")
+    @property
+    def output_snapshot(self):
+        """Public read-only snapshot of output pipeline state."""
+        return self._output_pipeline().snapshot()
+
+    @property
+    def reload_coordinator(self) -> ReloadCoordinator:
+        """Public typed access to ``ReloadCoordinator`` collaborator."""
+        return self._reload_coordinator()
+
+    @property
+    def applied_recognition_settings(self) -> RecognitionSettings:
+        """Currently applied ``RecognitionSettings`` snapshot."""
+        return self._reload_coordinator().applied_recognition_settings
+
+    @property
+    def reload_snapshot(self):
+        """Public read-only snapshot of deferred reload & model-loading state."""
+        return self._reload_coordinator().snapshot()
 
     # 友好化错误信息映射
     ERROR_HINTS: ClassVar[dict[str, str]] = {
@@ -332,6 +335,10 @@ class App(QObject):
             ),
             "set_models_dir_fn": overrides.pop(
                 "set_models_dir_fn", base.set_models_dir_fn or (lambda _p: True)
+            ),
+            "window_input": overrides.pop("window_input", base.window_input),
+            "confirm_rewrite_remote_fn": overrides.pop(
+                "confirm_rewrite_remote_fn", base.confirm_rewrite_remote_fn
             ),
             "skip_theme_init": overrides.pop("skip_theme_init", True),
         }
@@ -529,7 +536,7 @@ class App(QObject):
 
     def _reset_continuous_stop_flags(self) -> None:
         self._continuous_user_stopped = False
-        self._keep_unsaved_continuous_text = False
+        self._output_pipeline().keep_unsaved_continuous_text = False
 
     def _rebuild_speaker_embedder(self) -> None:
         self._embedder = None
@@ -537,6 +544,61 @@ class App(QObject):
         self._speaker_embedder()
         if not self._meeting_active() and self._safe_attr("_current_session_id") is None:
             self._speakers = self._new_speaker_session()
+
+    # ── ReloadHostProtocol implementation ─────────────────────────
+
+    def is_meeting_active(self) -> bool:
+        return self._meeting_active()
+
+    def meeting_save_audio_override(self) -> bool | None:
+        return getattr(getattr(self._safe_attr("_meeting"), "options", None), "save_audio", None)
+
+    def is_reload_pipeline_busy(self) -> bool:
+        return self._pipeline_busy() or bool(
+            getattr(self._safe_attr("_meeting"), "importing_media", False)
+        )
+
+    def queued_audio_segment_count(self) -> int:
+        return len(self._safe_attr("_segment_queue") or ())
+
+    def is_recovery_busy(self) -> bool:
+        return bool(self._safe_attr("_recovery_busy", False))
+
+    def is_exit_started(self) -> bool:
+        return bool(self._safe_attr("_exit_started", False))
+
+    def is_onboarding_active(self) -> bool:
+        return getattr(self._safe_attr("_onboarding"), "_setup_dialog", None) is not None
+
+    def is_main_window_visible(self) -> bool:
+        return self._visible_main_window() is not None
+
+    def clear_queued_audio(self) -> None:
+        self._clear_queued_audio()
+
+    def stop_continuous_listening(self) -> None:
+        self._stop_continuous_listening()
+
+    def reset_continuous_stop_flags(self) -> None:
+        self._reset_continuous_stop_flags()
+
+    def rebuild_speaker_embedder(self) -> None:
+        self._rebuild_speaker_embedder()
+
+    def sync_hotkey_trigger_mode(self) -> None:
+        self._sync_hotkey_trigger_mode()
+
+    def sync_settings_runtime_status(self, status: Any = None) -> None:
+        self._sync_settings_runtime_status(status)
+
+    def sync_recognition_runtime_status(self) -> None:
+        self._sync_recognition_runtime_status()
+
+    def sync_deferred_settings_notice(self, notice: str = "") -> None:
+        self._sync_deferred_settings_notice(notice)
+
+    def sync_tray_status_summary(self, status: Any = None) -> None:
+        self._sync_tray_status_summary(status)
 
     def _build_reload_coordinator(self) -> ReloadCoordinator:
         modules = self._safe_attr("_modules")
@@ -546,6 +608,7 @@ class App(QObject):
             else (lambda p: set_models_dir(p))
         )
         coord = ReloadCoordinator(
+            host=self,
             config=self._safe_attr("_config"),
             aux_model_path_fn=lambda mid: self._aux_model_path(mid),
             set_models_dir_fn=set_dir_fn,
@@ -555,31 +618,6 @@ class App(QObject):
                 else None
             ),
             now_monotonic=lambda: time.monotonic(),
-            meeting_active=lambda: self._meeting_active(),
-            meeting_save_audio=lambda: getattr(
-                getattr(self._safe_attr("_meeting"), "options", None),
-                "save_audio",
-                None,
-            ),
-            pipeline_busy=lambda: (
-                self._pipeline_busy()
-                or bool(getattr(self._safe_attr("_meeting"), "importing_media", False))
-            ),
-            has_queued_segments=lambda: bool(self._safe_attr("_segment_queue")),
-            queued_segment_count=lambda: len(self._safe_attr("_segment_queue") or ()),
-            recovery_busy=lambda: bool(self._safe_attr("_recovery_busy", False)),
-            exit_started=lambda: bool(self._safe_attr("_exit_started", False)),
-            clear_queued_audio=lambda: self._clear_queued_audio(),
-            stop_continuous_listening=lambda: self._stop_continuous_listening(),
-            reset_continuous_stop_flags=self._reset_continuous_stop_flags,
-            rebuild_speaker_embedder=self._rebuild_speaker_embedder,
-            sync_hotkey_trigger_mode=lambda: self._sync_hotkey_trigger_mode(),
-            sync_settings_runtime_status=lambda status=None: self._sync_settings_runtime_status(status),
-            sync_recognition_runtime_status=lambda: self._sync_recognition_runtime_status(),
-            sync_deferred_settings_notice=lambda notice="": self._sync_deferred_settings_notice(notice),
-            sync_tray_status_summary=lambda status=None: self._sync_tray_status_summary(status),
-            onboarding_active=lambda: getattr(self._safe_attr("_onboarding"), "_setup_dialog", None) is not None,
-            main_window_visible=lambda: self._visible_main_window() is not None,
         )
         self._sync_reload_coordinator_refs(coord)
         return coord
@@ -606,10 +644,16 @@ class App(QObject):
 
     def _init_modules(self):
         m = self._modules
+        self._active_rewrite: _RewriteContext | None = None
+        self._inflight_rewrite_target: tuple[int, str] | None = None
         self._hotkey_mgr = (
             m.hotkey_mgr
             if m is not None and m.hotkey_mgr is not None
-            else HotKeyManager(self._config.get("hotkey", DEFAULT_HOTKEY))
+            else HotKeyManager(
+                self._config.get("hotkey", DEFAULT_HOTKEY),
+                paste_last_hotkey=str(self._config.get("audio.paste_last_hotkey", "") or ""),
+                rewrite_hotkey=str(self._config.get("audio.rewrite_hotkey", "") or ""),
+            )
         )
         self._recorder = m.recorder if m is not None and m.recorder is not None else AudioRecorder()
         cfg_dir = getattr(self._config, "config_dir", None)
@@ -658,7 +702,7 @@ class App(QObject):
         if hasattr(finished, "connect") and hasattr(failed, "connect"):
             finished.connect(self._on_media_import_settled)
             failed.connect(self._on_media_import_failed_notify)
-        self._deferred_audio_settings = False
+        self._reload_coordinator().deferred_audio_settings = False
         self._meeting_idle_warned = False
         self._unrecognized_meeting_notice = ""
         self._pending_system_silent_warning = ""
@@ -781,6 +825,18 @@ class App(QObject):
         self._hotkey_mgr.recording_stop.connect(self._on_recording_stop)
         self._hotkey_mgr.recording_cancel.connect(self._on_recording_cancel)
         self._hotkey_mgr.continuous_listen_start.connect(self._on_continuous_hotkey_start)
+        paste_last_sig = getattr(self._hotkey_mgr, "paste_last_triggered", None)
+        if paste_last_sig is not None and hasattr(paste_last_sig, "connect"):
+            paste_last_sig.connect(self.paste_last_transcript)
+        rewrite_start_sig = getattr(self._hotkey_mgr, "rewrite_start", None)
+        if rewrite_start_sig is not None and hasattr(rewrite_start_sig, "connect"):
+            rewrite_start_sig.connect(self.start_select_and_rewrite)
+        rewrite_stop_sig = getattr(self._hotkey_mgr, "rewrite_stop", None)
+        if rewrite_stop_sig is not None and hasattr(rewrite_stop_sig, "connect"):
+            rewrite_stop_sig.connect(self.stop_select_and_rewrite)
+        rewrite_cancel_sig = getattr(self._hotkey_mgr, "rewrite_cancel", None)
+        if rewrite_cancel_sig is not None and hasattr(rewrite_cancel_sig, "connect"):
+            rewrite_cancel_sig.connect(self.cancel_select_and_rewrite)
         self._hotkey_mgr.hotkey_tap_too_short.connect(self._on_hotkey_tap_too_short)
         self._hotkey_mgr.esc_pressed.connect(self._on_esc_pressed)
         self._history.add_committed_callback(self._history_committed.emit)
@@ -816,6 +872,12 @@ class App(QObject):
 
         self._polisher.polish_complete.connect(self._on_polish_complete)
         self._polisher.polish_error.connect(self._on_polish_error)
+        rewrite_ok = getattr(self._polisher, "rewrite_complete", None)
+        if rewrite_ok is not None and hasattr(rewrite_ok, "connect"):
+            rewrite_ok.connect(self._on_rewrite_complete)
+        rewrite_err = getattr(self._polisher, "rewrite_error", None)
+        if rewrite_err is not None and hasattr(rewrite_err, "connect"):
+            rewrite_err.connect(self._on_rewrite_error)
 
         self._floating.continuous_stop_requested.connect(self._stop_continuous_user_session)
         cancel_sig = getattr(self._floating, "cancel_requested", None)
@@ -880,7 +942,7 @@ class App(QObject):
             )
 
     def _pending_segment_count(self) -> int:
-        in_flight = bool(self._safe_attr("_is_transcribing", False)) or self._output_busy
+        in_flight = bool(self._safe_attr("_is_transcribing", False)) or self._output_pipeline().busy
         return len(self._safe_attr("_segment_queue") or ()) + (1 if in_flight else 0)
 
     def _discardable_segment_count(self) -> int:
@@ -939,7 +1001,7 @@ class App(QObject):
         log.warning("%s，丢弃 %d 段未识别的会议语音", reason, dropped_count)
         detail = (
             f"语音模型未就绪，会议末尾 {dropped_count} 段语音未能识别。"
-            "若已开启录音恢复，可从原始录音找回。"
+            "若本场保存了会议录音，可在会议页回放核对。"
         )
         self._unrecognized_meeting_notice = detail
         meeting = self._meeting_or_none()
@@ -969,7 +1031,7 @@ class App(QObject):
     def _pipeline_busy(self) -> bool:
         return bool(
             self._safe_attr("_is_transcribing", False)
-            or self._output_busy
+            or self._output_pipeline().busy
             or self._safe_attr("_prefetch_segment") is not None
             or self._safe_attr("_recovery_busy", False)
         )
@@ -1241,8 +1303,9 @@ class App(QObject):
             log.info("Esc：放弃正在识别的切片")
         self._is_transcribing = False
         # Only this hold's row. A sentence already in polish lives in
-        # `_output_pending_record` and keeps its original window.
-        self._pending_record = None
+        # `output_pending_record` and keeps its original window.
+        self._active_rewrite = None
+        self._output_pipeline().pending_record = None
         self._pending_turn_context = None
         self._pending_turn_audio = None
         self._clear_live_transcript()
@@ -1250,6 +1313,267 @@ class App(QObject):
         self._recorder.cancel()
         self._floating.show_cancelled()
         self._later(0, self._apply_pending_recognition_settings)
+
+    def _window_input_backend(self):
+        m = self._safe_attr("_modules")
+        if m is not None and m.window_input is not None:
+            return m.window_input
+        backend = self.__dict__.get("_win_input_backend")
+        if backend is None:
+            backend = (
+                Win32WindowInputBackend()
+                if sys.platform == "win32"
+                else HeadlessWindowInputBackend()
+            )
+            self.__dict__["_win_input_backend"] = backend
+        return backend
+
+    def _fallback_last_history_text(self) -> str:
+        if not bool(self._config.get("history.enabled", True)):
+            return ""
+        if getattr(self._history, "disabled", False):
+            return ""
+        list_sessions = getattr(self._history, "list_sessions", None)
+        get_segs = getattr(self._history, "get_session_segments", None)
+        if not (callable(list_sessions) and callable(get_segs)):
+            return ""
+        try:
+            sessions = list_sessions(limit=1, offset=0)
+            if not sessions:
+                return ""
+            segs = get_segs(sessions[0].session_id)
+            parts = [(s.polished_text or s.raw_text or "").strip() for s in segs]
+            return join_segment_texts([p for p in parts if p])
+        except Exception:
+            return ""
+
+    def paste_last_transcript(self) -> bool:
+        """Paste the most recent non-meeting transcript into the current foreground window."""
+        if self._safe_attr("_exit_started", False) or self._meeting_blocks_hotkey():
+            return False
+        if self._pipeline_busy() or getattr(self._recorder, "is_recording", False):
+            self._floating.show_info("当前正在处理语音", "请稍后再重贴上一句")
+            return False
+        text = (self._output_pipeline().last_output_text or "").strip()
+        if not text:
+            text = self._fallback_last_history_text()
+        if not text:
+            self._floating.show_info("暂无上一句可重贴", "请先完成一次语音转写")
+            return False
+        target_hwnd, target_app = self._read_paste_target()
+        pipe = self._output_pipeline()
+        pipe.busy = True
+        pipe.stage = OutputStage.PASTE
+
+        def _on_done(result: PasteResult | str) -> None:
+            pipe.busy = False
+            pipe.stage = OutputStage.IDLE
+            status = result.status if isinstance(result, PasteResult) else str(result).split(":", 1)[0]
+            app_label = result.target_app if isinstance(result, PasteResult) else target_app
+            if status in ("sent", "pasted"):
+                self._floating.show_success(
+                    "已重贴上一句",
+                    f"发送到 {app_label}" if app_label else "",
+                )
+            else:
+                self._floating.show_info("已复制上一句", "可按 Ctrl+V 粘贴")
+            self._later(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
+
+        self._paster.paste_async(
+            text,
+            _on_done,
+            target_hwnd=target_hwnd,
+            target_app=target_app,
+        )
+        return True
+
+    def start_select_and_rewrite(self) -> bool:
+        """Capture selected text via UIA (never simulating Ctrl+C in terminals) and begin voice instruction capture."""
+        if self._recovery_busy or self._safe_attr("_exit_started", False):
+            return False
+        if self._meeting_blocks_hotkey():
+            return False
+        self._apply_pending_recognition_settings()
+        if not self._recognizer.is_ready:
+            self._show_model_not_ready()
+            return False
+        if self._pipeline_busy() or getattr(self._recorder, "is_recording", False) or self._segment_queue:
+            self._floating.show_busy_transcribing()
+            return False
+
+        backend = self._window_input_backend()
+        hwnd, app_name = backend.foreground_target()
+        selected = (backend.read_selected_text(app_name) or "").strip()
+        if not selected:
+            if is_terminal_process(app_name):
+                self._floating.show_warning(
+                    "终端内未读取到无障碍选区",
+                    "为防止误发 Ctrl+C 中断程序，终端内不模拟复制键",
+                )
+            else:
+                self._floating.show_warning(
+                    "未读取到选中文本",
+                    "请先在支持无障碍选区的编辑器中选中文字",
+                )
+            return False
+
+        api_url = str(self._config.get("llm.api_url", "") or "").strip()
+        api_key = str(self._config.get("llm.api_key", "") or "")
+        model_name = str(self._config.get("llm.model_name", "") or "").strip()
+        if not polish_settings_complete(api_url, api_key, model_name):
+            self._floating.show_warning(
+                "AI 服务尚未配置完整",
+                "请先在「AI 服务」填写接口地址与模型名称",
+            )
+            return False
+
+        self._active_rewrite = _RewriteContext(
+            target_hwnd=int(hwnd or 0),
+            target_app=str(app_name or ""),
+            selected_text=selected,
+            api_url=api_url,
+            api_key=api_key,
+            model_name=model_name,
+        )
+        self._locked_trigger_mode = TRIGGER_MODE_HOTKEY
+        self._hold_session_id = uuid4().hex
+        self._hold_target = (int(hwnd or 0), str(app_name or ""))
+        self._current_transcription = ""
+        self._hold_paste_sent = False
+        self._hold_duration_ms = 0
+        self._hold_failed_slices = 0
+        self._hold_opened_at = time.monotonic()
+        self._recorder.start(continuous=False)
+        self._clear_live_transcript()
+        self._play_start_cue()
+        self._tray.set_recording(True)
+        self._tray.set_activity_tooltip("recording")
+        try:
+            self._floating.show_recording(
+                title="指令录音中",
+                hint="说出改写指令（如：翻译成英文、精简为三点）· 松开执行",
+            )
+        except TypeError:
+            self._floating.show_recording()
+        return True
+
+    def stop_select_and_rewrite(self) -> None:
+        if self._meeting_active():
+            return
+        if not self._recorder.is_recording:
+            self._active_rewrite = None
+            self._release_unstarted_hold()
+            return
+        self._sound.play_stop()
+        self._tray.set_recording(False)
+        self._tray.set_activity_tooltip("recognizing")
+        self._floating.end_capture()
+        self._recorder.stop()
+        self._later(0, self._apply_pending_recognition_settings)
+
+    def cancel_select_and_rewrite(self) -> None:
+        self._active_rewrite = None
+        self._inflight_rewrite_target = None
+        cancel_rw = getattr(self._polisher, "cancel_rewrite", None)
+        if callable(cancel_rw):
+            cancel_rw()
+        self._on_recording_cancel()
+
+    def _confirm_rewrite_remote_origin(self, origin: str) -> bool:
+        m = self._safe_attr("_modules")
+        if m is not None and m.confirm_rewrite_remote_fn is not None:
+            return bool(m.confirm_rewrite_remote_fn(origin))
+        return confirm(
+            self._visible_main_window(),
+            "确认发送到远程 AI 服务",
+            f"即将把当前选中的文本与语音改写指令发送至远程接口（{origin}）。\n"
+            "确认后该地址将记住，后续改写不再重复询问。",
+            accept="确认发送",
+        )
+
+    def _dispatch_rewrite_instruction(self, ctx: _RewriteContext, instruction: str) -> None:
+        pipe = self._output_pipeline()
+        pipe.pending_record = None
+        pipe.output_pending_record = None
+        suffixes = str(self._config.get("llm.proxy_bypass_suffixes", "") or "")
+        origin = canonical_remote_origin(ctx.api_url, suffixes)
+        if origin:
+            confirmed = [
+                str(item).strip().lower()
+                for item in (self._config.get("llm.rewrite_confirmed_origins", []) or [])
+            ]
+            if origin.lower() not in confirmed:
+                if not self._confirm_rewrite_remote_origin(origin):
+                    self._floating.show_info("已取消选中改写", "未向远程服务发送选区内容")
+                    self._later(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
+                    return
+                confirmed.append(origin.lower())
+                self._config.set("llm.rewrite_confirmed_origins", confirmed)
+                save_now = getattr(self._config, "save_immediate", None)
+                if callable(save_now):
+                    save_now()
+
+        self._inflight_rewrite_target = (ctx.target_hwnd, ctx.target_app)
+        pipe.busy = True
+        pipe.stage = OutputStage.POLISH
+        self._tray.set_activity_tooltip("polishing")
+        try:
+            self._floating.show_polishing(instruction, action="改写")
+        except TypeError:
+            self._floating.show_polishing(instruction)
+        self._polisher.rewrite(
+            ctx.selected_text,
+            instruction,
+            ctx.api_url,
+            ctx.api_key,
+            ctx.model_name,
+            proxy_mode=str(self._config.get("llm.proxy_mode", "system") or "system"),
+            proxy_bypass_suffixes=suffixes,
+        )
+
+    def _on_rewrite_complete(self, rewritten_text: str) -> None:
+        target = self._inflight_rewrite_target
+        self._inflight_rewrite_target = None
+        pipe = self._output_pipeline()
+        cleaned = normalize_asr_output(rewritten_text or "").strip()
+        if not cleaned or target is None:
+            pipe.busy = False
+            pipe.stage = OutputStage.IDLE
+            self._tray.set_activity_tooltip(None)
+            self._floating.show_error("改写结果为空，原选区未改动")
+            self._later(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
+            return
+        hwnd, app_name = target
+        pipe.stage = OutputStage.PASTE
+
+        def _on_done(result: PasteResult | str) -> None:
+            pipe.busy = False
+            pipe.stage = OutputStage.IDLE
+            self._tray.set_activity_tooltip(None)
+            status = result.status if isinstance(result, PasteResult) else str(result).split(":", 1)[0]
+            dest = result.target_app if isinstance(result, PasteResult) else app_name
+            if status in ("sent", "pasted"):
+                self._floating.show_success("已改写并替换", f"发送到 {dest}" if dest else "")
+            else:
+                self._floating.show_info("改写结果已复制", "焦点已变化或受限，可按 Ctrl+V 粘贴")
+            self._later(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
+
+        self._paster.paste_async(
+            cleaned,
+            _on_done,
+            target_hwnd=hwnd,
+            target_app=app_name,
+        )
+
+    def _on_rewrite_error(self, error_msg: str) -> None:
+        self._inflight_rewrite_target = None
+        pipe = self._output_pipeline()
+        pipe.busy = False
+        pipe.stage = OutputStage.IDLE
+        self._tray.set_activity_tooltip(None)
+        self._sound.play_error()
+        self._floating.show_error(error_msg or "选中改写失败，原选区未改动")
+        self._later(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
 
     def _on_continuous_hotkey_start(self):
         if self._recovery_busy:
@@ -1269,7 +1593,7 @@ class App(QObject):
         log.info("快捷键触发：开始持续转写")
         self._hold_paste_sent = False
         self._continuous_user_stopped = False
-        self._keep_unsaved_continuous_text = False
+        self._output_pipeline().keep_unsaved_continuous_text = False
         self._current_session_id = None
         self._current_seq = 0
         # Segments still queued from the previous session keep its speaker numbering.
@@ -1363,7 +1687,7 @@ class App(QObject):
             if self._is_transcribing and callable(cancel_current):
                 cancel_current()
                 self._is_transcribing = False
-                self._pending_record = None
+                self._output_pipeline().pending_record = None
                 self._pending_turn_context = None
                 self._pending_turn_audio = None
             self._clear_live_transcript()
@@ -1374,21 +1698,24 @@ class App(QObject):
         if self._recorder.is_recording:
             self._on_recording_cancel()
             return
+        pipe = self._output_pipeline()
         if self._is_transcribing or self._segment_queue or (
-            self._output_busy and self._output_stage is OutputStage.POLISH
+            pipe.busy and pipe.stage is OutputStage.POLISH
         ):
             self._hold_paste_sent = True
+            self._active_rewrite = None
+            self._inflight_rewrite_target = None
             self._clear_queued_audio()
             cancel_current = getattr(self._recognizer, "cancel_current", None)
             if callable(cancel_current):
                 cancel_current()
             self._polisher.cancel()
             self._is_transcribing = False
-            self._output_busy = False
-            self._output_token += 1
-            self._output_stage = OutputStage.IDLE
-            self._pending_record = None
-            self._output_pending_record = None
+            pipe.busy = False
+            pipe.token += 1
+            pipe.stage = OutputStage.IDLE
+            pipe.pending_record = None
+            pipe.output_pending_record = None
             self._pending_turn_context = None
             self._pending_turn_audio = None
             self._clear_live_transcript()
@@ -1804,7 +2131,7 @@ class App(QObject):
             )
             self._embedder = embedder
             self._embedder_policy_key = policy_key
-            self._applied_speaker_aux = (speaker_path, activity_path)
+            self._reload_coordinator().applied_speaker_aux = (speaker_path, activity_path)
         return embedder
 
     def _new_speaker_session(self) -> MeetingSpeakerSession:
@@ -1952,8 +2279,9 @@ class App(QObject):
                     reason = "未识别"
             else:
                 reason = "未识别" if held_sec >= HOLD_NO_SPEECH_SEC else "录音过短"
+            self._active_rewrite = None
             log.warning("单次转写未输出: %s", "未检测到语音" if reason == "未识别" else reason)
-            if not self._output_busy:
+            if not self._output_pipeline().busy:
                 self._floating.show_error(self._friendly_error(reason))
             return
         context = self._capture_segment_context()
@@ -1988,7 +2316,8 @@ class App(QObject):
             return
         if context is None:
             context = self._capture_segment_context()
-        self._pending_record = self._build_pending_history_record(audio, context)
+        pending_rec = self._build_pending_history_record(audio, context)
+        self._output_pipeline().pending_record = pending_rec
         skip_diarization = self._continuous_diarization_unused(context)
         analyze_turns = (
             not skip_diarization
@@ -2004,10 +2333,10 @@ class App(QObject):
             if (analyze_turns or skip_diarization)
             else self._label_speaker(audio, route, context)
         )
-        self._pending_record.speaker_id = speaker_id
-        self._pending_record.speaker_route = speaker_route
+        pending_rec.speaker_id = speaker_id
+        pending_rec.speaker_route = speaker_route
         if not self._is_continuous_mode():
-            self._hold_duration_ms += self._pending_record.duration_ms
+            self._hold_duration_ms += pending_rec.duration_ms
         self._is_transcribing = True
         self._tray.set_activity_tooltip("recognizing")
         if self._continuous_user_stopped:
@@ -2061,7 +2390,8 @@ class App(QObject):
             if self._current_session_id == context.session_id:
                 self._current_seq += extra
         prepared = []
-        route = self._pending_record.speaker_route if self._pending_record is not None else ""
+        pending_rec = self._output_pipeline().pending_record
+        route = pending_rec.speaker_route if pending_rec is not None else ""
         if len(turns) > 1 and context.source == "mixed" and not context.route_reliable:
             # A dominant lane for the whole chunk does not identify each
             # individual turn. A lane that was captured on its own keeps
@@ -2172,12 +2502,13 @@ class App(QObject):
         if not text:
             return False
         self._hold_paste_sent = True
-        self._output_dropped_slices = self._hold_failed_slices
+        pipe = self._output_pipeline()
+        pipe.dropped_slices = self._hold_failed_slices
         self._current_transcription = text
-        if self._pending_record is not None:
-            self._pending_record.raw_text = self._live_raw_committed or text
+        if pipe.pending_record is not None:
+            pipe.pending_record.raw_text = self._live_raw_committed or text
             if self._hold_duration_ms:
-                self._pending_record.duration_ms = self._hold_duration_ms
+                pipe.pending_record.duration_ms = self._hold_duration_ms
         self._deliver_recognized_text(text)
         return True
 
@@ -2195,7 +2526,7 @@ class App(QObject):
             and meeting.current is not None
         ):
             return meeting.current.glossary
-        return self._applied_recognition_settings.glossary
+        return self.applied_recognition_settings.glossary
 
     def _on_final_result(self, text: str):
         if self._safe_attr("_exit_started", False):
@@ -2213,8 +2544,9 @@ class App(QObject):
             log.debug("识别结果长度: %d 字符", len(text))
             self._current_transcription = text
             self._commit_live_transcript(text, raw_text=raw_text)
-            if self._pending_record is not None:
-                self._pending_record.raw_text = raw_text
+            pending_rec = self._output_pipeline().pending_record
+            if pending_rec is not None:
+                pending_rec.raw_text = raw_text
         else:
             log.warning("未识别到语音内容")
             if not self._is_continuous_mode():
@@ -2244,6 +2576,7 @@ class App(QObject):
         self._deliver_recognized_text(text)
 
     def _finish_empty_recognition(self) -> None:
+        self._active_rewrite = None
         if self._recognizer.is_loading:
             self._floating.show_model_loading("模型载入中，请稍候…")
             self._tray.set_activity_tooltip("loading")
@@ -2287,6 +2620,11 @@ class App(QObject):
         timer.start(msec)
 
     def _deliver_recognized_text(self, text: str) -> None:
+        rewrite_ctx = self._safe_attr("_active_rewrite")
+        if rewrite_ctx is not None:
+            self._active_rewrite = None
+            self._dispatch_rewrite_instruction(rewrite_ctx, text)
+            return
         self._output_pipeline().deliver_recognized_text(text)
 
     def _on_recognizer_error(self, error_msg: str):
@@ -2331,7 +2669,7 @@ class App(QObject):
     def _pump_segment_queue(self):
         if self._prefetch_segment is not None:
             return
-        if self._output_busy and not self._is_transcribing:
+        if self._output_pipeline().busy and not self._is_transcribing:
             self._prefetch_next_segment()
             return
         if self._pipeline_busy() or not self._segment_queue:
@@ -2363,7 +2701,7 @@ class App(QObject):
                     self._recorder.stop()
             if self._meeting_active():
                 self._meeting_capture_pending = False
-                self._meeting.pause("排队录音读取失败，已暂停采集；请从录音恢复核对原声。")
+                self._meeting.pause("排队录音读取失败，已暂停采集；可在会议页回放已保存的录音。")
                 self._floating.show_meeting_paused(self._meeting.paused_detail)
             else:
                 self._floating.show_error(str(exc))
@@ -2544,9 +2882,10 @@ class App(QObject):
         """Emit a single consolidated tray notice at startup so back-to-back calls do not clobber each other."""
         warnings: list[str] = []
         infos: list[str] = list(extra_info or ())
-        if isinstance(self._models_dir_notice, str) and self._models_dir_notice.strip():
-            log.warning(self._models_dir_notice)
-            warnings.append(self._models_dir_notice.strip())
+        models_notice = self._reload_coordinator().models_dir_notice
+        if isinstance(models_notice, str) and models_notice.strip():
+            log.warning(models_notice)
+            warnings.append(models_notice.strip())
         notice = getattr(self._history, "startup_notice", "")
         if isinstance(notice, str) and notice.strip():
             log.warning("历史记录状态: %s", notice)
@@ -2806,9 +3145,10 @@ class App(QObject):
         requested_lang = str(opts.get("language", "") or "").strip()
         if requested_lang:
             settings = replace(settings, language=requested_lang)
-        vad = getattr(settings, "vad", getattr(self._applied_recognition_settings, "vad", VAD_SILERO))
+        applied = self.applied_recognition_settings
+        vad = getattr(settings, "vad", getattr(applied, "vad", VAD_SILERO))
         vad_path = self._aux_model_path(AUX_MODEL_SILERO_VAD) if vad == VAD_SILERO else None
-        glossary = getattr(settings, "glossary", ()) or getattr(self._applied_recognition_settings, "glossary", ()) or ()
+        glossary = getattr(settings, "glossary", ()) or getattr(applied, "glossary", ()) or ()
         speaker_model_enabled = bool(getattr(settings, "speaker_model_enabled", True))
         speaker_activity_enabled = bool(getattr(settings, "speaker_activity_enabled", False))
         speaker_path = self._aux_model_path(AUX_MODEL_SPEAKER) if speaker_model_enabled else None
@@ -2829,7 +3169,7 @@ class App(QObject):
         def _import_recognizer_scope():
             current_id = str(getattr(self._recognizer, "current_model_id", "") or "")
             same_model = not effective_model_id or effective_model_id == current_id
-            resident_lang = str(getattr(self._applied_recognition_settings, "effective_language", "") or "")
+            resident_lang = str(getattr(self.applied_recognition_settings, "effective_language", "") or "")
             same_lang = (
                 not requested_lang
                 or not _sr.model_supports(effective_model_id, _sr.SUPPORTS_LANGUAGE)
@@ -2972,7 +3312,7 @@ class App(QObject):
             and (
                 self._is_transcribing
                 or bool(self._segment_queue)
-                or self._output_busy
+                or self._output_pipeline().busy
                 or bool((self._live_committed or "").strip())
             )
         ):
@@ -3056,7 +3396,7 @@ class App(QObject):
         self._current_seq = 0
         self._speakers = self._meeting.speakers or SpeakerSession()
         self._continuous_user_stopped = False
-        self._keep_unsaved_continuous_text = False
+        self._output_pipeline().keep_unsaved_continuous_text = False
         self._meeting_capture_pending = False
         self._clear_live_transcript()
 
@@ -3444,9 +3784,11 @@ class App(QObject):
                 )
             )
         settings.hotkey_updated.connect(self._on_hotkey_updated)
+        extra_hk = getattr(settings, "extra_hotkeys_updated", None)
+        if extra_hk is not None and hasattr(extra_hk, "connect"):
+            extra_hk.connect(self._on_extra_hotkeys_updated)
         settings.settings_changed.connect(self._on_settings_changed)
         settings.audio_options_changed.connect(self._apply_audio_options)
-        settings.audio_recovery_requested.connect(self._show_audio_recovery)
         settings.usage_hint_changed.connect(
             lambda: self._floating.set_esc_stops_continuous(
                 self._config.get("audio.esc_stops_continuous", True)
@@ -3813,6 +4155,14 @@ class App(QObject):
         if callable(refresh_onb):
             refresh_onb()
 
+    def _on_extra_hotkeys_updated(self) -> None:
+        update_paste = getattr(self._hotkey_mgr, "update_paste_last_hotkey", None)
+        if callable(update_paste):
+            update_paste(str(self._config.get("audio.paste_last_hotkey", "") or ""))
+        update_rewrite = getattr(self._hotkey_mgr, "update_rewrite_hotkey", None)
+        if callable(update_rewrite):
+            update_rewrite(str(self._config.get("audio.rewrite_hotkey", "") or ""))
+
     def _on_settings_changed(self):
         self._reload_coordinator().on_settings_changed()
 
@@ -3842,13 +4192,14 @@ class App(QObject):
         # Hotkeys cannot start a second decode while recovery is running.
         self._recovery_busy = True
         try:
+            applied = self.applied_recognition_settings
             dialog = AudioRecoveryDialog(
                 self._config.config_dir / "audio-recovery",
                 recognizer=self._recognizer._recognizer if self._recognizer.is_ready else None,
-                vad=self._applied_recognition_settings.vad,
+                vad=applied.vad,
                 vad_path=self._aux_model_path(AUX_MODEL_SILERO_VAD),
-                quiet=self._applied_recognition_settings.quiet_speech_mode,
-                glossary=self._applied_recognition_settings.glossary,
+                quiet=applied.quiet_speech_mode,
+                glossary=applied.glossary,
                 decode_lock=getattr(self._recognizer, "_decode_lock", None),
                 recognizer_getter=lambda: (
                     self._recognizer._recognizer if self._recognizer.is_ready else None
@@ -4114,7 +4465,7 @@ class App(QObject):
         if recovery is not None:
             recovery.cancel_processing()
         self._clear_queued_audio()
-        self._output_stage = OutputStage.IDLE
+        self._output_pipeline().stage = OutputStage.IDLE
         log.info("SayInk 正在退出...")
         for timer in self.findChildren(QTimer):
             timer.stop()

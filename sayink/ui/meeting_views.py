@@ -1357,6 +1357,8 @@ class _CurrentPageStack(QStackedWidget):
 def _export_kind(path: str, selected: str) -> str:
     chosen = selected or ""
     lower = path.lower()
+    if chosen.startswith("Word") or lower.endswith(".docx"):
+        return "docx"
     if chosen.startswith("SRT") or lower.endswith(".srt"):
         return "srt"
     if chosen.startswith("纯文本") or lower.endswith(".txt"):
@@ -1364,11 +1366,11 @@ def _export_kind(path: str, selected: str) -> str:
     return "md"
 
 
-_KNOWN_MEETING_EXPORT_SUFFIXES = {".md", ".txt", ".srt", ".json", ".csv"}
+_KNOWN_MEETING_EXPORT_SUFFIXES = {".md", ".docx", ".txt", ".srt", ".json", ".csv"}
 
 
 def _with_export_suffix(path: str, kind: str) -> str:
-    suffix = {"md": ".md", "txt": ".txt", "srt": ".srt"}[kind]
+    suffix = {"md": ".md", "docx": ".docx", "txt": ".txt", "srt": ".srt"}[kind]
     target = Path(path)
     if target.suffix.lower() == suffix:
         return str(target)

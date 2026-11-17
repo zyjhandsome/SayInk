@@ -258,8 +258,8 @@ class TestGeneralPageLayout:
         assert "转写留在剪贴板" in clipboard_text
         history_text = " ".join(lb.text() for lb in settings_window._history_enabled_row.findChildren(QLabel))
         assert "保存转写历史" in history_text
-        assert "仅保存转写文本" in history_text
-        assert "录音恢复有独立开关" in history_text
+        assert "只保存转写文本" in history_text
+        assert "停止新增转写" in history_text
 
         footnotes = [
             lb.text()
@@ -374,7 +374,7 @@ class TestGeneralPageLayout:
             assert f"border: 1px solid {BORDER}" in sheet
             assert f"border-radius: {RADIUS_LG}px" in sheet
 
-    def test_settings_content_column_is_transparent_on_sheet(self, settings_window):
+    def test_settings_content_column_uses_the_page_background(self, settings_window):
         from sayink.ui import design_tokens as tok
 
         for widget in (
@@ -383,8 +383,8 @@ class TestGeneralPageLayout:
             settings_window._pages,
         ):
             sheet = widget.styleSheet()
-            assert "transparent" in sheet.lower()
-            assert f"background: {tok.BG}" not in sheet
+            assert f"background: {tok.BG}" in sheet
+            assert "transparent" not in sheet.lower()
         assert not hasattr(settings_window, "_sheet")
 
     def test_about_paths_start_hidden_and_reveal_on_toggle(
@@ -1396,15 +1396,19 @@ class TestMeetingSettings:
         assert "加载失败" not in settings_window._vad_runtime_label.text()
 
     def test_glossary_lines_become_terms_capped_and_deduped(self, settings_window, config):
+        from sayink.asr_correction import MAX_GLOSSARY_ENTRIES
+
         win = settings_window
-        lines = ["SayInk", "  ", "SayInk", "FireRedASR2", "x" * 30] + [f"t{i}" for i in range(60)]
+        lines = ["SayInk", "  ", "SayInk", "FireRedASR2", "x" * 30] + [
+            f"t{i}" for i in range(MAX_GLOSSARY_ENTRIES + 10)
+        ]
         win._meeting_glossary_edit.setPlainText("\n".join(lines))
         win._flush_meeting_glossary()
         terms = [g["term"] for g in config.get("stt.glossary")]
         # A term longer than the hotword cap is left out. Cutting it in the
         # middle would save a fragment and splice that fragment into later text.
         assert terms[:3] == ["SayInk", "FireRedASR2", "t0"]
-        assert len(terms) == 50
+        assert len(terms) == MAX_GLOSSARY_ENTRIES
         assert all(len(term) <= 20 for term in terms)
         win.reload_settings()
         assert win._meeting_glossary_edit.toPlainText().splitlines()[:2] == ["SayInk", "FireRedASR2"]
@@ -1422,18 +1426,20 @@ class TestMeetingSettings:
         assert win._meeting_glossary_edit.toPlainText().splitlines() == ["五证=五中、无证", "SayInk", "张鑫=张新、张欣"]
 
     def test_glossary_limit_warnings_and_count(self, settings_window, config):
+        from sayink.asr_correction import MAX_GLOSSARY_ENTRIES
+
         win = settings_window
         page = win.general_page
-        win._meeting_glossary_edit.setPlainText("\n".join(f"词{i}" for i in range(50)))
-        assert "50 行" in page.glossary_count_label.text()
+        win._meeting_glossary_edit.setPlainText("\n".join(f"词{i}" for i in range(MAX_GLOSSARY_ENTRIES)))
+        assert f"{MAX_GLOSSARY_ENTRIES} 行" in page.glossary_count_label.text()
         win._flush_meeting_glossary()
-        assert len(config.get("stt.glossary")) == 50
+        assert len(config.get("stt.glossary")) == MAX_GLOSSARY_ENTRIES
         assert not win._glossary_skip_note
 
         win._meeting_glossary_edit.appendPlainText("额外词")
         win._flush_meeting_glossary()
-        assert len(config.get("stt.glossary")) == 50
-        assert "超过 50 个词" in win._glossary_skip_note
+        assert len(config.get("stt.glossary")) == MAX_GLOSSARY_ENTRIES
+        assert f"超过 {MAX_GLOSSARY_ENTRIES} 个词" in win._glossary_skip_note
 
         win._meeting_glossary_edit.setPlainText("正确=一、二、三、四、五、六、" + "长" * 21 + "\n=缺少正确词")
         win._flush_meeting_glossary()

@@ -88,17 +88,8 @@ class TestPasteShortcut:
         assert not hasattr(text_paster, "pyautogui")
 
     @pytest.mark.parametrize("platform", ["darwin", "linux"])
-    def test_failed_system_command_falls_back_to_clipboard(self, platform, paste_env, monkeypatch):
-        import subprocess
-        from unittest.mock import Mock
-
-        def run(command, **kwargs):
-            if kwargs.get("check"):
-                raise subprocess.CalledProcessError(1, command)
-            return subprocess.CompletedProcess(command, 1)
-
+    def test_non_windows_headless_paste_falls_back_to_clipboard(self, platform, paste_env, monkeypatch):
         monkeypatch.setattr(tp.sys, "platform", platform)
-        monkeypatch.setattr(tp.subprocess, "run", Mock(side_effect=run))
         monkeypatch.setattr(tp, "_paste_shortcut", _REAL_PASTE_SHORTCUT)
         paste_env["set_foreground"]([(1234, "Editor", 4242)])
         results = []
@@ -106,58 +97,31 @@ class TestPasteShortcut:
         assert [result.status for result in results] == ["clipboard"]
         assert paste_env["clipboard"] == "keep this text"
 
-    def test_linux_paste_shortcut_clears_held_modifiers(self, monkeypatch):
-        from unittest.mock import Mock
-
-        run_mock = Mock()
+    def test_non_windows_foreground_window_returns_headless_empty_tuple(self, monkeypatch):
         monkeypatch.setattr(tp.sys, "platform", "linux")
-        monkeypatch.setattr(tp.subprocess, "run", run_mock)
-        _REAL_PASTE_SHORTCUT()
-        run_mock.assert_called_once_with(
-            ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
-            timeout=2,
-            check=True,
-        )
+        assert tp.get_foreground_window_info() == (0, "", 0)
 
-    def test_macos_foreground_window_queries_integer_pid_and_detects_app_switch(
-        self, paste_env, monkeypatch
-    ):
-        outputs = ["4821\nVisual Studio Code\n", "5910\nSlack\n"]
-        monkeypatch.setattr(tp.sys, "platform", "darwin")
-        monkeypatch.setattr(
-            tp.subprocess,
-            "check_output",
-            lambda *_a, **_k: outputs.pop(0),
-        )
-        info_first = tp.get_foreground_window_info()
-        info_second = tp.get_foreground_window_info()
-        assert info_first == (4821, "Visual Studio Code")
-        assert isinstance(info_first[0], int)
-        assert info_second == (5910, "Slack")
-
-        # Switching frontmost app on macOS between utterance start and paste aborts Ctrl+V/Cmd+V.
-        paste_env["set_foreground"]([info_second])
+    def test_focus_switch_between_utterance_start_and_paste_aborts_send(self, paste_env):
+        paste_env["set_foreground"]([(5910, "Slack", 5910)])
         results = []
         TextPaster().paste_async(
-            "macOS dictation",
+            "Windows dictation",
             results.append,
-            target_hwnd=info_first[0],
-            target_app=info_first[1],
+            target_hwnd=4821,
+            target_app="Code.exe",
         )
         assert paste_env["shortcut_calls"] == 0
         assert [(r.status, r.detail) for r in results] == [("clipboard", "focus_changed")]
 
-    def test_macos_foreground_window_returns_zero_on_osascript_failure(self, monkeypatch):
-        def _fail(*_a, **_k):
-            raise OSError("osascript unavailable")
 
-        monkeypatch.setattr(tp.subprocess, "check_output", _fail)
-        assert tp._get_foreground_window_macos() == (0, "")
+class TestWindowsPlatformBoundary:
+    def test_terminal_process_guard_covers_shells_and_emulators(self):
+        from sayink.platform.window_input import is_terminal_process
 
-
-class TestCrossPlatformSupport:
-    def test_platform_detection(self):
-        assert sys.platform in ["win32", "darwin", "linux"]
+        for term in ("WindowsTerminal.exe", "wt.exe", "pwsh.exe", "powershell.exe", "cmd.exe", "mintty.exe"):
+            assert is_terminal_process(term) is True
+        for non_term in ("Code.exe", "WeChat.exe", "WINWORD.EXE", "notepad.exe", ""):
+            assert is_terminal_process(non_term) is False
 
 
 @pytest.fixture

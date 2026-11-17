@@ -637,7 +637,7 @@ def effective_language(language: str) -> str:
     return "zh" if code in ("", "auto") else code
 
 
-MAX_HOTWORDS = 50
+MAX_HOTWORDS = 30
 MAX_HOTWORD_CHARS = 20
 
 
@@ -645,8 +645,10 @@ def format_hotwords(glossary) -> str:
     """Glossary entries (``{"term": ..., "variants": [...]}`` or plain strings)
     → the comma-separated hotword string Fun-ASR-Nano / Qwen3-ASR expect.
 
-    Only the canonical term goes in: a hotword nudges the decoder towards that
-    spelling, so listing the mis-heard variants would make them likelier."""
+    Only up to ``MAX_HOTWORDS`` (30) canonical terms go into the decoder so
+    large personal glossaries (up to 500 entries) never overload hotword biasing
+    or degrade CER; all entries still run through post-ASR variant replacement
+    and English case restoration."""
     seen: list[str] = []
     for entry in glossary or ():
         term = entry.get("term", "") if isinstance(entry, dict) else entry

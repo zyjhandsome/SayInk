@@ -343,7 +343,7 @@ class TestAppCorrectionMode:
             app = h["app"]
             app._deliver_recognized_text("很久以前")
             app._on_polish_complete("很久以前")
-            app._last_output_at -= 1000.0
+            app.output_pipeline.last_output_at -= 1000.0
             app._deliver_recognized_text("现在")
             assert h["polisher"].polish.call_args.kwargs["context"] == ""
 

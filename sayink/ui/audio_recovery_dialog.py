@@ -195,7 +195,7 @@ class AudioRecoveryDialog(QDialog):
         self._empty_banner_title = QLabel("当前没有可恢复的本地录音缓存")
         self._empty_banner_title.setObjectName("recoveryEmptyBannerTitle")
         self._empty_banner_desc = QLabel(
-            "开启「通用 → 应用与历史 → 本机录音恢复缓存」后，后续录音会自动保存在此，支持导出 WAV 或重新识别。"
+            "设置里打开「保存会议录音」后，会议录音会保存在此，可导出或重新识别。单次转写和持续转写不保存录音。"
         )
         self._empty_banner_desc.setObjectName("recoveryEmptyBannerDesc")
         self._empty_banner_desc.setWordWrap(True)
@@ -401,7 +401,7 @@ class AudioRecoveryDialog(QDialog):
                 self.status.setText("")
         else:
             self.track.clear()
-            self.status.setText("没有录音缓存。开启「录音恢复」后，从下一次录音开始保存。")
+            self.status.setText("没有录音缓存。会议录音在设置里打开「保存会议录音」后才会留下。")
         self._set_busy(False)
 
     def _update_tracks(self, row):

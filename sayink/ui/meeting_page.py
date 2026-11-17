@@ -88,7 +88,7 @@ from sayink.ui import design_tokens as tok
 from sayink.ui.clipboard import COPY_FAILED_TEXT, copy_text as copy_text
 from sayink.ui.flow_layout import PairedToolBar, WrappingToolBar, defer_while_live_resize
 from sayink.ui.history_window import (
-    _ElidedLabel, _SessionCheckBox, _SessionList, release_list_item_widgets, session_list_item_css,
+    _ElidedLabel, _SessionCheckBox, _SessionList, release_list_item_widgets,
 )
 from sayink.ui.meeting_batch import confirm_batch_delete as confirm_batch_delete, fit_action_button
 from sayink.ui.meeting_dialogs import (
@@ -100,16 +100,14 @@ from sayink.ui.meeting_dialogs import (
     build_meeting_datetime_edit_css as build_meeting_datetime_edit_css,
 )
 from sayink.ui.meeting_drafts import MeetingDraftBuffer
-from sayink.ui.meeting_import_mixin import (
-    _MeetingImportMixin,
-    _ORIG_GET_OPEN_FILE_NAME as _ORIG_GET_OPEN_FILE_NAME,
-    _format_import_remain as _format_import_remain,
+from sayink.ui.meeting_import_controller import MeetingImportController
+from sayink.ui.meeting_live_controller import (
+    DEFAULT_SYSTEM_SILENT_MSG,
+    LIVE_REMOTE_SILENCE_SECONDS,
+    LIVE_REMOTE_SILENCE_THRESHOLD,
+    MeetingLiveController,
 )
-from sayink.ui.meeting_live_mixin import (
-    _LANGUAGE_LABELS as _LANGUAGE_LABELS,
-    _MeetingLiveMixin,
-    _SOURCE_LABELS as _SOURCE_LABELS,
-)
+from sayink.ui.session_stream_view import build_stream_row_wash_css
 from sayink.ui.meeting_player import (
     _AudioPlayerBar as _AudioPlayerBar,
     _CleanComboBox as _CleanComboBox,
@@ -164,31 +162,28 @@ class _MeetingStreamRow(QWidget):
 
 
 def _paint_meeting_row(row: QWidget, *, selected: bool) -> None:
-    from sayink.ui import design_tokens as tok
-
-    bg = tok.ACCENT_SOFT if selected else "transparent"
-    bar = tok.ACCENT if selected else "transparent"
-    css = (
-        "QWidget#meetingStreamRow {"
-        f" background: {bg};"
-        " border: none;"
-        f" border-left: {tok.NAV_SELECTED_BAR_PX}px solid {bar};"
-        " border-radius: 0;"
-        "}"
-        f"QLabel#meetingRowTitle {{ color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; background: transparent; }}"
-        f"QLabel#meetingRowMeta {{ color: {tok.TEXT_SEC}; font-size: {tok.TYPE_CAPTION}px; background: transparent; }}"
+    css = build_stream_row_wash_css(
+        "meetingStreamRow",
+        selected=selected,
+        title_object_name="meetingRowTitle",
+        meta_object_name="meetingRowMeta",
     )
     if row.styleSheet() != css:
         row.setStyleSheet(css)
 
 
-class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
+class MeetingPage(QWidget):
+    LIVE_REMOTE_SILENCE_THRESHOLD = LIVE_REMOTE_SILENCE_THRESHOLD
+    LIVE_REMOTE_SILENCE_SECONDS = LIVE_REMOTE_SILENCE_SECONDS
+    _DEFAULT_SYSTEM_SILENT_MSG = DEFAULT_SYSTEM_SILENT_MSG
+
     start_requested = pyqtSignal(object)   # MeetingOptions
     end_requested = pyqtSignal()
     pause_requested = pyqtSignal()
     resume_requested = pyqtSignal()
     configure_requested = pyqtSignal()     # minutes need the AI service connection
     aux_models_changed = pyqtSignal()      # a helper model was downloaded here
+    glossary_updated = pyqtSignal()        # user accepted a learned glossary correction
     _title_write_settled = pyqtSignal(str, str, int)
     _record_notes_write_settled = pyqtSignal(str, str, int)
     _history_write_failed = pyqtSignal()
@@ -198,6 +193,11 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
         self._config = config
         self._ctrl = controller
         self._store = controller.store
+        self._live_ui = MeetingLiveController(self)
+        self._import_ui = MeetingImportController(self)
+        self._compact_single_pane = False
+        self._compact_showing_detail = False
+        self._host_viewport_width: int | None = None
         self._aux_dl = AuxModelDownloads(str(config.get("stt.download_source", "auto") or "auto"), self)
         self._aux_dl.progress.connect(self._on_aux_progress)
         self._aux_dl.finished.connect(self._on_aux_finished)
@@ -227,6 +227,7 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
         self._transcript_editable = False
         self._citation_return: tuple[str, int] | None = None
         self._correcting_speakers = False
+        self._pending_glossary_suggestion: tuple[str, str] | None = None
         self._live_correcting_speakers = False
         self._live_transcript_sequences: list[int] = []
         self._live_locked_sequences: set[int] = set()
@@ -241,7 +242,7 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
         self._setup_ui()
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
-        self._status_timer.timeout.connect(self._status_label.hide)
+        self._status_timer.timeout.connect(self._hide_status_banner)
         self._live_feedback_timer = QTimer(self)
         self._live_feedback_timer.setSingleShot(True)
         self._live_feedback_timer.timeout.connect(self._live_speaker_feedback.hide)
@@ -409,11 +410,20 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
         browse_lay = QVBoxLayout(browse_page)
         browse_lay.setContentsMargins(0, 0, 0, 0)
         browse_lay.setSpacing(8)
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(8)
         self._status_label = QLabel("")
         self._status_label.setTextFormat(Qt.TextFormat.PlainText)
         self._status_label.setWordWrap(True)
         self._status_label.hide()
-        browse_lay.addWidget(self._status_label, 0)
+        status_row.addWidget(self._status_label, 1)
+        self._glossary_learn_btn = QPushButton("加入词典")
+        self._glossary_learn_btn.setAccessibleName("将改错词条加入自定义词汇")
+        self._glossary_learn_btn.clicked.connect(self.accept_glossary_suggestion)
+        self._glossary_learn_btn.hide()
+        status_row.addWidget(self._glossary_learn_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        browse_lay.addLayout(status_row)
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.setChildrenCollapsible(False)
@@ -462,6 +472,7 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self._list.setWordWrap(True)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
+        self._list.itemClicked.connect(self._on_compact_meeting_clicked)
         self._delete_shortcut = QShortcut(QKeySequence.StandardKey.Delete, self._list)
         self._delete_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self._delete_shortcut.activated.connect(self._delete_selected_meetings)
@@ -492,6 +503,12 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
         # sit in the tab row so they read as acting on that tab only.
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
+        self._back_to_list_btn = QPushButton("← 返回列表")
+        self._back_to_list_btn.setObjectName("meetingBackToListBtn")
+        self._back_to_list_btn.setAccessibleName("返回会议列表")
+        self._back_to_list_btn.clicked.connect(self.show_compact_list)
+        self._back_to_list_btn.hide()
+        title_row.addWidget(self._back_to_list_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         self._detail_title = QLineEdit()
         self._detail_title.setPlaceholderText("会议标题")
         self._detail_title.setAccessibleName("会议标题")
@@ -894,221 +911,9 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
         )
 
     def reapply_theme(self) -> None:
-        from sayink.ui import design_tokens as tok
-        from sayink.ui import settings_styles as ss
-        from sayink.ui.settings_components import PAGE_TITLE
+        from sayink.ui.meeting_workspace_chrome import reapply_theme as _reapply_theme
 
-        self.setStyleSheet(ss.WINDOW_CSS)
-        self._title_label.setStyleSheet(PAGE_TITLE)
-        self._card_title.setStyleSheet(
-            f"font-family: {tok.FONT_DISPLAY}; font-size: {tok.TYPE_TITLE}px; font-weight: 700;"
-            f" background: transparent; color: {tok.TEXT_SEC}; padding: 2px 0 0 0;"
-        )
-        self._live_title.setStyleSheet(
-            f"font-size: {tok.TYPE_TITLE}px; font-weight: 700; color: {tok.TEXT}; background: transparent;"
-        )
-        self._paint_live_clock()
-        dim = f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
-        for label in (self._list_summary, self._detail_meta, self._card_hint, self._live_caps,
-                      self._card_notes, self._empty_label, self._template_label, self._content_hint,
-                      self._notes_empty, self._live_speaker_hint, self._live_speaker_feedback,
-                      self._materials_agenda, self._opt_loopback_hint, self._live_mic_label,
-                      self._live_sys_label, self._live_find_status, self._detail_find_status):
-            label.setStyleSheet(dim)
-        field_label_css = (
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700; background: transparent;"
-        )
-        for field_lbl in getattr(self, "_card_field_labels", ()):
-            field_lbl.setStyleSheet(field_label_css)
-        save_font = self._opt_save_audio.font()
-        save_font.setFamily(tok.UI_FONT_FAMILY)
-        save_font.setPixelSize(tok.TYPE_BODY_SM)
-        self._opt_save_audio.setFont(save_font)
-        self._opt_save_audio.setStyleSheet("background: transparent;")
-        self._opt_save_audio.update()
-        for label in (self._marks_title, self._notes_title, self._materials_notes_label, self._materials_marks_label):
-            label.setStyleSheet(
-                f"color: {tok.TEXT}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700; background: transparent;"
-            )
-        status_css = (
-            f"color: {tok.TEXT}; font-size: {tok.TYPE_FOOTNOTE}px; background: {tok.SURFACE_PEARL};"
-            f" border: 1px solid {tok.HAIRLINE}; border-radius: {tok.RADIUS_MD}px; padding: 6px 10px;"
-        )
-        self._status_label.setStyleSheet(status_css)
-        self._paint_status_label()
-        self._import_progress.setStyleSheet(
-            f"color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; background: transparent; border: none;"
-        )
-        self._import_kicker.setStyleSheet(
-            f"color: {tok.TEXT}; font-size: {tok.TYPE_TITLE}px; font-weight: 700; background: transparent;"
-        )
-        self._import_filename.setStyleSheet(
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; background: transparent;"
-        )
-        self._import_live_caption.setStyleSheet(
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
-        )
-        self._start_block.setStyleSheet(
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
-        )
-        self._audio_missing.setStyleSheet(
-            f"color: {tok.AMBER_TEXT}; font-size: {tok.TYPE_FOOTNOTE}px; background: {tok.AMBER_SOFT};"
-            f" border: 1px solid {tok.CALLOUT_BORDER}; border-radius: {tok.RADIUS_MD}px; padding: 6px 10px;"
-        )
-        self._live_status.setStyleSheet(status_css)
-        self._import_progress_bar.setStyleSheet(
-            f"QProgressBar {{ background: {tok.SURFACE_PEARL}; border: 1px solid {tok.HAIRLINE};"
-            f" border-radius: 5px; }}"
-            f"QProgressBar::chunk {{ background: {tok.ACCENT}; border-radius: 4px; }}"
-        )
-        self._system_silent_banner.setStyleSheet(
-            f"QFrame#meetingSilentBanner {{ background: {tok.AMBER_SOFT}; border: 1px solid {tok.CALLOUT_BORDER};"
-            f" border-radius: {tok.RADIUS_MD}px; }}"
-        )
-        self._system_silent_label.setStyleSheet(
-            f"color: {tok.AMBER_TEXT}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700; background: transparent;"
-        )
-        self._audio_player.reapply_theme()
-        edit_css = f"""
-            QLineEdit {{
-                background: {tok.INPUT_BG}; color: {tok.TEXT};
-                border: 1px solid {tok.CONTROL_BORDER}; border-radius: {tok.RADIUS_MD}px;
-                padding: 6px 12px; min-height: {tok.CONTROL_FIELD_HEIGHT - 14}px; font-size: {tok.TYPE_BODY_SM}px;
-            }}
-            QLineEdit:focus {{ border: 2px solid {tok.ACCENT}; padding: 5px 11px; }}
-        """
-        self._search_edit.setStyleSheet(ss.build_search_field_css())
-        for edit in (self._opt_title, self._opt_participants, self._mark_note, self._live_find_edit, self._detail_find_edit):
-            edit.setStyleSheet(edit_css)
-        self._detail_title.setStyleSheet(f"""
-            QLineEdit {{
-                background: transparent; color: {tok.TEXT};
-                border: 1px solid transparent; border-radius: {tok.RADIUS_MD}px;
-                padding: 4px 4px; min-height: 32px;
-                font-size: {tok.TYPE_HERO}px; font-weight: 700;
-            }}
-            QLineEdit:hover {{ border: 1px solid {tok.HAIRLINE}; }}
-            QLineEdit:focus {{ background: {tok.SURFACE_PEARL}; border: 2px solid {tok.ACCENT}; padding: 3px 3px; }}
-        """)
-        self._paint_notes_state()
-        self._template_combo.setMinimumHeight(tok.CONTROL_BTN_SM_HEIGHT)
-        from sayink.ui.tray_icon import _menu_font, _menu_stylesheet
-
-        for menu in (
-            self._more_menu,
-            self._speaker_menu,
-            self._export_menu,
-            self._live_speaker_menu,
-            self._template_menu,
-        ):
-            menu.setFont(_menu_font())
-            menu.setStyleSheet(_menu_stylesheet())
-        text_css = f"""
-            QTextBrowser, QPlainTextEdit {{
-                background: {tok.SURFACE_PEARL}; color: {tok.TEXT};
-                border: 1px solid {tok.HAIRLINE}; border-radius: {tok.RADIUS_MD}px;
-                padding: 8px; font-size: {tok.TYPE_BODY_SM}px;
-                selection-background-color: {tok.ACCENT_SOFT}; selection-color: {tok.TEXT};
-            }}
-            QPlainTextEdit:focus {{ border: 2px solid {tok.ACCENT}; }}
-        """
-        for view in (self._notes_edit, self._live_transcript, self._user_notes,
-                     self._opt_agenda, self._record_notes, self._record_marks):
-            view.setStyleSheet(text_css)
-        self._marks_view.setStyleSheet(
-            text_css
-            + f"QTextBrowser {{ padding: 4px 8px; font-size: {tok.TYPE_FOOTNOTE}px; }}"
-        )
-        self._notes_edit.setStyleSheet(text_css + f"QPlainTextEdit {{ font-size: {tok.READING_FONT_PX}px; }}")
-        reading_css = f"""
-            QTextBrowser {{
-                background: transparent; color: {tok.TEXT}; border: none; padding: 4px 0;
-                font-size: {tok.READING_FONT_PX}px;
-                selection-background-color: {tok.ACCENT_SOFT}; selection-color: {tok.TEXT};
-            }}
-        """
-        for view in (self._notes_view, self._transcript_view):
-            view.setStyleSheet(reading_css)
-            view.document().setDocumentMargin(0)
-        self._list.setStyleSheet(f"""
-            QListWidget {{ background: transparent; border: 2px solid transparent; outline: none;
-                           color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; }}
-            {session_list_item_css()}
-            QLabel#meetingRowTitle {{ color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; background: transparent; }}
-            QLabel#meetingRowMeta {{ color: {tok.TEXT_SEC}; font-size: {tok.TYPE_CAPTION}px;
-                                     background: transparent; }}
-        """)
-        for combo in (self._opt_source, self._opt_model, self._opt_language, self._template_combo):
-            combo.setStyleSheet("")
-        self._template_combo.setStyleSheet(ss.build_toolbar_combo_css())
-        disabled_sm = self._disabled_btn_sm_override()
-        for btn in (self._start_btn, self._card_start, self._resume_btn, self._live_new_msg_btn):
-            btn.setStyleSheet(ss.BTN_ACCENT_SM)
-        self._mark_btn.setStyleSheet(
-            ss.BTN_ACCENT_SM if self._mark_btn.isEnabled() else ss.BTN_ACCENT_SM + disabled_sm
-        )
-        for btn in (self._generate_btn, self._cancel_notes_edit_btn, self._copy_btn,
-                    self._transcript_copy_btn, self._export_btn, self._card_cancel,
-                    self._pause_btn, self._cancel_btn, self._return_notes_btn, self._clear_search_btn,
-                    self._live_find_prev_btn, self._live_find_next_btn, self._live_find_close_btn,
-                    self._detail_find_prev_btn, self._detail_find_next_btn, self._detail_find_close_btn,
-                    self._system_silent_dismiss_btn,
-                    self._manage_templates_btn,
-                    self._card_dl_btn, self._live_dl_btn, self._load_more_btn, self._materials_toggle,
-                    self._sort_btn, self._selection_mode_btn, self._batch_all_btn, self._batch_export_btn, self._batch_generate_btn,
-                    self._import_btn, self._media_btn, self._media_retry_btn, self._media_again_btn):
-            btn.setStyleSheet(ss.BTN_GHOST_SM)
-        for btn in (self._edit_btn, self._correct_speaker_btn, self._live_correct_speaker_btn):
-            btn.setStyleSheet(ss.BTN_GHOST_SM + disabled_sm)
-        self._media_cancel_btn.setStyleSheet(ss.BTN_DANGER_SM)
-        self._batch_delete_btn.setStyleSheet(ss.BTN_DANGER_SM)
-        for btn in (
-            self._sort_btn, self._selection_mode_btn, self._batch_all_btn, self._batch_export_btn,
-            self._batch_generate_btn, self._batch_delete_btn,
-        ):
-            fit_action_button(btn)
-        tab_h = max(self._export_btn.sizeHint().height(), tok.CONTROL_BTN_SM_HEIGHT)
-        chip_h = max(20, tab_h - 8)
-        self._tab_bar.setStyleSheet(f"""
-            QWidget#meetingTabs {{ background: {tok.SURFACE_PEARL}; border: 1px solid {tok.HAIRLINE};
-                                   border-radius: {tok.RADIUS_MD}px; }}
-            QPushButton#meetingTab {{ background: transparent; color: {tok.TEXT_SEC};
-                                      border: 1px solid transparent; border-radius: {tok.RADIUS_SM}px;
-                                      padding: 0 16px; min-height: {chip_h}px; max-height: {chip_h}px;
-                                      font-size: {tok.TYPE_BODY_SM}px; font-weight: 400; }}
-            QPushButton#meetingTab:hover:!checked {{ color: {tok.TEXT}; background: {tok.ROW_HOVER}; }}
-            QPushButton#meetingTab:checked {{ background: {tok.SECONDARY_CONTAINER}; color: {tok.TEXT};
-                                              border-color: transparent; font-weight: 400; }}
-            QPushButton#meetingTab:focus {{ border-color: {tok.ACCENT_FOCUS}; }}
-        """)
-        self._tab_bar.setFixedHeight(tab_h)
-        no_indicator = "QPushButton::menu-indicator { image: none; width: 0px; }"
-        self._more_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
-        self._template_menu_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
-        self._speaker_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator + disabled_sm)
-        self._live_speaker_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator + disabled_sm)
-        self._end_btn.setStyleSheet(ss.BTN_DANGER_SOLID_SM)
-        for splitter in (self._splitter, self._live_split):
-            splitter.setStyleSheet(
-                "QSplitter::handle { background: transparent; }"
-                f"QSplitter::handle:hover {{ background: {tok.ACCENT_FOCUS}; }}"
-            )
-        self._drafts.live_marks_html = ""
-        if self._stack.currentIndex() == PAGE_LIVE and self._ctrl.is_active:
-            self._sync_live_state()
-            self._render_live()
-        if self._detail_id:
-            self._render_detail()
-        if self._detail_find_bar.isVisible() and self._detail_find_edit.text().strip():
-            self._find_detail_text(restart=False)
-        if self._live_find_bar.isVisible() and self._live_find_edit.text().strip():
-            idx, total = find_in_reading_view(
-                self._live_transcript, self._live_find_edit.text(), step=False
-            )
-            self._live_find_status.setText("未找到" if total == 0 else f"{idx} / {total}")
-        if hasattr(self, "_list"):
-            self._sync_batch_checks()
-        self._sync_media_buttons()
+        _reapply_theme(self)
 
     # ── list / browse ─────────────────────────────────────────────
 
@@ -1230,6 +1035,15 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
             self._sort_btn.setText("最近添加")
             self._sort_btn.setToolTip("当前按最近添加/开会排序（新导入的会议始终在最上方）；点击切换为按会议时间排序")
         fit_action_button(self._sort_btn)
+
+    def flush_all_drafts(self, *, sync: bool = True) -> bool:
+        """Public contract flushing live user notes, bound title, notes draft, and record notes."""
+        self.flush_pending_user_notes()
+        return bool(
+            self._flush_bound_title(sync=sync)
+            and self._save_notes_draft()
+            and self._save_record_notes()
+        )
 
     def _toggle_list_sort(self) -> None:
         if not self._flush_bound_title(sync=True) or not self._save_notes_draft() or not self._save_record_notes():
@@ -1377,7 +1191,10 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
             self._show_import_detail()
         elif importing:
             self._paint_import_banner()
-        self._detail_pane.setVisible(bool(records) or self._editing_notes or importing)
+        if self.is_compact_single_pane:
+            self._apply_compact_pane_visibility()
+        else:
+            self._detail_pane.setVisible(bool(records) or self._editing_notes or importing)
 
     def _release_row_widgets(self) -> None:
         """Drop row widgets before ``clear()``.
@@ -1777,14 +1594,26 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
             return
         default = export_save_path(f"会议导出-{time.strftime('%Y%m%d')}.md")
         with native_file_dialog(self):
-            raw_path, _selected = QFileDialog.getSaveFileName(self, "导出选中的会议", default, "Markdown (*.md)")
+            raw_path, selected = QFileDialog.getSaveFileName(
+                self,
+                "导出选中的会议",
+                default,
+                "Markdown (*.md);;Word 文档 (*.docx)",
+            )
         if not raw_path:
             return
-        path = _with_export_suffix(raw_path, "md")
+        kind = "docx" if _export_kind(raw_path, selected) == "docx" else "md"
+        path = _with_export_suffix(raw_path, kind)
         if not self._confirm_export_overwrite_if_adjusted(raw_path, path):
             return
         try:
-            Path(path).write_text(self._ctrl.export_meetings_markdown(ids), encoding="utf-8")
+            body_md = self._ctrl.export_meetings_markdown(ids)
+            if kind == "docx":
+                from sayink.docx_io import write_docx_document
+
+                write_docx_document(path, title=f"会议导出（{len(ids)} 场）", markdown_body=body_md)
+            else:
+                Path(path).write_text(body_md, encoding="utf-8")
         except OSError as exc:
             alert_error(self, "导出失败", f"无法写入文件：{exc}")
             return
@@ -1863,6 +1692,8 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
             # Opening a specific meeting (import, notice) leaves batch selection,
             # otherwise the batch view keeps covering the meeting just opened.
             self._set_batch_mode(False)
+        if self.is_compact_single_pane and meeting_id:
+            self._compact_showing_detail = True
         self.refresh()
         self._sync_media_buttons()
 
@@ -2470,14 +2301,140 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
         self._switch_tab(0)
         self._notes_view.restore_reading_position(value)
 
-    def _set_status(self, text: str, *, transient: bool = False, tone: str = "info") -> None:
+    def _hide_status_banner(self) -> None:
+        self._status_label.hide()
+        self._pending_glossary_suggestion = None
+        if hasattr(self, "_glossary_learn_btn"):
+            self._glossary_learn_btn.hide()
+
+    def _set_status(
+        self,
+        text: str,
+        *,
+        transient: bool = False,
+        tone: str = "info",
+        learn_glossary: bool = False,
+        duration_ms: int = 4000,
+    ) -> None:
+        from sayink.ui import settings_styles as ss
+
         self._status_timer.stop()
+        if not learn_glossary:
+            self._pending_glossary_suggestion = None
         self._status_tone = tone if text else "info"
         self._status_label.setText(text)
         self._status_label.setVisible(bool(text))
+        if hasattr(self, "_glossary_learn_btn"):
+            self._glossary_learn_btn.setStyleSheet(ss.BTN_ACCENT_SM)
+            self._glossary_learn_btn.setVisible(bool(text and learn_glossary))
         self._paint_status_label()
         if text and transient:
-            self._status_timer.start(4000)
+            self._status_timer.start(duration_ms)
+
+    @property
+    def pending_glossary_suggestion(self) -> tuple[str, str] | None:
+        """Latest ``(term, variant)`` candidate detected from a manual segment correction."""
+        return self._pending_glossary_suggestion
+
+    def accept_glossary_suggestion(self) -> bool:
+        """Persist the pending ``(term, variant)`` suggestion into ``stt.glossary``."""
+        suggestion = self._pending_glossary_suggestion
+        self._pending_glossary_suggestion = None
+        if hasattr(self, "_glossary_learn_btn"):
+            self._glossary_learn_btn.hide()
+        if suggestion is None or self._config is None:
+            return False
+        from sayink.asr_correction import (
+            format_glossary_suggestion_label,
+            persist_glossary_learning,
+        )
+
+        term, variant = suggestion
+        if not persist_glossary_learning(self._config, term, variant):
+            return False
+        self.glossary_updated.emit()
+        label = format_glossary_suggestion_label(term, variant)
+        if self._stack.currentIndex() == PAGE_LIVE:
+            self._live_feedback_timer.stop()
+            self._live_speaker_feedback.setText(f"已加入自定义词汇：{label}")
+            self._live_speaker_feedback.show()
+            self._live_feedback_timer.start(4000)
+        else:
+            self._set_status(f"已加入自定义词汇：{label}", transient=True, tone="ok")
+        return True
+
+    def apply_segment_correction(
+        self,
+        meeting_id: str,
+        seq: int,
+        corrected_text: str | None,
+    ) -> bool:
+        """Public contract method to save a segment text edit and compute glossary suggestions."""
+        record = self._store.get_meeting(meeting_id) if meeting_id else None
+        if record is None:
+            return False
+        get_seg = getattr(self._store, "get_segment", None)
+        segment = (
+            get_seg(record.id, seq)
+            if callable(get_seg)
+            else next((s for s in self._store.get_segments(record.id) if s.seq == seq), None)
+        )
+        if segment is None:
+            return False
+        before_text = (segment.corrected_text or segment.polished_text or segment.raw_text or "").strip()
+        if not self._ctrl.save_segment_text(record.id, seq, corrected_text):
+            return False
+        self._post_segment_text_saved(record, seq, before_text=before_text, corrected_text=corrected_text)
+        return True
+
+    def _post_segment_text_saved(
+        self,
+        record: MeetingRecord,
+        seq: int,
+        *,
+        before_text: str,
+        corrected_text: str | None,
+    ) -> None:
+        action = "已恢复这一段的原文" if corrected_text is None else "已保存这一段的修改"
+        suggestion: tuple[str, str] | None = None
+        if corrected_text is not None and self._config is not None:
+            from sayink.asr_correction import extract_learned_correction_pair
+
+            suggestion = extract_learned_correction_pair(
+                before_text,
+                corrected_text,
+                self._config.get("stt.glossary", []) or [],
+            )
+        self._pending_glossary_suggestion = suggestion
+        if self._stack.currentIndex() == PAGE_LIVE and self._ctrl.current_id == record.id:
+            self._render_live()
+            self._live_transcript.place_cursor_at_segment(seq)
+            self._live_feedback_timer.stop()
+            msg = action + "。"
+            if suggestion is not None:
+                from sayink.asr_correction import format_glossary_suggestion_label
+
+                msg = f"{action} · 可将「{format_glossary_suggestion_label(*suggestion)}」加入词典"
+            self._live_speaker_feedback.setText(msg)
+            self._live_speaker_feedback.show()
+            self._live_feedback_timer.start(5000)
+            return
+        self._render_detail()
+        self._transcript_view.place_cursor_at_segment(seq)
+        notes = self._store.get_notes(record.id)
+        hint = f"；已有{self._result_label()}保留，建议重新生成。" if notes is not None and notes.markdown else "。"
+        if suggestion is not None:
+            from sayink.asr_correction import format_glossary_suggestion_label
+
+            label = format_glossary_suggestion_label(*suggestion)
+            self._set_status(
+                f"{action}{hint} 识别出改词「{label}」",
+                transient=True,
+                learn_glossary=True,
+                duration_ms=6000,
+            )
+        else:
+            self._set_status(action + hint, transient=True)
 
     def _paint_status_label(self) -> None:
         tone = getattr(self, "_status_tone", "info")
@@ -2913,88 +2870,44 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
             self._follow_live_resize()
 
     def _sync_live_marks_height(self, has_marks: bool | None = None) -> None:
-        if not hasattr(self, "_marks_view"):
-            return
-        compact_h = 0 < self.height() < 540
-        if has_marks is None:
-            try:
-                current_id = self._ctrl.current_id
-                has_marks = bool(current_id and self._store.get_marks(current_id))
-            except Exception:
-                has_marks = False
-        self._marks_view.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded if has_marks else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        if compact_h:
-            max_h = 68 if has_marks else 48
-        else:
-            max_h = 160 if has_marks else 88
-        self._marks_view.setMinimumHeight(34 if compact_h else 36)
-        self._marks_view.setMaximumHeight(max_h)
+        from sayink.ui.meeting_workspace_chrome import _sync_live_marks_height as _sync_marks
+
+        _sync_marks(self, has_marks)
+
+    @property
+    def is_compact_single_pane(self) -> bool:
+        """True when narrow split-screen mode (<680px window / <580px workspace) shows one pane at a time."""
+        return bool(getattr(self, "_compact_single_pane", False))
+
+    def show_compact_list(self) -> None:
+        from sayink.ui.meeting_workspace_chrome import show_compact_list as _show_compact_list
+
+        _show_compact_list(self)
+
+    def show_compact_detail(self) -> None:
+        from sayink.ui.meeting_workspace_chrome import show_compact_detail as _show_compact_detail
+
+        _show_compact_detail(self)
+
+    def _on_compact_meeting_clicked(self, item: QListWidgetItem) -> None:
+        from sayink.ui.meeting_workspace_chrome import _on_compact_meeting_clicked as _on_compact_click
+
+        _on_compact_click(self, item)
+
+    def _apply_compact_pane_visibility(self) -> None:
+        from sayink.ui.meeting_workspace_chrome import _apply_compact_pane_visibility as _apply_panes
+
+        _apply_panes(self)
+
+    def sync_viewport_width(self, host_width: int | None = None) -> None:
+        from sayink.ui.meeting_workspace_chrome import sync_viewport_width as _sync_viewport_width
+
+        _sync_viewport_width(self, host_width)
 
     def _sync_responsive_layout(self) -> None:
-        if not hasattr(self, "_outer_layout"):
-            return
-        w = self.width()
-        h = self.height()
-        compact_h = 0 < h < 540
-        narrow_w = 0 < w < 880
+        from sayink.ui.meeting_workspace_chrome import _sync_responsive_layout as _sync_layout
 
-        base_left, base_top, base_right, base_bottom = tok.WORKSPACE_MARGINS
-        if narrow_w and w < 720:
-            h_margin = 16
-        elif compact_h or narrow_w:
-            h_margin = 20
-        else:
-            h_margin = base_left
-        v_top = 8 if compact_h else base_top
-        v_bottom = 8 if compact_h else base_bottom
-        self._outer_layout.setContentsMargins(h_margin, v_top, h_margin, v_bottom)
-        self._outer_layout.setSpacing(6 if compact_h else 14)
-
-        if hasattr(self, "_live_layout"):
-            self._live_layout.setSpacing(4 if compact_h else 10)
-        if hasattr(self, "_live_side_layout"):
-            self._live_side_layout.setSpacing(4 if compact_h else 8)
-            self._live_side_layout.setContentsMargins(8 if narrow_w else 12, 0, 0, 0)
-        if hasattr(self, "_user_notes"):
-            self._user_notes.setMinimumHeight(46 if compact_h else 64)
-        self._sync_live_marks_height()
-
-        if hasattr(self, "_browse_left") and hasattr(self, "_detail_pane"):
-            if narrow_w:
-                avail = max(300, w - 2 * h_margin - self._splitter.handleWidth())
-                ratio = w / 880.0
-                list_min = max(
-                    140,
-                    min(
-                        tok.WORKSPACE_LIST_MIN_WIDTH - 16,
-                        int(tok.WORKSPACE_LIST_MIN_WIDTH * ratio),
-                        int(avail * 0.34),
-                    ),
-                )
-                detail_min = max(
-                    200,
-                    min(
-                        tok.WORKSPACE_DETAIL_MIN_WIDTH - 20,
-                        int(tok.WORKSPACE_DETAIL_MIN_WIDTH * ratio),
-                        avail - list_min - 4,
-                    ),
-                )
-                self._browse_left.setMinimumWidth(list_min)
-                self._detail_pane.setMinimumWidth(detail_min)
-                if hasattr(self, "_detail_layout"):
-                    self._detail_layout.setContentsMargins(12 if w < 720 else 16, 0, 0, 0)
-                if hasattr(self, "_live_side_scroll"):
-                    self._live_side_scroll.setMinimumWidth(180)
-            else:
-                self._browse_left.setMinimumWidth(tok.WORKSPACE_LIST_MIN_WIDTH)
-                self._detail_pane.setMinimumWidth(tok.WORKSPACE_DETAIL_MIN_WIDTH)
-                if hasattr(self, "_detail_layout"):
-                    self._detail_layout.setContentsMargins(20, 0, 0, 0)
-                if hasattr(self, "_live_side_scroll"):
-                    self._live_side_scroll.setMinimumWidth(240)
-            self._fit_template_cluster()
+        _sync_layout(self)
 
     def _follow_live_resize(self) -> None:
         if hasattr(self, "_materials_scroll"):
@@ -3277,6 +3190,69 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
             if text:
                 self._set_status("已复制文字稿" if copy_text(text) else COPY_FAILED_TEXT)
 
+    def _markdown_for_export_scope(self, record: MeetingRecord, scope: str) -> str:
+        if scope == "transcript":
+            return self._ctrl.export_transcript_markdown(record.id)
+        if scope == "notes":
+            return self._current_notes_text()
+        if self._editing_notes:
+            supplement = self._ctrl.supplements_markdown(record.id)
+            text = self._current_notes_text().rstrip()
+            if supplement:
+                text += "\n\n" + supplement
+            text += "\n\n## 文字稿\n\n" + self._ctrl.transcript_text(record.id) + "\n"
+            return text
+        return self._ctrl.export_markdown(record.id)
+
+    def _docx_metadata_rows(self, record: MeetingRecord) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = [("时间", _format_dt(record.started_at))]
+        if record.ended_at:
+            rows.append(("时长", _duration_label(record.duration_ms)))
+        if (record.participants or "").strip():
+            rows.append(("参会人", record.participants.strip()))
+        return rows
+
+    def export_meeting_to_path(
+        self,
+        meeting_id: str,
+        path: str | Path,
+        *,
+        scope: str = "all",
+    ) -> bool:
+        """Public contract writing ``meeting_id`` to ``path`` (.md, .docx, .txt, or .srt)."""
+        record = self._store.get_meeting(meeting_id)
+        if record is None:
+            return False
+        target = Path(path)
+        kind = _export_kind(str(target), "")
+        if kind == "docx":
+            from sayink.docx_io import write_docx_document
+
+            if meeting_id == self._detail_id:
+                body_md = self._markdown_for_export_scope(record, scope)
+            elif scope == "transcript":
+                body_md = self._ctrl.export_transcript_markdown(record.id)
+            elif scope == "notes":
+                notes = self._store.get_notes(record.id)
+                body_md = notes.markdown if notes is not None else ""
+            else:
+                body_md = self._ctrl.export_markdown(record.id)
+            write_docx_document(
+                target,
+                title=record.display_title,
+                metadata_rows=self._docx_metadata_rows(record),
+                markdown_body=body_md,
+            )
+            return True
+        if kind == "srt":
+            target.write_text(self._ctrl.export_transcript_srt(record.id), encoding="utf-8")
+            return True
+        if kind == "txt":
+            target.write_text(self._ctrl.transcript_text(record.id), encoding="utf-8")
+            return True
+        target.write_text(self._ctrl.export_markdown(record.id), encoding="utf-8")
+        return True
+
     def _export(self, scope: str = "all") -> None:
         if not self._flush_bound_title(sync=True) or not self._save_record_notes():
             return
@@ -3287,7 +3263,7 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
         default = export_save_path(
             f"{safe_filename(record.display_title)}-{label}-{_safe_dt(record.started_at).strftime('%Y%m%d')}.md"
         )
-        filters = "Markdown (*.md);;纯文本 (*.txt)"
+        filters = "Markdown (*.md);;Word 文档 (*.docx);;纯文本 (*.txt)"
         if self._transcript_has_times:
             filters += ";;SRT 字幕 (*.srt)"
         with native_file_dialog(self):
@@ -3305,9 +3281,19 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
             return
         srt_note = ""
         try:
-            if kind == "srt":
+            if kind == "docx":
+                from sayink.docx_io import write_docx_document
+
+                write_docx_document(
+                    path,
+                    title=record.display_title,
+                    metadata_rows=self._docx_metadata_rows(record),
+                    markdown_body=self._markdown_for_export_scope(record, scope),
+                )
+            elif kind == "srt":
                 text = self._ctrl.export_transcript_srt(record.id)
                 srt_note = getattr(self._ctrl, "srt_skip_note", "") or ""
+                Path(path).write_text(text, encoding="utf-8")
             elif kind == "txt":
                 if scope == "notes":
                     text = self._current_notes_text()
@@ -3320,19 +3306,10 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
                     text = "\n\n".join(chunks)
                     if text and not text.endswith("\n"):
                         text += "\n"
-            elif scope == "transcript":
-                text = self._ctrl.export_transcript_markdown(record.id)
-            elif scope == "notes":
-                text = self._current_notes_text()
-            elif self._editing_notes:
-                supplement = self._ctrl.supplements_markdown(record.id)
-                text = self._current_notes_text().rstrip()
-                if supplement:
-                    text += "\n\n" + supplement
-                text += "\n\n## 文字稿\n\n" + self._ctrl.transcript_text(record.id) + "\n"
+                Path(path).write_text(text, encoding="utf-8")
             else:
-                text = self._ctrl.export_markdown(record.id)
-            Path(path).write_text(text, encoding="utf-8")
+                text = self._markdown_for_export_scope(record, scope)
+                Path(path).write_text(text, encoding="utf-8")
         except OSError as exc:
             alert_error(self, "导出失败", f"无法写入文件：{exc}")
             return
@@ -3442,6 +3419,7 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
                 detail_text += "\n发言归属：已手动更正，仅作用于本段。"
             if segment.corrected_text:
                 detail_text += "\n正文：已编辑，修改前的原文保留如下。"
+        before_text = (segment.corrected_text or segment.polished_text or segment.raw_text or "").strip()
         dialog = _SegmentTextDialog(
             segment, position=position, speaker=speaker,
             save_text=lambda text: self._ctrl.save_segment_text(record.id, seq, text), parent=self,
@@ -3450,20 +3428,12 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
         with _quiet_tooltips(self):
             accepted = dialog.exec() == QDialog.DialogCode.Accepted
         if accepted:
-            action = "已恢复这一段的原文" if dialog.corrected_text is None else "已保存这一段的修改"
-            if self._stack.currentIndex() == PAGE_LIVE and self._ctrl.current_id == record.id:
-                self._render_live()
-                self._live_transcript.place_cursor_at_segment(seq)
-                self._live_feedback_timer.stop()
-                self._live_speaker_feedback.setText(action + "。")
-                self._live_speaker_feedback.show()
-                self._live_feedback_timer.start(4000)
-                return
-            self._render_detail()
-            self._transcript_view.place_cursor_at_segment(seq)
-            notes = self._store.get_notes(record.id)
-            hint = f"；已有{self._result_label()}保留，建议重新生成。" if notes is not None and notes.markdown else "。"
-            self._set_status(action + hint, transient=True)
+            self._post_segment_text_saved(
+                record,
+                seq,
+                before_text=before_text,
+                corrected_text=dialog.corrected_text,
+            )
 
     def _toggle_speaker_correction(self, enabled: bool) -> None:
         self._correcting_speakers = enabled
@@ -3627,6 +3597,199 @@ class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
             self._prompt_segment_text(int(url.path()), meeting_id=meeting_id)
         elif url.scheme() == "live-details":
             self._prompt_segment_text(int(url.path()), details=True, meeting_id=meeting_id)
+
+    # ── Composed live & import controller delegations ─────────────
+
+    def _build_start_card(self) -> QWidget:
+        return self._live_ui.build_start_card()
+
+    def _build_live(self) -> QWidget:
+        return self._live_ui.build_live()
+
+    def show_start_card(self) -> None:
+        self._live_ui.show_start_card()
+
+    def cancel_downloads(self) -> None:
+        self._aux_dl.cancel()
+
+    @property
+    def running_workers(self):
+        return self._aux_dl.running_workers
+
+    def set_lane_levels(self, mic_level: float = 0.0, system_level: float = 0.0) -> None:
+        self._live_ui.set_lane_levels(mic_level, system_level)
+
+    def show_system_silent_warning(self, message: str = "") -> None:
+        self._live_ui.show_system_silent_warning(message)
+
+    def clear_system_silent_warning(self) -> None:
+        self._live_ui.clear_system_silent_warning()
+
+    def flush_pending_user_notes(self) -> bool:
+        return self._live_ui.flush_pending_user_notes()
+
+    def _follow_model_label(self) -> str:
+        return self._live_ui.follow_model_label()
+
+    def _update_card_notes(self) -> None:
+        self._live_ui.update_card_notes()
+
+    def _sync_aux_buttons(self) -> None:
+        self._live_ui.sync_aux_buttons()
+
+    def _download_aux_models(self) -> None:
+        self._live_ui.download_aux_models()
+
+    def _on_aux_progress(self, pct: int) -> None:
+        self._live_ui.on_aux_progress(pct)
+
+    def _on_aux_finished(self, ok: bool, message: str) -> None:
+        self._live_ui.on_aux_finished(ok, message)
+
+    def _options_from_card(self):
+        return self._live_ui.options_from_card()
+
+    def _leave_start_card(self) -> None:
+        self._live_ui.leave_start_card()
+
+    def _start_from_card(self) -> None:
+        self._live_ui.start_from_card()
+
+    def _dismiss_system_silent_warning(self) -> None:
+        self._live_ui.dismiss_system_silent_warning()
+
+    def _check_live_remote_silence(self) -> None:
+        self._live_ui.check_live_remote_silence()
+
+    def _on_live_range_changed(self, minimum: int, maximum: int) -> None:
+        self._live_ui.on_live_range_changed(minimum, maximum)
+
+    def _on_live_scroll_changed(self, value: int) -> None:
+        self._live_ui.on_live_scroll_changed(value)
+
+    def _scroll_live_to_bottom(self) -> None:
+        self._live_ui.scroll_live_to_bottom()
+
+    def _position_live_new_msg_btn(self) -> None:
+        self._live_ui.position_live_new_msg_btn()
+
+    def _enter_live(self) -> None:
+        self._live_ui.enter_live()
+
+    def _sync_live_state(self) -> None:
+        self._live_ui.sync_live_state()
+
+    def _paint_live_clock(self) -> None:
+        self._live_ui.paint_live_clock()
+
+    def _on_state_changed(self, state: MeetingState) -> None:
+        self._live_ui.on_state_changed(state)
+
+    def _on_meeting_changed(self, meeting_id: str) -> None:
+        self._live_ui.on_meeting_changed(meeting_id)
+
+    def _refresh_now(self) -> None:
+        self._live_ui.refresh_now()
+
+    def _render_live(self) -> None:
+        self._live_ui.render_live()
+
+    def _add_mark(self) -> None:
+        self._live_ui.add_mark()
+
+    def _save_user_notes(self) -> None:
+        self._live_ui.save_user_notes()
+
+    def _confirm_end(self) -> None:
+        self._live_ui.confirm_end()
+
+    def _ask_import(self):
+        return self._import_ui.ask_import()
+
+    def _import_transcript(self) -> None:
+        self._import_ui.import_transcript()
+
+    def _remove_queued_media(self, index: int) -> None:
+        self._import_ui.remove_queued_media(index)
+
+    def _sync_media_buttons(self) -> None:
+        self._import_ui.sync_media_buttons()
+
+    def _import_media(self) -> None:
+        self._import_ui.import_media()
+
+    def _confirm_and_begin_media_paths(self, paths: list[Path]) -> tuple[bool, str]:
+        return self._import_ui.confirm_and_begin_media_paths(paths)
+
+    def _begin_media_paths(self, paths: list[Path]) -> str:
+        return self._import_ui.begin_media_paths(paths)
+
+    def _show_import_detail(self) -> None:
+        self._import_ui.show_import_detail()
+
+    def _paint_import_banner(self) -> None:
+        self._import_ui.paint_import_banner()
+
+    def _hide_import_chrome(self) -> None:
+        self._import_ui.hide_import_chrome()
+
+    def _cancel_media_import(self) -> None:
+        self._import_ui.cancel_media_import()
+
+    def _confirm_cancel_import(self) -> bool:
+        return self._import_ui.confirm_cancel_import()
+
+    def _confirm_cancel_queued_import(self, queued_count: int) -> str:
+        return self._import_ui.confirm_cancel_queued_import(queued_count)
+
+    def _on_media_started(self, path: str, title: str) -> None:
+        self._import_ui.on_media_started(path, title)
+
+    def _on_media_progress(self, text: str) -> None:
+        self._import_ui.on_media_progress(text)
+
+    def _on_media_preview(self, text: str) -> None:
+        self._import_ui.on_media_preview(text)
+
+    def _on_media_finished(self, meeting_id: str) -> None:
+        self._import_ui.on_media_finished(meeting_id)
+
+    def _retry_media_save(self) -> None:
+        self._import_ui.retry_media_save()
+
+    def _retry_failed_media(self) -> None:
+        self._import_ui.retry_failed_media()
+
+    def _on_media_failed(self, message: str) -> None:
+        self._import_ui.on_media_failed(message)
+
+    def _install_import_drop_targets(self) -> None:
+        self._import_ui.install_import_drop_targets()
+
+    def _handle_import_drag(self, event, *, dropping: bool) -> bool:
+        return self._import_ui.handle_import_drag(event, dropping=dropping)
+
+    def _accept_dropped_files(self, paths: list[Path]) -> None:
+        self._import_ui.accept_dropped_files(paths)
+
+    def _import_dropped_transcript(self, path: Path, *, ignored: int) -> None:
+        self._import_ui.import_dropped_transcript(path, ignored=ignored)
+
+    def dragLeaveEvent(self, event) -> None:
+        self._drag_url_cache = None
+        super().dragLeaveEvent(event)
+
+    def dragEnterEvent(self, event) -> None:
+        if not self._handle_import_drag(event, dropping=False):
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if not self._handle_import_drag(event, dropping=False):
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:
+        if not self._handle_import_drag(event, dropping=True):
+            super().dropEvent(event)
 
 
 __all__ = ["MeetingPage", "PAGE_BROWSE", "PAGE_LIVE", "PAGE_START"]

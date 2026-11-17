@@ -195,7 +195,7 @@ def test_prefetch_finishes_during_polish_without_changing_current_output():
         session = app._record_for_output().session_id
         callbacks["on_text"]("第二句")
         assert app._record_for_output().raw_text == "第一句"
-        assert app._output_raw_text == "第一句"
+        assert app.output_pipeline.raw_text == "第一句"
         assert len(app._segment_queue) == 1
         h["paster"].paste_async.assert_not_called()
         _finish_first_output(h)
@@ -293,7 +293,7 @@ def test_prefetched_meeting_turns_drain_in_order_with_original_timestamps():
 def test_output_watchdog_keeps_prefetch_while_falling_back_to_original():
     with app_harness(LLM) as h, patch("sayink.app.QTimer.singleShot"):
         app, callbacks = _two_segments(h)
-        app._output_pipeline().release_stuck_output(app._output_token)
+        app.output_pipeline.release_stuck_output(app.output_pipeline.token)
         assert h["paster"].paste_async.call_args.args[0] == "第一句"
         callbacks["on_text"]("第二句")
         h["paster"].paste_async.call_args.args[1]("sent")

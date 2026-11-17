@@ -39,7 +39,7 @@ _DEBOUNCE_THRESHOLD_CHARS = 8_000
 _ASYNC_PARSE_THRESHOLD_CHARS = 50_000
 _ASYNC_FILE_BYTES = 256 * 1024
 _DEBOUNCE_DELAY_MS = 180
-_DROP_SUFFIXES = {".txt", ".md", ".srt", ".vtt", ".json"}
+_DROP_SUFFIXES = {".txt", ".md", ".docx", ".srt", ".vtt", ".json"}
 
 
 class _PreviewParseWorker(QThread):
@@ -120,7 +120,7 @@ class TranscriptImportDialog(QDialog):
         layout.setSpacing(10)
 
         self._hint = QLabel(
-            "粘贴文字稿，或打开 / 拖入 .txt、.md、.srt、.vtt、.json。"
+            "粘贴文字稿，或打开 / 拖入 .txt、.md、.docx、.srt、.vtt、.json。"
             "最多约 200 万字。导入后可在会议页生成纪要。"
         )
         self._hint.setWordWrap(True)
@@ -639,7 +639,7 @@ class TranscriptImportDialog(QDialog):
                 self,
                 "打开文字稿",
                 "",
-                "文字稿 (*.txt *.md *.srt *.vtt *.json);;所有文件 (*.*)",
+                "文字稿 (*.txt *.md *.docx *.srt *.vtt *.json);;所有文件 (*.*)",
             )
         if not path:
             return
@@ -691,7 +691,7 @@ class TranscriptImportDialog(QDialog):
         if not supported:
             chosen = files[0]
             self._set_file_error(
-                f"不支持直接导入 {chosen.suffix or '该类型'} 文件；请选择 .txt、.md、.srt、.vtt 或 .json。"
+                f"不支持直接导入 {chosen.suffix or '该类型'} 文件；请选择 .txt、.md、.docx、.srt、.vtt 或 .json。"
             )
             return True
         note = ""

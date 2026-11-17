@@ -366,18 +366,19 @@ def test_start_card_checkbox_border_and_heading_hierarchy(qapp, meeting_env, mod
     page.show_start_card()
     _pump(4)
 
-    assert isinstance(page._opt_save_audio, ThemedCheckBox)
+    assert not hasattr(page, "_opt_save_audio")
     assert f"{tok.TYPE_TITLE_LG}px" in page._title_label.styleSheet()
     assert f"{tok.TYPE_TITLE}px" in page._card_title.styleSheet()
     assert tok.TEXT_SEC in page._card_title.styleSheet()
 
     # Unchecked ThemedCheckBox must paint a visible non-background box outline in both Light & Dark.
-    page._opt_save_audio.setChecked(False)
+    box = ThemedCheckBox("保存会议录音", page)
+    box.setChecked(False)
     canvas = QImage(220, 32, QImage.Format.Format_ARGB32_Premultiplied)
     bg = QColor(tok.BG)
     canvas.fill(bg)
-    page._opt_save_audio.resize(220, 28)
-    page._opt_save_audio.render(canvas, QPoint(0, 0))
+    box.resize(220, 28)
+    box.render(canvas, QPoint(0, 0))
     indicator_pixels = {
         canvas.pixelColor(x, y).name()
         for x in range(1, 20)

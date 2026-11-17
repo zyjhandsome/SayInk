@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import logging
+from typing import Any
 
 from PyQt6.QtCore import QEvent, QPoint, QSignalBlocker, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -284,6 +285,8 @@ class GeneralSettingsPage(SettingsPage):
     hotkey_capture_ended = pyqtSignal()
     hotkey_changed = pyqtSignal(str)
     hotkey_reset_requested = pyqtSignal()
+    paste_last_hotkey_changed = pyqtSignal(str)
+    rewrite_hotkey_changed = pyqtSignal(str)
     esc_stop_toggled = pyqtSignal(bool)
     input_source_toggled = pyqtSignal(bool)
     output_mode_changed = pyqtSignal(int)
@@ -311,8 +314,6 @@ class GeneralSettingsPage(SettingsPage):
     history_enabled_toggled = pyqtSignal(bool)
     history_limits_changed = pyqtSignal(int)
     history_limits_editing_finished = pyqtSignal()
-    recovery_toggled = pyqtSignal(bool)
-    audio_recovery_requested = pyqtSignal()
 
     # Explicitly typed widget/control fields (eliminating 77 dynamic win._* injections)
     trigger_group: QButtonGroup
@@ -322,6 +323,12 @@ class GeneralSettingsPage(SettingsPage):
     hotkey_hint: QLabel
     hotkey_conflict_label: QLabel
     hotkey_reset_btn: QPushButton
+    extra_hotkeys_btn: QPushButton
+    extra_hotkeys_panel: QWidget
+    paste_last_hotkey_edit: HotkeyEdit
+    paste_last_clear_btn: QPushButton
+    rewrite_hotkey_edit: HotkeyEdit
+    rewrite_clear_btn: QPushButton
     esc_stop_divider: QWidget
     esc_stop_row: ToggleOptionRow
     audio_device_buttons: tuple[QPushButton, QPushButton]
@@ -374,10 +381,7 @@ class GeneralSettingsPage(SettingsPage):
     llm_proxy_combo: ElidedComboBox
     llm_proxy_suffix_edit: QLineEdit
     listen_bar_autohide_row: ToggleOptionRow
-    advanced_recovery_btn: QPushButton
-    advanced_recovery_panel: QWidget
-    recovery_row: ToggleOptionRow
-    recovery_btn: QPushButton
+    meeting_save_audio_row: ToggleOptionRow
     meeting_language_combo: ElidedComboBox
     meeting_glossary_edit: GlossaryPlainTextEdit
     glossary_count_label: QLabel
@@ -461,6 +465,7 @@ class GeneralSettingsPage(SettingsPage):
             self.vad_download_btn,
             self.meeting_source_combo,
             self.meeting_model_combo,
+            self.meeting_save_audio_row,
             self.meeting_start_card_row,
             self.meeting_start_card_reset_btn,
             self.llm_proxy_combo,
@@ -474,8 +479,6 @@ class GeneralSettingsPage(SettingsPage):
             self.history_enabled_row,
             self.history_retention_days_spin,
             self.history_max_entries_spin,
-            self.recovery_row,
-            self.recovery_btn,
         ]
         chain_tab_order(self.general_tab_chain)
 
@@ -488,12 +491,6 @@ class GeneralSettingsPage(SettingsPage):
             self.set_advanced_mixing_expanded(True)
         elif fw is self.meeting_start_card_reset_btn and not self.advanced_network_panel.isVisible():
             self.set_advanced_network_expanded(True)
-        elif (
-            fw is not None
-            and (fw is self.history_max_entries_spin or self.history_max_entries_spin.isAncestorOf(fw))
-            and not self.advanced_recovery_panel.isVisible()
-        ):
-            self.set_advanced_recovery_expanded(True)
 
     def focusNextPrevChild(self, next: bool) -> bool:
         self.prepare_tab_navigation(next)
@@ -546,6 +543,7 @@ class GeneralSettingsPage(SettingsPage):
         lay.addWidget(self.hotkey_conflict_label)
         self.hotkey_edit.hotkey_changed.connect(self.sync_hotkey_reset_state)
         self.sync_hotkey_reset_state(self.hotkey_edit.value)
+        self._build_extra_hotkeys_panel(lay)
         self.esc_stop_divider = group_divider()
         lay.addWidget(self.esc_stop_divider)
         self.esc_stop_row = ToggleOptionRow(
@@ -584,6 +582,96 @@ class GeneralSettingsPage(SettingsPage):
         section = settings_section("录音与输入", card)
         section.setObjectName("recordingInputSection")
         return section
+
+    def _build_extra_hotkeys_panel(self, lay: QVBoxLayout) -> None:
+        self.extra_hotkeys_btn = device_selection_link("扩展快捷键（重贴上一句 / 选中改写）")
+        self.extra_hotkeys_btn.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.extra_hotkeys_btn.toggled.connect(self.set_extra_hotkeys_expanded)
+        lay.addWidget(inline_action_row(self.extra_hotkeys_btn, margins=(16, 0, 16, 10)))
+
+        self.extra_hotkeys_panel = QWidget()
+        self.extra_hotkeys_panel.setVisible(False)
+        self.extra_hotkeys_panel.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
+        ex_lay = QVBoxLayout(self.extra_hotkeys_panel)
+        ex_lay.setContentsMargins(0, 0, 0, 0)
+        ex_lay.setSpacing(0)
+        ex_lay.addWidget(group_divider())
+
+        self.paste_last_hotkey_edit = HotkeyEdit()
+        self.paste_last_hotkey_edit.setAccessibleName("重贴上一句快捷键")
+        self.paste_last_hotkey_edit.setMinimumHeight(36)
+        self.paste_last_hotkey_edit.capture_started.connect(self.hotkey_capture_started.emit)
+        self.paste_last_hotkey_edit.capture_ended.connect(self.hotkey_capture_ended.emit)
+        self.paste_last_hotkey_edit.hotkey_changed.connect(self.paste_last_hotkey_changed.emit)
+        self.paste_last_clear_btn = _ghost_button(
+            "清空",
+            lambda: self._clear_optional_hotkey(
+                self.paste_last_hotkey_edit, self.paste_last_hotkey_changed
+            ),
+            tooltip="关闭重贴上一句快捷键",
+        )
+        paste_row = QWidget()
+        paste_lay = QHBoxLayout(paste_row)
+        paste_lay.setContentsMargins(0, 0, 0, 0)
+        paste_lay.setSpacing(8)
+        paste_lay.addWidget(self.paste_last_hotkey_edit, 1)
+        paste_lay.addWidget(self.paste_last_clear_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        ex_lay.addWidget(
+            stacked_field_row(
+                "重贴上一句（可选）",
+                paste_row,
+                "按下后将最近一次转写结果粘贴到当前光标处（不新增历史记录）；默认留空不启用。",
+                buddy=self.paste_last_hotkey_edit,
+            )
+        )
+        ex_lay.addWidget(group_divider())
+
+        self.rewrite_hotkey_edit = HotkeyEdit()
+        self.rewrite_hotkey_edit.setAccessibleName("选中改写快捷键")
+        self.rewrite_hotkey_edit.setMinimumHeight(36)
+        self.rewrite_hotkey_edit.capture_started.connect(self.hotkey_capture_started.emit)
+        self.rewrite_hotkey_edit.capture_ended.connect(self.hotkey_capture_ended.emit)
+        self.rewrite_hotkey_edit.hotkey_changed.connect(self.rewrite_hotkey_changed.emit)
+        self.rewrite_clear_btn = _ghost_button(
+            "清空",
+            lambda: self._clear_optional_hotkey(
+                self.rewrite_hotkey_edit, self.rewrite_hotkey_changed
+            ),
+            tooltip="关闭选中改写快捷键",
+        )
+        rewrite_row = QWidget()
+        rewrite_lay = QHBoxLayout(rewrite_row)
+        rewrite_lay.setContentsMargins(0, 0, 0, 0)
+        rewrite_lay.setSpacing(8)
+        rewrite_lay.addWidget(self.rewrite_hotkey_edit, 1)
+        rewrite_lay.addWidget(self.rewrite_clear_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        ex_lay.addWidget(
+            stacked_field_row(
+                "选中改写（可选）",
+                rewrite_row,
+                "先在编辑器中选中文字，再按住此快捷键说出指令（如「翻译成英文」「精简为三点」）。"
+                "通过 Windows 无障碍接口无副作用读取选区，终端内绝不模拟 Ctrl+C；首次发往远程接口会弹窗确认。",
+                buddy=self.rewrite_hotkey_edit,
+            )
+        )
+        lay.addWidget(self.extra_hotkeys_panel)
+
+    @staticmethod
+    def _clear_optional_hotkey(edit: HotkeyEdit, sig: Any) -> None:
+        edit.set_value("")
+        sig.emit("")
+
+    def set_extra_hotkeys_expanded(self, visible: bool) -> None:
+        def change() -> None:
+            set_section_visible(self.extra_hotkeys_panel, visible)
+            self.extra_hotkeys_btn.setText(
+                "收起扩展快捷键" if visible else "扩展快捷键（重贴上一句 / 选中改写）"
+            )
+            set_checked_link(self.extra_hotkeys_btn, visible)
+
+        without_scroll_jump(self.extra_hotkeys_btn, change)
 
     def _build_source_picker(self, lay: QVBoxLayout) -> None:
         self.source_group = QButtonGroup(self)
@@ -792,7 +880,7 @@ class GeneralSettingsPage(SettingsPage):
 
     def _build_history_rows(self, lay: QVBoxLayout) -> None:
         self.history_enabled_row = ToggleOptionRow(
-            "保存转写历史", "历史仅保存转写文本；关闭后停止新增转写，录音恢复有独立开关"
+            "保存转写历史", "历史只保存转写文本；关闭后停止新增转写"
         )
         self.history_retention_days_spin = QSpinBox()
         self.history_retention_days_spin.setRange(1, 3650)
@@ -884,26 +972,6 @@ class GeneralSettingsPage(SettingsPage):
         lay.addWidget(group_divider())
         self._build_toggle_rows(lay)
         self._build_history_rows(lay)
-        lay.addWidget(group_divider())
-        self.advanced_recovery_btn = device_selection_link("本机录音恢复缓存")
-        self.advanced_recovery_btn.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.advanced_recovery_btn.toggled.connect(self.set_advanced_recovery_expanded)
-        lay.addWidget(inline_action_row(self.advanced_recovery_btn, margins=(16, 8, 16, 8)))
-        self.advanced_recovery_panel = QWidget()
-        self.advanced_recovery_panel.setVisible(False)
-        self.advanced_recovery_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        rec_lay = QVBoxLayout(self.advanced_recovery_panel)
-        rec_lay.setContentsMargins(0, 0, 0, 0)
-        rec_lay.setSpacing(0)
-        self.recovery_row = ToggleOptionRow(
-            "录音恢复（本机缓存）",
-            "默认关闭；开启后保存完整录音，正常结束保留 7 天，总量上限 5 GB，超出时自动清理最早的旧录音。下次录音生效。",
-        )
-        self.recovery_row.toggled.connect(self.recovery_toggled.emit)
-        rec_lay.addWidget(self.recovery_row)
-        self.recovery_btn = _ghost_button("查看 / 恢复录音", self.audio_recovery_requested.emit)
-        rec_lay.addWidget(inline_action_row(self.recovery_btn))
-        lay.addWidget(self.advanced_recovery_panel)
         bottom = QWidget()
         bottom.setFixedHeight(4)
         lay.addWidget(bottom)
@@ -934,9 +1002,9 @@ class GeneralSettingsPage(SettingsPage):
         lay.addWidget(stacked_field_row(
             "自定义词汇", self.meeting_glossary_edit,
             "每行填写一个产品名、人名或专业术语，单次转写、持续转写和会议共用。"
-            "支持热词的模型会在识别时参考这些词，词汇过多可能影响识别效果。\n"
-            "填写「正确词=误写1、误写2」可在识别后直接替换匹配的文字，适用于所有模型；请避免使用容易误替换的词。\n"
-            "最多 50 个词；正确词和每个误写各不超过 20 字，每个词最多 5 个误写。离开输入框、切换页面或关闭设置时保存。",
+            "支持热词的模型会在识别时参考前 30 个词（避免热词过多劣化识别准确率）。\n"
+            "填写「正确词=误写1、误写2」可在识别后零延迟替换匹配的文字，适用于所有模型；请避免使用容易误替换的词。\n"
+            "最多 500 个词；正确词和每个误写各不超过 20 字，每个词最多 5 个误写。离开输入框、切换页面或关闭设置时保存。",
         ))
         self.glossary_count_label = footnote("")
         self.glossary_clear_btn = _ghost_button(
@@ -1023,6 +1091,15 @@ class GeneralSettingsPage(SettingsPage):
         self.meeting_defaults_hint.setProperty("viRole", "importantHint")
         lay.addWidget(inline_action_row(self.meeting_defaults_hint, margins=(16, 0, 16, 10)))
         lay.addWidget(group_divider())
+        self.meeting_save_audio_row = ToggleOptionRow(
+            "保存会议录音",
+            "结束后可点文字回放。只存在本机。",
+        )
+        self.meeting_save_audio_row.toggled.connect(
+            lambda _checked=False: self.meeting_setting_changed.emit()
+        )
+        lay.addWidget(self.meeting_save_audio_row)
+        lay.addWidget(group_divider())
         self.meeting_start_card_row = ToggleOptionRow(
             "开始前显示会议信息卡", "填写标题、参会人与议程；关闭后从托盘直接开始",
         )
@@ -1085,11 +1162,11 @@ class GeneralSettingsPage(SettingsPage):
         for button in self.general_section_jumps:
             button.setStyleSheet(settings_styles.BTN_GHOST_SM)
         for btn in (
+            self.extra_hotkeys_btn,
             self.advanced_audio_btn,
             self.advanced_mixing_btn,
             self.advanced_recognition_btn,
             self.advanced_network_btn,
-            self.advanced_recovery_btn,
         ):
             paint_device_selection_link(btn)
         self.paint_glossary_edit()
@@ -1302,19 +1379,6 @@ class GeneralSettingsPage(SettingsPage):
             set_checked_link(self.advanced_network_btn, visible)
 
         without_scroll_jump(self.advanced_network_btn, change)
-
-    def set_advanced_recovery_expanded(self, visible: bool) -> None:
-        def change() -> None:
-            set_section_visible(self.advanced_recovery_panel, visible)
-            self.advanced_recovery_btn.setText(
-                "收起本机录音恢复缓存" if visible else "本机录音恢复缓存"
-            )
-            self.advanced_recovery_btn.setAccessibleName(
-                "收起本机录音恢复缓存" if visible else "展开本机录音恢复缓存"
-            )
-            set_checked_link(self.advanced_recovery_btn, visible)
-
-        without_scroll_jump(self.advanced_recovery_btn, change)
 
     def reveal_proxy_settings(self) -> None:
         self.set_advanced_network_expanded(True)
@@ -1534,6 +1598,12 @@ class GeneralSettingsPage(SettingsPage):
         self.llm_proxy_suffix_edit.setText(proxy_suffix)
         self.hotkey_edit.set_value(config.get("hotkey", DEFAULT_HOTKEY))
         self.sync_hotkey_reset_state(config.get("hotkey", DEFAULT_HOTKEY))
+        paste_last_hk = str(config.get("audio.paste_last_hotkey", "") or "")
+        rewrite_hk = str(config.get("audio.rewrite_hotkey", "") or "")
+        self.paste_last_hotkey_edit.set_value(paste_last_hk)
+        self.rewrite_hotkey_edit.set_value(rewrite_hk)
+        if paste_last_hk or rewrite_hk:
+            self.set_extra_hotkeys_expanded(True)
         self.auto_start_row.setChecked(config.get("auto_start", False))
         self.sound_row.setChecked(config.get("sound_enabled", True))
         self.restore_clipboard_row.setChecked(bool(config.get("output.restore_clipboard", True)))
@@ -1541,16 +1611,12 @@ class GeneralSettingsPage(SettingsPage):
         set_combo_by_data(self.output_mode_combo, output_choice)
         self.esc_stop_row.setChecked(bool(config.get("audio.esc_stops_continuous", True)))
         self.history_enabled_row.setChecked(config.get("history.enabled", True))
-        recovery_on = bool(config.get("audio.recovery_enabled", False))
         separate_on = bool(config.get("audio.separate_lanes", False))
-        self.recovery_row.setChecked(recovery_on)
         self.separate_lanes_row.setChecked(separate_on)
         if separate_on:
             self.set_advanced_mixing_expanded(True)
         if resolved_proxy != "system" or bool(proxy_suffix.strip()):
             self.set_advanced_network_expanded(True)
-        if recovery_on:
-            self.set_advanced_recovery_expanded(True)
         self.history_retention_days_spin.setValue(
             int_or(config.get("history.retention_days", 90), 90)
         )
@@ -1583,6 +1649,7 @@ class GeneralSettingsPage(SettingsPage):
         set_combo_by_data(self.meeting_model_combo, config.get("meeting.model_id", "") or "")
         set_combo_by_data(self.meeting_language_combo, config.get("stt.language", "auto"))
         self.meeting_start_card_row.setChecked(bool(config.get("meeting.show_start_card", True)))
+        self.meeting_save_audio_row.setChecked(bool(config.get("meeting.save_audio", True)))
 
         glossary = config.get("stt.glossary", []) or []
         lines = (format_glossary_line(g) for g in glossary)
@@ -1594,13 +1661,18 @@ class GeneralSettingsPage(SettingsPage):
         self.update_glossary_count()
 
     def update_glossary_count(self) -> None:
+        from sayink.asr_correction import MAX_GLOSSARY_ENTRIES
+        from sayink.speech_recognizer import MAX_HOTWORDS
+
         count = sum(bool(line.strip()) for line in self.meeting_glossary_edit.toPlainText().splitlines())
-        self.glossary_count_label.setText(f"已填写 {count} 行 / 最多 50 个词")
+        self.glossary_count_label.setText(
+            f"已填写 {count} 行 / 最多 {MAX_GLOSSARY_ENTRIES} 个词（前 {MAX_HOTWORDS} 个作为识别热词）"
+        )
         self.glossary_clear_btn.setEnabled(count > 0)
 
     def parse_glossary_editor(self) -> tuple[list[dict], str]:
-        from sayink.asr_correction import parse_glossary_line_with_warnings
-        from sayink.speech_recognizer import MAX_HOTWORD_CHARS, MAX_HOTWORDS
+        from sayink.asr_correction import MAX_GLOSSARY_ENTRIES, parse_glossary_line_with_warnings
+        from sayink.speech_recognizer import MAX_HOTWORD_CHARS
 
         terms: list[dict] = []
         seen: set[str] = set()
@@ -1618,8 +1690,8 @@ class GeneralSettingsPage(SettingsPage):
             if term in seen:
                 skipped.append(f"第 {line_number} 行：正确词重复，未保存")
                 continue
-            if len(terms) >= MAX_HOTWORDS:
-                skipped.append(f"超过 {MAX_HOTWORDS} 个词，其余未保存")
+            if len(terms) >= MAX_GLOSSARY_ENTRIES:
+                skipped.append(f"超过 {MAX_GLOSSARY_ENTRIES} 个词，其余未保存")
                 break
             seen.add(term)
             entry["term"] = term

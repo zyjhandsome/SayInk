@@ -1296,6 +1296,7 @@ class SettingsPage(QScrollArea):
         self._layout.setSpacing(tok.SETTINGS_SECTION_SPACING)
         self._layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.setWidget(body)
+        self._paint_page_surface()
         # Keep AsNeeded, but reserve the bar gutter when it is hidden so
         # tall sections (e.g. 润色接口配置) don't shift rows horizontally.
         self.verticalScrollBar().rangeChanged.connect(self._sync_scroll_gutter)
@@ -1328,6 +1329,31 @@ class SettingsPage(QScrollArea):
                 self.setViewportMargins(0, 0, gutter, 0)
         finally:
             self._syncing_gutter = False
+
+    def _paint_page_surface(self) -> None:
+        """Fill the scroll surface. A transparent viewport keeps the desktop.
+
+        The main window does not erase with the system brush. After sleep, or
+        the moment the startup cloak drops, any region this page does not paint
+        still shows the windows behind it.
+        """
+        from sayink.ui import design_tokens as live
+
+        viewport = self.viewport()
+        viewport.setObjectName("settingsPageViewport")
+        viewport.setAutoFillBackground(True)
+        viewport.setStyleSheet(
+            f"QWidget#settingsPageViewport {{ background: {live.BG}; }}"
+        )
+        body = self.widget()
+        if body is None:
+            return
+        body.setObjectName("settingsPageBody")
+        body.setAutoFillBackground(True)
+        body.setStyleSheet(f"QWidget#settingsPageBody {{ background: {live.BG}; }}")
+
+    def reapply_styles(self) -> None:
+        self._paint_page_surface()
 
     def set_compact(self, compact: bool = True) -> None:
         m = tok.SETTINGS_CONTENT_MARGINS if compact else (PAGE_MARGIN_H, PAGE_MARGIN_V, PAGE_MARGIN_H, PAGE_MARGIN_V)

@@ -138,6 +138,51 @@ def _stamp_shortcut_app_id(lnk_path: Path, pythoncom, propsys, pscon) -> None:
     store.Commit()
 
 
+def _handle_frozen_group_shortcuts(
+    lnk_path: Path,
+    group_shortcuts: list[Path],
+    pythoncom: object,
+    propsys: object,
+    pscon: object,
+) -> None:
+    if lnk_path.is_file():
+        try:
+            lnk_path.unlink()
+        except OSError:
+            pass
+    primary = group_shortcuts[0]
+    if _read_shortcut_app_id(primary, propsys, pscon) != APP_USER_MODEL_ID:
+        try:
+            _stamp_shortcut_app_id(primary, pythoncom, propsys, pscon)
+        except Exception:
+            pass
+
+
+def _shortcut_matches_existing(
+    existing: object,
+    lnk_path: Path,
+    target: str,
+    arguments: str,
+    workdir: str,
+    *,
+    is_frozen: bool,
+    propsys: object,
+    pscon: object,
+) -> bool:
+    existing_target = getattr(existing, "Targetpath", "") or ""
+    existing_args = getattr(existing, "Arguments", "") or ""
+    existing_workdir = getattr(existing, "WorkingDirectory", "") or ""
+    if not is_frozen and existing_target.lower().endswith("sayink.exe"):
+        log.debug("保留正式版开始菜单快捷方式，不被源码运行覆盖: %s", existing_target)
+        return True
+    return (
+        _norm_win_path(existing_target) == _norm_win_path(target)
+        and existing_args.strip() == arguments.strip()
+        and _norm_win_path(existing_workdir) == _norm_win_path(workdir)
+        and _read_shortcut_app_id(lnk_path, propsys, pscon) == APP_USER_MODEL_ID
+    )
+
+
 def _ensure_start_menu_shortcut() -> None:
     """Register Start Menu shortcut idempotently without duplicating or clobbering installs."""
     try:
@@ -152,75 +197,44 @@ def _ensure_start_menu_shortcut() -> None:
         appdata = os.environ.get("APPDATA", "").strip()
         if not appdata:
             return
-        start_menu = (
-            Path(appdata)
-            / "Microsoft"
-            / "Windows"
-            / "Start Menu"
-            / "Programs"
-        )
+        start_menu = Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
         start_menu.mkdir(parents=True, exist_ok=True)
         lnk_path = start_menu / f"{APP_DISPLAY_NAME}.lnk"
         is_frozen = bool(getattr(sys, "frozen", False))
         group_shortcuts = _installed_group_shortcuts(start_menu)
 
-        # Running from source must never overwrite an installed SayInk shortcut or
-        # create a duplicate second entry alongside Setup's Programs\SayInk\SayInk.lnk.
         if not is_frozen and group_shortcuts:
             log.debug("检测到已安装版开始菜单快捷方式，源码模式跳过写入: %s", group_shortcuts[0])
             return
-
-        target, arguments, workdir = _launcher_target()
-
         if is_frozen and group_shortcuts:
-            # Setup already created {group}\SayInk.lnk; remove any legacy duplicate
-            # top-level Programs\SayInk.lnk and ensure AppUserModelID is stamped if writable.
-            if lnk_path.is_file():
-                try:
-                    lnk_path.unlink()
-                except OSError:
-                    pass
-            primary = group_shortcuts[0]
-            if _read_shortcut_app_id(primary, propsys, pscon) != APP_USER_MODEL_ID:
-                try:
-                    _stamp_shortcut_app_id(primary, pythoncom, propsys, pscon)
-                except Exception:
-                    pass
+            _handle_frozen_group_shortcuts(lnk_path, group_shortcuts, pythoncom, propsys, pscon)
             return
 
+        target, arguments, workdir = _launcher_target()
         shell = win32com.client.Dispatch("WScript.Shell")
-
-        if lnk_path.is_file():
-            existing = shell.CreateShortCut(str(lnk_path))
-            existing_target = getattr(existing, "Targetpath", "") or ""
-            existing_args = getattr(existing, "Arguments", "") or ""
-            existing_workdir = getattr(existing, "WorkingDirectory", "") or ""
-            if not is_frozen and existing_target.lower().endswith("sayink.exe"):
-                log.debug("保留正式版开始菜单快捷方式，不被源码运行覆盖: %s", existing_target)
-                return
-            if (
-                _norm_win_path(existing_target) == _norm_win_path(target)
-                and existing_args.strip() == arguments.strip()
-                and _norm_win_path(existing_workdir) == _norm_win_path(workdir)
-                and _read_shortcut_app_id(lnk_path, propsys, pscon) == APP_USER_MODEL_ID
-            ):
-                return
-            shortcut = existing
-        else:
-            shortcut = shell.CreateShortCut(str(lnk_path))
+        shortcut = shell.CreateShortCut(str(lnk_path))
+        if lnk_path.is_file() and _shortcut_matches_existing(
+            shortcut,
+            lnk_path,
+            target,
+            arguments,
+            workdir,
+            is_frozen=is_frozen,
+            propsys=propsys,
+            pscon=pscon,
+        ):
+            return
 
         shortcut.Targetpath = target
         shortcut.Arguments = arguments
         shortcut.WorkingDirectory = workdir
         shortcut.Description = APP_DISPLAY_NAME
-
         if is_frozen:
             shortcut.IconLocation = f"{target},0"
         else:
             icon_path = _project_root() / "sayink" / "icon.ico"
             if icon_path.exists():
                 shortcut.IconLocation = f"{icon_path},0"
-
         shortcut.save()
         _stamp_shortcut_app_id(lnk_path, pythoncom, propsys, pscon)
         log.info("已注册开始菜单快捷方式: %s", lnk_path)

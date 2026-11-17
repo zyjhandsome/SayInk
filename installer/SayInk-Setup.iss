@@ -2,17 +2,17 @@
 ; Creates a professional Windows installer with custom installation path
 ;
 ; Constants are normally passed by build_installer.py:
-;   ISCC /DAppVersionStr=3.0.6 /DAppVersionQuad=3.0.6.0 SayInk-Setup.iss
+;   ISCC /DAppVersionStr=3.0.7 /DAppVersionQuad=3.0.7.0 SayInk-Setup.iss
 ; Both installers copy dist\SayInk\models\. Lite has CAM++, Silero VAD and
 ; the experimental speaker-activity model; the app downloads Fun-ASR-Nano on
 ; first start. Full installer:
 ; /DOutputSuffix=-full, and models\ also contains Fun-ASR-Nano.
 ; The in-app updater only downloads the lite name (sayink/updater.py).
 #ifndef AppVersionStr
-#define AppVersionStr "3.0.6"
+#define AppVersionStr "3.0.7"
 #endif
 #ifndef AppVersionQuad
-#define AppVersionQuad "3.0.6.0"
+#define AppVersionQuad "3.0.7.0"
 #endif
 #ifndef OutputSuffix
 #define OutputSuffix ""
@@ -101,7 +101,7 @@ Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\SayInk.
 Filename: "{app}\SayInk.exe"; Description: "立即运行 SayInk"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-Filename: "taskkill"; Parameters: "/F /IM SayInk.exe"; Flags: runhidden waituntilterminated
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM SayInk.exe"; Flags: runhidden waituntilterminated
 
 [UninstallDelete]
 ; Never delete {app} recursively with wildcards: if a user installed into a
@@ -304,7 +304,7 @@ begin
   if CheckForMutexes(SingleInstanceMutexName) then
   begin
     // Request polite exit first before forceful termination so SQLite/Config flush cleanly.
-    Exec('taskkill', '/IM SayInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM SayInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
     for I := 1 to 25 do
     begin
       if not CheckForMutexes(SingleInstanceMutexName) then
@@ -314,7 +314,7 @@ begin
   end;
 
   // Final safety fallback if any SayInk.exe process is still hung.
-  Exec('taskkill', '/F /IM SayInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM SayInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
 end;
 
 function InitializeSetup(): Boolean;
@@ -323,7 +323,7 @@ var
 begin
   WaitForGracefulAppExit();
   // A running VoiceInk holds files in ~\.voiceink open and the rename fails.
-  Exec('taskkill', '/F /IM VoiceInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM VoiceInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
   Sleep(500);
   MigrateLegacyDataDir();
   UninstallLegacyVoiceInk();

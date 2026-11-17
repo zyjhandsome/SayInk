@@ -27,6 +27,7 @@ from sayink.config import (
     TRIGGER_MODE_MEETING,
     Config as _ConfigRules,
 )
+from sayink.contracts import OutputPipelineSnapshot
 from sayink.history_store import SegmentRecord
 from sayink.polish_fidelity import polish_rejection_reason
 from sayink.runtime_status import OutputStage
@@ -36,9 +37,12 @@ from sayink.text_paster import PasteResult
 from sayink.text_polisher import (
     LLM_MODE_CORRECT,
     LLM_MODE_POLISH,
+    app_preset_instruction,
+    app_preset_label,
     normalize_llm_mode,
     polish_settings_complete,
     prompt_config_key,
+    resolve_app_style_rule,
 )
 
 log = logging.getLogger("SayInk")
@@ -116,6 +120,66 @@ class _QueuedSegment:
         return self.audio.load() if isinstance(self.audio, StoredAudio) else self.audio
 
 
+def _noop(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
+def _false() -> bool:
+    return False
+
+
+def _zero_target() -> tuple[int, str]:
+    return (0, "")
+
+
+def _cancel_conflict(**_kw: Any) -> str:
+    return "cancel"
+
+
+def _identity_str(msg: str) -> str:
+    return msg
+
+
+def _default_platform() -> str:
+    return sys.platform
+
+
+def _default_watchdog_ms() -> int:
+    return OUTPUT_WATCHDOG_MS
+
+
+def _default_context_window() -> float:
+    return RECENT_OUTPUT_CONTEXT_S
+
+
+_PIPELINE_CALLBACK_DEFAULTS: dict[str, Callable[..., Any]] = {
+    "schedule_later": _noop,
+    "pump_queue": _noop,
+    "finish_empty_recognition": _noop,
+    "refresh_continuous_ui": _noop,
+    "maybe_finish_dictation_speakers": _noop,
+    "stop_continuous_user_session": _noop,
+    "ask_history_output_conflict": _cancel_conflict,
+    "glossary_for_pending_segment": list,
+    "continuous_session_active": _false,
+    "continuous_user_stopped": _false,
+    "has_queued_segments": _false,
+    "meeting_active": _false,
+    "exit_started": _false,
+    "hold_target": _zero_target,
+    "clear_transcribing": _noop,
+    "friendly_error": _identity_str,
+    "copy_to_clipboard": pyperclip.copy,
+    "now_monotonic": time.monotonic,
+    "now_wall": time.time,
+    "platform_name": _default_platform,
+    "watchdog_ms": _default_watchdog_ms,
+    "recent_context_window_s": _default_context_window,
+    "polish_reject_fn": polish_rejection_reason,
+    "correction_reject_fn": correction_rejection_reason,
+}
+
+
 class OutputPipeline:
     """Serializes LLM polish/correction, paste dispatch, watchdogs, and history writes."""
 
@@ -129,33 +193,10 @@ class OutputPipeline:
         floating: Any = None,
         tray: Any = None,
         recorder: Any = None,
-        schedule_later: Callable[[int, Callable[[], None]], None] | None = None,
-        pump_queue: Callable[[], None] | None = None,
-        schedule_queue_pump: Callable[[], None] | None = None,
-        finish_empty_recognition: Callable[[], None] | None = None,
-        refresh_continuous_ui: Callable[[], None] | None = None,
-        maybe_finish_dictation_speakers: Callable[[], None] | None = None,
-        stop_continuous_user_session: Callable[[], None] | None = None,
-        ask_history_output_conflict: Callable[..., str] | None = None,
-        glossary_for_pending_segment: Callable[[], list] | None = None,
-        continuous_session_active: Callable[[], bool] | None = None,
-        continuous_user_stopped: Callable[[], bool] | None = None,
-        has_queued_segments: Callable[[], bool] | None = None,
-        meeting_active: Callable[[], bool] | None = None,
-        exit_started: Callable[[], bool] | None = None,
-        hold_target: Callable[[], tuple[int, str]] | None = None,
-        clear_transcribing: Callable[[], None] | None = None,
-        friendly_error: Callable[[str], str] | None = None,
         output_text_dispatch: Callable[..., None] | None = None,
         handle_paste_result_dispatch: Callable[..., None] | None = None,
-        copy_to_clipboard: Callable[[str], None] | None = None,
-        now_monotonic: Callable[[], float] | None = None,
-        now_wall: Callable[[], float] | None = None,
-        platform_name: Callable[[], str] | None = None,
-        watchdog_ms: Callable[[], int] | None = None,
-        recent_context_window_s: Callable[[], float] | None = None,
-        polish_reject_fn: Callable[[str, str], str | None] | None = None,
-        correction_reject_fn: Callable[[str, str, list], str | None] | None = None,
+        schedule_queue_pump: Callable[[], None] | None = None,
+        **callbacks: Callable[..., Any] | None,
     ) -> None:
         self.config = config
         self.polisher = polisher
@@ -164,68 +205,53 @@ class OutputPipeline:
         self.floating = floating
         self.tray = tray
         self.recorder = recorder
-
-        self.schedule_later = schedule_later or (lambda _ms, _fn: None)
-        self.pump_queue = pump_queue or (lambda: None)
-        self.schedule_queue_pump = schedule_queue_pump or (
-            lambda: self.schedule_later(SEGMENT_PUMP_DELAY_MS, self.pump_queue)
-        )
-        self.finish_empty_recognition = finish_empty_recognition or (lambda: None)
-        self.refresh_continuous_ui = refresh_continuous_ui or (lambda: None)
-        self.maybe_finish_dictation_speakers = maybe_finish_dictation_speakers or (lambda: None)
-        self.stop_continuous_user_session = stop_continuous_user_session or (lambda: None)
-        self.ask_history_output_conflict = ask_history_output_conflict or (lambda **_kw: "cancel")
-        self.glossary_for_pending_segment = glossary_for_pending_segment or list
-        self.continuous_session_active = continuous_session_active or (lambda: False)
-        self.continuous_user_stopped = continuous_user_stopped or (lambda: False)
-        self.has_queued_segments = has_queued_segments or (lambda: False)
-        self.meeting_active = meeting_active or (lambda: False)
-        self.exit_started = exit_started or (lambda: False)
-        self.hold_target = hold_target or (lambda: (0, ""))
-        self.clear_transcribing = clear_transcribing or (lambda: None)
-        self.friendly_error = friendly_error or (lambda msg: msg)
         self.output_text_dispatch = output_text_dispatch
         self.handle_paste_result_dispatch = handle_paste_result_dispatch
-        self.copy_to_clipboard = copy_to_clipboard or pyperclip.copy
-        self.now_monotonic = now_monotonic or time.monotonic
-        self.now_wall = now_wall or time.time
-        self.platform_name = platform_name or (lambda: sys.platform)
-        self.watchdog_ms = watchdog_ms or (lambda: OUTPUT_WATCHDOG_MS)
-        self.recent_context_window_s = recent_context_window_s or (lambda: RECENT_OUTPUT_CONTEXT_S)
-        self.polish_reject_fn = polish_reject_fn or polish_rejection_reason
-        self.correction_reject_fn = correction_reject_fn or correction_rejection_reason
+        self._bind_callbacks(schedule_queue_pump, callbacks)
 
-        # Output stays serial. One next segment may be decoded into the queue
-        # while the pending history record and polisher own the current one.
         self.busy: bool = False
         self.token: int = 0
         self.invalidated_token: int = 0
-        # Raw text of the segment currently being output. A new hold recording
-        # may start meanwhile and reset _current_transcription.
         self.raw_text: str = ""
-        # "polish" while the polisher owns the sentence, "paste" once it was
-        # handed to the paster; the watchdog decides from this what to salvage.
         self.stage: OutputStage = OutputStage.IDLE
         self.stage_text: str = ""
-        # The history row of the sentence being pasted, so the watchdog can
-        # still save it when the paster's callback never arrives.
         self.stage_record: SegmentRecord | None = None
-        # Pending row owned by polish/paste. Esc on a newer hold clears
-        # `pending_record` and must not drop this sentence or its window.
         self.output_pending_record: _PendingHistoryRecord | None = None
         self.pending_record: _PendingHistoryRecord | None = None
-        # Which LLM mode owns the in-flight sentence and the glossary it was
-        # sent with, so the right acceptance guard runs when the reply lands.
         self.llm_mode: str = LLM_MODE_POLISH
+        self.active_preset_label: str = ""
         self.glossary: list = []
-        # Tail of the previous output and when it went out; correction mode
-        # shows it to the model as read-only context for a split sentence.
         self.last_output_text: str = ""
         self.last_output_at: float = 0.0
         self.dropped_slices: int = 0
         self.keep_unsaved_continuous_text: bool = False
         self.history_failure_notified: bool = False
         self.polish_error_failed: bool = False
+
+    def _bind_callbacks(
+        self,
+        schedule_queue_pump: Callable[[], None] | None,
+        callbacks: dict[str, Callable[..., Any] | None],
+    ) -> None:
+        for name, default_fn in _PIPELINE_CALLBACK_DEFAULTS.items():
+            provided = callbacks.pop(name, None)
+            setattr(self, name, provided if provided is not None else default_fn)
+        self.schedule_queue_pump = schedule_queue_pump or (
+            lambda: self.schedule_later(SEGMENT_PUMP_DELAY_MS, self.pump_queue)
+        )
+        if callbacks:
+            unknown = ", ".join(sorted(callbacks))
+            raise TypeError(f"Unexpected OutputPipeline callback argument(s): {unknown}")
+
+    def snapshot(self) -> OutputPipelineSnapshot:
+        return OutputPipelineSnapshot(
+            busy=bool(self.busy),
+            stage=self.stage,
+            stage_text=str(self.stage_text or ""),
+            last_output_text=str(self.last_output_text or ""),
+            last_output_at=float(self.last_output_at or 0.0),
+            dropped_slices=int(self.dropped_slices or 0),
+        )
 
     def _dispatch_output(self, text: str, *, degraded_from_polish: bool = False) -> None:
         target = self.output_text_dispatch or self.output_text
@@ -405,6 +431,74 @@ class OutputPipeline:
             self.enqueue_history_record(record, target_app="")
         self.pump_queue()
 
+    def _resolve_target_polish_plan(
+        self,
+        pending: _PendingHistoryRecord | None,
+        base_mode: str,
+    ) -> tuple[bool, str, str, str]:
+        """Return ``(skip_llm, effective_mode, preset_label, style_instruction)`` for ``pending``."""
+        is_meeting = pending is not None and pending.trigger_mode == TRIGGER_MODE_MEETING
+        if is_meeting:
+            return False, base_mode, "", ""
+        target_app = pending.target_app if pending is not None else self.paste_target_for_output()[1]
+        rule = resolve_app_style_rule(target_app, self.config.get("llm.app_presets", []))
+        if rule is None:
+            return False, base_mode, "", ""
+        label = app_preset_label(rule.preset_id)
+        if rule.preset_id == "raw":
+            return True, base_mode, label, ""
+        if rule.preset_id == "correct":
+            return False, LLM_MODE_CORRECT, label, ""
+        inst = app_preset_instruction(rule.preset_id)
+        if rule.custom_instruction:
+            inst = f"{inst}\n{rule.custom_instruction}".strip()
+        return False, base_mode, label, inst
+
+    def _show_polishing_hud(self, text: str, *, action: str, preset_label: str) -> None:
+        if self.continuous_user_stopped():
+            suffix = f" · {preset_label}" if preset_label else ""
+            self.floating.show_continuous_stopped(f"正在处理剩余内容 · 正在{action}{suffix}")
+            return
+        try:
+            self.floating.show_polishing(text, action=action, preset_label=preset_label)
+        except TypeError:
+            self.floating.show_polishing(text, action=action)
+
+    def _invoke_polisher(
+        self,
+        text: str,
+        *,
+        api_url: str,
+        api_key: str,
+        model_name: str,
+        prompt: str,
+        mode: str,
+        style_instruction: str,
+    ) -> None:
+        common = dict(
+            mode=mode,
+            glossary=self.glossary,
+            context=self.recent_output_context(),
+            target_app="",
+            proxy_mode=self.config.get("llm.proxy_mode", "system"),
+            proxy_bypass_suffixes=str(self.config.get("llm.proxy_bypass_suffixes", "") or ""),
+        )
+        if style_instruction:
+            try:
+                self.polisher.polish(
+                    text,
+                    api_url,
+                    api_key,
+                    model_name,
+                    prompt,
+                    style_instruction=style_instruction,
+                    **common,
+                )
+                return
+            except TypeError:
+                prompt = f"{prompt}\n\n{style_instruction}".strip() if prompt else style_instruction
+        self.polisher.polish(text, api_url, api_key, model_name, prompt, **common)
+
     def deliver_recognized_text(self, text: str) -> None:
         self.claim_pending_record_for_output()
         self.mark_busy()
@@ -412,16 +506,20 @@ class OutputPipeline:
         self.raw_text = text
         self.stage = OutputStage.POLISH
         self.stage_text = ""
-        llm_enabled = self.config.get("llm.enabled", False)
+        llm_enabled = bool(self.config.get("llm.enabled", False))
         pending = self.record_for_output()
         if pending is not None and pending.trigger_mode == TRIGGER_MODE_MEETING:
-            # Meeting rows go to the minutes model later, in one pass; a
-            # per-sentence polish would only add latency and API cost.
             llm_enabled = bool(self.config.get("meeting.polish_segments", False)) and llm_enabled
+        base_mode = normalize_llm_mode(self.config.get("llm.mode", LLM_MODE_POLISH))
+        skip_llm, mode, preset_label, style_instruction = self._resolve_target_polish_plan(
+            pending, base_mode
+        )
+        self.active_preset_label = preset_label
+        if skip_llm:
+            llm_enabled = False
         api_url = self.config.get("llm.api_url", "")
         api_key = self.config.get("llm.api_key", "")
         model_name = self.config.get("llm.model_name", "")
-        mode = normalize_llm_mode(self.config.get("llm.mode", LLM_MODE_POLISH))
         prompt = self.config.get(prompt_config_key(mode), "")
         self.llm_mode = mode
         self.glossary = list(self.glossary_for_pending_segment() or [])
@@ -429,23 +527,15 @@ class OutputPipeline:
         if llm_enabled and polish_settings_complete(api_url, api_key, model_name):
             action = "纠错" if mode == LLM_MODE_CORRECT else "润色"
             self.tray.set_activity_tooltip("correcting" if mode == LLM_MODE_CORRECT else "polishing")
-            if self.continuous_user_stopped():
-                self.floating.show_continuous_stopped(f"正在处理剩余内容 · 正在{action}")
-            else:
-                self.floating.show_polishing(text, action=action)
-            target_app = pending.target_app if pending is not None else ""
-            self.polisher.polish(
+            self._show_polishing_hud(text, action=action, preset_label=preset_label)
+            self._invoke_polisher(
                 text,
-                api_url,
-                api_key,
-                model_name,
-                prompt,
+                api_url=api_url,
+                api_key=api_key,
+                model_name=model_name,
+                prompt=prompt,
                 mode=mode,
-                glossary=self.glossary,
-                context=self.recent_output_context(),
-                target_app=target_app,
-                proxy_mode=self.config.get("llm.proxy_mode", "system"),
-                proxy_bypass_suffixes=str(self.config.get("llm.proxy_bypass_suffixes", "") or ""),
+                style_instruction=style_instruction,
             )
         elif llm_enabled:
             log.warning("文字润色已开启但配置不完整，直接输出原文")
@@ -496,108 +586,73 @@ class OutputPipeline:
             degraded_from_polish=True,
         )
 
-    def output_text(self, text: str, *, degraded_from_polish: bool = False) -> None:
-        if self.exit_started():
-            return
-        self.clear_transcribing()
-        text = normalize_asr_output(text)
-        if not text.strip():
-            # Nothing to paste or save: release the output slot completely so
-            # the next sentence does not inherit this one's stage or record.
-            self.busy = False
-            self.polish_error_failed = False
-            self.stage = OutputStage.IDLE
-            self.stage_text = ""
-            self.stage_record = None
-            if self.output_pending_record is not None:
-                self.output_pending_record = None
-            else:
-                self.pending_record = None
-            self.finish_empty_recognition()
-            return
+    def _release_empty_output_slot(self) -> None:
+        self.busy = False
+        self.polish_error_failed = False
+        self.stage = OutputStage.IDLE
+        self.stage_text = ""
+        self.stage_record = None
+        if self.output_pending_record is not None:
+            self.output_pending_record = None
+        else:
+            self.pending_record = None
+        self.finish_empty_recognition()
 
-        # Freeze drops the pending row, and that row is the only place a
-        # continuous utterance keeps the window from when speech started.
-        paste_hwnd, paste_app = self.paste_target_for_output()
-        record = self.freeze_pending_history_record(text, degraded_from_polish)
-        is_meeting_row = record is not None and record.trigger_mode == TRIGGER_MODE_MEETING
-        # H-01: Leftover dictation slices draining after a meeting has started
-        # must NEVER fire Ctrl+V into the foreground window mid-meeting.
-        forced_meeting_history = self.meeting_active() and not is_meeting_row
-        history_only = self.utterance_history_only(record) or forced_meeting_history
-        if not is_meeting_row:
-            # Context for the next correction: only dictation that is about to
-            # go out, never a meeting row the user is not typing anywhere.
-            self.last_output_text = text
-            self.last_output_at = self.now_monotonic()
-        preserve_tail = self.keep_unsaved_continuous_text and not getattr(self.recorder, "is_continuous", False)
-        if (
-            not is_meeting_row
-            and not self.meeting_active()
-            and history_only
-            and not bool(self.config.get("history.enabled", True))
-            and (getattr(self.recorder, "is_continuous", False) is True or preserve_tail)
-        ):
-            if preserve_tail:
-                copied = self.copy_clipboard(text)
-                self._dispatch_paste_result(
-                    PasteResult(
-                        "clipboard" if copied else "failed",
-                        detail="history_conflict" if copied else "clipboard_failed",
-                    ),
-                    degraded_from_polish=degraded_from_polish,
-                    record=record,
-                )
-                self.release_unsaved_hold()
-                return
-            # The dialog runs a nested event loop. Drop the polish watchdog
-            # first, or a slow answer re-enters this sentence and pastes it twice.
-            self.token += 1
-            self.stage = OutputStage.PASTE
-            choice = self.ask_history_output_conflict(listening=True)
-            if choice == "history":
-                self.config.set("history.enabled", True)
-            elif choice == "paste":
-                self._set_output_mode_paste()
-            else:
-                self.keep_unsaved_continuous_text = True
-                copied = self.copy_clipboard(text)
-                self.stop_continuous_user_session()
-                self._dispatch_paste_result(
-                    PasteResult(
-                        "clipboard" if copied else "failed",
-                        detail="history_conflict" if copied else "clipboard_failed",
-                    ),
-                    degraded_from_polish=degraded_from_polish,
-                    record=record,
-                )
-                self.release_unsaved_hold()
-                return
-            # 「改为输入光标」/「开启历史」apply to this sentence. Re-read after
-            # the dialog; the captured-source rule still applies if the user
-            # only turned history back on.
-            forced_meeting_history = self.meeting_active() and not is_meeting_row
-            history_only = self.utterance_history_only(record) or forced_meeting_history
-        if is_meeting_row or history_only:
-            # Meeting / playback capture: the words go to history, never to
-            # whatever window happens to be in front.
-            saved = is_meeting_row or bool(self.config.get("history.enabled", True))
-            if forced_meeting_history and not saved:
-                # Never silently lose draining dictation words when a meeting
-                # started while history was off: copy to clipboard safely.
-                self.copy_clipboard(text)
-            log.info("只记录不粘贴：%d 字%s", len(text), "" if saved else "（历史已关闭，未保存）")
+    def _resolve_continuous_unsaved_conflict(
+        self,
+        text: str,
+        *,
+        degraded_from_polish: bool,
+        record: SegmentRecord | None,
+        preserve_tail: bool,
+    ) -> bool:
+        """Handle continuous history-only output when history is disabled. Returns True if handled."""
+        if preserve_tail:
+            copied = self.copy_clipboard(text)
             self._dispatch_paste_result(
-                PasteResult("recorded", detail="" if saved else "history_disabled"),
+                PasteResult(
+                    "clipboard" if copied else "failed",
+                    detail="history_conflict" if copied else "clipboard_failed",
+                ),
                 degraded_from_polish=degraded_from_polish,
                 record=record,
             )
-            return
+            self.release_unsaved_hold()
+            return True
+        self.token += 1
+        self.stage = OutputStage.PASTE
+        choice = self.ask_history_output_conflict(listening=True)
+        if choice == "history":
+            self.config.set("history.enabled", True)
+            return False
+        if choice == "paste":
+            self._set_output_mode_paste()
+            return False
+        self.keep_unsaved_continuous_text = True
+        copied = self.copy_clipboard(text)
+        self.stop_continuous_user_session()
+        self._dispatch_paste_result(
+            PasteResult(
+                "clipboard" if copied else "failed",
+                detail="history_conflict" if copied else "clipboard_failed",
+            ),
+            degraded_from_polish=degraded_from_polish,
+            record=record,
+        )
+        self.release_unsaved_hold()
+        return True
+
+    def _begin_async_paste(
+        self,
+        text: str,
+        *,
+        paste_hwnd: int,
+        paste_app: str,
+        degraded_from_polish: bool,
+        record: SegmentRecord | None,
+    ) -> None:
         self.stage = OutputStage.PASTE
         self.stage_text = text
-        # Kept outside the paste callback so the watchdog can still save the
-        # row when the paster never answers. Always renew the watchdog when
-        # entering PASTE so slow polish time never steals PASTE's budget.
         self.stage_record = record
         self.mark_busy()
         paste_token = self.token
@@ -625,6 +680,80 @@ class OutputPipeline:
             _on_paste_done,
             target_hwnd=paste_hwnd,
             target_app=paste_app,
+        )
+
+    def output_text(self, text: str, *, degraded_from_polish: bool = False) -> None:
+        if self.exit_started():
+            return
+        self.clear_transcribing()
+        text = normalize_asr_output(text)
+        if not text.strip():
+            self._release_empty_output_slot()
+            return
+
+        paste_hwnd, paste_app = self.paste_target_for_output()
+        record = self.freeze_pending_history_record(text, degraded_from_polish)
+        is_meeting_row = record is not None and record.trigger_mode == TRIGGER_MODE_MEETING
+        forced_meeting_history = self.meeting_active() and not is_meeting_row
+        history_only = self.utterance_history_only(record) or forced_meeting_history
+        if not is_meeting_row:
+            self.last_output_text = text
+            self.last_output_at = self.now_monotonic()
+        if self._needs_unsaved_continuous_prompt(is_meeting_row, history_only):
+            preserve_tail = self.keep_unsaved_continuous_text and not getattr(
+                self.recorder, "is_continuous", False
+            )
+            if self._resolve_continuous_unsaved_conflict(
+                text,
+                degraded_from_polish=degraded_from_polish,
+                record=record,
+                preserve_tail=preserve_tail,
+            ):
+                return
+            forced_meeting_history = self.meeting_active() and not is_meeting_row
+            history_only = self.utterance_history_only(record) or forced_meeting_history
+        if is_meeting_row or history_only:
+            self._record_only_without_paste(
+                text,
+                is_meeting_row=is_meeting_row,
+                forced_meeting_history=forced_meeting_history,
+                degraded_from_polish=degraded_from_polish,
+                record=record,
+            )
+            return
+        self._begin_async_paste(
+            text,
+            paste_hwnd=paste_hwnd,
+            paste_app=paste_app,
+            degraded_from_polish=degraded_from_polish,
+            record=record,
+        )
+
+    def _needs_unsaved_continuous_prompt(self, is_meeting_row: bool, history_only: bool) -> bool:
+        if is_meeting_row or self.meeting_active() or not history_only:
+            return False
+        if bool(self.config.get("history.enabled", True)):
+            return False
+        is_cont = getattr(self.recorder, "is_continuous", False) is True
+        return is_cont or self.keep_unsaved_continuous_text
+
+    def _record_only_without_paste(
+        self,
+        text: str,
+        *,
+        is_meeting_row: bool,
+        forced_meeting_history: bool,
+        degraded_from_polish: bool,
+        record: SegmentRecord | None,
+    ) -> None:
+        saved = is_meeting_row or bool(self.config.get("history.enabled", True))
+        if forced_meeting_history and not saved:
+            self.copy_clipboard(text)
+        log.info("只记录不粘贴：%d 字%s", len(text), "" if saved else "（历史已关闭，未保存）")
+        self._dispatch_paste_result(
+            PasteResult("recorded", detail="" if saved else "history_disabled"),
+            degraded_from_polish=degraded_from_polish,
+            record=record,
         )
 
     def freeze_pending_history_record(
@@ -709,6 +838,12 @@ class OutputPipeline:
                 "listening" if self.continuous_session_active() else None
             )
 
+    @staticmethod
+    def _recorded_title_suffix(polish_failed: bool, degraded_from_polish: bool) -> str:
+        if polish_failed:
+            return " · 润色未生效（密钥/网络异常），已保留原文"
+        return "（原文）" if degraded_from_polish else ""
+
     def _show_recorded_paste_feedback(
         self,
         *,
@@ -722,28 +857,25 @@ class OutputPipeline:
         saved = error_detail != "history_disabled"
         meeting_row = getattr(record, "trigger_mode", None) == TRIGGER_MODE_MEETING
         if self.meeting_active() and not meeting_row:
-            # Leftover dictation segment archived silently without disturbing meeting bar.
             log.info("会议进行中：遗留口述分片已归档至历史（不发送粘贴键）")
             return
         done = "已记录" if meeting_row else "已保存到历史"
-        if polish_failed:
-            suffix = " · 润色未生效（密钥/网络异常），已保留原文"
-        elif degraded_from_polish:
-            suffix = "（原文）"
-        else:
-            suffix = ""
+        suffix = self._recorded_title_suffix(polish_failed, degraded_from_polish)
         title = (done if saved else "未保存 · 历史已关闭") + suffix
-        if not saved:
-            hint = "当前为「仅保存到历史」，但历史已关闭；请在设置中打开历史或改为输入当前光标"
-        else:
-            hint = "" if meeting_row else "未输入其他应用"
+        hint = (
+            "当前为「仅保存到历史」，但历史已关闭；请在设置中打开历史或改为输入当前光标"
+            if not saved
+            else ("" if meeting_row else "未输入其他应用")
+        )
         if dropped and not meeting_row:
             hint = f"{hint}{dropped_suffix}" if hint else f"有 {dropped} 段未识别"
+        is_clean_save = saved and not degraded_from_polish and not polish_failed
+        use_info = (not is_clean_save) or bool(dropped and not meeting_row)
         self.show_post_output_floating(
             title,
             hint,
             stopped_text=f"剩余内容：{title}",
-            use_info=not (saved and not degraded_from_polish and not polish_failed) or bool(dropped and not meeting_row),
+            use_info=use_info,
             refresh_ms=RESULT_TOAST_MS,
         )
 
@@ -872,6 +1004,81 @@ class OutputPipeline:
             refresh_ms=RESULT_TOAST_WITH_HINT_MS,
         )
 
+    def _route_paste_status_feedback(
+        self,
+        status: str,
+        *,
+        record: SegmentRecord | None,
+        target_app: str,
+        error_detail: str,
+        polish_failed: bool,
+        degraded_from_polish: bool,
+        dropped: int,
+        dropped_suffix: str,
+    ) -> None:
+        paste_key = "Ctrl+V"
+        paste_hint = f"可按 {paste_key} 粘贴"
+        if polish_failed:
+            success_msg = "润色未生效（密钥/网络异常），已发送原文"
+        else:
+            success_msg = "已发送（原文）" if degraded_from_polish else "已发送"
+        target_hint = f"发送到 {target_app}" if target_app else "请确认目标应用已接收"
+        if dropped:
+            target_hint = f"{target_hint}{dropped_suffix}"
+
+        if status in {"sent", "pasted"}:
+            log.info("已向目标窗口发送粘贴快捷键%s", f": {target_app}" if target_app else "")
+            self.show_post_output_floating(
+                success_msg,
+                target_hint,
+                stopped_text=f"剩余内容：{success_msg} · {target_hint}",
+                use_info=degraded_from_polish or polish_failed,
+                refresh_ms=RESULT_TOAST_WITH_HINT_MS if polish_failed else RESULT_TOAST_MS,
+            )
+            return
+        if status == "recorded":
+            self._show_recorded_paste_feedback(
+                record=record,
+                error_detail=error_detail,
+                polish_failed=polish_failed,
+                degraded_from_polish=degraded_from_polish,
+                dropped=dropped,
+                dropped_suffix=dropped_suffix,
+            )
+            return
+        if status == "unverified":
+            self._show_unverified_paste_feedback(
+                error_detail=error_detail,
+                target_app=target_app,
+                paste_hint=paste_hint,
+                polish_failed=polish_failed,
+                dropped=dropped,
+                dropped_suffix=dropped_suffix,
+            )
+            return
+        if status == "skipped" and error_detail in {"clipboard_changed", "clipboard_unavailable"}:
+            self._show_skipped_paste_feedback(
+                record=record,
+                error_detail=error_detail,
+                target_app=target_app,
+                polish_failed=polish_failed,
+                dropped_suffix=dropped_suffix,
+            )
+            return
+        if status == "clipboard":
+            self._show_clipboard_paste_feedback(
+                error_detail=error_detail,
+                target_app=target_app,
+                paste_key=paste_key,
+                paste_hint=paste_hint,
+                polish_failed=polish_failed,
+                dropped=dropped,
+                dropped_suffix=dropped_suffix,
+            )
+            return
+        log.error("输出失败: %s", error_detail)
+        self.floating.show_error(self.friendly_error("输出失败"))
+
     def handle_paste_result(
         self,
         result: PasteResult | str,
@@ -901,73 +1108,21 @@ class OutputPipeline:
         self.stage_text = ""
         self.stage_record = None
         status, target_app, error_detail = self._unpack_paste_result(result)
-        paste_key = "Cmd+V" if self.platform_name() == "darwin" else "Ctrl+V"
-        paste_hint = f"可按 {paste_key} 粘贴"
-        if polish_failed:
-            success_msg = "润色未生效（密钥/网络异常），已发送原文"
-        else:
-            success_msg = "已发送（原文）" if degraded_from_polish else "已发送"
-        target_hint = f"发送到 {target_app}" if target_app else "请确认目标应用已接收"
         dropped = self.dropped_slices
         self.dropped_slices = 0
         dropped_suffix = f" · 有 {dropped} 段未识别" if dropped else ""
-        if dropped:
-            # A slice of the hold failed to recognise and was left out; the
-            # user would otherwise only notice the gap in the pasted text.
-            target_hint = f"{target_hint}{dropped_suffix}"
         self._update_post_paste_tray_tooltip()
-
-        if status in {"sent", "pasted"}:
-            log.info("已向目标窗口发送粘贴快捷键%s", f": {target_app}" if target_app else "")
-            self.show_post_output_floating(
-                success_msg,
-                target_hint,
-                stopped_text=f"剩余内容：{success_msg} · {target_hint}",
-                use_info=degraded_from_polish or polish_failed,
-                refresh_ms=RESULT_TOAST_WITH_HINT_MS if polish_failed else RESULT_TOAST_MS,
-            )
-        elif status == "recorded":
-            self._show_recorded_paste_feedback(
-                record=record,
-                error_detail=error_detail,
-                polish_failed=polish_failed,
-                degraded_from_polish=degraded_from_polish,
-                dropped=dropped,
-                dropped_suffix=dropped_suffix,
-            )
-        elif status == "unverified":
-            self._show_unverified_paste_feedback(
-                error_detail=error_detail,
-                target_app=target_app,
-                paste_hint=paste_hint,
-                polish_failed=polish_failed,
-                dropped=dropped,
-                dropped_suffix=dropped_suffix,
-            )
-        elif status == "skipped" and error_detail in {"clipboard_changed", "clipboard_unavailable"}:
-            self._show_skipped_paste_feedback(
-                record=record,
-                error_detail=error_detail,
-                target_app=target_app,
-                polish_failed=polish_failed,
-                dropped_suffix=dropped_suffix,
-            )
-        elif status == "clipboard":
-            self._show_clipboard_paste_feedback(
-                error_detail=error_detail,
-                target_app=target_app,
-                paste_key=paste_key,
-                paste_hint=paste_hint,
-                polish_failed=polish_failed,
-                dropped=dropped,
-                dropped_suffix=dropped_suffix,
-            )
-        else:
-            log.error("输出失败: %s", error_detail)
-            self.floating.show_error(self.friendly_error("输出失败"))
-
+        self._route_paste_status_feedback(
+            status,
+            record=record,
+            target_app=target_app,
+            error_detail=error_detail,
+            polish_failed=polish_failed,
+            degraded_from_polish=degraded_from_polish,
+            dropped=dropped,
+            dropped_suffix=dropped_suffix,
+        )
         self.enqueue_history_record(record, target_app=target_app)
-        # Last words of a stopped continuous session are in: settle speakers.
         self.maybe_finish_dictation_speakers()
         self.schedule_later(SEGMENT_PUMP_DELAY_MS, self.pump_queue)
 

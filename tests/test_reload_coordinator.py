@@ -470,14 +470,42 @@ class TestAppHeadlessReloadDI:
             # Change model while recording -> deferred via ReloadCoordinator
             cfg.set("stt.model_id", "paraformer-zh")
             app._on_recognition_settings_changed()
-            assert app._recognition_change_pending is True
+            assert app.reload_snapshot.recognition_change_pending is True
             app._recognizer.configure.assert_not_called()
 
             # Recording stops -> pending model reload fires automatically
             app._recorder.is_recording = False
             app._apply_pending_recognition_settings()
-            assert app._recognition_change_pending is False
+            assert app.reload_snapshot.recognition_change_pending is False
             app._recognizer.configure.assert_called_once()
             assert app._recognizer.configure.call_args.args[0] == "paraformer-zh"
         finally:
             app.deleteLater()
+
+
+def test_only_a_saved_meeting_opens_the_audio_journal(tmp_path: Path) -> None:
+    data = tmp_path / "profile"
+    dictation, parts = _build_coordinator(
+        {"audio.recovery_enabled": True, "meeting.save_audio": True},
+    )
+    parts["config"].config_dir = data
+    dictation.apply_audio_options()
+    assert parts["recorder"].recovery_dirs[-1] is None
+
+    meeting, meeting_parts = _build_coordinator(
+        {"audio.recovery_enabled": True, "meeting.save_audio": False},
+        meeting_active=lambda: True,
+        meeting_save_audio=lambda: False,
+    )
+    meeting_parts["config"].config_dir = data
+    meeting.apply_audio_options()
+    assert meeting_parts["recorder"].recovery_dirs[-1] is None
+
+    kept, kept_parts = _build_coordinator(
+        {"audio.recovery_enabled": False, "meeting.save_audio": True},
+        meeting_active=lambda: True,
+        meeting_save_audio=lambda: None,
+    )
+    kept_parts["config"].config_dir = data
+    kept.apply_audio_options()
+    assert kept_parts["recorder"].recovery_dirs[-1] == data / "audio-recovery"

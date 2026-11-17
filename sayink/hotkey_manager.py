@@ -189,6 +189,10 @@ class HotKeyManager(QObject):
     recording_stop = pyqtSignal()
     recording_cancel = pyqtSignal()
     continuous_listen_start = pyqtSignal()
+    paste_last_triggered = pyqtSignal()
+    rewrite_start = pyqtSignal()
+    rewrite_stop = pyqtSignal()
+    rewrite_cancel = pyqtSignal()
     esc_pressed = pyqtSignal()
     hotkey_tap_too_short = pyqtSignal()
     listener_status = pyqtSignal(bool, str)
@@ -197,12 +201,24 @@ class HotKeyManager(QObject):
     # 将钩子线程日志异步投递到主线程，避免 RotatingFileHandler 同步磁盘 I/O 触发 LowLevelHooksTimeout
     _hook_log = pyqtSignal(int, str)
 
-    def __init__(self, hotkey_str: str = "alt+x", parent=None):
+    def __init__(
+        self,
+        hotkey_str: str = "alt+x",
+        parent=None,
+        *,
+        paste_last_hotkey: str = "",
+        rewrite_hotkey: str = "",
+    ):
         super().__init__(parent)
         self._hotkey_keys = parse_hotkey(hotkey_str)
         self._hotkey_str = hotkey_str
+        self._paste_last_str = paste_last_hotkey or ""
+        self._paste_last_keys = parse_hotkey(self._paste_last_str)
+        self._rewrite_str = rewrite_hotkey or ""
+        self._rewrite_keys = parse_hotkey(self._rewrite_str)
         self._pressed_keys = set()
         self._is_recording = False
+        self._recording_kind = "dictate"
         self._continuous_trigger_mode = False
         self._paused = False
         self._stopped = False
@@ -220,12 +236,14 @@ class HotKeyManager(QObject):
         self._health_timer.timeout.connect(self._on_health_tick)
         self._last_health_wall = time.time()
         self._hold_pending = False
+        self._hold_kind = "dictate"
         self._hold_activated = False
         self._hold_started_at = 0.0
         self._suppressed_vks: set[int] = set()
         self._suppressed_vk_at: dict[int, float] = {}
         self._suppressed_vk_async_visible: set[int] = set()
         self._main_keys_by_vk: dict[int, object] = {}
+        self._combos_by_vk: dict[int, list[tuple[object, tuple]]] = {}
         self._hotkey_modifiers: tuple = ()
         self._rebuild_suppress_plan()
         self._arm_hold_on_main.connect(self._start_hold_timer_on_main_thread)
@@ -246,14 +264,21 @@ class HotKeyManager(QObject):
         """Caller holds ``self._lock`` or is still in __init__."""
         modifiers = tuple(k for k in self._hotkey_keys if k in _MODIFIER_VKS)
         mains: dict[int, object] = {}
-        for key in self._hotkey_keys:
-            if key in _MODIFIER_VKS:
+        combos_by_vk: dict[int, list[tuple[object, tuple]]] = {}
+        for combo_keys in (self._hotkey_keys, self._rewrite_keys, self._paste_last_keys):
+            if not combo_keys:
                 continue
-            vk = _main_key_vk(key)
-            if vk:
-                mains[vk] = key
+            c_mods = tuple(k for k in combo_keys if k in _MODIFIER_VKS)
+            for key in combo_keys:
+                if key in _MODIFIER_VKS:
+                    continue
+                vk = _main_key_vk(key)
+                if vk:
+                    mains.setdefault(vk, key)
+                    combos_by_vk.setdefault(vk, []).append((key, c_mods))
         self._hotkey_modifiers = modifiers
         self._main_keys_by_vk = mains
+        self._combos_by_vk = combos_by_vk
         self._suppressed_vks = set()
         self._suppressed_vk_at = {}
         self._suppressed_vk_async_visible = set()
@@ -378,25 +403,29 @@ class HotKeyManager(QObject):
             with self._lock:
                 if self._paused:
                     return True
-                main_key = self._main_keys_by_vk.get(vk)
-                modifiers = self._hotkey_modifiers
+                candidates = list(self._combos_by_vk.get(vk, ()))
                 already = vk in self._suppressed_vks
                 has_suppressed = bool(self._suppressed_vks)
-            if main_key is None:
+            if not candidates:
                 if (
                     has_suppressed
                     and msg in (_WM_KEYDOWN, _WM_SYSKEYDOWN)
                     and vk not in _ALL_MODIFIER_VKS
-                    and not self._modifiers_held(modifiers)
+                    and not self._modifiers_held(self._hotkey_modifiers)
                 ):
                     with self._lock:
                         self._suppressed_vks.clear()
                         self._suppressed_vk_at.clear()
                         self._prune_stale_modifiers_locked()
                 return True
+            matched = next(
+                ((mk, mods) for mk, mods in candidates if self._modifiers_held(mods)),
+                candidates[0],
+            )
+            main_key, modifiers = matched
+            held = self._modifiers_held(modifiers)
             if msg in (_WM_KEYDOWN, _WM_SYSKEYDOWN):
                 now = time.monotonic()
-                held = self._modifiers_held(modifiers)
                 if not held:
                     with self._lock:
                         for mod in modifiers:
@@ -535,16 +564,20 @@ class HotKeyManager(QObject):
             self._hold_watch_timer.stop()
             return
         held_ms = None
+        stop_kind = "dictate"
         now = time.monotonic()
         with self._lock:
-            if not self._is_recording or self._continuous_trigger_mode or self._paused:
+            is_cont_dictate = self._continuous_trigger_mode and self._recording_kind != "rewrite"
+            if not self._is_recording or is_cont_dictate or self._paused:
                 self._hold_watch_timer.stop()
                 return
+            active_keys = self._active_hold_keys_locked(self._recording_kind)
+            active_mods = tuple(k for k in active_keys if k in _MODIFIER_VKS)
             released = False
-            if self._hotkey_modifiers and not self._modifiers_held(self._hotkey_modifiers):
+            if active_mods and not self._modifiers_held(active_mods):
                 released = True
             if not released:
-                for key in self._hotkey_keys:
+                for key in active_keys:
                     if key in _MODIFIER_VKS:
                         continue
                     vk = _main_key_vk(key)
@@ -554,14 +587,13 @@ class HotKeyManager(QObject):
                         if not self._async_key_down(vk):
                             released = True
                             break
-                    elif not self._hotkey_modifiers:
-                        # Single-key suppressed hotkey (e.g. F8): hardware typematic
-                        # repeat stops arriving once UIPI / lock screen eats events.
+                    elif not active_mods:
                         last_at = self._suppressed_vk_at.get(vk, now)
                         if (now - last_at) > _SUPPRESSED_REPEAT_MAX_GAP_S:
                             released = True
                             break
             if released:
+                stop_kind = self._recording_kind
                 self._is_recording = False
                 self._hold_pending = False
                 self._pressed_keys.clear()
@@ -572,7 +604,10 @@ class HotKeyManager(QObject):
         if held_ms is not None:
             self._hold_watch_timer.stop()
             log.info("快捷键按住 %.0f ms，轮询检测到松开", held_ms)
-            self.recording_stop.emit()
+            if stop_kind == "rewrite":
+                self.rewrite_stop.emit()
+            else:
+                self.recording_stop.emit()
 
     def start(self):
         self._stopped = False
@@ -663,6 +698,28 @@ class HotKeyManager(QObject):
             self._rebuild_suppress_plan()
             self._pressed_keys.clear()
         log.info("快捷键已更新: %s", hotkey_str)
+        self._ensure_listener_alive()
+
+    def update_paste_last_hotkey(self, hotkey_str: str) -> None:
+        with self._lock:
+            self._paste_last_str = hotkey_str or ""
+            self._paste_last_keys = parse_hotkey(self._paste_last_str)
+            self._rebuild_suppress_plan()
+            self._pressed_keys.clear()
+        log.info("重贴上一句快捷键已更新: %s", self._paste_last_str or "(未启用)")
+        self._ensure_listener_alive()
+
+    def update_rewrite_hotkey(self, hotkey_str: str) -> None:
+        self._cancel_hold_pending()
+        with self._lock:
+            self._rewrite_str = hotkey_str or ""
+            self._rewrite_keys = parse_hotkey(self._rewrite_str)
+            self._rebuild_suppress_plan()
+            self._pressed_keys.clear()
+        log.info("选中改写快捷键已更新: %s", self._rewrite_str or "(未启用)")
+        self._ensure_listener_alive()
+
+    def _ensure_listener_alive(self) -> None:
         listener = self._listener
         is_alive_fn = getattr(listener, "is_alive", None) if listener is not None else None
         if listener is None and not self._stopped:
@@ -680,6 +737,8 @@ class HotKeyManager(QObject):
 
     @property
     def hold_threshold_ms(self) -> int:
+        if self._hold_kind == "rewrite":
+            return MIN_HOLD_MS
         if self._continuous_trigger_mode:
             return MIN_HOLD_CONTINUOUS_MS
         return MIN_HOLD_MS
@@ -688,38 +747,48 @@ class HotKeyManager(QObject):
         self._hold_timer.stop()
         self._hold_pending = False
 
+    def _active_hold_keys_locked(self, kind: str | None = None) -> set:
+        target = kind or (self._recording_kind if self._is_recording else self._hold_kind)
+        return self._rewrite_keys if target == "rewrite" else self._hotkey_keys
+
     def _hotkey_still_held(self) -> bool:
         with self._lock:
             return self._hotkey_still_held_locked()
 
-    def _hotkey_still_held_locked(self) -> bool:
+    def _hotkey_still_held_locked(self, kind: str | None = None) -> bool:
         """Caller must hold ``self._lock``."""
-        return bool(
-            self._hotkey_keys
-            and self._hotkey_keys.issubset(self._pressed_keys)
-        )
+        keys = self._active_hold_keys_locked(kind)
+        return bool(keys and keys.issubset(self._pressed_keys))
 
     def _on_hold_timeout(self):
-        # The "still held" check and the state flip happen under one lock:
-        # a release slipping in between would see a pending, not-yet-active
-        # hold (so it only reports a short tap, never a stop) while this
-        # thread goes on to start a recording that nothing will stop.
-        start_continuous = start_recording = False
+        start_continuous = start_recording = start_rewrite = False
         reconcile = self._should_reconcile_async_state()
         with self._lock:
             if reconcile:
                 self._prune_stale_pressed_keys_locked()
-            if not self._hold_pending or self._paused or not self._hotkey_still_held_locked():
+            kind = self._hold_kind
+            if not self._hold_pending or self._paused or not self._hotkey_still_held_locked(kind):
                 self._hold_pending = False
                 return
             self._hold_pending = False
             self._hold_activated = True
-            if self._continuous_trigger_mode:
+            if kind == "rewrite":
+                if not self._is_recording:
+                    self._is_recording = True
+                    self._recording_kind = "rewrite"
+                    start_rewrite = True
+            elif self._continuous_trigger_mode:
                 start_continuous = True
             elif not self._is_recording:
                 self._is_recording = True
+                self._recording_kind = "dictate"
                 start_recording = True
-        if start_continuous:
+        if start_rewrite:
+            log.debug("选中改写快捷键按住达标，开始指令录音")
+            if reconcile:
+                self._hold_watch_timer.start(_HOLD_WATCH_POLL_MS)
+            self.rewrite_start.emit()
+        elif start_continuous:
             log.debug("快捷键按住达标，请求开启持续监听")
             self.continuous_listen_start.emit()
         elif start_recording:
@@ -728,23 +797,24 @@ class HotKeyManager(QObject):
                 self._hold_watch_timer.start(_HOLD_WATCH_POLL_MS)
             self.recording_start.emit()
 
+    def _all_configured_keys(self) -> set:
+        return self._hotkey_keys | self._rewrite_keys | self._paste_last_keys
+
     def _normalize_key(self, key):
-        # A hotkey written with the generic modifier ("shift+x") accepts either
-        # physical key; only an explicit right variant ("shift_r+x") keeps the
-        # left and right keys apart.
+        all_keys = self._all_configured_keys()
         if key in (keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr):
-            if keyboard.Key.alt_r in self._hotkey_keys:
+            if keyboard.Key.alt_r in all_keys:
                 return key
             return keyboard.Key.alt_l
         if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
-            if keyboard.Key.ctrl_r in self._hotkey_keys:
+            if keyboard.Key.ctrl_r in all_keys:
                 return key
             return keyboard.Key.ctrl_l
         if key in (keyboard.Key.shift_l, keyboard.Key.shift_r):
-            if keyboard.Key.shift_r in self._hotkey_keys:
+            if keyboard.Key.shift_r in all_keys:
                 return key
             return keyboard.Key.shift_l
-        if isinstance(key, keyboard.KeyCode) and key not in self._hotkey_keys:
+        if isinstance(key, keyboard.KeyCode) and key not in all_keys:
             vk = getattr(key, "vk", None)
             if vk is not None:
                 mapped = self._main_keys_by_vk.get(int(vk))
@@ -753,7 +823,7 @@ class HotKeyManager(QObject):
             char = getattr(key, "char", None)
             if char and len(char) == 1:
                 lower_kc = keyboard.KeyCode.from_char(char.lower())
-                if lower_kc in self._hotkey_keys:
+                if lower_kc in all_keys:
                     return lower_kc
         return key
 
@@ -767,7 +837,10 @@ class HotKeyManager(QObject):
         normalized = self._normalize_key(key)
         newly_armed = False
         stale_held_ms = None
+        stale_kind = "dictate"
         sync_hold_timer = False
+        fire_paste_last = False
+        cancel_kind: str | None = None
         reconcile = self._should_reconcile_async_state()
 
         with self._lock:
@@ -775,17 +848,18 @@ class HotKeyManager(QObject):
                 return
             if reconcile:
                 self._prune_stale_pressed_keys_locked(incoming_key=normalized)
-                if self._hold_pending and not self._hotkey_still_held_locked():
+                if self._hold_pending and not self._hotkey_still_held_locked(self._hold_kind):
                     self._hold_pending = False
                     sync_hold_timer = True
-                if self._is_recording and not self._hotkey_still_held_locked():
+                if self._is_recording and not self._hotkey_still_held_locked(self._recording_kind):
                     self._is_recording = False
+                    stale_kind = self._recording_kind
                     stale_held_ms = (time.monotonic() - self._hold_started_at) * 1000
-            # Auto-repeat re-sends keys that are already down; only the press
-            # that completes the combo starts a hold. Re-arming on repeats
-            # would clear ``_hold_activated`` after continuous listening began
-            # and make the release replay the swallowed key as typed text.
-            was_complete = self._hotkey_still_held_locked()
+            was_dictate = self._hotkey_still_held_locked("dictate")
+            was_rewrite = self._hotkey_still_held_locked("rewrite")
+            was_paste_last = bool(
+                self._paste_last_keys and self._paste_last_keys.issubset(self._pressed_keys)
+            )
             self._pressed_keys.add(normalized)
 
             if key == keyboard.Key.esc:
@@ -795,38 +869,51 @@ class HotKeyManager(QObject):
                     sync_hold_timer = True
                 if self._is_recording:
                     self._is_recording = False
-                    self.recording_cancel.emit()
+                    cancel_kind = self._recording_kind
                 break_esc = True
             else:
                 break_esc = False
 
-            if (
-                not break_esc
-                and not was_complete
-                and not self._is_recording
-                and not self._hold_pending
-                and self._hotkey_still_held_locked()
-            ):
-                self._hold_pending = True
-                self._hold_activated = False
-                self._hold_started_at = time.monotonic()
-                newly_armed = True
+            if not break_esc and not self._is_recording and not self._hold_pending:
+                if (
+                    not was_paste_last
+                    and self._paste_last_keys
+                    and self._paste_last_keys.issubset(self._pressed_keys)
+                ):
+                    fire_paste_last = True
+                elif not was_rewrite and self._hotkey_still_held_locked("rewrite"):
+                    self._hold_pending = True
+                    self._hold_kind = "rewrite"
+                    self._hold_activated = False
+                    self._hold_started_at = time.monotonic()
+                    newly_armed = True
+                elif not was_dictate and self._hotkey_still_held_locked("dictate"):
+                    self._hold_pending = True
+                    self._hold_kind = "dictate"
+                    self._hold_activated = False
+                    self._hold_started_at = time.monotonic()
+                    newly_armed = True
+        if cancel_kind == "rewrite":
+            self.rewrite_cancel.emit()
+        elif cancel_kind == "dictate":
+            self.recording_cancel.emit()
         if stale_held_ms is not None:
             self._defer_hook_log(logging.INFO, "快捷键按住 %.0f ms，检测到修饰键已释放", stale_held_ms)
-            self.recording_stop.emit()
-        # Auto-repeat keeps calling here; restarting the timer on every repeat
-        # could postpone the hold threshold forever.
+            if stale_kind == "rewrite":
+                self.rewrite_stop.emit()
+            else:
+                self.recording_stop.emit()
+        if fire_paste_last:
+            self.paste_last_triggered.emit()
         if newly_armed or sync_hold_timer:
             self._arm_hold_on_main.emit()
 
     def _on_release(self, key, *, quiet: bool = False) -> bool:
-        """Returns True when this release ended a hold before it activated,
-        i.e. the combo was tapped rather than held. ``quiet`` skips the
-        ``hotkey_tap_too_short`` hint for such a tap."""
         if self._is_menu_mask(key):
             return False
         normalized = self._normalize_key(key)
         recording_held_ms = None
+        stop_kind = "dictate"
         sync_hold_timer = False
         emit_short_tap = False
         short_tap_held_ms: float | None = None
@@ -837,23 +924,25 @@ class HotKeyManager(QObject):
                 return False
             self._pressed_keys.discard(normalized)
             self._pressed_keys.discard(key)
-            # Only letting go of part of the hotkey ends a pending hold.
-            releases_hotkey = normalized in self._hotkey_keys or key in self._hotkey_keys
+            active_pending_keys = self._active_hold_keys_locked(self._hold_kind)
+            releases_hotkey = normalized in active_pending_keys or key in active_pending_keys
 
             if self._hold_pending and releases_hotkey:
+                pending_kind = self._hold_kind
                 self._hold_pending = False
                 sync_hold_timer = True
                 if not self._hold_activated:
                     tapped = True
                     held_ms = (time.monotonic() - self._hold_started_at) * 1000
-                    quiet = quiet or self._taps_type_text()
-                    if held_ms >= MIN_SHORT_TAP_MS and not quiet:
+                    quiet = quiet or (pending_kind == "dictate" and self._taps_type_text())
+                    if held_ms >= MIN_SHORT_TAP_MS and not quiet and pending_kind == "dictate":
                         emit_short_tap = True
                     else:
                         short_tap_held_ms = held_ms
 
-            if self._is_recording and not self._hotkey_still_held_locked():
+            if self._is_recording and not self._hotkey_still_held_locked(self._recording_kind):
                 self._is_recording = False
+                stop_kind = self._recording_kind
                 recording_held_ms = (time.monotonic() - self._hold_started_at) * 1000
 
         if short_tap_held_ms is not None:
@@ -871,7 +960,10 @@ class HotKeyManager(QObject):
                 self._stop_timers_if_possible()
                 self._start_health_timer_if_possible()
             self._defer_hook_log(logging.INFO, "快捷键按住 %.0f ms 后松开", recording_held_ms)
-            self.recording_stop.emit()
+            if stop_kind == "rewrite":
+                self.rewrite_stop.emit()
+            else:
+                self.recording_stop.emit()
         return tapped
 
     def _start_hold_timer_on_main_thread(self):
@@ -884,3 +976,11 @@ class HotKeyManager(QObject):
     @property
     def hotkey_str(self) -> str:
         return self._hotkey_str
+
+    @property
+    def paste_last_hotkey_str(self) -> str:
+        return self._paste_last_str
+
+    @property
+    def rewrite_hotkey_str(self) -> str:
+        return self._rewrite_str

@@ -231,8 +231,30 @@ def decode_transcript(data: bytes) -> str:
     return text
 
 
+SUPPORTED_TRANSCRIPT_SUFFIXES: tuple[str, ...] = (
+    ".txt",
+    ".md",
+    ".docx",
+    ".srt",
+    ".vtt",
+    ".json",
+)
+
+
 def read_transcript_file(path: str | Path, *, max_bytes: int | None = None) -> str:
-    with Path(path).open("rb") as handle:
+    target = Path(path)
+    suffix = target.suffix.lower()
+    if suffix == ".doc":
+        raise TranscriptDecodeError("暂不支持旧版二进制 .doc，请另存为 .docx 后导入。")
+    if suffix == ".docx":
+        from sayink.docx_io import DocxFormatError, MAX_DOCX_UNCOMPRESSED_BYTES, read_docx_text
+
+        cap = min(max_bytes, MAX_DOCX_UNCOMPRESSED_BYTES) if max_bytes is not None else MAX_DOCX_UNCOMPRESSED_BYTES
+        try:
+            return read_docx_text(target, max_uncompressed_bytes=max(1, cap))
+        except DocxFormatError as exc:
+            raise TranscriptDecodeError(str(exc)) from exc
+    with target.open("rb") as handle:
         data = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
     if max_bytes is not None and len(data) > max_bytes:
         raise TranscriptDecodeError("文件超过可导入的大小，已保留当前输入。请拆开后再导入。")

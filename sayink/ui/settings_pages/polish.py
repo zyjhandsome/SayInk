@@ -17,12 +17,15 @@ from PyQt6.QtWidgets import (
 
 from sayink.config import Config
 from sayink.text_polisher import (
+    APP_STYLE_PRESETS,
     LLM_MODE_CORRECT,
     LLM_MODE_POLISH,
     API_ADDRESS_HINT,
     api_key_required,
     custom_prompt_or_empty,
+    format_app_presets_editor,
     normalize_llm_mode,
+    parse_app_presets_editor,
     parse_proxy_bypass_suffixes,
     prompt_config_key,
 )
@@ -96,6 +99,7 @@ class PolishSettingsPage(SettingsPage):
     llm_enable_toggled = pyqtSignal(bool)
     llm_mode_changed = pyqtSignal(int)
     llm_fields_edited = pyqtSignal()
+    app_presets_edited = pyqtSignal()
     prompt_reset_requested = pyqtSignal()
     llm_test_requested = pyqtSignal()
     minutes_fields_edited = pyqtSignal()
@@ -122,6 +126,12 @@ class PolishSettingsPage(SettingsPage):
     llm_mode_combo: ElidedComboBox
     prompt_reset_btn: QPushButton
     llm_prompt_edit: QTextEdit
+    app_preset_app_edit: QLineEdit
+    app_preset_combo: ElidedComboBox
+    app_preset_add_btn: QPushButton
+    app_presets_edit: QTextEdit
+    app_presets_status: QLabel
+    app_presets_timer: QTimer
     llm_prompt_timer: QTimer
     llm_prompt_mode: str
     minutes_model_edit: QLineEdit
@@ -165,6 +175,13 @@ class PolishSettingsPage(SettingsPage):
             lambda: self.llm_prompt_timer.start(600)
         )
         self.llm_prompt_edit.setTabChangesFocus(True)
+        self.app_presets_timer = QTimer(self)
+        self.app_presets_timer.setSingleShot(True)
+        self.app_presets_timer.timeout.connect(self.app_presets_edited.emit)
+        self.app_presets_edit.textChanged.connect(
+            lambda: self.app_presets_timer.start(500)
+        )
+        self.app_presets_edit.setTabChangesFocus(True)
         self.sync_proxy_summary(config)
         self.polish_tab_chain = [
             self.llm_url_edit,
@@ -314,8 +331,81 @@ class PolishSettingsPage(SettingsPage):
         self.llm_prompt_edit.setPlaceholderText("留空则使用所选处理方式的内置提示词")
         prompt_lay.addWidget(self.llm_prompt_edit)
         p_lay.addWidget(settings_section("提示词", prompt_group))
+        p_lay.addWidget(self._build_app_presets_section())
         lay.addWidget(self.llm_prompt_container)
         return wrap
+
+    def _build_app_presets_section(self) -> QWidget:
+        group = settings_group()
+        g_lay = QVBoxLayout(group)
+        g_lay.setContentsMargins(16, 12, 16, 12)
+        g_lay.setSpacing(8)
+
+        quick_row = QHBoxLayout()
+        quick_row.setContentsMargins(0, 0, 0, 0)
+        quick_row.setSpacing(8)
+        self.app_preset_app_edit = QLineEdit()
+        self.app_preset_app_edit.setAccessibleName("目标应用进程名")
+        self.app_preset_app_edit.setPlaceholderText("进程名，如 WeChat.exe、Code.exe")
+        self.app_preset_app_edit.setMinimumHeight(34)
+        self.app_preset_combo = ElidedComboBox()
+        self.app_preset_combo.setAccessibleName("润色预设风格")
+        for preset_id, (label, _inst) in APP_STYLE_PRESETS.items():
+            self.app_preset_combo.addItem(label, preset_id)
+        self.app_preset_add_btn = QPushButton("添加规则")
+        self.style_action_button(self.app_preset_add_btn)
+        self.app_preset_add_btn.clicked.connect(self._append_quick_app_preset)
+        quick_row.addWidget(self.app_preset_app_edit, 2)
+        quick_row.addWidget(self.app_preset_combo, 1)
+        quick_row.addWidget(self.app_preset_add_btn, 0)
+        g_lay.addLayout(quick_row)
+
+        self.app_presets_edit = QTextEdit()
+        self.app_presets_edit.setAccessibleName("按应用润色规则")
+        self.app_presets_edit.setFixedHeight(88)
+        self.app_presets_edit.setPlaceholderText(
+            "每行一条「进程名=预设」，例如：\nWeChat.exe=聊天口语\nCode.exe=代码终端\nwt.exe=直出原文"
+        )
+        g_lay.addWidget(self.app_presets_edit)
+        g_lay.addWidget(
+            footnote(
+                "仅对你主动绑定的软件生效，未绑定的软件保持默认处理方式，绝不自动乱猜；"
+                "命中规则时转写条会明示当前生效的预设名称。"
+            )
+        )
+        self.app_presets_status = _status_label()
+        self.app_presets_status.hide()
+        g_lay.addWidget(self.app_presets_status)
+        self.paint_app_presets_edit()
+        return settings_section("按应用切换预设（可选）", group)
+
+    def _append_quick_app_preset(self) -> None:
+        app_name = self.app_preset_app_edit.text().strip()
+        if not app_name:
+            return
+        label = self.app_preset_combo.currentText().strip()
+        existing = self.app_presets_edit.toPlainText().strip()
+        line = f"{app_name}={label}"
+        self.app_presets_edit.setPlainText(f"{existing}\n{line}".strip() if existing else line)
+        self.app_preset_app_edit.clear()
+        self.app_presets_timer.stop()
+        self.app_presets_edited.emit()
+
+    def paint_app_presets_edit(self) -> None:
+        self.app_presets_edit.setStyleSheet(f"""
+            QTextEdit {{
+                background: {tok.INPUT_BG}; color: {tok.TEXT};
+                border: 1px solid {tok.HAIRLINE}; border-radius: {tok.RADIUS_MD}px;
+                padding: 8px 12px; font-size: {tok.TYPE_BODY_SM}px; font-family: {tok.FONT};
+            }}
+            QTextEdit:focus {{
+                border: 2px solid {tok.ACCENT_FOCUS};
+                padding: 7px 11px;
+            }}
+        """)
+
+    def parse_app_presets(self) -> tuple[list[dict[str, str]], str]:
+        return parse_app_presets_editor(self.app_presets_edit.toPlainText())
 
     def _build_minutes_section(self, config: Config | None) -> QWidget:
         group = settings_group()
@@ -480,8 +570,10 @@ class PolishSettingsPage(SettingsPage):
 
     def apply_theme(self) -> None:
         self.paint_prompt_edit()
+        self.paint_app_presets_edit()
         self.paint_status_label(self.llm_test_status)
         self.paint_status_label(self.minutes_test_status)
+        self.paint_status_label(self.app_presets_status)
         self.paint_key_toggle()
         paint_device_selection_link(self.proxy_jump_btn)
         _lock_single_line_width(self.proxy_summary_label)
@@ -552,6 +644,11 @@ class PolishSettingsPage(SettingsPage):
         set_combo_by_data(self.llm_mode_combo, config.get("llm.mode", "polish"))
         mode = self.sync_mode_preview()
         self.load_prompt_for_mode(config, mode)
+        blocker = QSignalBlocker(self.app_presets_edit)
+        self.app_presets_edit.setPlainText(
+            format_app_presets_editor(config.get("llm.app_presets", []))
+        )
+        del blocker
         self.sync_proxy_summary(config)
 
     def load_minutes_config(self, config: Config) -> None:

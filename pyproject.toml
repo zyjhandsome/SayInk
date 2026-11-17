@@ -1,0 +1,16 @@
+[project]
+name = "sayink"
+requires-python = ">=3.10"
+
+[tool.pyright]
+pythonVersion = "3.10"
+pythonPlatform = "Windows"
+typeCheckingMode = "standard"
+include = [
+    "sayink/contracts.py",
+    "sayink/llm",
+    "sayink/platform",
+    "tests/fakes",
+]
+reportMissingImports = false
+reportPrivateUsage = "error"

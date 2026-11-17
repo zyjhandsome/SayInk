@@ -95,6 +95,8 @@ DEFAULT_CONFIG = {
         "esc_stops_continuous": True,
         "recovery_enabled": False,
         "separate_lanes": False,
+        "paste_last_hotkey": "",
+        "rewrite_hotkey": "",
     },
     "stt": {
         "model_id": DEFAULT_MODEL_ID,
@@ -117,6 +119,8 @@ DEFAULT_CONFIG = {
         "prompt": "",          # custom prompt for 润色 (legacy key)
         "prompt_correct": "",  # custom prompt for 纠错
         "mode": "polish",
+        "app_presets": [],     # explicit per-app style rules: [{"app": "WeChat.exe", "preset": "chat"}]
+        "rewrite_confirmed_origins": [],  # confirmed remote origins for select-and-speak rewrite
     },
     "history": {
         "enabled": True,

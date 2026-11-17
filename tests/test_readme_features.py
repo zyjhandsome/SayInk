@@ -37,12 +37,12 @@ def test_recording_bar_receives_the_saved_esc_preference_on_startup():
 
 
 class TestReadmeSharedRecognition:
-    def test_audio_recovery_requires_explicit_opt_in(self):
+    def test_dictation_does_not_keep_audio_even_if_legacy_recovery_flag_is_set(self):
         with app_harness() as h:
             h["recorder"].set_recovery_directory.assert_called_once_with(None)
             h["recorder"].set_separate_lanes.assert_called_once_with(False)
         with app_harness({"audio.recovery_enabled": True}) as h:
-            h["recorder"].set_recovery_directory.assert_called_once_with(h["config"].config_dir / "audio-recovery")
+            h["recorder"].set_recovery_directory.assert_called_once_with(None)
 
     def test_boundary_context_requires_user_choice_and_a_timestamp_model(self):
         for enabled in (False, True):
@@ -737,7 +737,8 @@ class TestReadmeReliabilityPromises:
         text = self._readme()
         assert "准确率最高" not in text
         assert "（实验性）" in text
-        assert "尚未做系统验证" in text
+        assert "专注于 Windows 10/11 原生桌面体验" in text
+        assert "xdotool" not in text
         eval_doc = (
             Path(__file__).resolve().parents[1] / "docs" / "meeting-speaker-eval.md"
         ).read_text(encoding="utf-8")
@@ -890,6 +891,7 @@ class TestReadmeMeetingNotes:
             MIN_FREE_BYTES,
             RETENTION_SECONDS,
         )
+        from sayink.asr_correction import MAX_GLOSSARY_ENTRIES
         from sayink.config import DEFAULT_CONFIG
         from sayink.reload_coordinator import DEFERRED_APPLY_NOTICE
         from sayink.speech_recognizer import MAX_HOTWORD_CHARS, MAX_HOTWORDS
@@ -918,7 +920,8 @@ class TestReadmeMeetingNotes:
         assert "约 81 MB" not in text
 
         #Glossary & History defaults match truth-source constants.
-        assert f"最多 {MAX_HOTWORDS} 条、每条 {MAX_HOTWORD_CHARS} 字" in text
+        assert f"最多 {MAX_GLOSSARY_ENTRIES} 条、每条 {MAX_HOTWORD_CHARS} 字" in text
+        assert f"前 {MAX_HOTWORDS} 条会作为**热词**" in text
         assert f"默认保留 **{DEFAULT_CONFIG['history']['retention_days']} 天**" in text
         assert f"最多 **{DEFAULT_CONFIG['history']['max_entries']} 场**" in text
 

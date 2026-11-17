@@ -18,6 +18,7 @@ from typing import Any, Callable
 from PyQt6.QtWidgets import QSystemTrayIcon
 
 from sayink.audio_devices import INPUT_SOURCES, sanitize_system_device_index
+from sayink.contracts import ReloadHostProtocol, ReloadStateSnapshot
 from sayink.recognition_settings import RecognitionSettings, aux_model_path
 from sayink.runtime_status import RuntimeStatus, SegmentationStatus, runtime_status_from_flags
 from sayink.speech_recognizer import (
@@ -37,12 +38,45 @@ LOAD_SECONDS_KEY = "stt_load_seconds"
 DEFERRED_APPLY_NOTICE = "已保存，待本场结束后生效"
 
 
+def _noop(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
+def _false() -> bool:
+    return False
+
+
+def _none() -> None:
+    return None
+
+
+_HOST_CALLBACK_MAP: tuple[tuple[str, str, Callable[..., Any]], ...] = (
+    ("meeting_active", "is_meeting_active", _false),
+    ("meeting_save_audio", "meeting_save_audio_override", _none),
+    ("pipeline_busy", "is_reload_pipeline_busy", _false),
+    ("recovery_busy", "is_recovery_busy", _false),
+    ("exit_started", "is_exit_started", _false),
+    ("onboarding_active", "is_onboarding_active", _false),
+    ("main_window_visible", "is_main_window_visible", _false),
+    ("clear_queued_audio", "clear_queued_audio", _noop),
+    ("stop_continuous_listening", "stop_continuous_listening", _noop),
+    ("reset_continuous_stop_flags", "reset_continuous_stop_flags", _noop),
+    ("rebuild_speaker_embedder", "rebuild_speaker_embedder", _noop),
+    ("sync_hotkey_trigger_mode", "sync_hotkey_trigger_mode", _noop),
+    ("sync_settings_runtime_status", "sync_settings_runtime_status", _noop),
+    ("sync_recognition_runtime_status", "sync_recognition_runtime_status", _noop),
+    ("sync_deferred_settings_notice", "sync_deferred_settings_notice", _noop),
+    ("sync_tray_status_summary", "sync_tray_status_summary", _noop),
+)
+
+
 class ReloadCoordinator:
     """Coordinates runtime diffing and safe deferred reloads for audio, VAD, speaker, and ASR."""
 
     def __init__(
         self,
         *,
+        host: ReloadHostProtocol | None = None,
         config: Any = None,
         recorder: Any = None,
         recognizer: Any = None,
@@ -56,25 +90,9 @@ class ReloadCoordinator:
         resolve_startup_model_id_fn: Callable[[str], str] | None = None,
         model_registry_fn: Callable[[], list[dict]] | None = None,
         now_monotonic: Callable[[], float] | None = None,
-        meeting_active: Callable[[], bool] | None = None,
-        meeting_save_audio: Callable[[], bool | None] | None = None,
-        pipeline_busy: Callable[[], bool] | None = None,
-        has_queued_segments: Callable[[], bool] | None = None,
-        queued_segment_count: Callable[[], int] | None = None,
-        recovery_busy: Callable[[], bool] | None = None,
-        exit_started: Callable[[], bool] | None = None,
-        clear_queued_audio: Callable[[], None] | None = None,
-        stop_continuous_listening: Callable[[], None] | None = None,
-        reset_continuous_stop_flags: Callable[[], None] | None = None,
-        rebuild_speaker_embedder: Callable[[], Any] | None = None,
-        sync_hotkey_trigger_mode: Callable[[], None] | None = None,
-        sync_settings_runtime_status: Callable[..., None] | None = None,
-        sync_recognition_runtime_status: Callable[[], None] | None = None,
-        sync_deferred_settings_notice: Callable[[str], None] | None = None,
-        sync_tray_status_summary: Callable[..., None] | None = None,
-        onboarding_active: Callable[[], bool] | None = None,
-        main_window_visible: Callable[[], bool] | None = None,
+        **callbacks: Callable[..., Any] | None,
     ) -> None:
+        self.host = host
         self.config = config
         self.recorder = recorder
         self.recognizer = recognizer
@@ -89,27 +107,7 @@ class ReloadCoordinator:
         self.resolve_startup_model_id_fn = resolve_startup_model_id_fn
         self.model_registry_fn = model_registry_fn
         self.now_monotonic = now_monotonic or time.monotonic
-
-        self.meeting_active = meeting_active or (lambda: False)
-        self.meeting_save_audio = meeting_save_audio or (lambda: None)
-        self.pipeline_busy = pipeline_busy or (lambda: False)
-        self.has_queued_segments = has_queued_segments or (lambda: False)
-        self.queued_segment_count = queued_segment_count or (
-            lambda: 1 if self.has_queued_segments() else 0
-        )
-        self.recovery_busy = recovery_busy or (lambda: False)
-        self.exit_started = exit_started or (lambda: False)
-        self.clear_queued_audio = clear_queued_audio or (lambda: None)
-        self.stop_continuous_listening = stop_continuous_listening or (lambda: None)
-        self.reset_continuous_stop_flags = reset_continuous_stop_flags or (lambda: None)
-        self.rebuild_speaker_embedder = rebuild_speaker_embedder or (lambda: None)
-        self.sync_hotkey_trigger_mode = sync_hotkey_trigger_mode or (lambda: None)
-        self.sync_settings_runtime_status = sync_settings_runtime_status or (lambda _s=None: None)
-        self.sync_recognition_runtime_status = sync_recognition_runtime_status or (lambda: None)
-        self.sync_deferred_settings_notice = sync_deferred_settings_notice or (lambda _n="": None)
-        self.sync_tray_status_summary = sync_tray_status_summary or (lambda _s=None: None)
-        self.onboarding_active = onboarding_active or (lambda: False)
-        self.main_window_visible = main_window_visible or (lambda: False)
+        self._bind_host_callbacks(host, callbacks)
 
         self.recognition_change_pending: bool = False
         self.models_reload_pending: bool = False
@@ -133,6 +131,34 @@ class ReloadCoordinator:
             self._applied_recognition_settings = RecognitionSettings(model_id=DEFAULT_MODEL_ID)
             self._initialized_from_config = False
 
+    def _bind_host_callbacks(
+        self,
+        host: ReloadHostProtocol | None,
+        callbacks: dict[str, Callable[..., Any] | None],
+    ) -> None:
+        for attr_name, host_method, fallback in _HOST_CALLBACK_MAP:
+            override = callbacks.pop(attr_name, None)
+            if override is not None:
+                setattr(self, attr_name, override)
+            elif host is not None and hasattr(host, host_method):
+                setattr(self, attr_name, getattr(host, host_method))
+            else:
+                setattr(self, attr_name, fallback)
+
+        has_queued = callbacks.pop("has_queued_segments", None)
+        queued_count = callbacks.pop("queued_segment_count", None)
+        if queued_count is None and host is not None and hasattr(host, "queued_audio_segment_count"):
+            queued_count = host.queued_audio_segment_count
+        if has_queued is None:
+            has_queued = (lambda: bool(queued_count())) if queued_count is not None else _false
+        if queued_count is None:
+            queued_count = lambda: 1 if has_queued() else 0
+        self.has_queued_segments = has_queued
+        self.queued_segment_count = queued_count
+        if callbacks:
+            unknown = ", ".join(sorted(callbacks))
+            raise TypeError(f"Unexpected ReloadCoordinator callback argument(s): {unknown}")
+
     @property
     def applied_recognition_settings(self) -> RecognitionSettings:
         return self._applied_recognition_settings
@@ -141,6 +167,17 @@ class ReloadCoordinator:
     def applied_recognition_settings(self, value: RecognitionSettings) -> None:
         self._applied_recognition_settings = value
         self._initialized_from_config = True
+
+    def snapshot(self) -> ReloadStateSnapshot:
+        return ReloadStateSnapshot(
+            recognition_change_pending=bool(self.recognition_change_pending),
+            models_reload_pending=bool(self.models_reload_pending),
+            deferred_audio_settings=bool(self.deferred_audio_settings),
+            loading_model_id=str(self.loading_model_id or ""),
+            models_dir_notice=str(self.models_dir_notice or ""),
+            deferred_meeting_audio_settings=bool(self.deferred_meeting_audio_settings),
+            pending_apply_notice=self.pending_apply_notice,
+        )
 
     def sync_config_if_needed(self, config: Any) -> None:
         """Populate initial recognition snapshot if ``config`` was injected lazily."""
@@ -255,6 +292,8 @@ class ReloadCoordinator:
         self.applied_audio_key = self.audio_runtime_key()
 
     def apply_audio_options(self) -> None:
+        # Dictation never keeps audio. A meeting writes a local journal only
+        # when 设置 → 会议默认设置 → 保存会议录音 is on for that meeting.
         meeting_on = bool(self.meeting_active())
         per_meeting = self.meeting_save_audio() if meeting_on else None
         meeting_wants_audio = (
@@ -262,10 +301,7 @@ class ReloadCoordinator:
             if per_meeting is None
             else bool(per_meeting)
         )
-        save_audio = bool(
-            self.config.get("audio.recovery_enabled", False)
-            or (meeting_on and meeting_wants_audio)
-        )
+        save_audio = bool(meeting_on and meeting_wants_audio)
         cfg_dir = getattr(self.config, "config_dir", None)
         root = (
             Path(cfg_dir) / "audio-recovery"
@@ -294,80 +330,80 @@ class ReloadCoordinator:
             and loader in {"fire_red_asr_ctc", "zipformer_ctc"}
         )
 
+    def _configure_downloaded_stt(
+        self,
+        model_id: str,
+        num_threads: int,
+        *,
+        hotwords: str,
+        language: str,
+        boot: bool,
+    ) -> None:
+        info = get_model_info(model_id)
+        name = info["name"] if info else model_id
+        needs_load = not (
+            self.recognizer.current_model_id == model_id and self.recognizer.is_ready
+        )
+        if needs_load and not self.recognizer.is_loading:
+            quiet_surface = bool(boot or self.onboarding_active() or self.main_window_visible())
+            self.cold_boot_load_quiet = quiet_surface
+            if not quiet_surface:
+                self.user_awaited_model_ready = True
+                self.floating.show_model_loading(
+                    f"正在将 {name} 载入内存，请稍候（{self.load_eta_text(model_id)}）…"
+                )
+            else:
+                self.user_awaited_model_ready = False
+            self.tray.set_activity_tooltip("loading")
+            self.sync_settings_runtime_status()
+        self.recognizer.configure(model_id, num_threads, hotwords=hotwords, language=language)
+
+    def _notify_missing_stt_model(self, model_id: str, *, boot: bool) -> None:
+        self.cold_boot_load_quiet = False
+        self.user_awaited_model_ready = False
+        info = get_model_info(model_id) if model_id else None
+        name = info["name"] if info else (model_id or DEFAULT_MODEL_ID)
+        log.warning("语音模型 %s 未下载，请在设置中下载模型", name)
+        hint = (
+            f"请下载语音模型「{name}」。"
+            "Windows 可点击托盘图标打开主窗口，再到设置 → 引擎；或右键托盘 → 打开 SayInk。"
+        )
+        first_run_setup = boot and (
+            not bool(self.config.get("first_run_welcome_seen", True)) or self.onboarding_active()
+        )
+        if first_run_setup:
+            return
+        if not boot and not self.main_window_visible():
+            self.floating.show_error(hint)
+        self.tray.showMessage(
+            "SayInk",
+            hint,
+            QSystemTrayIcon.MessageIcon.Warning,
+            6000,
+        )
+
     def configure_stt(self, *, boot: bool = False) -> None:
         configured = self.config.get("stt.model_id", DEFAULT_MODEL_ID)
         model_id = self._resolve_startup_model_id(configured)
         if model_id and model_id != configured and self._is_model_downloaded(model_id):
-            # The saved model is not on disk (deleted, or the upgrade migration
-            # pointed at a default this build does not bundle). Record what is
-            # actually running so the engine page, tray menu and bar agree.
             log.info("语音模型配置已改为实际使用的 %s（原 %s 未下载）", model_id, configured)
             self.config.set("stt.model_id", model_id)
             if not self.recognition_change_pending:
                 self.applied_recognition_settings = RecognitionSettings.from_config(self.config)
         num_threads = self.config.get("stt.num_threads", 4)
-        # Same glossary / language as a meeting, so starting one does not
-        # force a model reload.
         shared = RecognitionSettings.from_config(self.config)
-        hotwords, language = shared.hotwords, shared.effective_language
         self.sync_recognizer_quiet_speech(shared)
 
         if model_id and self._is_model_downloaded(model_id):
-            info = get_model_info(model_id)
-            name = info["name"] if info else model_id
-            needs_load = not (
-                self.recognizer.current_model_id == model_id
-                and self.recognizer.is_ready
+            self._configure_downloaded_stt(
+                model_id,
+                num_threads,
+                hotwords=shared.hotwords,
+                language=shared.effective_language,
+                boot=boot,
             )
-            if needs_load and not self.recognizer.is_loading:
-                quiet_surface = bool(
-                    boot
-                    or self.onboarding_active()
-                    or self.main_window_visible()
-                )
-                self.cold_boot_load_quiet = quiet_surface
-                if not quiet_surface:
-                    self.user_awaited_model_ready = True
-                    self.floating.show_model_loading(
-                        f"正在将 {name} 载入内存，请稍候（{self.load_eta_text(model_id)}）…"
-                    )
-                else:
-                    self.user_awaited_model_ready = False
-                self.tray.set_activity_tooltip("loading")
-                self.sync_settings_runtime_status()
-            self.recognizer.configure(model_id, num_threads, hotwords=hotwords, language=language)
         else:
-            self.cold_boot_load_quiet = False
-            self.user_awaited_model_ready = False
-            info = get_model_info(model_id) if model_id else None
-            name = info["name"] if info else (model_id or DEFAULT_MODEL_ID)
-            log.warning("语音模型 %s 未下载，请在设置中下载模型", name)
-            hint = (
-                f"请下载语音模型「{name}」。"
-                "Windows 可点击托盘图标打开主窗口，再到设置 → 引擎；或右键托盘 → 打开 SayInk。"
-            )
-            first_run_setup = boot and (
-                not bool(self.config.get("first_run_welcome_seen", True))
-                or self.onboarding_active()
-            )
-            if not first_run_setup:
-                if boot:
-                    # Single-surface notice on cold boot instead of floating error + tray toast.
-                    self.tray.showMessage(
-                        "SayInk",
-                        hint,
-                        QSystemTrayIcon.MessageIcon.Warning,
-                        6000,
-                    )
-                else:
-                    if not self.main_window_visible():
-                        self.floating.show_error(hint)
-                    self.tray.showMessage(
-                        "SayInk",
-                        hint,
-                        QSystemTrayIcon.MessageIcon.Warning,
-                        6000,
-                    )
+            self._notify_missing_stt_model(model_id, boot=boot)
         self.applied_recognition_key = self.recognition_runtime_key()
 
     def load_eta_text(self, model_id: str) -> str:
@@ -409,6 +445,23 @@ class ReloadCoordinator:
             return self.applied_recognition_settings.model_id
         return str(self.config.get("stt.model_id", DEFAULT_MODEL_ID) or DEFAULT_MODEL_ID)
 
+    def _loaded_campplus_status_text(self, embedder: Any, *, activity_requested: bool) -> str:
+        speaker = "CAM++ 已下载 · 已加载；用于持续转写与会议"
+        if getattr(embedder, "activity_guard", None) is not None:
+            return speaker + "；多人发言检测（按需护档）已加载"
+        if getattr(embedder, "activity_guard_error", ""):
+            return speaker + "；多人发言检测加载失败，本场未启用"
+        if activity_requested:
+            return speaker + "；多人发言检测未加载，请在引擎页检查检测模型"
+        return speaker
+
+    def _disabled_campplus_status_text(self) -> str:
+        if self.config.get("stt.debug_force_speaker_model", None) is False:
+            return "CAM++ 增强已关闭 · 使用频谱粗略区分"
+        if self.aux_model_path_fn(AUX_MODEL_SPEAKER) is not None:
+            return "CAM++ 已下载 · 按需加载（会议及使用电脑声音的持续转写中自动启用）"
+        return "CAM++ 未下载 · 会议或含电脑声音时使用频谱粗略区分；可在引擎页下载"
+
     def speaker_runtime_status_text(
         self,
         *,
@@ -418,30 +471,15 @@ class ReloadCoordinator:
         active = active_meeting is not None and bool(getattr(active_meeting, "is_active", False))
         caps = getattr(active_meeting, "capabilities", None) if active else None
         embedder = getattr(active_meeting, "embedder", None) if active else dictation_embedder
-        enabled = (
-            caps.speaker_enabled
-            if active and caps is not None
-            else self.applied_recognition_settings.speaker_model_enabled
+        applied = self.applied_recognition_settings
+        enabled = caps.speaker_enabled if caps is not None else applied.speaker_model_enabled
+        activity_req = (
+            caps.speaker_activity_enabled if caps is not None else applied.speaker_activity_enabled
         )
         if embedder is not None and getattr(embedder, "name", "") == "campplus":
-            speaker = "CAM++ 已下载 · 已加载；用于持续转写与会议"
-            if getattr(embedder, "activity_guard", None) is not None:
-                speaker += "；多人发言检测（按需护档）已加载"
-            elif getattr(embedder, "activity_guard_error", ""):
-                speaker += "；多人发言检测加载失败，本场未启用"
-            elif (
-                caps.speaker_activity_enabled
-                if active and caps is not None
-                else self.applied_recognition_settings.speaker_activity_enabled
-            ):
-                speaker += "；多人发言检测未加载，请在引擎页检查检测模型"
-            return speaker
+            return self._loaded_campplus_status_text(embedder, activity_requested=activity_req)
         if not enabled:
-            if self.config.get("stt.debug_force_speaker_model", None) is False:
-                return "CAM++ 增强已关闭 · 使用频谱粗略区分"
-            if self.aux_model_path_fn(AUX_MODEL_SPEAKER) is not None:
-                return "CAM++ 已下载 · 按需加载（会议及使用电脑声音的持续转写中自动启用）"
-            return "CAM++ 未下载 · 会议或含电脑声音时使用频谱粗略区分；可在引擎页下载"
+            return self._disabled_campplus_status_text()
         if embedder is not None and getattr(embedder, "model_available", False):
             return "CAM++ 已下载 · 加载失败 · 已回退频谱粗略区分"
         if self.aux_model_path_fn(AUX_MODEL_SPEAKER) is not None:
@@ -504,6 +542,39 @@ class ReloadCoordinator:
         self._publish_deferred_notice()
         self.update_tray_models()
 
+    def _is_recognition_apply_blocked(self) -> bool:
+        queue_blocks = bool(self.has_queued_segments()) and bool(
+            self.recognizer.is_ready or self.recognizer.is_loading
+        )
+        return bool(
+            self.meeting_active()
+            or getattr(self.recorder, "is_recording", False)
+            or self.pipeline_busy()
+            or queue_blocks
+        )
+
+    def _apply_changed_subsystems(
+        self,
+        new: RecognitionSettings,
+        *,
+        models_changed: bool,
+        speaker_changed: bool,
+        segmenter_changed: bool,
+        asr_changed: bool,
+    ) -> None:
+        self.recognition_change_pending = False
+        self.models_reload_pending = False
+        if models_changed or asr_changed:
+            self.sync_models_dir()
+        self.applied_recognition_settings = new
+        if segmenter_changed:
+            self.apply_dictation_segmenter_profile()
+        if speaker_changed:
+            self.rebuild_speaker_embedder()
+        if asr_changed:
+            self.configure_stt()
+        self.sync_recognition_runtime_status()
+
     def apply_pending_recognition_settings(self) -> None:
         if self.exit_started():
             return
@@ -518,40 +589,18 @@ class ReloadCoordinator:
                 models_changed=models_changed,
             )
             if not (speaker_changed or segmenter_changed or asr_changed) and not self.meeting_active():
-                # Post-decode glossary variants only (or hotwords on a model that
-                # ignores decoder hotwords): update immediately without touching
-                # STT, Silero VAD, or CAM++ speaker embedder.
                 self.recognition_change_pending = False
                 self.models_reload_pending = False
                 self.applied_recognition_settings = new
                 self.sync_recognition_runtime_status()
-            else:
-                # Queued audio normally waits for the current model to finish it. When
-                # that model failed to load, the queue waits for *a* model and the
-                # change waits for the queue: let the new model through, it is the
-                # only thing that can drain the queue.
-                queue_blocks = bool(self.has_queued_segments()) and bool(
-                    self.recognizer.is_ready or self.recognizer.is_loading
+            elif not self._is_recognition_apply_blocked():
+                self._apply_changed_subsystems(
+                    new,
+                    models_changed=models_changed,
+                    speaker_changed=speaker_changed,
+                    segmenter_changed=segmenter_changed,
+                    asr_changed=asr_changed,
                 )
-                blocked = (
-                    self.meeting_active()
-                    or bool(getattr(self.recorder, "is_recording", False))
-                    or self.pipeline_busy()
-                    or queue_blocks
-                )
-                if not blocked:
-                    self.recognition_change_pending = False
-                    self.models_reload_pending = False
-                    if models_changed or asr_changed:
-                        self.sync_models_dir()
-                    self.applied_recognition_settings = new
-                    if segmenter_changed:
-                        self.apply_dictation_segmenter_profile()
-                    if speaker_changed:
-                        self.rebuild_speaker_embedder()
-                    if asr_changed:
-                        self.configure_stt()
-                    self.sync_recognition_runtime_status()
         self.apply_deferred_audio_settings()
         if was_deferred and not self.has_deferred_settings:
             self._publish_deferred_notice()

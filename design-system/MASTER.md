@@ -129,6 +129,9 @@ Effective theme is always `light` or `dark`.
 | `SPACE_LG` / `--space-lg` | `24px` | Section padding |
 | `SPACE_XL` | `32px` | Large gaps |
 | `SIDEBAR_WIDTH` | `168px` | Navigation and runtime summary |
+| `COMPACT_SIDEBAR_WIDTH` | `64px` | Collapsed navigation rail below `COMPACT_WINDOW_THRESHOLD` (`680px`) |
+| `MIN_WINDOW_WIDTH` / `MIN_WINDOW_HEIGHT` | `560px` / `480px` | Split-screen compact floor alongside Zoom / Teams / Office |
+| `COMPACT_WINDOW_THRESHOLD` / `COMPACT_WORKSPACE_THRESHOLD` | `680px` / `580px` | Breakpoints switching History & Meeting into single-pane list↔detail mode |
 | `CONTENT_MAX_WIDTH` | `900px` | Settings document width at larger window sizes |
 | `CONTROL_NUMERIC_WIDTH` | `120px` | History spinboxes (flat stepper + suffix) |
 | `CONTROL_SETTINGS_COMBO_WIDTH` | `280px` | Settings dropdown controls (fits long source/mirror labels) |

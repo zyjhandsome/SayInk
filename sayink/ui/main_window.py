@@ -47,6 +47,7 @@ _STATE_TONES = {
 }
 
 NAV_LABELS = ("历史", "会议", "通用", "引擎", "AI 服务", "关于")
+COMPACT_NAV_LABELS = ("历史", "会议", "通用", "引擎", "AI", "关于")
 PAGE_KEYS = ("history", "meeting", "general", "engine", "polish", "about")
 PAGE_OBJECT_NAMES = (
     "pageHistory",
@@ -68,8 +69,8 @@ _STATUS_DOT_PX = 8
 _RESIZE_BORDER_PX = 6
 _WINDOW_W = 960
 _WINDOW_H = 640
-_MIN_W = 880
-_MIN_H = 580
+_MIN_W = tok.MIN_WINDOW_WIDTH
+_MIN_H = tok.MIN_WINDOW_HEIGHT
 
 # Win32 messages used for native edge resizing and a stable maximize rect.
 _WM_NCHITTEST = 0x0084
@@ -423,10 +424,11 @@ class MainWindow(QWidget):
             return
         # Never below what the pages need when the screen can hold them, and
         # never wider/taller than the available desktop work area (C-09).
+        self._sync_compact_sidebar(min(self.width(), avail.width()))
         for page in (getattr(self, "_history", None), getattr(self, "_meeting", None)):
             sync_fn = getattr(page, "sync_viewport_width", None)
             if callable(sync_fn):
-                sync_fn(avail.width())
+                sync_fn(min(self.width(), avail.width()))
         layout = self.layout()
         if layout is not None:
             layout.activate()
@@ -587,6 +589,7 @@ class MainWindow(QWidget):
         self._history.history_preferences_requested.connect(self._open_history_preferences)
         self._history.meeting_created.connect(self._open_promoted_meeting)
         self._history.ai_settings_requested.connect(self._open_ai_connection)
+        self._history.glossary_updated.connect(self._on_glossary_learned)
         self._settings._history_enabled_row.toggled.connect(self._history.set_history_enabled)
         self._history.set_history_enabled(bool(self._config.get("history.enabled", True)))
         if self._meeting_controller is not None:
@@ -627,7 +630,12 @@ class MainWindow(QWidget):
         # (The settings page is built right after this one; resolve it lazily.)
         page.aux_models_changed.connect(lambda: self._settings._rebuild_model_cards())
         page.configure_requested.connect(self._open_ai_connection)
+        page.glossary_updated.connect(self._on_glossary_learned)
         return page
+
+    def _on_glossary_learned(self) -> None:
+        self._settings.general_page.load_recognition_and_meeting(self._config)
+        self._settings.recognition_changed.emit()
 
     def _enable_shortcuts(self, enabled: bool) -> None:
         for shortcut in self._shortcuts:
@@ -732,6 +740,37 @@ class MainWindow(QWidget):
         )
         self._size_grip.setVisible(not self.isMaximized())
 
+    @property
+    def is_compact_mode(self) -> bool:
+        """True when window width is below ``COMPACT_WINDOW_THRESHOLD`` (560–679px split-screen mode)."""
+        return 0 < self.width() < tok.COMPACT_WINDOW_THRESHOLD
+
+    @property
+    def sidebar_width(self) -> int:
+        return self._sidebar.width() if hasattr(self, "_sidebar") else tok.SIDEBAR_WIDTH
+
+    def _sync_compact_sidebar(self, target_width: int | None = None) -> None:
+        if not hasattr(self, "_sidebar") or not hasattr(self, "_nav_buttons"):
+            return
+        win_w = int(target_width) if target_width is not None and target_width > 0 else self.width()
+        compact = 0 < win_w < tok.COMPACT_WINDOW_THRESHOLD
+        desired_w = tok.COMPACT_SIDEBAR_WIDTH if compact else tok.SIDEBAR_WIDTH
+        if self._sidebar.width() != desired_w:
+            self._sidebar.setFixedWidth(desired_w)
+            side_lay = self._sidebar.layout()
+            if side_lay is not None:
+                side_lay.setContentsMargins(6 if compact else 12, 8, 6 if compact else 12, 10)
+        labels = COMPACT_NAV_LABELS if compact else NAV_LABELS
+        for idx, btn in enumerate(self._nav_buttons):
+            if idx < len(labels) and btn.text() != labels[idx]:
+                btn.setText(labels[idx])
+        for lbl in (self._runtime_label, self._mode_label, self._output_label, self._shortcut_label):
+            lbl.setVisible(not compact)
+        if compact:
+            self._status_dot.setToolTip(self._runtime_label.text())
+        else:
+            self._status_dot.setToolTip("")
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         # The iconic size is not a layout the user sees. Rebuilding the mask
@@ -739,6 +778,7 @@ class MainWindow(QWidget):
         # and again on the way back.
         if self.isMinimized():
             return
+        self._sync_compact_sidebar(self.width())
         for page in (getattr(self, "_history", None), getattr(self, "_meeting", None)):
             sync_fn = getattr(page, "sync_viewport_width", None)
             if callable(sync_fn):
@@ -833,6 +873,11 @@ class MainWindow(QWidget):
         if self._native_frame_is_page_sized() or attempt >= 15 or not self.isVisible():
             self._set_presentation_cloak(False)
             self._present_attempts = 0
+            # Uncloak and a sleep/resume both drop the DWM surface. This window
+            # skips the system erase, so without a paint after it is visible the
+            # client keeps whatever was on the desktop. Settings pages that do
+            # not fill their own background then look transparent.
+            self.update()
             return
         from PyQt6.QtCore import QTimer
 

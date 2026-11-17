@@ -278,7 +278,7 @@ def test_large_screen_keeps_preferred_minimum(qapp, tmp_path, monkeypatch):
     _use_screen(monkeypatch, 1920, 1040)
     win, store = _make_main_window(tmp_path, monkeypatch)
     try:
-        assert (win.minimumWidth(), win.minimumHeight()) == (880, 580)
+        assert (win.minimumWidth(), win.minimumHeight()) == (560, 480)
     finally:
         win.close()
         store.close()
@@ -711,6 +711,27 @@ def test_erase_background_is_handled_with_the_theme_color(qapp, tmp_path, monkey
             win.close()
         if store is not None:
             store.close()
+
+
+def test_uncloak_repaints_so_the_desktop_cannot_show_through(qapp, tmp_path, monkeypatch):
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    paints: list[bool] = []
+    try:
+        win.update = lambda *args, **kwargs: paints.append(True)
+        win._native_frame_is_page_sized = lambda: True
+        win._set_presentation_cloak = lambda cloaked: None
+        win._sync_native_size = lambda: None
+        win._finish_presentation()
+        assert paints == [True]
+        sheet = win._settings.general_page.viewport().styleSheet()
+        assert "settingsPageViewport" in sheet
+        assert "transparent" not in sheet
+        from sayink.ui import design_tokens as tok
+
+        assert tok.BG in sheet
+    finally:
+        store.close()
+        win.deleteLater()
 
 
 def test_dwm_frame_uses_the_theme_background(qapp, tmp_path, monkeypatch):

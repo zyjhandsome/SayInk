@@ -428,7 +428,7 @@ def _chip_qss() -> str:
 
 
 class _Toast(QFrame):
-    """Non-layout overlay for transient feedback (copy done / undo delete)."""
+    """Non-layout overlay for transient feedback (copy done / undo delete / glossary learn)."""
 
     visibility_changed = pyqtSignal(bool)
 
@@ -442,6 +442,10 @@ class _Toast(QFrame):
         self.label.setTextFormat(Qt.TextFormat.PlainText)
         self.label.setWordWrap(True)
         lay.addWidget(self.label, 1)
+        self.learn_button = QPushButton("加入词典")
+        self.learn_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.learn_button.hide()
+        lay.addWidget(self.learn_button)
         self.button = QPushButton("撤销")
         self.button.setCursor(Qt.CursorShape.PointingHandCursor)
         lay.addWidget(self.button)
@@ -461,8 +465,11 @@ class _Toast(QFrame):
             return
         max_w = max(240, parent.width() - 48)
         btn_w = (self.button.sizeHint().width() + 12) if not self.button.isHidden() else 0
+        learn_w = (
+            (self.learn_button.sizeHint().width() + 12) if not self.learn_button.isHidden() else 0
+        )
         text = self.label.text()
-        natural_w = self.label.fontMetrics().horizontalAdvance(text) + btn_w + 32
+        natural_w = self.label.fontMetrics().horizontalAdvance(text) + btn_w + learn_w + 32
         w = min(max(natural_w, 240), max_w)
         lay = self.layout()
         wrapped_h = lay.totalHeightForWidth(w) if lay is not None and lay.hasHeightForWidth() else -1
@@ -599,6 +606,7 @@ class HistoryWindow(QWidget):
     history_preferences_requested = pyqtSignal()
     meeting_created = pyqtSignal(str)
     ai_settings_requested = pyqtSignal()
+    glossary_updated = pyqtSignal()
 
     ROW_HEIGHT = 80
     GROUP_HEADER_HEIGHT = 30
@@ -641,6 +649,7 @@ class HistoryWindow(QWidget):
         self._detail_scroll_lock = False
         self._detail_scroll_settle = False
         self._detail_scroll_gen = 0
+        self._pending_glossary_suggestion: tuple[str, str] | None = None
         self._setup_window()
         self._setup_ui()
         self.refresh()
@@ -745,6 +754,7 @@ class HistoryWindow(QWidget):
                 f"color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; background: transparent;"
             )
             self._undo_btn.setStyleSheet(ss.BTN_ACCENT_SM)
+            self._learn_glossary_btn.setStyleSheet(ss.BTN_ACCENT_SM)
         if hasattr(self, "_details"):
             if getattr(self, "_editing_session", False):
                 self._details.setStyleSheet(f"""
@@ -803,6 +813,8 @@ class HistoryWindow(QWidget):
             no_indicator = "QPushButton::menu-indicator { image: none; width: 0px; }"
             for button in (self._selection_mode_btn, self._select_all_btn, self._metadata_btn):
                 button.setStyleSheet(ss.BTN_GHOST_SM)
+            if hasattr(self, "_back_to_list_btn"):
+                self._back_to_list_btn.setStyleSheet(ss.BTN_GHOST_SM)
             for menu_btn in (self._manage_btn, self._detail_more_btn):
                 menu_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
             from sayink.ui.tray_icon import _menu_font, _menu_stylesheet
@@ -879,21 +891,9 @@ class HistoryWindow(QWidget):
             self._sync_row_selection()
 
     def _paint_stream_row(self, row: QWidget, *, selected: bool) -> None:
-        from sayink.ui import design_tokens as tok
+        from sayink.ui.session_stream_view import build_stream_row_wash_css
 
-        # The item widget covers QListWidget::item:selected, so the wash and
-        # left bar have to live on the row itself. A transparent bar on the
-        # idle row keeps the text from jumping when the selection moves.
-        bg = tok.ACCENT_SOFT if selected else "transparent"
-        bar = tok.ACCENT if selected else "transparent"
-        css = (
-            "QWidget#historyStreamRow {"
-            f" background: {bg};"
-            " border: none;"
-            f" border-left: {tok.NAV_SELECTED_BAR_PX}px solid {bar};"
-            " border-radius: 0;"
-            "}"
-        )
+        css = build_stream_row_wash_css("historyStreamRow", selected=selected)
         if row.styleSheet() != css:
             row.setStyleSheet(css)
 
@@ -1116,6 +1116,7 @@ class HistoryWindow(QWidget):
         self._session_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._session_list.customContextMenuRequested.connect(self._open_session_row_menu)
         self._session_list.itemSelectionChanged.connect(self._on_selection_changed)
+        self._session_list.itemClicked.connect(self._on_compact_item_clicked)
         stream_lay.addWidget(self._session_list, 1)
         self._list_footer = QHBoxLayout()
         self._list_footer.setContentsMargins(0, 0, 0, 0)
@@ -1135,7 +1136,13 @@ class HistoryWindow(QWidget):
         right_lay.setSpacing(10)
 
         title_row = QHBoxLayout()
-        title_row.setSpacing(12)
+        title_row.setSpacing(8)
+        self._back_to_list_btn = QPushButton("← 返回列表")
+        self._back_to_list_btn.setObjectName("historyBackToListBtn")
+        self._back_to_list_btn.setAccessibleName("返回会话列表")
+        self._back_to_list_btn.clicked.connect(self.show_compact_list)
+        self._back_to_list_btn.hide()
+        title_row.addWidget(self._back_to_list_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         self._detail_title = QLabel("会话详情")
         self._detail_title.setWordWrap(True)
         title_row.addWidget(self._detail_title, 1)
@@ -1285,11 +1292,13 @@ class HistoryWindow(QWidget):
         split.setSizes(list(tok.WORKSPACE_SPLIT_SIZES))
         outer.addWidget(split, 1)
 
-        # ── overlay toast (copy feedback + undo delete) ──
+        # ── overlay toast (copy feedback + undo delete + glossary learn) ──
         self._toast = _Toast(self)
         self._toast.visibility_changed.connect(self._sync_detail_toast_margin)
         self._undo_bar = self._toast
         self._feedback_label = self._toast.label
+        self._learn_glossary_btn = self._toast.learn_button
+        self._learn_glossary_btn.clicked.connect(self.accept_glossary_suggestion)
         self._undo_btn = self._toast.button
         self._undo_btn.clicked.connect(self._undo_pending_action)
         self._feedback_timer = QTimer(self)
@@ -1314,6 +1323,45 @@ class HistoryWindow(QWidget):
             button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self._paint_history_styles()
 
+    @property
+    def is_compact_single_pane(self) -> bool:
+        """True when narrow split-screen mode (<680px window / <580px workspace) shows one pane at a time."""
+        return bool(getattr(self, "_compact_single_pane", False))
+
+    def show_compact_list(self) -> None:
+        """Return to the session list pane in compact narrow mode."""
+        self._compact_showing_detail = False
+        self._apply_compact_pane_visibility()
+
+    def show_compact_detail(self) -> None:
+        """Open the selected session detail pane in compact narrow mode."""
+        if not self.is_compact_single_pane:
+            return
+        self._compact_showing_detail = True
+        self._apply_compact_pane_visibility()
+
+    def _on_compact_item_clicked(self, item: QListWidgetItem) -> None:
+        if (
+            self.is_compact_single_pane
+            and not self._selection_mode
+            and bool(item.data(Qt.ItemDataRole.UserRole))
+        ):
+            self.show_compact_detail()
+
+    def _apply_compact_pane_visibility(self) -> None:
+        compact = self.is_compact_single_pane
+        show_detail = bool(getattr(self, "_compact_showing_detail", False)) and not self._selection_mode
+        if compact:
+            self._left_pane.setVisible(not show_detail)
+            self._right_pane.setVisible(show_detail)
+            if hasattr(self, "_back_to_list_btn"):
+                self._back_to_list_btn.setVisible(show_detail)
+        else:
+            self._left_pane.setVisible(True)
+            self._right_pane.setVisible(True)
+            if hasattr(self, "_back_to_list_btn"):
+                self._back_to_list_btn.hide()
+
     def sync_viewport_width(self, host_width: int | None = None) -> None:
         if not hasattr(self, "_left_pane") or not hasattr(self, "_right_pane"):
             return
@@ -1327,16 +1375,42 @@ class HistoryWindow(QWidget):
             win_w = self.width()
         if win_w <= 0:
             return
+        sidebar_w = (
+            tok.COMPACT_SIDEBAR_WIDTH
+            if win_w < tok.COMPACT_WINDOW_THRESHOLD
+            else tok.SIDEBAR_WIDTH
+        )
         if host_width is not None and in_host_shell:
-            hist_w = max(240, win_w - tok.SIDEBAR_WIDTH - 2)
+            hist_w = max(220, win_w - sidebar_w - 2)
         else:
             hist_w = self.width() if self.width() > 0 else win_w
+
+        outer = self.layout()
+        full_margins = tok.WORKSPACE_MARGINS
+        # Single-pane mode is a hosted split-screen behavior. A free-standing
+        # history view keeps both panes so the open session stays reachable.
+        compact_single = in_host_shell and (
+            win_w < tok.COMPACT_WINDOW_THRESHOLD
+            or hist_w < tok.COMPACT_WORKSPACE_THRESHOLD
+        )
+        if compact_single:
+            self._compact_single_pane = True
+            if outer is not None and outer.contentsMargins().left() != 12:
+                outer.setContentsMargins(12, 12, 12, 12)
+            if hasattr(self, "_right_pane_layout") and self._right_pane_layout.contentsMargins().left() != 0:
+                self._right_pane_layout.setContentsMargins(0, 0, 0, 0)
+            self._left_pane.setMinimumWidth(180)
+            self._right_pane.setMinimumWidth(180)
+            self._apply_compact_pane_visibility()
+            return
+
+        if getattr(self, "_compact_single_pane", False):
+            self._compact_single_pane = False
+            self._apply_compact_pane_visibility()
 
         base_left = tok.WORKSPACE_LIST_MIN_WIDTH
         base_right = tok.WORKSPACE_DETAIL_MIN_WIDTH
         base_sum = base_left + base_right
-        outer = self.layout()
-        full_margins = tok.WORKSPACE_MARGINS
         full_chrome_w = full_margins[0] + full_margins[2] + self._splitter.handleWidth()
 
         if win_w >= 880 and hist_w >= base_sum + full_chrome_w:
@@ -2276,11 +2350,45 @@ class HistoryWindow(QWidget):
         self._exit_inline_edit_state()
         self._on_selection_changed()
 
+    @property
+    def pending_glossary_suggestion(self) -> tuple[str, str] | None:
+        """Latest ``(term, variant)`` candidate detected from a saved session edit."""
+        return self._pending_glossary_suggestion
+
+    def edit_selected_session(self, new_text: str) -> bool:
+        """Public contract method to enter inline edit on the selected session and commit ``new_text``."""
+        self._start_inline_edit()
+        if not self._editing_session:
+            return False
+        self._details.setPlainText(new_text)
+        return self._save_inline_edit()
+
+    def accept_glossary_suggestion(self) -> bool:
+        """Persist the pending ``(term, variant)`` suggestion into ``stt.glossary``."""
+        suggestion = self._pending_glossary_suggestion
+        self._pending_glossary_suggestion = None
+        if hasattr(self, "_learn_glossary_btn"):
+            self._learn_glossary_btn.hide()
+        if suggestion is None or self._config is None:
+            return False
+        from sayink.asr_correction import (
+            format_glossary_suggestion_label,
+            persist_glossary_learning,
+        )
+
+        term, variant = suggestion
+        if not persist_glossary_learning(self._config, term, variant):
+            return False
+        self.glossary_updated.emit()
+        self._show_feedback(f"已加入自定义词汇：{format_glossary_suggestion_label(term, variant)}")
+        return True
+
     def _save_inline_edit(self, *, refresh: bool = True, strict_paragraphs: bool = False) -> bool:
         if not self._editing_session or not self._editing_session_id:
             return True
         session_id = self._editing_session_id
         editing_raw = getattr(self, "_editing_raw_mode", False)
+        original_edit_text = self._editing_original_text
         new_text = self._details.toPlainText().strip()
         segments = _segments_in_order(self._get_session_segments_effective(session_id))
         if not new_text or not segments:
@@ -2317,7 +2425,29 @@ class HistoryWindow(QWidget):
             self._view_raw_btn.setChecked(not target_polished)
             self._view_polished_btn.blockSignals(False)
             self._view_raw_btn.blockSignals(False)
-            self._show_feedback("已保存原文修改" if editing_raw else "已保存修改")
+            base_msg = "已保存原文修改" if editing_raw else "已保存修改"
+            suggestion = None
+            if self._config is not None:
+                from sayink.asr_correction import extract_learned_correction_pair
+
+                suggestion = extract_learned_correction_pair(
+                    original_edit_text,
+                    new_text,
+                    self._config.get("stt.glossary", []) or [],
+                )
+            if suggestion is not None and not (self._pending_delete or self._pending_merge):
+                from sayink.asr_correction import format_glossary_suggestion_label
+
+                self._pending_glossary_suggestion = suggestion
+                label = format_glossary_suggestion_label(*suggestion)
+                self._show_feedback(
+                    f"{base_msg} · 识别出改词「{label}」",
+                    learn_glossary=True,
+                    duration_ms=6000,
+                )
+            else:
+                self._pending_glossary_suggestion = None
+                self._show_feedback(base_msg)
         if refresh:
             self.refresh()
         return True
@@ -2558,7 +2688,15 @@ class HistoryWindow(QWidget):
         else:
             self._copy_selected_polished()
 
-    def _show_feedback(self, text: str) -> None:
+    def _show_feedback(
+        self,
+        text: str,
+        *,
+        learn_glossary: bool = False,
+        duration_ms: int = 2200,
+    ) -> None:
+        if not learn_glossary:
+            self._pending_glossary_suggestion = None
         self._transient_active = True
         has_undo = bool(self._pending_delete or self._pending_merge)
         if self._pending_delete and "可撤销" not in text:
@@ -2568,13 +2706,16 @@ class HistoryWindow(QWidget):
         else:
             display_text = text
         self._feedback_label.setText(display_text)
+        self._learn_glossary_btn.setVisible(bool(learn_glossary and not has_undo))
         self._undo_btn.setVisible(has_undo)
         self._toast.show()
         self._toast.reposition()
-        self._feedback_timer.start(2200)
+        self._feedback_timer.start(duration_ms)
 
     def _end_transient_feedback(self) -> None:
         self._transient_active = False
+        self._pending_glossary_suggestion = None
+        self._learn_glossary_btn.hide()
         self._refresh_toast()
 
     def _refresh_toast(self) -> None:
