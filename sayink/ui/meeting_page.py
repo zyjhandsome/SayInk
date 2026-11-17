@@ -18,37 +18,28 @@ The page never touches audio or the recognizer: it asks the
 from __future__ import annotations
 
 import bisect
-from contextlib import contextmanager
 import copy
-import hashlib
 import html
 import json
 import logging
 from pathlib import Path
-import re
-import tempfile
-import threading
+import tempfile as tempfile
 import time
-import wave
 import weakref
 
-from PyQt6.QtCore import QDateTime, QEvent, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QDesktopServices,
     QKeySequence,
-    QPainter,
     QShortcut,
     QTextCursor,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QButtonGroup,
-    QCheckBox,
     QComboBox,
-    QDateTimeEdit,
     QDialog,
-    QFileDialog,
+    QFileDialog as QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -56,33 +47,26 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMenu,
-    QMessageBox,
+    QMessageBox as QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSlider,
     QSplitter,
     QStackedWidget,
-    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
-from sayink.audio_devices import input_source_label
 from sayink.aux_models import (
     AuxModelDownloads,
-    aux_models_size_mb,
-    describe_aux_models,
-    missing_aux_models,
+    missing_aux_models as missing_aux_models,
 )
 from sayink.meeting_session import (
     MeetingController,
-    MeetingOptions,
     MeetingState,
     minutes_settings_complete,
-    resolve_capabilities,
     safe_filename,
 )
 from sayink.meeting_store import (
@@ -96,68 +80,80 @@ from sayink.meeting_store import (
     now_ms,
 )
 from sayink.minutes_prompts import describe_template, format_timestamp, get_template, list_templates, transcript_lines
-from sayink.media_import import MEDIA_SOURCE, file_dialog_filter
+from sayink.media_import import MEDIA_SOURCE
 from sayink.transcript_import import IMPORT_SOURCE
 from sayink.ui.history_export import _safe_dt, export_save_path
-from sayink.recognition_settings import ADVANCED_RECOGNITION_PATH, audio_source
-from sayink.speech_recognizer import DEFAULT_MODEL_ID, MODEL_REGISTRY, is_model_downloaded
+from sayink.speech_recognizer import is_model_downloaded as is_model_downloaded
 from sayink.ui import design_tokens as tok
-from sayink.ui.clipboard import COPY_FAILED_TEXT, copy_text
+from sayink.ui.clipboard import COPY_FAILED_TEXT, copy_text as copy_text
 from sayink.ui.flow_layout import PairedToolBar, WrappingToolBar, defer_while_live_resize
 from sayink.ui.history_window import (
     _ElidedLabel, _SessionCheckBox, _SessionList, release_list_item_widgets, session_list_item_css,
 )
-from sayink.ui.meeting_batch import confirm_batch_delete, fit_action_button
-from sayink.ui.native_dialog import native_file_dialog
+from sayink.ui.meeting_batch import confirm_batch_delete as confirm_batch_delete, fit_action_button
+from sayink.ui.meeting_dialogs import (
+    _MeetingTimeDialog as _MeetingTimeDialog,
+    _SegmentSpeakerDialog as _SegmentSpeakerDialog,
+    _SegmentTextDialog as _SegmentTextDialog,
+    _quiet_tooltips,
+    _style_dialog_box,
+    build_meeting_datetime_edit_css as build_meeting_datetime_edit_css,
+)
 from sayink.ui.meeting_drafts import MeetingDraftBuffer
+from sayink.ui.meeting_import_mixin import (
+    _MeetingImportMixin,
+    _ORIG_GET_OPEN_FILE_NAME as _ORIG_GET_OPEN_FILE_NAME,
+    _format_import_remain as _format_import_remain,
+)
+from sayink.ui.meeting_live_mixin import (
+    _LANGUAGE_LABELS as _LANGUAGE_LABELS,
+    _MeetingLiveMixin,
+    _SOURCE_LABELS as _SOURCE_LABELS,
+)
+from sayink.ui.meeting_player import (
+    _AudioPlayerBar as _AudioPlayerBar,
+    _CleanComboBox as _CleanComboBox,
+    _LevelMeterBar as _LevelMeterBar,
+    _PRUNED_PLAYBACK_DIRS as _PRUNED_PLAYBACK_DIRS,
+    _STALE_PLAYBACK_WAV_PRUNED as _STALE_PLAYBACK_WAV_PRUNED,
+    _format_audio_clock as _format_audio_clock,
+    _probe_wav_duration_ms as _probe_wav_duration_ms,
+    _prune_stale_playback_wavs as _prune_stale_playback_wavs,
+    resolve_meeting_audio_path,
+)
 from sayink.ui.meeting_views import (
+    _CompactTextBrowser,
     _STATUS_TEXT,
-    _CurrentPageStack,
+    _CurrentPageStack as _CurrentPageStack,
     _duration_label,
-    _export_kind,
+    _export_kind as _export_kind,
     _format_dt,
     _meeting_row_meta,
     _meeting_row_text,
     _position_label,
-    _ReadingView,
-    _SegmentSpeakerDialog,
-    _SegmentTextDialog,
+    _ReadingView as _ReadingView,
     _speaker_source,
-    _TranscriptView,
-    _with_export_suffix,
+    _TranscriptView as _TranscriptView,
+    _with_export_suffix as _with_export_suffix,
     build_transcript_html,
     clear_reading_search,
     find_in_reading_view,
-    link_citations,
-    notes_for_display,
+    link_citations as link_citations,
+    notes_for_display as notes_for_display,
     speaker_color as speaker_color,
 )
-from sayink.ui.media_import_dialog import MediaImportDialog, natural_media_sort_key
-from sayink.ui.prompts import alert_error, style_message_box
+from sayink.ui.native_dialog import native_file_dialog
+from sayink.ui.prompts import alert_error
 
 log = logging.getLogger("SayInk")
 
-_ORIG_GET_OPEN_FILE_NAME = QFileDialog.getOpenFileName
 _ORIG_GET_OPEN_FILE_NAMES = QFileDialog.getOpenFileNames
 
 PAGE_BROWSE = 0
 PAGE_START = 1
 PAGE_LIVE = 2
 
-_SOURCE_LABELS = tuple((key, input_source_label(key)) for key in ("mixed", "microphone", "system"))
-_LANGUAGE_LABELS = (("auto", "自动（中文优先）"), ("zh", "中文"), ("en", "English"), ("ja", "日本語"))
 _EMPTY_MEETINGS = "还没有会议记录。\n点击右上角「导入文字稿」「导入音视频」或「开始会议」，也可以从托盘菜单开始。"
-
-
-def _format_import_remain(seconds: float) -> str:
-    remaining = max(0, int(round(seconds)))
-    if remaining < 60:
-        return f"大约还需 {remaining} 秒"
-    minutes, secs = divmod(remaining, 60)
-    if minutes < 60:
-        return f"大约还需 {minutes} 分 {secs} 秒" if secs else f"大约还需 {minutes} 分钟"
-    hours, minutes = divmod(minutes, 60)
-    return f"大约还需 {hours} 小时 {minutes} 分钟"
 
 
 class _MeetingStreamRow(QWidget):
@@ -186,862 +182,7 @@ def _paint_meeting_row(row: QWidget, *, selected: bool) -> None:
         row.setStyleSheet(css)
 
 
-@contextmanager
-def _quiet_tooltips(widget: QWidget):
-    """Hide tips before a dialog, and don't let them pop again while it is open."""
-    from PyQt6.QtWidgets import QToolTip
-
-    QToolTip.hideText()
-    forced = widget.testAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips)
-    if forced:
-        widget.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, False)
-    try:
-        yield
-    finally:
-        if forced:
-            widget.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
-        QToolTip.hideText()
-
-
-def _style_dialog_box(box: QMessageBox, *, danger_btn: QPushButton | None = None) -> None:
-    primary = danger_btn
-    if primary is None:
-        for btn in box.buttons():
-            if box.buttonRole(btn) == QMessageBox.ButtonRole.AcceptRole:
-                primary = btn
-                break
-    style_message_box(box, primary=primary, destructive=danger_btn is not None)
-
-
-class _CleanComboBox(QComboBox):
-    """ComboBox that elides overflowing closed-box text cleanly instead of mid-glyph clipping."""
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.currentTextChanged.connect(self._sync_overflow_tooltip)
-
-    def _sync_overflow_tooltip(self, *_args) -> None:
-        """Repeat the value only when the closed box cannot show all of it."""
-        from PyQt6.QtWidgets import QStyle, QStyleOptionComboBox
-
-        text = self.currentText()
-        opt = QStyleOptionComboBox()
-        self.initStyleOption(opt)
-        edit_rect = self.style().subControlRect(
-            QStyle.ComplexControl.CC_ComboBox, opt, QStyle.SubControl.SC_ComboBoxEditField, self,
-        )
-        avail = edit_rect.width() - 4
-        if avail <= 0 or not text:
-            tip = ""
-        else:
-            elided = self.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, avail)
-            tip = text if elided != text else ""
-        if self.toolTip() != tip:
-            self.setToolTip(tip)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._sync_overflow_tooltip()
-
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
-        self._sync_overflow_tooltip()
-
-    def paintEvent(self, event) -> None:
-        from PyQt6.QtWidgets import QStyle, QStyleOptionComboBox, QStylePainter
-
-        painter = QStylePainter(self)
-        opt = QStyleOptionComboBox()
-        self.initStyleOption(opt)
-        edit_rect = self.style().subControlRect(
-            QStyle.ComplexControl.CC_ComboBox,
-            opt,
-            QStyle.SubControl.SC_ComboBoxEditField,
-            self,
-        )
-        avail = max(24, edit_rect.width() - 4)
-        if opt.fontMetrics.horizontalAdvance(opt.currentText) > avail:
-            opt.currentText = opt.fontMetrics.elidedText(
-                opt.currentText, Qt.TextElideMode.ElideRight, avail
-            )
-        painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, opt)
-        painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, opt)
-
-
-class _LevelMeterBar(QFrame):
-    """Lightweight single-lane real-time audio level meter."""
-
-    def __init__(self, accessible_name: str = "", parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._level = 0.0
-        self._active = True
-        self.setFixedHeight(8)
-        self.setMinimumWidth(64)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        if accessible_name:
-            self.setAccessibleName(accessible_name)
-
-    @property
-    def level(self) -> float:
-        return self._level
-
-    def set_active(self, active: bool) -> None:
-        active = bool(active)
-        if self._active != active:
-            self._active = active
-            if not active:
-                self._level = 0.0
-            self.update()
-
-    def set_level(self, value: float) -> None:
-        try:
-            clamped = max(0.0, min(1.0, float(value)))
-        except (TypeError, ValueError):
-            clamped = 0.0
-        if not self._active:
-            clamped = 0.0
-        if abs(self._level - clamped) >= 0.005:
-            self._level = clamped
-            self.update()
-
-    def paintEvent(self, event) -> None:
-        from sayink.ui import design_tokens as tok
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = self.rect()
-        track_color = tok.qcolor_from_token(tok.HAIRLINE)
-        if not self._active and track_color.isValid():
-            base_alpha = track_color.alpha()
-            track_color.setAlpha(90 if base_alpha > 150 else max(8, int(round(base_alpha * 0.6))))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(track_color)
-        painter.drawRoundedRect(rect, 4.0, 4.0)
-        if self._active and self._level > 0.005:
-            fill_w = max(4, int(round(rect.width() * self._level)))
-            bar_color = tok.qcolor_from_token(tok.STATE_WARN if self._level > 0.85 else tok.ACCENT)
-            painter.setBrush(bar_color)
-            painter.drawRoundedRect(0, 0, min(rect.width(), fill_w), rect.height(), 4.0, 4.0)
-        painter.end()
-
-
-def _format_audio_clock(ms: int) -> str:
-    sec = max(0, int(ms) // 1000)
-    h, rem = divmod(sec, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-
-
-def _probe_wav_duration_ms(path: Path) -> int:
-    try:
-        if path.suffix.lower() == ".wav" and path.is_file():
-            with wave.open(str(path), "rb") as wf:
-                rate = wf.getframerate()
-                frames = wf.getnframes()
-                if rate > 0 and frames >= 0:
-                    return int(round(frames * 1000.0 / rate))
-        elif path.suffix.lower() == ".f32" and path.is_file():
-            samples = path.stat().st_size // 4
-            return int(round(samples * 1000.0 / 16000.0))
-        elif path.is_dir() and (path / "audio.f32").is_file():
-            samples = (path / "audio.f32").stat().st_size // 4
-            return int(round(samples * 1000.0 / 16000.0))
-    except Exception:
-        pass
-    return 0
-
-
-_STALE_PLAYBACK_WAV_PRUNED = False
-_PRUNED_PLAYBACK_DIRS: set[str] = set()
-
-
-def _prune_stale_playback_wavs(
-    out_dir: Path,
-    *,
-    max_age_s: float = 48 * 3600,
-    exclude: set[Path] | None = None,
-    force: bool = False,
-) -> None:
-    global _STALE_PLAYBACK_WAV_PRUNED
-    if not _STALE_PLAYBACK_WAV_PRUNED:
-        _PRUNED_PLAYBACK_DIRS.clear()
-    dir_key = str(out_dir).casefold()
-    if not force and dir_key in _PRUNED_PLAYBACK_DIRS:
-        return
-    _STALE_PLAYBACK_WAV_PRUNED = True
-    _PRUNED_PLAYBACK_DIRS.add(dir_key)
-    excluded: set[str] = set()
-    for item in exclude or ():
-        try:
-            excluded.add(str(Path(item).resolve()).casefold())
-        except OSError:
-            excluded.add(str(item).casefold())
-    try:
-        if not out_dir.is_dir():
-            return
-        cutoff = time.time() - max_age_s
-        for wav_file in out_dir.glob("*.wav"):
-            try:
-                if excluded and str(wav_file.resolve()).casefold() in excluded:
-                    continue
-                if wav_file.stat().st_mtime < cutoff:
-                    wav_file.unlink(missing_ok=True)
-            except OSError:
-                pass
-    except OSError:
-        pass
-
-
-class _AudioPlayerBar(QFrame):
-    """Lightweight embedded audio playback bar for local meeting / imported / recovery audio."""
-
-    playback_error = pyqtSignal(str)
-    _async_wav_ready = pyqtSignal(int, str, str, str)
-    _ASYNC_F32_BYTES = 2 * 1024 * 1024
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setObjectName("meetingAudioPlayer")
-        self._source_path = ""
-        self._playable_path = ""
-        self._duration_ms = 0
-        self._position_ms = 0
-        self._playing = False
-        self._preparing_async = False
-        self._prepare_token = 0
-        self._rate = 1.0
-        self._dragging_slider = False
-        self._allow_headless_fallback: bool = False
-        self._pending_seek_ms: int | None = None
-        self._backend_error_seen: bool = False
-        self._player = None
-        self._audio_out = None
-        self._session_temp_wavs: set[Path] = set()
-        self._temp_wavs_by_source: dict[str, set[Path]] = {}
-        self._async_wav_ready.connect(self._on_async_wav_ready)
-        session_temp_wavs = self._session_temp_wavs
-        threading.Thread(
-            target=_prune_stale_playback_wavs,
-            args=(Path(tempfile.gettempdir()) / "sayink-playback",),
-            kwargs={"exclude": set(session_temp_wavs)},
-            daemon=True,
-            name="sayink-playback-prune",
-        ).start()
-
-        def _cleanup_on_destroy(*_args, _paths=session_temp_wavs) -> None:
-            for wav_path in list(_paths):
-                try:
-                    wav_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            _paths.clear()
-
-        self.destroyed.connect(_cleanup_on_destroy)
-        weakref.finalize(self, _cleanup_on_destroy)
-        self._fallback_timer = QTimer(self)
-        self._fallback_timer.setInterval(200)
-        self._fallback_timer.timeout.connect(self._on_fallback_tick)
-        self._fallback_last_ts = 0.0
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(10, 4, 10, 4)
-        lay.setSpacing(8)
-        self._play_btn = QPushButton("播放")
-        self._play_btn.setAccessibleName("播放或暂停会议录音")
-        self._play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._play_btn.clicked.connect(self.toggle_play)
-        lay.addWidget(self._play_btn, 0)
-
-        self._time_label = QLabel("00:00 / 00:00")
-        self._time_label.setAccessibleName("音频回放进度")
-        lay.addWidget(self._time_label, 0)
-
-        self._slider = QSlider(Qt.Orientation.Horizontal)
-        self._slider.setAccessibleName("拖动音频进度")
-        self._slider.setRange(0, 0)
-        self._slider.sliderPressed.connect(self._on_slider_pressed)
-        self._slider.sliderReleased.connect(self._on_slider_released)
-        self._slider.valueChanged.connect(self._on_slider_changed)
-        lay.addWidget(self._slider, 1)
-
-        self._speed_combo = _CleanComboBox()
-        self._speed_combo.setAccessibleName("倍速播放")
-        self._speed_combo.setToolTip("调整音频回放倍速")
-        for rate in (0.75, 1.0, 1.25, 1.5, 2.0):
-            label = f"{rate:.1f}x" if rate in (1.0, 2.0) else f"{rate:g}x"
-            self._speed_combo.addItem(label, rate)
-        self._speed_combo.setCurrentIndex(1)
-        self._speed_combo.currentIndexChanged.connect(self._on_speed_changed)
-        self._speed_combo.setFixedWidth(114)
-        lay.addWidget(self._speed_combo, 0)
-
-    @property
-    def audio_path(self) -> str:
-        return self._source_path
-
-    @property
-    def duration_ms(self) -> int:
-        return self._duration_ms
-
-    def reapply_theme(self) -> None:
-        from sayink.ui import design_tokens as tok
-        from sayink.ui import settings_styles as ss
-
-        self.setStyleSheet(
-            f"QFrame#meetingAudioPlayer {{ background: {tok.SURFACE_PEARL}; border: 1px solid {tok.HAIRLINE};"
-            f" border-radius: {tok.RADIUS_MD}px; }}"
-        )
-        self._play_btn.setStyleSheet(ss.BTN_GHOST_SM)
-        self._time_label.setStyleSheet(
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_CAPTION}px; background: transparent;"
-        )
-        self._speed_combo.setStyleSheet(
-            ss.build_toolbar_combo_css()
-            + "QComboBox { padding: 0px 4px 0px 8px; }"
-            + "QComboBox:focus, QComboBox:on { padding: 0px 3px 0px 7px; }"
-            + "QComboBox::drop-down { width: 22px; }"
-        )
-        self._slider.setStyleSheet(
-            f"QSlider::groove:horizontal {{ height: 4px; background: {tok.HAIRLINE}; border-radius: 2px; }}"
-            f"QSlider::sub-page:horizontal {{ background: {tok.ACCENT}; border-radius: 2px; }}"
-            f"QSlider::handle:horizontal {{ width: 12px; height: 12px; margin: -4px 0;"
-            f" border-radius: 6px; background: {tok.ACCENT}; }}"
-        )
-
-    def _ensure_backend(self) -> bool:
-        if self._player is not None:
-            return True
-        try:
-            from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
-
-            if not QMediaDevices.audioOutputs():
-                return False
-            self._audio_out = QAudioOutput(self)
-            self._player = QMediaPlayer(self)
-            self._player.setAudioOutput(self._audio_out)
-            self._player.positionChanged.connect(self._on_backend_position)
-            self._player.durationChanged.connect(self._on_backend_duration)
-            self._player.playbackStateChanged.connect(self._on_backend_state)
-            self._player.mediaStatusChanged.connect(self._on_media_status_changed)
-            self._player.errorOccurred.connect(self._on_backend_error)
-            self._player.setPlaybackRate(self._rate)
-            return True
-        except Exception:
-            self._player = None
-            self._audio_out = None
-            return False
-
-    def _is_media_seekable(self) -> bool:
-        if self._player is None:
-            return False
-        try:
-            from PyQt6.QtMultimedia import QMediaPlayer
-
-            return self._player.mediaStatus() in (
-                QMediaPlayer.MediaStatus.LoadedMedia,
-                QMediaPlayer.MediaStatus.BufferedMedia,
-                QMediaPlayer.MediaStatus.BufferingMedia,
-                QMediaPlayer.MediaStatus.EndOfMedia,
-            )
-        except Exception:
-            return False
-
-    def _fail_playback(self, message: str) -> None:
-        self._playing = False
-        self._fallback_timer.stop()
-        self._pending_seek_ms = None
-        self._sync_ui()
-        if message:
-            self.playback_error.emit(message)
-
-    def _start_headless_fallback(self) -> None:
-        self._playing = True
-        self._fallback_last_ts = time.monotonic()
-        self._fallback_timer.start()
-        self._sync_ui()
-
-    @staticmethod
-    def _norm_audio_key(path: str | Path | None) -> str:
-        raw = str(path or "").strip()
-        if not raw:
-            return ""
-        try:
-            return str(Path(raw).resolve()).casefold()
-        except OSError:
-            return raw.casefold()
-
-    @staticmethod
-    def _temp_wav_path_for_raw_f32(raw_f32: Path) -> Path:
-        resolved_raw = raw_f32.resolve()
-        digest = hashlib.sha256(str(resolved_raw).encode("utf-8")).hexdigest()[:12]
-        out_dir = Path(tempfile.gettempdir()) / "sayink-playback"
-        _prune_stale_playback_wavs(out_dir)
-        tag = f"{raw_f32.parent.name}-{digest}-{raw_f32.stat().st_size}"
-        return out_dir / f"{tag}.wav"
-
-    def _register_temp_wav(self, source_path: str | Path, raw_f32: Path, wav_path: Path) -> None:
-        self._session_temp_wavs.add(wav_path)
-        for key in (self._norm_audio_key(source_path), self._norm_audio_key(raw_f32)):
-            if key:
-                self._temp_wavs_by_source.setdefault(key, set()).add(wav_path)
-
-    def unload_source(self) -> None:
-        self._pending_seek_ms = None
-        self.stop()
-        if self._player is not None:
-            try:
-                self._player.setSource(QUrl())
-            except Exception:
-                pass
-        if self._source_path:
-            from sayink.audio_recovery import release_recovery_path
-            release_recovery_path(Path(self._source_path))
-        self._source_path = ""
-        self._playable_path = ""
-        self._duration_ms = 0
-        self._position_ms = 0
-        self._sync_ui()
-
-    def collect_temp_wavs_for_audio_paths(self, audio_paths) -> set[Path]:
-        targets: set[Path] = set()
-        match_keys: set[str] = set()
-        for raw_item in audio_paths or ():
-            text = str(raw_item or "").strip()
-            if not text:
-                continue
-            p = Path(text)
-            raw_f32 = p / "audio.f32" if p.is_dir() else p
-            for candidate in (p, raw_f32):
-                key = self._norm_audio_key(candidate)
-                if key:
-                    match_keys.add(key)
-                    targets.update(self._temp_wavs_by_source.get(key, ()))
-            try:
-                if raw_f32.is_file() and raw_f32.suffix.lower() == ".f32":
-                    targets.add(self._temp_wav_path_for_raw_f32(raw_f32))
-            except OSError:
-                pass
-        current_key = self._norm_audio_key(self._source_path)
-        playable_path = Path(self._playable_path) if self._playable_path else None
-        if (current_key and current_key in match_keys) or (
-            playable_path is not None and playable_path in targets
-        ):
-            self.unload_source()
-        return targets
-
-    def remove_temp_wavs(self, targets: set[Path] | list[Path] | tuple[Path, ...]) -> None:
-        target_set = set(targets)
-        if not target_set:
-            return
-        playable_path = Path(self._playable_path) if self._playable_path else None
-        if playable_path is not None and playable_path in target_set:
-            self.unload_source()
-        for wav_path in target_set:
-            try:
-                wav_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            self._session_temp_wavs.discard(wav_path)
-        for key in list(self._temp_wavs_by_source):
-            remaining = self._temp_wavs_by_source[key] - target_set
-            if remaining:
-                self._temp_wavs_by_source[key] = remaining
-            else:
-                self._temp_wavs_by_source.pop(key, None)
-
-    def cleanup_temp_files(self) -> None:
-        self.unload_source()
-        for wav_path in list(self._session_temp_wavs):
-            try:
-                wav_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        self._session_temp_wavs.clear()
-        self._temp_wavs_by_source.clear()
-        _prune_stale_playback_wavs(
-            Path(tempfile.gettempdir()) / "sayink-playback",
-            force=True,
-        )
-
-    @staticmethod
-    def _convert_raw_f32_to_wav(raw_f32: Path, wav_path: Path) -> None:
-        import numpy as np
-
-        out_dir = wav_path.parent
-        out_dir.mkdir(parents=True, exist_ok=True)
-        if wav_path.is_file():
-            return
-        tmp_path = out_dir / f"{wav_path.name}.{threading.get_ident()}.tmp"
-        chunk_bytes = 262_144 * 4
-        try:
-            with raw_f32.open("rb") as src_fp, wave.open(str(tmp_path), "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(16000)
-                while raw_chunk := src_fp.read(chunk_bytes):
-                    usable = len(raw_chunk) - (len(raw_chunk) % 4)
-                    if usable <= 0:
-                        break
-                    samples = np.frombuffer(memoryview(raw_chunk)[:usable], dtype="<f4")
-                    pcm = (np.clip(np.nan_to_num(samples), -1.0, 1.0) * 32767.0).astype("<i2")
-                    wf.writeframes(pcm.tobytes())
-            tmp_path.replace(wav_path)
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
-
-    def _materialize_playable_path(self) -> str:
-        if self._playable_path and Path(self._playable_path).is_file():
-            return self._playable_path
-        if not self._source_path:
-            return ""
-        src = Path(self._source_path)
-        if src.is_file() and src.suffix.lower() != ".f32":
-            self._playable_path = str(src)
-            return self._playable_path
-        # Export raw float32 journal / cache to a temporary PCM WAV on demand.
-        try:
-            raw_f32 = src / "audio.f32" if src.is_dir() else src
-            if not raw_f32.is_file():
-                return ""
-            wav_path = self._temp_wav_path_for_raw_f32(raw_f32)
-            self._convert_raw_f32_to_wav(raw_f32, wav_path)
-            self._register_temp_wav(self._source_path, raw_f32, wav_path)
-            self._playable_path = str(wav_path)
-            return self._playable_path
-        except Exception:
-            return ""
-
-    def _maybe_prepare_playable_async(self) -> bool:
-        if self._playable_path and Path(self._playable_path).is_file():
-            return False
-        if not self._source_path or self._allow_headless_fallback or not self.isVisible():
-            return False
-        src = Path(self._source_path)
-        if src.is_file() and src.suffix.lower() != ".f32":
-            return False
-        raw_f32 = src / "audio.f32" if src.is_dir() else src
-        try:
-            if not raw_f32.is_file() or raw_f32.stat().st_size < self._ASYNC_F32_BYTES:
-                return False
-            wav_path = self._temp_wav_path_for_raw_f32(raw_f32)
-            if wav_path.is_file():
-                return False
-        except OSError:
-            return False
-        self._prepare_token += 1
-        token = self._prepare_token
-        source_snapshot = self._source_path
-        self._preparing_async = True
-        self._sync_ui()
-
-        def _bg() -> None:
-            try:
-                self._convert_raw_f32_to_wav(raw_f32, wav_path)
-                self._async_wav_ready.emit(token, source_snapshot, str(raw_f32), str(wav_path))
-            except Exception as exc:
-                self._async_wav_ready.emit(token, source_snapshot, "", f"无法播放该音频文件：{exc}")
-
-        threading.Thread(target=_bg, daemon=True, name="sayink-f32-wav").start()
-        return True
-
-    def _on_async_wav_ready(self, token: int, source_path: str, raw_f32_str: str, result_or_err: str) -> None:
-        if token != self._prepare_token or source_path != self._source_path:
-            return
-        self._preparing_async = False
-        if not raw_f32_str:
-            self._fail_playback(result_or_err)
-            return
-        wav_path = Path(result_or_err)
-        self._register_temp_wav(source_path, Path(raw_f32_str), wav_path)
-        self._playable_path = str(wav_path)
-        self._sync_ui()
-        self.play()
-
-    def load_audio(self, path: str | Path | None, *, fallback_duration_ms: int = 0) -> bool:
-        resolved = str(path or "").strip()
-        if not resolved:
-            self.unload_source()
-            return False
-        p = Path(resolved)
-        valid = p.is_file() or (p.is_dir() and (p / "audio.f32").is_file())
-        if not valid:
-            self.unload_source()
-            return False
-        if resolved == self._source_path:
-            if self._duration_ms <= 0 and fallback_duration_ms > 0:
-                self._duration_ms = int(fallback_duration_ms)
-                self._sync_ui()
-            return True
-        self.stop()
-        self._pending_seek_ms = None
-        from sayink.audio_recovery import hold_recovery_path, release_recovery_path
-
-        if self._source_path:
-            release_recovery_path(Path(self._source_path))
-        self._source_path = resolved
-        if p.is_dir():
-            hold_recovery_path(p)
-        self._playable_path = str(p) if p.is_file() and p.suffix.lower() != ".f32" else ""
-        probed = _probe_wav_duration_ms(p)
-        self._duration_ms = max(probed, max(0, int(fallback_duration_ms)))
-        self._position_ms = 0
-        if self._player is not None:
-            try:
-                self._player.setSource(
-                    QUrl.fromLocalFile(self._playable_path) if self._playable_path else QUrl()
-                )
-            except Exception:
-                pass
-        self._sync_ui()
-        return True
-
-    def toggle_play(self) -> None:
-        if self._playing:
-            self.pause()
-        else:
-            self.play()
-
-    def play(self) -> None:
-        if not self._source_path or self._preparing_async:
-            return
-        if self._duration_ms > 0 and self._position_ms >= self._duration_ms:
-            self._position_ms = 0
-            if self._pending_seek_ms is not None and self._pending_seek_ms >= self._duration_ms:
-                self._pending_seek_ms = 0
-        if self._maybe_prepare_playable_async():
-            return
-        playable = self._materialize_playable_path()
-        if not playable:
-            if self._allow_headless_fallback:
-                self._start_headless_fallback()
-            else:
-                self._fail_playback("无法播放该音频文件：未找到可回放的本地音频。")
-            return
-        if not self._ensure_backend() or self._player is None:
-            if self._allow_headless_fallback:
-                self._start_headless_fallback()
-            else:
-                self._fail_playback("未检测到可用的音频输出设备，无法回放录音。")
-            return
-        self._backend_error_seen = False
-        desired_pos = self._pending_seek_ms if self._pending_seek_ms is not None else self._position_ms
-        try:
-            target_url = QUrl.fromLocalFile(playable)
-            if self._player.source() != target_url:
-                self._pending_seek_ms = desired_pos
-                self._player.setSource(target_url)
-            self._player.setPlaybackRate(self._rate)
-            if self._is_media_seekable():
-                self._player.setPosition(desired_pos)
-                self._pending_seek_ms = None
-            else:
-                self._pending_seek_ms = desired_pos
-            self._player.play()
-        except Exception as exc:
-            if self._allow_headless_fallback:
-                self._start_headless_fallback()
-            else:
-                self._fail_playback(f"无法播放该音频文件：{exc}")
-            return
-        if self._backend_error_seen:
-            if self._allow_headless_fallback:
-                self._start_headless_fallback()
-            return
-        self._fallback_timer.stop()
-        self._playing = True
-        self._sync_ui()
-
-    def pause(self) -> None:
-        self._prepare_token += 1
-        self._preparing_async = False
-        self._playing = False
-        self._fallback_timer.stop()
-        if self._player is not None:
-            try:
-                self._player.pause()
-            except Exception:
-                pass
-        self._sync_ui()
-
-    def stop(self) -> None:
-        self._prepare_token += 1
-        self._preparing_async = False
-        self._playing = False
-        self._fallback_timer.stop()
-        self._pending_seek_ms = None
-        if self._player is not None:
-            try:
-                self._player.stop()
-            except Exception:
-                pass
-        self._position_ms = 0
-        self._sync_ui()
-
-    def seek_ms(self, offset_ms: int, *, autoplay: bool = False) -> None:
-        target = max(0, int(offset_ms))
-        if self._duration_ms > 0:
-            target = min(target, self._duration_ms)
-        self._position_ms = target
-        self._pending_seek_ms = target
-        if self._player is not None and self._playable_path:
-            try:
-                if self._player.source() == QUrl.fromLocalFile(self._playable_path) and self._is_media_seekable():
-                    self._player.setPosition(target)
-                    self._pending_seek_ms = None
-            except Exception:
-                pass
-        if autoplay:
-            self.play()
-        else:
-            self._sync_ui()
-
-    def _on_fallback_tick(self) -> None:
-        if not self._playing:
-            self._fallback_timer.stop()
-            return
-        now = time.monotonic()
-        elapsed_ms = int(round((now - self._fallback_last_ts) * 1000.0 * self._rate))
-        self._fallback_last_ts = now
-        self._position_ms += max(0, elapsed_ms)
-        if self._duration_ms > 0 and self._position_ms >= self._duration_ms:
-            self._position_ms = self._duration_ms
-            self._playing = False
-            self._fallback_timer.stop()
-        self._sync_ui()
-
-    def _on_backend_position(self, pos: int) -> None:
-        if not self._dragging_slider and self._pending_seek_ms is None:
-            self._position_ms = max(0, int(pos))
-            self._sync_ui()
-
-    def _on_backend_duration(self, dur: int) -> None:
-        if dur > 0:
-            self._duration_ms = int(dur)
-            if self._pending_seek_ms is not None and self._pending_seek_ms > self._duration_ms:
-                self._pending_seek_ms = self._duration_ms
-                self._position_ms = self._duration_ms
-            self._sync_ui()
-
-    def _on_media_status_changed(self, status) -> None:
-        try:
-            from PyQt6.QtMultimedia import QMediaPlayer
-
-            if status in (
-                QMediaPlayer.MediaStatus.LoadedMedia,
-                QMediaPlayer.MediaStatus.BufferedMedia,
-            ) and self._pending_seek_ms is not None:
-                target = max(0, int(self._pending_seek_ms))
-                if self._duration_ms > 0:
-                    target = min(target, self._duration_ms)
-                self._position_ms = target
-                if self._player is not None:
-                    self._player.setPosition(target)
-                self._pending_seek_ms = None
-                self._sync_ui()
-            elif status == QMediaPlayer.MediaStatus.EndOfMedia:
-                self._pending_seek_ms = None
-                self._playing = False
-                self._fallback_timer.stop()
-                self._sync_ui()
-            elif (
-                status == QMediaPlayer.MediaStatus.InvalidMedia
-                and not self._backend_error_seen
-                and not self._allow_headless_fallback
-            ):
-                self._backend_error_seen = True
-                self._fail_playback("无法播放该音频文件：音频格式不受支持或文件已损坏。")
-        except Exception:
-            pass
-
-    def _on_backend_error(self, error, error_string: str = "") -> None:
-        try:
-            from PyQt6.QtMultimedia import QMediaPlayer
-
-            if error == QMediaPlayer.Error.NoError:
-                return
-        except Exception:
-            pass
-        self._backend_error_seen = True
-        self._pending_seek_ms = None
-        if self._allow_headless_fallback:
-            return
-        detail = str(error_string or "").strip()
-        if not detail and self._player is not None:
-            try:
-                detail = str(self._player.errorString() or "").strip()
-            except Exception:
-                detail = ""
-        msg = (
-            f"无法播放该音频文件：{detail}"
-            if detail
-            else "无法播放该音频文件：音频格式不受支持或文件已损坏。"
-        )
-        self._fail_playback(msg)
-
-    def _on_backend_state(self, state) -> None:
-        try:
-            from PyQt6.QtMultimedia import QMediaPlayer
-
-            if state == QMediaPlayer.PlaybackState.PlayingState:
-                self._fallback_timer.stop()
-                self._playing = True
-                self._sync_ui()
-            elif state == QMediaPlayer.PlaybackState.PausedState:
-                if not self._fallback_timer.isActive():
-                    self._playing = False
-                    self._sync_ui()
-            elif state == QMediaPlayer.PlaybackState.StoppedState and not self._fallback_timer.isActive():
-                loading = (
-                    self._player is not None
-                    and self._player.mediaStatus() == QMediaPlayer.MediaStatus.LoadingMedia
-                )
-                if not loading:
-                    self._playing = False
-                    self._sync_ui()
-        except Exception:
-            pass
-
-    def _on_slider_pressed(self) -> None:
-        self._dragging_slider = True
-
-    def _on_slider_released(self) -> None:
-        self._dragging_slider = False
-        self.seek_ms(self._slider.value(), autoplay=self._playing)
-
-    def _on_slider_changed(self, value: int) -> None:
-        if self._dragging_slider:
-            self._position_ms = max(0, int(value))
-            self._time_label.setText(
-                f"{_format_audio_clock(self._position_ms)} / {_format_audio_clock(self._duration_ms)}"
-            )
-
-    def _on_speed_changed(self, _index: int) -> None:
-        rate = float(self._speed_combo.currentData() or 1.0)
-        self._rate = rate
-        if self._player is not None:
-            try:
-                self._player.setPlaybackRate(rate)
-            except Exception:
-                pass
-
-    def _sync_ui(self) -> None:
-        if getattr(self, "_preparing_async", False):
-            self._play_btn.setText("准备中…")
-            self._play_btn.setEnabled(False)
-        else:
-            self._play_btn.setText("暂停" if self._playing else "播放")
-            self._play_btn.setEnabled(bool(self._source_path))
-        upper = max(self._duration_ms, self._position_ms, 0)
-        self._slider.blockSignals(True)
-        self._slider.setRange(0, upper)
-        if not self._dragging_slider:
-            self._slider.setValue(min(self._position_ms, upper))
-        self._slider.blockSignals(False)
-        self._time_label.setText(
-            f"{_format_audio_clock(self._position_ms)} / {_format_audio_clock(self._duration_ms)}"
-        )
-class MeetingPage(QWidget):
+class MeetingPage(_MeetingImportMixin, _MeetingLiveMixin, QWidget):
     start_requested = pyqtSignal(object)   # MeetingOptions
     end_requested = pyqtSignal()
     pause_requested = pyqtSignal()
@@ -1521,7 +662,7 @@ class MeetingPage(QWidget):
         body_lay.addWidget(self._record_notes)
         self._materials_marks_label = QLabel("标记")
         body_lay.addWidget(self._materials_marks_label)
-        self._record_marks = QTextBrowser()
+        self._record_marks = _CompactTextBrowser()
         self._record_marks.setAccessibleName("标记")
         self._record_marks.setOpenLinks(False)
         self._record_marks.setMinimumHeight(32)
@@ -1741,337 +882,28 @@ class MeetingPage(QWidget):
         browse_lay.addWidget(self._splitter, 1)
         return browse_page
 
-    def _build_start_card(self) -> QWidget:
-        page = QWidget()
-        page_lay = QVBoxLayout(page)
-        page_lay.setContentsMargins(0, 0, 0, 0)
-        page_lay.setSpacing(8)
-        self._start_scroll = QScrollArea()
-        self._start_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._start_scroll.setWidgetResizable(True)
-        self._start_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        content = QWidget()
-        self._start_scroll.setWidget(content)
-        page_lay.addWidget(self._start_scroll, 1)
-        lay = QVBoxLayout(content)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
-        self._card_title = QLabel("开始会议")
-        lay.addWidget(self._card_title)
-        self._card_hint = QLabel(
-            "音源、模型和语言仅作用于本场会议；下方标题、参会人与议程均为选填，写进纪要并帮助模型理解上下文。"
-        )
-        self._card_hint.setWordWrap(True)
-        lay.addWidget(self._card_hint)
-
-        row = QHBoxLayout()
-        row.setSpacing(10)
-        self._opt_source = _CleanComboBox()
-        self._opt_source.setAccessibleName("会议音频来源")
-        for key, label in _SOURCE_LABELS:
-            self._opt_source.addItem(label, key)
-        self._opt_model = _CleanComboBox()
-        self._opt_model.setAccessibleName("会议识别模型")
-        self._opt_language = _CleanComboBox()
-        self._opt_language.setAccessibleName("会议语言")
-        for key, label in _LANGUAGE_LABELS:
-            self._opt_language.addItem(label, key)
-        # 「自动（中文优先）」和「麦克风 + 电脑声音」一样长；模型名更长，只多给一档。
-        for caption, field, stretch in (
-            ("音频来源", self._opt_source, 3),
-            ("转写模型", self._opt_model, 4),
-            ("识别语言", self._opt_language, 3),
-        ):
-            field.setMinimumWidth(0)
-            field.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-            column = QVBoxLayout()
-            column.setSpacing(4)
-            label = QLabel(caption)
-            label.setBuddy(field)
-            column.addWidget(label)
-            column.addWidget(field)
-            row.addLayout(column, stretch)
-        lay.addLayout(row)
-
-        self._opt_loopback_hint = QLabel("")
-        self._opt_loopback_hint.setWordWrap(True)
-        self._opt_loopback_hint.setAccessibleName("电脑声回环输出设备")
-        self._opt_loopback_hint.hide()
-        lay.addWidget(self._opt_loopback_hint)
-
-        self._opt_save_audio = QCheckBox(
-            "本机保存会议录音（支持点击文字回放核对与断电恢复，纯离线存储）"
-        )
-        self._opt_save_audio.setAccessibleName("本机保存会议录音")
-        self._opt_save_audio.setChecked(True)
-        self._opt_save_audio.toggled.connect(self._on_save_audio_toggled)
-        lay.addWidget(self._opt_save_audio)
-
-        meta_row = QHBoxLayout()
-        meta_row.setSpacing(10)
-        self._opt_title = QLineEdit()
-        self._opt_title.setPlaceholderText("会议标题（选填，留空按时间命名）")
-        self._opt_title.setAccessibleName("会议标题")
-        meta_row.addWidget(self._opt_title, 1)
-        self._opt_participants = QLineEdit()
-        self._opt_participants.setPlaceholderText("参会人（选填，逗号分隔）")
-        self._opt_participants.setAccessibleName("参会人")
-        meta_row.addWidget(self._opt_participants, 1)
-        lay.addLayout(meta_row)
-
-        self._opt_agenda = QPlainTextEdit()
-        self._opt_agenda.setPlaceholderText("议程 / 背景（选填，每行一条）")
-        self._opt_agenda.setAccessibleName("议程")
-        self._opt_agenda.setFixedHeight(60)
-        lay.addWidget(self._opt_agenda)
-
-        self._card_notes = QLabel("")
-        self._card_notes.setWordWrap(True)
-        self._card_notes.hide()
-        lay.addWidget(self._card_notes)
-        dl_row = QHBoxLayout()
-        self._card_dl_btn = QPushButton("下载辅助模型")
-        self._card_dl_btn.setAccessibleName("下载会议辅助模型")
-        self._card_dl_btn.clicked.connect(self._download_aux_models)
-        self._card_dl_btn.hide()
-        dl_row.addWidget(self._card_dl_btn, 0)
-        dl_row.addStretch(1)
-        lay.addLayout(dl_row)
-        lay.addStretch(1)
-
-        actions = QHBoxLayout()
-        actions.addStretch(1)
-        self._card_cancel = QPushButton("取消")
-        self._card_cancel.clicked.connect(self._leave_start_card)
-        actions.addWidget(self._card_cancel)
-        self._card_start = QPushButton("开始")
-        self._card_start.setAccessibleName("开始会议记录")
-        self._card_start.setDefault(True)
-        self._card_start.clicked.connect(self._start_from_card)
-        actions.addWidget(self._card_start)
-        page_lay.addLayout(actions)
-        self._opt_source.currentIndexChanged.connect(self._update_card_notes)
-        self._opt_model.currentIndexChanged.connect(self._update_card_notes)
-        return page
-
-    def _build_live(self) -> QWidget:
-        page = QWidget()
-        lay = QVBoxLayout(page)
-        self._live_layout = lay
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(10)
-        head = QHBoxLayout()
-        head.setSpacing(12)
-        self._live_title = QLabel("会议进行中")
-        self._live_title.setTextFormat(Qt.TextFormat.PlainText)
-        self._live_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        head.addWidget(self._live_title, 1)
-        self._live_rec_dot = QLabel()
-        self._live_rec_dot.setFixedSize(8, 8)
-        self._live_rec_dot.setAccessibleName("正在记录")
-        head.addWidget(self._live_rec_dot, 0, Qt.AlignmentFlag.AlignVCenter)
-        self._live_clock = QLabel("00:00:00")
-        self._live_clock.setObjectName("meetingLiveClock")
-        self._live_clock.setAccessibleName("会议已进行时间")
-        head.addWidget(self._live_clock, 0)
-        self._pause_btn = QPushButton("暂停采集")
-        self._pause_btn.setAccessibleName("暂停会议采集")
-        self._pause_btn.setToolTip("暂停期间不采集新音频；已录内容继续识别，会议记录保留。")
-        self._pause_btn.clicked.connect(self.pause_requested.emit)
-        head.addWidget(self._pause_btn, 0)
-        self._resume_btn = QPushButton("继续采集")
-        self._resume_btn.setAccessibleName("继续会议采集")
-        self._resume_btn.setToolTip("继续采集新的会议音频。")
-        self._resume_btn.clicked.connect(self.resume_requested.emit)
-        self._resume_btn.hide()
-        head.addWidget(self._resume_btn, 0)
-        self._end_btn = QPushButton("结束会议")
-        self._end_btn.setAccessibleName("结束会议")
-        self._end_btn.clicked.connect(self._confirm_end)
-        head.addWidget(self._end_btn, 0)
-        lay.addLayout(head)
-
-        self._system_silent_banner = QFrame()
-        self._system_silent_banner.setObjectName("meetingSilentBanner")
-        banner_lay = QHBoxLayout(self._system_silent_banner)
-        banner_lay.setContentsMargins(10, 6, 8, 6)
-        banner_lay.setSpacing(8)
-        self._system_silent_label = QLabel()
-        self._system_silent_label.setTextFormat(Qt.TextFormat.PlainText)
-        self._system_silent_label.setWordWrap(True)
-        self._system_silent_label.setAccessibleName("电脑声静音提醒")
-        banner_lay.addWidget(self._system_silent_label, 1)
-        self._system_silent_dismiss_btn = QPushButton("知道了")
-        self._system_silent_dismiss_btn.setAccessibleName("关闭电脑声静音提醒")
-        self._system_silent_dismiss_btn.clicked.connect(self._dismiss_system_silent_warning)
-        banner_lay.addWidget(self._system_silent_dismiss_btn, 0, Qt.AlignmentFlag.AlignVCenter)
-        self._system_silent_banner.hide()
-        lay.addWidget(self._system_silent_banner)
-
-        self._live_meters_bar = QWidget()
-        self._live_meters_bar.setObjectName("meetingLiveMeters")
-        meters_lay = QHBoxLayout(self._live_meters_bar)
-        meters_lay.setContentsMargins(0, 0, 0, 0)
-        meters_lay.setSpacing(8)
-        self._live_mic_label = QLabel("麦克风")
-        meters_lay.addWidget(self._live_mic_label, 0)
-        self._live_mic_meter = _LevelMeterBar("麦克风实时电平")
-        meters_lay.addWidget(self._live_mic_meter, 1)
-        meters_lay.addSpacing(8)
-        self._live_sys_label = QLabel("电脑声（对方）")
-        meters_lay.addWidget(self._live_sys_label, 0)
-        self._live_sys_meter = _LevelMeterBar("电脑声（对方）实时电平")
-        meters_lay.addWidget(self._live_sys_meter, 1)
-        lay.addWidget(self._live_meters_bar)
-
-        self._live_status = QLabel("")
-        self._live_status.setTextFormat(Qt.TextFormat.PlainText)
-        self._live_status.setWordWrap(True)
-        self._live_status.hide()
-        lay.addWidget(self._live_status)
-
-        speaker_tools = PairedToolBar(spacing=8)
-        self._live_speaker_hint = QLabel("点击姓名可命名；纠正发言人只影响选中的段落，人工修改会保留。")
-        self._live_speaker_hint.setWordWrap(True)
-        self._live_speaker_btn = QPushButton("命名说话人")
-        self._live_speaker_btn.setAccessibleName("会议记录中命名说话人")
-        self._live_speaker_menu = QMenu(self._live_speaker_btn)
-        self._live_speaker_menu.aboutToShow.connect(self._populate_live_speaker_menu)
-        self._live_speaker_btn.setMenu(self._live_speaker_menu)
-        speaker_tools.add_right(self._live_speaker_btn)
-        self._live_correct_speaker_btn = QPushButton("纠正发言人")
-        self._live_correct_speaker_btn.setCheckable(True)
-        self._live_correct_speaker_btn.toggled.connect(self._toggle_live_speaker_correction)
-        speaker_tools.add_right(self._live_correct_speaker_btn)
-        lay.addWidget(speaker_tools)
-        lay.addWidget(self._live_speaker_hint)
-        self._live_speaker_feedback = QLabel()
-        self._live_speaker_feedback.setTextFormat(Qt.TextFormat.PlainText)
-        self._live_speaker_feedback.setWordWrap(True)
-        self._live_speaker_feedback.hide()
-        lay.addWidget(self._live_speaker_feedback)
-
-        self._live_find_bar = QWidget()
-        find_lay = QHBoxLayout(self._live_find_bar)
-        find_lay.setContentsMargins(0, 0, 0, 0)
-        find_lay.setSpacing(6)
-        self._live_find_edit = QLineEdit()
-        self._live_find_edit.setPlaceholderText("查找本场文字稿；Enter 下一处，Shift+Enter 上一处")
-        self._live_find_edit.setAccessibleName("查找本场文字稿")
-        self._live_find_edit.setClearButtonEnabled(True)
-        self._live_find_edit.textChanged.connect(lambda: self._find_live_text(restart=True))
-        self._live_find_edit.returnPressed.connect(self._find_live_text)
-        self._live_find_edit.installEventFilter(self)
-        find_lay.addWidget(self._live_find_edit, 1)
-        self._live_find_status = QLabel()
-        find_lay.addWidget(self._live_find_status)
-        self._live_find_prev_btn = QPushButton("上一处")
-        self._live_find_prev_btn.setAccessibleName("查找上一处")
-        self._live_find_prev_btn.clicked.connect(lambda: self._find_live_text(backward=True))
-        find_lay.addWidget(self._live_find_prev_btn)
-        self._live_find_next_btn = QPushButton("下一处")
-        self._live_find_next_btn.setAccessibleName("查找下一处")
-        self._live_find_next_btn.clicked.connect(lambda: self._find_live_text(backward=False))
-        find_lay.addWidget(self._live_find_next_btn)
-        self._live_find_close_btn = QPushButton("关闭查找")
-        self._live_find_close_btn.clicked.connect(self._close_live_find)
-        find_lay.addWidget(self._live_find_close_btn)
-        self._live_find_bar.hide()
-        lay.addWidget(self._live_find_bar)
-
-        self._live_split = QSplitter(Qt.Orientation.Horizontal)
-        self._live_split.setChildrenCollapsible(False)
-        self._live_transcript = _TranscriptView()
-        self._live_transcript.setOpenLinks(False)
-        self._live_transcript.anchorClicked.connect(self._on_live_transcript_link)
-        self._live_transcript.setAccessibleName("实时文字稿")
-        self._live_transcript.setPlaceholderText("开始说话后，这里会按说话人逐条出现文字…")
-        self._live_transcript.viewport().installEventFilter(self)
-        self._live_follow_bottom = True
-        self._live_scroll_guard = 0
-        self._live_transcript.verticalScrollBar().valueChanged.connect(self._on_live_scroll_changed)
-        self._live_transcript.verticalScrollBar().rangeChanged.connect(self._on_live_range_changed)
-        self._live_new_msg_btn = QPushButton("↓ 底部有新发言", self._live_transcript.viewport())
-        self._live_new_msg_btn.setAccessibleName("跳到底部查看新发言")
-        self._live_new_msg_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._live_new_msg_btn.clicked.connect(self._scroll_live_to_bottom)
-        self._live_new_msg_btn.hide()
-        self._live_split.addWidget(self._live_transcript)
-        side = QWidget()
-        side_lay = QVBoxLayout(side)
-        self._live_side_layout = side_lay
-        side_lay.setContentsMargins(12, 0, 0, 0)
-        side_lay.setSpacing(8)
-        self._marks_title = QLabel("标记")
-        side_lay.addWidget(self._marks_title)
-        mark_row = QHBoxLayout()
-        mark_row.setSpacing(6)
-        self._mark_note = QLineEdit()
-        self._mark_note.setPlaceholderText("备注（可空）")
-        self._mark_note.setAccessibleName("标记备注")
-        self._mark_note.returnPressed.connect(self._add_mark)
-        mark_row.addWidget(self._mark_note, 1)
-        self._mark_btn = QPushButton("标记此刻")
-        self._mark_btn.setAccessibleName("标记此刻")
-        self._mark_btn.clicked.connect(self._add_mark)
-        mark_row.addWidget(self._mark_btn)
-        side_lay.addLayout(mark_row)
-        self._marks_view = QTextBrowser()
-        self._marks_view.setAccessibleName("标记列表")
-        self._marks_view.setPlaceholderText("")
-        self._marks_view.setMinimumHeight(36)
-        self._marks_view.setMaximumHeight(88)
-        side_lay.addWidget(self._marks_view)
-        self._notes_title = QLabel("我的笔记")
-        side_lay.addWidget(self._notes_title)
-        self._user_notes = QPlainTextEdit()
-        self._user_notes.setAccessibleName("我的笔记")
-        self._user_notes.setPlaceholderText("随手记；生成纪要时会一并参考。")
-        self._user_notes.setMinimumHeight(64)
-        self._user_notes_timer = QTimer(self)
-        self._user_notes_timer.setSingleShot(True)
-        self._user_notes_timer.setInterval(800)
-        self._user_notes_timer.timeout.connect(self._save_user_notes)
-        self._user_notes.textChanged.connect(lambda: self._user_notes_timer.start())
-        side_lay.addWidget(self._user_notes, 1)
-        self._live_side_scroll = QScrollArea()
-        self._live_side_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._live_side_scroll.setWidgetResizable(True)
-        self._live_side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._live_side_scroll.setMinimumWidth(240)
-        self._live_side_scroll.setWidget(side)
-        self._live_split.addWidget(self._live_side_scroll)
-        self._live_split.setStretchFactor(0, 3)
-        self._live_split.setStretchFactor(1, 2)
-        lay.addWidget(self._live_split, 1)
-
-        actions = QHBoxLayout()
-        self._live_caps = QLabel("")
-        self._live_caps.setWordWrap(True)
-        actions.addWidget(self._live_caps, 1)
-        self._live_dl_btn = QPushButton("下载辅助模型")
-        self._live_dl_btn.setAccessibleName("下载会议辅助模型（进行中）")
-        self._live_dl_btn.clicked.connect(self._download_aux_models)
-        self._live_dl_btn.hide()
-        actions.addWidget(self._live_dl_btn)
-        lay.addLayout(actions)
-        return page
-
     # ── theme ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _disabled_btn_sm_override() -> str:
+        from sayink.ui import design_tokens as tok
+
+        return (
+            f"\nQPushButton:disabled {{ color: {tok.TEXT_DIM}; background: {tok.SURFACE_PEARL};"
+            f" border: 1px solid {tok.HAIRLINE}; font-weight: 400; }}"
+        )
 
     def reapply_theme(self) -> None:
         from sayink.ui import design_tokens as tok
         from sayink.ui import settings_styles as ss
-
-        self.setStyleSheet(ss.WINDOW_CSS)
-        title_css = (
-            f"font-family: {tok.FONT_DISPLAY}; font-size: {tok.TYPE_TITLE_LG}px; font-weight: 700;"
-            f" background: transparent; color: {tok.TEXT};"
-        )
         from sayink.ui.settings_components import PAGE_TITLE
 
+        self.setStyleSheet(ss.WINDOW_CSS)
         self._title_label.setStyleSheet(PAGE_TITLE)
-        self._card_title.setStyleSheet(title_css)
+        self._card_title.setStyleSheet(
+            f"font-family: {tok.FONT_DISPLAY}; font-size: {tok.TYPE_TITLE}px; font-weight: 700;"
+            f" background: transparent; color: {tok.TEXT_SEC}; padding: 2px 0 0 0;"
+        )
         self._live_title.setStyleSheet(
             f"font-size: {tok.TYPE_TITLE}px; font-weight: 700; color: {tok.TEXT}; background: transparent;"
         )
@@ -2083,9 +915,17 @@ class MeetingPage(QWidget):
                       self._materials_agenda, self._opt_loopback_hint, self._live_mic_label,
                       self._live_sys_label, self._live_find_status, self._detail_find_status):
             label.setStyleSheet(dim)
-        self._opt_save_audio.setStyleSheet(
-            f"QCheckBox {{ color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; background: transparent; spacing: 8px; }}"
+        field_label_css = (
+            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700; background: transparent;"
         )
+        for field_lbl in getattr(self, "_card_field_labels", ()):
+            field_lbl.setStyleSheet(field_label_css)
+        save_font = self._opt_save_audio.font()
+        save_font.setFamily(tok.UI_FONT_FAMILY)
+        save_font.setPixelSize(tok.TYPE_BODY_SM)
+        self._opt_save_audio.setFont(save_font)
+        self._opt_save_audio.setStyleSheet("background: transparent;")
+        self._opt_save_audio.update()
         for label in (self._marks_title, self._notes_title, self._materials_notes_label, self._materials_marks_label):
             label.setStyleSheet(
                 f"color: {tok.TEXT}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700; background: transparent;"
@@ -2140,7 +980,6 @@ class MeetingPage(QWidget):
         self._search_edit.setStyleSheet(ss.build_search_field_css())
         for edit in (self._opt_title, self._opt_participants, self._mark_note, self._live_find_edit, self._detail_find_edit):
             edit.setStyleSheet(edit_css)
-        # Reads as a heading; the frame only appears once the user goes to edit it.
         self._detail_title.setStyleSheet(f"""
             QLineEdit {{
                 background: transparent; color: {tok.TEXT};
@@ -2173,12 +1012,14 @@ class MeetingPage(QWidget):
             }}
             QPlainTextEdit:focus {{ border: 2px solid {tok.ACCENT}; }}
         """
-        for view in (self._notes_edit, self._live_transcript, self._marks_view, self._user_notes,
+        for view in (self._notes_edit, self._live_transcript, self._user_notes,
                      self._opt_agenda, self._record_notes, self._record_marks):
             view.setStyleSheet(text_css)
+        self._marks_view.setStyleSheet(
+            text_css
+            + f"QTextBrowser {{ padding: 4px 8px; font-size: {tok.TYPE_FOOTNOTE}px; }}"
+        )
         self._notes_edit.setStyleSheet(text_css + f"QPlainTextEdit {{ font-size: {tok.READING_FONT_PX}px; }}")
-        # Reading a saved meeting matches 历史: text sits on the page, and only
-        # the editor gets a field border, so "can I type here" is visible.
         reading_css = f"""
             QTextBrowser {{
                 background: transparent; color: {tok.TEXT}; border: none; padding: 4px 0;
@@ -2198,22 +1039,27 @@ class MeetingPage(QWidget):
                                      background: transparent; }}
         """)
         for combo in (self._opt_source, self._opt_model, self._opt_language, self._template_combo):
-            combo.setStyleSheet("")  # Inherit the shared form and popup styles.
-        # Match the small action buttons so 纪要 and 文字稿 share one tool-row height.
+            combo.setStyleSheet("")
         self._template_combo.setStyleSheet(ss.build_toolbar_combo_css())
-        for btn in (self._start_btn, self._card_start, self._pause_btn, self._resume_btn, self._live_new_msg_btn):
+        disabled_sm = self._disabled_btn_sm_override()
+        for btn in (self._start_btn, self._card_start, self._resume_btn, self._live_new_msg_btn):
             btn.setStyleSheet(ss.BTN_ACCENT_SM)
-        for btn in (self._generate_btn, self._edit_btn, self._cancel_notes_edit_btn, self._copy_btn,
+        self._mark_btn.setStyleSheet(
+            ss.BTN_ACCENT_SM if self._mark_btn.isEnabled() else ss.BTN_ACCENT_SM + disabled_sm
+        )
+        for btn in (self._generate_btn, self._cancel_notes_edit_btn, self._copy_btn,
                     self._transcript_copy_btn, self._export_btn, self._card_cancel,
-                    self._cancel_btn, self._correct_speaker_btn, self._return_notes_btn, self._clear_search_btn,
-                    self._mark_btn, self._live_find_prev_btn, self._live_find_next_btn, self._live_find_close_btn,
+                    self._pause_btn, self._cancel_btn, self._return_notes_btn, self._clear_search_btn,
+                    self._live_find_prev_btn, self._live_find_next_btn, self._live_find_close_btn,
                     self._detail_find_prev_btn, self._detail_find_next_btn, self._detail_find_close_btn,
                     self._system_silent_dismiss_btn,
-                    self._manage_templates_btn, self._live_correct_speaker_btn,
+                    self._manage_templates_btn,
                     self._card_dl_btn, self._live_dl_btn, self._load_more_btn, self._materials_toggle,
                     self._sort_btn, self._selection_mode_btn, self._batch_all_btn, self._batch_export_btn, self._batch_generate_btn,
                     self._import_btn, self._media_btn, self._media_retry_btn, self._media_again_btn):
             btn.setStyleSheet(ss.BTN_GHOST_SM)
+        for btn in (self._edit_btn, self._correct_speaker_btn, self._live_correct_speaker_btn):
+            btn.setStyleSheet(ss.BTN_GHOST_SM + disabled_sm)
         self._media_cancel_btn.setStyleSheet(ss.BTN_DANGER_SM)
         self._batch_delete_btn.setStyleSheet(ss.BTN_DANGER_SM)
         for btn in (
@@ -2221,8 +1067,6 @@ class MeetingPage(QWidget):
             self._batch_generate_btn, self._batch_delete_btn,
         ):
             fit_action_button(btn)
-        # Match 导出's real box (style min-height plus its border) so the tab
-        # capsule and the button share one line. Both labels use the same weight.
         tab_h = max(self._export_btn.sizeHint().height(), tok.CONTROL_BTN_SM_HEIGHT)
         chip_h = max(20, tab_h - 8)
         self._tab_bar.setStyleSheet(f"""
@@ -2241,16 +1085,27 @@ class MeetingPage(QWidget):
         no_indicator = "QPushButton::menu-indicator { image: none; width: 0px; }"
         self._more_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
         self._template_menu_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
-        self._speaker_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
-        self._live_speaker_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator)
+        self._speaker_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator + disabled_sm)
+        self._live_speaker_btn.setStyleSheet(ss.BTN_GHOST_SM + no_indicator + disabled_sm)
         self._end_btn.setStyleSheet(ss.BTN_DANGER_SOLID_SM)
         for splitter in (self._splitter, self._live_split):
             splitter.setStyleSheet(
                 "QSplitter::handle { background: transparent; }"
                 f"QSplitter::handle:hover {{ background: {tok.ACCENT_FOCUS}; }}"
             )
+        self._drafts.live_marks_html = ""
+        if self._stack.currentIndex() == PAGE_LIVE and self._ctrl.is_active:
+            self._sync_live_state()
+            self._render_live()
         if self._detail_id:
             self._render_detail()
+        if self._detail_find_bar.isVisible() and self._detail_find_edit.text().strip():
+            self._find_detail_text(restart=False)
+        if self._live_find_bar.isVisible() and self._live_find_edit.text().strip():
+            idx, total = find_in_reading_view(
+                self._live_transcript, self._live_find_edit.text(), step=False
+            )
+            self._live_find_status.setText("未找到" if total == 0 else f"{idx} / {total}")
         if hasattr(self, "_list"):
             self._sync_batch_checks()
         self._sync_media_buttons()
@@ -3037,581 +1892,6 @@ class MeetingPage(QWidget):
         elif getattr(self, "_tab_auto_switched", False):
             self._switch_tab(0, _auto=False)
 
-    def _imported_status_message(self, meeting_id: str, kind_label: str) -> str:
-        if self._ctrl.generating_for == meeting_id:
-            return f"已导入{kind_label}，正在自动生成纪要。"
-        job = self._ctrl.queued_generation(meeting_id)
-        if job is not None and not job.failed:
-            return f"已导入{kind_label}，已自动加入纪要生成队列。"
-        if kind_label == "音视频":
-            return "已导入音视频。可先核对文字稿，或切换到「纪要」点击「生成纪要」。"
-        return "已导入文字稿。确认内容后，可切换到「纪要」点击「生成纪要」。"
-
-    def _ask_import(self) -> tuple | None:
-        from sayink.ui.transcript_import_dialog import TranscriptImportDialog
-
-        dialog = TranscriptImportDialog(self)
-        with _quiet_tooltips(self):
-            accepted = dialog.exec() == QDialog.DialogCode.Accepted
-        if not accepted:
-            return None
-        return (
-            dialog.transcript_text(),
-            dialog.meeting_title(),
-            dialog.detect_structure(),
-            dialog.meeting_started_ms(),
-            dialog.parsed(),
-        )
-
-    def _import_transcript(self) -> None:
-        if self._ctrl.is_active:
-            self._set_status("会议进行中，请结束后再导入文字稿")
-            return
-        asked = self._ask_import()
-        if not asked:
-            return
-        text, title, detect = asked[:3]
-        started = asked[3] if len(asked) > 3 else None
-        preparsed = asked[4] if len(asked) > 4 else None
-        try:
-            record = self._ctrl.import_transcript(
-                text, title=title, detect_structure=detect, started_at=started, parsed=preparsed,
-            )
-        except TypeError:
-            record = self._ctrl.import_transcript(
-                text, title=title, detect_structure=detect, started_at=started,
-            )
-        if record is None:
-            self._set_status(getattr(self._ctrl, "transcript_import_notice", "") or "没有可导入的文字")
-            return
-        self.show_meeting(record.id)
-        self._set_status(self._imported_status_message(record.id, "文字稿"))
-
-    def _import_is_recognizing(self) -> bool:
-        return "正在识别" in (getattr(self, "_media_progress_text", "") or "")
-
-    def _queued_media(self) -> tuple[tuple[str, str], ...]:
-        queued = getattr(self._ctrl, "queued_media", None)
-        if callable(queued):
-            return tuple(queued())
-        return tuple(getattr(self._ctrl, "_media_queue", ()) or ())
-
-    def _sync_import_queue(self, queued) -> None:
-        signature = tuple((str(path), str(title)) for path, title in queued)
-        if signature == getattr(self, "_queue_signature", None):
-            self._import_queue.setVisible(bool(signature))
-            return
-        self._queue_signature = signature
-        while self._import_queue_lay.count():
-            item = self._import_queue_lay.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        from sayink.ui import settings_styles as ss
-
-        for index, (path, title) in enumerate(signature):
-            row = QWidget()
-            lay = QHBoxLayout(row)
-            lay.setContentsMargins(0, 0, 0, 0)
-            lay.setSpacing(8)
-            name = title or Path(path).name
-            label = QLabel(name)
-            label.setObjectName("meetingImportQueueItem")
-            remove = QPushButton("移除")
-            remove.setAccessibleName(f"移除排队文件 {name}")
-            remove.setStyleSheet(ss.BTN_GHOST_SM)
-            remove.setCursor(Qt.CursorShape.PointingHandCursor)
-            remove.clicked.connect(lambda _checked=False, item_index=index: self._remove_queued_media(item_index))
-            lay.addWidget(label, 1)
-            lay.addWidget(remove, 0)
-            self._import_queue_lay.addWidget(row)
-        self._import_queue.setVisible(bool(signature))
-
-    def _remove_queued_media(self, index: int) -> None:
-        remove = getattr(self._ctrl, "remove_queued_media", None)
-        if callable(remove):
-            remove(index)
-        self._queue_signature = None
-        self._sync_media_buttons()
-
-    def _sync_media_buttons(self) -> None:
-        busy = bool(getattr(self._ctrl, "importing_media", False))
-        browsing = self._stack.currentIndex() == PAGE_BROWSE
-        active = bool(getattr(self._ctrl, "is_active", False))
-        self._import_btn.setVisible(browsing)
-        self._media_btn.setVisible(browsing)
-        self._media_btn.setEnabled(not active)
-        self._import_btn.setEnabled(not active)
-        self._start_btn.setEnabled(not busy and not active)
-        self._media_btn.setText("加入队列" if busy else "导入音视频")
-        self._media_btn.setToolTip(
-            "正在识别。再选或拖入的文件会排在后面。" if busy else self._media_tip
-        )
-        recognizing = self._import_is_recognizing()
-        block = "正在识别，结束后可以开始会议" if recognizing else "正在读取，结束后可以开始会议"
-        self._start_btn.setToolTip(block if busy else self._start_tip)
-        self._start_block.setText(block if busy else "")
-        self._start_block.setVisible(busy and browsing)
-        self._import_btn.setToolTip(
-            "会议进行中，请结束后再导入文字稿" if active else self._import_tip
-        )
-        pending = busy and self._media_cancel_pending
-        self._media_cancel_btn.setVisible(busy and browsing)
-        self._media_cancel_btn.setEnabled(not pending)
-        if pending:
-            stop_label = "正在停止…"
-        elif recognizing:
-            stop_label = "停止识别"
-        else:
-            stop_label = "取消导入"
-        self._media_cancel_btn.setText(stop_label)
-        self._media_cancel_btn.setToolTip(
-            "停在当前这段之后。已经识别的文字会留下，后面不再识别。"
-            if recognizing or pending else
-            "还没开始识别，取消后不会留下文字。"
-        )
-        if not busy:
-            self._media_cancel_pending = False
-        self._media_retry_btn.setVisible(
-            browsing and not busy and bool(getattr(self._ctrl, "_unsaved_media", None))
-        )
-        self._media_again_btn.setVisible(
-            browsing and not busy and bool(self._failed_media_path) and Path(self._failed_media_path).is_file()
-        )
-        queued = self._queued_media()
-        phase = "正在识别" if recognizing else "正在读取"
-        if queued:
-            phase += f" · 还有 {len(queued)} 个在排队"
-        if busy and browsing:
-            self._import_kicker.setText(phase)
-            self._import_kicker.setVisible(True)
-            self._import_filename.set_full_text(getattr(self, "_media_import_title", "") or "")
-            self._import_filename.setVisible(bool(getattr(self, "_media_import_title", "")))
-        else:
-            self._import_kicker.hide()
-            self._import_filename.hide()
-        self._sync_import_queue(queued if busy else ())
-
-    def _existing_media_audio_paths(self) -> set[str]:
-        existing: set[str] = set()
-        for rec in getattr(self, "_records", ()) or ():
-            ap = str(getattr(rec, "audio_path", "") or "").strip()
-            if ap:
-                existing.add(ap)
-        for ap in getattr(self, "_meeting_audio_paths", {}).values():
-            if ap:
-                existing.add(str(ap))
-        cur_src = str(getattr(self._ctrl, "_media_source_path", "") or "").strip()
-        if cur_src:
-            existing.add(cur_src)
-        for queued_path, _title in self._queued_media():
-            if queued_path:
-                existing.add(str(queued_path))
-        return existing
-
-    def _import_media(self) -> None:
-        if not getattr(self._ctrl, "importing_media", False):
-            reason = self._ctrl.media_block_reason()
-            if reason:
-                self._set_status(reason, tone="error")
-                return
-        if QFileDialog.getOpenFileName is not _ORIG_GET_OPEN_FILE_NAME:
-            with native_file_dialog(self):
-                path, _selected = QFileDialog.getOpenFileName(
-                    self, "导入音视频", "", file_dialog_filter()
-                )
-            if not path:
-                return
-            self._begin_media_paths([Path(path)])
-            return
-        with native_file_dialog(self):
-            paths, _selected = QFileDialog.getOpenFileNames(
-                self, "导入音视频", "", file_dialog_filter()
-            )
-        if not paths:
-            return
-        self._confirm_and_begin_media_paths([Path(p) for p in paths])
-
-    def _confirm_and_begin_media_paths(self, paths: list[Path]) -> tuple[bool, str]:
-        dialog = MediaImportDialog(
-            paths,
-            config=self._config,
-            existing_audio_paths=self._existing_media_audio_paths(),
-            queueing=bool(getattr(self._ctrl, "importing_media", False)),
-            parent=self,
-        )
-        with _quiet_tooltips(self):
-            accepted = dialog.exec() == QDialog.DialogCode.Accepted
-        if not accepted:
-            return False, ""
-        requests = dialog.import_requests()
-        if not requests:
-            return False, ""
-        return True, self._begin_media_requests(requests)
-
-    def _begin_media_paths(self, paths: list[Path]) -> str:
-        ordered = sorted(paths, key=natural_media_sort_key) if len(paths) > 1 else list(paths)
-        return self._begin_media_requests([(path, path.stem, {}) for path in ordered])
-
-    def _begin_media_requests(self, requests: list[tuple[Path, str, dict]]) -> str:
-        if not getattr(self._ctrl, "importing_media", False):
-            self._last_batch_saved_id = ""
-        for path, title, opts in requests:
-            was_importing = bool(getattr(self._ctrl, "importing_media", False))
-            kwargs: dict = {"title": title or path.stem}
-            if opts:
-                for key in ("language", "model_id", "started_at"):
-                    if key in opts and opts[key] not in ("", None):
-                        kwargs[key] = opts[key]
-            try:
-                message = self._ctrl.start_media_import(str(path), **kwargs)
-            except TypeError:
-                message = self._ctrl.start_media_import(str(path), title=title or path.stem)
-            if message:
-                self._set_status(message, tone="error")
-                return message
-            notice = str(getattr(self._ctrl, "media_queue_notice", "") or "")
-            if notice or was_importing:
-                self._ctrl.media_queue_notice = ""
-                if notice:
-                    self._set_status(notice)
-                self._sync_media_buttons()
-                continue
-            self._arm_import_view(path, title=title or path.stem)
-        return ""
-
-    def _clear_import_live(self) -> None:
-        self._last_media_preview_text = ""
-        self._import_live.clear()
-
-    def _arm_import_view(self, path: Path, *, title: str = "") -> None:
-        self._failed_media_path = ""
-        self._media_cancel_pending = False
-        self._pending_media_import_path = str(path)
-        self._media_import_started = time.monotonic()
-        self._import_owns_detail = True
-        self._media_import_title = (title or path.stem).strip()
-        self._media_progress_text = "正在读取音频…"
-        self._clear_import_live()
-        self._sync_media_buttons()
-        self._show_import_detail()
-
-    def _on_media_started(self, path: str, title: str) -> None:
-        resolved_title = (title or (Path(path).stem if path else "")).strip()
-        self._failed_media_path = ""
-        self._media_cancel_pending = False
-        self._pending_media_import_path = str(path or "")
-        self._media_import_started = time.monotonic()
-        if resolved_title:
-            self._media_import_title = resolved_title
-        self._media_progress_text = "正在读取音频…"
-        self._clear_import_live()
-        if self._import_owns_detail or not self._detail_id:
-            self._show_import_detail()
-        else:
-            self._detail_pane.setVisible(True)
-            self._paint_import_banner()
-
-    def _apply_progress_widgets(self) -> None:
-        raw_text = getattr(self, "_media_progress_text", "") or "正在读取音频…"
-        explicit = re.findall(r"[（(]\s*(\d+)\s*%\s*[）)]", raw_text)
-        match = re.search(r"(\d+)\s*/\s*(\d+)", raw_text)
-        pct = None
-        if explicit:
-            pct = max(0, min(100, int(explicit[-1])))
-            display_text = raw_text
-            self._import_progress_bar.setRange(0, 100)
-            self._import_progress_bar.setValue(pct)
-        elif match and int(match.group(2)) > 0:
-            done, total = int(match.group(1)), int(match.group(2))
-            pct = max(0, min(100, int(round(done * 100.0 / total))))
-            display_text = raw_text if "%" in raw_text else f"{raw_text}（{pct}%）"
-            self._import_progress_bar.setRange(0, 100)
-            self._import_progress_bar.setValue(pct)
-        else:
-            pct_match = re.search(r"(\d+)\s*%", raw_text)
-            if pct_match:
-                pct = max(0, min(100, int(pct_match.group(1))))
-                self._import_progress_bar.setRange(0, 100)
-                self._import_progress_bar.setValue(pct)
-            else:
-                self._import_progress_bar.setRange(0, 0)
-            display_text = raw_text
-        remain = ""
-        if pct is not None and 5 <= pct <= 95 and self._media_import_started:
-            elapsed = time.monotonic() - self._media_import_started
-            if elapsed >= 3:
-                remain = _format_import_remain(elapsed * (100 - pct) / max(pct, 1))
-        if self._media_cancel_pending:
-            display_text = "正在停止，当前这段完成后保留已有文字"
-        elif "正在识别" in raw_text:
-            parts = ["正在识别"]
-            if pct is not None:
-                parts.append(f"{pct}%")
-            if remain:
-                parts.append(remain)
-            display_text = " · ".join(parts)
-        else:
-            parts = ["正在读取"]
-            if pct is not None:
-                parts.append(f"{pct}%")
-            if remain:
-                parts.append(remain)
-            display_text = " · ".join(parts)
-        self._import_progress.setVisible(True)
-        self._import_progress.setText(display_text)
-        self._import_progress_bar.setVisible(True)
-
-    def _show_import_detail(self) -> None:
-        """Recognition progress owns the detail until the user opens another meeting."""
-        self._import_owns_detail = True
-        self._set_single_detail_visible(False)
-        self._batch_tools.hide()
-        self._batch_notice_scroll.hide()
-        self._audio_missing.hide()
-        self._status_label.hide()
-        self._detail_pane.setVisible(True)
-        # Hidden, but not editable: a focus loss must not save the title as the import name.
-        self._detail_title.setReadOnly(True)
-        self._detail_title.hide()
-        self._detail_meta.setVisible(True)
-        self._detail_meta.setText(
-            "点左侧其他会议可以先看。识别会在后台继续（支持随时按快捷键语音输入）；开始新会议需等导入结束。"
-        )
-        self._list.blockSignals(True)
-        self._list.clearSelection()
-        self._list.setCurrentItem(None)
-        self._list.blockSignals(False)
-        self._apply_progress_widgets()
-        self._sync_media_buttons()
-
-    def _paint_import_banner(self) -> None:
-        self._apply_progress_widgets()
-        self._sync_media_buttons()
-
-    def _hide_import_chrome(self) -> None:
-        self._import_kicker.hide()
-        self._import_filename.hide()
-        self._import_progress.hide()
-        self._import_progress_bar.hide()
-        self._import_queue.hide()
-        self._import_live_caption.hide()
-        self._import_live.hide()
-        self._media_cancel_btn.hide()
-        self._start_block.hide()
-
-    def _cancel_media_import(self) -> None:
-        if self._media_cancel_pending:
-            return
-        queued = self._queued_media()
-        if queued:
-            action = self._confirm_cancel_queued_import(len(queued))
-            if not action:
-                return
-            self._media_cancel_pending = True
-            if action == "cancel_all":
-                cancel_all = getattr(self._ctrl, "cancel_all_media_imports", None)
-                if callable(cancel_all):
-                    cancel_all()
-                else:
-                    self._ctrl.cancel_media_import()
-                self._queue_signature = None
-            else:
-                skip_cur = getattr(self._ctrl, "skip_current_media_import", None)
-                if callable(skip_cur):
-                    skip_cur()
-                else:
-                    self._ctrl.cancel_media_import()
-            self._sync_media_buttons()
-            self._apply_progress_widgets()
-            return
-        if self._stop_needs_confirm() and not self._confirm_cancel_import():
-            return
-        self._media_cancel_pending = True
-        self._ctrl.cancel_media_import()
-        self._sync_media_buttons()
-        self._apply_progress_widgets()
-
-    def _stop_needs_confirm(self) -> bool:
-        if self._import_live.toPlainText().strip():
-            return True
-        bar = self._import_progress_bar
-        return bar.maximum() > 0 and bar.value() >= 50
-
-    def _confirm_cancel_import(self) -> bool:
-        box = QMessageBox(self)
-        box.setWindowTitle("停止识别")
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setText("要停止识别吗？")
-        box.setInformativeText("停在当前这段。下面已经出现的文字会留下，后面不再识别，也不能从这里接着做。")
-        stay = box.addButton("继续识别", QMessageBox.ButtonRole.RejectRole)
-        stop = box.addButton("停止并保留已识别的文字", QMessageBox.ButtonRole.DestructiveRole)
-        box.setDefaultButton(stay)
-        with _quiet_tooltips(self):
-            box.exec()
-        return box.clickedButton() is stop
-
-    def _confirm_cancel_queued_import(self, queued_count: int) -> str:
-        box = QMessageBox(self)
-        box.setWindowTitle("停止或跳过当前文件")
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setText(f"当前后面还有 {queued_count} 个文件在排队，要怎样处理？")
-        box.setInformativeText(
-            "可以选择仅跳过当前正在处理的文件并继续后续排队任务，或一次性全部停止并清空排队列表。"
-        )
-        stay = box.addButton("继续识别", QMessageBox.ButtonRole.RejectRole)
-        skip_one = box.addButton("仅跳过当前文件", QMessageBox.ButtonRole.ActionRole)
-        stop_all = box.addButton(
-            f"全部停止并清空排队（共 {queued_count} 个）",
-            QMessageBox.ButtonRole.DestructiveRole,
-        )
-        box.setDefaultButton(stay)
-        with _quiet_tooltips(self):
-            box.exec()
-        clicked = box.clickedButton()
-        if clicked is skip_one:
-            return "skip_current"
-        if clicked is stop_all:
-            return "cancel_all"
-        return ""
-
-    def _on_media_progress(self, text: str) -> None:
-        if not text:
-            return
-        title = str(getattr(self._ctrl, "_media_title", "") or "")
-        if title and title != getattr(self, "_media_import_title", ""):
-            self._media_import_started = time.monotonic()
-            self._clear_import_live()
-        if title:
-            self._media_import_title = title
-        self._media_progress_text = text
-        if not getattr(self._ctrl, "importing_media", False):
-            return
-        if self._import_owns_detail or not self._detail_id:
-            self._show_import_detail()
-        else:
-            self._detail_pane.setVisible(True)
-            self._paint_import_banner()
-
-    def _on_media_preview(self, text: str) -> None:
-        incoming = text or ""
-        prev = getattr(self, "_last_media_preview_text", "")
-        sb = self._import_live.verticalScrollBar()
-        at_bottom = (not prev) or (sb.maximum() <= 0) or (sb.value() >= max(0, sb.maximum() - 24))
-        saved_scroll = sb.value()
-        if incoming != prev:
-            if prev and incoming.startswith(prev):
-                delta = incoming[len(prev):]
-                cursor = QTextCursor(self._import_live.document())
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                cursor.insertText(delta)
-            else:
-                self._import_live.setPlainText(incoming)
-            self._last_media_preview_text = incoming
-            if at_bottom:
-                sb.setValue(sb.maximum())
-            else:
-                sb.setValue(saved_scroll)
-        visible = bool(incoming) and bool(getattr(self._ctrl, "importing_media", False))
-        self._import_live.setVisible(visible)
-        self._import_live_caption.setVisible(visible)
-
-    def _on_media_finished(self, meeting_id: str) -> None:
-        imported_path = str(
-            getattr(self._ctrl, "last_imported_audio_path", "")
-            or self._pending_media_import_path
-            or ""
-        )
-        was_watching = self._import_owns_detail
-        more_queued = bool(self._queued_media()) and not getattr(self._ctrl, "_unsaved_media", None)
-        self._pending_media_import_path = ""
-        if not self._failed_media_path or self._failed_media_path == imported_path:
-            self._failed_media_path = ""
-        self._media_cancel_pending = False
-        if meeting_id:
-            self._last_batch_saved_id = meeting_id
-            if imported_path:
-                self._meeting_audio_paths[meeting_id] = imported_path
-        if more_queued:
-            self._import_owns_detail = was_watching
-            self.refresh()
-            notice = getattr(self._ctrl, "media_import_notice", "") or ""
-            if notice:
-                self._set_status(notice, tone="error" if "失败" in notice else "info")
-            return
-        self._import_owns_detail = False
-        self._hide_import_chrome()
-        self._sync_media_buttons()
-        last_batch_id = getattr(self, "_last_batch_saved_id", "")
-        self._last_batch_saved_id = ""
-        if not meeting_id:
-            if was_watching and last_batch_id and self._store.get_meeting(last_batch_id) is not None:
-                self.show_meeting(last_batch_id)
-            else:
-                self._render_detail()
-                self._detail_pane.setVisible(bool(self._records) or self._editing_notes)
-            notice = getattr(self._ctrl, "media_import_notice", "") or "没有识别到文字"
-            self._set_status(notice, tone="error" if "失败" in notice else "info")
-            return
-        if was_watching:
-            self.show_meeting(meeting_id)
-        else:
-            self.refresh()
-        notice = getattr(self._ctrl, "media_import_notice", "") or ""
-        if notice:
-            self._set_status(notice, tone="error" if "失败" in notice else "info")
-            return
-        record = self._store.get_meeting(meeting_id)
-        if record is not None and record.status == STATUS_INTERRUPTED:
-            self._set_status("已停止识别。已识别的部分保留为已中断的会议。")
-        elif was_watching:
-            self._set_status(self._imported_status_message(meeting_id, "音视频"), tone="ok")
-        else:
-            self._set_status("识别完成，可在列表中打开。", tone="ok")
-
-    def _retry_media_save(self) -> None:
-        message = self._ctrl.retry_media_save()
-        self._sync_media_buttons()
-        if message:
-            self._set_status(message, tone="error")
-
-    def _retry_failed_media(self) -> None:
-        path = self._failed_media_path
-        if not path or not Path(path).is_file():
-            self._failed_media_path = ""
-            self._sync_media_buttons()
-            self._set_status("找不到刚才的文件，无法重新导入。", tone="error")
-            return
-        self._failed_media_path = ""
-        self._begin_media_paths([Path(path)])
-
-    def _on_media_failed(self, message: str) -> None:
-        failed = str(
-            getattr(self._ctrl, "last_failed_audio_path", "")
-            or self._pending_media_import_path
-            or getattr(self._ctrl, "_media_source_path", "")
-            or ""
-        )
-        self._failed_media_path = failed
-        self._pending_media_import_path = ""
-        self._media_cancel_pending = False
-        more_queued = bool(self._queued_media()) and not getattr(self._ctrl, "_unsaved_media", None)
-        if more_queued:
-            self._set_status(message or "导入音视频失败", tone="error")
-            return
-        was_watching = self._import_owns_detail
-        self._import_owns_detail = False
-        self._hide_import_chrome()
-        self._sync_media_buttons()
-        last_batch_id = getattr(self, "_last_batch_saved_id", "")
-        self._last_batch_saved_id = ""
-        if was_watching and last_batch_id and self._store.get_meeting(last_batch_id) is not None:
-            self.show_meeting(last_batch_id)
-        else:
-            self._render_detail()
-            self._detail_pane.setVisible(bool(self._records) or self._editing_notes)
-        self._set_status(message or "导入音视频失败", tone="error")
-
     def _show_ended_meeting(self, meeting_id: str, *, unsaved_live: bool = False) -> None:
         """Leave the live page once recording ends, even when a note save failed."""
         self._live_silence_timer.stop()
@@ -3680,75 +1960,17 @@ class MeetingPage(QWidget):
     register_meeting_audio = set_meeting_audio_path
 
     def _resolve_meeting_audio_path(self, record: MeetingRecord | None) -> str:
-        if record is None:
-            return ""
-        direct_candidates: list[str] = []
-        rec_audio = str(getattr(record, "audio_path", "") or "").strip()
-        if rec_audio:
-            direct_candidates.append(rec_audio)
-        mapped = self._meeting_audio_paths.get(record.id, "")
-        if mapped:
-            direct_candidates.append(mapped)
-        for cand in direct_candidates:
-            p = Path(cand)
-            if p.is_file() or (p.is_dir() and (p / "audio.f32").is_file()):
-                return str(p)
-        if record.source == IMPORT_SOURCE:
-            return ""
         no_audio = getattr(self, "_no_audio_meeting_ids", None)
         if no_audio is None:
             no_audio = set()
             self._no_audio_meeting_ids = no_audio
-        if record.status != STATUS_LIVE and record.id in no_audio:
-            return ""
-        candidates: list[str] = []
-        cfg_dir = getattr(self._config, "config_dir", None)
-        if cfg_dir is not None:
-            import os
-
-            base = Path(cfg_dir)
-            for rel in (
-                base / "meeting-audio" / f"{record.id}.wav",
-                base / "meetings" / f"{record.id}.wav",
-                base / "audio-recovery" / f"{record.id}.wav",
-            ):
-                candidates.append(str(rel))
-            for cand in candidates:
-                p = Path(cand)
-                if p.is_file() or (p.is_dir() and (p / "audio.f32").is_file()):
-                    return str(p)
-            rec_root = base / "audio-recovery"
-            if rec_root.is_dir():
-                try:
-                    sig = hash(
-                        tuple(
-                            sorted(
-                                (entry.name, entry.stat().st_mtime_ns)
-                                for entry in os.scandir(rec_root)
-                            )
-                        )
-                    )
-                    cached = self._recovery_audio_cache.get(record.id)
-                    if cached is not None and cached[0] == sig:
-                        rec_hit = cached[1]
-                    else:
-                        from sayink.audio_recovery import recordings
-
-                        rec_hit = ""
-                        for item in recordings(rec_root):
-                            if str(item.metadata.get("meeting_id") or "") == record.id:
-                                rec_hit = str(item.path)
-                                break
-                        self._recovery_audio_cache[record.id] = (sig, rec_hit)
-                    if rec_hit:
-                        p = Path(rec_hit)
-                        if p.is_file() or (p.is_dir() and (p / "audio.f32").is_file()):
-                            return str(p)
-                except Exception:
-                    pass
-        if record.status != STATUS_LIVE and not rec_audio:
-            no_audio.add(record.id)
-        return ""
+        return resolve_meeting_audio_path(
+            record,
+            meeting_audio_paths=self._meeting_audio_paths,
+            no_audio_ids=no_audio,
+            recovery_audio_cache=self._recovery_audio_cache,
+            config=self._config,
+        )
 
     def _clear_detail(self, *, clear_status: bool = True) -> None:
         if not self._flush_bound_title(sync=True) or not self._save_notes_draft() or not self._save_record_notes():
@@ -4104,7 +2326,7 @@ class MeetingPage(QWidget):
         self._return_notes_btn.setVisible(transcript and bool(self._citation_return and self._citation_return[0] == self._detail_id))
         if transcript:
             hint = ("点击发言旁的「更正」修改这一段的归属。" if self._correcting_speakers else
-                    "移到段落上或用 Tab 聚焦可编辑、查看详情；点击姓名可命名。"
+                    "移到段落上，或用方向键移到该段按 Enter 可编辑、查看详情；点击姓名可命名。"
                     if self._transcript_editable else
                     "正在生成，完成前不能修改文字稿。" if self._ctrl.generating_for == self._detail_id else
                     "有可编辑的段落后，可以把鼠标移到段落上修改。")
@@ -4147,10 +2369,15 @@ class MeetingPage(QWidget):
         if not has_notes:
             self._copy_btn.setToolTip(f"还没有{result_label}可复制")
         self._transcript_copy_btn.setEnabled(has_transcript)
-        # Same filled action as 历史's copy button. The large primary style is
-        # taller than the shared small-button box and made the two toolbars disagree.
-        self._copy_btn.setStyleSheet(ss.BTN_ACCENT_SM)
-        self._transcript_copy_btn.setStyleSheet(ss.BTN_ACCENT_SM)
+        # Same filled action as 历史's copy button. When disabled, keep a muted
+        # bordered pill instead of collapsing into floating plain text.
+        disabled_sm = self._disabled_btn_sm_override()
+        self._copy_btn.setStyleSheet(
+            ss.BTN_ACCENT_SM if has_notes else ss.BTN_ACCENT_SM + disabled_sm
+        )
+        self._transcript_copy_btn.setStyleSheet(
+            ss.BTN_ACCENT_SM if has_transcript else ss.BTN_ACCENT_SM + disabled_sm
+        )
         self._fit_template_cluster()
         self._export_actions["notes"].setEnabled(has_notes)
         self._export_actions["transcript"].setEnabled(has_transcript)
@@ -4270,31 +2497,12 @@ class MeetingPage(QWidget):
         if record is None or record.status == STATUS_LIVE:
             self._set_status("进行中的会议要结束后才能改时间。")
             return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("修改会议时间")
-        layout = QVBoxLayout(dialog)
-        hint = QLabel("列表按这个时间排序。修改后，每句话相对会议开始的时间不变。")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        edit = QDateTimeEdit(QDateTime.fromMSecsSinceEpoch(int(record.started_at)))
-        edit.setDisplayFormat("yyyy-MM-dd HH:mm")
-        edit.setCalendarPopup(True)
-        edit.setAccessibleName("会议时间")
-        layout.addWidget(edit)
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        cancel = QPushButton("取消")
-        save = QPushButton("保存")
-        cancel.clicked.connect(dialog.reject)
-        save.clicked.connect(dialog.accept)
-        buttons.addWidget(cancel)
-        buttons.addWidget(save)
-        layout.addLayout(buttons)
+        dialog = _MeetingTimeDialog(int(record.started_at), self)
         with _quiet_tooltips(self):
             accepted = dialog.exec() == QDialog.DialogCode.Accepted
         if not accepted:
             return
-        self._store.shift_meeting_start(record.id, int(edit.dateTime().toMSecsSinceEpoch()))
+        self._store.shift_meeting_start(record.id, dialog.started_ms)
         if not self._store.flush():
             self._set_status("会议时间没能保存。", tone="error")
             return
@@ -4714,8 +2922,11 @@ class MeetingPage(QWidget):
                 has_marks = bool(current_id and self._store.get_marks(current_id))
             except Exception:
                 has_marks = False
+        self._marks_view.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded if has_marks else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         if compact_h:
-            max_h = 68 if has_marks else 46
+            max_h = 68 if has_marks else 48
         else:
             max_h = 160 if has_marks else 88
         self._marks_view.setMinimumHeight(34 if compact_h else 36)
@@ -4797,137 +3008,6 @@ class MeetingPage(QWidget):
             event.accept()
             return
         super().keyPressEvent(event)
-
-    def _install_import_drop_targets(self) -> None:
-        candidates = (
-            self._list.viewport(),
-            self._search_edit,
-            self._browse_left,
-            self._empty_label,
-            self._splitter,
-            self._detail_pane,
-            self._notes_stack,
-            self._notes_view,
-            self._notes_view.viewport(),
-            self._notes_empty,
-            self._transcript_view,
-            self._transcript_view.viewport(),
-            self._import_live,
-            self._import_live.viewport(),
-        )
-        self._import_drop_widgets = tuple(w for w in candidates if w is not None)
-        for widget in self._import_drop_widgets:
-            widget.setAcceptDrops(True)
-            widget.installEventFilter(self)
-
-    def dragLeaveEvent(self, event) -> None:
-        self._drag_url_cache = None
-        super().dragLeaveEvent(event)
-
-    def dragEnterEvent(self, event) -> None:
-        if not self._handle_import_drag(event, dropping=False):
-            super().dragEnterEvent(event)
-
-    def dragMoveEvent(self, event) -> None:
-        if not self._handle_import_drag(event, dropping=False):
-            super().dragMoveEvent(event)
-
-    def dropEvent(self, event) -> None:
-        if not self._handle_import_drag(event, dropping=True):
-            super().dropEvent(event)
-
-    def _handle_import_drag(self, event, *, dropping: bool) -> bool:
-        mime = event.mimeData()
-        if mime is None or not mime.hasUrls():
-            return False
-        raw_urls = tuple(url.toString() for url in mime.urls())
-        cache = getattr(self, "_drag_url_cache", None)
-        refresh = dropping or event.type() == QEvent.Type.DragEnter or cache is None or cache[0] != raw_urls
-        if not refresh:
-            paths = list(cache[1])
-        else:
-            paths = []
-            for url in mime.urls():
-                if not url.isLocalFile():
-                    continue
-                path = Path(url.toLocalFile())
-                if path.is_file():
-                    paths.append(path)
-            self._drag_url_cache = None if dropping else (raw_urls, list(paths))
-        if not paths:
-            return False
-        event.acceptProposedAction()
-        if dropping:
-            self._accept_dropped_files(paths)
-        return True
-
-    def _accept_dropped_files(self, paths: list[Path]) -> None:
-        from sayink.audio_file_decoder import SUPPORTED_EXTENSIONS
-
-        text_suffixes = {".txt", ".md", ".srt", ".vtt", ".json"}
-        media = [path for path in paths if path.suffix.lower() in SUPPORTED_EXTENSIONS]
-        texts = [path for path in paths if path.suffix.lower() in text_suffixes]
-        if media:
-            ignored = len(paths) - len(media)
-            if self.isVisible():
-                accepted, error = self._confirm_and_begin_media_paths(media)
-                if not accepted:
-                    return
-            else:
-                error = self._begin_media_paths(media)
-            if error:
-                if ignored:
-                    self._set_status(f"{error} 已忽略 {ignored} 个不是音视频的文件。", tone="error")
-                return
-            if ignored:
-                self._set_status(f"已开始导入音视频，已忽略 {ignored} 个不是音视频的文件。")
-            return
-        if texts:
-            self._import_dropped_transcript(texts[0], ignored=max(0, len(paths) - 1))
-            return
-        self._set_status(
-            "不能导入这些文件。音视频请用支持的格式，文字稿用 .txt、.md、.srt、.vtt 或 .json。",
-            tone="error",
-        )
-
-    def _import_dropped_transcript(self, path: Path, *, ignored: int) -> None:
-        if self._ctrl.is_active:
-            self._set_status("会议进行中，请结束后再导入文字稿")
-            return
-        from sayink.ui.transcript_import_dialog import TranscriptImportDialog
-
-        dialog = TranscriptImportDialog(self)
-        # A file that fails to load still opens the dialog so the user can
-        # keep or replace the text. Accept must import that result; returning
-        # here used to discard an explicit 导入 click.
-        loaded = dialog._load_file_path(path)
-        if loaded and ignored:
-            dialog._extra_note = f"一次只能导入一个文件，已忽略其余 {ignored} 个。"
-            dialog._refresh()
-        with _quiet_tooltips(self):
-            accepted = dialog.exec() == QDialog.DialogCode.Accepted
-        if not accepted:
-            return
-        try:
-            record = self._ctrl.import_transcript(
-                dialog.transcript_text(),
-                title=dialog.meeting_title(),
-                detect_structure=dialog.detect_structure(),
-                started_at=dialog.meeting_started_ms(),
-                parsed=dialog.parsed(),
-            )
-        except TypeError:
-            record = self._ctrl.import_transcript(
-                dialog.transcript_text(),
-                title=dialog.meeting_title(),
-                detect_structure=dialog.detect_structure(),
-                started_at=dialog.meeting_started_ms(),
-            )
-        if record is None:
-            self._set_status(getattr(self._ctrl, "transcript_import_notice", "") or "没有可导入的文字", tone="error")
-            return
-        self.show_meeting(record.id)
-        self._set_status(self._imported_status_message(record.id, "文字稿"), tone="ok")
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop):
@@ -5547,628 +3627,6 @@ class MeetingPage(QWidget):
             self._prompt_segment_text(int(url.path()), meeting_id=meeting_id)
         elif url.scheme() == "live-details":
             self._prompt_segment_text(int(url.path()), details=True, meeting_id=meeting_id)
-
-    # ── start card ────────────────────────────────────────────────
-
-    def _on_save_audio_toggled(self, checked: bool) -> None:
-        self._config.set("meeting.save_audio", bool(checked))
-        if hasattr(self._config, "save"):
-            try:
-                self._config.save()
-            except Exception:
-                pass
-        self._update_card_notes()
-
-    def show_start_card(self) -> None:
-        if not self._flush_bound_title(sync=True) or not self._save_notes_draft() or not self._save_record_notes():
-            return
-        self._audio_player.stop()
-        if self._ctrl.is_active:
-            self._enter_live()
-            return
-        defaults = MeetingOptions.from_config(self._config)
-        self._opt_title.clear()
-        self._opt_participants.clear()
-        self._opt_agenda.clear()
-        self._opt_save_audio.blockSignals(True)
-        self._opt_save_audio.setChecked(bool(self._config.get("meeting.save_audio", True)))
-        self._opt_save_audio.blockSignals(False)
-        index = self._opt_source.findData(defaults.input_source)
-        self._opt_source.setCurrentIndex(max(0, index))
-        self._opt_model.blockSignals(True)
-        self._opt_model.clear()
-        self._opt_model.addItem(self._follow_model_label(), "")
-        for model in MODEL_REGISTRY:
-            if is_model_downloaded(model["id"]):
-                self._opt_model.addItem(model["name"], model["id"])
-        index = self._opt_model.findData(defaults.model_id)
-        self._opt_model.setCurrentIndex(max(0, index))
-        self._opt_model.blockSignals(False)
-        self._opt_model._sync_overflow_tooltip()
-        index = self._opt_language.findData(defaults.language)
-        self._opt_language.setCurrentIndex(max(0, index))
-        self._update_card_notes()
-        self._start_btn.setVisible(False)
-        self._stack.setCurrentIndex(PAGE_START)
-        self._sync_media_buttons()
-        self._opt_title.setFocus()
-        self._start_scroll.verticalScrollBar().setValue(0)
-
-    def _follow_model_label(self) -> str:
-        from sayink.speech_recognizer import get_model_info
-
-        info = get_model_info(self._config.get("stt.model_id", ""))
-        name = info["name"] if info else "未选择"
-        return f"与转写相同（当前：{name}）"
-
-    def _update_card_notes(self) -> None:
-        from sayink import audio_devices
-
-        options = self._options_from_card()
-        if options.input_source in ("mixed", "system"):
-            loopback_fn = getattr(audio_devices, "describe_active_loopback_device", None)
-            dev_desc = str(loopback_fn() or "").strip() if callable(loopback_fn) else ""
-            if dev_desc:
-                prefix = "" if ("回环" in dev_desc or "输出" in dev_desc) else "当前电脑声回环输出："
-                self._opt_loopback_hint.setText(f"{prefix}{dev_desc}")
-                self._opt_loopback_hint.show()
-            else:
-                self._opt_loopback_hint.clear()
-                self._opt_loopback_hint.hide()
-        else:
-            self._opt_loopback_hint.clear()
-            self._opt_loopback_hint.hide()
-        dictation = str(self._config.get("stt.model_id", DEFAULT_MODEL_ID) or DEFAULT_MODEL_ID)
-        caps = resolve_capabilities(self._config, options, dictation_model_id=dictation)
-        notes = list(caps.notes)
-        if self._store.disabled:
-            notes.insert(0, "历史数据库不可用：会议文字稿无法保存，现在无法开始会议。请重启应用或更换历史位置。")
-        if not minutes_settings_complete(self._config):
-            notes.append("尚未配置纪要模型（设置 → AI 服务）；会议结束后仍可先保存文字稿。")
-        self._card_start.setEnabled(not self._store.disabled)
-        self._card_notes.setText("\n".join(f"· {n}" for n in notes))
-        self._card_notes.setVisible(bool(notes))
-        self._sync_aux_buttons()
-
-    # ── aux models (speaker embedding / Silero VAD) ───────────────
-
-    def _sync_aux_buttons(self) -> None:
-        """Show 「下载辅助模型」 wherever a helper model is still missing."""
-        missing = missing_aux_models()
-        if self._aux_dl.running:
-            return
-        label = f"下载辅助模型（约 {aux_models_size_mb(missing)} MB）" if missing else ""
-        what = describe_aux_models(missing)
-        self._card_dl_btn.setToolTip(
-            f"{what}：下载后在会议开始时自动加载；实际状态可在 {ADVANCED_RECOGNITION_PATH} 查看"
-        )
-        self._live_dl_btn.setToolTip(f"{what}：本场会议已按当前方式进行，下载后从下一场开始生效")
-        for button in (self._card_dl_btn, self._live_dl_btn):
-            button.setText(label)
-            button.setEnabled(True)
-            button.setVisible(bool(missing))
-
-    def _download_aux_models(self) -> None:
-        if self._aux_dl.running:
-            return
-        if not self._aux_dl.start():
-            self._sync_aux_buttons()
-            return
-        for button in (self._card_dl_btn, self._live_dl_btn):
-            button.setEnabled(False)
-            button.setText("下载中 0%")
-
-    def cancel_downloads(self) -> None:
-        """Cancel any in-progress helper-model download on app exit."""
-        self._aux_dl.cancel()
-
-    @property
-    def running_workers(self):
-        return self._aux_dl.running_workers
-
-    def _on_aux_progress(self, pct: int) -> None:
-        for button in (self._card_dl_btn, self._live_dl_btn):
-            button.setText(f"下载中 {int(pct)}%")
-
-    def _on_aux_finished(self, ok: bool, message: str) -> None:
-        if ok or self._aux_dl.downloaded_any:
-            self.aux_models_changed.emit()
-        if ok:
-            if self._stack.currentIndex() == PAGE_START:
-                self._update_card_notes()
-                self._card_notes.setText(
-                    "· 辅助模型已下载，将在会议开始时自动加载。\n" + self._card_notes.text()
-                )
-                self._card_notes.show()
-            elif self._stack.currentIndex() == PAGE_LIVE:
-                self._live_caps.setText(f"{self._live_caps.text()} · 辅助模型已下载，下一场会议生效")
-        else:
-            if self._stack.currentIndex() == PAGE_START:
-                self._card_notes.setText(f"· {message}；可稍后重试，或在 引擎 页下载。")
-                self._card_notes.show()
-            elif self._stack.currentIndex() == PAGE_LIVE:
-                self._live_status.setText(f"{message}；可稍后重试，或在 引擎 页下载。")
-                self._live_status.show()
-        self._sync_aux_buttons()
-
-    def _options_from_card(self) -> MeetingOptions:
-        defaults = MeetingOptions.from_config(self._config)
-        return MeetingOptions(
-            title=self._opt_title.text().strip(),
-            participants=self._opt_participants.text().strip(),
-            agenda=self._opt_agenda.toPlainText().strip(),
-            input_source=str(self._opt_source.currentData() or defaults.input_source),
-            model_id=str(self._opt_model.currentData() or ""),
-            glossary=defaults.glossary,
-            vad=defaults.vad,
-            language=str(self._opt_language.currentData() or "auto"),
-            save_audio=bool(self._opt_save_audio.isChecked()),
-        )
-
-    def _leave_start_card(self) -> None:
-        self._start_btn.setVisible(True)
-        self._stack.setCurrentIndex(PAGE_BROWSE)
-        self._sync_media_buttons()
-
-    def _start_from_card(self) -> None:
-        options = self._options_from_card()
-        # These are session overrides. Only Settings changes saved defaults.
-        self.start_requested.emit(options)
-
-    # ── live view & dual-lane audio meters ────────────────────────
-
-    LIVE_REMOTE_SILENCE_THRESHOLD = 0.008
-    LIVE_REMOTE_SILENCE_SECONDS = 15.0
-    _DEFAULT_SYSTEM_SILENT_MSG = (
-        "电脑声（对方）已连续 15 秒无声音输入：线下会议可忽略。线上会议若正在使用蓝牙耳机"
-        "（Hands-Free 通信设备）或外接声卡，请检查 Windows 默认播放设备与会议软件扬声器输出是否一致。"
-    )
-
-    def _live_input_source(self) -> str:
-        record = self._ctrl.current
-        if record is not None and getattr(record, "source", ""):
-            return str(record.source)
-        return str(audio_source(self._config, meeting=True) or "mixed")
-
-    def _live_captures_mic_audio(self) -> bool:
-        return self._live_input_source() in ("mixed", "microphone")
-
-    def _live_captures_system_audio(self) -> bool:
-        return self._live_input_source() in ("mixed", "system")
-
-    def _sync_live_meter_lanes(self) -> None:
-        has_mic = self._live_captures_mic_audio()
-        has_sys = self._live_captures_system_audio()
-        self._live_mic_label.setText("麦克风" if has_mic else "麦克风（未启用）")
-        self._live_sys_label.setText("电脑声（对方）" if has_sys else "电脑声（未启用）")
-        self._live_mic_meter.set_active(has_mic)
-        self._live_sys_meter.set_active(has_sys)
-
-    def set_lane_levels(self, mic_level: float = 0.0, system_level: float = 0.0) -> None:
-        """Feed dual-lane real-time levels [0..1] from the active meeting audio pipeline."""
-        self._live_mic_meter.set_level(mic_level)
-        self._live_sys_meter.set_level(system_level)
-        try:
-            sys_val = float(system_level)
-        except (TypeError, ValueError):
-            sys_val = 0.0
-        if sys_val >= self.LIVE_REMOTE_SILENCE_THRESHOLD:
-            self._live_remote_active_ts = time.monotonic()
-            self._system_silent_dismissed = False
-            if self._system_silent_banner.isVisible():
-                self._system_silent_banner.hide()
-        else:
-            self._check_live_remote_silence()
-
-    def show_system_silent_warning(self, message: str = "") -> None:
-        """Show non-blocking yellow warning banner when remote computer audio stays silent."""
-        text = (message or "").strip() or self._DEFAULT_SYSTEM_SILENT_MSG
-        self._system_silent_label.setText(text)
-        self._system_silent_banner.show()
-
-    def clear_system_silent_warning(self) -> None:
-        self._system_silent_dismissed = False
-        self._live_remote_active_ts = time.monotonic()
-        self._system_silent_banner.hide()
-
-    def _dismiss_system_silent_warning(self) -> None:
-        self._system_silent_dismissed = True
-        self._system_silent_banner.hide()
-
-    def _check_live_remote_silence(self) -> None:
-        if (
-            self._stack.currentIndex() != PAGE_LIVE
-            or self._ctrl.state is not MeetingState.LIVE
-            or not self._live_captures_system_audio()
-        ):
-            return
-        if self._system_silent_dismissed:
-            return
-        if (time.monotonic() - self._live_remote_active_ts) >= self.LIVE_REMOTE_SILENCE_SECONDS:
-            if not self._system_silent_banner.isVisible():
-                self.show_system_silent_warning()
-
-    def _set_live_scroll(self, value: int) -> None:
-        view = self._live_transcript
-        bar = view.verticalScrollBar()
-        self._live_scroll_guard += 1
-        view._scroll_guard += 1
-        try:
-            bar.setValue(value)
-        finally:
-            view._scroll_guard -= 1
-            self._live_scroll_guard -= 1
-
-    def _should_follow_live(self, position: int, anchor: int) -> bool:
-        if not self._live_follow_bottom or position != anchor:
-            return False
-        return not bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
-
-    def _stick_live_bottom(self) -> None:
-        view = self._live_transcript
-        self._live_scroll_guard += 1
-        view._scroll_guard += 1
-        try:
-            cursor = view.textCursor()
-            if not cursor.hasSelection():
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                view.setTextCursor(cursor)
-            view.verticalScrollBar().setValue(view.verticalScrollBar().maximum())
-        finally:
-            view._scroll_guard -= 1
-            self._live_scroll_guard -= 1
-
-    def _on_live_range_changed(self, _minimum: int, maximum: int) -> None:
-        if not self._live_follow_bottom:
-            return
-        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
-            return
-        bar = self._live_transcript.verticalScrollBar()
-        if bar.value() >= maximum:
-            return
-        self._set_live_scroll(maximum)
-
-    def _on_live_scroll_changed(self, value: int) -> None:
-        if self._live_scroll_guard:
-            return
-        bar = self._live_transcript.verticalScrollBar()
-        if value >= max(0, bar.maximum() - 24):
-            self._live_follow_bottom = True
-            self._live_new_msg_btn.hide()
-        else:
-            self._live_follow_bottom = False
-
-    def _scroll_live_to_bottom(self) -> None:
-        self._live_follow_bottom = True
-        self._live_new_msg_btn.hide()
-        view = self._live_transcript
-        if hasattr(view, "flush_layout"):
-            view.flush_layout()
-        self._stick_live_bottom()
-
-    def _position_live_new_msg_btn(self) -> None:
-        if not hasattr(self, "_live_new_msg_btn") or not hasattr(self, "_live_transcript"):
-            return
-        vp = self._live_transcript.viewport()
-        self._live_new_msg_btn.adjustSize()
-        bw = max(136, self._live_new_msg_btn.sizeHint().width() + 16)
-        bh = max(28, self._live_new_msg_btn.sizeHint().height())
-        self._live_new_msg_btn.resize(bw, bh)
-        x = max(8, (vp.width() - bw) // 2)
-        y = max(8, vp.height() - bh - 10)
-        self._live_new_msg_btn.move(x, y)
-
-    def _enter_live(self) -> None:
-        record = self._ctrl.current
-        meeting_id = record.id if record is not None else ""
-        if self._drafts.enter_live_session(meeting_id):
-            self._live_transcript.clear()
-            self._live_find_edit.clear()
-            self._live_find_bar.hide()
-            self._live_correcting_speakers = False
-            self._live_follow_bottom = True
-            self._live_speaker_menu.clear()
-            self._live_speaker_feedback.clear()
-            self._live_speaker_feedback.hide()
-            self._live_feedback_timer.stop()
-            self._live_new_msg_btn.hide()
-            self._system_silent_dismissed = False
-            self._system_silent_banner.hide()
-        self._live_remote_active_ts = time.monotonic()
-        self._sync_live_meter_lanes()
-        self._live_mic_meter.set_level(0.0)
-        self._live_sys_meter.set_level(0.0)
-        self._live_title.setText(record.display_title if record is not None else "会议进行中")
-        self._live_clock.setText(self._ctrl.elapsed_text())
-        caps = self._ctrl.capabilities
-        if caps is not None:
-            vad_label = "Silero VAD 已加载" if caps.vad == "silero" else "能量断句"
-            if caps.vad_error:
-                vad_label += "（Silero 加载失败，已回退）"
-            elif caps.vad_requested == "silero" and caps.vad == "energy":
-                vad_label += "（Silero 未下载）"
-            bits = [f"模型 {caps.model_id}", vad_label]
-            bits.append("说话人模型" if caps.speaker_model_available else "说话人（粗略）")
-            if caps.speaker_model_available:
-                bits.append("会内换人检测（实验性）；短促插话可能仍需确认")
-            if caps.hotwords and caps.hotwords_supported:
-                bits.append("热词已启用")
-            self._live_caps.setToolTip(" · ".join(bits))
-            self._live_caps.setText("说话人区分已增强" if caps.speaker_model_available else "说话人区分较粗略")
-        self._sync_aux_buttons()
-        self._user_notes.blockSignals(True)
-        self._user_notes.setPlainText(record.notes_user if record is not None else "")
-        self._user_notes.blockSignals(False)
-        self._mark_note.clear()
-        self._start_btn.setVisible(False)
-        self._stack.setCurrentIndex(PAGE_LIVE)
-        self._sync_media_buttons()
-        self._sync_live_state()
-        self._sync_responsive_layout()
-        self._render_live()
-
-    def _sync_live_state(self) -> None:
-        state = self._ctrl.state
-        self._sync_live_meter_lanes()
-        if state is MeetingState.PAUSED:
-            self._live_silence_timer.stop()
-            self._live_remote_active_ts = time.monotonic()
-            self._live_status.setText(f"采集已暂停：{self._ctrl.paused_detail or '等待继续'}")
-            self._live_status.show()
-            self._resume_btn.show()
-            self._pause_btn.hide()
-            self._end_btn.setEnabled(True)
-            self._mark_btn.setEnabled(False)
-            self._paint_live_clock()
-        elif state is MeetingState.DRAINING:
-            self._live_silence_timer.stop()
-            self._live_status.setText("正在整理文字稿，请稍候…")
-            self._live_status.show()
-            self._resume_btn.hide()
-            self._pause_btn.hide()
-            self._end_btn.setEnabled(False)
-            self._mark_btn.setEnabled(False)
-            self._paint_live_clock()
-        else:
-            self._live_remote_active_ts = time.monotonic()
-            if self._live_captures_system_audio():
-                self._live_silence_timer.start()
-            else:
-                self._live_silence_timer.stop()
-            self._live_status.hide()
-            self._resume_btn.hide()
-            self._pause_btn.show()
-            self._end_btn.setEnabled(True)
-            self._mark_btn.setEnabled(True)
-            self._paint_live_clock()
-
-    def _paint_live_clock(self) -> None:
-        from sayink.ui import design_tokens as tok
-
-        paused = self._ctrl.state is MeetingState.PAUSED
-        color = tok.TEXT_DIM if paused else tok.STATE_RECORD
-        self._live_clock.setStyleSheet(
-            f"font-size: {tok.TYPE_TITLE_LG}px; font-weight: 700; color: {color}; background: transparent;"
-        )
-        self._live_rec_dot.setStyleSheet(
-            f"background: {color}; border-radius: 4px;"
-        )
-        self._live_rec_dot.setAccessibleName("采集已暂停" if paused else "正在记录")
-
-    def _on_state_changed(self, state: MeetingState) -> None:
-        unsaved_live = False
-        if state in (MeetingState.DRAINING, MeetingState.ENDED):
-            self._live_silence_timer.stop()
-            # current_id is still this meeting. The debounce timer must not
-            # fire later, after the controller has cleared it.
-            if not self.flush_pending_user_notes():
-                unsaved_live = True
-                self._keep_unsaved_live_notes()
-        if state is MeetingState.LIVE and self._stack.currentIndex() != PAGE_LIVE:
-            self._enter_live()
-        elif state in (MeetingState.PAUSED, MeetingState.DRAINING, MeetingState.LIVE):
-            self._sync_live_state()
-            self._render_live()
-        elif state is MeetingState.ENDED:
-            self._show_ended_meeting(self._ctrl.current_id, unsaved_live=unsaved_live)
-
-    def _on_meeting_changed(self, meeting_id: str) -> None:
-        self._pending_refresh_id = meeting_id
-        self._refresh_timer.start()
-
-    def _refresh_now(self) -> None:
-        if self._stack.currentIndex() == PAGE_LIVE and self._ctrl.is_active:
-            self._render_live()
-            return
-        if self._pending_refresh_id == self._detail_id or self._pending_refresh_id not in self._records:
-            self.refresh()
-        else:
-            self._render_detail()
-
-    def _render_live(self) -> None:
-        meeting_id = self._ctrl.current_id
-        if not meeting_id:
-            return
-        record = self._ctrl.current
-        started_at = record.started_at if record is not None else 0
-        segments = self._store.get_segments(meeting_id)
-        names = self._ctrl.speaker_names(meeting_id)
-        prev_seg_count = self._drafts.live_segment_count
-        self._live_transcript_sequences = [s.seq for s in segments if (s.corrected_text or s.polished_text or s.raw_text).strip()]
-        cur_seg_count = len(self._live_transcript_sequences)
-        self._live_locked_sequences = {s.seq for s in segments if s.speaker_locked}
-        editable = bool(self._live_transcript_sequences) and self._ctrl.state in (MeetingState.LIVE, MeetingState.PAUSED)
-        self._live_speaker_btn.setEnabled(editable)
-        self._live_correct_speaker_btn.setEnabled(editable)
-        self._live_correcting_speakers = self._live_correcting_speakers and editable
-        self._live_correct_speaker_btn.blockSignals(True)
-        self._live_correct_speaker_btn.setChecked(self._live_correcting_speakers)
-        self._live_correct_speaker_btn.blockSignals(False)
-        self._live_correct_speaker_btn.setText("完成纠正" if self._live_correcting_speakers else "纠正发言人")
-        self._live_speaker_hint.setText(
-            "点击目标段落旁的「更正」修改归属，人工更正会保留。" if self._live_correcting_speakers else
-            "移到已出现的段落上可改文字；点击姓名可命名。还在识别的这一句要等落段后才能改。"
-        )
-        bar = self._live_transcript.verticalScrollBar()
-        cursor = self._live_transcript.textCursor()
-        position, anchor = cursor.position(), cursor.anchor()
-        scroll = bar.value()
-        follow = self._should_follow_live(position, anchor)
-        rendered = self._transcript_html(transcript_lines(segments, started_at), names, links=True, live=True)
-        self._live_scroll_guard += 1
-        try:
-            if rendered != self._drafts.live_html:
-                previous = self._drafts.live_html
-                if previous and rendered.startswith(previous):
-                    self._drafts.live_html = rendered
-                    # Normal live transcription only adds paragraphs. Keep the
-                    # existing document instead of parsing and laying it out again.
-                    tail = QTextCursor(self._live_transcript.document())
-                    tail.movePosition(QTextCursor.MoveOperation.End)
-                    tail.insertBlock()
-                    tail.insertHtml(rendered[len(previous):])
-                    if follow:
-                        self._stick_live_bottom()
-                    else:
-                        cursor = self._live_transcript.textCursor()
-                        last = self._live_transcript.document().characterCount() - 1
-                        anchor = self._live_transcript.position_before_action(min(anchor, last))
-                        position = self._live_transcript.position_before_action(min(position, last))
-                        cursor.setPosition(anchor)
-                        cursor.setPosition(position, QTextCursor.MoveMode.KeepAnchor)
-                        self._live_transcript.setTextCursor(cursor)
-                        bar.setValue(scroll)
-                elif previous and self._live_transcript.retarget_speaker_labels(previous, rendered):
-                    self._drafts.live_html = rendered
-                    if follow:
-                        self._stick_live_bottom()
-                elif previous and self._live_transcript.retarget_action_links(previous, rendered):
-                    self._drafts.live_html = rendered
-                    if follow:
-                        self._stick_live_bottom()
-                elif previous and self._live_transcript.retarget_paragraphs(previous, rendered, polish_line_height=False):
-                    self._drafts.live_html = rendered
-                    if follow:
-                        self._stick_live_bottom()
-                    else:
-                        bar.setValue(scroll)
-                else:
-                    # Paragraphs were split or merged. Rebuild, then keep the
-                    # scroll target until the later layout batches finish.
-                    self._drafts.live_html = rendered
-                    self._live_transcript.setHtml(rendered)
-                    if follow:
-                        self._live_transcript.pin_scroll(follow_bottom=True)
-                        self._stick_live_bottom()
-                    else:
-                        self._live_transcript.pin_scroll(scroll)
-                if self._live_find_bar.isVisible() and self._live_find_edit.text().strip():
-                    idx, total = find_in_reading_view(
-                        self._live_transcript, self._live_find_edit.text(), step=False
-                    )
-                    self._live_find_status.setText("未找到" if total == 0 else f"{idx} / {total}")
-        finally:
-            self._live_scroll_guard -= 1
-        self._drafts.live_segment_count = cur_seg_count
-        if self._live_follow_bottom:
-            self._live_new_msg_btn.hide()
-        elif cur_seg_count > prev_seg_count:
-            self._position_live_new_msg_btn()
-            self._live_new_msg_btn.show()
-            self._live_new_msg_btn.raise_()
-        marks = self._store.get_marks(meeting_id)
-        self._sync_live_marks_height(has_marks=bool(marks))
-        if marks:
-            marks_html = "".join(
-                f"<p style='margin:0 0 4px 0'>[{format_timestamp(m.offset_ms)}] {html.escape(m.note) or '标记'}</p>"
-                for m in marks
-            )
-        else:
-            marks_html = (
-                "<p style='margin:0 0 6px 0'>重要时刻按一下「标记此刻」。</p>"
-                "<p style='margin:0'>纪要会优先覆盖这些点。</p>"
-            )
-        if marks_html != self._drafts.live_marks_html:
-            self._drafts.live_marks_html = marks_html
-            self._marks_view.setHtml(marks_html)
-
-    def _add_mark(self) -> None:
-        if self._ctrl.state is MeetingState.PAUSED:
-            return
-        offset = self._ctrl.add_mark(self._mark_note.text())
-        if offset is not None:
-            self._mark_note.clear()
-            self._render_live()
-
-    def flush_pending_user_notes(self) -> bool:
-        """Write the live note and read it back. False leaves the typed text."""
-        if hasattr(self, "_user_notes_timer"):
-            self._user_notes_timer.stop()
-        meeting_id = getattr(self._ctrl, "current_id", None)
-        if not meeting_id or not hasattr(self, "_user_notes"):
-            return True
-        text = self._user_notes.toPlainText()
-        store = getattr(self, "_store", None)
-        if store is None:
-            self._save_user_notes()
-            return True
-        if self._drafts.flush_live_user_notes(store, meeting_id, text, self._ctrl.update_meeting):
-            return True
-        self._set_status("笔记尚未保存，输入已保留。")
-        return False
-
-    def _keep_unsaved_live_notes(self) -> None:
-        """Hold the live note in the post-meeting editor when the write failed."""
-        meeting_id = getattr(self._ctrl, "current_id", None) or self._drafts.record_notes_meeting_id
-        if not meeting_id or not hasattr(self, "_user_notes"):
-            return
-        text = self._user_notes.toPlainText()
-        if (
-            self._drafts.record_notes_meeting_id
-            and self._drafts.record_notes_meeting_id != meeting_id
-            and self._has_unsaved_record_notes()
-            and not self._save_record_notes()
-        ):
-            self._drafts.stash_live_note_for_other_meeting(
-                getattr(self, "_store", None), meeting_id, text
-            )
-            self._set_status("笔记尚未保存，输入已保留。")
-            return
-        self._drafts.adopt_live_note(meeting_id)
-        self._record_notes.blockSignals(True)
-        self._record_notes.setPlainText(text)
-        self._record_notes.blockSignals(False)
-        if hasattr(self, "_record_notes_timer"):
-            self._record_notes_timer.start()
-        self._set_status("笔记尚未保存，输入已保留。")
-
-    def _save_user_notes(self) -> None:
-        meeting_id = self._ctrl.current_id
-        if not meeting_id:
-            return
-        text = self._user_notes.toPlainText()
-        record = self._ctrl.current
-        if record is not None and record.notes_user == text:
-            return
-        self._ctrl.update_meeting(meeting_id, notes_user=text)
-
-    def _confirm_end(self) -> None:
-        self._user_notes_timer.stop()
-        self._save_user_notes()
-        box = QMessageBox(self)
-        box.setWindowTitle("结束会议")
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setText("结束这场会议？")
-        box.setInformativeText("会先把剩余语音识别完，然后可以生成纪要。")
-        end = box.addButton("结束会议", QMessageBox.ButtonRole.AcceptRole)
-        back = box.addButton("继续记录", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(end)
-        box.setEscapeButton(back)
-        _style_dialog_box(box, danger_btn=end)
-        with _quiet_tooltips(self):
-            box.exec()
-        if box.clickedButton() == end:
-            self.end_requested.emit()
 
 
 __all__ = ["MeetingPage", "PAGE_BROWSE", "PAGE_LIVE", "PAGE_START"]

@@ -181,10 +181,10 @@ def test_light_mode_search_highlight_and_level_meter_never_render_black(qapp, me
     passive_bg = selections[1].format.background().color()
     assert active_bg.isValid()
     assert passive_bg.isValid()
-    assert (active_bg.red(), active_bg.green(), active_bg.blue()) == (37, 99, 235)
-    assert active_bg.alpha() == 20
+    assert active_bg.name().lower() == "#93c5fd"
+    assert active_bg.alpha() == 255
     assert active_bg.name().lower() != "#000000"
-    assert passive_bg.name().lower() == "#fffbeb"
+    assert passive_bg.name().lower() == "#fde68a"
 
     # Paint _LevelMeterBar onto a white canvas in light mode and verify no black #000000 track pixels.
     meter = _LevelMeterBar("测试电平")

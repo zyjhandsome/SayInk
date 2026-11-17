@@ -843,14 +843,15 @@ def test_keyboard_can_reveal_and_activate_paragraph_edit(meeting, monkeypatch):
     page._switch_tab(1)
     QApplication.processEvents()
     view = page._transcript_view
+    assert view.tabChangesFocus() is True
     opened = []
     monkeypatch.setattr(page, "_prompt_segment_text", opened.append)
     view.setFocus(Qt.FocusReason.TabFocusReason)
     for _ in range(10):
-        QTest.keyClick(view, Qt.Key.Key_Tab)
-        if view.textCursor().charFormat().anchorHref() == "edit-segment:7":
+        if view._primary_block_action_href(view.textCursor().block()) == "edit-segment:7":
             break
-    assert view.textCursor().charFormat().anchorHref() == "edit-segment:7"
+        QTest.keyClick(view, Qt.Key.Key_Down)
+    assert view._primary_block_action_href(view.textCursor().block()) == "edit-segment:7"
     assert _transcript_link(view, "edit-segment:7").charFormat().foreground().color().alpha() == 255
     QTest.keyClick(view, Qt.Key.Key_Return)
     assert opened == [7]
@@ -1468,8 +1469,8 @@ def test_live_controls_put_pause_and_end_ahead_of_marking(meeting):
     page.resize(910, 472)
     page.show()
     QApplication.processEvents()
-    assert page._pause_btn.styleSheet() == ss.BTN_ACCENT_SM
-    assert page._mark_btn.styleSheet() == ss.BTN_GHOST_SM
+    assert page._pause_btn.styleSheet() == ss.BTN_GHOST_SM
+    assert page._mark_btn.styleSheet() == ss.BTN_ACCENT_SM
     assert page._end_btn.styleSheet() == ss.BTN_DANGER_SOLID_SM
     assert tok.STATE_RECORD in page._live_clock.styleSheet()
     assert page._pause_btn.mapTo(page, QPoint(0, 0)).y() < page._mark_btn.mapTo(page, QPoint(0, 0)).y()

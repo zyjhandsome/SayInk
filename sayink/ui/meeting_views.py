@@ -7,8 +7,9 @@ from pathlib import Path
 import re
 import time
 
-from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
+    QColor,
     QFont,
     QKeySequence,
     QTextBlockFormat,
@@ -19,23 +20,16 @@ from PyQt6.QtGui import (
     QTextFormat,
 )
 from PyQt6.QtWidgets import (
-    QApplication,
-    QComboBox,
-    QDialog,
-    QHBoxLayout,
-    QLabel,
-    QPlainTextEdit,
-    QPushButton,
     QStackedWidget,
     QTextBrowser,
     QTextEdit,
-    QVBoxLayout,
 )
 
 from sayink.meeting_store import STATUS_ENDED, STATUS_INTERRUPTED, STATUS_LIVE, MeetingRecord
 from sayink.minutes_prompts import format_timestamp
 from sayink.media_import import MEDIA_SOURCE
 from sayink.transcript_import import IMPORT_SOURCE
+from sayink.ui.meeting_dialogs import _SegmentSpeakerDialog, _SegmentTextDialog
 from sayink.ui.reading import fit_reading_width
 
 _STATUS_TEXT = {STATUS_LIVE: "进行中", STATUS_INTERRUPTED: "已中断", STATUS_ENDED: "已结束"}
@@ -306,6 +300,19 @@ def build_transcript_html(
     return "".join(parts)
 
 
+class _CompactTextBrowser(QTextBrowser):
+    """QTextBrowser whose Tab key moves widget focus instead of cycling inline anchors."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTabChangesFocus(True)
+
+    def focusNextPrevChild(self, next: bool) -> bool:
+        if self.tabChangesFocus():
+            return QTextEdit.focusNextPrevChild(self, next)
+        return super().focusNextPrevChild(next)
+
+
 class _ReadingView(QTextBrowser):
     """QTextBrowser tuned for long CJK text: looser leading, a heading scale
     below the page title, and text that wraps to the current detail width."""
@@ -314,6 +321,10 @@ class _ReadingView(QTextBrowser):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setTabChangesFocus(True)
+        self.setTextInteractionFlags(
+            self.textInteractionFlags() | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
         self._reading_key = None
         self._reading_anchor = 0
         self._defer_layout = False
@@ -322,6 +333,11 @@ class _ReadingView(QTextBrowser):
         self._reading_timer = QTimer(self)
         self._reading_timer.setSingleShot(True)
         self._reading_timer.timeout.connect(self._restore_reading_position)
+
+    def focusNextPrevChild(self, next: bool) -> bool:
+        if self.tabChangesFocus():
+            return QTextEdit.focusNextPrevChild(self, next)
+        return super().focusNextPrevChild(next)
 
     def restore_reading_position(self, value: int) -> None:
         self._reading_anchor = value
@@ -1054,13 +1070,50 @@ class _TranscriptView(_ReadingView):
         super().focusOutEvent(event)
 
     def focusNextPrevChild(self, next: bool) -> bool:
+        if self.tabChangesFocus():
+            return super().focusNextPrevChild(next)
         self._keyboard_actions = True
         handled = super().focusNextPrevChild(next)
         self._reveal_cursor_actions()
         return handled
 
+    def _primary_block_action_href(self, block) -> str:
+        if block is None or not block.isValid():
+            return ""
+        anchors: list[str] = []
+        it = block.begin()
+        while not it.atEnd():
+            fragment = it.fragment()
+            if fragment.isValid():
+                href = fragment.charFormat().anchorHref()
+                if href:
+                    anchors.append(href)
+            it += 1
+        for prefixes in (
+            ("segment:", "live-segment:"),
+            ("edit-segment:", "live-edit:"),
+            ("edited-segment:", "details-segment:", "live-details:"),
+            ("speaker:", "live-speaker:"),
+        ):
+            for href in anchors:
+                if href.startswith(prefixes):
+                    return href
+        return ""
+
     def keyPressEvent(self, event) -> None:
         self._keyboard_actions = True
+        if (
+            event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and event.modifiers() in (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.KeypadModifier)
+            and not self.textCursor().hasSelection()
+        ):
+            href = self.textCursor().charFormat().anchorHref() or self._primary_block_action_href(
+                self.textCursor().block()
+            )
+            if href:
+                self.anchorClicked.emit(QUrl(href))
+                event.accept()
+                return
         super().keyPressEvent(event)
         self._reveal_cursor_actions()
 
@@ -1125,8 +1178,6 @@ def find_in_reading_view(
 
     Returns ``(active_1based_index, total_matches)`` and highlights all matches.
     """
-    from sayink.ui import design_tokens as tok
-
     if view is None:
         return 0, 0
     needle = (query or "").strip()
@@ -1207,9 +1258,7 @@ def find_in_reading_view(
                 break
 
     extra: list[QTextEdit.ExtraSelection] = []
-    passive_bg = tok.qcolor_from_token(tok.AMBER_SOFT)
-    active_bg = tok.qcolor_from_token(tok.ACCENT_SOFT)
-    text_fg = tok.qcolor_from_token(tok.TEXT)
+    active_bg, passive_bg, text_fg = search_highlight_colors()
     for i, (m_start, m_end) in enumerate(matches):
         sel = QTextEdit.ExtraSelection()
         c = QTextCursor(doc)
@@ -1231,226 +1280,15 @@ def find_in_reading_view(
     return chosen_idx + 1, len(matches)
 
 
-class _SegmentSpeakerDialog(QDialog):
-    def __init__(self, segment, choices: list[tuple[int | None, str]], parent=None, *, save_speaker=None, live=False):
-        super().__init__(parent)
-        self._save_speaker = save_speaker
-        from sayink.ui import design_tokens as tok
-        from sayink.ui import settings_styles as ss
+def search_highlight_colors() -> tuple[QColor, QColor, QColor]:
+    """Return ``(active_bg, passive_bg, text_fg)`` with strong contrast in Light & Dark."""
+    from sayink.ui import design_tokens as tok
 
-        self.setWindowTitle("修改本段说话人")
-        self.setObjectName("meetingSpeakerCorrection")
-        self.setFixedWidth(420)
-        self.setStyleSheet(ss.WINDOW_CSS + f"""
-            QDialog#meetingSpeakerCorrection {{ background: {tok.SURFACE}; color: {tok.TEXT}; }}
-            QLabel {{ background: transparent; color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; }}
-        """)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 16, 20, 16)
-        lay.setSpacing(12)
-        preview = QLabel((segment.corrected_text or segment.polished_text or segment.raw_text)[:220])
-        preview.setTextFormat(Qt.TextFormat.PlainText)
-        preview.setWordWrap(True)
-        lay.addWidget(preview)
-        self.speaker_combo = QComboBox()
-        self.speaker_combo.setAccessibleName("这一段的发言人")
-        self.speaker_combo.setPlaceholderText("请选择这一段的发言人")
-        for speaker_id, label in choices:
-            self.speaker_combo.addItem(label, speaker_id)
-        self.speaker_combo.setCurrentIndex(self.speaker_combo.findData(segment.speaker_id))
-        lay.addWidget(self.speaker_combo)
-        hint = QLabel(
-            "更正这一段，人工更正会保留。清晰的声音会帮助判断后续发言；其他已有段落保持原归属。" if live else
-            "仅更改这一段的归属。现有纪要中的发言人需要核对，或重新生成纪要。"
-        )
-        hint.setWordWrap(True)
-        lay.addWidget(hint)
-        self.error = QLabel()
-        self.error.setWordWrap(True)
-        self.error.setStyleSheet(f"color: {tok.RED}; font-weight: 700; background: transparent;")
-        self.error.hide()
-        lay.addWidget(self.error)
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        cancel = QPushButton("取消")
-        cancel.setStyleSheet(ss.BTN_GHOST_SM)
-        cancel.clicked.connect(self.reject)
-        self.save_btn = QPushButton("应用更正")
-        self.save_btn.setStyleSheet(ss.BTN_PRIMARY)
-        self.save_btn.clicked.connect(self._save)
-        buttons.addWidget(cancel)
-        buttons.addWidget(self.save_btn)
-        lay.addLayout(buttons)
-
-    @property
-    def speaker_id(self) -> int | None:
-        value = self.speaker_combo.currentData()
-        return int(value) if value is not None else None
-
-    def _save(self) -> None:
-        if self.speaker_combo.currentIndex() < 0:
-            self.error.setText("请先选择这一段的发言人。")
-            self.error.show()
-            return
-        if self._save_speaker is not None and not self._save_speaker(self.speaker_id):
-            self.error.setText("更正尚未保存，选择已保留。请重试；会议已结束或正在整理时，请关闭后重新选择。")
-            self.error.show()
-            return
-        self.accept()
-
-
-class _SegmentTextDialog(QDialog):
-    """Keep a segment draft open until its write has been verified."""
-
-    def __init__(
-        self,
-        segment,
-        *,
-        position: str,
-        speaker: str,
-        save_text,
-        parent=None,
-        details: str = "",
-        read_only: bool = False,
-    ):
-        super().__init__(parent)
-        from sayink.ui import design_tokens as tok
-        from sayink.ui import settings_styles as ss
-
-        self._save_text = save_text
-        self._original = (segment.polished_text or segment.raw_text).strip()
-        self._initial = (segment.corrected_text or self._original).strip()
-        self._read_only = read_only
-        self.setWindowTitle("修改详情" if details else "编辑本段文字稿")
-        self.setObjectName("meetingTextCorrection")
-        self.setStyleSheet(ss.WINDOW_CSS + f"""
-            QDialog#meetingTextCorrection {{ background: {tok.SURFACE}; color: {tok.TEXT}; }}
-            QLabel {{ background: transparent; color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; }}
-            QPlainTextEdit {{ background: {tok.SURFACE_PEARL}; color: {tok.TEXT};
-                border: 1px solid {tok.HAIRLINE}; border-radius: {tok.RADIUS_MD}px;
-                padding: 8px; font-size: {tok.READING_FONT_PX}px;
-                selection-background-color: {tok.ACCENT_SOFT}; selection-color: {tok.TEXT}; }}
-        """)
-        self.setMinimumSize(320, 300)
-        screen = self.screen() or QApplication.primaryScreen()
-        if screen is not None:
-            available = screen.availableGeometry()
-            self.resize(
-                min(600, max(320, available.width() - 48)),
-                min(500, max(300, available.height() - 64)),
-            )
-        else:
-            self.resize(600, 500)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 16, 20, 16)
-        lay.setSpacing(12)
-        context = QLabel(f"[{position}]  {speaker}" if position else speaker)
-        context.setTextFormat(Qt.TextFormat.PlainText)
-        context.setWordWrap(True)
-        lay.addWidget(context)
-        if details:
-            self.details_label = QLabel(details)
-            self.details_label.setTextFormat(Qt.TextFormat.PlainText)
-            self.details_label.setWordWrap(True)
-            lay.addWidget(self.details_label)
-        hint = QLabel(
-            "当前只能查看。生成或收尾结束后可以再改这一段。" if read_only else
-            "仅修改这一段。保存后用于纪要、原文精整、复制和导出，时间与发言人保持不变。"
-        )
-        hint.setWordWrap(True)
-        lay.addWidget(hint)
-        self.editor = QPlainTextEdit()
-        self.editor.setAccessibleName("本段文字稿内容")
-        self.editor.setPlainText(self._initial)
-        self.editor.setReadOnly(read_only)
-        lay.addWidget(self.editor, 1)
-        self.original_view = QPlainTextEdit()
-        self.original_view.setAccessibleName("修改前的原文")
-        self.original_view.setReadOnly(True)
-        self.original_view.setPlainText(self._original)
-        self.original_view.setMaximumHeight(110)
-        self.original_view.hide()
-        lay.addWidget(self.original_view)
-        self.error = QLabel()
-        self.error.setWordWrap(True)
-        self.error.setAccessibleName("文字稿保存状态")
-        self.error.setStyleSheet(f"color: {tok.RED}; font-weight: 700; background: transparent;")
-        self.error.hide()
-        lay.addWidget(self.error)
-        buttons = QHBoxLayout()
-        self.original_btn = QPushButton("查看原文")
-        self.original_btn.setCheckable(True)
-        self.original_btn.setStyleSheet(ss.BTN_GHOST_SM)
-        self.original_btn.toggled.connect(self.original_view.setVisible)
-        self.original_btn.toggled.connect(lambda shown: self.original_btn.setText("收起原文" if shown else "查看原文"))
-        buttons.addWidget(self.original_btn)
-        self.restore_btn = QPushButton("恢复原文")
-        self.restore_btn.setStyleSheet(ss.BTN_GHOST_SM)
-        self.restore_btn.setToolTip("将本段恢复为修改前的文字，点击「保存修改」后生效")
-        self.restore_btn.clicked.connect(self._restore_original)
-        buttons.addWidget(self.restore_btn)
-        buttons.addStretch(1)
-        lay.insertLayout(lay.indexOf(self.original_view), buttons)
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        cancel = QPushButton("取消")
-        if read_only:
-            cancel.setText("关闭")
-        cancel.setStyleSheet(ss.BTN_GHOST_SM)
-        cancel.clicked.connect(self.reject)
-        buttons.addWidget(cancel)
-        self.save_btn = QPushButton("保存修改")
-        self.save_btn.setStyleSheet(ss.BTN_PRIMARY)
-        self.save_btn.clicked.connect(self._save)
-        self.save_btn.setDefault(True)
-        buttons.addWidget(self.save_btn)
-        lay.addLayout(buttons)
-        self.editor.textChanged.connect(self._sync_actions)
-        self._sync_actions()
-        self.restore_btn.setVisible(not read_only)
-        self.save_btn.setVisible(not read_only)
-        if details and segment.corrected_text:
-            self.original_btn.setChecked(True)
-        self.editor.setFocus()
-        self.editor.installEventFilter(self)
-
-    def eventFilter(self, obj, event) -> bool:
-        if obj is self.editor and event.type() == QEvent.Type.KeyPress:
-            if (
-                event.modifiers() == Qt.KeyboardModifier.ControlModifier
-                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-            ):
-                self._save()
-                return True
-        return super().eventFilter(obj, event)
-
-    def _restore_original(self) -> None:
-        """One undoable edit, so Ctrl+Z brings back what was just replaced."""
-        cursor = self.editor.textCursor()
-        cursor.beginEditBlock()
-        cursor.select(QTextCursor.SelectionType.Document)
-        cursor.insertText(self._original)
-        cursor.endEditBlock()
-        self.editor.setTextCursor(cursor)
-
-    @property
-    def corrected_text(self) -> str | None:
-        text = self.editor.toPlainText().strip()
-        return None if text == self._original else text
-
-    def _sync_actions(self) -> None:
-        text = self.editor.toPlainText().strip()
-        self.save_btn.setEnabled(not self._read_only and bool(text) and text != self._initial)
-        self.restore_btn.setEnabled(text != self._original)
-
-    def _save(self) -> None:
-        if not self.save_btn.isEnabled():
-            return
-        if not self._save_text(self.corrected_text):
-            self.error.setText("尚未保存。修改内容仍保留在这里，请重试或复制备份。")
-            self.error.show()
-            return
-        self.accept()
+    is_dark = getattr(tok, "ACTIVE_THEME", "light") == "dark"
+    active_bg = QColor("#1D4ED8" if is_dark else "#93C5FD")
+    passive_bg = QColor("#92400E" if is_dark else "#FDE68A")
+    text_fg = tok.qcolor_from_token(tok.TEXT)
+    return active_bg, passive_bg, text_fg
 
 
 class _CurrentPageStack(QStackedWidget):
@@ -1540,6 +1378,7 @@ def _with_export_suffix(path: str, kind: str) -> str:
 
 
 __all__ = [
+    "_CompactTextBrowser",
     "_CurrentPageStack",
     "_ReadingView",
     "_STATUS_TEXT",
@@ -1562,5 +1401,6 @@ __all__ = [
     "find_in_reading_view",
     "link_citations",
     "notes_for_display",
+    "search_highlight_colors",
     "speaker_color",
 ]
