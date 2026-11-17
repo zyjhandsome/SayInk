@@ -623,6 +623,82 @@ class SpeakerTurnDetector:
         self.context_action = "short_split"
         return [SpeakerTurn(0, cut, left, False), SpeakerTurn(cut, first.stop, right, False), *turns[1:]]
 
+    def _extract_window_vectors_and_anchors(self, samples, starts, window, *, cancelled=None):
+        vectors, anchors = [], []
+        for start in starts:
+            if cancelled is not None and cancelled():
+                return None
+            piece = samples[start:start + window]
+            vector = self._embed_or_none(piece) if _clear_voice(piece) else None
+            if vector is not None and anchors and vector.size != anchors[0].size:
+                vector = None
+            vectors.append(vector)
+            if vector is not None and (not anchors or max(float(a @ vector) for a in anchors) < self._match):
+                if len(anchors) < MAX_TURNS:
+                    anchors.append(vector)
+        return vectors, anchors
+
+    @staticmethod
+    def _refine_window_anchors(anchors, vectors):
+        if len(anchors) <= 1:
+            return anchors
+        refined = []
+        for index, anchor in enumerate(anchors):
+            candidates = [v for v in vectors if v is not None and float(v @ anchor) >= STABLE_SIMILARITY
+                          and index == int(np.argmax([float(v @ a) for a in anchors]))]
+            supported = [v for v in candidates
+                         if sum(float(v @ other) >= 0.9 for other in candidates) >= 2]
+            if supported:
+                anchor = min(supported, key=lambda v: max(float(v @ a) for j, a in enumerate(anchors) if j != index))
+            refined.append(anchor)
+        return refined
+
+    def _propose_stable_run_cuts(self, samples, starts, window, minimum, vectors, anchors, *, cancelled=None):
+        labels = []
+        for vector in vectors:
+            if vector is None:
+                labels.append(-1)
+                continue
+            scores = sorted(((float(a @ vector), i) for i, a in enumerate(anchors)), reverse=True)
+            best, label = scores[0]
+            runner_up = scores[1][0] if len(scores) > 1 else -1.0
+            labels.append(label if best >= STABLE_SIMILARITY and best - runner_up >= 0.08 else -1)
+        runs, begin = [], 0
+        for end in range(1, len(labels) + 1):
+            if end < len(labels) and labels[end] == labels[begin]:
+                continue
+            if labels[begin] >= 0 and end - begin >= 2:
+                run_vectors = [v for v in vectors[begin:end] if v is not None]
+                if all(float(a @ b) >= STABLE_SIMILARITY for a, b in zip(run_vectors, run_vectors[1:], strict=False)):
+                    runs.append((labels[begin], begin, end - 1))
+            begin = end
+        cuts = []
+        previous = runs[0] if runs else None
+        for run in runs[1:]:
+            if cancelled is not None and cancelled():
+                return None
+            if previous[0] != run[0] and float(anchors[previous[0]] @ anchors[run[0]]) <= CHANGE_SIMILARITY:
+                center = (starts[previous[2]] + starts[run[1]] + window) // 2
+                cut = self._quiet_cut(samples, center, (cuts[-1] if cuts else 0) + minimum, samples.size - minimum)
+                if cut is not None:
+                    cuts.append(cut)
+            previous = run
+        return cuts
+
+    def _confirm_proposed_cuts(self, samples, proposed, *, cancelled=None):
+        cuts, unresolved = [], []
+        for index, cut in enumerate(proposed):
+            if cancelled is not None and cancelled():
+                return None
+            lower = proposed[index - 1] if index else 0
+            upper = proposed[index + 1] if index + 1 < len(proposed) else len(samples)
+            confirmed = self._verify_change(samples, cut, lower, upper)
+            if confirmed is True:
+                cuts.append(cut)
+            elif confirmed is None:
+                unresolved.append(cut)
+        return cuts, unresolved
+
     def _analyze(self, audio: np.ndarray, *, cancelled=None) -> list[SpeakerTurn]:
         raw_floor = getattr(audio, "noise_floor", None)
         samples = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -634,102 +710,29 @@ class SpeakerTurnDetector:
         hop = int(HOP_SEC * TARGET_SAMPLE_RATE)
         minimum = int(MIN_TURN_SEC * TARGET_SAMPLE_RATE)
         if samples.size > int(MAX_ANALYSIS_SEC * TARGET_SAMPLE_RATE):
-            # Unbounded input gets no model work at all; it stays unknown.
             return self._plain_single(samples, uncertain=True, mixed=True)
         if samples.size < 2 * window + hop:
             return self._single(samples, cancelled=cancelled)
         starts = list(range(0, samples.size - window + 1, hop))
         if starts[-1] + window < samples.size:
             starts.append(samples.size - window)
-        vectors = []
-        anchors = []
-        for start in starts:
-            if cancelled is not None and cancelled():
-                return []
-            piece = samples[start:start + window]
-            vector = self._embed_or_none(piece) if _clear_voice(piece) else None
-            if vector is not None and anchors and vector.size != anchors[0].size:
-                vector = None
-            vectors.append(vector)
-            if vector is not None and (not anchors or max(float(a @ vector) for a in anchors) < self._match):
-                # Local labels are disposable; they never allocate meeting ids.
-                if len(anchors) < MAX_TURNS:
-                    anchors.append(vector)
+        extracted = self._extract_window_vectors_and_anchors(samples, starts, window, cancelled=cancelled)
+        if extracted is None:
+            return []
+        vectors, anchors = extracted
         if not anchors:
-            # No 1.2 s window held a full second of clear speech, so nothing
-            # proposed a speaker change. Clips under that analysis length
-            # already seed a profile when the whole utterance is clear; forcing
-            # uncertain here left the opening of a meeting unnamed. A configured
-            # activity check can still abstain on demand, without inventing splits.
             return self._single(samples, cancelled=cancelled, allow_activity_splits=False, need_guard=True)
-        # A new voice may first appear in a window straddling the change.
-        # Replace that mixed anchor with a repeated, better-separated state.
-        # Otherwise the mixed anchor can hide a real A→B boundary.
-        if len(anchors) > 1:
-            refined = []
-            for index, anchor in enumerate(anchors):
-                candidates = [v for v in vectors if v is not None and float(v @ anchor) >= STABLE_SIMILARITY
-                              and index == int(np.argmax([float(v @ a) for a in anchors]))]
-                supported = [v for v in candidates
-                             if sum(float(v @ other) >= 0.9 for other in candidates) >= 2]
-                if supported:
-                    anchor = min(supported, key=lambda v: max(float(v @ a) for j, a in enumerate(anchors) if j != index))
-                refined.append(anchor)
-            anchors = refined
-        labels = []
-        for vector in vectors:
-            if vector is None:
-                labels.append(-1)
-                continue
-            scores = sorted(((float(a @ vector), i) for i, a in enumerate(anchors)), reverse=True)
-            best, label = scores[0]
-            runner_up = scores[1][0] if len(scores) > 1 else -1.0
-            labels.append(label if best >= STABLE_SIMILARITY and best - runner_up >= 0.08 else -1)
-        # Two consecutive, mutually consistent windows are required for each
-        # stable run. An isolated different window cannot create a new turn.
-        runs = []
-        begin = 0
-        for end in range(1, len(labels) + 1):
-            if end < len(labels) and labels[end] == labels[begin]:
-                continue
-            if labels[begin] >= 0 and end - begin >= 2:
-                run_vectors = [v for v in vectors[begin:end] if v is not None]
-                stable = all(float(a @ b) >= STABLE_SIMILARITY
-                             for a, b in zip(run_vectors, run_vectors[1:], strict=False))
-                if stable:
-                    runs.append((labels[begin], begin, end - 1))
-            begin = end
-        cuts = []
-        previous = runs[0] if runs else None
-        for run in runs[1:]:
-            if cancelled is not None and cancelled():
-                return []
-            if previous[0] != run[0] and float(anchors[previous[0]] @ anchors[run[0]]) <= CHANGE_SIMILARITY:
-                center = (starts[previous[2]] + starts[run[1]] + window) // 2
-                cut = self._quiet_cut(samples, center, (cuts[-1] if cuts else 0) + minimum,
-                                      samples.size - minimum)
-                if cut is not None:
-                    cuts.append(cut)
-            previous = run
-        # Short CAM++ windows can disagree merely because of laughter or
-        # phonetic content. A proposal must also separate longer voice clips.
-        proposed = cuts
-        cuts = []
-        unresolved = []
-        for index, cut in enumerate(proposed):
-            if cancelled is not None and cancelled():
-                return []
-            lower = proposed[index - 1] if index else 0
-            upper = proposed[index + 1] if index + 1 < len(proposed) else len(samples)
-            confirmed = self._verify_change(samples, cut, lower, upper)
-            if confirmed is True:
-                cuts.append(cut)
-            elif confirmed is None:
-                unresolved.append(cut)
+        anchors = self._refine_window_anchors(anchors, vectors)
+        proposed = self._propose_stable_run_cuts(
+            samples, starts, window, minimum, vectors, anchors, cancelled=cancelled
+        )
+        if proposed is None:
+            return []
+        confirmed_pair = self._confirm_proposed_cuts(samples, proposed, cancelled=cancelled)
+        if confirmed_pair is None:
+            return []
+        cuts, unresolved = confirmed_pair
         if not cuts:
-            # Distinct voices may recur only in isolated windows, leaving no
-            # stable consecutive run and no reliable cut. Their whole-clip
-            # embedding would blend voices and could poison a speaker profile.
             repeated_conflict = not proposed and _conflicting_repeated_windows(vectors)
             if repeated_conflict and self._activity_guard is None:
                 return self._plain_single(samples, uncertain=True, mixed=True)

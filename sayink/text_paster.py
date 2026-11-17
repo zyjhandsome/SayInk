@@ -1058,6 +1058,64 @@ class TextPaster:
             _, title = info[:2]
         return title in cls.OWN_TITLES
 
+    def _resolve_initial_paste_target(
+        self,
+        info: tuple,
+        target_hwnd: int | None,
+        target_app: str | None,
+    ) -> tuple[int, str, bool, PasteTargetSnapshot | None, str, bool]:
+        current_snapshot = build_paste_target_snapshot(info)
+        if target_hwnd is None:
+            hwnd = info[0]
+            has_target = hwnd != 0 and not self._is_own_window(info)
+            resolved_app = _process_name_from_window_info(info) if has_target else ""
+            if not has_target:
+                return hwnd, resolved_app, False, None, "", False
+            if _is_ime_composing(hwnd, current_snapshot.focus_hwnd):
+                return hwnd, resolved_app, False, current_snapshot, "ime_active", False
+            return hwnd, resolved_app, True, current_snapshot, "", False
+
+        hwnd = int(target_hwnd)
+        resolved_app = target_app or ""
+        baseline = get_remembered_paste_target(hwnd) or current_snapshot
+        if hwnd == 0 or info[0] != hwnd:
+            skip = "focus_changed" if hwnd and info[0] != hwnd else ""
+            return hwnd, resolved_app, False, baseline, skip, False
+        if self._is_own_window(info):
+            return hwnd, resolved_app, False, baseline, "", False
+        if target_rejects_synthetic_input(info):
+            return hwnd, resolved_app, False, baseline, "elevated", True
+        if detect_session_change(baseline, current_snapshot):
+            return hwnd, resolved_app, False, baseline, "session_changed", True
+        if _is_ime_composing(hwnd, current_snapshot.focus_hwnd):
+            return hwnd, resolved_app, False, baseline, "ime_active", True
+        return hwnd, resolved_app, True, baseline, "", True
+
+    def _prepare_clipboard_backup(self) -> ClipboardSnapshot | None:
+        if not self.restore_clipboard:
+            return None
+        if self._restore_expected is not None and not self._clipboard_paste_blocker(*self._restore_expected):
+            old_snapshot = self._saved_snapshot
+        else:
+            old_snapshot = self._capture_clipboard_snapshot()
+        self._saved_snapshot = old_snapshot
+        return old_snapshot
+
+    @staticmethod
+    def _recheck_target_before_send(
+        hwnd: int,
+        baseline_snapshot: PasteTargetSnapshot | None,
+    ) -> tuple[tuple, str]:
+        info_now = get_foreground_window_info()
+        if hwnd == 0 or info_now[0] != hwnd:
+            return info_now, "focus_changed"
+        now_snapshot = build_paste_target_snapshot(info_now)
+        if detect_session_change(baseline_snapshot, now_snapshot):
+            return info_now, "session_changed"
+        if _is_ime_composing(hwnd, now_snapshot.focus_hwnd):
+            return info_now, "ime_active"
+        return info_now, ""
+
     def paste_async(
         self,
         text: str,
@@ -1080,52 +1138,18 @@ class TextPaster:
             return
 
         info = get_foreground_window_info()
-        current_snapshot = build_paste_target_snapshot(info)
-        baseline_snapshot: PasteTargetSnapshot | None = None
-        skip_detail = ""
-        checked_uipi = False
-        if target_hwnd is None:
-            hwnd = info[0]
-            has_target = hwnd != 0 and not self._is_own_window(info)
-            target_app = _process_name_from_window_info(info) if has_target else ""
-            if has_target:
-                baseline_snapshot = current_snapshot
-                if _is_ime_composing(hwnd, current_snapshot.focus_hwnd):
-                    has_target = False
-                    skip_detail = "ime_active"
-        else:
-            hwnd = int(target_hwnd)
-            target_app = target_app or ""
-            baseline_snapshot = get_remembered_paste_target(hwnd) or current_snapshot
-            if hwnd == 0 or info[0] != hwnd:
-                has_target = False
-                skip_detail = "focus_changed" if hwnd and info[0] != hwnd else ""
-            elif self._is_own_window(info):
-                has_target = False
-            elif target_rejects_synthetic_input(info):
-                checked_uipi = True
-                has_target = False
-                skip_detail = "elevated"
-            else:
-                checked_uipi = True
-                if detect_session_change(baseline_snapshot, current_snapshot):
-                    has_target = False
-                    skip_detail = "session_changed"
-                elif _is_ime_composing(hwnd, current_snapshot.focus_hwnd):
-                    has_target = False
-                    skip_detail = "ime_active"
-                else:
-                    has_target = True
+        (
+            hwnd,
+            target_app,
+            has_target,
+            baseline_snapshot,
+            skip_detail,
+            checked_uipi,
+        ) = self._resolve_initial_paste_target(info, target_hwnd, target_app)
 
         self._paste_seq += 1
         seq = self._paste_seq
-        old_snapshot: ClipboardSnapshot | None = None
-        if self.restore_clipboard:
-            if self._restore_expected is not None and not self._clipboard_paste_blocker(*self._restore_expected):
-                old_snapshot = self._saved_snapshot
-            else:
-                old_snapshot = self._capture_clipboard_snapshot()
-            self._saved_snapshot = old_snapshot
+        old_snapshot = self._prepare_clipboard_backup()
 
         report = callback
 
@@ -1172,24 +1196,14 @@ class TextPaster:
             global _ACTIVE_PASTE_MODE
             if seq != self._paste_seq:
                 return
-            info_now = get_foreground_window_info()
-            skip_detail = ""
-            if hwnd == 0 or info_now[0] != hwnd:
-                skip_detail = "focus_changed"
-            else:
-                now_snapshot = build_paste_target_snapshot(info_now)
-                if detect_session_change(baseline_snapshot, now_snapshot):
-                    skip_detail = "session_changed"
-                elif _is_ime_composing(hwnd, now_snapshot.focus_hwnd):
-                    skip_detail = "ime_active"
-
-            paste_mode = detect_terminal_paste_mode(info_now, target_app or "") if not skip_detail else None
+            info_now, skip_now = self._recheck_target_before_send(hwnd, baseline_snapshot)
+            paste_mode = detect_terminal_paste_mode(info_now, target_app or "") if not skip_now else None
             clipboard_blocker = self._clipboard_paste_blocker(expected_clip_seq, text)
             if clipboard_blocker:
                 callback(PasteResult("skipped", target_app=target_app, detail=clipboard_blocker))
                 return
-            if skip_detail:
-                callback(PasteResult("clipboard", target_app=target_app, detail=skip_detail))
+            if skip_now:
+                callback(PasteResult("clipboard", target_app=target_app, detail=skip_now))
                 return
             prev_mode = _ACTIVE_PASTE_MODE
             _ACTIVE_PASTE_MODE = paste_mode

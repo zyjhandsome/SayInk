@@ -33,13 +33,3 @@ ignore = [
 
 [lint.mccabe]
 max-complexity = 30
-
-[lint.per-file-ignores]
-# Legacy complex state/audio/parser hotspots pre-existing above 30; keep new code <= 30.
-"sayink/audio_recorder.py" = ["C901"]      # _drain_mixed_mono (31)
-"sayink/meeting_store.py" = ["C901"]       # _cleanup_owned_meeting_audio (34)
-"sayink/output_pipeline.py" = ["C901"]     # handle_paste_result (33)
-"sayink/speaker_clustering.py" = ["C901"]  # reassign_turns (41)
-"sayink/speaker_turns.py" = ["C901"]       # _analyze (35)
-"sayink/text_paster.py" = ["C901"]         # paste_async (34)
-"sayink/transcript_import.py" = ["C901"]   # _parse_json_transcript (47)

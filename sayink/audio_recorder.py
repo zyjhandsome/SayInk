@@ -880,9 +880,7 @@ class AudioRecorder(QObject):
             track[-fade_len:] *= np.linspace(1.0, 0.0, fade_len, endpoint=False, dtype=np.float32)
         return np.pad(track, (0, take - track.size))
 
-    def _drain_mixed_mono(self, final: bool = False) -> Optional[np.ndarray]:
-        """Mix what every lane has delivered so far with drift compensation."""
-        now = time.monotonic()
+    def _drain_and_resample_lanes(self) -> list[tuple[_CaptureLane, Optional[np.ndarray], float]]:
         drained: list[tuple[_CaptureLane, Optional[np.ndarray], float]] = []
         with self._lock:
             for lane in self._lanes:
@@ -896,7 +894,15 @@ class AudioRecorder(QObject):
                 lane.resampler = StreamResampler(lane.sample_rate, TARGET_SAMPLE_RATE)
             track = lane.resampler.process(raw)
             lane.pending = np.concatenate([lane.pending, track]) if lane.pending.size else track
+        return drained
 
+    def _compute_mix_take(
+        self,
+        drained: list[tuple[_CaptureLane, Optional[np.ndarray], float]],
+        *,
+        now: float,
+        final: bool,
+    ) -> tuple[int, bool]:
         longest = max((lane.pending.size for lane, _raw, _last in drained), default=0)
         both_live = (
             not final
@@ -904,23 +910,26 @@ class AudioRecorder(QObject):
             and all((now - last) < self.MIX_WAIT_SEC for _lane, _raw, last in drained)
         )
         if final or len(drained) <= 1:
-            take = longest
-        else:
-            waiting = [
-                lane.pending.size
-                for lane, _raw, last in drained
-                if now - last < self.MIX_WAIT_SEC
-            ]
-            take = min(waiting) if waiting else longest
-            take = max(take, longest - int(self.MAX_MIX_SKEW_SEC * TARGET_SAMPLE_RATE))
-        if take <= 0:
-            self._block_mic_energy = 0.0
-            self._block_system_energy = 0.0
-            self._recovery_tracks = {}
-            return None
+            return longest, both_live
+        waiting = [
+            lane.pending.size
+            for lane, _raw, last in drained
+            if now - last < self.MIX_WAIT_SEC
+        ]
+        take = min(waiting) if waiting else longest
+        take = max(take, longest - int(self.MAX_MIX_SKEW_SEC * TARGET_SAMPLE_RATE))
+        return take, both_live
 
-        lane_tracks = []
-        populated_roles = set()
+    def _slice_lane_tracks(
+        self,
+        drained: list[tuple[_CaptureLane, Optional[np.ndarray], float]],
+        *,
+        take: int,
+        both_live: bool,
+        now: float,
+    ) -> tuple[list[tuple[str, np.ndarray]], set[str]]:
+        lane_tracks: list[tuple[str, np.ndarray]] = []
+        populated_roles: set[str] = set()
         for lane, _raw, _last in drained:
             excess = lane.pending.size - take
             if both_live and take >= 160 and excess > self.DRIFT_TOLERANCE_SAMPLES:
@@ -950,24 +959,31 @@ class AudioRecorder(QObject):
             if lane.endpoint.role == "system" and now < self._mute_system_until:
                 track = np.zeros_like(track)
             lane_tracks.append((lane.endpoint.role, track))
+        return lane_tracks, populated_roles
 
+    def _update_lane_levels_and_suppress_echo(
+        self,
+        lane_tracks: list[tuple[str, np.ndarray]],
+        populated_roles: set[str],
+        *,
+        now: float,
+    ) -> None:
         roles = [role for role, _track in lane_tracks]
         self._recovery_tracks = dict(lane_tracks)
-
         # Measure raw/cleaned per-lane levels before mixing so mic speech never masks a dead system lane.
         raw_sys_rms = 0.0
         for role, track in lane_tracks:
             if role == "system" and role in populated_roles:
                 raw_sys_rms = rms_volume(track)
-
         if sorted(roles) == ["microphone", "system"]:
             mic_index, system_index = roles.index("microphone"), roles.index("system")
-            cleaned = self._duplicate_suppressor.process(lane_tracks[mic_index][1], lane_tracks[system_index][1])
+            cleaned = self._duplicate_suppressor.process(
+                lane_tracks[mic_index][1], lane_tracks[system_index][1]
+            )
             lane_tracks[mic_index] = ("microphone", cleaned)
         else:
             self._duplicate_suppressor.reset()
         self._block_tracks = {role: track for role, track in lane_tracks}
-
         mic_rms = 0.0
         for role, track in lane_tracks:
             if role != "system" and role in populated_roles:
@@ -980,28 +996,18 @@ class AudioRecorder(QObject):
             self._last_system_speech_at = now
             self._system_ever_active = True
 
-        tracks: list[np.ndarray] = []
-        mix_roles: list[str] = []
-        gains: list[float] = []
-        mic_energy = 0.0
-        system_energy = 0.0
-        for role, track in lane_tracks:
-            if role not in populated_roles:
-                continue
-            energy = float(np.dot(track, track))
-            if role == "system":
-                system_energy += energy
-            else:
-                mic_energy += energy
-            tracks.append(track)
-            mix_roles.append(role)
-            if self._balancer is not None:
-                gains.append(self._balancer.observe(role, track))
-        self._block_mic_energy = mic_energy
-        self._block_system_energy = system_energy
+    def _mix_balanced_tracks(
+        self,
+        tracks: list[np.ndarray],
+        mix_roles: list[str],
+        gains: list[float],
+        take: int,
+    ) -> np.ndarray:
         if not tracks:
             return np.zeros(take, dtype=np.float32)
-        audible = [index for index, track in enumerate(tracks) if rms_volume(track) >= _DIGITAL_SILENCE_RMS]
+        audible = [
+            index for index, track in enumerate(tracks) if rms_volume(track) >= _DIGITAL_SILENCE_RMS
+        ]
         if len(tracks) == 1:
             role = mix_roles[0]
             only = (
@@ -1036,6 +1042,43 @@ class AudioRecorder(QObject):
                 ]
             return mix_to_mono(scaled, TARGET_SAMPLE_RATE, gains=[1.0] * len(scaled))
         return mix_to_mono(tracks, TARGET_SAMPLE_RATE)
+
+    def _drain_mixed_mono(self, final: bool = False) -> Optional[np.ndarray]:
+        """Mix what every lane has delivered so far with drift compensation."""
+        now = time.monotonic()
+        drained = self._drain_and_resample_lanes()
+        take, both_live = self._compute_mix_take(drained, now=now, final=final)
+        if take <= 0:
+            self._block_mic_energy = 0.0
+            self._block_system_energy = 0.0
+            self._recovery_tracks = {}
+            return None
+
+        lane_tracks, populated_roles = self._slice_lane_tracks(
+            drained, take=take, both_live=both_live, now=now
+        )
+        self._update_lane_levels_and_suppress_echo(lane_tracks, populated_roles, now=now)
+
+        tracks: list[np.ndarray] = []
+        mix_roles: list[str] = []
+        gains: list[float] = []
+        mic_energy = 0.0
+        system_energy = 0.0
+        for role, track in lane_tracks:
+            if role not in populated_roles:
+                continue
+            energy = float(np.dot(track, track))
+            if role == "system":
+                system_energy += energy
+            else:
+                mic_energy += energy
+            tracks.append(track)
+            mix_roles.append(role)
+            if self._balancer is not None:
+                gains.append(self._balancer.observe(role, track))
+        self._block_mic_energy = mic_energy
+        self._block_system_energy = system_energy
+        return self._mix_balanced_tracks(tracks, mix_roles, gains, take)
 
     def _glide_lane_gain(self, role: str, track: np.ndarray, target: float) -> np.ndarray:
         """Scale one lane, moving its gain toward ``target`` without a step.

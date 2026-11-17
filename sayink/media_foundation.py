@@ -451,6 +451,100 @@ def _probe_duration_100ns(reader, ole32) -> int:
     return 0
 
 
+def _parse_mvhd_duration_ms(body: bytes) -> int:
+    if len(body) < 20:
+        return 0
+    ver = body[0]
+    if ver == 0:
+        timescale, duration = struct.unpack_from(">II", body, 12)
+        if timescale <= 0 or duration in (0, 0xFFFFFFFF):
+            return 0
+        return int(duration * 1000 // timescale)
+    if ver == 1 and len(body) >= 32:
+        timescale, duration = struct.unpack_from(">IQ", body, 20)
+        if timescale <= 0 or duration in (0, 0xFFFFFFFFFFFFFFFF):
+            return 0
+        return int(duration * 1000 // timescale)
+    return 0
+
+
+def _probe_iso_bmff_duration_ms(path: Path) -> int:
+    """Best-effort header-only duration probe for MP4/M4A/MOV containers."""
+    try:
+        file_size = path.stat().st_size
+        if file_size < 16:
+            return 0
+        with path.open("rb") as fh:
+            pos = 0
+            while pos + 8 <= file_size:
+                fh.seek(pos)
+                hdr = fh.read(8)
+                if len(hdr) < 8:
+                    break
+                size, box_type = struct.unpack(">I4s", hdr)
+                hdr_len = 8
+                if size == 1:
+                    ext = fh.read(8)
+                    if len(ext) < 8:
+                        break
+                    size = struct.unpack(">Q", ext)[0]
+                    hdr_len = 16
+                elif size == 0:
+                    size = file_size - pos
+                if size < hdr_len or pos + size > file_size:
+                    break
+                if pos == 0 and box_type not in _BMFF_TOP_TYPES:
+                    return 0
+                if box_type == b"moov":
+                    payload_len = size - hdr_len
+                    if 0 < payload_len <= _MAX_MOOV_BYTES:
+                        for sub_type, sub_body in _iter_bmff_boxes(fh.read(payload_len)):
+                            if sub_type == b"mvhd":
+                                return _parse_mvhd_duration_ms(sub_body)
+                    return 0
+                pos += size
+    except Exception:
+        return 0
+    return 0
+
+
+def probe_duration_ms(path: Path) -> int:
+    """Best-effort media duration in milliseconds without decoding audio frames."""
+    bmff_ms = _probe_iso_bmff_duration_ms(path)
+    if bmff_ms > 0:
+        return bmff_ms
+    try:
+        ole32 = _get_ole32()
+        mfplat = getattr(getattr(ctypes, "windll", None), "mfplat", None)
+        mfreadwrite = getattr(getattr(ctypes, "windll", None), "mfreadwrite", None)
+        if ole32 is None or mfplat is None or mfreadwrite is None:
+            return 0
+        _ensure_prototypes(mfplat, mfreadwrite)
+        started = ole32.CoInitializeEx(None, COINIT_MULTITHREADED)
+        if started < 0 and (started & 0xFFFFFFFF) != 0x80010106:
+            return 0
+        own_com = started >= 0
+        mf_started = False
+        reader = c_void_p()
+        try:
+            if mfplat.MFStartup(MF_VERSION, 0) < 0:
+                return 0
+            mf_started = True
+            hr = mfreadwrite.MFCreateSourceReaderFromURL(str(path.resolve()), None, byref(reader))
+            if hr < 0:
+                return 0
+            dur_100ns = _probe_duration_100ns(reader, ole32)
+            return max(0, int(dur_100ns // 10_000)) if dur_100ns > 0 else 0
+        finally:
+            _release(reader)
+            if mf_started:
+                mfplat.MFShutdown()
+            if own_com:
+                ole32.CoUninitialize()
+    except Exception:
+        return 0
+
+
 def _read_current_format(reader, action: str) -> tuple[int, int]:
     current = c_void_p()
     hr = _method(reader, 6, HRESULT, (c_ulong, POINTER(c_void_p)))(

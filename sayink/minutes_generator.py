@@ -36,6 +36,7 @@ from sayink.minutes_prompts import (
     build_system_prompt,
     build_user_prompt,
     chunk_transcript_with_spans,
+    format_timestamp,
     parse_timestamp,
     render_transcript,
     section_title,
@@ -545,6 +546,7 @@ class MinutesWorker(QThread):
             timestamps_available=self._req.timestamps_available,
         )
         level = 0
+        used_fallback_last = False
         while len(partials) > 1:
             level += 1
             groups, current = [], []
@@ -558,8 +560,14 @@ class MinutesWorker(QThread):
             if len(groups) == len(partials):
                 # Never send an unbounded final merge or discard already valid sections.
                 self.progress.emit("各段纪要已完成，正在按顺序保留内容…")
-                return _concat_partials(partials)
+                return _concat_partials(
+                    partials,
+                    context=ctx,
+                    template=self._req.template,
+                    timestamps_available=self._req.timestamps_available,
+                )
             merged = []
+            used_fallback_last = False
             for index, group in enumerate(groups):
                 if len(group) == 1:
                     merged.append(group[0])
@@ -578,12 +586,22 @@ class MinutesWorker(QThread):
                         merged.extend([await self._merge(client, httpx, group[:mid], merge_context=ctx),
                                        await self._merge(client, httpx, group[mid:], merge_context=ctx)])
                     else:
+                        used_fallback_last = True
                         merged.append(_concat_partials(group))
                 except LLMResponseError:
                     self.progress.emit("合并结果未通过校验，正在保留已完成的分段纪要…")
+                    used_fallback_last = True
                     merged.append(_concat_partials(group))
             partials = merged
-        return partials[0]
+        result = partials[0]
+        if used_fallback_last:
+            result = _preserve_unmerged_user_context(
+                result,
+                ctx,
+                template=self._req.template,
+                timestamps_available=self._req.timestamps_available,
+            )
+        return result
 
     def run(self) -> None:
         if self._cancelled:
@@ -979,7 +997,88 @@ def _split_chunk(text):
     return text[:cut], text[cut:]
 
 
-def _concat_partials(partials: Sequence[dict[str, Any]]) -> dict[str, Any]:
+def _collect_merged_fact_haystack(payload: dict[str, Any]) -> str:
+    fragments: list[str] = []
+
+    def _walk(val: Any) -> None:
+        if isinstance(val, str):
+            fragments.append(_FACT_NORM_RE.sub("", val).casefold())
+        elif isinstance(val, list):
+            for item in val:
+                _walk(item)
+        elif isinstance(val, dict):
+            for k, v in val.items():
+                if k != "_speaker_names":
+                    _walk(v)
+
+    _walk(payload)
+    return " ".join(f for f in fragments if f)
+
+
+def _preserve_unmerged_user_context(
+    merged: dict[str, Any],
+    context: MeetingContext | None,
+    *,
+    template: MinutesTemplate | None = None,
+    timestamps_available: bool = True,
+) -> dict[str, Any]:
+    if context is None or (not context.notes_user.strip() and not context.marks):
+        return merged
+    haystack = _collect_merged_fact_haystack(merged)
+    raw_blob = json.dumps(merged, ensure_ascii=False)
+    uncovered: list[dict[str, str]] = []
+    seen_norms: set[str] = set()
+
+    for offset_ms, note in context.marks:
+        clean_note = str(note or "").strip()
+        ts_str = format_timestamp(offset_ms) if timestamps_available else ""
+        if clean_note:
+            norm = _FACT_NORM_RE.sub("", clean_note).casefold()
+            if norm and norm not in haystack and norm not in seen_norms:
+                seen_norms.add(norm)
+                uncovered.append({"text": f"标记：{clean_note}", "ts": ts_str})
+        elif ts_str and ts_str not in raw_blob and ts_str not in seen_norms:
+            seen_norms.add(ts_str)
+            uncovered.append({"text": "用户重点标记时刻", "ts": ts_str})
+
+    for raw_line in context.notes_user.splitlines():
+        clean_line = re.sub(r"^[-*+•]\s+", "", raw_line.strip()).strip()
+        if not clean_line:
+            continue
+        norm = _FACT_NORM_RE.sub("", clean_line).casefold()
+        if norm and norm not in haystack and norm not in seen_norms:
+            seen_norms.add(norm)
+            uncovered.append({"text": clean_line, "ts": ""})
+
+    if not uncovered:
+        return merged
+
+    sections = template.sections if template is not None else (SECTION_SUMMARY, SECTION_TOPICS)
+    if SECTION_TOPICS in sections:
+        merged.setdefault("topics", []).append({"title": "用户笔记与标记", "points": uncovered})
+        if not str(merged.get("summary") or "").strip() and SECTION_SUMMARY in sections:
+            merged["summary"] = "用户笔记与标记：" + "；".join(p["text"] for p in uncovered)
+    elif SECTION_SUMMARY in sections:
+        note_lines = [
+            f"{p['text']}{(' [' + p['ts'] + ']') if p['ts'] else ''}" for p in uncovered
+        ]
+        suffix = "用户笔记与标记：" + "；".join(note_lines)
+        cur_sum = str(merged.get("summary") or "").strip()
+        merged["summary"] = f"{cur_sum}\n\n{suffix}" if cur_sum else suffix
+    elif SECTION_OPEN_QUESTIONS in sections:
+        merged.setdefault("open_questions", []).extend(uncovered)
+    else:
+        merged.setdefault("topics", []).append({"title": "用户笔记与标记", "points": uncovered})
+    return merged
+
+
+def _concat_partials(
+    partials: Sequence[dict[str, Any]],
+    *,
+    context: MeetingContext | None = None,
+    template: MinutesTemplate | None = None,
+    timestamps_available: bool = True,
+) -> dict[str, Any]:
     list_keys = ("topics", "decisions", "action_items", "open_questions", "chapters", "speakers")
     merged: dict[str, Any] = {
         "title": "",
@@ -1010,6 +1109,13 @@ def _concat_partials(partials: Sequence[dict[str, Any]]) -> dict[str, Any]:
                         merged[key].append(item)
                         seen.add(identity)
     merged["summary"] = "\n\n".join(dict.fromkeys(s for s in summaries if s))
+    if context is not None:
+        _preserve_unmerged_user_context(
+            merged,
+            context,
+            template=template,
+            timestamps_available=timestamps_available,
+        )
     return merged
 
 

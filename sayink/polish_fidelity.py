@@ -246,6 +246,68 @@ def normalized_number_tokens(text: str) -> list[str]:
     return [_canonical_number(match) for match in _SIGNED_NUMBER_RE.findall(prepared)]
 
 
+_LOOKUP_WEEKDAY_RE = re.compile(r"(?:周|星期|礼拜)([一二三四五六日天])")
+_LOOKUP_PERCENT_RE = re.compile(r"百分之\s*(百|[零〇一二两三四五六七八九十百千万亿\d.点]+)")
+_LOOKUP_LONE_ONE_UNIT_RE = re.compile(
+    r"(?<![零〇一二两三四五六七八九十百千万亿\d])一"
+    r"(?=\s*(?:年|月|日|号|天|周|个月|小时|分钟|元|块|美元|人|%|％|[千百kKwW]))"
+)
+_LOOKUP_SUBSCALE_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*([万wW千kK百])(?![A-Za-z])")
+_LOOKUP_DECIMAL_RE = re.compile(r"(?<![\d.])\d+\.\d+")
+_LOOKUP_YMD_RE = re.compile(r"(?<!\d)(\d{4})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})\s*[日号]?(?!\d)")
+_LOOKUP_YM_RE = re.compile(r"(?<!\d)(\d{4})\s*[-/年]\s*(\d{1,2})\s*月?(?![\d日号])")
+_LOOKUP_MD_RE = re.compile(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?(?!\d)")
+_LOOKUP_SPOKEN_YUAN_RE = re.compile(r"(?<=\d)\s*(?:块钱|块(?!儿)|元钱)")
+_LOOKUP_STRIP_PUNCT_RE = re.compile(r"[\s,，。、；;:：]")
+_LOOKUP_WD_SENTINEL_RE = re.compile(r"\x00WD_([一二三四五六日])\x00")
+
+
+def _replace_cn_percent(match: re.Match[str]) -> str:
+    inner = match.group(1).strip()
+    if inner == "百":
+        return " 100% "
+    if inner == "一":
+        return " 1% "
+    dec = _CN_DECIMAL_RE.sub(_cn_decimal_replace, inner)
+    conv = _CN_NUMERAL_RE.sub(lambda m: _cn_numeral_to_arabic(m.group(0)), dec)
+    conv = _expand_cn_scales(conv).strip()
+    if re.fullmatch(r"\d+(?:\.\d+)?", conv):
+        return f" {_canonical_number(conv)}% "
+    return match.group(0)
+
+
+def _replace_subscale(match: re.Match[str]) -> str:
+    val = float(match.group(1))
+    unit = match.group(2)
+    scale = 10_000 if unit in ("万", "w", "W") else (1_000 if unit in ("千", "k", "K") else 100)
+    return f" {_format_counted(val * scale)} "
+
+
+def normalize_fact_lookup_text(text: str) -> str:
+    """Canonicalize Chinese/Arabic numerals, percentages, scales, dates and weekdays for lookup."""
+    if not text:
+        return ""
+    s = unicodedata.normalize("NFKC", text)
+    s = _LOOKUP_WEEKDAY_RE.sub(
+        lambda m: f"\x00WD_{'日' if m.group(1) == '天' else m.group(1)}\x00",
+        s,
+    )
+    s = _LOOKUP_PERCENT_RE.sub(_replace_cn_percent, s)
+    s = _LOOKUP_LONE_ONE_UNIT_RE.sub("1", s)
+    s = _prepare_number_text(s)
+    s = _LOOKUP_SUBSCALE_RE.sub(_replace_subscale, s)
+    s = _LOOKUP_DECIMAL_RE.sub(lambda m: _canonical_number(m.group(0)), s)
+    s = _LOOKUP_YMD_RE.sub(
+        lambda m: f"{m.group(1)}年{int(m.group(2))}月{int(m.group(3))}日",
+        s,
+    )
+    s = _LOOKUP_YM_RE.sub(lambda m: f"{m.group(1)}年{int(m.group(2))}月", s)
+    s = _LOOKUP_MD_RE.sub(lambda m: f"{int(m.group(1))}月{int(m.group(2))}日", s)
+    s = _LOOKUP_SPOKEN_YUAN_RE.sub("元", s)
+    s = _LOOKUP_WD_SENTINEL_RE.sub(r"周\1", s)
+    return _LOOKUP_STRIP_PUNCT_RE.sub("", s)
+
+
 def _number_order_kept(raw: list[str], polished: list[str]) -> bool:
     """Polished text may insert formatting zeros (3点 → 3:00) but not reorder."""
     index = 0
