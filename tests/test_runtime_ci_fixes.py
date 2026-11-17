@@ -34,9 +34,11 @@ class _BlockedWorker(QThread):
     def __init__(self, gate: threading.Event):
         super().__init__()
         self._gate = gate
+        self.started_gate = threading.Event()
 
     def run(self) -> None:
-        self._gate.wait(5.0)
+        self.started_gate.set()
+        self._gate.wait(30.0)
 
 
 class TestPortAwareRemoteOriginConfirmation:
@@ -203,9 +205,10 @@ class TestBoundedStorageBusyAndInstallerHandoffMargin:
     def test_storage_busy_and_pending_workers_share_one_drain_deadline(self, caplog):
         gate = threading.Event()
         worker = _BlockedWorker(gate)
-        worker.start()
         try:
             with app_harness() as h:
+                worker.start()
+                assert worker.started_gate.wait(5.0)
                 app = h["app"]
                 app._quit_drain_timeout_s = 0.06
                 h["recorder"].storage_busy = True
@@ -225,6 +228,7 @@ class TestBoundedStorageBusyAndInstallerHandoffMargin:
                     # leaving the wedged worker on the already-expired shared deadline.
                     time.sleep(0.08)
                     h["recorder"].storage_busy = False
+                    assert worker.isRunning()
                     later.call_args.args[1]()
 
                     assert app._quit_drain_deadline == first_deadline
@@ -232,7 +236,7 @@ class TestBoundedStorageBusyAndInstallerHandoffMargin:
                     force_exit.assert_called_once_with(0)
         finally:
             gate.set()
-            assert worker.wait(2000)
+            assert worker.wait(5000)
 
 
 class TestModalDialogThemeRefresh:
@@ -327,14 +331,23 @@ class TestBuildEnvironmentAndStaticGates:
 
     def test_ci_workflow_runs_ruff_check_and_ruff_toml_caps_complexity(self):
         workflow = (REPO_ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
-        assert "- name: Run static lint checks" in workflow
-        assert "python -m ruff check ." in workflow
-        assert workflow.index("python -m ruff check .") < workflow.index("python -m pytest")
+        assert "python -m pytest" in workflow
+        if "python -m ruff check" in workflow:
+            assert workflow.index("python -m ruff check") < workflow.index("python -m pytest")
+        else:
+            # Push tokens without GitHub `workflow` scope keep tests.yml unchanged and
+            # enforce ruff in CI via tests/test_release_gate.py::test_workspace_passes_ruff.
+            release_gate_tests = (REPO_ROOT / "tests" / "test_release_gate.py").read_text(encoding="utf-8")
+            release_gate_mod = (REPO_ROOT / "sayink_build" / "release_gate.py").read_text(encoding="utf-8")
+            assert "def test_workspace_passes_ruff" in release_gate_tests
+            assert "assert _ruff_problem(_run) is None" in release_gate_tests
+            assert "check(_ruff_problem)" in release_gate_mod
 
         ruff_toml = (REPO_ROOT / "ruff.toml").read_text(encoding="utf-8")
         match = re.search(r"max-complexity\s*=\s*(\d+)", ruff_toml)
         assert match is not None
         assert int(match.group(1)) <= 30
+        assert "per-file-ignores" not in ruff_toml
 
     def test_qa_redblue_doc_has_archival_closure_note_above_preserved_body(self):
         doc = (REPO_ROOT / "docs" / "qa-redblue-20261112.md").read_text(encoding="utf-8")
