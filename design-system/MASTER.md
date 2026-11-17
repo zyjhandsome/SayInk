@@ -50,7 +50,7 @@ Effective theme is always `light` or `dark`.
 | Foreground Secondary | `#4B5563` | `TEXT_SEC` |
 | Foreground Dim | `#667085` | `TEXT_DIM` |
 | Border | `rgba(13,13,13,0.08)` | `BORDER` / `HAIRLINE` |
-| Control Border | `#D1D5DB` | `CONTROL_BORDER` |
+| Control Border / Toggle Off | `#858D99` (hover `#6B7280`) | `CONTROL_BORDER` / `TOGGLE_OFF` (>= 3.0:1 non-text contrast on `BG` & `SURFACE_PEARL`) |
 | Destructive / Record | `#C81E1E` / `#DC2626` | `RED` / `STATE_RECORD` (`RED_TEXT`: `#991B1B`) |
 | Success / toggle on | `#15803D` | `GREEN` / `TOGGLE_ON` / `STATE_LISTEN` (`GREEN_TEXT`: `#166534`) |
 | Focus Ring | `#2563EB` | `ACCENT_FOCUS` |
@@ -79,11 +79,11 @@ Effective theme is always `light` or `dark`.
 | Foreground Secondary | `#D1D5DB` | `TEXT_SEC` |
 | Foreground Dim | `#9CA3AF` | `TEXT_DIM` |
 | Border | `rgba(255,255,255,0.08)` | `BORDER` / `HAIRLINE` |
-| Control Border | `#4B5563` | `CONTROL_BORDER` |
+| Control Border / Toggle Off | `#737C8C` (hover `#8891A0`) | `CONTROL_BORDER` / `TOGGLE_OFF` (>= 3.0:1 non-text contrast on `BG` & `SURFACE_PEARL`) |
 | Destructive / Record | `#F87171` | `RED` / `STATE_RECORD` |
 | Success / toggle on | `#16A34A` | `GREEN` / `TOGGLE_ON` / `STATE_LISTEN` (quiet mid-green; not neon `#22C55E`) |
 | Focus Ring | `#3B82F6` | `ACCENT_FOCUS` |
-| Nav / row selected | `rgba(255,255,255,0.06)` | `NAV_SELECTED_BG` / `ROW_SELECTED` |
+| Nav / row selected | `rgba(255, 255, 255, 0.12)` / `rgba(255,255,255,0.06)` | `NAV_SELECTED_BG` / `ROW_SELECTED` (`ROW_HOVER`: `rgba(255, 255, 255, 0.04)`) |
 
 ### Floating overlay (theme-aware)
 
@@ -131,6 +131,7 @@ Effective theme is always `light` or `dark`.
 | `SIDEBAR_WIDTH` | `168px` | Navigation and runtime summary |
 | `CONTENT_MAX_WIDTH` | `900px` | Settings document width at larger window sizes |
 | `CONTROL_NUMERIC_WIDTH` | `120px` | History spinboxes (flat stepper + suffix) |
+| `CONTROL_SETTINGS_COMBO_WIDTH` | `280px` | Settings dropdown controls (fits long source/mirror labels) |
 
 ### Shape
 

@@ -948,6 +948,10 @@ class MainWindow(QWidget):
             return
 
     def _apply_dwm_theme_colors(self) -> None:
+        from sayink.ui import design_tokens as live
+        from sayink.ui.theme import apply_window_dark_titlebar
+
+        apply_window_dark_titlebar(self, _qcolor(live.BG).lightness() < 128)
         for attr, value in self._dwm_frame_attributes().items():
             self._apply_dwm_attribute(attr, value)
 

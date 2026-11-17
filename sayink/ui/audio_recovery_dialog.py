@@ -6,7 +6,7 @@ import time
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPalette
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QListWidget,
+    QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
     QPlainTextEdit, QPushButton, QVBoxLayout,
 )
 
@@ -24,6 +24,7 @@ from sayink.ui import settings_styles
 from sayink.ui.native_dialog import native_file_dialog
 from sayink.ui.prompts import confirm
 from sayink.ui.settings_components import ElidedComboBox, _qcolor
+from sayink.ui.theme import apply_window_dark_titlebar
 
 
 class RecoveryWorker(QThread):
@@ -186,8 +187,33 @@ class AudioRecoveryDialog(QDialog):
         self._note_label.setWordWrap(True)
         layout.addWidget(self._note_label)
 
+        self._empty_banner = QFrame()
+        self._empty_banner.setObjectName("recoveryEmptyBanner")
+        empty_banner_lay = QVBoxLayout(self._empty_banner)
+        empty_banner_lay.setContentsMargins(12, 10, 12, 10)
+        empty_banner_lay.setSpacing(2)
+        self._empty_banner_title = QLabel("当前没有可恢复的本地录音缓存")
+        self._empty_banner_title.setObjectName("recoveryEmptyBannerTitle")
+        self._empty_banner_desc = QLabel(
+            "开启「通用 → 应用与历史 → 本机录音恢复缓存」后，后续录音会自动保存在此，支持导出 WAV 或重新识别。"
+        )
+        self._empty_banner_desc.setObjectName("recoveryEmptyBannerDesc")
+        self._empty_banner_desc.setWordWrap(True)
+        empty_banner_lay.addWidget(self._empty_banner_title)
+        empty_banner_lay.addWidget(self._empty_banner_desc)
+        self._empty_banner.hide()
+        layout.addWidget(self._empty_banner)
+
         self.items = QListWidget()
         self.items.setAccessibleName("可恢复录音列表")
+        self._empty_list_hint = QLabel("暂无可恢复的录音记录")
+        self._empty_list_hint.setObjectName("recoveryEmptyListHint")
+        self._empty_list_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_list_hint.setWordWrap(True)
+        self._empty_list_hint.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        items_overlay = QVBoxLayout(self.items)
+        items_overlay.setContentsMargins(16, 16, 16, 16)
+        items_overlay.addWidget(self._empty_list_hint, 1, Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.items, 1)
 
         track_row = QHBoxLayout()
@@ -284,11 +310,23 @@ class AudioRecoveryDialog(QDialog):
         primary_sm = getattr(settings_styles, "BTN_PRIMARY_SM", settings_styles.BTN_ACCENT_SM)
         self.setStyleSheet(
             settings_styles.WINDOW_CSS
-            + f"\nQDialog {{ background: {tok.BG}; }}"
+            + settings_styles.build_combo_css()
+            + f"\nQDialog {{ background: {tok.BG}; color: {tok.TEXT}; }}"
+            + "\nQFrame#recoveryEmptyBanner {"
+            + f" background: {tok.SURFACE_PEARL}; border: 1px solid {tok.HAIRLINE};"
+            + f" border-radius: {tok.RADIUS_MD}px; }}"
+            + "\nQLabel#recoveryEmptyBannerTitle {"
+            + f" color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; font-weight: 700; background: transparent; }}"
+            + "\nQLabel#recoveryEmptyBannerDesc {"
+            + f" color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent; }}"
+            + "\nQLabel#recoveryEmptyListHint {"
+            + f" color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent; }}"
             + "\nQListWidget {"
             + f" background: {tok.INPUT_BG}; color: {tok.TEXT};"
             + f" border: 1px solid {tok.CONTROL_BORDER}; border-radius: {tok.RADIUS_MD}px;"
             + " padding: 4px; outline: none; }"
+            + "\nQListWidget:disabled {"
+            + f" background: {tok.SURFACE_PEARL}; color: {tok.TEXT_DIM}; border-color: {tok.HAIRLINE}; }}"
             + "\nQListWidget::item {"
             + f" color: {tok.TEXT}; border-radius: {tok.RADIUS_SM}px;"
             + " padding: 7px 10px; margin: 1px 0; }"
@@ -298,6 +336,8 @@ class AudioRecoveryDialog(QDialog):
             + "\nQPlainTextEdit {"
             + f" background: {tok.INPUT_BG}; color: {tok.TEXT};"
             + f" border: 1px solid {tok.CONTROL_BORDER}; border-radius: {tok.RADIUS_MD}px; padding: 8px 10px; }}"
+            + "\nQPlainTextEdit:focus {"
+            + f" border: 2px solid {tok.ACCENT_FOCUS}; padding: 7px 9px; }}"
         )
         self._note_label.setStyleSheet(
             f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
@@ -315,6 +355,7 @@ class AudioRecoveryDialog(QDialog):
         palette = self.output.palette()
         palette.setColor(QPalette.ColorRole.PlaceholderText, _qcolor(tok.TEXT_DIM))
         self.output.setPalette(palette)
+        apply_window_dark_titlebar(self, getattr(tok, "ACTIVE_THEME", "light") == "dark")
 
     def _sync_save_enabled(self) -> None:
         has_text = bool(self.output.toPlainText().strip())
@@ -349,13 +390,17 @@ class AudioRecoveryDialog(QDialog):
                 stamp = "未知时间"
             state = "已结束" if item.metadata.get("complete") else "异常中断 / 缓存失败"
             self.items.addItem(f"{stamp} · {item.seconds / 60:.1f} 分钟 · {state}")
-        if self.recordings:
+        has_recordings = bool(self.recordings)
+        self._empty_banner.setVisible(not has_recordings)
+        self._empty_list_hint.setVisible(not has_recordings)
+        if has_recordings:
             self.items.setCurrentRow(0)
             if self._current_recognizer() is None:
                 self.status.setText("模型尚未就绪，可先导出录音；模型载入后可重新识别。")
             else:
                 self.status.setText("")
         else:
+            self.track.clear()
             self.status.setText("没有录音缓存。开启「录音恢复」后，从下一次录音开始保存。")
         self._set_busy(False)
 

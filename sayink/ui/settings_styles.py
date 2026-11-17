@@ -125,8 +125,133 @@ def build_spinbox_css() -> str:
 """
 
 
-def build_window_css() -> str:
+def build_combo_css() -> str:
+    """Standard 40px form QComboBox with flat drop-down and themed chevron."""
     down = _spin_arrow_urls()[1]
+    return f"""
+    QComboBox {{
+        background: {t.INPUT_BG};
+        color: {t.TEXT};
+        border: 1px solid {t.CONTROL_BORDER};
+        border-radius: {t.RADIUS_MD}px;
+        padding: 6px 28px 6px 12px;
+        font-size: {t.TYPE_BODY_SM}px;
+        min-height: {t.CONTROL_FIELD_HEIGHT - 14}px;
+    }}
+    QComboBox:hover {{
+        border-color: {t.CONTROL_BORDER_HOVER};
+    }}
+    QComboBox:focus, QComboBox:on {{
+        border: 2px solid {t.ACCENT_FOCUS};
+        padding: 5px 27px 5px 11px;
+    }}
+    QComboBox:disabled {{
+        color: {t.TEXT_DIM};
+        background: {t.BAR_OFF};
+        border-color: {t.HAIRLINE};
+    }}
+    QComboBox::drop-down {{
+        subcontrol-origin: padding;
+        subcontrol-position: center right;
+        width: 28px;
+        border: none;
+        background: transparent;
+    }}
+    QComboBox::down-arrow {{
+        image: url("{down}");
+        width: 10px;
+        height: 6px;
+    }}
+    QComboBox QAbstractItemView {{
+        background: {t.SURFACE_PEARL};
+        color: {t.TEXT};
+        border: 1px solid {t.HAIRLINE};
+        border-radius: {t.RADIUS_LG}px;
+        padding: 4px;
+        selection-background-color: {t.ROW_SELECTED};
+        selection-color: {t.TEXT};
+        outline: none;
+    }}
+    QComboBox QAbstractItemView::item {{
+        min-height: 28px;
+        padding: 4px 28px 4px 10px;
+        border-radius: {t.RADIUS_SM}px;
+        color: {t.TEXT};
+    }}
+    QComboBox QAbstractItemView::item:hover,
+    QComboBox QAbstractItemView::item:selected {{
+        background: {t.ROW_SELECTED};
+        color: {t.TEXT};
+    }}
+"""
+
+
+def build_date_time_edit_css() -> str:
+    """40px QDateTimeEdit matching QComboBox / QLineEdit height, border, focus ring, and chevron."""
+    up, down = _spin_arrow_urls()
+    return f"""
+    QDateTimeEdit {{
+        background: {t.INPUT_BG};
+        color: {t.TEXT};
+        border: 1px solid {t.CONTROL_BORDER};
+        border-radius: {t.RADIUS_MD}px;
+        padding: 6px 28px 6px 12px;
+        font-size: {t.TYPE_BODY_SM}px;
+        min-height: {t.CONTROL_FIELD_HEIGHT - 14}px;
+        max-height: {t.CONTROL_FIELD_HEIGHT - 14}px;
+        selection-background-color: {t.PRIMARY_CONTAINER};
+        selection-color: {t.PRIMARY_ON};
+    }}
+    QDateTimeEdit:hover {{
+        border-color: {t.CONTROL_BORDER_HOVER};
+    }}
+    QDateTimeEdit:focus {{
+        border: 2px solid {t.ACCENT_FOCUS};
+        padding: 5px 27px 5px 11px;
+    }}
+    QDateTimeEdit:disabled {{
+        color: {t.TEXT_DIM};
+        background: {t.BAR_OFF};
+        border-color: {t.HAIRLINE};
+    }}
+    QDateTimeEdit::drop-down {{
+        subcontrol-origin: padding;
+        subcontrol-position: center right;
+        width: 28px;
+        border: none;
+        background: transparent;
+    }}
+    QDateTimeEdit::up-button, QDateTimeEdit::down-button {{
+        subcontrol-origin: border;
+        width: 22px;
+        background: {t.SURFACE_PEARL};
+        border: none;
+        border-left: 1px solid {t.HAIRLINE};
+    }}
+    QDateTimeEdit::up-button {{
+        subcontrol-position: top right;
+        margin: 1px 1px 0 0;
+        border-top-right-radius: {t.RADIUS_MD - 1}px;
+    }}
+    QDateTimeEdit::down-button {{
+        subcontrol-position: bottom right;
+        margin: 0 1px 1px 0;
+        border-bottom-right-radius: {t.RADIUS_MD - 1}px;
+    }}
+    QDateTimeEdit::up-arrow {{
+        image: url("{up}");
+        width: 10px;
+        height: 6px;
+    }}
+    QDateTimeEdit::down-arrow {{
+        image: url("{down}");
+        width: 10px;
+        height: 6px;
+    }}
+"""
+
+
+def build_window_css() -> str:
     return f"""
     QDialog {{
         background: transparent;
@@ -173,60 +298,8 @@ def build_window_css() -> str:
         border: none;
         background: transparent;
     }}
-    QComboBox {{
-        background: {t.INPUT_BG};
-        color: {t.TEXT};
-        border: 1px solid {t.CONTROL_BORDER};
-        border-radius: {t.RADIUS_MD}px;
-        padding: 6px 28px 6px 12px;
-        font-size: {t.TYPE_BODY_SM}px;
-        min-height: {t.CONTROL_FIELD_HEIGHT - 14}px;
-    }}
-    QComboBox:hover {{
-        border-color: {t.TEXT_DIM};
-    }}
-    QComboBox:focus, QComboBox:on {{
-        border: 2px solid {t.ACCENT_FOCUS};
-        padding: 5px 27px 5px 11px;
-    }}
-    QComboBox:disabled {{
-        color: {t.TEXT_DIM};
-        background: {t.BAR_OFF};
-        border-color: {t.HAIRLINE};
-    }}
-    QComboBox::drop-down {{
-        subcontrol-origin: padding;
-        subcontrol-position: center right;
-        width: 28px;
-        border: none;
-        background: transparent;
-    }}
-    QComboBox::down-arrow {{
-        image: url("{down}");
-        width: 10px;
-        height: 6px;
-    }}
-    QComboBox QAbstractItemView {{
-        background: {t.SURFACE_PEARL};
-        color: {t.TEXT};
-        border: 1px solid {t.HAIRLINE};
-        border-radius: {t.RADIUS_LG}px;
-        padding: 4px;
-        selection-background-color: {t.ROW_SELECTED};
-        selection-color: {t.TEXT};
-        outline: none;
-    }}
-    QComboBox QAbstractItemView::item {{
-        min-height: 28px;
-        padding: 4px 28px 4px 10px;
-        border-radius: {t.RADIUS_SM}px;
-        color: {t.TEXT};
-    }}
-    QComboBox QAbstractItemView::item:hover,
-    QComboBox QAbstractItemView::item:selected {{
-        background: {t.ROW_SELECTED};
-        color: {t.TEXT};
-    }}
+    {build_combo_css()}
+    {build_date_time_edit_css()}
     {build_spinbox_css()}
     QScrollBar:vertical {{
         background: transparent;
@@ -265,7 +338,7 @@ def build_btn_primary() -> str:
         background: {t.PRIMARY_CONTAINER_PRESSED};
         border-color: {t.PRIMARY_CONTAINER_PRESSED};
     }}
-    QPushButton:disabled {{ background: {t.BAR_OFF}; border-color: {t.BAR_OFF}; color: {t.TEXT_DIM}; }}
+    QPushButton:disabled {{ background: {t.SURFACE_PEARL}; border: 1px solid {t.HAIRLINE}; color: {t.TEXT_DIM}; font-weight: 400; }}
     QPushButton:focus {{ border: 2px solid {t.ACCENT_FOCUS}; padding: 8px 13px; }}
 """
 
@@ -289,8 +362,9 @@ def build_btn_ghost() -> str:
         background: {t.SURFACE_PEARL}; color: {t.TEXT}; border: 1px solid {t.HAIRLINE};
         border-radius: {t.RADIUS_MD}px; padding: 10px 22px; font-size: {t.TYPE_BODY}px;
     }}
-    QPushButton:hover {{ background: {t.SURFACE}; color: {t.TEXT}; border-color: {t.TEXT_DIM}; }}
+    QPushButton:hover {{ background: {t.SURFACE}; color: {t.TEXT}; border-color: {t.CONTROL_BORDER}; }}
     QPushButton:focus {{ outline: none; border: 2px solid {t.ACCENT_FOCUS}; padding: 9px 21px; }}
+    QPushButton:disabled {{ background: {t.SURFACE_PEARL}; color: {t.TEXT_DIM}; border: 1px solid {t.HAIRLINE}; font-weight: 400; }}
 """
 
 
@@ -318,7 +392,7 @@ def build_btn_ghost_sm() -> str:
     QPushButton:focus {{
         border: 2px solid {t.ACCENT_FOCUS}; padding: 0px {focus_pad_h}px;
     }}
-    QPushButton:disabled {{ color: {t.TEXT_DIM}; background: transparent; border-color: transparent; }}
+    QPushButton:disabled {{ color: {t.TEXT_DIM}; background: {t.SURFACE_PEARL}; border: 1px solid {t.HAIRLINE}; font-weight: 400; }}
 """
 
 
@@ -334,7 +408,7 @@ def build_btn_danger_sm() -> str:
     QPushButton:focus {{
         border: 2px solid {t.ACCENT_FOCUS}; padding: 0px {focus_pad_h}px;
     }}
-    QPushButton:disabled {{ color: {t.TEXT_DIM}; background: transparent; border-color: {t.HAIRLINE}; }}
+    QPushButton:disabled {{ color: {t.TEXT_DIM}; background: {t.SURFACE_PEARL}; border: 1px solid {t.HAIRLINE}; font-weight: 400; }}
 """
 
 
@@ -427,7 +501,7 @@ def build_btn_accent_sm() -> str:
     QPushButton:focus {{
         border: 2px solid {t.ACCENT_FOCUS}; padding: 0px {focus_pad_h}px;
     }}
-    QPushButton:disabled {{ color: {t.TEXT_DIM}; background: transparent; border-color: transparent; font-weight: 400; }}
+    QPushButton:disabled {{ color: {t.TEXT_DIM}; background: {t.SURFACE_PEARL}; border: 1px solid {t.HAIRLINE}; font-weight: 400; }}
 """
 
 
@@ -459,6 +533,8 @@ def reload_styles() -> None:
     global _LOADED_AXIS, _LOADED_FONT
     sc.reload_styles()
     g = globals()
+    g["COMBO_CSS"] = build_combo_css()
+    g["DATE_TIME_EDIT_CSS"] = build_date_time_edit_css()
     g["WINDOW_CSS"] = build_window_css()
     g["BTN_PRIMARY"] = build_btn_primary()
     g["BTN_GHOST"] = build_btn_ghost()
@@ -470,6 +546,8 @@ def reload_styles() -> None:
     _LOADED_FONT = getattr(t, "UI_FONT_FAMILY", None)
 
 
+COMBO_CSS = ""
+DATE_TIME_EDIT_CSS = ""
 WINDOW_CSS = ""
 BTN_PRIMARY = ""
 BTN_GHOST = ""

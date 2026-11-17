@@ -209,6 +209,7 @@ def _ghost_button(
 ) -> QPushButton:
     btn = QPushButton(text)
     btn.setProperty("viBtn", "ghostSm")
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
     btn.setMinimumHeight(height)
     btn.setStyleSheet(settings_styles.BTN_GHOST_SM)
     if tooltip:
@@ -528,18 +529,21 @@ class GeneralSettingsPage(SettingsPage):
         self.hotkey_conflict_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.hotkey_conflict_label.setProperty("viTone", "idle")
         self.hotkey_conflict_label.hide()
-        lay.addWidget(stacked_field_row("录音快捷键", self.hotkey_edit))
-        lay.addWidget(self.hotkey_hint)
-        lay.addWidget(self.hotkey_conflict_label)
         self.hotkey_reset_btn = _ghost_button(
             "快捷键恢复默认",
             self.hotkey_reset_requested.emit,
             tooltip="仅将录音快捷键恢复为 Alt+X，不改变转写模式、Esc、音频来源和结果去向",
         )
         self.hotkey_reset_btn.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
-        hotkey_reset_wrap = inline_action_row(self.hotkey_reset_btn)
-        hotkey_reset_wrap.layout().setAlignment(self.hotkey_reset_btn, Qt.AlignmentFlag.AlignLeft)
-        lay.addWidget(hotkey_reset_wrap)
+        hotkey_input_row = QWidget()
+        hotkey_input_lay = QHBoxLayout(hotkey_input_row)
+        hotkey_input_lay.setContentsMargins(0, 0, 0, 0)
+        hotkey_input_lay.setSpacing(8)
+        hotkey_input_lay.addWidget(self.hotkey_edit, 1)
+        hotkey_input_lay.addWidget(self.hotkey_reset_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(stacked_field_row("录音快捷键", hotkey_input_row, buddy=self.hotkey_edit))
+        lay.addWidget(self.hotkey_hint)
+        lay.addWidget(self.hotkey_conflict_label)
         self.hotkey_edit.hotkey_changed.connect(self.sync_hotkey_reset_state)
         self.sync_hotkey_reset_state(self.hotkey_edit.value)
         self.esc_stop_divider = group_divider()

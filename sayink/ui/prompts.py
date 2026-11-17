@@ -6,6 +6,7 @@ ship a QTranslator. Callers pass the verb the button actually performs.
 
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -17,24 +18,88 @@ from PyQt6.QtWidgets import (
 )
 
 
+_STANDARD_BUTTON_LABELS = {
+    QMessageBox.StandardButton.Ok: "确定",
+    QMessageBox.StandardButton.Cancel: "取消",
+    QMessageBox.StandardButton.Yes: "确定",
+    QMessageBox.StandardButton.No: "取消",
+    QMessageBox.StandardButton.Close: "关闭",
+}
+
+_ENGLISH_FALLBACK_LABELS = {
+    "ok": "确定",
+    "cancel": "取消",
+    "yes": "确定",
+    "no": "取消",
+    "close": "关闭",
+}
+
+
+def localize_message_box_buttons(box: QMessageBox) -> None:
+    """Translate standard English Ok/Cancel/Yes/No/Close buttons into Chinese."""
+    if not isinstance(box, QMessageBox):
+        return
+    for btn in box.buttons():
+        std = box.standardButton(btn)
+        if std in _STANDARD_BUTTON_LABELS:
+            btn.setText(_STANDARD_BUTTON_LABELS[std])
+            continue
+        cleaned = (btn.text() or "").replace("&", "").strip().lower()
+        if cleaned in _ENGLISH_FALLBACK_LABELS:
+            btn.setText(_ENGLISH_FALLBACK_LABELS[cleaned])
+
+
+def _resolve_primary_button(box: QMessageBox, primary: object | None) -> object | None:
+    if primary is not None:
+        return primary
+    buttons = box.buttons()
+    if len(buttons) == 1:
+        return buttons[0]
+    default_btn = box.defaultButton()
+    accept_roles = (
+        QMessageBox.ButtonRole.AcceptRole,
+        QMessageBox.ButtonRole.YesRole,
+        QMessageBox.ButtonRole.ActionRole,
+    )
+    if default_btn in buttons and box.buttonRole(default_btn) in accept_roles:
+        return default_btn
+    for btn in buttons:
+        if box.buttonRole(btn) in (QMessageBox.ButtonRole.AcceptRole, QMessageBox.ButtonRole.YesRole):
+            return btn
+    return default_btn if default_btn in buttons else None
+
+
 def style_message_box(
     box: QMessageBox,
     *,
     primary: object | None = None,
     destructive: bool = False,
 ) -> None:
-    """Apply active theme tokens to a QMessageBox and its buttons."""
+    """Localize standard buttons and apply active theme tokens + dark titlebar to a QMessageBox."""
+    if not isinstance(box, QMessageBox):
+        return
     from sayink.ui import design_tokens as tok
     from sayink.ui import settings_styles as ss
+    from sayink.ui.theme import apply_window_dark_titlebar
+
+    localize_message_box_buttons(box)
+    resolved_primary = _resolve_primary_button(box, primary)
+    axis = getattr(tok, "ACTIVE_THEME", "light")
+    box.setProperty("_sayinkStyledPrimary", resolved_primary)
+    box.setProperty("_sayinkStyledDestructive", bool(destructive))
+    box.setProperty("_sayinkMessageBoxStyled", axis)
 
     box.setStyleSheet(
         ss.WINDOW_CSS
         + f"\nQMessageBox {{ background: {tok.BG}; color: {tok.TEXT}; }}"
-        + f"\nQMessageBox QLabel {{ color: {tok.TEXT}; background: transparent; }}"
+        + f"\nQMessageBox QLabel {{ color: {tok.TEXT}; font-size: {tok.TYPE_BODY_SM}px; background: transparent; }}"
     )
     primary_css = ss.BTN_DANGER_SOLID_SM if destructive else ss.BTN_ACCENT_SM
     for btn in box.buttons():
-        btn.setStyleSheet(primary_css if btn is primary else ss.BTN_GHOST_SM)
+        btn.setMinimumWidth(68)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(primary_css if btn is resolved_primary else ss.BTN_GHOST_SM)
+    apply_window_dark_titlebar(box, axis == "dark")
 
 
 def confirm_box(
@@ -172,6 +237,30 @@ def text_prompt_box(
     buttons.accepted.connect(_on_accept)
     buttons.rejected.connect(dialog.reject)
     layout.addWidget(buttons)
+
+    def _reapply_prompt_theme() -> None:
+        from sayink.ui.theme import apply_window_dark_titlebar
+
+        dialog.setStyleSheet(
+            settings_styles.WINDOW_CSS
+            + f"\nQDialog {{ background: {tok.BG}; color: {tok.TEXT}; }}"
+        )
+        error_label.setStyleSheet(
+            f"color: {tok.RED_TEXT}; font-size: {tok.TYPE_CAPTION}px;"
+            " font-weight: 700; background: transparent;"
+        )
+        save.setStyleSheet(settings_styles.BTN_PRIMARY)
+        cancel.setStyleSheet(settings_styles.BTN_GHOST)
+        if error_label.isVisible():
+            edit.setStyleSheet(
+                f"QLineEdit {{ background: {tok.SURFACE}; color: {tok.TEXT};"
+                f" border: 2px solid {tok.RED_TEXT}; border-radius: {tok.RADIUS_MD}px;"
+                " padding: 5px 11px; }"
+            )
+        apply_window_dark_titlebar(dialog, getattr(tok, "ACTIVE_THEME", "light") == "dark")
+
+    dialog.reapply_theme = _reapply_prompt_theme  # type: ignore[attr-defined]
+    _reapply_prompt_theme()
     edit.setFocus()
     return dialog, edit
 
