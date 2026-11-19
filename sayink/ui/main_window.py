@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import weakref
 
 from PyQt6.QtCore import QEvent, QLineF, QPoint, QRect, QRectF, Qt, pyqtSignal
@@ -34,11 +35,42 @@ from sayink.ui import design_tokens as tok
 from sayink.ui.settings_components import _qcolor, sync_group_tab_stop
 
 if sys.platform == "win32":
+    import ctypes as _win32_ctypes
     from ctypes import wintypes as _win32_wintypes
+
+    class _WIN32_RECT_TYPE(_win32_ctypes.Structure):
+        _fields_ = [
+            ("left", _win32_ctypes.c_long),
+            ("top", _win32_ctypes.c_long),
+            ("right", _win32_ctypes.c_long),
+            ("bottom", _win32_ctypes.c_long),
+        ]
+
+    class _WIN32_NCCALCSIZE_PARAMS_TYPE(_win32_ctypes.Structure):
+        _fields_ = [
+            ("rgrc", _WIN32_RECT_TYPE * 3),
+            ("lppos", _win32_ctypes.c_void_p),
+        ]
+
+    class _WIN32_WINDOWPOS_TYPE(_win32_ctypes.Structure):
+        _fields_ = [
+            ("hwnd", _win32_wintypes.HWND),
+            ("hwndInsertAfter", _win32_wintypes.HWND),
+            ("x", _win32_ctypes.c_int),
+            ("y", _win32_ctypes.c_int),
+            ("cx", _win32_ctypes.c_int),
+            ("cy", _win32_ctypes.c_int),
+            ("flags", _win32_ctypes.c_uint),
+        ]
 
     _WIN32_MSG_TYPE = _win32_wintypes.MSG
 else:
+    _WIN32_RECT_TYPE = None
+    _WIN32_NCCALCSIZE_PARAMS_TYPE = None
+    _WIN32_WINDOWPOS_TYPE = None
     _WIN32_MSG_TYPE = None
+
+_LIVE_RESIZE_PAINT_EVENT = QEvent.Type(QEvent.registerEventType())
 
 _STATE_TONES = {
     RuntimeState.READY: "GREEN",
@@ -66,7 +98,9 @@ _NAV_BTN_H = 40
 _NAV_FONT_PX = 14
 _INK_DOT_PX = 8
 _STATUS_DOT_PX = 8
-_RESIZE_BORDER_PX = 6
+# Wide enough to grab at 200% scaling. The rounded region used to cut the
+# corner of this band off the window, so the corners never received the click.
+_RESIZE_BORDER_PX = 8
 _WINDOW_W = 960
 _WINDOW_H = 640
 _MIN_W = tok.MIN_WINDOW_WIDTH
@@ -84,6 +118,7 @@ _WM_ENTERSIZEMOVE = 0x0231
 _WM_EXITSIZEMOVE = 0x0232
 _WM_SIZING = 0x0214
 _WM_WINDOWPOSCHANGING = 0x0046
+_WM_WINDOWPOSCHANGED = 0x0047
 # Qt sets this on every size change. It throws away the client bits, and the
 # following erase is the full-window flash on an edge or corner drag.
 _SWP_NOSIZE = 0x0001
@@ -145,6 +180,28 @@ def _win32_draw():
     gdi32.DeleteObject.restype = c_int
     cached = (user32, gdi32, RECT, byref)
     _win32_draw._api = cached
+    return cached
+
+
+def _win32_sync():
+    """Cached Win32 invalidation/frame helpers with 64-bit HWND safety."""
+    cached = getattr(_win32_sync, "_api", None)
+    if cached is not None:
+        return cached
+    import ctypes
+    from ctypes import byref, c_int, c_uint, windll, wintypes
+
+    user32 = windll.user32
+    user32.InvalidateRect.argtypes = [wintypes.HWND, ctypes.POINTER(_WIN32_RECT_TYPE), wintypes.BOOL]
+    user32.InvalidateRect.restype = wintypes.BOOL
+    user32.UpdateWindow.argtypes = [wintypes.HWND]
+    user32.UpdateWindow.restype = wintypes.BOOL
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, c_int, c_int, c_int, c_int, c_uint,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    cached = (user32, byref)
+    _win32_sync._api = cached
     return cached
 
 
@@ -257,6 +314,11 @@ class MainWindow(QWidget):
         self._drag_offset = None
         self._live_resizing = False
         self._sizing_edge = 0
+        # True only after DWM accepts rounded corners. That clip replaces the
+        # window region: a region deletes the corner pixels, and those pixels
+        # are the resize handles.
+        self._dwm_round_corners = False
+        self._dwm_corners_unsupported = False
         self._model_runtime_text = "正在启动…"
         self._model_runtime_state = RuntimeState.LOADING
         # A live meeting owns the dot while it runs (see _refresh_usage_summary).
@@ -778,18 +840,87 @@ class MainWindow(QWidget):
         # and again on the way back.
         if self.isMinimized():
             return
+        self._position_size_grip()
+        self._position_frame_edges()
+        if self.isMaximized():
+            self._clear_round_mask()
+        else:
+            self._apply_window_shape()
+        # Rebuilding the history and meeting panes on every pixel is what makes
+        # an edge drag hitch. The final size still gets one layout pass.
+        if self._live_resizing:
+            self._schedule_resize_followup()
+            return
+        self._follow_resize()
+
+    def _schedule_resize_followup(self) -> None:
+        from PyQt6.QtCore import QTimer
+
+        timer = getattr(self, "_resize_follow_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._follow_resize)
+            self._resize_follow_timer = timer
+        timer.start(32)
+
+    def _follow_resize(self) -> None:
+        if self.isMinimized():
+            return
+        if self._live_resizing:
+            self._schedule_resize_followup()
+            return
+        self._follow_resize_seq = int(getattr(self, "_follow_resize_seq", 0)) + 1
+        timer = getattr(self, "_resize_follow_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
         self._sync_compact_sidebar(self.width())
         for page in (getattr(self, "_history", None), getattr(self, "_meeting", None)):
             sync_fn = getattr(page, "sync_viewport_width", None)
             if callable(sync_fn):
                 sync_fn(self.width())
-        self._position_size_grip()
         self._sync_frame_margin()
-        self._position_frame_edges()
-        if self.isMaximized():
-            self._clear_round_mask()
+        from sayink.ui import flow_layout
+
+        flush_fn = getattr(flow_layout, "flush_live_resize", None)
+        if callable(flush_fn):
+            flush_fn(self)
+        live_timer = getattr(self, "_live_resize_timer", None)
+        if live_timer is not None and live_timer.isActive():
+            live_timer.stop()
+
+    def _end_live_resize(self) -> None:
+        """Clear interactive live-resize state and flush deferred timers/callbacks."""
+        was_live = bool(self._live_resizing)
+        was_sizing = bool(self._sizing_edge)
+        self._drag_offset = None
+        self._sizing_edge = 0
+        self._live_resizing = False
+        timer = getattr(self, "_resize_follow_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+        if not was_live and not was_sizing:
+            live_timer = getattr(self, "_live_resize_timer", None)
+            if live_timer is not None and live_timer.isActive():
+                live_timer.stop()
             return
-        self._apply_window_shape()
+        seq_before = int(getattr(self, "_follow_resize_seq", 0))
+        if was_sizing:
+            self._restore_resting_nudge(int(self.winId() or 0), True)
+        if not self.isMinimized():
+            if self.isVisible():
+                self._apply_window_shape()
+            if int(getattr(self, "_follow_resize_seq", 0)) == seq_before:
+                self._follow_resize()
+            return
+        from sayink.ui import flow_layout
+
+        flush_fn = getattr(flow_layout, "flush_live_resize", None)
+        if callable(flush_fn):
+            flush_fn(self)
+        live_timer = getattr(self, "_live_resize_timer", None)
+        if live_timer is not None and live_timer.isActive():
+            live_timer.stop()
 
     def show(self) -> None:
         # The tray can reopen a window that is still visible to Qt but minimized
@@ -926,6 +1057,10 @@ class MainWindow(QWidget):
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowDeactivate:
+            if self._live_resizing or self._sizing_edge:
+                self._end_live_resize()
+            return
         if event.type() != QEvent.Type.WindowStateChange:
             return
         if hasattr(self, "_max_btn"):
@@ -975,22 +1110,22 @@ class MainWindow(QWidget):
             _DWMWA_SYSTEMBACKDROP_TYPE: _DWMSBT_NONE,
         }
 
-    def _apply_dwm_attribute(self, attr: int, value: int) -> None:
+    def _apply_dwm_attribute(self, attr: int, value: int) -> bool:
         if sys.platform != "win32":
-            return
+            return False
         try:
             from ctypes import byref, c_int, c_long, c_void_p, sizeof, windll, wintypes
 
             hwnd = int(self.winId())
             if hwnd == 0:
-                return
+                return False
             dwm_set = windll.dwmapi.DwmSetWindowAttribute
             if hasattr(dwm_set, "argtypes"):
                 dwm_set.argtypes = [wintypes.HWND, wintypes.DWORD, c_void_p, wintypes.DWORD]
                 dwm_set.restype = c_long
-            dwm_set(hwnd, attr, byref(c_int(value)), sizeof(c_int))
+            return int(dwm_set(hwnd, attr, byref(c_int(value)), sizeof(c_int))) == 0
         except Exception:
-            return
+            return False
 
     def _apply_dwm_theme_colors(self) -> None:
         from sayink.ui import design_tokens as live
@@ -1001,8 +1136,18 @@ class MainWindow(QWidget):
             self._apply_dwm_attribute(attr, value)
 
     def _apply_native_round_corners(self, radius: int) -> None:
+        if getattr(self, "_dwm_corners_unsupported", False):
+            self._dwm_round_corners = False
+            return
+        # DWMWCP_ROUND while windowed, DWMWCP_DONOTROUND while maximized.
         preference = 1 if radius <= 0 else 2
-        self._apply_dwm_attribute(_DWMWA_WINDOW_CORNER_PREFERENCE, preference)
+        ok = self._apply_dwm_attribute(_DWMWA_WINDOW_CORNER_PREFERENCE, preference)
+        if preference != 2:
+            self._dwm_round_corners = False
+            return
+        self._dwm_round_corners = bool(ok)
+        if not ok and int(self.winId() or 0):
+            self._dwm_corners_unsupported = True
 
     def _clear_round_mask(self) -> None:
         self._mask_key = None
@@ -1089,11 +1234,18 @@ class MainWindow(QWidget):
 
     def _apply_window_shape(self) -> None:
         radius = self._chrome_radius()
-        if radius != getattr(self, "_native_radius", None):
+        corners_ready = bool(getattr(self, "_dwm_round_corners", False))
+        if radius != getattr(self, "_native_radius", None) or (radius > 0 and not corners_ready):
             self._native_radius = radius
             self._apply_native_round_corners(radius)
         # Swapping the window region on every frame of a drag makes the edges jitter.
         if radius <= 0 or self.isMaximized() or self._live_resizing:
+            self._clear_round_mask()
+            return
+        # DWM already clips the drawn corners. A region would also delete them
+        # from hit testing, and the four corner resize handles would be gone.
+        # Moving that region is what makes a title-bar drag stutter.
+        if getattr(self, "_dwm_round_corners", False):
             self._clear_round_mask()
             return
         key = (self.width(), self.height(), radius)
@@ -1190,9 +1342,8 @@ class MainWindow(QWidget):
             elif (
                 etype == QEvent.Type.MouseButtonRelease
                 and event.button() == Qt.MouseButton.LeftButton
-            ):
-                self._live_resizing = False
-                self._apply_window_shape()
+            ) or etype in (QEvent.Type.UngrabMouse, QEvent.Type.Hide):
+                self._end_live_resize()
             return super().eventFilter(obj, event)
         # The caption covers the top resize border. A Qt drag from those
         # pixels fights the native top-edge resize and the window shakes.
@@ -1209,6 +1360,10 @@ class MainWindow(QWidget):
         if self._caption_drag_target(obj) and event.type() == QEvent.Type.MouseButtonDblClick:
             if event.button() == Qt.MouseButton.LeftButton:
                 self._drag_offset = None
+                # The native double-click already toggles while a system move
+                # loop is running. A second toggle would restore immediately.
+                if time.monotonic() - getattr(self, "_caption_dblclick_at", 0.0) < 0.4:
+                    return True
                 self._toggle_maximized()
                 return True
         if not self._caption_drag_target(obj) or self.isMaximized():
@@ -1220,6 +1375,12 @@ class MainWindow(QWidget):
             etype == QEvent.Type.MouseButtonPress
             and event.button() == Qt.MouseButton.LeftButton
         ):
+            # self.move() on every mouse event waits for a full Python round
+            # trip, so the window trails the cursor. The system move loop
+            # drags in the compositor and still snaps to the screen edges.
+            if self._begin_system_move():
+                self._drag_offset = None
+                return True
             self._drag_offset = (
                 event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             )
@@ -1236,6 +1397,26 @@ class MainWindow(QWidget):
             self._drag_offset = None
         return super().eventFilter(obj, event)
 
+    def _begin_system_move(self) -> bool:
+        """Drag with the system move loop when this press is a real click.
+
+        A synthetic mouse event does not hold the button down. Falling
+        through to the Qt move keeps tests and replayed events working.
+        """
+        if sys.platform != "win32":
+            return False
+        handle = self.windowHandle()
+        if handle is None:
+            return False
+        try:
+            import ctypes
+
+            if not (ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000):
+                return False
+            return bool(handle.startSystemMove())
+        except Exception:
+            return False
+
     def _hide_window(self) -> None:
         """Leave the app in the tray. The window should already be gone before Qt tears state down.
 
@@ -1247,6 +1428,8 @@ class MainWindow(QWidget):
             return
         self._hiding = True
         self._drag_offset = None
+        if self._live_resizing or self._sizing_edge:
+            self._end_live_resize()
         was_visible = self.isVisible()
         try:
             if sys.platform == "win32" and was_visible:
@@ -1297,6 +1480,11 @@ class MainWindow(QWidget):
         if getattr(self, "_native_dialog_depth", 0):
             return
         self._close_hold = False
+
+    def hideEvent(self, event) -> None:
+        if self._live_resizing or self._sizing_edge:
+            self._end_live_resize()
+        super().hideEvent(event)
 
     def closeEvent(self, event) -> None:
         event.ignore()
@@ -1487,20 +1675,9 @@ class MainWindow(QWidget):
 
     @staticmethod
     def _nccalc_params(msg):
-        from ctypes import POINTER, Structure, c_long, c_void_p, cast
-
-        class RECT(Structure):
-            _fields_ = [
-                ("left", c_long),
-                ("top", c_long),
-                ("right", c_long),
-                ("bottom", c_long),
-            ]
-
-        class NCCALCSIZE_PARAMS(Structure):
-            _fields_ = [("rgrc", RECT * 3), ("lppos", c_void_p)]
-
-        return cast(msg.lParam, POINTER(NCCALCSIZE_PARAMS)).contents
+        return _win32_ctypes.cast(
+            msg.lParam, _win32_ctypes.POINTER(_WIN32_NCCALCSIZE_PARAMS_TYPE)
+        ).contents
 
     def _is_zoomed(self, hwnd) -> bool:
         if self.isFullScreen():
@@ -1546,27 +1723,58 @@ class MainWindow(QWidget):
         Consuming the message also skips the frame-margin correction Qt would
         apply from the one-pixel resting nudge.
         """
-        if not self._live_resizing:
+        if not self._live_resizing or not msg.lParam:
             return False
-        import ctypes
-        from ctypes import wintypes
-
-        class WINDOWPOS(ctypes.Structure):
-            _fields_ = [
-                ("hwnd", wintypes.HWND),
-                ("hwndInsertAfter", wintypes.HWND),
-                ("x", ctypes.c_int),
-                ("y", ctypes.c_int),
-                ("cx", ctypes.c_int),
-                ("cy", ctypes.c_int),
-                ("flags", ctypes.c_uint),
-            ]
-
-        pos = ctypes.cast(msg.lParam, ctypes.POINTER(WINDOWPOS)).contents
+        pos = _win32_ctypes.cast(
+            msg.lParam, _win32_ctypes.POINTER(_WIN32_WINDOWPOS_TYPE)
+        ).contents
         if pos.flags & _SWP_NOSIZE:
             return False
         pos.flags &= ~_SWP_NOCOPYBITS
         return True
+
+    def _mark_live_resize_dirty(self, msg) -> None:
+        """Guarantee a synchronous WM_PAINT on every live resize step, including shrinks.
+
+        Clearing ``SWP_NOCOPYBITS`` leaves the Win32 update region empty whenever
+        width and height shrink, so ``UpdateWindow`` skips ``WM_PAINT`` and leaves
+        right/bottom chrome clipped until posted events drain. Invalidating a 1×1
+        corner pixel without erase triggers ``WM_PAINT`` synchronously while keeping
+        preserved client pixels intact before ``QBackingStore`` flushes.
+        """
+        if not self._live_resizing or not msg.lParam or self.isMinimized():
+            return
+        pos = _win32_ctypes.cast(
+            msg.lParam, _win32_ctypes.POINTER(_WIN32_WINDOWPOS_TYPE)
+        ).contents
+        if pos.flags & _SWP_NOSIZE or pos.cx <= 0 or pos.cy <= 0:
+            return
+        hwnd = int(msg.hWnd or 0)
+        if not hwnd:
+            return
+        user32, byref = _win32_sync()
+        corner = _WIN32_RECT_TYPE(pos.cx - 1, pos.cy - 1, pos.cx, pos.cy)
+        user32.InvalidateRect(hwnd, byref(corner), False)
+        if not getattr(self, "_resize_paint_queued", False):
+            self._resize_paint_queued = True
+            QApplication.postEvent(self, QEvent(_LIVE_RESIZE_PAINT_EVENT))
+
+    def _restore_resting_nudge(self, hwnd, was_sizing: bool) -> None:
+        """Re-apply the 1px bottom client extension once an edge resize finishes."""
+        if (
+            not was_sizing
+            or not hwnd
+            or not self._uses_win32_surface()
+            or not self.isVisible()
+            or self.isMinimized()
+            or self._is_zoomed(hwnd)
+        ):
+            return
+        try:
+            user32, _byref = _win32_sync()
+            user32.SetWindowPos(int(hwnd), 0, 0, 0, 0, 0, _SWP_FRAMECHANGED)
+        except Exception:
+            return
 
     def _expand_caption_sized_show(self, msg) -> None:
         """Show the page at its real size instead of the tiny system caption.
@@ -1635,19 +1843,15 @@ class MainWindow(QWidget):
         cy.value = want_h
 
     def _client_alignment(self) -> int:
-        """Anchor existing pixels to the edges that are not being dragged.
+        """Keep existing pixels pinned to the top-left origin during live resize.
 
-        The default copy pins them to the top-left. A top or left drag then
-        slides the whole page for a frame. Anchoring to the stable edges
-        leaves those pixels where they are, so only the new strip is painted.
+        The custom caption bar, navigation sidebar, and page headers are all
+        top-left anchored in Qt. Returning ``WVR_ALIGNBOTTOM`` or ``WVR_ALIGNRIGHT``
+        on top/left/top-right drags shifts those controls away from ``(0, 0)`` in
+        the DWM surface before ``QBackingStore`` flushes, causing per-frame
+        oscillation. Top-left alignment (``0``) keeps top-left chrome stationary
+        and exposes only the trailing right/bottom strip.
         """
-        edge = self._sizing_edge
-        if edge in (_WMSZ_TOP, _WMSZ_TOPRIGHT):
-            return _WVR_ALIGNBOTTOM | _WVR_ALIGNLEFT
-        if edge == _WMSZ_TOPLEFT:
-            return _WVR_ALIGNBOTTOM | _WVR_ALIGNRIGHT
-        if edge in (_WMSZ_LEFT, _WMSZ_BOTTOMLEFT):
-            return _WVR_ALIGNTOP | _WVR_ALIGNRIGHT
         return 0
 
     def _release_theme_brush(self) -> None:
@@ -1960,6 +2164,22 @@ class MainWindow(QWidget):
         fitted.ptMaxSize.y = work.bottom - work.top
         return True
 
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.UngrabMouse and (self._live_resizing or self._sizing_edge):
+            self._end_live_resize()
+        if event.type() == _LIVE_RESIZE_PAINT_EVENT:
+            self._resize_paint_queued = False
+            if sys.platform == "win32" and self.isVisible() and not self.isMinimized():
+                try:
+                    hwnd = int(self.winId() or 0)
+                    if hwnd:
+                        user32, _byref = _win32_sync()
+                        user32.UpdateWindow(hwnd)
+                except Exception:
+                    pass
+            return True
+        return super().event(event)
+
     def nativeEvent(self, event_type, message):
         # Note: deliberately never delegates to super().nativeEvent(); the
         # PyQt6 base implementation faults when re-entered with the voidptr.
@@ -1969,15 +2189,18 @@ class MainWindow(QWidget):
                 msg = _WIN32_MSG_TYPE.from_address(int(message))
                 if msg.message == _WM_ERASEBKGND:
                     # Windows erases with the light class brush before Qt paints.
-                    # That full-window white is the flash on show. During a drag
-                    # the old pixels are still valid; filling them is the flicker.
-                    if not self._live_resizing:
-                        self._erase_background(msg)
+                    # Filling with the theme brush prevents a white flash on show
+                    # AND fills newly exposed right/bottom strips during outward
+                    # drags (where HDC is clipped strictly to the new strip) so
+                    # DWM never presents uninitialized black pixels.
+                    self._erase_background(msg)
                     return True, 1
                 if msg.message == _WM_WINDOWPOSCHANGING:
                     self._expand_caption_sized_show(msg)
                     if self._keep_resize_bits(msg):
                         return True, 0
+                elif msg.message == _WM_WINDOWPOSCHANGED:
+                    self._mark_live_resize_dirty(msg)
                 if msg.message == _WM_NCPAINT:
                     # WS_CAPTION is on for snap. Painting that non-client frame
                     # is the small system caption (icon, maximize, close).
@@ -1993,23 +2216,20 @@ class MainWindow(QWidget):
                     if self._fill_min_max_info(msg):
                         return True, 0
                 if msg.message == _WM_NCLBUTTONDBLCLK and int(msg.wParam) == _HTCAPTION:
+                    self._caption_dblclick_at = time.monotonic()
                     self._toggle_maximized()
                     return True, 0
                 if msg.message == _WM_NCCALCSIZE and msg.wParam:
                     # Decide from the rect Windows proposed. The one-pixel client
                     # extension below would otherwise look like a size change.
                     # A caption move has no sizing edge and keeps the resting rect.
-                    # An edge drag anchors the existing pixels instead of throwing
-                    # them away: a full discard is erased white for one frame.
+                    # An edge drag anchors the existing pixels to top-left instead
+                    # of throwing them away: a full discard flashes for one frame.
                     resizing = bool(self._sizing_edge) and self._proposed_size_changed(msg)
-                    # The extra pixel is only for a resting top border. During a
-                    # drag it makes the client one pixel taller than the window
-                    # Qt is sizing, so the two rects chase each other.
-                    if (
-                        not self._is_zoomed(msg.hWnd)
-                        and not self._live_resizing
-                        and not self._sizing_edge
-                    ):
+                    # The extra pixel is only off while an edge is actively sizing
+                    # so Qt and Windows size the exact same rect. Pure caption moves
+                    # (_sizing_edge == 0) keep the resting extension untouched.
+                    if not self._is_zoomed(msg.hWnd) and not self._sizing_edge:
                         self._nudge_client_bottom(msg)
                     if resizing:
                         return True, self._client_alignment()
@@ -2029,10 +2249,15 @@ class MainWindow(QWidget):
                     self._live_resizing = True
                     self._clear_round_mask()
                 elif msg.message == _WM_EXITSIZEMOVE:
+                    was_sizing = bool(self._sizing_edge)
                     self._drag_offset = None
                     self._sizing_edge = 0
                     self._live_resizing = False
+                    seq_before = int(getattr(self, "_follow_resize_seq", 0))
+                    self._restore_resting_nudge(msg.hWnd, was_sizing)
                     self._apply_window_shape()
+                    if int(getattr(self, "_follow_resize_seq", 0)) == seq_before:
+                        self._follow_resize()
                 if msg.message == _WM_NCHITTEST and self.windowHandle() is not None:
                     # QCursor.pos() is already in logical coordinates, which
                     # keeps the hit test correct on mixed-DPI monitor setups.

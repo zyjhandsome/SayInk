@@ -445,6 +445,15 @@ class _SampledSpeakerView:
         self.speaker_count = int(speaker_count)
 
 
+def _subsample_evenly(indices: list[int], limit: int) -> list[int]:
+    if limit <= 0 or not indices:
+        return []
+    if len(indices) <= limit:
+        return list(indices)
+    step = len(indices) / limit
+    return [indices[min(len(indices) - 1, int(i * step))] for i in range(limit)]
+
+
 def _select_bounded_turn_indices(
     turns: list[TurnObservation],
     *,
@@ -452,31 +461,54 @@ def _select_bounded_turn_indices(
     protected: set[int],
     locked: set[int],
     sample_budget: int,
+    max_turns: int = MAX_UNBOUNDED_TURNS,
 ) -> list[int]:
-    must_keep: list[int] = []
+    hard_cap = max(1, int(max_turns))
+    target = min(hard_cap, max(1, int(sample_budget)))
+    anchors: list[int] = []
+    pinned: list[int] = []
+    protected_pool: list[int] = []
     optional: list[int] = []
     seen_first_for_speaker: set[int] = set()
     for idx, turn in enumerate(turns):
         is_anchor = turn.speaker_id > 0 and turn.speaker_id not in seen_first_for_speaker
         if is_anchor:
             seen_first_for_speaker.add(turn.speaker_id)
-        if (
-            turn.key in locked
-            or turn.key in confirmed
-            or turn.speaker_id in protected
-            or is_anchor
-        ):
-            must_keep.append(idx)
+            anchors.append(idx)
+        elif turn.key in locked or turn.key in confirmed:
+            pinned.append(idx)
+        elif turn.speaker_id in protected:
+            protected_pool.append(idx)
         else:
             optional.append(idx)
-    budget = max(0, int(sample_budget) - len(must_keep))
-    if budget >= len(optional):
-        return sorted(must_keep + optional)
-    if budget <= 0:
-        return sorted(must_keep)
-    step = len(optional) / budget
-    sampled_opt = [optional[min(len(optional) - 1, int(i * step))] for i in range(budget)]
-    return sorted(set(must_keep) | set(sampled_opt))
+
+    if len(anchors) >= hard_cap:
+        return sorted(_subsample_evenly(anchors, hard_cap))
+
+    # Unsampled confirmed/locked/protected turns still keep their exact speaker
+    # during projection, so never let a huge pinned/protected pool starve
+    # optional turns from other speakers out of the clustering sample.
+    budget_after_anchors = max(0, target - len(anchors))
+    if len(pinned) + len(protected_pool) + len(optional) <= budget_after_anchors:
+        return sorted(anchors + pinned + protected_pool + optional)[:hard_cap]
+
+    opt_quota = min(len(optional), max(MIN_CLUSTER_TURNS * 2, budget_after_anchors // 3)) if optional else 0
+    rem_for_kept = max(0, budget_after_anchors - opt_quota)
+    pin_quota = min(len(pinned), rem_for_kept)
+    prot_quota = min(len(protected_pool), max(0, rem_for_kept - pin_quota))
+    spare = max(0, budget_after_anchors - opt_quota - pin_quota - prot_quota)
+    if spare > 0 and len(optional) > opt_quota:
+        add_opt = min(spare, len(optional) - opt_quota)
+        opt_quota += add_opt
+        spare -= add_opt
+    if spare > 0 and len(protected_pool) > prot_quota:
+        prot_quota += min(spare, len(protected_pool) - prot_quota)
+
+    chosen = set(anchors)
+    chosen.update(_subsample_evenly(pinned, pin_quota))
+    chosen.update(_subsample_evenly(protected_pool, prot_quota))
+    chosen.update(_subsample_evenly(optional, opt_quota))
+    return sorted(chosen)[:hard_cap]
 
 
 def _build_cluster_projection(
@@ -570,6 +602,7 @@ def bounded_final_assignments(
         protected=protected,
         locked=locked,
         sample_budget=sample_budget,
+        max_turns=max_turns,
     )
     sampled_turns = [keyed[i] for i in chosen_indices]
     sampled_keys = {t.key for t in sampled_turns}

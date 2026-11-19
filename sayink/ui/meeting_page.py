@@ -59,6 +59,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from sayink.atomic_io import atomic_write_text as atomic_write_text
 from sayink.aux_models import (
     AuxModelDownloads,
     missing_aux_models as missing_aux_models,
@@ -67,7 +68,7 @@ from sayink.meeting_session import (
     MeetingController,
     MeetingState,
     minutes_settings_complete,
-    safe_filename,
+    safe_filename as safe_filename,
 )
 from sayink.meeting_store import (
     SORT_RECENT,
@@ -82,7 +83,7 @@ from sayink.meeting_store import (
 from sayink.minutes_prompts import describe_template, format_timestamp, get_template, list_templates, transcript_lines
 from sayink.media_import import MEDIA_SOURCE
 from sayink.transcript_import import IMPORT_SOURCE
-from sayink.ui.history_export import _safe_dt, export_save_path
+from sayink.ui.history_export import _safe_dt, export_save_path as export_save_path
 from sayink.speech_recognizer import is_model_downloaded as is_model_downloaded
 from sayink.ui import design_tokens as tok
 from sayink.ui.clipboard import COPY_FAILED_TEXT, copy_text as copy_text
@@ -140,8 +141,8 @@ from sayink.ui.meeting_views import (
     notes_for_display as notes_for_display,
     speaker_color as speaker_color,
 )
-from sayink.ui.native_dialog import native_file_dialog
-from sayink.ui.prompts import alert_error
+from sayink.ui.native_dialog import native_file_dialog as native_file_dialog
+from sayink.ui.prompts import alert_error as alert_error
 
 log = logging.getLogger("SayInk")
 
@@ -276,6 +277,9 @@ class MeetingPage(QWidget):
             preview.connect(self._on_media_preview)
         self._ctrl.media_import_finished.connect(self._on_media_finished)
         self._ctrl.media_import_failed.connect(self._on_media_failed)
+        fin_failed = getattr(self._ctrl, "finalize_save_failed", None)
+        if hasattr(fin_failed, "connect"):
+            fin_failed.connect(self._on_finalize_save_failed)
         self._install_import_drop_targets()
         self.reapply_theme()
         self.refresh()
@@ -374,6 +378,27 @@ class MeetingPage(QWidget):
         self._media_retry_btn.setStyleSheet(ss.BTN_GHOST_SM)
         self._media_retry_btn.hide()
         top.addWidget(self._media_retry_btn, 0)
+        self._media_discard_btn = QPushButton("放弃未保存结果")
+        self._media_discard_btn.setAccessibleName("放弃未保存的导入结果")
+        self._media_discard_btn.setToolTip("放弃当前尚未写入数据库的导入识别结果")
+        self._media_discard_btn.clicked.connect(self._discard_unsaved_media)
+        self._media_discard_btn.setStyleSheet(ss.BTN_DANGER_SM)
+        self._media_discard_btn.hide()
+        top.addWidget(self._media_discard_btn, 0)
+        self._finalize_retry_btn = QPushButton("重试保存结束状态")
+        self._finalize_retry_btn.setAccessibleName("重试保存会议结束状态")
+        self._finalize_retry_btn.setToolTip("刚才结束的会议尚未保存终态，点击重试写入数据库")
+        self._finalize_retry_btn.clicked.connect(self._retry_finalize_save)
+        self._finalize_retry_btn.setStyleSheet(ss.BTN_GHOST_SM)
+        self._finalize_retry_btn.hide()
+        top.addWidget(self._finalize_retry_btn, 0)
+        self._finalize_discard_btn = QPushButton("放弃")
+        self._finalize_discard_btn.setAccessibleName("放弃未保存的会议结束状态")
+        self._finalize_discard_btn.setToolTip("放弃未保存的会议结束状态更新")
+        self._finalize_discard_btn.clicked.connect(self._discard_unsaved_finalize)
+        self._finalize_discard_btn.setStyleSheet(ss.BTN_DANGER_SM)
+        self._finalize_discard_btn.hide()
+        top.addWidget(self._finalize_discard_btn, 0)
         self._media_again_btn = QPushButton("重新导入")
         self._media_again_btn.setAccessibleName("重新导入刚才的音视频")
         self._media_again_btn.setToolTip("再识别一次刚才失败的文件")
@@ -1569,55 +1594,14 @@ class MeetingPage(QWidget):
         self.refresh()
 
     def _confirm_export_overwrite_if_adjusted(self, raw_path: str, final_path: str) -> bool:
-        raw_p = Path(raw_path)
-        final_p = Path(final_path)
-        if raw_p != final_p and final_p.exists():
-            from sayink.ui.prompts import confirm_box
+        from sayink.ui.meeting_workspace_chrome import confirm_export_overwrite_if_adjusted
 
-            box, overwrite = confirm_box(
-                self,
-                "确认覆盖已有文件",
-                f"文件「{final_p.name}」已存在，是否覆盖？",
-                accept="覆盖",
-                cancel="取消",
-                destructive=True,
-            )
-            _style_dialog_box(box, danger_btn=overwrite)
-            with _quiet_tooltips(self):
-                box.exec()
-            return box.clickedButton() == overwrite
-        return True
+        return confirm_export_overwrite_if_adjusted(self, raw_path, final_path)
 
     def _export_selected_meetings(self) -> None:
-        ids = self._selected_meeting_ids()
-        if not ids:
-            return
-        default = export_save_path(f"会议导出-{time.strftime('%Y%m%d')}.md")
-        with native_file_dialog(self):
-            raw_path, selected = QFileDialog.getSaveFileName(
-                self,
-                "导出选中的会议",
-                default,
-                "Markdown (*.md);;Word 文档 (*.docx)",
-            )
-        if not raw_path:
-            return
-        kind = "docx" if _export_kind(raw_path, selected) == "docx" else "md"
-        path = _with_export_suffix(raw_path, kind)
-        if not self._confirm_export_overwrite_if_adjusted(raw_path, path):
-            return
-        try:
-            body_md = self._ctrl.export_meetings_markdown(ids)
-            if kind == "docx":
-                from sayink.docx_io import write_docx_document
+        from sayink.ui.meeting_workspace_chrome import export_selected_meetings
 
-                write_docx_document(path, title=f"会议导出（{len(ids)} 场）", markdown_body=body_md)
-            else:
-                Path(path).write_text(body_md, encoding="utf-8")
-        except OSError as exc:
-            alert_error(self, "导出失败", f"无法写入文件：{exc}")
-            return
-        self._set_status(f"已导出 {len(ids)} 场会议")
+        export_selected_meetings(self)
 
     def _generate_selected_meetings(self) -> None:
         ids = self._selected_meeting_ids()
@@ -2460,7 +2444,8 @@ class MeetingPage(QWidget):
         if not accepted:
             return
         self._store.shift_meeting_start(record.id, dialog.started_ms)
-        if not self._store.flush():
+        saved = self._store.get_meeting(record.id) if self._store.flush() else None
+        if saved is None or int(saved.started_at) != int(dialog.started_ms):
             self._set_status("会议时间没能保存。", tone="error")
             return
         self.refresh()
@@ -2861,11 +2846,11 @@ class MeetingPage(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        self._sync_responsive_layout()
+        if not defer_while_live_resize(self, self._follow_live_resize):
+            self._sync_responsive_layout()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._sync_responsive_layout()
         if not defer_while_live_resize(self, self._follow_live_resize):
             self._follow_live_resize()
 
@@ -2910,10 +2895,9 @@ class MeetingPage(QWidget):
         _sync_layout(self)
 
     def _follow_live_resize(self) -> None:
-        if hasattr(self, "_materials_scroll"):
-            cap = max(108, min(200, int(self.height() * 0.28)))
-            self._materials_scroll.setMaximumHeight(cap)
-        self._position_live_new_msg_btn()
+        from sayink.ui.meeting_workspace_chrome import follow_live_resize
+
+        follow_live_resize(self)
 
     def keyPressEvent(self, event) -> None:
         if event.matches(QKeySequence.StandardKey.Find):
@@ -2929,7 +2913,8 @@ class MeetingPage(QWidget):
             ):
                 return True
         if obj is getattr(self, "_notes_bar", None) and event.type() == QEvent.Type.Resize:
-            self._fit_template_cluster()
+            if not defer_while_live_resize(self._notes_bar, self._fit_template_cluster):
+                self._fit_template_cluster()
         elif (
             hasattr(self, "_live_transcript")
             and obj is self._live_transcript.viewport()
@@ -3220,103 +3205,14 @@ class MeetingPage(QWidget):
         scope: str = "all",
     ) -> bool:
         """Public contract writing ``meeting_id`` to ``path`` (.md, .docx, .txt, or .srt)."""
-        record = self._store.get_meeting(meeting_id)
-        if record is None:
-            return False
-        target = Path(path)
-        kind = _export_kind(str(target), "")
-        if kind == "docx":
-            from sayink.docx_io import write_docx_document
+        from sayink.ui.meeting_workspace_chrome import export_meeting_to_path as _export_to_path
 
-            if meeting_id == self._detail_id:
-                body_md = self._markdown_for_export_scope(record, scope)
-            elif scope == "transcript":
-                body_md = self._ctrl.export_transcript_markdown(record.id)
-            elif scope == "notes":
-                notes = self._store.get_notes(record.id)
-                body_md = notes.markdown if notes is not None else ""
-            else:
-                body_md = self._ctrl.export_markdown(record.id)
-            write_docx_document(
-                target,
-                title=record.display_title,
-                metadata_rows=self._docx_metadata_rows(record),
-                markdown_body=body_md,
-            )
-            return True
-        if kind == "srt":
-            target.write_text(self._ctrl.export_transcript_srt(record.id), encoding="utf-8")
-            return True
-        if kind == "txt":
-            target.write_text(self._ctrl.transcript_text(record.id), encoding="utf-8")
-            return True
-        target.write_text(self._ctrl.export_markdown(record.id), encoding="utf-8")
-        return True
+        return _export_to_path(self, meeting_id, path, scope=scope)
 
     def _export(self, scope: str = "all") -> None:
-        if not self._flush_bound_title(sync=True) or not self._save_record_notes():
-            return
-        record = self._store.get_meeting(self._detail_id) if self._detail_id else None
-        if record is None:
-            return
-        label = {"notes": self._result_label(), "transcript": "文字稿", "all": "完整会议记录"}[scope]
-        default = export_save_path(
-            f"{safe_filename(record.display_title)}-{label}-{_safe_dt(record.started_at).strftime('%Y%m%d')}.md"
-        )
-        filters = "Markdown (*.md);;Word 文档 (*.docx);;纯文本 (*.txt)"
-        if self._transcript_has_times:
-            filters += ";;SRT 字幕 (*.srt)"
-        with native_file_dialog(self):
-            raw_path, selected = QFileDialog.getSaveFileName(
-                self, "导出" + label, default, filters,
-            )
-        if not raw_path:
-            return
-        kind = _export_kind(raw_path, selected)
-        if kind == "srt" and not self._transcript_has_times:
-            self._set_status("这场文字稿没有时间戳，无法导出字幕")
-            return
-        path = _with_export_suffix(raw_path, kind)
-        if not self._confirm_export_overwrite_if_adjusted(raw_path, path):
-            return
-        srt_note = ""
-        try:
-            if kind == "docx":
-                from sayink.docx_io import write_docx_document
+        from sayink.ui.meeting_workspace_chrome import export_single_meeting
 
-                write_docx_document(
-                    path,
-                    title=record.display_title,
-                    metadata_rows=self._docx_metadata_rows(record),
-                    markdown_body=self._markdown_for_export_scope(record, scope),
-                )
-            elif kind == "srt":
-                text = self._ctrl.export_transcript_srt(record.id)
-                srt_note = getattr(self._ctrl, "srt_skip_note", "") or ""
-                Path(path).write_text(text, encoding="utf-8")
-            elif kind == "txt":
-                if scope == "notes":
-                    text = self._current_notes_text()
-                elif scope == "transcript":
-                    text = self._ctrl.transcript_text(record.id)
-                else:
-                    notes = self._current_notes_text().rstrip()
-                    supplement = self._ctrl.supplements_markdown(record.id).strip()
-                    chunks = [part for part in (notes, supplement, self._ctrl.transcript_text(record.id).rstrip()) if part]
-                    text = "\n\n".join(chunks)
-                    if text and not text.endswith("\n"):
-                        text += "\n"
-                Path(path).write_text(text, encoding="utf-8")
-            else:
-                text = self._markdown_for_export_scope(record, scope)
-                Path(path).write_text(text, encoding="utf-8")
-        except OSError as exc:
-            alert_error(self, "导出失败", f"无法写入文件：{exc}")
-            return
-        if kind == "srt":
-            self._set_status(f"已导出文字稿字幕（{srt_note}）" if srt_note else "已导出文字稿字幕")
-        else:
-            self._set_status("已导出" + label + ("（包含当前草稿）" if self._editing_notes and scope != "transcript" else ""))
+        export_single_meeting(self, scope=scope)
 
     def _delete(self) -> None:
         record = self._store.get_meeting(self._detail_id) if self._detail_id else None
@@ -3523,7 +3419,7 @@ class MeetingPage(QWidget):
                 target_sid = duplicate_sids[0]
                 merge_fn = getattr(self._ctrl, "merge_speakers", None)
                 if callable(merge_fn):
-                    merged = merge_fn(meeting_id, speaker_id, target_sid)
+                    merged = bool(merge_fn(meeting_id, speaker_id, target_sid))
                 else:
                     segments = [
                         s for s in self._store.get_segments(meeting_id)
@@ -3535,8 +3431,9 @@ class MeetingPage(QWidget):
                             merged = False
                             break
                     if merged:
-                        self._ctrl.rename_speaker(meeting_id, speaker_id, "")
-                        self._ctrl.rename_speaker(meeting_id, target_sid, name)
+                        cleared = self._ctrl.rename_speaker(meeting_id, speaker_id, "")
+                        renamed = self._ctrl.rename_speaker(meeting_id, target_sid, name)
+                        merged = cleared is not None and renamed is not None
                 if not merged:
                     self._speaker_edit_status(meeting_id, "姓名尚未保存，请在整理完成后重试。")
                     return
@@ -3633,9 +3530,6 @@ class MeetingPage(QWidget):
 
     def _update_card_notes(self) -> None:
         self._live_ui.update_card_notes()
-
-    def _sync_aux_buttons(self) -> None:
-        self._live_ui.sync_aux_buttons()
 
     def _download_aux_models(self) -> None:
         self._live_ui.download_aux_models()
@@ -3756,6 +3650,18 @@ class MeetingPage(QWidget):
 
     def _retry_media_save(self) -> None:
         self._import_ui.retry_media_save()
+
+    def _discard_unsaved_media(self) -> None:
+        self._import_ui.discard_unsaved_media()
+
+    def _on_finalize_save_failed(self, meeting_id: str, message: str) -> None:
+        self._import_ui.on_finalize_save_failed(meeting_id, message)
+
+    def _retry_finalize_save(self) -> None:
+        self._import_ui.retry_finalize_save()
+
+    def _discard_unsaved_finalize(self) -> None:
+        self._import_ui.discard_unsaved_finalize()
 
     def _retry_failed_media(self) -> None:
         self._import_ui.retry_failed_media()

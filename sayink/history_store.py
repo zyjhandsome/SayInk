@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2
 _SUPPRESSED_POLISHED_MARKER = "\u200b"
+_MAX_TRACKED_FAILED_TICKETS = 512
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS history (
@@ -159,15 +161,16 @@ def _ensure_meeting_note_columns(conn: sqlite3.Connection) -> None:
     for name in ("previous_metadata", "user_markdown", "user_metadata"):
         if name not in present:
             conn.execute(f"ALTER TABLE meeting_notes ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
-    if "user_markdown" not in present:
-        conn.execute(
-            """
-            UPDATE meeting_notes
-            SET user_markdown = markdown,
-                user_transcript_changed = transcript_changed
-            WHERE user_edited = 1 AND markdown != '' AND user_markdown = ''
-            """
-        )
+    conn.execute(
+        """
+        UPDATE meeting_notes
+        SET user_markdown = markdown,
+            user_transcript_changed = transcript_changed
+        WHERE user_edited = 1
+          AND markdown != ''
+          AND (user_markdown IS NULL OR user_markdown = '')
+        """
+    )
 
 
 _PAGED_SESSION_SUMMARY_SQL = """
@@ -320,14 +323,20 @@ class HistoryStore:
         self._stop = object()
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
+        self._writer_done = threading.Event()
         self._init_error: BaseException | None = None
         self._committed_callbacks: list[Callable[[], None]] = []
         self._failed_callbacks: list[Callable[[str], None]] = []
         self._segment_calibrator: Callable[[SegmentRecord], SegmentRecord] | None = None
-        self._fail_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._fail_lock = self._state_lock
         self._next_op_ticket = 1
+        self._last_processed_ticket = 0
         self._last_failed_ticket = 0
-        self._unflushed_failure_tickets: list[int] = []
+        self._failed_tickets: OrderedDict[int, None] = OrderedDict()
+        self._evicted_failed_watermark = 0
+        self._unobserved_failed_tickets: OrderedDict[int, None] = OrderedDict()
+        self._unobserved_overflow = False
         self._write_failures = 0
         self._unflushed_failures = 0
         self._closed = False
@@ -391,31 +400,61 @@ class HistoryStore:
         finally:
             conn.close()
 
+    @property
+    def recovery_dir(self) -> Path:
+        return self.db_path.parent / "audio-recovery"
+
     def _quarantine_corrupt_db(self) -> Path | None:
         """Rename ``history.db`` (plus WAL/SHM side files) like config does for
         a corrupt ``config.json``, so the data is kept for manual recovery."""
         self._close_read_connections()
         stamp = time.strftime("%Y%m%d-%H%M%S")
         backup = self.db_path.with_name(f"{self.db_path.stem}.corrupt-{stamp}{self.db_path.suffix}")
+        seq = 1
+        while backup.exists():
+            backup = self.db_path.with_name(
+                f"{self.db_path.stem}.corrupt-{stamp}-{seq}{self.db_path.suffix}"
+            )
+            seq += 1
         try:
             self.db_path.replace(backup)
         except OSError:
             logger.exception("HistoryStore could not back up corrupt database")
             return None
+        moved_sides: list[tuple[Path, Path]] = []
         for suffix in ("-wal", "-shm"):
             side = self.db_path.with_name(self.db_path.name + suffix)
             if side.exists():
+                side_backup = backup.with_name(backup.name + suffix)
                 try:
-                    side.replace(backup.with_name(backup.name + suffix))
+                    side.replace(side_backup)
+                    moved_sides.append((side, side_backup))
                 except OSError:
-                    logger.warning("HistoryStore could not move %s", side.name)
+                    logger.error(
+                        "HistoryStore could not move %s; aborting recreate so stale WAL/SHM is not replayed",
+                        side.name,
+                        exc_info=True,
+                    )
+                    for orig_side, moved_side in reversed(moved_sides):
+                        try:
+                            moved_side.replace(orig_side)
+                        except OSError:
+                            pass
+                    try:
+                        backup.replace(self.db_path)
+                    except OSError:
+                        pass
+                    return None
         return backup
 
     def _disable(self) -> None:
         self._close_read_connections()
-        self.disabled = True
-        self.startup_notice = DISABLED_NOTICE
-        self._queue.put(self._stop)
+        with self._state_lock:
+            self.disabled = True
+            self.startup_notice = DISABLED_NOTICE
+            if self._thread is None:
+                self._writer_done.set()
+            self._queue.put(self._stop)
 
     def add_committed_callback(self, callback: Callable[[], None]) -> None:
         self._committed_callbacks.append(callback)
@@ -452,10 +491,13 @@ class HistoryStore:
         wall-clock timestamps against active meeting pause intervals."""
         self._segment_calibrator = calibrator
 
-    def _next_ticket(self) -> int:
-        with self._fail_lock:
+    def _enqueue_op(self, op: str, payload: Any) -> int:
+        with self._state_lock:
+            if self.disabled or self._closed or self._thread is None:
+                return 0
             ticket = self._next_op_ticket
             self._next_op_ticket += 1
+            self._queue.put((op, payload, ticket))
             return ticket
 
     def enqueue(self, record: SegmentRecord) -> int:
@@ -467,23 +509,13 @@ class HistoryStore:
                 record = calibrator(record)
             except Exception:
                 logger.exception("HistoryStore segment calibrator failed")
-        ticket = self._next_ticket()
-        self._queue.put(("insert", record, ticket))
-        return ticket
+        return self._enqueue_op("insert", record)
 
     def enqueue_delete_sessions(self, session_ids: list[str]) -> int:
-        if self.disabled or self._closed:
-            return 0
-        ticket = self._next_ticket()
-        self._queue.put(("delete_sessions", list(session_ids), ticket))
-        return ticket
+        return self._enqueue_op("delete_sessions", list(session_ids))
 
     def enqueue_delete_all(self) -> int:
-        if self.disabled or self._closed:
-            return 0
-        ticket = self._next_ticket()
-        self._queue.put(("delete_all", None, ticket))
-        return ticket
+        return self._enqueue_op("delete_all", None)
 
     def enqueue_cleanup(
         self,
@@ -491,13 +523,9 @@ class HistoryStore:
         max_entries: int,
         active_session_id: str | None,
     ) -> int:
-        if self.disabled or self._closed:
-            return 0
-        ticket = self._next_ticket()
-        self._queue.put(
-            ("cleanup", (retention_days, max_entries, active_session_id), ticket)
+        return self._enqueue_op(
+            "cleanup", (retention_days, max_entries, active_session_id)
         )
-        return ticket
 
     def enqueue_write(
         self,
@@ -513,11 +541,7 @@ class HistoryStore:
         stored in ``history.db``.
         ``after_commit`` runs on the writer only after a successful commit.
         """
-        if self.disabled or self._closed:
-            return 0
-        ticket = self._next_ticket()
-        self._queue.put(("write", (fn, failure_notice, after_commit), ticket))
-        return ticket
+        return self._enqueue_op("write", (fn, failure_notice, after_commit))
 
     @staticmethod
     def _row_filter(trigger_mode: str | None, respect_locks: bool) -> tuple[str, tuple]:
@@ -539,15 +563,15 @@ class HistoryStore:
         trigger_mode: str | None = None,
         respect_locks: bool = False,
         failure_notice: str = WRITE_FAILED_NOTICE,
-    ) -> None:
+    ) -> int:
         """Renumber speakers of one session after a re-clustering pass
         (``{old_id: new_id}``); used by meetings and continuous dictation."""
         if not mapping or not session_id:
-            return
+            return 0
         extra_sql, extra = self._row_filter(trigger_mode, respect_locks)
         pairs = [(int(new), session_id, int(old), *extra) for old, new in mapping.items() if old != new]
         if not pairs:
-            return
+            return 0
 
         def _relabel(conn: sqlite3.Connection) -> None:
             # Two passes through a temporary offset so a→b, b→a does not collide.
@@ -560,7 +584,7 @@ class HistoryStore:
                 (session_id, *extra),
             )
 
-        self.enqueue_write(_relabel, failure_notice=failure_notice)
+        return self.enqueue_write(_relabel, failure_notice=failure_notice)
 
     def relabel_session_segments(
         self,
@@ -569,12 +593,12 @@ class HistoryStore:
         *,
         trigger_mode: str | None = None,
         failure_notice: str = WRITE_FAILED_NOTICE,
-    ) -> None:
+    ) -> int:
         """Apply a per-segment speaker re-assignment ``{seq: speaker_id}`` to
         one session after the end-of-session clustering pass. Rows the user
         locked keep their speaker."""
         if not assignments or not session_id:
-            return
+            return 0
         extra_sql, extra = self._row_filter(trigger_mode, respect_locks=False)
         rows = [(int(speaker_id), session_id, int(seq), int(speaker_id), *extra)
                 for seq, speaker_id in assignments.items()]
@@ -586,7 +610,7 @@ class HistoryStore:
                 rows,
             )
 
-        self.enqueue_write(_relabel, failure_notice=failure_notice)
+        return self.enqueue_write(_relabel, failure_notice=failure_notice)
 
     def enqueue_update_polished(
         self,
@@ -594,11 +618,11 @@ class HistoryStore:
         polished_by_seq: dict[int, str],
         *,
         failure_notice: str = WRITE_FAILED_NOTICE,
-    ) -> None:
+    ) -> int:
         """Update ``polished_text`` and ``corrected_text`` for specified ``seq`` rows
         in ``session_id`` without touching ``raw_text``."""
         if self.disabled or self._closed or not session_id or not polished_by_seq:
-            return
+            return 0
         rows = [
             (str(text), str(text), session_id, int(seq))
             for seq, text in polished_by_seq.items()
@@ -610,7 +634,7 @@ class HistoryStore:
                 rows,
             )
 
-        self.enqueue_write(_update, failure_notice=failure_notice)
+        return self.enqueue_write(_update, failure_notice=failure_notice)
 
     def enqueue_merge_sessions(
         self,
@@ -618,15 +642,15 @@ class HistoryStore:
         session_ids: list[str],
         *,
         failure_notice: str = WRITE_FAILED_NOTICE,
-    ) -> None:
+    ) -> int:
         """Merge non-meeting segments of ``session_ids`` into ``target_session_id``
         in chronological order ``(created_at ASC, seq ASC, id ASC)`` and
         resequence ``seq`` to ``0..N-1``."""
         if self.disabled or self._closed or not target_session_id:
-            return
+            return 0
         ids = list(dict.fromkeys(s for s in session_ids if s))
         if len(ids) < 2:
-            return
+            return 0
         if target_session_id not in ids:
             ids.insert(0, target_session_id)
 
@@ -651,7 +675,77 @@ class HistoryStore:
                 [(target_session_id, new_seq, row_id) for new_seq, row_id in enumerate(ordered_ids)],
             )
 
-        self.enqueue_write(_merge, failure_notice=failure_notice)
+        return self.enqueue_write(_merge, failure_notice=failure_notice)
+
+    def _is_ticket_failed_locked(self, ticket: int) -> bool:
+        return ticket <= self._evicted_failed_watermark or ticket in self._failed_tickets
+
+    def _any_ticket_failed_in_range_locked(self, low: int, high: int) -> bool:
+        if low > high:
+            return False
+        if self._evicted_failed_watermark >= low:
+            return True
+        return any(low <= t <= high for t in self._failed_tickets)
+
+    def _ack_observed_ticket_locked(self, ticket: int) -> None:
+        self._unobserved_failed_tickets.pop(ticket, None)
+        self._unflushed_failures = len(self._unobserved_failed_tickets) + (
+            1 if self._unobserved_overflow else 0
+        )
+
+    def _ack_observed_range_locked(self, low: int, high: int) -> None:
+        if low <= high and self._unobserved_failed_tickets:
+            for t in [k for k in self._unobserved_failed_tickets if low <= k <= high]:
+                self._unobserved_failed_tickets.pop(t, None)
+            self._unflushed_failures = len(self._unobserved_failed_tickets) + (
+                1 if self._unobserved_overflow else 0
+            )
+
+    def _consume_unobserved_failures_locked(self) -> bool:
+        ok = not self._unobserved_failed_tickets and not self._unobserved_overflow
+        self._unobserved_failed_tickets.clear()
+        self._unobserved_overflow = False
+        self._unflushed_failures = 0
+        return ok
+
+    def flush_ticket(self, ticket: int, timeout: float | None = None) -> bool:
+        """Wait for ``ticket`` and return True iff that operation committed cleanly.
+
+        Non-destructive on ``_failed_tickets``: querying ``ticket`` never clears
+        failure state for ``ticket`` or any other ticketed caller, while marking
+        ``ticket`` observed for unscoped ``flush()``.
+        """
+        effective_timeout = CLOSE_TIMEOUT_SEC if timeout is None else float(timeout)
+        self._reap_dead_read_connections()
+        if ticket <= 0 or self.disabled:
+            return False
+        done: threading.Event | None = None
+        result_box = [False]
+        wait_writer = False
+        with self._state_lock:
+            if self.disabled or ticket >= self._next_op_ticket:
+                return False
+            if self._last_processed_ticket >= ticket:
+                self._ack_observed_ticket_locked(ticket)
+                return not self._is_ticket_failed_locked(ticket)
+            if self._closed or self._thread is None:
+                wait_writer = not self._writer_done.is_set()
+            else:
+                done = threading.Event()
+                self._queue.put(("barrier", (done, result_box, ("exact", ticket))))
+        if done is not None:
+            if not done.wait(timeout=effective_timeout):
+                return False
+            self._reap_dead_read_connections()
+            return bool(result_box[0])
+        if wait_writer:
+            self._writer_done.wait(timeout=effective_timeout)
+        self._reap_dead_read_connections()
+        with self._state_lock:
+            if self.disabled or self._last_processed_ticket < ticket:
+                return False
+            self._ack_observed_ticket_locked(ticket)
+            return not self._is_ticket_failed_locked(ticket)
 
     def flush(
         self,
@@ -663,20 +757,72 @@ class HistoryStore:
 
         Readers use a separate connection; a caller that reads right after
         enqueueing (meeting end → render transcript) needs this barrier.
-        When ``since_ticket`` is given, returns True iff no operation with
-        ``ticket >= since_ticket`` failed before the barrier; otherwise returns
-        True iff every operation processed since the previous barrier succeeded.
+        When ``since_ticket`` is given, returns True iff ``since_ticket`` is a
+        valid processed ticket and no operation queued in ``[since_ticket, now]``
+        failed (non-destructively); otherwise returns True iff no unobserved
+        failure occurred since the previous unscoped barrier.
         """
         self._reap_dead_read_connections()
-        if self.disabled or self._closed or self._thread is None:
+        if since_ticket is not None:
+            if since_ticket <= 0 or self.disabled:
+                return False
+            done: threading.Event | None = None
+            result_box = [False]
+            wait_writer = False
+            with self._state_lock:
+                upper_ticket = self._next_op_ticket - 1
+                if self.disabled or since_ticket > upper_ticket:
+                    return False
+                if self._last_processed_ticket >= upper_ticket:
+                    self._ack_observed_range_locked(since_ticket, upper_ticket)
+                    return not self._any_ticket_failed_in_range_locked(since_ticket, upper_ticket)
+                if self._closed or self._thread is None:
+                    wait_writer = not self._writer_done.is_set()
+                else:
+                    done = threading.Event()
+                    self._queue.put(("barrier", (done, result_box, ("since", since_ticket, upper_ticket))))
+            if done is not None:
+                if not done.wait(timeout=timeout):
+                    return False
+                self._reap_dead_read_connections()
+                return bool(result_box[0])
+            if wait_writer:
+                self._writer_done.wait(timeout=timeout)
+            self._reap_dead_read_connections()
+            with self._state_lock:
+                if self.disabled or self._last_processed_ticket < upper_ticket:
+                    return False
+                self._ack_observed_range_locked(since_ticket, upper_ticket)
+                return not self._any_ticket_failed_in_range_locked(since_ticket, upper_ticket)
+
+        if self.disabled:
             return True
-        done = threading.Event()
+        done = None
         result_box = [True]
-        self._queue.put(("barrier", (done, result_box, since_ticket)))
-        if not done.wait(timeout=timeout):
-            return False
+        wait_writer = False
+        with self._state_lock:
+            if self.disabled:
+                return True
+            upper_ticket = self._next_op_ticket - 1
+            if self._closed or self._thread is None:
+                if self._last_processed_ticket >= upper_ticket:
+                    return self._consume_unobserved_failures_locked()
+                wait_writer = not self._writer_done.is_set()
+            else:
+                done = threading.Event()
+                self._queue.put(("barrier", (done, result_box, None)))
+        if done is not None:
+            if not done.wait(timeout=timeout):
+                return False
+            self._reap_dead_read_connections()
+            return bool(result_box[0])
+        if wait_writer:
+            self._writer_done.wait(timeout=timeout)
         self._reap_dead_read_connections()
-        return bool(result_box[0])
+        with self._state_lock:
+            if self._last_processed_ticket < upper_ticket:
+                return False
+            return self._consume_unobserved_failures_locked()
 
     def read(self, fn: Callable[[sqlite3.Connection], Any], default: Any = None) -> Any:
         """Run ``fn(conn)`` on a cached thread-local read-only connection."""
@@ -690,16 +836,17 @@ class HistoryStore:
             return default
 
     def close(self, timeout: float = CLOSE_TIMEOUT_SEC) -> None:
-        self._closed = True
+        with self._state_lock:
+            self._closed = True
+            thread = self._thread
+            self._thread = None
+            pending = 0
+            if not self.disabled and thread is not None:
+                pending = self._queue.qsize()
+                self._queue.put(self._stop)
         self._close_read_connections()
-        if self.disabled:
+        if self.disabled or thread is None:
             return
-        thread = self._thread
-        if thread is None:
-            return
-        self._thread = None
-        pending = self._queue.qsize()
-        self._queue.put(self._stop)
         thread.join(timeout=timeout)
         if thread.is_alive():
             logger.warning(
@@ -970,55 +1117,80 @@ class HistoryStore:
     def _writer_loop(self) -> None:
         conn: sqlite3.Connection | None = None
         try:
-            # Writer thread exclusively owns this connection for its lifetime.
-            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000)
-            conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
-            conn.execute("PRAGMA journal_mode=WAL;")
-        except Exception as exc:
-            if conn is not None:
+            try:
+                # Writer thread exclusively owns this connection for its lifetime.
+                conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000)
+                conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
+            except Exception as exc:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                self._init_error = exc
+                self._ready.set()
+                return
+            self._ready.set()
+
+            try:
+                while True:
+                    item = self._queue.get()
+                    if item is self._stop:
+                        while True:
+                            try:
+                                more = self._queue.get_nowait()
+                            except queue.Empty:
+                                break
+                            if more is self._stop:
+                                continue
+                            self._dispatch(conn, more)
+                        try:
+                            conn.execute("PRAGMA optimize;")
+                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                        except Exception:
+                            logger.debug("HistoryStore shutdown WAL checkpoint skipped", exc_info=True)
+                        return
+                    self._dispatch(conn, item)
+            finally:
                 try:
                     conn.close()
                 except Exception:
-                    pass
-            self._init_error = exc
-            self._ready.set()
-            return
-        self._ready.set()
-
-        try:
-            while True:
-                item = self._queue.get()
-                if item is self._stop:
-                    while True:
-                        try:
-                            more = self._queue.get_nowait()
-                        except queue.Empty:
-                            break
-                        if more is self._stop:
-                            continue
-                        self._dispatch(conn, more)
-                    try:
-                        conn.execute("PRAGMA optimize;")
-                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                    except Exception:
-                        logger.debug("HistoryStore shutdown WAL checkpoint skipped", exc_info=True)
-                    return
-                self._dispatch(conn, item)
+                    logger.exception("HistoryStore writer connection close failed")
         finally:
-            try:
-                conn.close()
-            except Exception:
-                logger.exception("HistoryStore writer connection close failed")
+            self._writer_done.set()
+
+    def _mark_ticket_processed(self, ticket: int) -> None:
+        if ticket <= 0:
+            return
+        with self._state_lock:
+            if ticket > self._last_processed_ticket:
+                self._last_processed_ticket = ticket
 
     def _record_write_failure(self, ticket: int = 0) -> None:
-        with self._fail_lock:
+        with self._state_lock:
             self._write_failures += 1
             if ticket <= 0:
                 ticket = self._next_op_ticket
                 self._next_op_ticket += 1
             self._last_failed_ticket = max(self._last_failed_ticket, ticket)
-            self._unflushed_failure_tickets.append(ticket)
-            self._unflushed_failures = len(self._unflushed_failure_tickets)
+            if ticket > self._last_processed_ticket:
+                self._last_processed_ticket = ticket
+            self._failed_tickets[ticket] = None
+            self._failed_tickets.move_to_end(ticket)
+            while len(self._failed_tickets) > _MAX_TRACKED_FAILED_TICKETS:
+                evicted_ticket, _ = self._failed_tickets.popitem(last=False)
+                if evicted_ticket > self._evicted_failed_watermark:
+                    self._evicted_failed_watermark = evicted_ticket
+            self._unobserved_failed_tickets[ticket] = None
+            self._unobserved_failed_tickets.move_to_end(ticket)
+            while len(self._unobserved_failed_tickets) > _MAX_TRACKED_FAILED_TICKETS:
+                self._unobserved_failed_tickets.popitem(last=False)
+                self._unobserved_overflow = True
+            self._unflushed_failures = len(self._unobserved_failed_tickets) + (
+                1 if self._unobserved_overflow else 0
+            )
 
     def _dispatch(self, conn: sqlite3.Connection, item: Any) -> None:
         op = ""
@@ -1038,25 +1210,38 @@ class HistoryStore:
                 retention_days, max_entries, active_session_id = payload
                 self._do_cleanup(conn, retention_days, max_entries, active_session_id)
             elif op == "barrier":
-                since_ticket: int | None = None
+                mode: Any = None
                 if isinstance(payload, tuple) and len(payload) == 3:
-                    done_evt, result_box, since_ticket = payload
+                    done_evt, result_box, mode = payload
                 elif isinstance(payload, tuple) and len(payload) == 2:
                     done_evt, result_box = payload
                 else:
                     done_evt, result_box = payload, None
-                with self._fail_lock:
-                    if since_ticket is None:
-                        ok = self._unflushed_failures == 0 and not self._unflushed_failure_tickets
-                        self._unflushed_failure_tickets.clear()
-                        self._unflushed_failures = 0
+                with self._state_lock:
+                    if mode is None:
+                        ok = self._consume_unobserved_failures_locked()
+                    elif isinstance(mode, tuple) and len(mode) == 2 and mode[0] == "exact":
+                        target_ticket = int(mode[1])
+                        if self._last_processed_ticket >= target_ticket:
+                            self._ack_observed_ticket_locked(target_ticket)
+                            ok = not self._is_ticket_failed_locked(target_ticket)
+                        else:
+                            ok = False
+                    elif isinstance(mode, tuple) and len(mode) == 3 and mode[0] == "since":
+                        low_t, high_t = int(mode[1]), int(mode[2])
+                        if self._last_processed_ticket >= high_t:
+                            self._ack_observed_range_locked(low_t, high_t)
+                            ok = not self._any_ticket_failed_in_range_locked(low_t, high_t)
+                        else:
+                            ok = False
                     else:
-                        relevant = [t for t in self._unflushed_failure_tickets if t >= since_ticket]
-                        ok = not relevant
-                        self._unflushed_failure_tickets = [
-                            t for t in self._unflushed_failure_tickets if t < since_ticket
-                        ]
-                        self._unflushed_failures = len(self._unflushed_failure_tickets)
+                        since_t = int(mode)
+                        upper_t = self._last_processed_ticket
+                        if since_t > 0 and upper_t >= since_t:
+                            self._ack_observed_range_locked(since_t, upper_t)
+                            ok = not self._any_ticket_failed_in_range_locked(since_t, upper_t)
+                        else:
+                            ok = False
                 if result_box is not None:
                     result_box[0] = ok
                 done_evt.set()
@@ -1081,7 +1266,9 @@ class HistoryStore:
                     except Exception:
                         logger.exception("HistoryStore post-commit cleanup failed")
             else:
+                self._mark_ticket_processed(ticket)
                 return
+            self._mark_ticket_processed(ticket)
             self._notify_committed()
         except Exception:
             logger.exception("HistoryStore writer op failed")
@@ -1128,15 +1315,14 @@ class HistoryStore:
         if not ids:
             return
         try:
-            recovery_root = self.db_path.parent / "audio-recovery"
+            recovery_root = self.recovery_dir
             if not recovery_root.is_dir() or recovery_root.is_symlink():
                 return
             if not any(recovery_root.iterdir()):
                 return
-            from sayink.audio_recovery import delete_session_recovery_files
+            from sayink.audio_recovery import delete_sessions_recovery_files
 
-            for sid in ids:
-                delete_session_recovery_files(sid, base_dir=recovery_root)
+            delete_sessions_recovery_files(ids, base_dir=recovery_root)
         except OSError:
             pass
 
@@ -1238,6 +1424,10 @@ class HistoryStore:
         if purged_ids:
             conn.commit()
             self._cleanup_session_recovery_audio(purged_ids)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+        except Exception:
+            logger.debug("HistoryStore passive WAL checkpoint skipped", exc_info=True)
 
     def _delete_sessions(self, conn: sqlite3.Connection, session_ids: list[str]) -> None:
         # SQLite binds at most 32766 variables. Delete in chunks within caller's transaction.

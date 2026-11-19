@@ -61,10 +61,16 @@ from sayink.ui.history_export import (
     suggest_batch_export_filename,
     suggest_single_export_filename,
 )
+from sayink.atomic_io import atomic_write_text
 from sayink.ui import settings_styles as _settings_styles
 from sayink.ui import design_tokens as tok
 from sayink.ui.clipboard import COPY_FAILED_TEXT as COPY_FAILED_TEXT, copy_text
-from sayink.ui.flow_layout import FlowLayout, WrappingToolBar, defer_while_live_resize
+from sayink.ui.flow_layout import (
+    FlowLayout,
+    WrappingToolBar,
+    defer_while_live_resize,
+    flush_live_resize,
+)
 from sayink.ui.native_dialog import native_file_dialog
 from sayink.ui.prompts import alert_error
 from sayink.ui.reading import fit_reading_width
@@ -125,7 +131,10 @@ class _ElidedLabel(QLabel):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._elide()
+        if event.oldSize().width() == event.size().width():
+            return
+        if not defer_while_live_resize(self, self._elide):
+            self._elide()
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -301,6 +310,8 @@ class _SessionList(QListWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if event.oldSize().width() == event.size().width():
+            return
         # Qt can retain the pre-show width of setItemWidget children after a
         # splitter resize. Reflow before eliding their text to the new width.
         # During an edge drag, doing that on every pixel repaints the list.
@@ -345,7 +356,10 @@ class _DetailTextEdit(QTextEdit):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._fit_reading_width()
+        if event.oldSize().width() == event.size().width():
+            return
+        if not defer_while_live_resize(self, self._fit_reading_width):
+            self._fit_reading_width()
 
     def setHtml(self, text: str) -> None:
         super().setHtml(text)
@@ -1365,6 +1379,21 @@ class HistoryWindow(QWidget):
     def sync_viewport_width(self, host_width: int | None = None) -> None:
         if not hasattr(self, "_left_pane") or not hasattr(self, "_right_pane"):
             return
+        if host_width is not None and host_width > 0:
+            self._pending_host_viewport_width = int(host_width)
+        if defer_while_live_resize(self, self.sync_viewport_width):
+            return
+        stashed = getattr(self, "_pending_host_viewport_width", None)
+        self._pending_host_viewport_width = None
+        eff_host = (
+            int(host_width)
+            if host_width is not None and host_width > 0
+            else (int(stashed) if stashed is not None and stashed > 0 else None)
+        )
+        self._apply_viewport_width(eff_host)
+        flush_live_resize(self)
+
+    def _apply_viewport_width(self, host_width: int | None = None) -> None:
         top_win = self.window()
         in_host_shell = top_win is not self
         if host_width is not None and host_width > 0:
@@ -1380,7 +1409,7 @@ class HistoryWindow(QWidget):
             if win_w < tok.COMPACT_WINDOW_THRESHOLD
             else tok.SIDEBAR_WIDTH
         )
-        if host_width is not None and in_host_shell:
+        if (host_width is not None or hasattr(top_win, "sidebar_width")) and in_host_shell:
             hist_w = max(220, win_w - sidebar_w - 2)
         else:
             hist_w = self.width() if self.width() > 0 else win_w
@@ -1399,8 +1428,10 @@ class HistoryWindow(QWidget):
                 outer.setContentsMargins(12, 12, 12, 12)
             if hasattr(self, "_right_pane_layout") and self._right_pane_layout.contentsMargins().left() != 0:
                 self._right_pane_layout.setContentsMargins(0, 0, 0, 0)
-            self._left_pane.setMinimumWidth(180)
-            self._right_pane.setMinimumWidth(180)
+            if self._left_pane.minimumWidth() != 180:
+                self._left_pane.setMinimumWidth(180)
+            if self._right_pane.minimumWidth() != 180:
+                self._right_pane.setMinimumWidth(180)
             self._apply_compact_pane_visibility()
             return
 
@@ -1446,7 +1477,8 @@ class HistoryWindow(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self.sync_viewport_width()
+        if not defer_while_live_resize(self, self.sync_viewport_width):
+            self.sync_viewport_width()
         if hasattr(self, "_toast") and self._toast.isVisible():
             self._toast.reposition()
 
@@ -2237,24 +2269,43 @@ class HistoryWindow(QWidget):
             out[seg.seq] = _SUPPRESSED_POLISHED_MARKER
         return out
 
-    def _update_raw_segments(self, session_id: str, raw_by_seq: dict[int, str]) -> None:
+    def _verify_store_ticket(self, ticket: object, *, timeout: float = 2.0) -> bool:
+        """Verify an async HistoryStore write ticket (compatible with FakeHistoryStore returning None)."""
+        if getattr(self._store, "disabled", False):
+            return False
+        flush_ticket = getattr(self._store, "flush_ticket", None)
+        flush = getattr(self._store, "flush", None)
+        if isinstance(ticket, int) and not isinstance(ticket, bool):
+            if ticket <= 0:
+                return False
+            if callable(flush_ticket):
+                return bool(flush_ticket(ticket, timeout=timeout))
+            if callable(flush):
+                try:
+                    return bool(flush(timeout=timeout, since_ticket=ticket))
+                except TypeError:
+                    return bool(flush(timeout=timeout))
+            return True
+        if callable(flush):
+            return bool(flush(timeout=timeout))
+        return True
+
+    def _update_raw_segments(self, session_id: str, raw_by_seq: dict[int, str]) -> object:
         raw_updater = getattr(self._store, "enqueue_update_raw", None)
         if callable(raw_updater):
-            raw_updater(session_id, raw_by_seq)
-            return
+            return raw_updater(session_id, raw_by_seq)
         enqueue_write = getattr(self._store, "enqueue_write", None)
         if callable(enqueue_write):
             rows = [
                 ("" if str(val) == _SUPPRESSED_POLISHED_MARKER else str(val), session_id, int(seq))
                 for seq, val in raw_by_seq.items()
             ]
-            enqueue_write(
+            return enqueue_write(
                 lambda conn: conn.executemany(
                     "UPDATE history SET raw_text = ? WHERE session_id = ? AND seq = ?",
                     rows,
                 )
             )
-            return
         segs_map = getattr(self._store, "segments", None)
         if isinstance(segs_map, dict) and session_id in segs_map:
             segs_map[session_id] = [
@@ -2266,6 +2317,7 @@ class HistoryWindow(QWidget):
                 else s
                 for s in segs_map[session_id]
             ]
+        return None
 
     def _on_edit_clicked(self) -> None:
         if self._editing_session:
@@ -2281,11 +2333,14 @@ class HistoryWindow(QWidget):
         rows. Returns True when a merge was committed."""
         if not self._pending_merge:
             return False
+        snapshot = list(self._pending_merge)
         self._undo_timer.stop()
-        self._commit_pending_merge_now()
-        flush = getattr(self._store, "flush", None)
-        if callable(flush):
-            flush(timeout=2.0)
+        ticket = self._commit_pending_merge_now()
+        if not self._verify_store_ticket(ticket, timeout=2.0):
+            self._pending_merge = snapshot
+            self._show_feedback("未能完成合并，请稍后重试")
+            self._refresh_toast()
+            return False
         self._toast.hide()
         return True
 
@@ -2293,7 +2348,9 @@ class HistoryWindow(QWidget):
         session_id = self._active_session_id()
         if not session_id:
             return
-        if self._settle_pending_merge():
+        if self._pending_merge:
+            if not self._settle_pending_merge():
+                return
             self.refresh()
             session_id = self._active_session_id() or session_id
         segments = _segments_in_order(self._get_session_segments_effective(session_id))
@@ -2404,14 +2461,11 @@ class HistoryWindow(QWidget):
                 self._show_feedback("未能保存修改")
                 return False
             if editing_raw:
-                self._update_raw_segments(session_id, mapping)
+                ticket = self._update_raw_segments(session_id, mapping)
             else:
                 updater = getattr(self._store, "enqueue_update_polished", None)
-                if callable(updater):
-                    updater(session_id, mapping)
-            flush = getattr(self._store, "flush", None)
-            saved = flush(timeout=2.0) if callable(flush) else True
-            if saved is False:
+                ticket = updater(session_id, mapping) if callable(updater) else 0
+            if not self._verify_store_ticket(ticket, timeout=2.0):
                 self._show_feedback("未能保存修改")
                 return False
             self._exit_inline_edit_state()
@@ -2452,6 +2506,13 @@ class HistoryWindow(QWidget):
             self.refresh()
         return True
 
+    def has_unsaved_inline_edit(self) -> bool:
+        """Return True when an inline session edit is open with unsaved text changes."""
+        if not getattr(self, "_editing_session", False) or not self._editing_session_id:
+            return False
+        current_text = self._details.toPlainText().strip()
+        return bool(current_text and current_text != self._editing_original_text.strip())
+
     def try_leave(self) -> bool:
         """Save or close an open inline session edit before switching sidebar pages.
 
@@ -2460,8 +2521,7 @@ class HistoryWindow(QWidget):
         """
         if not getattr(self, "_editing_session", False) or not self._editing_session_id:
             return True
-        current_text = self._details.toPlainText().strip()
-        if not current_text or current_text == self._editing_original_text.strip():
+        if not self.has_unsaved_inline_edit():
             self._exit_inline_edit_state()
             self._on_selection_changed()
             return True
@@ -2516,7 +2576,9 @@ class HistoryWindow(QWidget):
         if config is not None and not bool(config.get("llm.enabled", False)):
             if not confirm_polish_while_disabled(self):
                 return
-        if self._settle_pending_merge():
+        if self._pending_merge:
+            if not self._settle_pending_merge():
+                return
             self.refresh()
             session_id = self._active_session_id() or session_id
         segments = _segments_in_order(self._get_session_segments_effective(session_id))
@@ -2590,11 +2652,11 @@ class HistoryWindow(QWidget):
                 self.refresh()
                 return
             updater = getattr(self._store, "enqueue_update_polished", None)
-            if callable(updater):
-                updater(session_id, mapping)
-            flush = getattr(self._store, "flush", None)
-            if callable(flush):
-                flush(timeout=2.0)
+            ticket = updater(session_id, mapping) if callable(updater) else 0
+            if not self._verify_store_ticket(ticket, timeout=2.0):
+                self._show_feedback(f"未能保存{label}结果，已保留原文")
+                self.refresh()
+                return
             self._view_polished = True
             self._user_view_polished = True
             self._search_auto_switched = False
@@ -2618,7 +2680,8 @@ class HistoryWindow(QWidget):
             return
         # The promoted meeting reads the rows on another connection: a merge
         # still in the writer queue would leave the newer sessions out of it.
-        self._settle_pending_merge()
+        if self._pending_merge and not self._settle_pending_merge():
+            return
         from sayink.meeting_store import MeetingStore
 
         promoter = getattr(self._store, "create_meeting_from_sessions", None)
@@ -2772,7 +2835,10 @@ class HistoryWindow(QWidget):
             return
         # Deleting the merged row means the merge itself is final; the toast
         # says so, since its own undo window is forfeited here.
-        self._merge_committed_by_delete = self._settle_pending_merge()
+        had_pending_merge = bool(self._pending_merge)
+        if had_pending_merge and not self._settle_pending_merge():
+            return
+        self._merge_committed_by_delete = had_pending_merge
         # Undo replaces the confirmation dialog: one safety net, not two.
         ids = {s.session_id for s in deletable}
         if self._polishing_session_id in ids:
@@ -2834,17 +2900,18 @@ class HistoryWindow(QWidget):
         self._toast.hide()
         QTimer.singleShot(250, self.refresh)
 
-    def _commit_pending_merge_now(self) -> None:
+    def _commit_pending_merge_now(self) -> object:
         if len(self._pending_merge) < 2:
             self._pending_merge = []
-            return
+            return None
         ordered = sorted(self._pending_merge, key=lambda s: s.created_at)
         target_id = ordered[0].session_id
         ids = [s.session_id for s in ordered]
         self._pending_merge = []
         merger = getattr(self._store, "enqueue_merge_sessions", None)
         if callable(merger):
-            merger(target_id, ids)
+            return merger(target_id, ids)
+        return 0
 
     def _commit_pending_merge(self) -> None:
         if not self._pending_merge:
@@ -2929,7 +2996,15 @@ class HistoryWindow(QWidget):
                 text = build_single_session_plain(session, segments, prefer_raw=prefer_raw)
             else:
                 text = build_single_session_markdown(session, segments, prefer_raw=prefer_raw)
-            Path(path).write_text(text, encoding="utf-8")
+            atomic_write_text(
+                path,
+                text,
+                encoding="utf-8",
+                newline="" if kind == "csv" else None,
+            )
+        except PermissionError as exc:
+            alert_error(self, "导出失败", f"目标文件可能正被其他程序占用，无法写入：{exc}")
+            return
         except OSError as exc:
             alert_error(self, "导出失败", f"无法写入文件：{exc}")
             return
@@ -2969,7 +3044,15 @@ class HistoryWindow(QWidget):
                 text = build_batch_export_csv(sessions, segments_by_session, prefer_raw=prefer_raw)
             else:
                 text = build_batch_export_markdown(sessions, segments_by_session, prefer_raw=prefer_raw)
-            Path(path).write_text(text, encoding="utf-8")
+            atomic_write_text(
+                path,
+                text,
+                encoding="utf-8",
+                newline="" if kind == "csv" else None,
+            )
+        except PermissionError as exc:
+            alert_error(self, "导出失败", f"目标文件可能正被其他程序占用，无法写入：{exc}")
+            return
         except OSError as exc:
             alert_error(self, "导出失败", f"无法写入文件：{exc}")
             return

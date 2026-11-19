@@ -11,6 +11,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QListWidgetItem
 
 from sayink.ui import design_tokens as tok
+from sayink.ui.flow_layout import defer_while_live_resize, flush_live_resize
 from sayink.ui.history_window import session_list_item_css
 from sayink.ui.meeting_batch import fit_action_button
 from sayink.ui.meeting_page import PAGE_LIVE
@@ -177,6 +178,17 @@ def reapply_theme(page: object) -> None:
                 page._import_btn, page._media_btn, page._media_retry_btn, page._media_again_btn,
                 page._back_to_list_btn):
         btn.setStyleSheet(ss.BTN_GHOST_SM)
+    for extra_ghost in (
+        getattr(page, "_finalize_retry_btn", None),
+    ):
+        if extra_ghost is not None:
+            extra_ghost.setStyleSheet(ss.BTN_GHOST_SM)
+    for extra_danger in (
+        getattr(page, "_media_discard_btn", None),
+        getattr(page, "_finalize_discard_btn", None),
+    ):
+        if extra_danger is not None:
+            extra_danger.setStyleSheet(ss.BTN_DANGER_SM)
     for btn in (page._edit_btn, page._correct_speaker_btn, page._live_correct_speaker_btn):
         btn.setStyleSheet(ss.BTN_GHOST_SM + disabled_sm)
     page._media_cancel_btn.setStyleSheet(ss.BTN_DANGER_SM)
@@ -230,6 +242,12 @@ def reapply_theme(page: object) -> None:
     page._sync_media_buttons()
 
 
+def _set_margins_if_changed(layout, left: int, top: int, right: int, bottom: int) -> None:
+    cur = layout.contentsMargins()
+    if (cur.left(), cur.top(), cur.right(), cur.bottom()) != (left, top, right, bottom):
+        layout.setContentsMargins(left, top, right, bottom)
+
+
 def _sync_live_marks_height(page, has_marks: bool | None = None) -> None:
     if not hasattr(page, "_marks_view"):
         return
@@ -240,15 +258,18 @@ def _sync_live_marks_height(page, has_marks: bool | None = None) -> None:
             has_marks = bool(current_id and page._store.get_marks(current_id))
         except Exception:
             has_marks = False
-    page._marks_view.setVerticalScrollBarPolicy(
-        Qt.ScrollBarPolicy.ScrollBarAsNeeded if has_marks else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-    )
+    policy = Qt.ScrollBarPolicy.ScrollBarAsNeeded if has_marks else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    if page._marks_view.verticalScrollBarPolicy() != policy:
+        page._marks_view.setVerticalScrollBarPolicy(policy)
     if compact_h:
         max_h = 68 if has_marks else 48
     else:
         max_h = 160 if has_marks else 88
-    page._marks_view.setMinimumHeight(34 if compact_h else 36)
-    page._marks_view.setMaximumHeight(max_h)
+    min_h = 34 if compact_h else 36
+    if page._marks_view.minimumHeight() != min_h:
+        page._marks_view.setMinimumHeight(min_h)
+    if page._marks_view.maximumHeight() != max_h:
+        page._marks_view.setMaximumHeight(max_h)
 
 
 def show_compact_list(page) -> None:
@@ -294,21 +315,52 @@ def _apply_compact_pane_visibility(page) -> None:
             page._back_to_list_btn.hide()
 
 
+def _sync_materials_and_overlay(page) -> None:
+    if hasattr(page, "_materials_scroll"):
+        cap = max(108, min(200, int(page.height() * 0.28)))
+        if page._materials_scroll.maximumHeight() != cap:
+            page._materials_scroll.setMaximumHeight(cap)
+    page._position_live_new_msg_btn()
+
+
 def sync_viewport_width(page, host_width: int | None = None) -> None:
-    page._host_viewport_width = int(host_width) if host_width is not None and host_width > 0 else None
-    page._sync_responsive_layout()
+    if host_width is not None and host_width > 0:
+        page._host_viewport_width = int(host_width)
+    if defer_while_live_resize(page, page._follow_live_resize):
+        return
+    _sync_responsive_layout(page, host_width=host_width)
+    _sync_materials_and_overlay(page)
+    flush_live_resize(page)
 
 
-def _sync_responsive_layout(page) -> None:
+def follow_live_resize(page) -> None:
+    if defer_while_live_resize(page, page._follow_live_resize):
+        return
+    _sync_responsive_layout(page)
+    _sync_materials_and_overlay(page)
+    flush_live_resize(page)
+
+
+def _sync_responsive_layout(page, host_width: int | None = None) -> None:
     if not hasattr(page, "_outer_layout"):
         return
+    stashed_host_w = getattr(page, "_host_viewport_width", None)
+    page._host_viewport_width = None
     top_win = page.window()
     in_host_shell = top_win is not page
-    host_w = page._host_viewport_width
-    if host_w is None and in_host_shell and top_win.width() > 0:
+    explicit_host_w = (
+        int(host_width)
+        if host_width is not None and host_width > 0
+        else (int(stashed_host_w) if stashed_host_w is not None and stashed_host_w > 0 else None)
+    )
+    if explicit_host_w is not None:
+        host_w: int | None = explicit_host_w
+    elif in_host_shell and top_win.width() > 0:
         host_w = top_win.width()
+    else:
+        host_w = None
     w = page.width()
-    if host_w is not None and in_host_shell:
+    if host_w is not None and in_host_shell and (explicit_host_w is not None or hasattr(top_win, "sidebar_width")):
         sidebar_w = (
             tok.COMPACT_SIDEBAR_WIDTH
             if host_w < tok.COMPACT_WINDOW_THRESHOLD
@@ -316,7 +368,7 @@ def _sync_responsive_layout(page) -> None:
         )
         eff_w = max(220, host_w - sidebar_w - 2)
     else:
-        eff_w = w
+        eff_w = w if w > 0 else (host_w or 0)
     h = page.height()
     compact_h = 0 < h < 540
     narrow_w = 0 < eff_w < 880 or (host_w is not None and 0 < host_w < 880)
@@ -338,11 +390,15 @@ def _sync_responsive_layout(page) -> None:
         h_margin = base_left
     v_top = 8 if (compact_h or compact_single) else base_top
     v_bottom = 8 if (compact_h or compact_single) else base_bottom
-    page._outer_layout.setContentsMargins(h_margin, v_top, h_margin, v_bottom)
-    page._outer_layout.setSpacing(6 if (compact_h or compact_single) else 14)
+    _set_margins_if_changed(page._outer_layout, h_margin, v_top, h_margin, v_bottom)
+    outer_spacing = 6 if (compact_h or compact_single) else 14
+    if page._outer_layout.spacing() != outer_spacing:
+        page._outer_layout.setSpacing(outer_spacing)
 
     if hasattr(page, "_live_layout"):
-        page._live_layout.setSpacing(4 if compact_h else 10)
+        live_spacing = 4 if compact_h else 10
+        if page._live_layout.spacing() != live_spacing:
+            page._live_layout.setSpacing(live_spacing)
     if hasattr(page, "_live_split"):
         desired_orient = (
             Qt.Orientation.Vertical if compact_single else Qt.Orientation.Horizontal
@@ -350,61 +406,251 @@ def _sync_responsive_layout(page) -> None:
         if page._live_split.orientation() != desired_orient:
             page._live_split.setOrientation(desired_orient)
     if hasattr(page, "_live_side_layout"):
-        page._live_side_layout.setSpacing(4 if compact_h else 8)
-        page._live_side_layout.setContentsMargins(
+        side_spacing = 4 if compact_h else 8
+        if page._live_side_layout.spacing() != side_spacing:
+            page._live_side_layout.setSpacing(side_spacing)
+        _set_margins_if_changed(
+            page._live_side_layout,
             0 if compact_single else (8 if narrow_w else 12),
             6 if compact_single else 0,
             0,
             0,
         )
     if hasattr(page, "_user_notes"):
-        page._user_notes.setMinimumHeight(46 if compact_h else 64)
+        notes_min_h = 46 if compact_h else 64
+        if page._user_notes.minimumHeight() != notes_min_h:
+            page._user_notes.setMinimumHeight(notes_min_h)
     page._sync_live_marks_height()
 
     if hasattr(page, "_browse_left") and hasattr(page, "_detail_pane"):
-        if compact_single:
-            page._compact_single_pane = True
-            page._browse_left.setMinimumWidth(180)
-            page._detail_pane.setMinimumWidth(180)
-            if hasattr(page, "_detail_layout"):
-                page._detail_layout.setContentsMargins(0, 0, 0, 0)
-            if hasattr(page, "_live_side_scroll"):
-                page._live_side_scroll.setMinimumWidth(0)
-            page._apply_compact_pane_visibility()
-        else:
-            if page._compact_single_pane:
-                page._compact_single_pane = False
-                page._apply_compact_pane_visibility()
-            if narrow_w:
-                avail = max(300, eff_w - 2 * h_margin - page._splitter.handleWidth())
-                ratio = eff_w / 880.0
-                list_min = max(
-                    140,
-                    min(
-                        tok.WORKSPACE_LIST_MIN_WIDTH - 16,
-                        int(tok.WORKSPACE_LIST_MIN_WIDTH * ratio),
-                        int(avail * 0.34),
-                    ),
-                )
-                detail_min = max(
-                    200,
-                    min(
-                        tok.WORKSPACE_DETAIL_MIN_WIDTH - 20,
-                        int(tok.WORKSPACE_DETAIL_MIN_WIDTH * ratio),
-                        avail - list_min - 4,
-                    ),
-                )
-                page._browse_left.setMinimumWidth(list_min)
-                page._detail_pane.setMinimumWidth(detail_min)
-                if hasattr(page, "_detail_layout"):
-                    page._detail_layout.setContentsMargins(12 if eff_w < 720 else 16, 0, 0, 0)
-                if hasattr(page, "_live_side_scroll"):
-                    page._live_side_scroll.setMinimumWidth(180)
-            else:
-                page._browse_left.setMinimumWidth(tok.WORKSPACE_LIST_MIN_WIDTH)
-                page._detail_pane.setMinimumWidth(tok.WORKSPACE_DETAIL_MIN_WIDTH)
-                if hasattr(page, "_detail_layout"):
-                    page._detail_layout.setContentsMargins(20, 0, 0, 0)
-                if hasattr(page, "_live_side_scroll"):
-                    page._live_side_scroll.setMinimumWidth(240)
+        _sync_browse_panes(page, compact_single=compact_single, narrow_w=narrow_w, eff_w=eff_w, h_margin=h_margin)
         page._fit_template_cluster()
+
+
+def _set_min_width_if_changed(widget, width: int) -> None:
+    if widget.minimumWidth() != width:
+        widget.setMinimumWidth(width)
+
+
+def _sync_browse_panes(page, *, compact_single: bool, narrow_w: bool, eff_w: int, h_margin: int) -> None:
+    if compact_single:
+        page._compact_single_pane = True
+        _set_min_width_if_changed(page._browse_left, 180)
+        _set_min_width_if_changed(page._detail_pane, 180)
+        if hasattr(page, "_detail_layout"):
+            _set_margins_if_changed(page._detail_layout, 0, 0, 0, 0)
+        if hasattr(page, "_live_side_scroll"):
+            _set_min_width_if_changed(page._live_side_scroll, 0)
+        page._apply_compact_pane_visibility()
+        return
+
+    if page._compact_single_pane:
+        page._compact_single_pane = False
+        page._apply_compact_pane_visibility()
+    if narrow_w:
+        avail = max(300, eff_w - 2 * h_margin - page._splitter.handleWidth())
+        ratio = eff_w / 880.0
+        list_min = max(
+            140,
+            min(
+                tok.WORKSPACE_LIST_MIN_WIDTH - 16,
+                int(tok.WORKSPACE_LIST_MIN_WIDTH * ratio),
+                int(avail * 0.34),
+            ),
+        )
+        detail_min = max(
+            200,
+            min(
+                tok.WORKSPACE_DETAIL_MIN_WIDTH - 20,
+                int(tok.WORKSPACE_DETAIL_MIN_WIDTH * ratio),
+                avail - list_min - 4,
+            ),
+        )
+        _set_min_width_if_changed(page._browse_left, list_min)
+        _set_min_width_if_changed(page._detail_pane, detail_min)
+        if hasattr(page, "_detail_layout"):
+            _set_margins_if_changed(page._detail_layout, 12 if eff_w < 720 else 16, 0, 0, 0)
+        if hasattr(page, "_live_side_scroll"):
+            _set_min_width_if_changed(page._live_side_scroll, 180)
+        return
+
+    _set_min_width_if_changed(page._browse_left, tok.WORKSPACE_LIST_MIN_WIDTH)
+    _set_min_width_if_changed(page._detail_pane, tok.WORKSPACE_DETAIL_MIN_WIDTH)
+    if hasattr(page, "_detail_layout"):
+        _set_margins_if_changed(page._detail_layout, 20, 0, 0, 0)
+    if hasattr(page, "_live_side_scroll"):
+        _set_min_width_if_changed(page._live_side_scroll, 240)
+
+
+def confirm_export_overwrite_if_adjusted(page, raw_path: str, final_path: str) -> bool:
+    from pathlib import Path
+    from sayink.ui import meeting_page as mp
+    from sayink.ui.prompts import confirm_box
+
+    raw_p = Path(raw_path)
+    final_p = Path(final_path)
+    if raw_p != final_p and final_p.exists():
+        box, overwrite = confirm_box(
+            page,
+            "确认覆盖已有文件",
+            f"文件「{final_p.name}」已存在，是否覆盖？",
+            accept="覆盖",
+            cancel="取消",
+            destructive=True,
+        )
+        mp._style_dialog_box(box, danger_btn=overwrite)
+        with mp._quiet_tooltips(page):
+            box.exec()
+        return box.clickedButton() == overwrite
+    return True
+
+
+def export_selected_meetings(page) -> None:
+    import time
+    from sayink.ui import meeting_page as mp
+
+    ids = page._selected_meeting_ids()
+    if not ids:
+        return
+    default = mp.export_save_path(f"会议导出-{time.strftime('%Y%m%d')}.md")
+    with mp.native_file_dialog(page):
+        raw_path, selected = mp.QFileDialog.getSaveFileName(
+            page,
+            "导出选中的会议",
+            default,
+            "Markdown (*.md);;Word 文档 (*.docx)",
+        )
+    if not raw_path:
+        return
+    kind = "docx" if mp._export_kind(raw_path, selected) == "docx" else "md"
+    path = mp._with_export_suffix(raw_path, kind)
+    if not page._confirm_export_overwrite_if_adjusted(raw_path, path):
+        return
+    try:
+        body_md = page._ctrl.export_meetings_markdown(ids)
+        if kind == "docx":
+            from sayink.docx_io import write_docx_document
+
+            write_docx_document(path, title=f"会议导出（{len(ids)} 场）", markdown_body=body_md)
+        else:
+            mp.atomic_write_text(path, body_md, encoding="utf-8")
+    except PermissionError as exc:
+        mp.alert_error(page, "导出失败", f"目标文件可能正被其他程序占用，无法写入：{exc}")
+        return
+    except OSError as exc:
+        mp.alert_error(page, "导出失败", f"无法写入文件：{exc}")
+        return
+    page._set_status(f"已导出 {len(ids)} 场会议")
+
+
+def export_meeting_to_path(page, meeting_id: str, path, *, scope: str = "all") -> bool:
+    from pathlib import Path
+    from sayink.ui import meeting_page as mp
+
+    record = page._store.get_meeting(meeting_id)
+    if record is None:
+        return False
+    target = Path(path)
+    kind = mp._export_kind(str(target), "")
+    try:
+        if kind == "docx":
+            from sayink.docx_io import write_docx_document
+
+            if meeting_id == page._detail_id:
+                body_md = page._markdown_for_export_scope(record, scope)
+            elif scope == "transcript":
+                body_md = page._ctrl.export_transcript_markdown(record.id)
+            elif scope == "notes":
+                notes = page._store.get_notes(record.id)
+                body_md = notes.markdown if notes is not None else ""
+            else:
+                body_md = page._ctrl.export_markdown(record.id)
+            write_docx_document(
+                target,
+                title=record.display_title,
+                metadata_rows=page._docx_metadata_rows(record),
+                markdown_body=body_md,
+            )
+            return True
+        if kind == "srt":
+            mp.atomic_write_text(target, page._ctrl.export_transcript_srt(record.id), encoding="utf-8")
+            return True
+        if kind == "txt":
+            mp.atomic_write_text(target, page._ctrl.transcript_text(record.id), encoding="utf-8")
+            return True
+        mp.atomic_write_text(target, page._ctrl.export_markdown(record.id), encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def export_single_meeting(page, scope: str = "all") -> None:
+    from sayink.ui import meeting_page as mp
+
+    if not page._flush_bound_title(sync=True) or not page._save_record_notes():
+        return
+    record = page._store.get_meeting(page._detail_id) if page._detail_id else None
+    if record is None:
+        return
+    label = {"notes": page._result_label(), "transcript": "文字稿", "all": "完整会议记录"}[scope]
+    default = mp.export_save_path(
+        f"{mp.safe_filename(record.display_title)}-{label}-{mp._safe_dt(record.started_at).strftime('%Y%m%d')}.md"
+    )
+    filters = "Markdown (*.md);;Word 文档 (*.docx);;纯文本 (*.txt)"
+    if page._transcript_has_times:
+        filters += ";;SRT 字幕 (*.srt)"
+    with mp.native_file_dialog(page):
+        raw_path, selected = mp.QFileDialog.getSaveFileName(
+            page, "导出" + label, default, filters,
+        )
+    if not raw_path:
+        return
+    kind = mp._export_kind(raw_path, selected)
+    if kind == "srt" and not page._transcript_has_times:
+        page._set_status("这场文字稿没有时间戳，无法导出字幕")
+        return
+    path = mp._with_export_suffix(raw_path, kind)
+    if not page._confirm_export_overwrite_if_adjusted(raw_path, path):
+        return
+    srt_note = ""
+    try:
+        if kind == "docx":
+            from sayink.docx_io import write_docx_document
+
+            write_docx_document(
+                path,
+                title=record.display_title,
+                metadata_rows=page._docx_metadata_rows(record),
+                markdown_body=page._markdown_for_export_scope(record, scope),
+            )
+        elif kind == "srt":
+            text = page._ctrl.export_transcript_srt(record.id)
+            srt_note = getattr(page._ctrl, "srt_skip_note", "") or ""
+            mp.atomic_write_text(path, text, encoding="utf-8")
+        elif kind == "txt":
+            if scope == "notes":
+                text = page._current_notes_text()
+            elif scope == "transcript":
+                text = page._ctrl.transcript_text(record.id)
+            else:
+                notes = page._current_notes_text().rstrip()
+                supplement = page._ctrl.supplements_markdown(record.id).strip()
+                chunks = [part for part in (notes, supplement, page._ctrl.transcript_text(record.id).rstrip()) if part]
+                text = "\n\n".join(chunks)
+                if text and not text.endswith("\n"):
+                    text += "\n"
+            mp.atomic_write_text(path, text, encoding="utf-8")
+        else:
+            text = page._markdown_for_export_scope(record, scope)
+            mp.atomic_write_text(path, text, encoding="utf-8")
+    except PermissionError as exc:
+        mp.alert_error(page, "导出失败", f"目标文件可能正被其他程序占用，无法写入：{exc}")
+        return
+    except OSError as exc:
+        mp.alert_error(page, "导出失败", f"无法写入文件：{exc}")
+        return
+    if kind == "srt":
+        page._set_status(f"已导出文字稿字幕（{srt_note}）" if srt_note else "已导出文字稿字幕")
+    else:
+        page._set_status("已导出" + label + ("（包含当前草稿）" if page._editing_notes and scope != "transcript" else ""))
+

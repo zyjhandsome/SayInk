@@ -70,48 +70,115 @@ def extract_choice_delta(choice: Any) -> tuple[str, str, str | None]:
     return content, reasoning, reason
 
 
-def iter_sse_payloads(lines: Iterable[str | None], *, include_done: bool = False) -> Iterator[Any]:
-    """Yield decoded JSON payloads (and optionally ``'[DONE]'``) from a synchronous line stream."""
-    event: list[str] = []
-    raw_lines: list[str] = []
-    saw_data = False
+MAX_SSE_BUFFER_BYTES = 262_144
 
-    def flush() -> Any:
-        nonlocal saw_data
-        if not event:
-            return None
-        raw = "\n".join(event)
-        event.clear()
-        saw_data = True
-        return "[DONE]" if raw == "[DONE]" else parse_sse_json(raw)
 
-    for line in lines:
-        if line is None:
-            continue
-        raw_lines.append(line)
-        if line == "":
-            item = flush()
-            if item == "[DONE]":
-                if include_done:
-                    yield "[DONE]"
-                return
-            if item is not None:
-                yield item
-        elif line.startswith("data:"):
-            event.append(line[5:].lstrip(" "))
+def _check_stream_line_guards(
+    is_cancelled: Callable[[], bool] | None,
+    deadline: float | None,
+) -> None:
+    if is_cancelled is not None and is_cancelled():
+        raise LLMCancelled()
+    if deadline is not None and time.monotonic() > deadline:
+        raise TimeoutError("总时长超时")
 
-    item = flush()
+
+def _append_bounded_line(
+    buf: list[str],
+    cur_bytes: int,
+    text: str,
+    max_bytes: int,
+    err_msg: str,
+) -> int:
+    next_bytes = cur_bytes + len(text.encode("utf-8", errors="replace")) + 1
+    if next_bytes > max_bytes:
+        raise LLMResponseError(err_msg)
+    buf.append(text)
+    return next_bytes
+
+
+def _parse_non_sse_fallback(raw_lines: list[str]) -> Any | None:
+    blob = "\n".join(ln for ln in raw_lines if ln).strip()
+    if blob.startswith(("{", "[")):
+        return parse_sse_json(blob)
+    return None
+
+
+def _flush_sse_event(event: list[str]) -> Any:
+    if not event:
+        return None
+    raw = "\n".join(event)
+    event.clear()
+    return "[DONE]" if raw == "[DONE]" else parse_sse_json(raw)
+
+
+def _should_stop_on_item(item: Any, include_done: bool, out: list[Any]) -> bool:
     if item == "[DONE]":
         if include_done:
-            yield "[DONE]"
-        return
+            out.append("[DONE]")
+        return True
     if item is not None:
-        yield item
-        return
-    if not saw_data:
-        blob = "\n".join(ln for ln in raw_lines if ln).strip()
-        if blob.startswith(("{", "[")):
-            yield parse_sse_json(blob)
+        out.append(item)
+    return False
+
+
+def iter_sse_payloads(
+    lines: Iterable[str | None],
+    *,
+    include_done: bool = False,
+    is_cancelled: Callable[[], bool] | None = None,
+    deadline: float | None = None,
+    max_buffer_bytes: int = MAX_SSE_BUFFER_BYTES,
+) -> Iterator[Any]:
+    """Yield decoded JSON payloads (and optionally ``'[DONE]'``) from a synchronous line stream."""
+    event: list[str] = []
+    event_bytes = 0
+    raw_lines: list[str] = []
+    raw_bytes = 0
+    saw_data = False
+    ready: list[Any] = []
+
+    for line in lines:
+        _check_stream_line_guards(is_cancelled, deadline)
+        if line is None or line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            if not saw_data:
+                saw_data = True
+                raw_lines.clear()
+                raw_bytes = 0
+            event_bytes = _append_bounded_line(
+                event,
+                event_bytes,
+                line[5:].lstrip(" "),
+                max_buffer_bytes,
+                "流式单条事件体积超出安全上限",
+            )
+        elif line == "":
+            event_bytes = 0
+            stop = _should_stop_on_item(_flush_sse_event(event), include_done, ready)
+            while ready:
+                yield ready.pop(0)
+            if stop:
+                return
+        elif not saw_data:
+            raw_bytes = _append_bounded_line(
+                raw_lines,
+                raw_bytes,
+                line,
+                max_buffer_bytes,
+                "非流式回退响应体积超出安全上限",
+            )
+
+    _check_stream_line_guards(is_cancelled, deadline)
+    had_trailing_event = bool(event)
+    _should_stop_on_item(_flush_sse_event(event), include_done, ready)
+    while ready:
+        yield ready.pop(0)
+    if not had_trailing_event and not saw_data:
+        fallback = _parse_non_sse_fallback(raw_lines)
+        if fallback is not None:
+            yield fallback
 
 
 _OPTIONAL_EMPTY_CHOICES_KEYS = ("usage", "prompt_filter_results", "system_fingerprint", "id", "model")
@@ -134,9 +201,18 @@ def iter_stream_pieces(
     lines: Iterable[str | None],
     *,
     include_done: bool = False,
+    is_cancelled: Callable[[], bool] | None = None,
+    deadline: float | None = None,
+    max_buffer_bytes: int = MAX_SSE_BUFFER_BYTES,
 ) -> Iterator[tuple[str, str, str | None]]:
     """Yield ``(content, reasoning, finish_reason)`` tuples from an SSE line iterator."""
-    for data in iter_sse_payloads(lines, include_done=include_done):
+    for data in iter_sse_payloads(
+        lines,
+        include_done=include_done,
+        is_cancelled=is_cancelled,
+        deadline=deadline,
+        max_buffer_bytes=max_buffer_bytes,
+    ):
         if data == "[DONE]":
             yield "", "", "[DONE]"
             return
@@ -145,9 +221,24 @@ def iter_stream_pieces(
             yield piece
 
 
-def stream_showed_activity(lines: Iterable[str | None]) -> bool:
+def stream_showed_activity(
+    lines: Iterable[str | None],
+    *,
+    is_cancelled: Callable[[], bool] | None = None,
+    total_timeout: float | None = None,
+    deadline: float | None = None,
+) -> bool:
     """True once any non-blank visible token or reasoning token arrives."""
-    for content, reasoning, _reason in iter_stream_pieces(lines):
+    effective_deadline = (
+        deadline
+        if deadline is not None
+        else (time.monotonic() + total_timeout if total_timeout is not None else None)
+    )
+    for content, reasoning, _reason in iter_stream_pieces(
+        lines,
+        is_cancelled=is_cancelled,
+        deadline=effective_deadline,
+    ):
         if content.strip() or reasoning.strip():
             return True
     return False
@@ -230,11 +321,18 @@ def collect_stream_text(
     is_cancelled: Callable[[], bool],
     total_timeout: float,
     reject_truncated: bool,
+    max_buffer_bytes: int = MAX_SSE_BUFFER_BYTES,
 ) -> str:
     """Synchronously collect verified text from an SSE line stream."""
     acc = SSEStreamAccumulator(reject_truncated=reject_truncated)
     deadline = time.monotonic() + total_timeout
-    for content, reasoning, reason in iter_stream_pieces(lines, include_done=True):
+    for content, reasoning, reason in iter_stream_pieces(
+        lines,
+        include_done=True,
+        is_cancelled=is_cancelled,
+        deadline=deadline,
+        max_buffer_bytes=max_buffer_bytes,
+    ):
         if is_cancelled():
             raise LLMCancelled()
         if time.monotonic() > deadline:
@@ -268,19 +366,22 @@ async def collect_async_stream_text(
     on_delta: Callable[[str], None] | None,
     on_status: Callable[[str], None] | None = None,
     finish_out: list[str | None] | None = None,
+    max_buffer_bytes: int = MAX_SSE_BUFFER_BYTES,
 ) -> str:
     """Asynchronously collect verified text from an ``httpx.Response`` SSE stream."""
     acc = SSEStreamAccumulator(reject_truncated=True, on_delta=on_delta, on_status=on_status)
     event_lines: list[str] = []
+    event_bytes = 0
     activity_deadline = time.monotonic() + first_timeout
     lines = response.aiter_lines().__aiter__()
 
     def consume_event() -> bool:
-        nonlocal activity_deadline
+        nonlocal activity_deadline, event_bytes
         if not event_lines:
             return False
         raw = "\n".join(event_lines)
         event_lines.clear()
+        event_bytes = 0
         if raw == "[DONE]":
             return acc.on_done_marker(strict_empty=True)
         piece = parse_sse_payload_piece(parse_sse_json(raw))
@@ -301,7 +402,13 @@ async def collect_async_stream_text(
             if consume_event():
                 break
         elif line.startswith("data:"):
-            event_lines.append(line[5:].lstrip(" "))
+            event_bytes = _append_bounded_line(
+                event_lines,
+                event_bytes,
+                line[5:].lstrip(" "),
+                max_buffer_bytes,
+                "流式单条事件体积超出安全上限",
+            )
 
     text = acc.finalize_text()
     if finish_out is not None:

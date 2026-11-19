@@ -751,10 +751,6 @@ class HotKeyManager(QObject):
         target = kind or (self._recording_kind if self._is_recording else self._hold_kind)
         return self._rewrite_keys if target == "rewrite" else self._hotkey_keys
 
-    def _hotkey_still_held(self) -> bool:
-        with self._lock:
-            return self._hotkey_still_held_locked()
-
     def _hotkey_still_held_locked(self, kind: str | None = None) -> bool:
         """Caller must hold ``self._lock``."""
         keys = self._active_hold_keys_locked(kind)

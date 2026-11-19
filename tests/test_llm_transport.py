@@ -319,3 +319,73 @@ def test_cancel_interrupts_waiting_for_response_headers():
     cancellation.cancel()
     thread.join(2)
     assert not thread.is_alive() and closed.is_set() and len(errors) == 1
+
+
+def test_sync_sse_heartbeats_enforce_deadline_and_cancel_per_raw_line_without_buffering():
+    import time
+    import sayink.llm_transport as facade
+    from sayink.llm.sse import (
+        MAX_SSE_BUFFER_BYTES,
+        collect_stream_text,
+        iter_sse_payloads,
+        stream_showed_activity,
+    )
+
+    # 1. Clean facade __all__: keeps _stream_text, drops dead private aliases
+    assert "_stream_text" in facade.__all__
+    for removed in (
+        "_BILLING_TERMS",
+        "_DONE_REASONS",
+        "_check_choice",
+        "_error_detail",
+        "_retry_after",
+        "_visible_text",
+    ):
+        assert removed not in facade.__all__
+
+    # 2. Pure heartbeat stream checks cancel on the very first raw line
+    read_count = 0
+
+    def _cancel_heartbeats():
+        nonlocal read_count
+        for _ in range(25_000):
+            read_count += 1
+            yield ": keep-alive"
+
+    with pytest.raises(LLMCancelled):
+        collect_stream_text(
+            _cancel_heartbeats(),
+            is_cancelled=lambda: read_count >= 2,
+            total_timeout=5.0,
+            reject_truncated=False,
+        )
+    assert read_count == 2
+
+    # 3. Pure heartbeat stream honors 20ms total_timeout instead of consuming 25k lines unchecked
+    def _slow_heartbeats():
+        while True:
+            time.sleep(0.005)
+            yield ": keep-alive"
+
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError):
+        collect_stream_text(
+            _slow_heartbeats(),
+            is_cancelled=lambda: False,
+            total_timeout=0.02,
+            reject_truncated=False,
+        )
+    assert (time.monotonic() - t0) < 0.5
+
+    # 4. stream_showed_activity also enforces total_timeout on pure heartbeats
+    with pytest.raises(TimeoutError):
+        stream_showed_activity(_slow_heartbeats(), total_timeout=0.02)
+
+    # 5. Comment lines and >256KB fallback/event payloads are capped
+    oversized_json = ['{"a": "' + ("x" * (MAX_SSE_BUFFER_BYTES + 1024)) + '"}']
+    with pytest.raises(LLMResponseError, match="体积超出安全上限"):
+        list(iter_sse_payloads(oversized_json))
+
+    oversized_event = ["data: " + ("y" * (MAX_SSE_BUFFER_BYTES + 1024)), ""]
+    with pytest.raises(LLMResponseError, match="体积超出安全上限"):
+        list(iter_sse_payloads(oversized_event))

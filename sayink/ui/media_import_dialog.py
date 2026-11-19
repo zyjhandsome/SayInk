@@ -24,6 +24,7 @@ from sayink.audio_file_decoder import SUPPORTED_EXTENSIONS
 from sayink.config import Config
 from sayink.media_import import file_dialog_filter
 from sayink.meeting_store import now_ms
+from sayink import speech_recognizer as _sr
 from sayink.speech_recognizer import MODEL_REGISTRY, is_model_downloaded
 from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles as ss
@@ -178,9 +179,10 @@ class MediaImportDialog(QDialog):
         self._model_combo = ElidedComboBox()
         self._model_combo.setAccessibleName("导入语音模型")
         self._model_combo.addItem("跟随会议 / 默认模型", "")
+        is_asr_downloaded = getattr(_sr, "is_asr_model_downloaded", is_model_downloaded)
         for info in MODEL_REGISTRY:
             mid = str(info.get("id", "") or "")
-            if mid and is_model_downloaded(mid):
+            if mid and is_asr_downloaded(mid):
                 self._model_combo.addItem(str(info.get("name", mid)), mid)
         model_col.addWidget(self._model_combo)
         opts_row.addLayout(model_col, 1)

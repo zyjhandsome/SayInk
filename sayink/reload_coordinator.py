@@ -192,11 +192,13 @@ class ReloadCoordinator:
             self._initialized_from_config = True
 
     def _is_model_downloaded(self, model_id: str) -> bool:
+        from sayink.speech_recognizer import is_asr_model_downloaded, is_aux_model
+
+        if is_aux_model(model_id):
+            return False
         if self.is_model_downloaded_fn is not None:
             return bool(self.is_model_downloaded_fn(model_id))
-        from sayink.speech_recognizer import is_model_downloaded
-
-        return bool(is_model_downloaded(model_id))
+        return bool(is_asr_model_downloaded(model_id))
 
     def _resolve_startup_model_id(self, configured: str) -> str:
         if self.resolve_startup_model_id_fn is not None:
@@ -308,6 +310,9 @@ class ReloadCoordinator:
             if save_audio and isinstance(cfg_dir, (str, os.PathLike))
             else None
         )
+        set_keep_fn = getattr(self.recorder, "set_recovery_keep_completed", None)
+        if callable(set_keep_fn):
+            set_keep_fn(save_audio)
         self.recorder.set_recovery_directory(root)
         self.recorder.set_separate_lanes(bool(self.config.get("audio.separate_lanes", False)))
 

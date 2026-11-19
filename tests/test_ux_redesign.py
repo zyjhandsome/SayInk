@@ -92,14 +92,14 @@ def test_tab_walks_the_general_page_top_to_bottom_then_back_to_the_current_nav(m
     win.setFocus()
     _qapp_session.processEvents()
 
-    stops = _tab_stops(win, _qapp_session, 33)
+    stops = _tab_stops(win, _qapp_session, 34)
     assert stops == [
         "通用", "录音与输入", "识别", "会议默认设置", "应用与历史",
         "单次转写", "录音快捷键", "仅麦克风", "识别结果去向",
         "测试声音（约 2 秒）", "设备恢复自动选择", "手动选择音频设备",
         "混合音源分别识别（实验性）",
         "识别语言", "自定义词汇", "展开高级识别设置",
-        "会议音频来源", "会议识别模型", "保存会议录音", "开始前显示会议信息卡", "开始卡片恢复默认",
+        "会议音频来源", "会议识别模型", "保存会议录音", "查看 / 恢复未完成录音", "开始前显示会议信息卡", "开始卡片恢复默认",
         "AI 服务代理模式",
         "额外直连域名",
         "主题模式：暗色",

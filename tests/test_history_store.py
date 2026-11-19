@@ -463,3 +463,217 @@ def test_ticketed_flush_and_meeting_store_isolate_earlier_write_failures(tmp_pat
         assert meetings.flush(timeout=2.0) is False
     finally:
         store.close(timeout=2.0)
+
+
+def test_flush_does_not_consume_other_callers_failed_ticket_and_bounds_history(tmp_path):
+    from sayink.history_store import _MAX_TRACKED_FAILED_TICKETS
+
+    store = HistoryStore(db_path=tmp_path / "history.db")
+    try:
+        ok_early = store.enqueue(_record("s1", 0, raw_text="early-ok", created_at=100))
+        bad_ticket = store.enqueue_write(lambda _conn: (_ for _ in ()).throw(RuntimeError("boom")))
+        ok_late = store.enqueue(_record("s1", 1, raw_text="late-ok", created_at=200))
+
+        # Unscoped flush observes the failure once, then resets its unscoped flag.
+        assert store.flush(timeout=2.0) is False
+        assert store.flush(timeout=2.0) is True
+
+        # Ticket-specific queries remain independent and non-destructive!
+        assert store.flush_ticket(bad_ticket, timeout=2.0) is False
+        assert store.flush_ticket(bad_ticket, timeout=2.0) is False
+        assert store.flush(timeout=2.0, since_ticket=bad_ticket) is False
+        assert store.flush_ticket(ok_early, timeout=2.0) is True
+        assert store.flush_ticket(ok_late, timeout=2.0) is True
+        assert store.flush(timeout=2.0, since_ticket=ok_late) is True
+        assert store.flush_ticket(0, timeout=1.0) is False
+        assert store.flush(timeout=1.0, since_ticket=0) is False
+
+        # A failure explicitly observed via flush_ticket does not poison a later unscoped flush().
+        observed_bad = store.enqueue_write(lambda _conn: (_ for _ in ()).throw(RuntimeError("observed")))
+        assert store.flush_ticket(observed_bad, timeout=2.0) is False
+        assert store.flush(timeout=2.0) is True
+        # Yet re-querying observed_bad by ticket remains False!
+        assert store.flush_ticket(observed_bad, timeout=2.0) is False
+
+        # Exceeding _MAX_TRACKED_FAILED_TICKETS bounds memory while keeping evicted range conservative.
+        first_storm = 0
+        for _ in range(_MAX_TRACKED_FAILED_TICKETS + 20):
+            t = store.enqueue_write(lambda _conn: (_ for _ in ()).throw(RuntimeError("storm")))
+            if first_storm == 0:
+                first_storm = t
+        after_storm_ok = store.enqueue(_record("s1", 2, raw_text="recovered", created_at=300))
+        assert store.flush_ticket(after_storm_ok, timeout=5.0) is True
+        assert len(store._failed_tickets) <= _MAX_TRACKED_FAILED_TICKETS
+        assert store.flush_ticket(first_storm, timeout=1.0) is False
+    finally:
+        store.close(timeout=2.0)
+
+
+def test_close_serializes_enqueue_and_unprocessed_tickets_report_false(tmp_path):
+    store = HistoryStore(db_path=tmp_path / "history.db")
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_write(_conn):
+        started.set()
+        release.wait(timeout=5.0)
+
+    t_slow = store.enqueue_write(slow_write)
+    assert started.wait(timeout=2.0)
+    t_queued_behind = store.enqueue(_record("s", 0, raw_text="behind-slow", created_at=1))
+    assert t_slow > 0 and t_queued_behind > t_slow
+
+    # Close times out while slow_write holds the writer; post-close enqueues return 0.
+    store.close(timeout=0.05)
+    assert store.enqueue(_record("s", 1, raw_text="after-close", created_at=2)) == 0
+    assert store.enqueue_write(lambda _c: None) == 0
+    assert store.flush_ticket(0, timeout=0.05) is False
+    assert store.flush_ticket(t_queued_behind, timeout=0.05) is False
+    assert store.flush(timeout=0.05, since_ticket=t_queued_behind) is False
+
+    # Once the blocked write finishes draining, t_queued_behind commits cleanly.
+    release.set()
+    assert store.flush_ticket(t_queued_behind, timeout=2.0) is True
+    assert [r.raw_text for r in store.get_session_segments("s")] == ["behind-slow"]
+
+
+def test_bulk_delete_reads_each_recovery_metadata_once(tmp_path, monkeypatch):
+    import json
+    from pathlib import Path
+
+    store = HistoryStore(db_path=tmp_path / "history.db")
+    rec_root = tmp_path / "audio-recovery"
+    rec_root.mkdir()
+    for idx in range(16):
+        folder = rec_root / f"{idx:032x}"
+        folder.mkdir()
+        (folder / "session.json").write_text(
+            json.dumps({"session_id": f"unrelated-{idx}", "sample_rate": 16000, "complete": True}),
+            encoding="utf-8",
+        )
+        (folder / "audio.f32").write_bytes(b"\x00" * 16)
+
+    matched_dir = rec_root / ("f" * 32)
+    matched_dir.mkdir()
+    (matched_dir / "session.json").write_text(
+        json.dumps({"session_id": "del-7", "sample_rate": 16000, "complete": True}),
+        encoding="utf-8",
+    )
+    (matched_dir / "audio.f32").write_bytes(b"\x00" * 16)
+
+    for i in range(40):
+        store.enqueue(_record(f"del-{i}", 0, raw_text=f"seg-{i}", created_at=1000 + i))
+    assert store.flush(timeout=2.0) is True
+
+    session_reads = 0
+    real_read_text = Path.read_text
+
+    def count_reads(self: Path, *args, **kwargs):
+        nonlocal session_reads
+        if self.name == "session.json":
+            session_reads += 1
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", count_reads)
+    try:
+        t_del = store.enqueue_delete_sessions([f"del-{i}" for i in range(40)])
+        assert store.flush_ticket(t_del, timeout=2.0) is True
+        assert not matched_dir.exists()
+        assert session_reads == 17
+    finally:
+        store.close(timeout=2.0)
+
+
+def test_quarantine_aborts_when_wal_sidecar_is_locked_and_handles_name_collisions(tmp_path, monkeypatch):
+    from pathlib import Path
+    from sayink import history_store as hs_mod
+
+    # 1. Locked -wal sidecar aborts recreate (disables store) and restores history.db
+    locked_dir = tmp_path / "locked_case"
+    locked_dir.mkdir()
+    db_file = locked_dir / "history.db"
+    wal_file = locked_dir / "history.db-wal"
+    seed = HistoryStore(db_path=db_file)
+    seed.enqueue(_record("s-seed", 0, raw_text="seed", created_at=1))
+    seed.close(timeout=2.0)
+
+    # Corrupt the WAL database body and place a locked -wal sidecar beside it;
+    # hold an OS handle or block rename on -wal so SQLite/quarantine cannot remove or move it.
+    raw = bytearray(db_file.read_bytes())
+    raw[:16] = b"corrupt-header!!"
+    db_file.write_bytes(bytes(raw))
+
+    real_bootstrap = HistoryStore._bootstrap_schema
+    first_call = {"done": False}
+
+    def bootstrap_leaving_wal(self: HistoryStore) -> None:
+        if not first_call["done"]:
+            first_call["done"] = True
+            wal_file.write_bytes(b"locked wal frames")
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return real_bootstrap(self)
+
+    real_replace = Path.replace
+
+    def block_wal_move(self: Path, target: Path):
+        if self.name.endswith("-wal"):
+            raise PermissionError("wal locked by external reader")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(HistoryStore, "_bootstrap_schema", bootstrap_leaving_wal)
+    monkeypatch.setattr(Path, "replace", block_wal_move)
+    s_locked = HistoryStore(db_path=db_file)
+    monkeypatch.setattr(Path, "replace", real_replace)
+    monkeypatch.setattr(HistoryStore, "_bootstrap_schema", real_bootstrap)
+    assert s_locked.disabled is True
+    assert db_file.exists()
+    assert db_file.read_bytes().startswith(b"corrupt-header!!")
+    s_locked.close(timeout=1.0)
+
+    # 2. Same-second corrupt DB backups use collision suffix instead of overwriting
+    coll_dir = tmp_path / "collision_case"
+    coll_dir.mkdir()
+    monkeypatch.setattr(hs_mod.time, "strftime", lambda _fmt: "20261118-120000")
+    db2 = coll_dir / "history.db"
+    db2.write_bytes(b"corrupt-db-one" * 20)
+    s1 = HistoryStore(db_path=db2)
+    s1.close(timeout=1.0)
+
+    db2.write_bytes(b"corrupt-db-two" * 20)
+    s2 = HistoryStore(db_path=db2)
+    s2.close(timeout=1.0)
+
+    b0 = coll_dir / "history.corrupt-20261118-120000.db"
+    b1 = coll_dir / "history.corrupt-20261118-120000-1.db"
+    assert b0.read_bytes().startswith(b"corrupt-db-one")
+    assert b1.read_bytes().startswith(b"corrupt-db-two")
+
+
+def test_user_markdown_backfill_recovers_after_partial_column_migration(tmp_path):
+    db_path = tmp_path / "partial_mig.db"
+    s = HistoryStore(db_path=db_path)
+    s.close(timeout=1.0)
+
+    # Simulate an interrupted migration where user_markdown column already exists as ''
+    # while user_edited=1 and markdown holds hand-edited content.
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO meeting_notes (meeting_id, markdown, user_edited, transcript_changed, user_markdown) "
+            "VALUES ('m1', '# 手改纪要', 1, 1, '')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    reopened = HistoryStore(db_path=db_path)
+    try:
+        row = reopened.read(
+            lambda c: c.execute(
+                "SELECT user_markdown, user_transcript_changed FROM meeting_notes WHERE meeting_id = 'm1'"
+            ).fetchone()
+        )
+        assert row == ("# 手改纪要", 1)
+    finally:
+        reopened.close(timeout=1.0)
+

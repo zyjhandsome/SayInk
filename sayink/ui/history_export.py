@@ -12,6 +12,7 @@ import re
 import time
 from typing import Iterable
 
+from sayink.atomic_io import atomic_write_text
 from sayink.history_store import SegmentRecord, SessionSummary
 
 _SUPPRESSED_POLISHED_MARKER = "\u200b"
@@ -415,8 +416,7 @@ def export_csv(
 
     csv_no_bom = _build_csv_without_bom(sessions, seg_map, prefer_raw=prefer_raw)
     if target_path is not None:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(csv_no_bom, encoding="utf-8-sig", newline="")
+        atomic_write_text(target_path, csv_no_bom, encoding="utf-8-sig", newline="")
     return "\ufeff" + csv_no_bom
 
 

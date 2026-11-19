@@ -50,3 +50,34 @@ def test_uninstall_removes_what_the_app_created_per_user():
     assert "SayInk.lnk" in text
     # Only a Run value launching this install; a source checkout keeps its own.
     assert "Pos(AppExe, Lowercase(Value)) > 0" in text
+
+
+def test_irreversible_setup_actions_deferred_to_prepare_to_install():
+    text = _text()
+    init_body = text.split("function InitializeSetup(): Boolean;", 1)[1].split(
+        "function PrepareToInstall", 1
+    )[0]
+    prep_body = text.split("function PrepareToInstall", 1)[1].split(
+        "function IsRealUserSid", 1
+    )[0]
+    for action in (
+        "WaitForGracefulAppExit",
+        "taskkill.exe",
+        "MigrateLegacyDataDir",
+        "UninstallLegacyVoiceInk",
+    ):
+        assert action not in init_body
+        assert action in prep_body
+
+
+def test_uninstall_scopes_interactive_session_user_and_prompts_separately_for_other_accounts():
+    text = _text()
+    # Unsafe two-level ExtractFileDir on Explorer\Shell Folders\AppData is removed
+    assert "'AppData'" not in text
+    assert "WTSQuerySessionInformationW" in text
+    uninstall = text.split("procedure CurUninstallStepChanged", 1)[1]
+    assert "CurrentUserDirs" in uninstall
+    assert "OtherUserDirs" in uninstall
+    assert "FormatDirList(CurrentUserDirs)" in uninstall
+    assert "FormatDirList(OtherUserDirs)" in uninstall
+    assert "not UninstallSilent()" in uninstall

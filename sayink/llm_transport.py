@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from sayink.llm import (
-    BILLING_TERMS as _BILLING_TERMS,
-    DONE_REASONS as _DONE_REASONS,
     Cancellation,
     LLMBrokenStream,
     LLMCancelled,
@@ -15,17 +13,13 @@ from sayink.llm import (
     async_completion as completion,
     chat_completion,
     chat_completions_url,
-    check_choice as _check_choice,
     collect_async_stream_text as _stream_text,
     is_billing_error,
     normalize_api_key,
     normalize_model_name,
-    response_error_detail as _error_detail,
-    retry_after_seconds as _retry_after,
     stream_chat_completion,
     strip_model_thinking,
     thinking_payload_extra,
-    visible_text as _visible_text,
 )
 
 __all__ = [
@@ -36,13 +30,7 @@ __all__ = [
     "LLMDeadlineError",
     "LLMResponseError",
     "LLMTruncatedError",
-    "_BILLING_TERMS",
-    "_DONE_REASONS",
-    "_check_choice",
-    "_error_detail",
-    "_retry_after",
     "_stream_text",
-    "_visible_text",
     "chat_completion",
     "chat_completions_url",
     "completion",

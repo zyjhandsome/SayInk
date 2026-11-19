@@ -1228,3 +1228,200 @@ def test_live_meeting_pause_resume_appends_single_journal_and_delete_cleans_play
     finally:
         controller.shutdown()
         history.close(timeout=2)
+
+
+def test_controller_merge_speakers_and_honest_mark_update_verification(tmp_path) -> None:
+    cfg, history, controller = _make_controller(tmp_path / "merge_and_marks")
+    try:
+        opts = MeetingOptions(title="原子合并与标记核验", input_source="microphone")
+        caps = resolve_capabilities(cfg, opts, dictation_model_id="funasr-nano")
+        live = controller.begin(opts, caps)
+
+        # 1) add_mark & update_meeting verify DB persistence and emit error on SQLite failure:
+        errors: list[str] = []
+        notices: list[tuple[str, str]] = []
+        controller.error.connect(errors.append)
+        controller.notice.connect(lambda t, d: notices.append((t, d)))
+
+        assert controller.add_mark("正常标记") is not None
+        assert any(t == "已标记" for t, _ in notices)
+
+        notices.clear()
+        history.enqueue_write(
+            lambda conn: conn.execute(
+                "CREATE TRIGGER reject_marks BEFORE INSERT ON meeting_marks "
+                "BEGIN SELECT RAISE(ABORT, 'marks full'); END;"
+            )
+        )
+        history.enqueue_write(
+            lambda conn: conn.execute(
+                "CREATE TRIGGER reject_title BEFORE UPDATE OF title ON meetings "
+                "BEGIN SELECT RAISE(ABORT, 'meetings ro'); END;"
+            )
+        )
+        assert history.flush()
+
+        assert controller.add_mark("会失败的标记") is None
+        assert not any(t == "已标记" for t, _ in notices)
+        assert errors
+
+        errors.clear()
+        assert controller.update_meeting(live.id, title="不会落盘的标题") is False
+        assert errors
+        assert controller.current.title == "原子合并与标记核验"
+
+        drop_a = history.enqueue_write(lambda conn: conn.execute("DROP TRIGGER reject_marks;"))
+        drop_b = history.enqueue_write(lambda conn: conn.execute("DROP TRIGGER reject_title;"))
+        assert history.flush_ticket(drop_a, timeout=2.0)
+        assert history.flush_ticket(drop_b, timeout=2.0)
+
+        # 2) Controller.merge_speakers atomically merges history, meeting_speakers, and JSON-backed minutes:
+        history.enqueue(
+            SegmentRecord(
+                session_id=live.id,
+                seq=0,
+                created_at=live.started_at + 1000,
+                raw_text="大家好我是林峰，负责后端改造。",
+                trigger_mode="meeting",
+                speaker_id=1,
+                captured_at=live.started_at + 1000,
+            )
+        )
+        s2 = history.enqueue(
+            SegmentRecord(
+                session_id=live.id,
+                seq=1,
+                created_at=live.started_at + 3000,
+                raw_text="补充一下联调时间安排。",
+                trigger_mode="meeting",
+                speaker_id=2,
+                captured_at=live.started_at + 3000,
+            )
+        )
+        assert history.flush_ticket(s2, timeout=2.0)
+        controller.request_end()
+
+        assert controller.rename_speaker(live.id, 1, "林峰") is not None
+        assert controller.rename_speaker(live.id, 2, "误分身") is not None
+        controller.store.save_notes(
+            live.id,
+            template_id="general",
+            model="qwen",
+            json_payload=json.dumps(
+                {
+                    "title": "后端联调",
+                    "summary": "林峰介绍后端改造，误分身补充联调时间。",
+                    "topics": [{"title": "进度", "points": [{"text": "误分身负责排期", "ts": "00:00:03"}]}],
+                    "_speaker_names": {"1": "林峰", "2": "误分身"},
+                },
+                ensure_ascii=False,
+            ),
+            markdown="# 后端联调\n\n## 摘要\n林峰介绍后端改造，误分身补充联调时间。\n",
+        )
+        assert controller.store.flush()
+
+        merged = controller.merge_speakers(live.id, "2", "1")
+        assert merged is not None
+        assert controller.speaker_names(live.id) == {1: "林峰"}
+        assert [s.speaker_id for s in controller.store.get_speakers(live.id)] == [1]
+        segs = controller.store.get_segments(live.id)
+        assert [(s.speaker_id, s.speaker_locked) for s in segs] == [(1, False), (1, True)]
+        notes = controller.store.get_notes(live.id)
+        assert notes is not None
+        assert "误分身" not in notes.markdown
+        assert "说话人2" not in notes.markdown
+        assert "林峰补充联调时间" in notes.markdown
+        assert "林峰负责排期" in notes.markdown
+    finally:
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_cancelled_minutes_worker_checkpoint_guard_and_bounded_clustering_must_keep_cap(
+    tmp_path, monkeypatch
+) -> None:
+    import numpy as np
+    import pytest
+    from types import SimpleNamespace
+    from sayink.minutes_generator import MinutesRequest, MinutesWorker
+    from sayink.minutes_prompts import GENERAL_TEMPLATE_ID, MeetingContext, TranscriptLine, get_template
+    from sayink.speaker_clustering import TurnObservation, bounded_final_assignments
+    from sayink.text_polisher import LLMCancelled
+
+    # 1) Cancelled MinutesWorker._remember never invokes save_checkpoint, and cancel_check guards queued writes:
+    _cfg, history, controller = _make_controller(tmp_path / "ckpt_guard")
+    try:
+        rec = controller.store.create_meeting(meeting_id="m-ckpt", started_at=1_000)
+        controller.store.end_meeting(rec.id, ended_at=5_000)
+        assert controller.store.flush()
+
+        controller.store.save_generation_checkpoint("m-ckpt", "fp-new", "step-1", '{"ok":true}')
+        assert controller.store.generation_checkpoints("m-ckpt", "fp-new") == {"step-1": '{"ok":true}'}
+
+        # Cancelled check prevents stale worker from wiping fp-new's checkpoint:
+        controller.store.save_generation_checkpoint(
+            "m-ckpt", "fp-stale", "step-old", '{"stale":true}', cancel_check=lambda: True
+        )
+        assert controller.store.generation_checkpoints("m-ckpt", "fp-new") == {"step-1": '{"ok":true}'}
+
+        called: list[str] = []
+        req = MinutesRequest(
+            api_url="http://localhost:11434/v1",
+            api_key="",
+            model_name="qwen",
+            template=get_template(GENERAL_TEMPLATE_ID),
+            context=MeetingContext(title="x", started_at_text="2026-01-01 10:00"),
+            lines=[TranscriptLine(offset_ms=0, speaker_id=1, text="测试")],
+            save_checkpoint=lambda k, _v: called.append(k),
+        )
+        worker = MinutesWorker(req)
+        worker.cancel()
+        with pytest.raises(LLMCancelled):
+            worker._remember("sys", "usr", '{"ok":1}')
+        assert called == []
+    finally:
+        controller.shutdown()
+        history.close(timeout=2)
+
+    # 2) bounded_final_assignments caps sampled turns to <= max_turns even when 1,500 turns are protected/locked:
+    seen_cluster_sizes: list[int] = []
+    import sayink.speaker_clustering as sc
+
+    real_final = sc.final_assignments
+
+    def _spy_final(session, threshold, **kwargs):
+        seen_cluster_sizes.append(len(session.turns))
+        return real_final(session, threshold, **kwargs)
+
+    monkeypatch.setattr(sc, "final_assignments", _spy_final)
+
+    v1 = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    v2 = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    turns = [
+        TurnObservation(
+            key=i,
+            speaker_id=1 if i < 1200 else 2,
+            vector=v1 if i < 1200 else v2,
+            duration_ms=2000,
+            learnable=True,
+        )
+        for i in range(1500)
+    ]
+    session = SimpleNamespace(
+        turns=turns,
+        confirmed={i: 1 for i in range(300)},
+        speaker_count=2,
+    )
+    locked_keys = set(range(900))
+    out = bounded_final_assignments(
+        session,
+        0.55,
+        protected_ids={1},
+        locked_keys=locked_keys,
+        max_turns=120,
+        sample_budget=60,
+    )
+    assert seen_cluster_sizes and max(seen_cluster_sizes) <= 120
+    assert len(out) == 1500
+    assert all(out[i] == 1 for i in range(1200))
+    assert all(out[i] == 2 for i in range(1200, 1500))

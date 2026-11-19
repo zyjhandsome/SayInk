@@ -240,10 +240,18 @@ class Win32WindowInputBackend:
         return get_foreground_window_win32()
 
     def foreground_target(self) -> tuple[int, str]:
-        from sayink.text_paster import TextPaster
+        from sayink.text_paster import (
+            TextPaster,
+            get_foreground_process_name,
+            get_foreground_window_info,
+        )
 
-        hwnd, app_name = TextPaster.capture_target_window()
-        return int(hwnd or 0), str(app_name or "")
+        info = get_foreground_window_info()
+        hwnd = int(info[0] or 0)
+        app_name = get_foreground_process_name() if hwnd else ""
+        if hwnd and TextPaster.is_own_window(info):
+            return 0, ""
+        return hwnd, str(app_name or "")
 
     def send_paste_shortcut(self, mode: str = "ctrl_v") -> None:
         send_paste_shortcut_win32(mode)

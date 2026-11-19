@@ -913,3 +913,79 @@ def test_record_notes_autosave_and_clean_leave_do_not_block_on_store_flush(
         page.deleteLater()
         controller.shutdown()
         history.close(timeout=2)
+
+
+def test_page_handles_unsaved_finalize_recovery_failed_mark_and_atomic_speaker_merge(
+    config, tmp_path
+):
+    page, controller, history, record = _page(config, tmp_path)
+    try:
+        # 1) Live mark failure preserves typed _mark_note text instead of wiping it:
+        live = _live(page, controller, history)
+        page._mark_note.setText("关键风险点待保存")
+        trig1 = history.enqueue_write(
+            lambda conn: conn.execute(
+                "CREATE TRIGGER fail_live_mark BEFORE INSERT ON meeting_marks "
+                "BEGIN SELECT RAISE(ABORT, 'disk full'); END;"
+            )
+        )
+        assert history.flush_ticket(trig1, timeout=2.0)
+        page._add_mark()
+        assert page._mark_note.text() == "关键风险点待保存"
+        drop1 = history.enqueue_write(lambda conn: conn.execute("DROP TRIGGER fail_live_mark;"))
+        assert history.flush_ticket(drop1, timeout=2.0)
+        page._add_mark()
+        assert page._mark_note.text() == ""
+
+        # 2) Finalize DB failure transitions UI out of PAGE_LIVE, shows retry button, and recovers on click:
+        trig2 = history.enqueue_write(
+            lambda conn: conn.execute(
+                "CREATE TRIGGER fail_page_finalize BEFORE UPDATE ON meetings "
+                "WHEN NEW.status = 'ended' BEGIN SELECT RAISE(ABORT, 'disk full'); END;"
+            )
+        )
+        assert history.flush_ticket(trig2, timeout=2.0)
+        controller.request_end()
+        QApplication.processEvents()
+
+        assert controller.state is MeetingState.IDLE
+        assert page._stack.currentIndex() == PAGE_BROWSE
+        assert controller.has_unsaved_finalize() is True
+        if hasattr(page, "_finalize_retry_btn"):
+            assert not page._finalize_retry_btn.isHidden()
+
+        drop2 = history.enqueue_write(lambda conn: conn.execute("DROP TRIGGER fail_page_finalize;"))
+        assert history.flush_ticket(drop2, timeout=2.0)
+        if hasattr(page, "_retry_finalize_save"):
+            page._retry_finalize_save()
+        else:
+            assert controller.retry_finalize_save() is None
+        QApplication.processEvents()
+        assert controller.has_unsaved_finalize() is False
+        assert controller.store.get_meeting(live.id).status == "ended"
+        if hasattr(page, "_finalize_retry_btn"):
+            assert page._finalize_retry_btn.isHidden()
+
+        # 3) Renaming speaker 2 to speaker 1's existing name uses atomic merge_speakers and leaves no orphan:
+        history.enqueue(
+            SegmentRecord(
+                record.id,
+                50,
+                record.started_at + 5_000,
+                raw_text="第二位发言人的补充意见",
+                speaker_id=2,
+                trigger_mode="meeting",
+                captured_at=record.started_at + 5_000,
+            )
+        )
+        assert history.flush(timeout=2.0)
+        assert controller.rename_speaker(record.id, 1, "王工") is not None
+        assert controller.rename_speaker(record.id, 2, "临时名") is not None
+        page.show_meeting(record.id)
+        page._rename_speaker(2, "王工", meeting_id=record.id)
+        assert controller.speaker_names(record.id) == {1: "王工"}
+        assert [s.speaker_id for s in controller.store.get_speakers(record.id)] == [1]
+    finally:
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)

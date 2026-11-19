@@ -1690,3 +1690,31 @@ class TestSectionDefaultRestore:
         assert config.get("meeting.confirmed_remote_hosts") == ["api.example.com"]
         assert config.get("llm.api_key") == "secret-key"
         assert "密钥" in seen[0][1]
+
+
+def test_meeting_defaults_exposes_audio_recovery_entry_and_forwards_signal(settings_window, qapp):
+    page = settings_window.general_page
+    btn = page.recovery_btn
+    assert btn.text() == "查看 / 恢复未完成录音"
+    assert btn in page.general_tab_chain
+
+    page_hits: list[bool] = []
+    win_hits: list[bool] = []
+    page.audio_recovery_requested.connect(lambda: page_hits.append(True))
+    settings_window.audio_recovery_requested.connect(lambda: win_hits.append(True))
+
+    settings_window.resize(980, 820)
+    settings_window.show()
+    qapp.processEvents()
+    try:
+        save_audio_y = page.meeting_save_audio_row.mapToGlobal(
+            page.meeting_save_audio_row.rect().center()
+        ).y()
+        recovery_y = btn.mapToGlobal(btn.rect().center()).y()
+        assert recovery_y > save_audio_y
+        btn.click()
+        assert page_hits == [True]
+        assert win_hits == [True]
+    finally:
+        settings_window.hide()
+

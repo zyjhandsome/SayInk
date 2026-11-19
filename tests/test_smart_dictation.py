@@ -301,3 +301,140 @@ def test_hotkey_manager_secondary_shortcuts_and_settings_validation(qapp, tmp_pa
     finally:
         settings.close()
         _ = np.zeros(1)
+
+
+def test_win32_window_input_backend_foreground_target_resolves_external_and_filters_own_pid(
+    monkeypatch,
+):
+    import os
+    import sayink.text_paster as tp
+    from sayink.platform.window_input import Win32WindowInputBackend
+
+    backend = Win32WindowInputBackend()
+
+    monkeypatch.setattr(tp, "get_foreground_window_info", lambda: (4321, "Report.docx", 99999))
+    monkeypatch.setattr(tp, "get_foreground_process_name", lambda: "WINWORD.EXE")
+    monkeypatch.setattr(tp.TextPaster, "is_own_window", classmethod(lambda cls, info: False))
+    assert backend.foreground_target() == (4321, "WINWORD.EXE")
+
+    monkeypatch.setattr(tp, "get_foreground_window_info", lambda: (8888, "SayInk", os.getpid()))
+    monkeypatch.setattr(tp, "get_foreground_process_name", lambda: "SayInk.exe")
+    monkeypatch.setattr(tp.TextPaster, "is_own_window", classmethod(lambda cls, info: True))
+    assert backend.foreground_target() == (0, "")
+
+
+def test_paste_last_and_rewrite_arm_watchdog_and_report_honest_failure_statuses(tmp_path: Path):
+    cfg = Config(config_dir=tmp_path)
+    cfg.set("audio.paste_last_hotkey", "alt+v")
+    cfg.set("llm.api_url", "http://localhost:11434/v1")
+    cfg.set("llm.model_name", "qwen2.5")
+
+    fake_win = FakeWindowInputBackend(
+        foreground=(606, "Editor", 5150),
+        process_name="Code.exe",
+        selected_text="原始选区内容",
+    )
+    recorder = MagicMock()
+    recorder.is_recording = False
+    recorder.is_continuous = False
+    recorder.start.side_effect = lambda **_kw: setattr(recorder, "is_recording", True)
+    recorder.stop.side_effect = lambda: setattr(recorder, "is_recording", False)
+
+    class _FakeRecognizer(QObject):
+        final_result = pyqtSignal(str)
+        meeting_result = pyqtSignal(object)
+        partial_result = pyqtSignal(str)
+        error = pyqtSignal(str)
+        ready = pyqtSignal()
+        model_load_progress = pyqtSignal(str)
+        is_ready = True
+        is_loading = False
+        is_silent_loading = False
+        current_model_id = "funasr-nano"
+        running_workers = ()
+        running_transcribe_workers = ()
+        configure = MagicMock()
+        set_boundary_context = MagicMock()
+
+    class _FakePolisher(QObject):
+        polish_complete = pyqtSignal(str)
+        polish_error = pyqtSignal(str)
+        rewrite_complete = pyqtSignal(str)
+        rewrite_error = pyqtSignal(str)
+        polish = MagicMock()
+        rewrite = MagicMock()
+        cancel = MagicMock()
+        cancel_rewrite = MagicMock()
+
+    recognizer = _FakeRecognizer()
+    polisher = _FakePolisher()
+    paster = MagicMock()
+    floating = MagicMock()
+
+    app = App.create_headless(
+        cfg,
+        modules=AppModules(
+            recorder=recorder,
+            recognizer=recognizer,
+            polisher=polisher,
+            paster=paster,
+            floating=floating,
+            window_input=fake_win,
+        ),
+    )
+    try:
+        # 1. Seed previous dictation raw_text + last_output_text, then test paste_last error status
+        app.output_pipeline.raw_text = "绝不能在改写超时后误贴的旧口述原文"
+        app.output_pipeline.last_output_text = "上一句重要结论"
+        paster.paste_async.side_effect = lambda _t, cb, **_kw: cb(
+            PasteResult("error", target_app="Code.exe", detail="clipboard locked")
+        )
+        assert app.paste_last_transcript() is True
+        floating.show_error.assert_called()
+        assert "无法写入剪贴板" in floating.show_error.call_args.args[0]
+        assert app.output_pipeline.last_output_text == "上一句重要结论"
+
+        # 2. Rewrite hangs in POLISH -> watchdog cancels rewrite WITHOUT pasting stale raw_text!
+        floating.reset_mock()
+        paster.reset_mock()
+        paster.paste_async.side_effect = None
+        assert app.start_select_and_rewrite() is True
+        app.stop_select_and_rewrite()
+        recognizer.final_result.emit("精简成一句话")
+        assert app.output_pipeline.busy is True
+        stuck_token = app.output_pipeline.token
+        app.output_pipeline.release_stuck_output(stuck_token)
+        assert app.output_pipeline.busy is False
+        polisher.cancel_rewrite.assert_called_once()
+        paster.paste_async.assert_not_called()
+        floating.show_error.assert_called_with("改写超时，原选区未改动")
+        # Late rewrite completion after watchdog is ignored
+        polisher.rewrite_complete.emit("迟到的改写结果")
+        paster.paste_async.assert_not_called()
+
+        # 3. Rewrite paste skipped -> stashes rewritten text in last_output_text & never claims copied
+        floating.reset_mock()
+        paster.paste_async.side_effect = lambda _t, cb, **_kw: cb(
+            PasteResult("skipped", target_app="Code.exe", detail="clipboard_changed")
+        )
+        assert app.start_select_and_rewrite() is True
+        app.stop_select_and_rewrite()
+        recognizer.final_result.emit("翻译成英文")
+        polisher.rewrite_complete.emit("Concise summary.")
+        assert app.output_pipeline.last_output_text == "Concise summary."
+        floating.show_warning.assert_called_once()
+        assert "Alt + V" in floating.show_warning.call_args.args[1]
+        floating.show_info.assert_not_called()
+
+        # 4. Explicit "copied" status reports clipboard copy accurately
+        floating.reset_mock()
+        paster.paste_async.side_effect = lambda _t, cb, **_kw: cb(
+            PasteResult("copied", target_app="Code.exe")
+        )
+        assert app.start_select_and_rewrite() is True
+        app.stop_select_and_rewrite()
+        recognizer.final_result.emit("改成正式语气")
+        polisher.rewrite_complete.emit("Formal summary.")
+        floating.show_info.assert_called_with("改写结果已复制", "焦点已变化或受限，可按 Ctrl+V 粘贴")
+    finally:
+        app.deleteLater()

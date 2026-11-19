@@ -219,6 +219,7 @@ class AudioRecorder(QObject):
         self._open_target = (0, "")
         self._segment_target = (0, "")
         self._recovery_root = None
+        self._recovery_keep_completed: bool = False
         self._recovery_session_id: str = ""
         self._last_session_journal: tuple[str, object] | None = None
         self._mute_system_until: float = 0.0
@@ -435,9 +436,17 @@ class AudioRecorder(QObject):
     def set_boundary_context(self, enabled: bool) -> None:
         self._boundary_requested = bool(enabled)
 
-    def set_recovery_directory(self, root) -> None:
+    def set_recovery_directory(self, root, *, keep_completed: bool | None = None) -> None:
         """Apply to the next recording, never start persisting an active one."""
         self._recovery_root = root
+        if keep_completed is not None:
+            self._recovery_keep_completed = bool(keep_completed)
+        elif root is None:
+            self._recovery_keep_completed = False
+
+    def set_recovery_keep_completed(self, enabled: bool) -> None:
+        """Mark whether completed journals in ``_recovery_root`` should be retained long-term."""
+        self._recovery_keep_completed = bool(enabled)
 
     @property
     def recovery_available(self) -> bool:
@@ -1525,12 +1534,25 @@ class AudioRecorder(QObject):
                                 for j in self._closing_journals
                             ):
                                 resume_dir = prev_path
-                    self._journal = RecordingJournal(
-                        self._recovery_root,
-                        metadata=journal_meta,
-                        on_error=self.warning.emit,
-                        resume_dir=resume_dir,
+                    keep_completed = bool(
+                        getattr(self, "_recovery_keep_completed", False)
+                        or self._meeting_profile
                     )
+                    try:
+                        self._journal = RecordingJournal(
+                            self._recovery_root,
+                            metadata=journal_meta,
+                            on_error=self.warning.emit,
+                            resume_dir=resume_dir,
+                            keep_completed=keep_completed,
+                        )
+                    except TypeError:
+                        self._journal = RecordingJournal(
+                            self._recovery_root,
+                            metadata=journal_meta,
+                            on_error=self.warning.emit,
+                            resume_dir=resume_dir,
+                        )
                     if self._recovery_session_id:
                         self._last_session_journal = (
                             self._recovery_session_id,

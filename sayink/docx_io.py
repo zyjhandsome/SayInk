@@ -12,10 +12,13 @@ SayInk ships zero external document dependencies while supporting:
 from __future__ import annotations
 
 from collections.abc import Sequence
+import io
 from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
 import zipfile
+
+from sayink.atomic_io import atomic_write_bytes
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _W = f"{{{_W_NS}}}"
@@ -376,18 +379,19 @@ def write_docx_document(
 ) -> None:
     """Write a valid OOXML ``.docx`` file from Markdown headings, lists, and paragraphs."""
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
     doc_xml = _build_document_xml(
         title=title,
         metadata_rows=metadata_rows,
         markdown_body=markdown_body,
     )
-    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", _CONTENT_TYPES_XML)
         zf.writestr("_rels/.rels", _ROOT_RELS_XML)
         zf.writestr("word/_rels/document.xml.rels", _DOC_RELS_XML)
         zf.writestr("word/styles.xml", _STYLES_XML)
         zf.writestr("word/document.xml", doc_xml)
+    atomic_write_bytes(target, buf.getvalue())
 
 
 __all__ = [

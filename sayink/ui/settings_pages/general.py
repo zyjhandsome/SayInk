@@ -303,6 +303,7 @@ class GeneralSettingsPage(SettingsPage):
     vad_download_requested = pyqtSignal()
     meeting_setting_changed = pyqtSignal()
     meeting_start_card_reset_requested = pyqtSignal()
+    audio_recovery_requested = pyqtSignal()
     llm_proxy_changed = pyqtSignal(int)
     llm_proxy_suffix_changed = pyqtSignal(str)
     theme_mode_changed = pyqtSignal(int)
@@ -382,6 +383,7 @@ class GeneralSettingsPage(SettingsPage):
     llm_proxy_suffix_edit: QLineEdit
     listen_bar_autohide_row: ToggleOptionRow
     meeting_save_audio_row: ToggleOptionRow
+    recovery_btn: QPushButton
     meeting_language_combo: ElidedComboBox
     meeting_glossary_edit: GlossaryPlainTextEdit
     glossary_count_label: QLabel
@@ -466,6 +468,7 @@ class GeneralSettingsPage(SettingsPage):
             self.meeting_source_combo,
             self.meeting_model_combo,
             self.meeting_save_audio_row,
+            self.recovery_btn,
             self.meeting_start_card_row,
             self.meeting_start_card_reset_btn,
             self.llm_proxy_combo,
@@ -1099,6 +1102,12 @@ class GeneralSettingsPage(SettingsPage):
             lambda _checked=False: self.meeting_setting_changed.emit()
         )
         lay.addWidget(self.meeting_save_audio_row)
+        self.recovery_btn = _ghost_button(
+            "查看 / 恢复未完成录音",
+            self.audio_recovery_requested.emit,
+            tooltip="查看异常中断的会议录音缓存，支持导出 WAV 或重新识别文字",
+        )
+        lay.addWidget(inline_action_row(self.recovery_btn))
         lay.addWidget(group_divider())
         self.meeting_start_card_row = ToggleOptionRow(
             "开始前显示会议信息卡", "填写标题、参会人与议程；关闭后从托盘直接开始",

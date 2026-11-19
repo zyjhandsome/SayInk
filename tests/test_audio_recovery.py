@@ -11,7 +11,7 @@ import pytest
 
 from sayink.audio_recovery import (
     RecordingJournal, recordings, delete_recording, store_pending, StoredAudio,
-    hold_recovery_path, release_recovery_path,
+    hold_recovery_path, release_recovery_path, delete_sessions_recovery_files,
 )
 from sayink.audio_recorder import AudioRecorder
 from sayink.asr_context import with_context
@@ -305,3 +305,105 @@ def test_damaged_metadata_does_not_hide_intact_recording(tmp_path, metadata):
     np.ones(16000, "<f4").tofile(directory / "audio.f32")
     item, = recordings(tmp_path)
     assert item.metadata["metadata_damaged"] and item.seconds == 1
+
+
+def test_close_timeout_keeps_journal_incomplete_until_writer_finishes_sync(tmp_path):
+    import threading
+
+    entered_get = threading.Event()
+    unpause_writer = threading.Event()
+    real_queue_get = None
+
+    journal = RecordingJournal(tmp_path)
+    real_queue_get = journal._queue.get
+
+    def gated_get(*args, **kwargs):
+        item = real_queue_get(*args, **kwargs)
+        entered_get.set()
+        unpause_writer.wait(timeout=5.0)
+        return item
+
+    journal._queue.get = gated_get  # type: ignore[method-assign]
+    assert journal.append(np.full(RATE, 0.5, dtype=np.float32))
+    assert entered_get.wait(timeout=2.0)
+
+    # Writer is paused before writing the 64,000B chunk: close() times out and returns False.
+    assert journal.close(timeout=0.05) is False
+    assert (journal.path / "audio.f32").stat().st_size == 0
+    on_disk_during_stall = json.loads((journal.path / "session.json").read_text(encoding="utf-8"))
+    assert on_disk_during_stall["complete"] is False
+
+    # Startup interrupted-recording scan sees complete=False during this window.
+    interrupted = [item for item in recordings(tmp_path) if not item.metadata.get("complete")]
+    assert len(interrupted) == 1
+
+    # Once writer resumes, it writes all 64,000B, fsyncs, and marks complete=True.
+    unpause_writer.set()
+    journal._thread.join(timeout=3.0)
+    assert not journal._thread.is_alive()
+    assert (journal.path / "audio.f32").stat().st_size == RATE * 4
+    final_meta = json.loads((journal.path / "session.json").read_text(encoding="utf-8"))
+    assert final_meta["complete"] is True
+    assert final_meta["closed"] is True
+    assert final_meta["samples"] == RATE
+    assert list(journal.path.glob("*.tmp")) == []
+
+
+def test_empty_journal_close_marks_complete_with_zero_samples(tmp_path):
+    journal = RecordingJournal(tmp_path)
+    assert journal.close(timeout=2.0) is True
+    item, = recordings(tmp_path)
+    assert item.samples == 0
+    assert item.metadata["complete"] is True
+    assert item.metadata["closed"] is True
+
+
+def test_keep_completed_exempts_saved_meeting_audio_from_expiry_and_quota(tmp_path):
+    aged_kept = tmp_path / ("a" * 32)
+    aged_kept.mkdir()
+    (aged_kept / "session.json").write_text(
+        json.dumps(
+            {
+                "sample_rate": RATE,
+                "complete": True,
+                "closed": True,
+                "keep_completed": True,
+                "meeting_id": "m-keep",
+                "started_at": time.time() - 30 * 86400,
+            }
+        ),
+        encoding="utf-8",
+    )
+    np.ones(40, "<f4").tofile(aged_kept / "audio.f32")  # 160 bytes
+
+    old_unkept = tmp_path / ("b" * 32)
+    old_unkept.mkdir()
+    (old_unkept / "session.json").write_text(
+        json.dumps(
+            {
+                "sample_rate": RATE,
+                "complete": True,
+                "closed": True,
+                "started_at": time.time() - 3600,
+            }
+        ),
+        encoding="utf-8",
+    )
+    np.ones(20, "<f4").tofile(old_unkept / "audio.f32")  # 80 bytes
+
+    # New journal with tiny 120B cap: aged_kept (160B, 30 days old) survives both
+    # 7-day expiry and quota eviction, old_unkept is evicted, and new meeting still records!
+    journal = RecordingJournal(tmp_path, max_bytes=120, keep_completed=True, metadata={"meeting_id": "m-new"})
+    assert aged_kept.exists()
+    assert not old_unkept.exists()
+    assert journal.append(np.ones(10, dtype=np.float32))
+    assert journal.close(timeout=2.0) is True
+    new_meta = json.loads((journal.path / "session.json").read_text(encoding="utf-8"))
+    assert new_meta["keep_completed"] is True
+    assert new_meta["complete"] is True
+
+    # Explicit meeting deletion still removes kept journals in a single batch pass.
+    removed = delete_sessions_recovery_files(["m-keep", "m-new"], base_dir=tmp_path)
+    assert removed == 2
+    assert recordings(tmp_path) == []
+

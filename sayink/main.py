@@ -313,8 +313,13 @@ def activation_server_name() -> str:
     return f"SayInk-activate-{user}{_windows_session_suffix()}"
 
 
-def _activate_running_instance(*, retries: int = 1, retry_delay_s: float = 0.25) -> bool:
-    """Ask the running instance to show its window instead of exiting silently."""
+def _send_command_to_running_instance(
+    payload: bytes,
+    *,
+    retries: int = 1,
+    retry_delay_s: float = 0.25,
+) -> bool:
+    """Send an IPC command line (e.g. ``b'show\\n'`` or ``b'QUIT\\n'``) to the running instance."""
     attempts = max(1, int(retries))
     for attempt in range(attempts):
         try:
@@ -326,7 +331,7 @@ def _activate_running_instance(*, retries: int = 1, retry_delay_s: float = 0.25)
             try:
                 sock.connectToServer(activation_server_name())
                 if sock.waitForConnected(1000):
-                    sock.write(b"show\n")
+                    sock.write(payload)
                     sock.flush()
                     sock.waitForBytesWritten(1000)
                     sock.disconnectFromServer()
@@ -340,6 +345,16 @@ def _activate_running_instance(*, retries: int = 1, retry_delay_s: float = 0.25)
         if attempt + 1 < attempts and retry_delay_s > 0:
             time.sleep(retry_delay_s)
     return False
+
+
+def _activate_running_instance(*, retries: int = 1, retry_delay_s: float = 0.25) -> bool:
+    """Ask the running instance to show its window instead of exiting silently."""
+    return _send_command_to_running_instance(b"show\n", retries=retries, retry_delay_s=retry_delay_s)
+
+
+def _quit_running_instance(*, retries: int = 1, retry_delay_s: float = 0.2) -> bool:
+    """Ask the running instance (including tray-only mode) to flush data and quit cleanly."""
+    return _send_command_to_running_instance(b"QUIT\n", retries=retries, retry_delay_s=retry_delay_s)
 
 
 def _notify_already_running(reason: str | None = None, *, message_box=None) -> str:
@@ -423,7 +438,8 @@ def _handle_existing_instance(
     return False
 
 
-def start_activation_server(on_activate):
+def start_activation_server(on_activate, *, on_quit=None):
+    from PyQt6.QtCore import QTimer
     from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
     server = QLocalServer()
@@ -443,19 +459,49 @@ def start_activation_server(on_activate):
             _log.warning("唤起服务启动失败: %s", server.errorString())
             return None
 
+    def _bind_connection(conn) -> None:
+        buf = bytearray()
+        dispatched = False
+
+        def _dispatch(force_default: bool = False) -> None:
+            nonlocal dispatched
+            if dispatched:
+                return
+            try:
+                if conn.bytesAvailable():
+                    buf.extend(bytes(conn.readAll()))
+            except RuntimeError:
+                pass
+            if b"\n" not in buf and not force_default:
+                return
+            dispatched = True
+            cmd = bytes(buf).strip().decode("utf-8", errors="ignore").upper()
+            if cmd == "QUIT":
+                if callable(on_quit):
+                    on_quit()
+            else:
+                on_activate()
+
+        def _on_disconnected() -> None:
+            _dispatch(True)
+            conn.deleteLater()
+
+        already_closed = conn.state() == QLocalSocket.LocalSocketState.UnconnectedState
+        _dispatch(already_closed)
+        if already_closed:
+            conn.deleteLater()
+            return
+        conn.readyRead.connect(lambda: _dispatch(False))
+        conn.disconnected.connect(_on_disconnected)
+        if not dispatched:
+            QTimer.singleShot(150, lambda: _dispatch(True))
+
     def _on_connection():
         while server.hasPendingConnections():
             conn = server.nextPendingConnection()
             if conn is None:
                 break
-            if conn.bytesAvailable():
-                conn.readAll()
-            if conn.state() == QLocalSocket.LocalSocketState.UnconnectedState:
-                conn.deleteLater()
-            else:
-                conn.readyRead.connect(conn.readAll)
-                conn.disconnected.connect(conn.deleteLater)
-            on_activate()
+            _bind_connection(conn)
 
     server.newConnection.connect(_on_connection)
     return server
@@ -547,6 +593,9 @@ def main():
             sys.exit(1)
         return
 
+    if sys.argv[1:] == ["--quit-running"]:
+        sys.exit(0 if _quit_running_instance(retries=3, retry_delay_s=0.15) else 1)
+
     setup_logging()
     log = logging.getLogger("SayInk")
     _install_exception_hooks(log)
@@ -589,6 +638,7 @@ def main():
 
     say_ink = None
     _early_activate_requested = False
+    _early_quit_requested = False
 
     def _dispatch_activation() -> None:
         nonlocal _early_activate_requested
@@ -597,7 +647,15 @@ def main():
         else:
             _early_activate_requested = True
 
-    _activation_server = start_activation_server(_dispatch_activation)
+    def _dispatch_quit() -> None:
+        nonlocal _early_quit_requested
+        if say_ink is not None:
+            say_ink.quit_for_external_request()
+        else:
+            _early_quit_requested = True
+            app.quit()
+
+    _activation_server = start_activation_server(_dispatch_activation, on_quit=_dispatch_quit)
 
     from sayink.ui.tray_icon import create_microphone_icon
     app.setWindowIcon(create_microphone_icon(recording=False, size=64))
@@ -635,6 +693,19 @@ def main():
     # Reuse it: a second Config would not see a plaintext API key the first one
     # already moved out of config.json when Credential Manager was unreadable.
     say_ink = App(_boot_config, on_release_instance_lock=_release_once)
+    set_fallback_sm = getattr(app, "setFallbackSessionManagementEnabled", None)
+    if callable(set_fallback_sm):
+        set_fallback_sm(False)
+    commit_sig = getattr(app, "commitDataRequest", None)
+    if commit_sig is not None and hasattr(commit_sig, "connect"):
+        commit_sig.connect(lambda _mgr: say_ink.commit_session_data())
+    about_to_quit_sig = getattr(app, "aboutToQuit", None)
+    if about_to_quit_sig is not None and hasattr(about_to_quit_sig, "connect"):
+        about_to_quit_sig.connect(say_ink.commit_session_data)
+    if _early_quit_requested:
+        say_ink.quit_for_external_request()
+        _release_once()
+        sys.exit(0)
     open_window_on_boot = (not silent_launch) or _early_activate_requested
     _early_activate_requested = False
     say_ink.start(show_main=open_window_on_boot)

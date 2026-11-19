@@ -805,3 +805,72 @@ def test_source_and_dist_launches_preserve_valid_installed_auto_start(tmp_path, 
     monkeypatch.setattr("sayink.app.auto_start_command", lambda: f'"{installed_exe}"')
     Config(secret_store=stub_secrets)
     assert written == [(run_key, "SayInk", f'"{installed_exe}"')]
+
+
+def test_save_if_dirty_skips_clean_writes_fsyncs_and_keeps_dirty_on_failure(config_home, monkeypatch):
+    from sayink import config as config_mod
+    from sayink.config import Config
+
+    cfg = Config(config_dir=config_home)
+    assert cfg.is_dirty is False
+
+    replace_calls: list[tuple[str, str]] = []
+    fsync_calls: list[int] = []
+    real_replace = config_mod.os.replace
+    real_fsync = config_mod.os.fsync
+
+    monkeypatch.setattr(
+        config_mod.os,
+        "replace",
+        lambda src, dst: (replace_calls.append((str(src), str(dst))), real_replace(src, dst))[1],
+    )
+    monkeypatch.setattr(
+        config_mod.os,
+        "fsync",
+        lambda fd: (fsync_calls.append(fd), real_fsync(fd))[1],
+    )
+
+    # Clean config does not rewrite config.json on exit.
+    assert cfg.save_if_dirty() is True
+    assert replace_calls == []
+
+    # Mutating a setting marks config dirty; failed save keeps it dirty for retry.
+    cfg.set("hotkey", "ctrl+shift+z")
+    assert cfg.is_dirty is True
+    monkeypatch.setattr(
+        config_mod.os,
+        "replace",
+        lambda _src, _dst: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    assert cfg.save_if_dirty() is False
+    assert cfg.is_dirty is True
+
+    # Recovering disk persists, fsyncs, and clears dirty state.
+    monkeypatch.setattr(
+        config_mod.os,
+        "replace",
+        lambda src, dst: (replace_calls.append((str(src), str(dst))), real_replace(src, dst))[1],
+    )
+    assert cfg.save_if_dirty() is True
+    assert cfg.is_dirty is False
+    assert len(replace_calls) == 1
+    assert len(fsync_calls) >= 1
+    assert Config(config_dir=config_home).get("hotkey") == "ctrl+shift+z"
+
+
+def test_corrupt_config_backups_never_overwrite_same_second_collision(config_home, monkeypatch):
+    from sayink import config as config_mod
+    from sayink.config import Config
+
+    monkeypatch.setattr(config_mod.time, "strftime", lambda _fmt: "20261118-235959")
+    (config_home / "config.json").write_text("{broken-first", encoding="utf-8")
+    Config(config_dir=config_home)
+
+    (config_home / "config.json").write_text("{broken-second", encoding="utf-8")
+    Config(config_dir=config_home)
+
+    first = config_home / "config.corrupt-20261118-235959.json"
+    second = config_home / "config.corrupt-20261118-235959-1.json"
+    assert first.read_text(encoding="utf-8") == "{broken-first"
+    assert second.read_text(encoding="utf-8") == "{broken-second"
+

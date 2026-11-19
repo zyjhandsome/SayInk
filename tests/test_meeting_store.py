@@ -3,6 +3,7 @@ meeting rows hidden from dictation history and exempt from cleanup)."""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 
@@ -573,3 +574,167 @@ class TestMeetingStore:
         assert shifted.started_at == 1_500_000_000_000
         assert shifted.created_at == archived_import.created_at
         assert [m.id for m in meetings.list_meetings(sort_by=SORT_RECENT)] == [archived_import.id, live_recent.id]
+
+    def test_thread_local_tickets_isolated_across_threads_and_relabel_records_tickets(
+        self, history, meetings
+    ):
+        import threading
+
+        rec = meetings.create_meeting(meeting_id="m-iso", started_at=1_000)
+        history.enqueue(_seg("m-iso", 0, "发言一", created_at=1_500, speaker_id=1))
+        history.enqueue(_seg("m-iso", 1, "发言二", created_at=2_500, speaker_id=2))
+        assert meetings.flush()
+
+        # Install a trigger rejecting speaker_id = 999 so relabel / set_segment_speakers failure is caught.
+        history.enqueue_write(
+            lambda conn: conn.execute(
+                "CREATE TRIGGER fail_bad_spk BEFORE UPDATE ON history "
+                "WHEN NEW.speaker_id = 999 BEGIN SELECT RAISE(ABORT, 'bad speaker'); END;"
+            )
+        )
+        assert history.flush()
+
+        t_bad = meetings.set_segment_speakers("m-iso", {0: 999})
+        assert t_bad > 0
+
+        worker_ok: list[bool] = []
+
+        def _bg_worker() -> None:
+            t_ok = meetings.update_meeting("m-iso", title="后台线程成功写入")
+            worker_ok.append(meetings.flush_ticket(t_ok, timeout=3.0))
+
+        bg = threading.Thread(target=_bg_worker)
+        bg.start()
+        bg.join(timeout=5.0)
+
+        # Background thread succeeded independently without consuming main thread's failed ticket!
+        assert worker_ok == [True]
+        assert meetings.flush(timeout=2.0) is False
+        assert meetings.get_meeting(rec.id).title == "后台线程成功写入"
+
+        # Next valid relabel on main thread succeeds cleanly.
+        t_swap = meetings.relabel_segments("m-iso", {1: 2, 2: 1})
+        assert t_swap > 0
+        assert meetings.flush(timeout=2.0) is True
+        assert [s.speaker_id for s in meetings.get_segments("m-iso")] == [2, 1]
+
+    def test_atomic_merge_speakers_and_orphan_speaker_cleanup(self, history, meetings):
+        meetings.create_meeting(meeting_id="m-merge", started_at=1_000)
+        history.enqueue(_seg("m-merge", 0, "第一段", created_at=1_100, speaker_id=1))
+        history.enqueue(_seg("m-merge", 1, "第二段", created_at=2_100, speaker_id=2))
+        meetings.set_speaker("m-merge", 1, suggested_name="张三")
+        meetings.set_speaker("m-merge", 2, display_name="李四")
+        meetings.set_speaker("m-merge", 3, display_name="孤儿说话人")
+        meetings.save_notes(
+            "m-merge",
+            template_id="general",
+            model="qwen",
+            json_payload=json.dumps(
+                {
+                    "summary": "说话人2提出排期，说话人1确认。",
+                    "_speaker_names": {"1": "张三", "2": "李四"},
+                },
+                ensure_ascii=False,
+            ),
+            markdown="# 纪要\n\n李四提出排期，张三确认。\n",
+        )
+        assert meetings.flush()
+
+        # Orphan speaker 3 has 0 history segments, yet has_speaker sees it and empty display_name removes it.
+        assert meetings.has_speaker("m-merge", 3) is True
+        assert meetings.speaker_has_segments("m-merge", 3) is False
+        meetings.set_speaker("m-merge", 3, display_name="")
+        assert meetings.flush()
+        assert meetings.has_speaker("m-merge", 3) is False
+
+        # Merge speaker 2 ("李四") into speaker 1 (suggested "张三" -> inherits manual "李四" since 1 had no manual name).
+        assert meetings.merge_speakers("m-merge", "2", "1") is True
+        segs = meetings.get_segments("m-merge")
+        assert [(s.speaker_id, s.speaker_locked) for s in segs] == [(1, False), (1, True)]
+        spk_rows = {s.speaker_id: s for s in meetings.get_speakers("m-merge")}
+        assert 2 not in spk_rows
+        assert spk_rows[1].display_name == "李四"
+        assert spk_rows[1].name_locked is True
+        notes = meetings.get_notes("m-merge")
+        assert notes is not None
+        assert notes.transcript_changed is True
+        assert "李四提出排期，李四确认" in notes.markdown
+
+    def test_create_meeting_from_sessions_uses_captured_at_plus_duration_instead_of_delayed_created_at(
+        self, history, meetings
+    ):
+        history.enqueue(
+            SegmentRecord(
+                session_id="d-polish-lag",
+                seq=0,
+                created_at=45_000,  # LLM polish finished 33s after speech ended
+                raw_text="准时结束的口述段",
+                polished_text="准时结束的口述段。",
+                source="mic",
+                duration_ms=2_000,
+                trigger_mode="hotkey",
+                captured_at=10_000,
+            )
+        )
+        history.enqueue(
+            SegmentRecord(
+                session_id="d-legacy-nocap",
+                seq=0,
+                created_at=11_500,
+                raw_text="无采集时间戳旧段",
+                source="mic",
+                duration_ms=500,
+                trigger_mode="hotkey",
+                captured_at=0,
+            )
+        )
+        assert history.flush(timeout=2.0)
+
+        rec = meetings.create_meeting_from_sessions(["d-polish-lag", "d-legacy-nocap"])
+        assert rec is not None and meetings.flush(timeout=2.0)
+        got = meetings.get_meeting(rec.id)
+        assert got is not None
+        assert got.started_at == 10_000
+        assert got.ended_at == 12_000
+
+    def test_batch_delete_meetings_scans_recovery_journals_in_single_pass(
+        self, history, meetings, monkeypatch
+    ):
+        import sayink.audio_recovery as ar
+
+        rec_root = history.db_path.parent / "audio-recovery"
+        rec_root.mkdir(parents=True, exist_ok=True)
+        mids = []
+        for idx in range(12):
+            rec = meetings.create_meeting(meeting_id=f"batch-del-{idx}", started_at=1_000 + idx)
+            mids.append(rec.id)
+            jdir = rec_root / f"{idx:032x}"
+            jdir.mkdir()
+            (jdir / "session.json").write_text(
+                json.dumps({"session_id": rec.id, "complete": True}),
+                encoding="utf-8",
+            )
+            (jdir / "audio.f32").write_bytes(b"\x00" * 16)
+        keep_dir = rec_root / ("f" * 32)
+        keep_dir.mkdir()
+        (keep_dir / "session.json").write_text(
+            json.dumps({"session_id": "keep-other", "complete": True}),
+            encoding="utf-8",
+        )
+        (keep_dir / "audio.f32").write_bytes(b"\x00" * 16)
+        assert meetings.flush()
+
+        batch_calls: list[set[str]] = []
+        real_batch = ar.delete_sessions_recovery_files
+
+        def _counted_batch(session_ids, base_dir=None):
+            batch_calls.append(set(session_ids))
+            return real_batch(session_ids, base_dir=base_dir)
+
+        monkeypatch.setattr(ar, "delete_sessions_recovery_files", _counted_batch)
+        meetings.delete_meetings(mids)
+        assert meetings.flush()
+
+        assert len(batch_calls) == 1
+        assert keep_dir.exists()
+        assert [p.name for p in rec_root.iterdir()] == ["f" * 32]

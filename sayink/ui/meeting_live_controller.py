@@ -810,6 +810,10 @@ class MeetingLiveController:
             self.render_live()
         elif state is MeetingState.ENDED:
             h._show_ended_meeting(h._ctrl.current_id, unsaved_live=unsaved_live)
+        elif state is MeetingState.IDLE and h._stack.currentIndex() == mp.PAGE_LIVE:
+            fallback_id = str(h._drafts.live_meeting_id or h._detail_id or "")
+            h._show_ended_meeting(fallback_id, unsaved_live=unsaved_live)
+            h._sync_media_buttons()
 
     def on_meeting_changed(self, meeting_id: str) -> None:
         h = self._host
@@ -986,6 +990,11 @@ class MeetingLiveController:
         if offset is not None:
             h._mark_note.clear()
             self.render_live()
+            return
+        h._live_feedback_timer.stop()
+        h._live_speaker_feedback.setText("标记未能写入数据库，输入已保留。")
+        h._live_speaker_feedback.show()
+        h._live_feedback_timer.start(4000)
 
     def flush_pending_user_notes(self) -> bool:
         h = self._host

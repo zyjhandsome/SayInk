@@ -558,3 +558,44 @@ class TestAppHeadlessOutputDI:
             assert history.records[0].target_app == "Terminal.exe"
         finally:
             app.deleteLater()
+
+    def test_dictation_skip_and_error_preserve_last_output_and_rate_limit_db_warnings(self) -> None:
+        pipe, ctx = _build_pipeline(
+            {
+                "history.enabled": False,
+                "audio.paste_last_hotkey": "ctrl+alt+v",
+            }
+        )
+        pipe.deliver_recognized_text("历史关闭时也不能丢的口述")
+        cb = ctx["paster"].calls[-1]["callback"]
+        cb(PasteResult("skipped", target_app="Code.exe", detail="clipboard_changed"))
+        assert pipe.last_output_text == "历史关闭时也不能丢的口述"
+        info_events = [e for e in ctx["floating"].events if e[0] == "info"]
+        assert info_events
+        assert "Ctrl + Alt + V" in info_events[-1][2]
+        assert "可重新转写" not in info_events[-1][2]
+
+        # Paste error with history disabled keeps last_output_text and mentions recovery
+        ctx["floating"].events.clear()
+        pipe.deliver_recognized_text("剪贴板报错时的口述")
+        ctx["paster"].calls[-1]["callback"](
+            PasteResult("error", target_app="Code.exe", detail="OpenClipboard failed")
+        )
+        assert pipe.last_output_text == "剪贴板报错时的口述"
+        err_events = [e for e in ctx["floating"].events if e[0] == "error"]
+        assert err_events and "上一句" in err_events[-1][1]
+
+        # "copied" status routes through clipboard feedback identically to "clipboard"
+        ctx["floating"].events.clear()
+        pipe.deliver_recognized_text("剪贴板回退状态")
+        ctx["paster"].calls[-1]["callback"](PasteResult("copied", target_app="Code.exe"))
+        assert any(e[0] in ("success", "info") and "已复制" in e[1] for e in ctx["floating"].events)
+
+        # History failure warnings rate-limit within cooldown and re-warn once cooldown elapses
+        pipe.on_history_write_failed("第一次磁盘满")
+        ctx["clock"][0] += 60.0
+        pipe.on_history_write_failed("冷却期内不刷屏")
+        assert len(ctx["tray"].messages) == 1
+        ctx["clock"][0] += 300.0
+        pipe.on_history_write_failed("五分钟后再次告警")
+        assert len(ctx["tray"].messages) == 2

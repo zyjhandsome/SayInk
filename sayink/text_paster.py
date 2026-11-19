@@ -873,15 +873,33 @@ class TextPaster:
             return "clipboard_unavailable"
 
     @classmethod
-    def _is_own_window(cls, info: tuple) -> bool:
+    def is_own_window(cls, info: tuple) -> bool:
         """Check if the foreground window belongs to this process."""
         if sys.platform == "win32" and len(info) >= 3:
-            _, title, pid = info
+            _, title, pid = info[:3]
             if pid == os.getpid():
                 return True
         else:
             _, title = info[:2]
         return title in cls.OWN_TITLES
+
+    @classmethod
+    def _is_own_window(cls, info: tuple) -> bool:
+        return cls.is_own_window(info)
+
+    @staticmethod
+    def _copy_clipboard_with_retry(text: str) -> None:
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                pyperclip.copy(text)
+                return
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(0.015 * (attempt + 1))
+        if last_exc is not None:
+            raise last_exc
 
     def _resolve_initial_paste_target(
         self,
@@ -1063,7 +1081,7 @@ class TextPaster:
             callback(result)
 
         try:
-            pyperclip.copy(text)
+            self._copy_clipboard_with_retry(text)
         except Exception as exc:
             log.error("写入剪贴板失败: %s", exc)
             finish(PasteResult("error", target_app=resolved_app, detail=str(exc)))

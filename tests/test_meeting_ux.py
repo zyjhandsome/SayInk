@@ -1601,3 +1601,250 @@ def test_failed_media_import_restores_the_open_meeting(meeting, monkeypatch):
     assert not page._detail_title.isReadOnly()
     assert page._tab_bar.isVisible() and page._content_stack.isVisible()
     assert page._status_label.text() == "无法读取音频"
+
+
+def test_meeting_page_defers_responsive_layout_and_flushes_on_live_resize_end(config, tmp_path):
+    import time
+    from PyQt6.QtWidgets import QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
+    from sayink.ui.flow_layout import set_live_resizing
+
+    class _Shell(QWidget):
+        sidebar_width = tok.SIDEBAR_WIDTH
+
+    store = HistoryStore(tmp_path / "history.db")
+    ctrl = MeetingController(config, store, pending_segments=lambda: 0)
+    rec = ctrl.import_transcript(
+        "\n".join(f"[00:00:{i:02d}] 张三：第 {i + 1} 段会议发言内容。" for i in range(25)),
+        title="缩放防抖评审",
+    )
+    assert rec is not None
+    ctrl.store.save_notes(
+        rec.id,
+        template_id="general",
+        model="qwen2.5",
+        json_payload="{}",
+        markdown="## 结论\n保持拖拽丝滑。",
+    )
+    store.flush()
+
+    shell = _Shell()
+    lay = QVBoxLayout(shell)
+    lay.setContentsMargins(0, 0, 0, 0)
+    stack = QStackedWidget(shell)
+    stack.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+    page = MeetingPage(config, ctrl, stack)
+    stack.addWidget(page)
+    lay.addWidget(stack)
+
+    def wait_ms(ms: int) -> None:
+        done = False
+
+        def _done() -> None:
+            nonlocal done
+            done = True
+
+        QTimer.singleShot(ms, _done)
+        deadline = time.perf_counter() + (ms / 1000.0) + 1.0
+        while not done and time.perf_counter() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.002)
+        QApplication.processEvents()
+
+    try:
+        shell.resize(1080, 680)
+        shell.show()
+        page.show_meeting(rec.id)
+        page._tab_transcript.click()
+        wait_ms(30)
+
+        assert page.is_compact_single_pane is False
+        assert page._browse_left.minimumWidth() == tok.WORKSPACE_LIST_MIN_WIDTH
+        assert page._detail_pane.minimumWidth() == tok.WORKSPACE_DETAIL_MIN_WIDTH
+        assert page._browse_left.isVisible() and page._detail_pane.isVisible()
+
+        # Enter live resize, sweep across 880px / 720px / 680px thresholds, and pause >32ms.
+        set_live_resizing(shell, True)
+        for w in (860, 710, 620, 560):
+            shell.resize(w, 500)
+            QApplication.processEvents()
+        wait_ms(70)
+
+        assert page.width() == 560
+        assert page.is_compact_single_pane is False
+        assert page._browse_left.minimumWidth() == tok.WORKSPACE_LIST_MIN_WIDTH
+        assert page._detail_pane.minimumWidth() == tok.WORKSPACE_DETAIL_MIN_WIDTH
+        assert page._browse_left.isVisible() and page._detail_pane.isVisible()
+        assert page._transcript_view._layout_timer.isActive() is False
+
+        # Ending live resize flushes responsive compact layout and transcript relayout immediately.
+        set_live_resizing(shell, False)
+        assert page.is_compact_single_pane is True
+        assert page._browse_left.minimumWidth() == 180
+        assert page._detail_pane.minimumWidth() == 180
+        assert page._browse_left.isVisible() and not page._detail_pane.isVisible()
+
+        # Drag back wide -> holds compact until release, then restores full dual-pane.
+        set_live_resizing(shell, True)
+        shell.resize(1080, 680)
+        QApplication.processEvents()
+        wait_ms(65)
+        assert page.is_compact_single_pane is True
+
+        set_live_resizing(shell, False)
+        assert page.is_compact_single_pane is False
+        assert page._browse_left.minimumWidth() == tok.WORKSPACE_LIST_MIN_WIDTH
+        assert page._browse_left.isVisible() and page._detail_pane.isVisible()
+
+        # Explicit host_width passed during live resize is preserved across deferred flush
+        set_live_resizing(shell, True)
+        page.sync_viewport_width(520)
+        assert page.is_compact_single_pane is False
+        set_live_resizing(shell, False)
+        assert page.is_compact_single_pane is True
+    finally:
+        page.cleanup()
+        shell.close()
+        store.close()
+
+
+def test_finalize_save_failed_leaves_live_page_and_exposes_retry_and_discard_controls(meeting, monkeypatch):
+    from unittest.mock import patch
+    from sayink.ui.meeting_page import PAGE_BROWSE, PAGE_LIVE
+
+    page, controller, _history, _record = meeting
+    page.show()
+    live = _begin_live(page, controller)
+    QApplication.processEvents()
+    assert page._stack.currentIndex() == PAGE_LIVE
+
+    state = {"unsaved": True, "retry_ok": False}
+
+    def fake_retry():
+        if state["retry_ok"]:
+            state["unsaved"] = False
+            return None
+        return "数据库繁忙"
+
+    def fake_discard() -> bool:
+        state["unsaved"] = False
+        return True
+
+    monkeypatch.setattr(controller, "has_unsaved_finalize", lambda: state["unsaved"], raising=False)
+    monkeypatch.setattr(controller, "unsaved_finalize_title", lambda: "进行中改字", raising=False)
+    monkeypatch.setattr(controller, "retry_finalize_save", fake_retry, raising=False)
+    monkeypatch.setattr(controller, "discard_unsaved_finalize", fake_discard, raising=False)
+
+    # Simulate DRAINING -> IDLE without ENDED when finalize DB write fails
+    controller._state = MeetingState.IDLE
+    page._live_ui.on_state_changed(MeetingState.IDLE)
+    page._on_finalize_save_failed(live.id, "磁盘空间不足，终态未保存")
+
+    assert page._stack.currentIndex() == PAGE_BROWSE
+    assert "磁盘空间不足" in page._status_label.text()
+    assert page._finalize_retry_btn.isVisible()
+    assert page._finalize_retry_btn.text() == "重试保存结束状态"
+    assert page._finalize_discard_btn.isVisible()
+    assert page._finalize_discard_btn.text() == "放弃"
+
+    # Failed retry keeps recovery buttons visible
+    page._retry_finalize_save()
+    assert page._finalize_retry_btn.isVisible()
+    assert "数据库繁忙" in page._status_label.text()
+
+    # Declining discard confirmation preserves unsaved state
+    with patch("sayink.ui.meeting_page.QMessageBox") as box_cls:
+        cancel_btn = object()
+        box_cls.return_value.addButton.side_effect = [cancel_btn, object()]
+        box_cls.return_value.clickedButton.return_value = cancel_btn
+        page._discard_unsaved_finalize()
+    assert state["unsaved"] is True
+    assert page._finalize_retry_btn.isVisible()
+
+    # Successful retry clears unsaved finalize state and hides buttons
+    state["retry_ok"] = True
+    page._retry_finalize_save()
+    assert state["unsaved"] is False
+    assert not page._finalize_retry_btn.isVisible()
+    assert not page._finalize_discard_btn.isVisible()
+
+
+def test_live_add_mark_preserves_note_when_store_write_fails(meeting, monkeypatch):
+    page, controller, _history, _record = meeting
+    page.show()
+    _begin_live(page, controller)
+    page._mark_note.setText("关键风险待跟进")
+
+    real_add_mark = controller.add_mark
+    monkeypatch.setattr(controller, "add_mark", lambda _note="": None)
+    page._mark_btn.click()
+    assert page._mark_note.text() == "关键风险待跟进"
+    assert "标记未能写入数据库" in page._live_speaker_feedback.text()
+
+    monkeypatch.setattr(controller, "add_mark", real_add_mark)
+    page._mark_btn.click()
+    assert page._mark_note.text() == ""
+
+
+def test_speaker_merge_delegation_time_readback_and_atomic_export_guard(meeting, monkeypatch, tmp_path):
+    page, controller, _history, record = meeting
+    page.show()
+    assert not hasattr(page, "_sync_aux_buttons")
+
+    # 1) Renaming speaker 1 -> "林工", then speaker 2 -> "林工" delegates to atomic merge_speakers
+    page._rename_speaker(1, "林工")
+    assert controller.speaker_names(record.id).get(1) == "林工"
+    merge_calls: list[tuple[str, int, int]] = []
+    merge_ok = False
+
+    def fake_merge(mid: str, from_sid: int, to_sid: int) -> bool:
+        merge_calls.append((mid, from_sid, to_sid))
+        return merge_ok
+
+    monkeypatch.setattr(controller, "merge_speakers", fake_merge, raising=False)
+    page._rename_speaker(2, "林工")
+    assert merge_calls == [(record.id, 2, 1)]
+    assert "姓名尚未保存" in page._status_label.text()
+
+    merge_ok = True
+    page._rename_speaker(2, "林工")
+    assert merge_calls == [(record.id, 2, 1), (record.id, 2, 1)]
+    assert "并入「林工」" in page._status_label.text()
+
+    # 2) _edit_meeting_time verifies DB readback before announcing success
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "sayink.ui.meeting_page._MeetingTimeDialog",
+        lambda *_a, **_kw: SimpleNamespace(
+            exec=lambda: QDialog.DialogCode.Accepted,
+            started_ms=record.started_at + 120_000,
+        ),
+    )
+    monkeypatch.setattr(controller.store, "shift_meeting_start", lambda *_a, **_kw: None)
+    page._edit_meeting_time()
+    assert "会议时间没能保存" in page._status_label.text()
+
+    # 3) Atomic export failure preserves existing target file intact and reports error on UI export
+    target = tmp_path / "existing_notes.md"
+    target.write_text("do-not-truncate", encoding="utf-8")
+    monkeypatch.setattr(
+        "sayink.ui.meeting_page.atomic_write_text",
+        lambda *_a, **_kw: (_ for _ in ()).throw(PermissionError("file locked")),
+    )
+    assert page.export_meeting_to_path(record.id, target) is False
+    assert target.read_text(encoding="utf-8") == "do-not-truncate"
+
+    alerts: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "sayink.ui.meeting_page.alert_error",
+        lambda _parent, title, body: alerts.append((title, body)),
+    )
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *_a, **_kw: (str(target), "Markdown (*.md)"),
+    )
+    page._export("notes")
+    assert target.read_text(encoding="utf-8") == "do-not-truncate"
+    assert alerts and alerts[0][0] == "导出失败" and "file locked" in alerts[0][1]
+

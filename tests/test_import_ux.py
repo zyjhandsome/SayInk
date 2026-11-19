@@ -848,5 +848,166 @@ def test_foreground_main_window_suppresses_redundant_media_tray_notifications():
 
         # Queue drained in background -> sends single tray notification!
         app._meeting.queued_media = lambda: ()
+        app._meeting.media_import_notice = ""
         app._on_media_import_settled("m1")
         assert fake_tray.showMessage.call_count == 1
+
+
+def test_transcript_import_dialog_keeps_draft_open_when_commit_fails(qapp):
+    from types import SimpleNamespace
+    from PyQt6.QtCore import QDateTime
+
+    should_succeed = False
+    attempts = 0
+
+    def commit_fn(text, title, detect_structure, started_ms, parsed):
+        nonlocal attempts
+        attempts += 1
+        if not should_succeed:
+            return None
+        return SimpleNamespace(
+            id="saved-m1",
+            title=title,
+            detect_structure=detect_structure,
+            started_ms=started_ms,
+            parsed=parsed,
+            text=text,
+        )
+
+    dialog = TranscriptImportDialog(
+        commit_fn=commit_fn,
+        commit_error_fn=lambda: "写入会议数据库失败：磁盘空间不足",
+    )
+    dialog.show()
+    try:
+        chosen_dt = QDateTime.fromString("2026-04-18 14:30:00", "yyyy-MM-dd HH:mm:ss")
+        dialog._edit.setPlainText("张三：第一句重要内容。\n李四：第二句重要结论。")
+        dialog._title.setText("架构评审纪要")
+        dialog._when.setDateTime(chosen_dt)
+
+        dialog._accept()
+        assert attempts == 1
+        assert dialog.result() != QDialog.DialogCode.Accepted
+        assert dialog.isVisible()
+        assert dialog.committed_record() is None
+        assert "磁盘空间不足" in dialog._preview.text()
+        assert "第一句重要内容" in dialog.transcript_text()
+        assert dialog.meeting_title() == "架构评审纪要"
+        assert dialog._when.dateTime() == chosen_dt
+
+        should_succeed = True
+        dialog._accept()
+        assert attempts == 2
+        assert dialog.result() == QDialog.DialogCode.Accepted
+        assert dialog.committed_record() is not None
+        assert dialog.committed_record().id == "saved-m1"
+    finally:
+        dialog._close_confirmed = True
+        dialog.close()
+        dialog.deleteLater()
+
+
+def test_unsaved_media_buttons_block_guards_and_auto_generate_forwarding(config, tmp_path, qapp, monkeypatch):
+    controller, history = _controller(config, tmp_path)
+    page = MeetingPage(config, controller)
+    page.show()
+    try:
+        sample = tmp_path / "failed_clip.wav"
+        sample.write_bytes(b"RIFF")
+        page._failed_media_path = str(sample)
+
+        # Simulate unsaved media result held by controller
+        unsaved_state = {"held": True}
+        monkeypatch.setattr(controller, "_unsaved_media", ("dummy", "客户访谈录音"), raising=False)
+        monkeypatch.setattr(
+            controller,
+            "unsaved_media_title",
+            lambda: "客户访谈录音" if unsaved_state["held"] else "",
+            raising=False,
+        )
+        monkeypatch.setattr(
+            controller,
+            "media_block_reason",
+            lambda: "有未保存的识别结果「客户访谈录音」，请先点击「重试保存」或「放弃未保存结果」。"
+            if unsaved_state["held"]
+            else "",
+            raising=False,
+        )
+
+        def fake_discard() -> bool:
+            unsaved_state["held"] = False
+            controller._unsaved_media = None
+            return True
+
+        monkeypatch.setattr(controller, "discard_unsaved_media", fake_discard, raising=False)
+
+        page._sync_media_buttons()
+        assert page._media_retry_btn.isVisible()
+        assert page._media_retry_btn.text() == "重试保存（客户访谈录音）"
+        assert page._media_discard_btn.isVisible()
+        assert page._media_discard_btn.text() == "放弃未保存结果"
+
+        # Manual import, drop import, and re-import must honor media_block_reason and preserve _failed_media_path
+        monkeypatch.setattr(
+            "sayink.ui.meeting_import_controller.MediaImportDialog",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("MediaImportDialog must not open while blocked")),
+        )
+        page._import_media()
+        assert "未保存的识别结果" in page._status_label.text()
+        page._import_ui._accept_dropped_media([sample], 0)
+        assert "未保存的识别结果" in page._status_label.text()
+        page._retry_failed_media()
+        assert page._failed_media_path == str(sample)
+
+        # Declining discard keeps unsaved media intact; confirming discards and hides recovery buttons
+        with patch("sayink.ui.meeting_page.QMessageBox") as box_cls:
+            cancel_btn = object()
+            box_cls.return_value.addButton.side_effect = [cancel_btn, object()]
+            box_cls.return_value.clickedButton.return_value = cancel_btn
+            page._discard_unsaved_media()
+        assert unsaved_state["held"] is True
+        assert page._media_retry_btn.isVisible()
+
+        with patch("sayink.ui.meeting_page.QMessageBox") as box_cls:
+            discard_btn = object()
+            box_cls.return_value.addButton.side_effect = [object(), discard_btn]
+            box_cls.return_value.clickedButton.return_value = discard_btn
+            page._discard_unsaved_media()
+        assert unsaved_state["held"] is False
+        assert not page._media_retry_btn.isVisible()
+        assert not page._media_discard_btn.isVisible()
+
+        # _build_start_kwargs forwards auto_generate explicitly
+        kwargs = page._import_ui._build_start_kwargs(
+            sample,
+            "测试",
+            {"language": "zh", "model_id": "funasr-nano", "started_at": 123, "auto_generate": True},
+        )
+        assert kwargs["auto_generate"] is True
+    finally:
+        page.hide()
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_media_import_dialog_excludes_auxiliary_models_via_asr_check(config, qapp, monkeypatch):
+    import sayink.speech_recognizer as sr
+    from sayink.ui.media_import_dialog import MediaImportDialog
+
+    first_asr = next(str(info["id"]) for info in sr.MODEL_REGISTRY if not info.get("auxiliary"))
+    monkeypatch.setattr(sr, "is_model_downloaded", lambda _mid: True)
+    monkeypatch.setattr(
+        sr,
+        "is_asr_model_downloaded",
+        lambda mid: mid == first_asr,
+        raising=False,
+    )
+    dialog = MediaImportDialog((), config=config)
+    try:
+        model_ids = [dialog._model_combo.itemData(i) for i in range(dialog._model_combo.count())]
+        assert model_ids == ["", first_asr]
+    finally:
+        dialog._close_confirmed = True
+        dialog.deleteLater()
+

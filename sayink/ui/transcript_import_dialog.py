@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from PyQt6.QtCore import QDateTime, QEvent, QSignalBlocker, QThread, QTimer, Qt, pyqtSignal
@@ -86,11 +87,20 @@ class _AsyncFileLoader(QThread):
 
 
 class TranscriptImportDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        commit_fn: Callable[[str, str, bool, int, object], object | None] | None = None,
+        commit_error_fn: Callable[[], str] | None = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("导入文字稿")
         self.setObjectName("transcriptImport")
         self.setAcceptDrops(True)
+        self._commit_fn = commit_fn
+        self._commit_error_fn = commit_error_fn
+        self._committed_record = None
         self._parsed_key = None
         self._parsed_value = None
         self._file_error = ""
@@ -729,8 +739,29 @@ class TranscriptImportDialog(QDialog):
                     return True
         return super().eventFilter(watched, event)
 
+    def committed_record(self):
+        return self._committed_record
+
     def _accept(self) -> None:
         self._refresh(force_sync=True)
         if not self._ok.isEnabled():
             return
+        if callable(self._commit_fn):
+            record = self._commit_fn(
+                self.transcript_text(),
+                self.meeting_title(),
+                self.detect_structure(),
+                self.meeting_started_ms(),
+                self.parsed(),
+            )
+            if record is None:
+                err = (
+                    str(self._commit_error_fn() or "").strip()
+                    if callable(self._commit_error_fn)
+                    else ""
+                ) or "无法写入数据库，请重试；框内文字已保留。"
+                self._preview.setText(err)
+                self._style_preview(error=True)
+                return
+            self._committed_record = record
         self.accept()

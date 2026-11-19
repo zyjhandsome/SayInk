@@ -380,12 +380,6 @@ def build():
             shutil.rmtree(dst_path)
         shutil.copytree(src_path, dst_path)
         print(f"    + {dir_name}")
-    if not with_model:
-        from sayink.speech_recognizer import get_model_info
-
-        asr_dir = models_dst / get_model_info(BUNDLE_REQUIRE_MODEL_ID)["dir_name"]
-        if asr_dir.exists():
-            shutil.rmtree(asr_dir)
 
     total_size = sum(
         f.stat().st_size for f in dist_dir.rglob("*") if f.is_file()
@@ -399,10 +393,7 @@ def build():
     print(f"  Output folder : {dist_dir}")
     print(f"  Executable    : {exe_path}")
     print(f"  Total size    : {size_mb:.0f} MB")
-    if downloaded:
-        print(f"  Models        : {len(downloaded)} models in models/ folder")
-    else:
-        print("  Models        : none (download via settings)")
+    print(f"  Models        : {len(downloaded)} models in models/ folder")
     print()
     print("  Distribution:")
     print("    Portable: zip this folder and share.")

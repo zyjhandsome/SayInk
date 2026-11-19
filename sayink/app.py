@@ -45,7 +45,7 @@ from sayink.audio_devices import (
 from sayink.audio_recorder import AudioRecorder, HoldCaptureStats
 from sayink.audio_utils import TARGET_SAMPLE_RATE
 from sayink.speaker_embedding import SpeakerEmbedder, make_embedder
-from sayink.speaker_clustering import final_assignments
+from sayink.speaker_clustering import bounded_final_assignments
 from sayink.speaker_session import SpeakerSession, recluster, voice_embedding
 from sayink.meeting_speakers import MeetingSpeakerSession, voice_sample_is_clear
 from sayink.speaker_turns import SpeakerTurnDetector
@@ -479,6 +479,17 @@ class App(QObject):
 
         return bool(is_model_downloaded(model_id))
 
+    def _is_asr_model_downloaded(self, model_id: str) -> bool:
+        from sayink.speech_recognizer import is_aux_model
+
+        if not model_id or is_aux_model(model_id):
+            return False
+        return bool(self._is_model_downloaded(model_id))
+
+    def _on_output_watchdog_reset(self) -> None:
+        self._inflight_rewrite_target = None
+        self._inflight_rewrite_token = 0
+
     def _build_output_pipeline(self) -> OutputPipeline:
         from sayink.asr_correction import correction_rejection_reason
 
@@ -499,6 +510,7 @@ class App(QObject):
             exit_started=lambda: bool(self._safe_attr("_exit_started", False)),
             hold_target=lambda: self._safe_attr("_hold_target", (0, "")),
             clear_transcribing=lambda: setattr(self, "_is_transcribing", False),
+            on_watchdog_reset=lambda: self._on_output_watchdog_reset(),
             friendly_error=self._friendly_error,
             output_text_dispatch=lambda text, **kw: self._output_text(text, **kw),
             handle_paste_result_dispatch=lambda result, **kw: self._handle_paste_result(result, **kw),
@@ -646,6 +658,7 @@ class App(QObject):
         m = self._modules
         self._active_rewrite: _RewriteContext | None = None
         self._inflight_rewrite_target: tuple[int, str] | None = None
+        self._inflight_rewrite_token: int = 0
         self._hotkey_mgr = (
             m.hotkey_mgr
             if m is not None and m.hotkey_mgr is not None
@@ -1197,7 +1210,11 @@ class App(QObject):
             self._show_model_not_ready()
             return
 
-        if self._is_transcribing or self._segment_queue:
+        if (
+            self._is_transcribing
+            or self._segment_queue
+            or self._safe_attr("_inflight_rewrite_target") is not None
+        ):
             # A previous hold is still being recognized or waits in the queue
             # behind an output in flight. Starting a new hold now would merge
             # that utterance into this one, and Esc would discard it.
@@ -1347,6 +1364,12 @@ class App(QObject):
         except Exception:
             return ""
 
+    def _rewrite_recovery_hint(self) -> str:
+        raw_hk = str(self._config.get("audio.paste_last_hotkey", "") or "").strip()
+        if raw_hk:
+            return f"结果已暂存为「上一句」，可按 {format_hotkey(raw_hk)} 重贴"
+        return "结果已暂存为「上一句」，可在设置绑定重贴快捷键后重贴"
+
     def paste_last_transcript(self) -> bool:
         """Paste the most recent non-meeting transcript into the current foreground window."""
         if self._safe_attr("_exit_started", False) or self._meeting_blocks_hotkey():
@@ -1362,21 +1385,49 @@ class App(QObject):
             return False
         target_hwnd, target_app = self._read_paste_target()
         pipe = self._output_pipeline()
-        pipe.busy = True
+        pipe.raw_text = ""
         pipe.stage = OutputStage.PASTE
+        pipe.stage_text = text
+        pipe.stage_record = None
+        pipe.mark_busy()
+        paste_token = pipe.token
+        done_called = False
 
         def _on_done(result: PasteResult | str) -> None:
+            nonlocal done_called
+            if done_called or self._safe_attr("_exit_started", False):
+                return
+            done_called = True
+            if paste_token <= pipe.invalidated_token or paste_token != pipe.token:
+                return
             pipe.busy = False
             pipe.stage = OutputStage.IDLE
-            status = result.status if isinstance(result, PasteResult) else str(result).split(":", 1)[0]
-            app_label = result.target_app if isinstance(result, PasteResult) else target_app
+            pipe.stage_text = ""
+            status, app_label, _detail = pipe._unpack_paste_result(result)
+            dest = app_label or target_app
             if status in ("sent", "pasted"):
                 self._floating.show_success(
                     "已重贴上一句",
-                    f"发送到 {app_label}" if app_label else "",
+                    f"发送到 {dest}" if dest else "",
+                )
+            elif status in ("clipboard", "copied"):
+                self._floating.show_info("已复制上一句", "可按 Ctrl+V 粘贴")
+            elif status == "unverified":
+                self._floating.show_info(
+                    "已发送上一句 · 未确认",
+                    f"焦点已切换，请检查 {dest}" if dest else "焦点已切换，请确认目标窗口已接收",
+                )
+            elif status == "skipped":
+                pipe.last_output_text = text
+                pipe.last_output_at = time.monotonic()
+                self._floating.show_warning(
+                    "剪贴板已变化，已取消重贴",
+                    "上一句仍已保留，可稍后再按重贴快捷键",
                 )
             else:
-                self._floating.show_info("已复制上一句", "可按 Ctrl+V 粘贴")
+                pipe.last_output_text = text
+                pipe.last_output_at = time.monotonic()
+                self._floating.show_error("重贴上一句失败：无法写入剪贴板\n上一句仍已保留，可稍后重试")
             self._later(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
 
         self._paster.paste_async(
@@ -1472,11 +1523,24 @@ class App(QObject):
         self._later(0, self._apply_pending_recognition_settings)
 
     def cancel_select_and_rewrite(self) -> None:
+        was_inflight = self._safe_attr("_inflight_rewrite_target") is not None
         self._active_rewrite = None
         self._inflight_rewrite_target = None
+        self._inflight_rewrite_token = 0
         cancel_rw = getattr(self._polisher, "cancel_rewrite", None)
         if callable(cancel_rw):
             cancel_rw()
+        if was_inflight:
+            pipe = self._output_pipeline()
+            pipe.busy = False
+            pipe.invalidated_token = pipe.token
+            pipe.token += 1
+            pipe.stage = OutputStage.IDLE
+            pipe.stage_text = ""
+            self._tray.set_activity_tooltip(None)
+            self._floating.show_cancelled()
+            self._later(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
+            return
         self._on_recording_cancel()
 
     def _confirm_rewrite_remote_origin(self, origin: str) -> bool:
@@ -1514,8 +1578,12 @@ class App(QObject):
                     save_now()
 
         self._inflight_rewrite_target = (ctx.target_hwnd, ctx.target_app)
-        pipe.busy = True
+        pipe.raw_text = ""
         pipe.stage = OutputStage.POLISH
+        pipe.stage_text = ""
+        pipe.stage_record = None
+        pipe.mark_busy()
+        self._inflight_rewrite_token = pipe.token
         self._tray.set_activity_tooltip("polishing")
         try:
             self._floating.show_polishing(instruction, action="改写")
@@ -1533,29 +1601,67 @@ class App(QObject):
 
     def _on_rewrite_complete(self, rewritten_text: str) -> None:
         target = self._inflight_rewrite_target
+        rw_token = int(self._safe_attr("_inflight_rewrite_token", 0) or 0)
         self._inflight_rewrite_target = None
+        self._inflight_rewrite_token = 0
         pipe = self._output_pipeline()
+        if target is None or (
+            rw_token and (rw_token <= pipe.invalidated_token or rw_token != pipe.token)
+        ):
+            return
         cleaned = normalize_asr_output(rewritten_text or "").strip()
-        if not cleaned or target is None:
+        if not cleaned:
             pipe.busy = False
             pipe.stage = OutputStage.IDLE
+            pipe.stage_text = ""
             self._tray.set_activity_tooltip(None)
             self._floating.show_error("改写结果为空，原选区未改动")
             self._later(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
             return
         hwnd, app_name = target
+        pipe.raw_text = ""
         pipe.stage = OutputStage.PASTE
+        pipe.stage_text = cleaned
+        pipe.stage_record = None
+        pipe.mark_busy()
+        paste_token = pipe.token
+        done_called = False
 
         def _on_done(result: PasteResult | str) -> None:
+            nonlocal done_called
+            if done_called or self._safe_attr("_exit_started", False):
+                return
+            done_called = True
+            if paste_token <= pipe.invalidated_token or paste_token != pipe.token:
+                return
             pipe.busy = False
             pipe.stage = OutputStage.IDLE
+            pipe.stage_text = ""
             self._tray.set_activity_tooltip(None)
-            status = result.status if isinstance(result, PasteResult) else str(result).split(":", 1)[0]
-            dest = result.target_app if isinstance(result, PasteResult) else app_name
+            status, app_label, _detail = pipe._unpack_paste_result(result)
+            dest = app_label or app_name
             if status in ("sent", "pasted"):
                 self._floating.show_success("已改写并替换", f"发送到 {dest}" if dest else "")
-            else:
+            elif status in ("clipboard", "copied"):
                 self._floating.show_info("改写结果已复制", "焦点已变化或受限，可按 Ctrl+V 粘贴")
+            elif status == "unverified":
+                self._floating.show_info(
+                    "改写结果已发送 · 未确认",
+                    f"焦点已切换，请检查 {dest}" if dest else "焦点已切换，请确认选区是否已替换",
+                )
+            elif status == "skipped":
+                pipe.last_output_text = cleaned
+                pipe.last_output_at = time.monotonic()
+                self._floating.show_warning(
+                    "剪贴板已变化，未自动替换选区",
+                    self._rewrite_recovery_hint(),
+                )
+            else:
+                pipe.last_output_text = cleaned
+                pipe.last_output_at = time.monotonic()
+                self._floating.show_error(
+                    f"改写结果未能写入剪贴板，原选区未改动\n{self._rewrite_recovery_hint()}"
+                )
             self._later(SEGMENT_PUMP_DELAY_MS, self._pump_segment_queue)
 
         self._paster.paste_async(
@@ -1566,10 +1672,18 @@ class App(QObject):
         )
 
     def _on_rewrite_error(self, error_msg: str) -> None:
+        target = self._inflight_rewrite_target
+        rw_token = int(self._safe_attr("_inflight_rewrite_token", 0) or 0)
         self._inflight_rewrite_target = None
+        self._inflight_rewrite_token = 0
         pipe = self._output_pipeline()
+        if target is None or (
+            rw_token and (rw_token <= pipe.invalidated_token or rw_token != pipe.token)
+        ):
+            return
         pipe.busy = False
         pipe.stage = OutputStage.IDLE
+        pipe.stage_text = ""
         self._tray.set_activity_tooltip(None)
         self._sound.play_error()
         self._floating.show_error(error_msg or "选中改写失败，原选区未改动")
@@ -1705,13 +1819,18 @@ class App(QObject):
             self._hold_paste_sent = True
             self._active_rewrite = None
             self._inflight_rewrite_target = None
+            self._inflight_rewrite_token = 0
             self._clear_queued_audio()
             cancel_current = getattr(self._recognizer, "cancel_current", None)
             if callable(cancel_current):
                 cancel_current()
+            cancel_rw = getattr(self._polisher, "cancel_rewrite", None)
+            if callable(cancel_rw):
+                cancel_rw()
             self._polisher.cancel()
             self._is_transcribing = False
             pipe.busy = False
+            pipe.invalidated_token = pipe.token
             pipe.token += 1
             pipe.stage = OutputStage.IDLE
             pipe.pending_record = None
@@ -2082,7 +2201,7 @@ class App(QObject):
         name = get_foreground_process_name() if hwnd else ""
         # H-12: Only zero SayInk's own windows here. Elevated target HWNDs stay
         # preserved so TextPaster can report detail="elevated" with actionable feedback.
-        if hwnd and TextPaster._is_own_window(info):
+        if hwnd and TextPaster.is_own_window(info):
             hwnd = 0
         return hwnd, name
 
@@ -2162,7 +2281,9 @@ class App(QObject):
         self._reclustered_session_id = session_id
         turns = [t for t in (getattr(speakers, "turns", None) or []) if getattr(t, "key", -1) >= 0]
         if turns:
-            assignments = final_assignments(speakers, self._speaker_embedder().cluster_threshold)
+            assignments = bounded_final_assignments(
+                speakers, self._speaker_embedder().cluster_threshold
+            )
             changed = {seq: sid for seq, sid in assignments.items() if seq >= 0}
             if changed:
                 log.info("持续转写 %s 说话人重新归属 %d 段", session_id[:8], len(changed))
@@ -3125,10 +3246,15 @@ class App(QObject):
 
     def _resolve_media_import_model_id(self) -> str:
         """H-31: Media import prefers dedicated meeting.model_id before falling back to stt.model_id."""
+        from sayink.speech_recognizer import is_aux_model
+
         meeting_model = str(self._config.get("meeting.model_id", "") or "").strip()
-        if meeting_model and self._is_model_downloaded(meeting_model):
+        if meeting_model and self._is_asr_model_downloaded(meeting_model):
             return meeting_model
-        return str(self._config.get("stt.model_id", DEFAULT_MODEL_ID) or DEFAULT_MODEL_ID)
+        stt_model = str(self._config.get("stt.model_id", DEFAULT_MODEL_ID) or DEFAULT_MODEL_ID).strip()
+        if stt_model and not is_aux_model(stt_model):
+            return stt_model
+        return DEFAULT_MODEL_ID
 
     def _run_media_import(self, path, cancel, progress, preview=None, options=None):
         from contextlib import contextmanager
@@ -3137,7 +3263,7 @@ class App(QObject):
 
         opts = dict(options or {})
         requested_model = str(opts.get("model_id", "") or "").strip()
-        if requested_model and self._is_model_downloaded(requested_model):
+        if requested_model and self._is_asr_model_downloaded(requested_model):
             effective_model_id = requested_model
         else:
             effective_model_id = self._resolve_media_import_model_id()
@@ -3560,6 +3686,15 @@ class App(QObject):
         if main is not None and main.isVisible():
             main.meeting_panel.show_meeting(meeting_id)
         else:
+            has_unsaved_fn = getattr(self._meeting, "has_unsaved_finalize", None)
+            if callable(has_unsaved_fn) and has_unsaved_fn() is True:
+                self._tray.showMessage(
+                    "SayInk",
+                    "会议结束状态未能写入数据库，请打开「会议」页重试保存。",
+                    QSystemTrayIcon.MessageIcon.Warning,
+                    8000,
+                )
+                return
             job = self._meeting.queued_generation(meeting_id)
             host = self._meeting.remote_host_needing_confirmation() if job is not None and job.automatic else ""
             if dropped:
@@ -3808,6 +3943,9 @@ class App(QObject):
             lambda: self._updates.check(interactive=True)
         )
         settings.update_install_requested.connect(self._updates.install)
+        audio_recovery_sig = getattr(settings, "audio_recovery_requested", None)
+        if audio_recovery_sig is not None and hasattr(audio_recovery_sig, "connect"):
+            audio_recovery_sig.connect(self._show_audio_recovery)
         download_notice = getattr(settings, "download_completed_notice", None)
         if download_notice is not None:
             download_notice.connect(self._on_download_completed_notice)
@@ -4318,9 +4456,55 @@ class App(QObject):
             return True
         return False
 
+    def _confirm_unsaved_history_inline_edit(self, *, install_update: bool = False) -> bool:
+        main = self._safe_attr("_main")
+        history_panel = getattr(main, "history_panel", None) if main is not None else None
+        if history_panel is None:
+            return True
+        has_unsaved_fn = getattr(history_panel, "has_unsaved_inline_edit", None)
+        has_unsaved = (
+            bool(has_unsaved_fn())
+            if callable(has_unsaved_fn)
+            else bool(getattr(history_panel, "_editing_session", False))
+        )
+        if not has_unsaved:
+            return True
+        try_leave_fn = getattr(history_panel, "try_leave", None)
+        if callable(try_leave_fn) and try_leave_fn():
+            return True
+        self._exit_dialog_open = True
+        try:
+            parent = main if main is not None and main.isVisible() else None
+            box = QMessageBox(parent)
+            box.setWindowTitle("安装更新" if install_update else "退出 SayInk")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText("历史记录修改尚未保存")
+            box.setInformativeText(
+                "历史记录中的内联修改未能保存。可以返回继续编辑，或放弃这次修改并安装更新。"
+                if install_update
+                else "历史记录中的内联修改未能保存。可以返回继续编辑，或放弃这次修改并退出。"
+            )
+            back = box.addButton("返回编辑", QMessageBox.ButtonRole.RejectRole)
+            discard = box.addButton(
+                "放弃修改并安装更新" if install_update else "放弃修改并退出",
+                QMessageBox.ButtonRole.DestructiveRole,
+            )
+            box.setDefaultButton(back)
+            box.setEscapeButton(back)
+            box.exec()
+            if box.clickedButton() == discard:
+                return True
+            if main is not None and not main.isVisible():
+                self._show_main_window("history")
+            return False
+        finally:
+            self._exit_dialog_open = False
+
     def _confirm_exit(self, *, install_update: bool = False) -> bool:
         """Never silently discard captured or in-flight speech on exit."""
         if self._exit_dialog_open:
+            return False
+        if not self._confirm_unsaved_history_inline_edit(install_update=install_update):
             return False
         draft = self._unsaved_meeting_draft()
         if draft:
@@ -4447,9 +4631,76 @@ class App(QObject):
         if callable(close_history):
             close_history()
         config = self._safe_attr("_config")
-        save_config = getattr(config, "save_immediate", None)
-        if callable(save_config):
-            save_config()
+        if isinstance(config, _ConfigRules):
+            config.save_if_dirty()
+        else:
+            save_config = getattr(config, "save_immediate", None)
+            if callable(save_config):
+                save_config()
+
+    def _flush_open_ui_before_shutdown(self) -> None:
+        main = self._safe_attr("_main")
+        if main is None:
+            return
+        history_panel = getattr(main, "history_panel", None)
+        if history_panel is not None:
+            has_unsaved_fn = getattr(history_panel, "has_unsaved_inline_edit", None)
+            has_unsaved = (
+                bool(has_unsaved_fn())
+                if callable(has_unsaved_fn)
+                else bool(getattr(history_panel, "_editing_session", False))
+            )
+            try_leave_fn = getattr(history_panel, "try_leave", None)
+            if has_unsaved and callable(try_leave_fn):
+                try:
+                    try_leave_fn()
+                except Exception:
+                    log.debug("退出前保存历史内联编辑失败", exc_info=True)
+            flush_del = getattr(history_panel, "flush_pending_delete", None)
+            if callable(flush_del):
+                flush_del()
+        panel = getattr(main, "meeting_panel", None)
+        flush_notes = getattr(panel, "flush_pending_user_notes", None)
+        if callable(flush_notes):
+            flush_notes()
+        flush_title = getattr(panel, "_flush_bound_title", None)
+        if callable(flush_title):
+            try:
+                flush_title(sync=True)
+            except TypeError:
+                flush_title()
+        save_rec_notes = getattr(panel, "_save_record_notes", None)
+        if callable(save_rec_notes):
+            save_rec_notes()
+
+    def commit_session_data(self) -> None:
+        """Synchronously flush open edits, HistoryStore, and dirty Config on OS shutdown."""
+        if self._safe_attr("_quit_persistence_finalized", False):
+            return
+        self._exit_started = True
+        try:
+            self._flush_open_ui_before_shutdown()
+            meeting = self._safe_attr("_meeting")
+            shutdown_meeting = getattr(meeting, "shutdown", None)
+            if callable(shutdown_meeting):
+                shutdown_meeting(wait_ms=0)
+            recorder = self._safe_attr("_recorder")
+            if recorder is not None:
+                if getattr(recorder, "is_continuous", False):
+                    recorder.stop_continuous()
+                elif getattr(recorder, "is_recording", False):
+                    recorder.cancel()
+        except Exception:
+            log.debug("会话结束前冲刷界面或录音缓存失败", exc_info=True)
+        self._finalize_quit_persistence()
+        self._release_instance_lock_once()
+
+    def quit_for_external_request(self) -> None:
+        """Non-interactive graceful quit triggered via wake pipe (e.g. installer/reinstall)."""
+        if self._safe_attr("_exit_started", False):
+            return
+        self._flush_open_ui_before_shutdown()
+        self._finish_quit()
 
     def _finish_quit(self):
         """Release resources after the user has accepted any pending loss."""
@@ -4555,12 +4806,10 @@ class App(QObject):
         meeting = self._safe_attr("_meeting")
         meeting_workers = [
             worker
-            for worker in getattr(meeting, "running_workers", ())
+            for worker in (getattr(meeting, "running_workers", ()) or ())
             if isinstance(worker, QThread) and worker.isRunning()
         ]
         updating_to_installer = bool(self._safe_attr("_updating_to_installer", False))
-        if not updating_to_installer and not meeting_workers:
-            self._release_instance_lock_once()
         owners = [self._recognizer, self._polisher, meeting, self._updates, self._settings_widget()]
         owners.extend(
             (
@@ -4578,6 +4827,11 @@ class App(QObject):
                    for worker in getattr(owner, "running_workers", ())
                    if isinstance(worker, QThread) and worker.isRunning()]
         if pending:
+            if not updating_to_installer and not meeting_workers:
+                cfg = self._safe_attr("_config")
+                if isinstance(cfg, _ConfigRules):
+                    cfg.save_if_dirty()
+                self._release_instance_lock_once()
             expired, timeout_s = self._check_quit_drain_deadline()
             if not expired:
                 self._later(QUIT_POLL_MS, self._complete_quit_when_idle)
@@ -4604,7 +4858,7 @@ class App(QObject):
         extra_infos: list[str] = []
         if interrupted:
             extra_infos.append(
-                f"发现 {len(interrupted)} 段可恢复录音。请到通用 → 应用与历史 → 查看 / 恢复录音。"
+                f"发现 {len(interrupted)} 段可恢复录音。请到通用 → 会议默认设置 → 查看 / 恢复未完成录音。"
             )
         self._show_history_startup_notice(extra_infos)
         self._meeting.mark_interrupted()

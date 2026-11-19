@@ -13,9 +13,11 @@ import shutil
 import threading
 import time
 import wave
+from collections.abc import Iterable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+import tempfile
 from uuid import uuid4
 
 import numpy as np
@@ -123,6 +125,17 @@ def _journal_f32_bytes(folder: Path) -> int:
     return _dir_f32_bytes(folder) + _dir_f32_bytes(folder / "pending")
 
 
+def _dir_is_kept_completed(folder: Path) -> bool:
+    meta_file = folder / "session.json"
+    if not meta_file.is_file() or meta_file.is_symlink():
+        return False
+    try:
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(meta, dict) and meta.get("complete") is True and meta.get("keep_completed") is True
+
+
 def _tree_f32_bytes(folder: Path) -> int:
     if not folder.is_dir() or folder.is_symlink():
         return 0
@@ -139,7 +152,10 @@ def _tree_f32_bytes(folder: Path) -> int:
     try:
         for child in folder.iterdir():
             if child.is_dir() and not child.is_symlink() and len(child.name) == 32:
-                total += _journal_f32_bytes(child)
+                if _dir_is_kept_completed(child):
+                    total += _dir_f32_bytes(child / "pending")
+                else:
+                    total += _journal_f32_bytes(child)
     except OSError:
         pass
     with _PENDING_BYTES_LOCK:
@@ -287,6 +303,10 @@ def delete_recording(root: Path, recording: RecoveryRecording) -> None:
     _invalidate_pending_bytes_cache(root)
 
 
+def _is_kept_completed(meta: dict) -> bool:
+    return meta.get("complete") is True and meta.get("keep_completed") is True
+
+
 def _evict_rank(item: RecoveryRecording, now: float) -> tuple[int, float] | None:
     """Sort key for journals that automatic cleanup may remove. None is protected."""
     if _is_held(item.path):
@@ -294,6 +314,8 @@ def _evict_rank(item: RecoveryRecording, now: float) -> tuple[int, float] | None
     meta = item.metadata
     started = float(meta.get("started_at") or 0)
     if meta.get("complete") is True:
+        if meta.get("keep_completed") is True:
+            return None
         return (0, started)
     if meta.get("closed") is True:
         return (1, started)
@@ -345,17 +367,19 @@ def _is_hex32_dir(path: Path) -> bool:
         return False
 
 
-def delete_session_recovery_files(session_id: str, base_dir: Path | None = None) -> int:
-    """Delete plaintext ``.f32`` recovery journals associated with ``session_id``.
+def delete_sessions_recovery_files(
+    session_ids: Iterable[str],
+    base_dir: Path | None = None,
+) -> int:
+    """Delete plaintext ``.f32`` recovery journals associated with any of ``session_ids``.
 
-    Matches either the 32-hex journal directory name directly or ``session_id`` /
-    ``meeting_id`` / ``history_id`` / ``id`` stored in ``session.json``.
-    Returns the count of deleted ``.f32`` audio files (or ``>= 1`` per removed
-    matching journal directory).
+    Scans ``base_dir`` in a single pass rather than re-reading every ``session.json``
+    once per deleted session.
     """
-    target_id = str(session_id or "").strip()
-    if not target_id:
+    targets = {str(sid or "").strip() for sid in (session_ids or ()) if str(sid or "").strip()}
+    if not targets:
         return 0
+    targets_lower = {t.lower() for t in targets}
     root = Path(base_dir) if base_dir is not None else (Path.home() / ".sayink" / "audio-recovery")
     if not root.exists() or not root.is_dir() or root.is_symlink():
         return 0
@@ -370,7 +394,7 @@ def delete_session_recovery_files(session_id: str, base_dir: Path | None = None)
                 continue
         except OSError:
             continue
-        matched = child.name.lower() == target_id.lower()
+        matched = child.name.lower() in targets_lower
         if not matched:
             meta_file = child / "session.json"
             if meta_file.is_file() and not meta_file.is_symlink():
@@ -379,7 +403,7 @@ def delete_session_recovery_files(session_id: str, base_dir: Path | None = None)
                     if isinstance(meta, dict):
                         for key in ("session_id", "meeting_id", "history_id", "id"):
                             val = meta.get(key)
-                            if val is not None and str(val).strip() == target_id:
+                            if val is not None and str(val).strip() in targets:
                                 matched = True
                                 break
                 except (OSError, ValueError):
@@ -401,16 +425,28 @@ def delete_session_recovery_files(session_id: str, base_dir: Path | None = None)
     return removed_files
 
 
+def delete_session_recovery_files(session_id: str, base_dir: Path | None = None) -> int:
+    """Delete plaintext ``.f32`` recovery journals associated with ``session_id``."""
+    target_id = str(session_id or "").strip()
+    if not target_id:
+        return 0
+    return delete_sessions_recovery_files((target_id,), base_dir=base_dir)
+
+
 class RecordingJournal:
     def __init__(self, root: Path, *, metadata: dict | None = None,
                  max_bytes: int = MAX_RECOVERY_BYTES, on_error=None,
-                 resume_dir: Path | None = None):
+                 resume_dir: Path | None = None, keep_completed: bool = False):
         self.root = root
         self._append_mode = False
+        self._keep_completed = bool(keep_completed)
         self._max_bytes = max_bytes
         self._on_error = on_error
         self._error = ""
         self._closed = False
+        self._quota_stopped = False
+        self._meta_lock = threading.Lock()
+        self._fail_lock = threading.Lock()
         self._queue: queue.Queue = queue.Queue(maxsize=20)
         self._stop = threading.Event()
         now = time.time()
@@ -440,6 +476,8 @@ class RecordingJournal:
                 except (OSError, ValueError):
                     pass
             started_at = float(prev_meta.get("started_at") or now)
+            keep_flag = self._keep_completed or (prev_meta.get("keep_completed") is True)
+            self._keep_completed = keep_flag
             self._meta = {
                 **prev_meta,
                 **(metadata or {}),
@@ -447,39 +485,22 @@ class RecordingJournal:
                 "started_at": started_at,
                 "complete": False,
             }
+            if keep_flag:
+                self._meta["keep_completed"] = True
             self._written_bytes = _journal_f32_bytes(self.path)
         else:
             self.path = root / uuid4().hex
             self._meta = {**(metadata or {}), "sample_rate": TARGET_SAMPLE_RATE,
                           "started_at": now, "complete": False}
+            if self._keep_completed:
+                self._meta["keep_completed"] = True
             self._written_bytes = 0
         sweep_orphan_pending(root, exclude_journal=self.path if self._append_mode else None)
         _invalidate_pending_bytes_cache(root)
-        self._fail_lock = threading.Lock()
         self._pending_cache: tuple[int, float, int] = (-1, 0.0, 0)
-        # Expire completed recordings past 7 days AND super-aged (>30d) incomplete fragments.
-        for item in recordings(root):
-            if self._append_mode and item.path == self.path:
-                continue
-            age = now - float(item.metadata.get("started_at", 0) or 0)
-            is_complete = item.metadata.get("complete") is True
-            expired = (
-                (is_complete and age > RETENTION_SECONDS)
-                or (not is_complete and age > INCOMPLETE_RETENTION_SECONDS)
-            )
-            if expired:
-                delete_recording(root, item)
-
-        # Leave headroom so the meeting does not fill the cap in the next minute.
-        # Completed journals, quota-closed sessions, then stale crash fragments.
-        evict_oldest_recordings(
-            root,
-            target_total_bytes=max(0, max_bytes - quota_headroom(max_bytes)),
-            exclude_paths=(self.path,),
-        )
-        self._existing_bytes = sum(
-            item.cache_bytes for item in recordings(root) if _path_key(item.path) != _path_key(self.path)
-        )
+        self._purge_expired(now)
+        self._enforce_quota()
+        self._existing_bytes = self._countable_existing_bytes()
         if self._existing_bytes + self._written_bytes >= max_bytes or shutil.disk_usage(root).free < MIN_FREE_BYTES:
             raise OSError("录音缓存空间不足，请导出或删除旧录音后重试")
         created_dir = False
@@ -495,14 +516,85 @@ class RecordingJournal:
         self._thread = threading.Thread(target=self._write, name="SayInkAudioJournal", daemon=True)
         self._thread.start()
 
-    def _save_metadata(self, *, sync: bool = True):
-        temp = self.path / "session.tmp"
-        with temp.open("w", encoding="utf-8") as handle:
-            json.dump(self._meta, handle, ensure_ascii=False)
-            handle.flush()
-            if sync:
-                os.fsync(handle.fileno())
-        os.replace(temp, self.path / "session.json")
+    def _purge_expired(self, now: float) -> None:
+        # Expire completed recordings past 7 days (unless keep_completed=True)
+        # AND super-aged (>30d) incomplete fragments.
+        for item in recordings(self.root):
+            if self._append_mode and item.path == self.path:
+                continue
+            if _is_kept_completed(item.metadata):
+                continue
+            age = now - float(item.metadata.get("started_at", 0) or 0)
+            is_complete = item.metadata.get("complete") is True
+            expired = (
+                (is_complete and age > RETENTION_SECONDS)
+                or (not is_complete and age > INCOMPLETE_RETENTION_SECONDS)
+            )
+            if expired:
+                delete_recording(self.root, item)
+
+    def _enforce_quota(self, extra_bytes: int = 0) -> None:
+        # Leave headroom so the meeting does not fill the cap in the next minute.
+        # Completed journals (except keep_completed=True), quota-closed sessions,
+        # then stale crash fragments.
+        limit = self._max_bytes - quota_headroom(self._max_bytes)
+        evict_oldest_recordings(
+            self.root,
+            target_total_bytes=max(0, limit - extra_bytes),
+            exclude_paths=(self.path,),
+        )
+
+    def _countable_existing_bytes(self) -> int:
+        return sum(
+            item.cache_bytes
+            for item in recordings(self.root)
+            if _path_key(item.path) != _path_key(self.path) and not _is_kept_completed(item.metadata)
+        )
+
+    def _save_metadata(self, *, sync: bool = True) -> None:
+        with self._meta_lock:
+            self._save_metadata_locked(sync=sync)
+
+    def _save_metadata_locked(self, *, sync: bool = True) -> None:
+        target = self.path / "session.json"
+        fd: int | None = None
+        temp: Path | None = None
+        snapshot = dict(self._meta)
+        try:
+            raw_fd, raw_tmp = tempfile.mkstemp(
+                dir=str(self.path),
+                prefix=".session.",
+                suffix=".tmp",
+            )
+            fd = raw_fd
+            temp = Path(raw_tmp)
+            with os.fdopen(raw_fd, "w", encoding="utf-8") as handle:
+                fd = None
+                json.dump(snapshot, handle, ensure_ascii=False)
+                handle.flush()
+                if sync:
+                    os.fsync(handle.fileno())
+            for delay in (0.02, 0.05, 0.1):
+                try:
+                    os.replace(temp, target)
+                    temp = None
+                    break
+                except PermissionError:
+                    time.sleep(delay)
+            if temp is not None:
+                os.replace(temp, target)
+                temp = None
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if temp is not None:
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     @property
     def healthy(self) -> bool:
@@ -563,6 +655,7 @@ class RecordingJournal:
     def _write(self):
         size = self._written_bytes
         open_mode = "ab" if self._append_mode else "wb"
+        drained_cleanly = False
         try:
             with ExitStack() as stack:
                 handles = {"audio": stack.enter_context((self.path / "audio.f32").open(open_mode, buffering=0))}
@@ -576,17 +669,11 @@ class RecordingJournal:
                     limit = self._max_bytes - quota_headroom(self._max_bytes)
                     used_bytes = self._existing_bytes + size + self._cached_pending_bytes()
                     if used_bytes + chunk_bytes > limit or shutil.disk_usage(self.root).free < MIN_FREE_BYTES + chunk_bytes:
-                        evict_oldest_recordings(
-                            self.root,
-                            target_total_bytes=max(0, limit - chunk_bytes),
-                            exclude_paths=(self.path,),
-                        )
-                        self._existing_bytes = sum(
-                            item.cache_bytes for item in recordings(self.root)
-                            if _path_key(item.path) != _path_key(self.path)
-                        )
+                        self._enforce_quota(extra_bytes=chunk_bytes)
+                        self._existing_bytes = self._countable_existing_bytes()
                         used_bytes = self._existing_bytes + size + self._cached_pending_bytes()
                     if used_bytes + chunk_bytes > self._max_bytes:
+                        self._quota_stopped = True
                         self._fail("录音缓存已达到 5 GB 上限；请导出或删除仍需保留的录音")
                         break
                     if time.monotonic() - last_sync >= 1:
@@ -594,6 +681,7 @@ class RecordingJournal:
                             os.fsync(handle.fileno())
                         last_sync = time.monotonic()
                         if shutil.disk_usage(self.root).free < MIN_FREE_BYTES:
+                            self._quota_stopped = True
                             self._fail("磁盘剩余空间不足，已停止录音缓存")
                             break
                     for role, samples in data.items():
@@ -609,29 +697,46 @@ class RecordingJournal:
                     self._written_bytes = size
                 for handle in handles.values():
                     os.fsync(handle.fileno())
-            self._meta.update(complete=self._closed and not self._error,
-                              closed=bool(self._closed),
-                              samples=(self.path / "audio.f32").stat().st_size // 4,
-                              error=self._error, stopped_at=time.time())
-            self._save_metadata()
+                drained_cleanly = self._stop.is_set() and self._queue.empty() and not self._error
         except OSError as exc:
             self._fail(f"录音缓存写入失败：{exc}")
+        finally:
+            try:
+                if self.path.is_dir() and not (self.path / "session.json").is_symlink():
+                    audio_file = self.path / "audio.f32"
+                    samples = audio_file.stat().st_size // 4 if audio_file.is_file() else 0
+                    with self._meta_lock:
+                        self._meta.update(
+                            complete=bool(drained_cleanly and self._closed and not self._error),
+                            closed=bool(self._closed or self._error or self._quota_stopped),
+                            samples=samples,
+                            error=self._error,
+                            stopped_at=time.time(),
+                        )
+                        self._save_metadata_locked()
+            except OSError as exc:
+                self._fail(f"录音缓存写入失败：{exc}")
 
     def close(self, timeout: float = 3) -> bool:
         self._closed = True
         self._stop.set()
         self._thread.join(timeout=timeout)
-        # A quota stop used to look like a fresh crash (complete false, never
-        # closed) and then blocked every later meeting for 24 hours.
+        if self._thread.is_alive():
+            return False
+        # A quota/IO stop may have exited _write() before close() was called.
+        # Mark closed=True once the writer thread is gone, without ever
+        # upgrading an incomplete/failed recording to complete=True.
         try:
             if self.path.is_dir() and not (self.path / "session.json").is_symlink():
-                self._meta["closed"] = True
-                self._meta["complete"] = not self._error
-                self._meta.setdefault("stopped_at", time.time())
-                self._save_metadata()
+                with self._meta_lock:
+                    if not self._meta.get("closed"):
+                        self._meta["closed"] = True
+                        self._meta["complete"] = bool(self._meta.get("complete") and not self._error)
+                        self._meta.setdefault("stopped_at", time.time())
+                        self._save_metadata_locked()
         except OSError:
             pass
-        return not self._thread.is_alive()
+        return True
 
 
 @dataclass(frozen=True)

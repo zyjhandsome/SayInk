@@ -17,6 +17,7 @@ import zipfile
 import pytest
 from PyQt6.QtWidgets import QApplication
 
+from sayink.atomic_io import atomic_write_bytes, atomic_write_text
 from sayink.config import Config
 from sayink.docx_io import DocxFormatError, read_docx_text, write_docx_document
 from sayink.history_store import HistoryStore, SegmentRecord
@@ -271,3 +272,63 @@ def test_compact_560px_split_screen_mode_across_main_history_and_meeting(qapp, t
         win.close()
         win.deleteLater()
         store.close()
+
+
+def test_docx_and_atomic_io_preserve_existing_file_on_write_or_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docx_path = tmp_path / "既有纪要.docx"
+    write_docx_document(
+        docx_path,
+        title="原始会议纪要",
+        metadata_rows=[("状态", "已归档")],
+        markdown_body="# 原始会议纪要\n\n- 这一版内容绝不能因覆盖失败变成 22 字节空包。\n",
+    )
+    original_bytes = docx_path.read_bytes()
+    assert len(original_bytes) > 500
+
+    # 1. Failure on first ZipFile.writestr leaves original .docx completely intact (not 22B!)
+    real_writestr = zipfile.ZipFile.writestr
+
+    def fail_first_entry(self, zinfo_or_arcname, data, *args, **kwargs):
+        raise OSError("simulated disk full during writestr")
+
+    monkeypatch.setattr(zipfile.ZipFile, "writestr", fail_first_entry)
+    with pytest.raises(OSError, match="simulated disk full"):
+        write_docx_document(docx_path, title="新纪要", markdown_body="新内容")
+    monkeypatch.setattr(zipfile.ZipFile, "writestr", real_writestr)
+
+    assert docx_path.read_bytes() == original_bytes
+    assert "原始会议纪要" in read_docx_text(docx_path)
+    assert list(tmp_path.glob("*.tmp")) == []
+
+    # 2. Transient PermissionError on os.replace retries and succeeds; persistent lock preserves target & cleans tmp
+    attempts = {"count": 0}
+    import sayink.atomic_io as atomic_io_mod
+
+    real_replace = atomic_io_mod.os.replace
+    monkeypatch.setattr(atomic_io_mod.time, "sleep", lambda _s: None)
+
+    def flaky_replace(src, dst):
+        attempts["count"] += 1
+        if attempts["count"] <= 2:
+            raise PermissionError("transient AV scan lock")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(atomic_io_mod.os, "replace", flaky_replace)
+    txt_path = tmp_path / "export.md"
+    atomic_write_text(txt_path, "第一次导出\n")
+    assert attempts["count"] == 3
+    assert txt_path.read_text(encoding="utf-8") == "第一次导出\n"
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+    monkeypatch.setattr(
+        atomic_io_mod.os,
+        "replace",
+        lambda _s, _d: (_ for _ in ()).throw(PermissionError("locked in Word")),
+    )
+    with pytest.raises(PermissionError, match="locked in Word"):
+        atomic_write_bytes(docx_path, b"new-bytes")
+    assert docx_path.read_bytes() == original_bytes
+    assert list(tmp_path.glob(".*.tmp")) == []
+

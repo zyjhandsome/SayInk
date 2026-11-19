@@ -2,17 +2,17 @@
 ; Creates a professional Windows installer with custom installation path
 ;
 ; Constants are normally passed by build_installer.py:
-;   ISCC /DAppVersionStr=3.0.7 /DAppVersionQuad=3.0.7.0 SayInk-Setup.iss
+;   ISCC /DAppVersionStr=3.0.8 /DAppVersionQuad=3.0.8.0 SayInk-Setup.iss
 ; Both installers copy dist\SayInk\models\. Lite has CAM++, Silero VAD and
 ; the experimental speaker-activity model; the app downloads Fun-ASR-Nano on
 ; first start. Full installer:
 ; /DOutputSuffix=-full, and models\ also contains Fun-ASR-Nano.
 ; The in-app updater only downloads the lite name (sayink/updater.py).
 #ifndef AppVersionStr
-#define AppVersionStr "3.0.7"
+#define AppVersionStr "3.0.8"
 #endif
 #ifndef AppVersionQuad
-#define AppVersionQuad "3.0.7.0"
+#define AppVersionQuad "3.0.8.0"
 #endif
 #ifndef OutputSuffix
 #define OutputSuffix ""
@@ -23,7 +23,7 @@
 
 [Setup]
 ; Fixed id: upgrades replace earlier SayInk installs instead of stacking.
-; (VoiceInk ≤ 2.1.0 used the implicit id "VoiceInk"; InitializeSetup below
+; (VoiceInk ≤ 2.1.0 used the implicit id "VoiceInk"; PrepareToInstall below
 ; removes that install first so the two names never coexist.)
 AppId={{SayInk}}
 AppName=SayInk
@@ -119,6 +119,9 @@ const
   SingleInstanceMutexName = 'Local\SayInk_Single_Instance_Mutex';
   SYNCHRONIZE_ACCESS = $00100000;
   CRED_TYPE_GENERIC = 1;
+  WTS_CURRENT_SERVER_HANDLE = 0;
+  WTSUserName = 5;
+  INVALID_SESSION_ID = $FFFFFFFF;
 
 function OpenProcess(dwDesiredAccess: DWORD; bInheritHandle: BOOL; dwProcessId: DWORD): THandle;
   external 'OpenProcess@kernel32.dll stdcall';
@@ -126,6 +129,24 @@ function WaitForSingleObject(hHandle: THandle; dwMilliseconds: DWORD): DWORD;
   external 'WaitForSingleObject@kernel32.dll stdcall';
 function CloseHandle(hObject: THandle): BOOL;
   external 'CloseHandle@kernel32.dll stdcall';
+function GetCurrentProcessId(): DWORD;
+  external 'GetCurrentProcessId@kernel32.dll stdcall';
+function ProcessIdToSessionId(dwProcessId: DWORD; var pSessionId: DWORD): BOOL;
+  external 'ProcessIdToSessionId@kernel32.dll stdcall';
+function WTSGetActiveConsoleSessionId(): DWORD;
+  external 'WTSGetActiveConsoleSessionId@kernel32.dll stdcall';
+function WTSQuerySessionInformationW(
+  hServer: THandle;
+  SessionId: DWORD;
+  WTSInfoClass: DWORD;
+  var ppBuffer: THandle;
+  var pBytesReturned: DWORD
+): BOOL;
+  external 'WTSQuerySessionInformationW@wtsapi32.dll stdcall';
+procedure WTSFreeMemory(pMemory: THandle);
+  external 'WTSFreeMemory@wtsapi32.dll stdcall';
+function CopyWideBuffer(lpString1: string; lpString2: THandle; iMaxLength: Integer): THandle;
+  external 'lstrcpynW@kernel32.dll stdcall';
 function CredDeleteW(TargetName: string; CredType: DWORD; Flags: DWORD): BOOL;
   external 'CredDeleteW@advapi32.dll stdcall';
 
@@ -282,7 +303,7 @@ end;
 
 procedure WaitForGracefulAppExit();
 var
-  WaitPidStr: string;
+  WaitPidStr, InstalledExe: string;
   WaitPid, I, ErrorCode: Integer;
   ProcHandle: THandle;
 begin
@@ -303,8 +324,12 @@ begin
 
   if CheckForMutexes(SingleInstanceMutexName) then
   begin
-    // Request polite exit first before forceful termination so SQLite/Config flush cleanly.
-    Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM SayInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+    // Ask a tray-only running instance via its wake pipe first so HistoryStore & Config flush.
+    InstalledExe := ExpandConstant('{app}\SayInk.exe');
+    if FileExists(InstalledExe) then
+      RunAsUser(InstalledExe, '--quit-running');
+    if CheckForMutexes(SingleInstanceMutexName) then
+      Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM SayInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
     for I := 1 to 25 do
     begin
       if not CheckForMutexes(SingleInstanceMutexName) then
@@ -318,16 +343,24 @@ begin
 end;
 
 function InitializeSetup(): Boolean;
+begin
+  // Keep wizard initialization side-effect-free so cancelling Setup leaves running
+  // processes, legacy installs, and user folders untouched.
+  Result := True;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ErrorCode: Integer;
 begin
+  NeedsRestart := False;
+  Result := '';
   WaitForGracefulAppExit();
   // A running VoiceInk holds files in ~\.voiceink open and the rename fails.
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM VoiceInk.exe', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
   Sleep(500);
   MigrateLegacyDataDir();
   UninstallLegacyVoiceInk();
-  Result := True;
 end;
 
 function IsRealUserSid(const Sid: string): Boolean;
@@ -335,53 +368,183 @@ begin
   Result := (Pos('S-1-5-21-', Sid) = 1) and (Pos('_Classes', Sid) = 0);
 end;
 
-procedure AppendUniqueDir(var List: TArrayOfString; const Candidate: string);
+function ActiveInteractiveSessionId(): DWORD;
 var
-  I, Len: Integer;
-  Norm: string;
+  SessionId: DWORD;
 begin
-  if (Candidate = '') or (not DirExists(Candidate)) then
-    Exit;
-  Norm := RemoveBackslashUnlessRoot(Candidate);
-  Len := GetArrayLength(List);
-  for I := 0 to Len - 1 do
-  begin
-    if CompareText(List[I], Norm) = 0 then
-      Exit;
-  end;
-  SetArrayLength(List, Len + 1);
-  List[Len] := Norm;
+  SessionId := INVALID_SESSION_ID;
+  if not ProcessIdToSessionId(GetCurrentProcessId(), SessionId) then
+    SessionId := WTSGetActiveConsoleSessionId();
+  if SessionId = INVALID_SESSION_ID then
+    SessionId := WTSGetActiveConsoleSessionId();
+  Result := SessionId;
 end;
 
-procedure CollectUserDataDirs(var DataDirs: TArrayOfString);
+function QuerySessionUserName(SessionId: DWORD): string;
+var
+  Buffer: THandle;
+  BytesReturned: DWORD;
+  CharCount: Integer;
+  UserName: string;
+begin
+  Result := '';
+  if SessionId = INVALID_SESSION_ID then
+    Exit;
+  Buffer := 0;
+  BytesReturned := 0;
+  if WTSQuerySessionInformationW(
+    WTS_CURRENT_SERVER_HANDLE, SessionId, WTSUserName, Buffer, BytesReturned
+  ) then
+  begin
+    try
+      if (Buffer <> 0) and (BytesReturned > 2) then
+      begin
+        CharCount := BytesReturned div 2;
+        SetLength(UserName, CharCount - 1);
+        CopyWideBuffer(UserName, Buffer, CharCount);
+        Result := Trim(UserName);
+      end;
+    finally
+      if Buffer <> 0 then
+        WTSFreeMemory(Buffer);
+    end;
+  end;
+end;
+
+function ResolveInteractiveUserSid(SessionId: DWORD; const SessionUser: string): string;
 var
   Sids: TArrayOfString;
   I: Integer;
-  HomeDir, AppDataDir: string;
+  CandUser, HomeDir: string;
 begin
-  SetArrayLength(DataDirs, 0);
-
+  Result := '';
   if RegGetSubkeyNames(HKU, '', Sids) then
   begin
     for I := 0 to GetArrayLength(Sids) - 1 do
     begin
       if IsRealUserSid(Sids[I]) then
       begin
+        if (SessionId <> INVALID_SESSION_ID)
+          and RegKeyExists(HKU, Sids[I] + '\Volatile Environment\' + IntToStr(SessionId)) then
+        begin
+          if (SessionUser = '')
+            or (RegQueryStringValue(HKU, Sids[I] + '\Volatile Environment', 'USERNAME', CandUser)
+                and (CompareText(Trim(CandUser), SessionUser) = 0)) then
+          begin
+            Result := Sids[I];
+            Exit;
+          end;
+        end;
+        if (SessionUser <> '')
+          and RegQueryStringValue(HKU, Sids[I] + '\Volatile Environment', 'USERNAME', CandUser)
+          and (CompareText(Trim(CandUser), SessionUser) = 0) then
+        begin
+          Result := Sids[I];
+          Exit;
+        end;
+      end;
+    end;
+  end;
+
+  if (SessionUser <> '') and RegGetSubkeyNames(HKLM, ProfileListKey, Sids) then
+  begin
+    for I := 0 to GetArrayLength(Sids) - 1 do
+    begin
+      if IsRealUserSid(Sids[I])
+        and RegQueryStringValue(HKLM, ProfileListKey + '\' + Sids[I], 'ProfileImagePath', HomeDir) then
+      begin
+        if CompareText(ExtractFileName(RemoveBackslashUnlessRoot(HomeDir)), SessionUser) = 0 then
+        begin
+          Result := Sids[I];
+          Exit;
+        end;
+      end;
+    end;
+  end;
+end;
+
+function DirListContains(const List: TArrayOfString; const Candidate: string): Boolean;
+var
+  I: Integer;
+  Norm: string;
+begin
+  Result := False;
+  if Candidate = '' then
+    Exit;
+  Norm := RemoveBackslashUnlessRoot(Candidate);
+  for I := 0 to GetArrayLength(List) - 1 do
+  begin
+    if CompareText(List[I], Norm) = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+procedure AppendUniqueDir(var List: TArrayOfString; const Candidate: string);
+var
+  Len: Integer;
+  Norm: string;
+begin
+  if (Candidate = '') or (not DirExists(Candidate)) then
+    Exit;
+  Norm := RemoveBackslashUnlessRoot(Candidate);
+  if DirListContains(List, Norm) then
+    Exit;
+  Len := GetArrayLength(List);
+  SetArrayLength(List, Len + 1);
+  List[Len] := Norm;
+end;
+
+procedure AppendHomeDataDirs(var List: TArrayOfString; const HomeDir: string);
+begin
+  if HomeDir = '' then
+    Exit;
+  AppendUniqueDir(List, AddBackslash(HomeDir) + '.sayink');
+  AppendUniqueDir(List, AddBackslash(HomeDir) + '.voiceink');
+end;
+
+procedure CollectScopedUserDataDirs(
+  const FallbackHome: string;
+  var CurrentUserDirs: TArrayOfString;
+  var OtherUserDirs: TArrayOfString
+);
+var
+  SessionId: DWORD;
+  SessionUser, ActiveSid, HomeDir: string;
+  Sids: TArrayOfString;
+  I: Integer;
+begin
+  SetArrayLength(CurrentUserDirs, 0);
+  SetArrayLength(OtherUserDirs, 0);
+
+  SessionId := ActiveInteractiveSessionId();
+  SessionUser := QuerySessionUserName(SessionId);
+  ActiveSid := ResolveInteractiveUserSid(SessionId, SessionUser);
+
+  if ActiveSid <> '' then
+  begin
+    if RegQueryStringValue(HKU, ActiveSid + '\Volatile Environment', 'USERPROFILE', HomeDir) then
+      AppendHomeDataDirs(CurrentUserDirs, HomeDir);
+    if RegQueryStringValue(HKLM, ProfileListKey + '\' + ActiveSid, 'ProfileImagePath', HomeDir) then
+      AppendHomeDataDirs(CurrentUserDirs, HomeDir);
+  end
+  else if FallbackHome <> '' then
+    AppendHomeDataDirs(CurrentUserDirs, FallbackHome);
+
+  if RegGetSubkeyNames(HKU, '', Sids) then
+  begin
+    for I := 0 to GetArrayLength(Sids) - 1 do
+    begin
+      if IsRealUserSid(Sids[I]) and (CompareText(Sids[I], ActiveSid) <> 0) then
+      begin
         if RegQueryStringValue(HKU, Sids[I] + '\Volatile Environment', 'USERPROFILE', HomeDir) then
         begin
-          AppendUniqueDir(DataDirs, AddBackslash(HomeDir) + '.sayink');
-          AppendUniqueDir(DataDirs, AddBackslash(HomeDir) + '.voiceink');
-        end
-        else if RegQueryStringValue(
-          HKU,
-          Sids[I] + '\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders',
-          'AppData',
-          AppDataDir
-        ) then
-        begin
-          HomeDir := ExtractFileDir(ExtractFileDir(RemoveBackslashUnlessRoot(AppDataDir)));
-          AppendUniqueDir(DataDirs, AddBackslash(HomeDir) + '.sayink');
-          AppendUniqueDir(DataDirs, AddBackslash(HomeDir) + '.voiceink');
+          if not DirListContains(CurrentUserDirs, AddBackslash(HomeDir) + '.sayink') then
+            AppendUniqueDir(OtherUserDirs, AddBackslash(HomeDir) + '.sayink');
+          if not DirListContains(CurrentUserDirs, AddBackslash(HomeDir) + '.voiceink') then
+            AppendUniqueDir(OtherUserDirs, AddBackslash(HomeDir) + '.voiceink');
         end;
       end;
     end;
@@ -391,15 +554,57 @@ begin
   begin
     for I := 0 to GetArrayLength(Sids) - 1 do
     begin
-      if IsRealUserSid(Sids[I]) and RegQueryStringValue(
-        HKLM, ProfileListKey + '\' + Sids[I], 'ProfileImagePath', HomeDir
-      ) then
+      if IsRealUserSid(Sids[I]) and (CompareText(Sids[I], ActiveSid) <> 0)
+        and RegQueryStringValue(HKLM, ProfileListKey + '\' + Sids[I], 'ProfileImagePath', HomeDir) then
       begin
-        AppendUniqueDir(DataDirs, AddBackslash(HomeDir) + '.sayink');
-        AppendUniqueDir(DataDirs, AddBackslash(HomeDir) + '.voiceink');
+        if not DirListContains(CurrentUserDirs, AddBackslash(HomeDir) + '.sayink') then
+          AppendUniqueDir(OtherUserDirs, AddBackslash(HomeDir) + '.sayink');
+        if not DirListContains(CurrentUserDirs, AddBackslash(HomeDir) + '.voiceink') then
+          AppendUniqueDir(OtherUserDirs, AddBackslash(HomeDir) + '.voiceink');
       end;
     end;
   end;
+end;
+
+function FormatDirList(const Dirs: TArrayOfString): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 0 to GetArrayLength(Dirs) - 1 do
+  begin
+    if Result <> '' then
+      Result := Result + #13#10;
+    Result := Result + '  • ' + Dirs[I];
+  end;
+end;
+
+function IsReparsePointDir(const DirPath: string): Boolean;
+var
+  FindRec: TFindRec;
+begin
+  Result := False;
+  if FindFirst(RemoveBackslashUnlessRoot(DirPath), FindRec) then
+  begin
+    try
+      Result := (FindRec.Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0;
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+procedure SafeDeleteDataDir(const DirPath: string);
+begin
+  if not DirExists(DirPath) then
+    Exit;
+  if IsReparsePointDir(DirPath) then
+  begin
+    Log('Removing reparse-point link without traversing target: ' + DirPath);
+    RemoveDir(DirPath);
+    Exit;
+  end;
+  DelTree(DirPath, True, True, True);
 end;
 
 procedure DeleteStoredApiCredentials();
@@ -410,27 +615,45 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  DataDirs: TArrayOfString;
+  CurrentUserDirs, OtherUserDirs: TArrayOfString;
   I: Integer;
 begin
   if CurUninstallStep = usUninstall then
   begin
     RemovePerUserLeftovers();
-    CollectUserDataDirs(DataDirs);
-    AppendUniqueDir(DataDirs, ExpandConstant('{%USERPROFILE}\.sayink'));
-    AppendUniqueDir(DataDirs, ExpandConstant('{%USERPROFILE}\.voiceink'));
-    if GetArrayLength(DataDirs) > 0 then
+    CollectScopedUserDataDirs(
+      ExpandConstant('{%USERPROFILE}'),
+      CurrentUserDirs,
+      OtherUserDirs
+    );
+    if GetArrayLength(CurrentUserDirs) > 0 then
     begin
       if SuppressibleMsgBox(
-        '是否删除用户配置、历史记录和模型数据？',
+        '是否删除当前用户的配置、历史记录和模型数据？' + #13#10#13#10 +
+        FormatDirList(CurrentUserDirs),
         mbConfirmation,
         MB_YESNO or MB_DEFBUTTON2,
         IDNO
       ) = IDYES then
       begin
-        for I := 0 to GetArrayLength(DataDirs) - 1 do
-          DelTree(DataDirs[I], True, True, True);
+        for I := 0 to GetArrayLength(CurrentUserDirs) - 1 do
+          SafeDeleteDataDir(CurrentUserDirs[I]);
         DeleteStoredApiCredentials();
+      end;
+    end;
+    if (GetArrayLength(OtherUserDirs) > 0) and (not UninstallSilent()) then
+    begin
+      if SuppressibleMsgBox(
+        '检测到此电脑上其他 Windows 账户也存有 SayInk / VoiceInk 数据：' + #13#10#13#10 +
+        FormatDirList(OtherUserDirs) + #13#10#13#10 +
+        '是否同时删除这些其他账户的数据？（共享电脑建议选择“否”）',
+        mbConfirmation,
+        MB_YESNO or MB_DEFBUTTON2,
+        IDNO
+      ) = IDYES then
+      begin
+        for I := 0 to GetArrayLength(OtherUserDirs) - 1 do
+          SafeDeleteDataDir(OtherUserDirs[I]);
       end;
     end;
   end;

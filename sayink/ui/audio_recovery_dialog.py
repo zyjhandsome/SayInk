@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 )
 
 from sayink.asr_correction import apply_glossary_variants
+from sayink.atomic_io import atomic_write_text
 from sayink.audio_recovery import recordings, delete_recording
 from sayink.audio_utils import TARGET_SAMPLE_RATE
 from sayink.speech_recognizer import (
@@ -500,7 +501,9 @@ class AudioRecoveryDialog(QDialog):
             target, _ = QFileDialog.getSaveFileName(self, "另存恢复文字", "恢复文字.txt", "Text (*.txt)")
         if target:
             try:
-                Path(target).write_text(self.output.toPlainText(), encoding="utf-8")
+                atomic_write_text(target, self.output.toPlainText(), encoding="utf-8")
+            except PermissionError as exc:
+                self.status.setText(f"目标文件可能正被占用，无法写入：{exc}")
             except OSError as exc:
                 self.status.setText(str(exc))
 

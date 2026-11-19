@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog, QFileDialog, QMessageBox, QPushButton
@@ -1009,14 +1007,15 @@ def test_export_failure_shows_error_message(qapp, monkeypatch, tmp_path):
     store = FakeHistoryStore()
     window = HistoryWindow(store)
     errors = []
+    target = tmp_path / "history.md"
+    target.write_text("existing-safe-content", encoding="utf-8")
     monkeypatch.setattr(
         QFileDialog,
         "getSaveFileName",
-        lambda *args, **kwargs: (str(tmp_path / "history.md"), "Markdown (*.md)"),
+        lambda *args, **kwargs: (str(target), "Markdown (*.md)"),
     )
     monkeypatch.setattr(
-        Path,
-        "write_text",
+        "sayink.ui.history_window.atomic_write_text",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
     )
     monkeypatch.setattr(
@@ -1029,6 +1028,7 @@ def test_export_failure_shows_error_message(qapp, monkeypatch, tmp_path):
 
     assert errors and "disk full" in errors[0][0]
     assert errors[0][1] == ["确定"]
+    assert target.read_text(encoding="utf-8") == "existing-safe-content"
 
 
 def test_clear_all_history_uses_store_enqueue_after_confirmation(qapp, monkeypatch):
@@ -1632,6 +1632,213 @@ def test_history_time_uses_when_the_person_spoke():
     saved_only = SegmentRecord("s", 1, 1_700_000_000_000, "乙")
     assert _segment_clock_ms(spoken) == 1_700_000_500_000
     assert _segment_clock_ms(saved_only) == 1_700_000_000_000
+
+
+def test_history_window_defers_responsive_switches_and_min_widths_during_live_resize(qapp):
+    import time
+    from PyQt6.QtCore import QTimer
+    from PyQt6.QtWidgets import QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
+    from sayink.ui import design_tokens as tok
+    from sayink.ui.flow_layout import set_live_resizing
+
+    class _Shell(QWidget):
+        sidebar_width = tok.SIDEBAR_WIDTH
+
+    store = FakeHistoryStore()
+    shell = _Shell()
+    lay = QVBoxLayout(shell)
+    lay.setContentsMargins(0, 0, 0, 0)
+    stack = QStackedWidget(shell)
+    stack.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+    history = HistoryWindow(store, stack)
+    stack.addWidget(history)
+    lay.addWidget(stack)
+
+    def wait_ms(ms: int) -> None:
+        done = False
+
+        def nonlocal_set() -> None:
+            nonlocal done
+            done = True
+
+        QTimer.singleShot(ms, nonlocal_set)
+
+        deadline = time.perf_counter() + (ms / 1000.0) + 1.0
+        while not done and time.perf_counter() < deadline:
+            qapp.processEvents()
+            time.sleep(0.002)
+        qapp.processEvents()
+
+    try:
+        shell.resize(960, 640)
+        shell.show()
+        qapp.processEvents()
+
+        assert history.is_compact_single_pane is False
+        assert history._left_pane.isVisible() and history._right_pane.isVisible()
+        assert history._left_pane.minimumWidth() == tok.WORKSPACE_LIST_MIN_WIDTH
+        assert history._right_pane.minimumWidth() == tok.WORKSPACE_DETAIL_MIN_WIDTH
+
+        # Begin live resize and drag across 880px and 680px compact thresholds, then pause >32ms.
+        set_live_resizing(shell, True)
+        for w in (860, 740, 620, 560):
+            shell.resize(w, 520)
+            qapp.processEvents()
+        wait_ms(70)
+
+        # Normal box stretching updates history.width(), while structural switches hold steady!
+        assert history.width() == 560
+        assert history.is_compact_single_pane is False
+        assert history._left_pane.isVisible() and history._right_pane.isVisible()
+        assert history._left_pane.minimumWidth() == tok.WORKSPACE_LIST_MIN_WIDTH
+        assert history._right_pane.minimumWidth() == tok.WORKSPACE_DETAIL_MIN_WIDTH
+
+        # Ending live resize flushes responsive single-pane state immediately.
+        set_live_resizing(shell, False)
+        assert history.is_compact_single_pane is True
+        assert history._left_pane.minimumWidth() == 180
+        assert history._right_pane.minimumWidth() == 180
+        assert history._left_pane.isVisible() and not history._right_pane.isVisible()
+
+        # Dragging back out to 960px also holds during drag and restores dual-pane on release.
+        set_live_resizing(shell, True)
+        shell.resize(960, 640)
+        qapp.processEvents()
+        wait_ms(65)
+        assert history.is_compact_single_pane is True
+
+        set_live_resizing(shell, False)
+        assert history.is_compact_single_pane is False
+        assert history._left_pane.isVisible() and history._right_pane.isVisible()
+        assert history._left_pane.minimumWidth() == tok.WORKSPACE_LIST_MIN_WIDTH
+    finally:
+        shell.close()
+
+
+def test_history_polish_and_inline_edit_verify_store_ticket_before_claiming_saved(qapp):
+    from PyQt6.QtCore import QObject, pyqtSignal
+
+    class FakePolisher(QObject):
+        polish_complete = pyqtSignal(str)
+        polish_error = pyqtSignal(str)
+
+        def polish(self, *_args, **_kwargs):
+            pass
+
+    class FakeConfig:
+        def get(self, key, default=None):
+            return {
+                "llm.api_url": "https://api.example.com/v1",
+                "llm.api_key": "sk-test",
+                "llm.model_name": "deepseek-chat",
+                "llm.mode": "polish",
+                "llm.enabled": True,
+            }.get(key, default)
+
+    store = FakeHistoryStore()
+    ticket_ok = False
+    next_ticket = 10
+
+    def tracked_update(session_id: str, polished_by_seq: dict[int, str]) -> int:
+        nonlocal next_ticket
+        next_ticket += 1
+        if ticket_ok:
+            FakeHistoryStore.enqueue_update_polished(store, session_id, polished_by_seq)
+        return next_ticket
+
+    store.enqueue_update_polished = tracked_update
+    store.flush_ticket = lambda _ticket, timeout=None: ticket_ok
+
+    polisher = FakePolisher()
+    window = HistoryWindow(store, config=FakeConfig(), polisher=polisher)
+    window.show()
+    try:
+        window._session_list.setCurrentItem(window.session_items()[1])
+        window._view_raw_btn.setChecked(True)
+        assert window._view_polished is False
+
+        # 1) Failed ticket on AI polish: must NOT claim saved or switch to polished view
+        window._polish_btn.click()
+        polisher.polish_complete.emit("润色结果但写库失败")
+        assert window._view_polished is False
+        assert "未能保存润色结果" in window._feedback_label.text()
+
+        # 2) Failed ticket on inline edit: editor stays open with typed draft intact
+        assert window.has_unsaved_inline_edit() is False
+        window._edit_btn.click()
+        assert window.has_unsaved_inline_edit() is False
+        window._details.setPlainText("手写重要修订")
+        assert window.has_unsaved_inline_edit() is True
+        window._edit_btn.click()
+        assert window._editing_session is True
+        assert window._details.toPlainText() == "手写重要修订"
+        assert "未能保存修改" in window._feedback_label.text()
+
+        # 3) Ticket succeeds on retry: commits and exits edit mode
+        ticket_ok = True
+        window._edit_btn.click()
+        assert window._editing_session is False
+        assert window.has_unsaved_inline_edit() is False
+        assert "手写重要修订" in window._details.toPlainText()
+    finally:
+        window.close()
+
+
+def test_failed_pending_merge_ticket_restores_original_sessions_and_aborts_followup(qapp):
+    from types import SimpleNamespace
+
+    store = FakeHistoryStore()
+    merge_ok = False
+    promoted: list[list[str]] = []
+
+    def tracked_merge(target_id: str, session_ids: list[str]) -> int:
+        if merge_ok:
+            FakeHistoryStore.enqueue_merge_sessions(store, target_id, session_ids)
+        return 7
+
+    store.enqueue_merge_sessions = tracked_merge
+    store.flush_ticket = lambda _ticket, timeout=None: merge_ok
+    store.create_meeting_from_sessions = lambda ids: promoted.append(list(ids)) or SimpleNamespace(id="m1")
+
+    window = HistoryWindow(store)
+    window.show()
+    try:
+        _merge_both(window)
+        # Attempt promote while merge write fails -> aborts promote and restores pending_merge snapshot
+        window._to_meeting_btn.click()
+        assert promoted == []
+        assert len(window._pending_merge) == 2
+        assert "未能完成合并" in window._feedback_label.text()
+        window._undo_pending_merge()
+        assert window.session_count() == 2
+    finally:
+        window.close()
+
+
+def test_history_deferred_sync_viewport_width_preserves_explicit_host_width(qapp):
+    from PyQt6.QtWidgets import QWidget
+    from sayink.ui.flow_layout import set_live_resizing
+
+    shell = QWidget()
+    store = FakeHistoryStore()
+    history = HistoryWindow(store, shell)
+    try:
+        shell.resize(960, 640)
+        history.resize(960, 640)
+        shell.show()
+        qapp.processEvents()
+        assert history.is_compact_single_pane is False
+
+        set_live_resizing(shell, True)
+        history.sync_viewport_width(520)
+        assert history.is_compact_single_pane is False
+
+        set_live_resizing(shell, False)
+        assert history.is_compact_single_pane is True
+    finally:
+        shell.close()
+
+
 
 
 

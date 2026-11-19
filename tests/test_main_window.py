@@ -1,8 +1,60 @@
 # tests/test_main_window.py
 import sys
 import pytest
+from PyQt6 import sip
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QCoreApplication, QEvent, QTimer, Qt
+
+
+_CREATED_WINDOWS: list[tuple[object, object, object]] = []
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_main_window_handles():
+    yield
+    from sayink.ui.main_window import MainWindow
+
+    app = QApplication.instance()
+    seen_wins: list[object] = []
+    for win, meeting, store in list(_CREATED_WINDOWS):
+        if meeting is not None and hasattr(meeting, "shutdown"):
+            try:
+                meeting.shutdown(wait_ms=0)
+            except Exception:
+                pass
+        if store is not None and hasattr(store, "close"):
+            try:
+                store.close()
+            except Exception:
+                pass
+        if win is not None and win not in seen_wins:
+            seen_wins.append(win)
+    _CREATED_WINDOWS.clear()
+
+    if app is not None:
+        for top in list(app.topLevelWidgets()):
+            if isinstance(top, MainWindow) and top not in seen_wins:
+                seen_wins.append(top)
+
+    for win in seen_wins:
+        if sip.isdeleted(win):
+            continue
+        meeting_attr = getattr(win, "_meeting", None)
+        if meeting_attr is not None and hasattr(meeting_attr, "shutdown"):
+            try:
+                meeting_attr.shutdown(wait_ms=0)
+            except Exception:
+                pass
+        for timer in win.findChildren(QTimer):
+            if not sip.isdeleted(timer):
+                timer.stop()
+        if hasattr(win, "_release_theme_brush"):
+            win._release_theme_brush()
+        win.hide()
+        win.deleteLater()
+
+    if seen_wins and app is not None:
+        QCoreApplication.sendPostedEvents(None, int(QEvent.Type.DeferredDelete.value))
 
 
 def _make_main_window(tmp_path, monkeypatch, *, with_meeting=False):
@@ -21,6 +73,7 @@ def _make_main_window(tmp_path, monkeypatch, *, with_meeting=False):
 
         meeting = MeetingController(config, store, pending_segments=lambda: 1)
     win = MainWindow(config, store, meeting=meeting)
+    _CREATED_WINDOWS.append((win, meeting, store))
     return win, store
 
 def _use_screen(monkeypatch, width, height):
@@ -417,14 +470,15 @@ def test_live_resize_keeps_the_round_mask_off(qapp, tmp_path, monkeypatch):
     try:
         win.show()
         QApplication.processEvents()
-        assert not win.mask().isEmpty()
+        expects_region = not win._dwm_round_corners
+        assert win.mask().isEmpty() is not expects_region
         win._live_resizing = True
         win.resize(win.width() + 20, win.height() + 20)
         QApplication.processEvents()
         assert win.mask().isEmpty()
         win._live_resizing = False
         win._apply_window_shape()
-        assert not win.mask().isEmpty()
+        assert win.mask().isEmpty() is not expects_region
     finally:
         win.close()
         store.close()
@@ -449,13 +503,15 @@ def test_caption_move_keeps_the_round_mask(qapp, tmp_path, monkeypatch):
     try:
         win.show()
         QApplication.processEvents()
-        assert not win.mask().isEmpty()
+        expects_region = not win._dwm_round_corners
+        assert win.mask().isEmpty() is not expects_region
         _post_native(win, _WM_ENTERSIZEMOVE)
         assert win._live_resizing is True
-        assert not win.mask().isEmpty()
+        # A title-bar move must not drop a region: that invalidates every pixel.
+        assert win.mask().isEmpty() is not expects_region
         _post_native(win, _WM_EXITSIZEMOVE)
         assert win._live_resizing is False
-        assert not win.mask().isEmpty()
+        assert win.mask().isEmpty() is not expects_region
         _post_native(win, _WM_ENTERSIZEMOVE)
         _post_native(win, _WM_SIZING)
         assert win.mask().isEmpty()
@@ -530,31 +586,43 @@ def test_maximized_client_rect_is_not_extended(qapp, tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Win32 client rect")
-@pytest.mark.parametrize(
-    ("edge", "alignment"),
-    [
-        (3, 0x0040 | 0x0020),  # top: bottom + left
-        (5, 0x0040 | 0x0020),  # top-right
-        (4, 0x0040 | 0x0080),  # top-left: bottom + right
-        (1, 0x0010 | 0x0080),  # left: top + right
-        (7, 0x0010 | 0x0080),  # bottom-left
-        (2, 0),  # right stays pinned to the top-left
-        (6, 0),
-        (8, 0),
-    ],
-)
-def test_live_edge_drag_keeps_existing_client_pixels(qapp, tmp_path, monkeypatch, edge, alignment):
+@pytest.mark.parametrize("edge", [1, 2, 3, 4, 5, 6, 7, 8])
+def test_live_edge_drag_keeps_existing_client_pixels_pinned_top_left(qapp, tmp_path, monkeypatch, edge):
     win, store = _make_main_window(tmp_path, monkeypatch)
     try:
+        win._live_resizing = True
         win._sizing_edge = edge
         msg, params = _nccalc_message(win, bottom=320, old_bottom=300)
         handled, result = win.nativeEvent(b"windows_generic_MSG", __import__("ctypes").addressof(msg))
         assert handled is True
-        assert result == alignment
-        # The resting one-pixel extension is off while a drag is in progress.
+        # Top-left alignment (0) across all 8 edges keeps the custom titlebar,
+        # left sidebar, and page headers pinned to (0, 0) instead of shifting
+        # them by (dx, dy) before QBackingStore flushes.
+        assert result == 0
+        # The resting one-pixel extension is off while an edge drag is in progress.
         assert params.rgrc[0].bottom == 320
         assert params.rgrc[1].bottom == 300
         assert params.rgrc[2].bottom == 0
+    finally:
+        win.close()
+        store.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 client rect")
+def test_caption_move_preserves_resting_bottom_nudge(qapp, tmp_path, monkeypatch):
+    """WM_ENTERSIZEMOVE without WM_SIZING (caption drag) must not toggle the 1px nudge."""
+    from sayink.ui.main_window import _WM_ENTERSIZEMOVE
+
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        _post_native(win, _WM_ENTERSIZEMOVE)
+        assert win._live_resizing is True
+        assert win._sizing_edge == 0
+        msg, params = _nccalc_message(win, bottom=300, old_bottom=300)
+        handled, result = win.nativeEvent(b"windows_generic_MSG", __import__("ctypes").addressof(msg))
+        assert handled is True
+        assert result == 0
+        assert params.rgrc[0].bottom == 301
     finally:
         win.close()
         store.close()
@@ -612,7 +680,8 @@ def test_size_grip_drag_does_not_swap_the_round_mask(qapp, tmp_path, monkeypatch
     try:
         win.show()
         qapp.processEvents()
-        assert not win.mask().isEmpty()
+        expects_region = not win._dwm_round_corners
+        assert win.mask().isEmpty() is not expects_region
         local = QPointF(8, 8)
         press = QMouseEvent(
             QEvent.Type.MouseButtonPress,
@@ -637,7 +706,7 @@ def test_size_grip_drag_does_not_swap_the_round_mask(qapp, tmp_path, monkeypatch
         )
         QApplication.sendEvent(win._size_grip, release)
         assert win._live_resizing is False
-        assert not win.mask().isEmpty()
+        assert win.mask().isEmpty() is not expects_region
     finally:
         win.close()
         store.close()
@@ -816,7 +885,61 @@ def test_window_is_built_hidden_and_stays_one_size_after_show(qapp, tmp_path, mo
         for _ in range(4):
             qapp.processEvents()
         assert (win.width(), win.height()) == size_before_show
-        assert not win.mask().isEmpty()
+        assert win.mask().isEmpty() == bool(win._dwm_round_corners)
+    finally:
+        win.close()
+        store.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 window region")
+def test_rounded_corners_do_not_eat_the_resize_handles(qapp, tmp_path, monkeypatch):
+    """The four corners must stay inside the window, or a drag there hits whatever is behind."""
+    import ctypes
+    from ctypes import wintypes
+
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        win.show()
+        qapp.processEvents()
+        if not win._dwm_round_corners:
+            pytest.skip("DWM rounded corners are unavailable")
+        assert win.mask().isEmpty()
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.WindowFromPoint.argtypes = [wintypes.POINT]
+        user32.WindowFromPoint.restype = wintypes.HWND
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+        ]
+        hwnd = int(win.winId())
+        user32.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+        qapp.processEvents()
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        points = (
+            (rect.left + 2, rect.top + 2),
+            (rect.right - 3, rect.top + 2),
+            (rect.left + 2, rect.bottom - 3),
+            (rect.right - 3, rect.bottom - 3),
+            (rect.left + 2, (rect.top + rect.bottom) // 2),
+            ((rect.left + rect.right) // 2, rect.bottom - 3),
+        )
+        try:
+            for x, y in points:
+                assert int(user32.WindowFromPoint(wintypes.POINT(x, y)) or 0) == hwnd
+        finally:
+            user32.SetWindowPos(hwnd, wintypes.HWND(-2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+        width, height = win.width(), win.height()
+        for point in (
+            (1, 1),
+            (width - 2, 1),
+            (1, height - 2),
+            (width - 2, height - 2),
+            (1, height // 2),
+            (width // 2, height - 2),
+        ):
+            assert win._hit_test(*point) not in (None, 1, 2)
     finally:
         win.close()
         store.close()
@@ -1205,3 +1328,257 @@ def test_post_meeting_tools_stay_on_one_row_at_minimum_window(qapp, tmp_path, mo
         win.close()
         controller.shutdown()
         store.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 erase during live resize")
+def test_erase_background_fills_exposed_strip_during_live_resize(qapp, tmp_path, monkeypatch):
+    """Outward edge drags must erase newly exposed strips with tok.BG instead of leaving black."""
+    import ctypes
+    from ctypes import wintypes
+    from PyQt6.QtGui import QColor
+    from sayink.ui import design_tokens as tok
+    from sayink.ui.main_window import _WMSZ_TOPRIGHT, _win32_draw
+
+    if qapp.platformName() != "windows":
+        pytest.skip("requires the native Windows Qt platform")
+
+    win = store = user32 = gdi32 = mem = bitmap = None
+    try:
+        tok.activate("dark")
+        win, store = _make_main_window(tmp_path, monkeypatch)
+        win.reapply_theme()
+        user32, gdi32, rect_type, byref = _win32_draw()
+        gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+        gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+        gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi32.SelectObject.restype = ctypes.c_void_p
+        gdi32.GetPixel.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        gdi32.GetPixel.restype = ctypes.c_uint
+        gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+        gdi32.DeleteDC.restype = ctypes.c_int
+
+        screen = user32.GetDC(0)
+        mem = gdi32.CreateCompatibleDC(screen)
+        bitmap = gdi32.CreateCompatibleBitmap(screen, 16, 16)
+        gdi32.SelectObject(mem, bitmap)
+        user32.ReleaseDC(0, screen)
+
+        black = gdi32.CreateSolidBrush(0x00000000)
+        user32.FillRect(mem, byref(rect_type(0, 0, 16, 16)), black)
+        gdi32.DeleteObject(black)
+        assert gdi32.GetPixel(mem, 4, 4) == 0x00000000
+
+        win._live_resizing = True
+        win._sizing_edge = _WMSZ_TOPRIGHT
+        msg = wintypes.MSG()
+        msg.hWnd = int(win.winId())
+        msg.message = 0x0014  # WM_ERASEBKGND
+        msg.wParam = int(mem)
+        handled, result = win.nativeEvent(b"windows_generic_MSG", ctypes.addressof(msg))
+        assert (handled, result) == (True, 1)
+
+        c = QColor(tok.BG)
+        expected = c.red() | (c.green() << 8) | (c.blue() << 16)
+        assert gdi32.GetPixel(mem, 4, 4) == expected
+    finally:
+        tok.activate("light")
+        if gdi32 is not None and mem:
+            gdi32.DeleteDC(mem)
+        if gdi32 is not None and bitmap:
+            gdi32.DeleteObject(bitmap)
+        if win is not None:
+            win._release_theme_brush()
+            win.close()
+        if store is not None:
+            store.close()
+
+
+def test_follow_resize_and_size_grip_release_flush_live_resize_callbacks(qapp, tmp_path, monkeypatch):
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QMouseEvent
+    from sayink.ui import flow_layout
+
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    flushed: list[object] = []
+    monkeypatch.setattr(flow_layout, "flush_live_resize", lambda w: flushed.append(w), raising=False)
+    try:
+        win.show()
+        qapp.processEvents()
+        flushed.clear()
+
+        local = QPointF(8, 8)
+        press = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            local,
+            local,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(win._size_grip, press)
+        assert win._live_resizing is True
+        win.resize(win.width() + 20, win.height() + 12)
+        assert getattr(win, "_resize_follow_timer", None) is not None
+        assert win._resize_follow_timer.isActive()
+        assert flushed == []
+
+        release = QMouseEvent(
+            QEvent.Type.MouseButtonRelease,
+            local,
+            local,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(win._size_grip, release)
+        assert win._live_resizing is False
+        assert flushed == [win]
+        assert not win._resize_follow_timer.isActive()
+    finally:
+        win.close()
+        store.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 live resize synchronization")
+def test_win32_live_resize_top_right_grow_and_shrink_syncs_surface_and_restores_nudge(qapp, tmp_path, monkeypatch):
+    """Real Win32 sizing sequence across TOPRIGHT grow & shrink must not shift chrome,
+    flash black, skip shrink WM_PAINT, or lose the 1px resting bottom nudge on exit.
+    """
+    import ctypes
+    from ctypes import wintypes
+    from sayink.ui import design_tokens as tok
+    from sayink.ui.main_window import _WMSZ_TOPRIGHT, _WM_ENTERSIZEMOVE, _WM_EXITSIZEMOVE, _WM_SIZING
+
+    if qapp.platformName() != "windows":
+        pytest.skip("requires the native Windows Qt platform")
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    user32.UpdateWindow.argtypes = [wintypes.HWND]
+    user32.UpdateWindow.restype = wintypes.BOOL
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetUpdateRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT), wintypes.BOOL]
+    user32.GetUpdateRect.restype = wintypes.BOOL
+
+    tok.activate("dark")
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    try:
+        win.reapply_theme()
+        win.move(200, 160)
+        win.resize(900, 600)
+        win.show()
+        for _ in range(6):
+            qapp.processEvents()
+
+        hwnd = int(win.winId())
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        swp_flags = 0x0004 | 0x0010  # SWP_NOZORDER | SWP_NOACTIVATE
+
+        user32.SendMessageW(hwnd, _WM_ENTERSIZEMOVE, 0, 0)
+        # 1) Outward TOPRIGHT step (+24w, +24h, top -24)
+        grow = wintypes.RECT(rect.left, rect.top - 24, rect.right + 24, rect.bottom)
+        user32.SendMessageW(hwnd, _WM_SIZING, _WMSZ_TOPRIGHT, ctypes.addressof(grow))
+        user32.SetWindowPos(hwnd, 0, grow.left, grow.top, grow.right - grow.left, grow.bottom - grow.top, swp_flags)
+        user32.UpdateWindow(hwnd)
+
+        # 2) Inward TOPRIGHT shrink step (-24w, -24h, top +24): must STILL mark an invalid
+        # rect despite SWP_NOCOPYBITS being cleared so UpdateWindow dispatches WM_PAINT!
+        shrink = wintypes.RECT(rect.left, rect.top, rect.right, rect.bottom)
+        user32.SendMessageW(hwnd, _WM_SIZING, _WMSZ_TOPRIGHT, ctypes.addressof(shrink))
+        user32.SetWindowPos(hwnd, 0, shrink.left, shrink.top, shrink.right - shrink.left, shrink.bottom - shrink.top, swp_flags)
+        upd = wintypes.RECT()
+        assert bool(user32.GetUpdateRect(hwnd, ctypes.byref(upd), False)) is True
+        user32.UpdateWindow(hwnd)
+        assert (win.width(), win.height()) == (900, 600)
+
+        user32.SendMessageW(hwnd, _WM_EXITSIZEMOVE, 0, 0)
+        qapp.processEvents()
+
+        wrect = wintypes.RECT()
+        crect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(wrect))
+        user32.GetClientRect(hwnd, ctypes.byref(crect))
+        assert crect.bottom - (wrect.bottom - wrect.top) == 1
+    finally:
+        tok.activate("light")
+        win.close()
+        store.close()
+
+
+def test_live_resize_clears_timers_on_hide_or_ungrab_and_dedupes_exit_follow(qapp, tmp_path, monkeypatch):
+    from PyQt6.QtCore import QEvent
+    from sayink.ui import flow_layout
+
+    win, store = _make_main_window(tmp_path, monkeypatch)
+    flushed: list[object] = []
+    orig_flush = flow_layout.flush_live_resize
+
+    def track_flush(w):
+        flushed.append(w)
+        orig_flush(w)
+
+    monkeypatch.setattr(flow_layout, "flush_live_resize", track_flush)
+    try:
+        win.show()
+        qapp.processEvents()
+        flushed.clear()
+
+        # 1) Hiding window mid-drag clears _live_resizing, stops both 32ms timers, and flushes callbacks
+        flow_layout.set_live_resizing(win, True)
+        flow_layout.defer_while_live_resize(win.history_panel, lambda: None)
+        win.resize(win.width() + 18, win.height() + 10)
+        assert win._live_resizing is True
+        assert win._resize_follow_timer.isActive()
+        assert win._live_resize_timer.isActive()
+
+        win._hide_window()
+        assert win._live_resizing is False
+        assert not win._resize_follow_timer.isActive()
+        assert not win._live_resize_timer.isActive()
+        assert win in flushed
+
+        # 2) UngrabMouse mid-drag also ends live resize cleanly
+        win.show()
+        qapp.processEvents()
+        flushed.clear()
+        flow_layout.set_live_resizing(win, True)
+        flow_layout.defer_while_live_resize(win.history_panel, lambda: None)
+        win.resize(win.width() + 12, win.height() + 8)
+        assert win._live_resizing is True
+        assert win._live_resize_timer.isActive()
+        QApplication.sendEvent(win, QEvent(QEvent.Type.UngrabMouse))
+        assert win._live_resizing is False
+        assert not win._resize_follow_timer.isActive()
+        assert not win._live_resize_timer.isActive()
+        assert win in flushed
+
+        # 3) If _restore_resting_nudge synchronously triggers _follow_resize, _end_live_resize
+        # does not invoke _follow_resize a second time.
+        follow_calls = 0
+        orig_follow = win._follow_resize
+
+        def counted_follow():
+            nonlocal follow_calls
+            follow_calls += 1
+            orig_follow()
+
+        monkeypatch.setattr(win, "_follow_resize", counted_follow)
+        monkeypatch.setattr(win, "_restore_resting_nudge", counted_follow)
+        win._live_resizing = True
+        win._nudge_suspended_for_resize = True
+        win._end_live_resize()
+        assert follow_calls == 1
+    finally:
+        win.close()
+        store.close()
+

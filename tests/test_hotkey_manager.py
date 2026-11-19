@@ -557,3 +557,7 @@ class TestHoldSurvivesUnrelatedKeys:
         assert mgr._hold_pending is True
         mgr._on_hold_timeout()
         assert started == [1]
+
+    def test_dead_unlocked_hotkey_still_held_helper_removed(self):
+        assert not hasattr(HotKeyManager, "_hotkey_still_held")
+        assert hasattr(HotKeyManager, "_hotkey_still_held_locked")

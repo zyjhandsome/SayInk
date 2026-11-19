@@ -26,6 +26,7 @@ from sayink.config import (
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_MEETING,
     Config as _ConfigRules,
+    format_hotkey,
 )
 from sayink.contracts import OutputPipelineSnapshot
 from sayink.history_store import SegmentRecord
@@ -50,6 +51,7 @@ log = logging.getLogger("SayInk")
 OUTPUT_WATCHDOG_MS = 45_000  # 流式润色可读更久；到点仍改出原文，避免后面的句子一直排队
 # A previous output older than this is no longer context for the next one.
 RECENT_OUTPUT_CONTEXT_S = 120.0
+HISTORY_FAILURE_WARN_COOLDOWN_S = 300.0
 
 # UI pacing (ms). Queued slices start on the next event-loop turn so a burst
 # of VAD cuts keeps spoken order; result toasts stay readable (a hint with a
@@ -168,6 +170,7 @@ _PIPELINE_CALLBACK_DEFAULTS: dict[str, Callable[..., Any]] = {
     "exit_started": _false,
     "hold_target": _zero_target,
     "clear_transcribing": _noop,
+    "on_watchdog_reset": _noop,
     "friendly_error": _identity_str,
     "copy_to_clipboard": pyperclip.copy,
     "now_monotonic": time.monotonic,
@@ -226,6 +229,7 @@ class OutputPipeline:
         self.dropped_slices: int = 0
         self.keep_unsaved_continuous_text: bool = False
         self.history_failure_notified: bool = False
+        self.last_history_failure_warn_at: float | None = None
         self.polish_error_failed: bool = False
 
     def _bind_callbacks(
@@ -389,6 +393,28 @@ class OutputPipeline:
         token = self.token
         self.schedule_later(self.watchdog_ms(), lambda: self.release_stuck_output(token))
 
+    def _cancel_polisher_on_watchdog(self) -> None:
+        cancel_rw = getattr(self.polisher, "cancel_rewrite", None)
+        if callable(cancel_rw):
+            cancel_rw()
+        cancel_fn = getattr(self.polisher, "cancel", None)
+        if callable(cancel_fn):
+            cancel_fn()
+
+    def _salvage_timed_out_stage_text(self, timed_out_polish: bool) -> None:
+        if self.stage_text.strip():
+            self.last_output_text = self.stage_text
+            self.last_output_at = float(self.now_monotonic())
+            try:
+                self.copy_to_clipboard(self.stage_text)
+            except Exception as exc:
+                log.warning("复制超时句子到剪贴板失败: %s", exc)
+            else:
+                self.floating.show_info("输出超时 · 已复制", "可按 Ctrl+V 粘贴")
+            return
+        if timed_out_polish:
+            self.floating.show_error("改写超时，原选区未改动")
+
     def release_stuck_output(self, token: int) -> None:
         if not self.busy or token != self.token:
             return
@@ -406,6 +432,9 @@ class OutputPipeline:
             if self.stage is OutputStage.PASTE and self.token == token:
                 self.mark_busy()
             return
+        timed_out_polish = self.stage is OutputStage.POLISH
+        if timed_out_polish:
+            self._cancel_polisher_on_watchdog()
         log.error("输出流程超时未回调，释放队列以免后续语音卡住")
         self.busy = False
         self.invalidated_token = self.token
@@ -414,17 +443,13 @@ class OutputPipeline:
         # The shortcut may still be waiting out its short delay. Sending it
         # after telling the user to paste by hand inserts the sentence twice.
         self.paster.cancel()
+        self.on_watchdog_reset()
+        if self.tray is not None:
+            self.tray.set_activity_tooltip(None)
         record = self.stage_record
         self.stage_record = None
-        if self.stage_text.strip():
-            # Ctrl+V may or may not have gone out; leave the words on the
-            # clipboard rather than risk pasting them twice.
-            try:
-                self.copy_to_clipboard(self.stage_text)
-            except Exception as exc:
-                log.warning("复制超时句子到剪贴板失败: %s", exc)
-            else:
-                self.floating.show_info("输出超时 · 已复制", "可按 Ctrl+V 粘贴")
+        self._salvage_timed_out_stage_text(timed_out_polish)
+        self.stage_text = ""
         if record is not None:
             # The paster's callback (which normally saves the row) is gone with
             # the cancel; the words are still worth keeping in history.
@@ -911,6 +936,35 @@ class OutputPipeline:
             refresh_ms=RESULT_TOAST_WITH_HINT_MS,
         )
 
+    def _history_saves_record(self, record: SegmentRecord | None) -> bool:
+        if record is None:
+            return False
+        if bool(getattr(self.history, "disabled", False)):
+            return False
+        if record.trigger_mode == TRIGGER_MODE_MEETING:
+            return True
+        return bool(self.config.get("history.enabled", True)) if self.config is not None else True
+
+    def _unsaved_last_output_hint(self) -> str:
+        if not self.last_output_text.strip():
+            return "本次转写未保存到历史，可重新转写"
+        raw_hk = (
+            str(self.config.get("audio.paste_last_hotkey", "") or "").strip()
+            if self.config is not None
+            else ""
+        )
+        if raw_hk:
+            return f"本次转写未保存到历史，已暂存为「上一句」，可按 {format_hotkey(raw_hk)} 重贴"
+        return "本次转写未保存到历史，已暂存为「上一句」，可在设置绑定重贴快捷键后重贴"
+
+    def _paste_error_message(self, record: SegmentRecord | None) -> str:
+        base = self.friendly_error("输出失败")
+        if self._history_saves_record(record):
+            return f"{base}\n本次转写已保存到历史，也可稍后重贴上一句"
+        if self.last_output_text.strip():
+            return f"{base}\n{self._unsaved_last_output_hint()}"
+        return base
+
     def _show_skipped_paste_feedback(
         self,
         *,
@@ -920,13 +974,18 @@ class OutputPipeline:
         polish_failed: bool,
         dropped_suffix: str,
     ) -> None:
-        reason = "剪贴板已变化" if error_detail == "clipboard_changed" else "无法核对剪贴板"
+        if error_detail == "clipboard_changed":
+            reason = "剪贴板已变化"
+        elif error_detail == "clipboard_unavailable":
+            reason = "无法核对剪贴板"
+        else:
+            reason = "已跳过剪贴板写入"
         title = f"{reason}，已取消自动粘贴"
         log.info("%s%s", title, f"（目标：{target_app}）" if target_app else "")
-        if record is not None and self.config.get("history.enabled", True) and not self.history.disabled:
+        if self._history_saves_record(record):
             hint = "本次转写可在历史中复制"
         else:
-            hint = "本次转写未保存到历史，可重新转写"
+            hint = self._unsaved_last_output_hint()
         if polish_failed:
             hint += " · 润色未生效（密钥/网络异常）"
         hint += dropped_suffix
@@ -1056,7 +1115,7 @@ class OutputPipeline:
                 dropped_suffix=dropped_suffix,
             )
             return
-        if status == "skipped" and error_detail in {"clipboard_changed", "clipboard_unavailable"}:
+        if status == "skipped":
             self._show_skipped_paste_feedback(
                 record=record,
                 error_detail=error_detail,
@@ -1065,7 +1124,7 @@ class OutputPipeline:
                 dropped_suffix=dropped_suffix,
             )
             return
-        if status == "clipboard":
+        if status in {"clipboard", "copied"}:
             self._show_clipboard_paste_feedback(
                 error_detail=error_detail,
                 target_app=target_app,
@@ -1077,7 +1136,7 @@ class OutputPipeline:
             )
             return
         log.error("输出失败: %s", error_detail)
-        self.floating.show_error(self.friendly_error("输出失败"))
+        self.floating.show_error(self._paste_error_message(record))
 
     def handle_paste_result(
         self,
@@ -1105,9 +1164,14 @@ class OutputPipeline:
         self.polish_error_failed = False
         self.busy = False
         self.stage = OutputStage.IDLE
+        sent_text = self.stage_text
         self.stage_text = ""
         self.stage_record = None
         status, target_app, error_detail = self._unpack_paste_result(result)
+        is_meeting_row = record is not None and record.trigger_mode == TRIGGER_MODE_MEETING
+        if not is_meeting_row and sent_text.strip() and status in {"skipped", "error", "failed"}:
+            self.last_output_text = sent_text
+            self.last_output_at = float(self.now_monotonic())
         dropped = self.dropped_slices
         self.dropped_slices = 0
         dropped_suffix = f" · 有 {dropped} 段未识别" if dropped else ""
@@ -1160,10 +1224,15 @@ class OutputPipeline:
         )
 
     def on_history_write_failed(self, message: str) -> None:
-        """One tray warning per run; the log keeps every failure."""
-        if self.history_failure_notified:
+        """Rate-limited tray warning so sustained DB write failures stay visible without spamming."""
+        now = float(self.now_monotonic())
+        if (
+            self.last_history_failure_warn_at is not None
+            and (now - self.last_history_failure_warn_at) < HISTORY_FAILURE_WARN_COOLDOWN_S
+        ):
             return
         self.history_failure_notified = True
+        self.last_history_failure_warn_at = now
         self.tray.showMessage(
             "SayInk", message, QSystemTrayIcon.MessageIcon.Warning, 8000
         )

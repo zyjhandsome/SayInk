@@ -619,7 +619,7 @@ def _probe_single_attempt(
             if adapted is not None and adapted[0] != token_parameter:
                 return "retry", "", downgrade, adapted[0]
             return "fail", http_status_message(code, err_body), downgrade, token_parameter
-        if not stream_showed_activity(response.iter_lines()):
+        if not stream_showed_activity(response.iter_lines(), total_timeout=15.0):
             return "fail", "API 返回空内容", downgrade, token_parameter
         return "ok", "连接成功", downgrade, token_parameter
 
@@ -670,7 +670,7 @@ def test_endpoint_connection(
                 if outcome == "fail":
                     return False, msg
         return False, "连接失败: 未收到响应"
-    except httpx.TimeoutException:
+    except (httpx.TimeoutException, TimeoutError):
         return False, "连接超时"
     except httpx.HTTPStatusError as exc:
         resp = getattr(exc, "response", None)

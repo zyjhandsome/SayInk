@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Sequence
@@ -191,6 +192,8 @@ class MinutesWorker(QThread):
         self._req = request
         self._cancelled = False
         self._cancellation = Cancellation()
+        self._checkpoint_lock = threading.Lock()
+        self._save_checkpoint = request.save_checkpoint
         self._preview_raw = ""
         self._preview_scan_pos = 0
         self._preview_anchor = ""
@@ -206,7 +209,9 @@ class MinutesWorker(QThread):
         self.transient_failure = False
 
     def cancel(self) -> None:
-        self._cancelled = True
+        with self._checkpoint_lock:
+            self._cancelled = True
+            self._save_checkpoint = None
         self._cancellation.cancel()
 
     # -- HTTP ------------------------------------------------------------
@@ -221,16 +226,22 @@ class MinutesWorker(QThread):
         return hashlib.sha256((system_prompt + "\0" + user_prompt).encode()).hexdigest()
 
     def _remember(self, system_prompt, user_prompt, raw):
-        if self._cancelled:
+        if self._cancelled or getattr(self._cancellation, "cancelled", False):
             raise LLMCancelled()
         key = self._step_key(system_prompt, user_prompt)
-        if self._req.save_checkpoint and key not in self._req.checkpoints:
-            try:
-                self._req.save_checkpoint(key, raw)
-            except Exception as exc:
-                # The answer is valid; only its resume point is lost. Keep it
-                # in memory and let the run finish instead of failing it.
-                log.warning("分段进度未能保存，本次结果仅保留在内存中: %s", exc)
+        with self._checkpoint_lock:
+            if self._cancelled or getattr(self._cancellation, "cancelled", False):
+                raise LLMCancelled()
+            saver = self._save_checkpoint
+            if saver is not None and key not in self._req.checkpoints:
+                try:
+                    saver(key, raw)
+                except Exception as exc:
+                    # The answer is valid; only its resume point is lost. Keep it
+                    # in memory and let the run finish instead of failing it.
+                    log.warning("分段进度未能保存，本次结果仅保留在内存中: %s", exc)
+            if self._cancelled or getattr(self._cancellation, "cancelled", False):
+                raise LLMCancelled()
         self._req.checkpoints[key] = raw
 
     def _reset_preview(self):

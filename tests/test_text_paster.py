@@ -608,3 +608,45 @@ class TestRememberedPasteTarget:
         # The remembered hwnd is not the later chat window, so no keys go there.
         assert paste_env["shortcut_calls"] == 0
         assert results[0].status == "clipboard"
+
+
+class TestClipboardCopyRetry:
+    def test_paste_async_retries_transient_clipboard_lock_three_times_before_succeeding(
+        self, paste_env, monkeypatch
+    ):
+        paste_env["set_foreground"]([(1234, "Editor", 4242)])
+        sleeps: list[float] = []
+        monkeypatch.setattr(tp.time, "sleep", sleeps.append)
+        attempts = {"n": 0}
+
+        def _flaky_copy(text: str) -> None:
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise RuntimeError("OpenClipboard temporarily locked")
+            paste_env["copied"].append(text)
+            paste_env["clipboard"] = text
+
+        monkeypatch.setattr(tp.pyperclip, "copy", _flaky_copy)
+        results = []
+        TextPaster().paste_async("重试后成功", results.append, target_hwnd=1234, target_app="Code.exe")
+        assert attempts["n"] == 3
+        assert len(sleeps) == 2
+        assert [r.status for r in results] == ["sent"]
+        assert paste_env["clipboard"] == "重试后成功"
+
+    def test_paste_async_reports_error_after_exhausting_three_clipboard_retries(
+        self, paste_env, monkeypatch
+    ):
+        paste_env["set_foreground"]([(1234, "Editor", 4242)])
+        monkeypatch.setattr(tp.time, "sleep", lambda _s: None)
+        attempts = {"n": 0}
+
+        def _always_fail(_text: str) -> None:
+            attempts["n"] += 1
+            raise RuntimeError("OpenClipboard permanently denied")
+
+        monkeypatch.setattr(tp.pyperclip, "copy", _always_fail)
+        results = []
+        TextPaster().paste_async("重试仍失败", results.append, target_hwnd=1234, target_app="Code.exe")
+        assert attempts["n"] == 3
+        assert [r.status for r in results] == ["error"]

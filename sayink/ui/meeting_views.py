@@ -29,6 +29,7 @@ from sayink.meeting_store import STATUS_ENDED, STATUS_INTERRUPTED, STATUS_LIVE, 
 from sayink.minutes_prompts import format_timestamp
 from sayink.media_import import MEDIA_SOURCE
 from sayink.transcript_import import IMPORT_SOURCE
+from sayink.ui.flow_layout import defer_while_live_resize
 from sayink.ui.meeting_dialogs import _SegmentSpeakerDialog, _SegmentTextDialog
 from sayink.ui.reading import fit_reading_width
 
@@ -783,6 +784,14 @@ class _TranscriptView(_ReadingView):
             self._schedule_blank_repair()
         self._apply_pending_scroll()
 
+    def _restart_block_layout(self) -> None:
+        self._laid_out_viewport_width = self.viewport().width()
+        if not self.document().blockCount():
+            return
+        self._repair_scheduled = False
+        self._next_layout_block_num = 0
+        self._layout_timer.start(0)
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         width = self.viewport().width()
@@ -794,10 +803,12 @@ class _TranscriptView(_ReadingView):
             and width != self._laid_out_viewport_width
             and self.document().blockCount()
         ):
-            self._repair_scheduled = False
-            self._next_layout_block_num = 0
-            self._layout_timer.start(0)
-        self._laid_out_viewport_width = width
+            self._layout_timer.stop()
+            if not defer_while_live_resize(self, self._restart_block_layout):
+                self._restart_block_layout()
+            return
+        if not self._laid_out_viewport_width:
+            self._laid_out_viewport_width = width
 
     def flush_layout(self) -> None:
         """Finish any pending batches before a scroll target is applied."""
@@ -1342,7 +1353,8 @@ class _CurrentPageStack(QStackedWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if event.oldSize().width() != event.size().width():
-            self.sync_height()
+            if not defer_while_live_resize(self, self.sync_height):
+                self.sync_height()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -1350,7 +1362,8 @@ class _CurrentPageStack(QStackedWidget):
 
     def event(self, event: QEvent) -> bool:
         if event.type() == QEvent.Type.LayoutRequest:
-            self.sync_height()
+            if not defer_while_live_resize(self, self.sync_height):
+                self.sync_height()
         return super().event(event)
 
 

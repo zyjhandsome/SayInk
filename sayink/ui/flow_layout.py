@@ -1,31 +1,227 @@
 """Left-to-right layout that wraps onto new rows instead of clipping."""
 
+from __future__ import annotations
+
+import weakref
+from collections.abc import Callable
+
 from PyQt6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer
-from PyQt6.QtWidgets import QLayout, QLayoutItem, QSizePolicy, QWidget
+from PyQt6.QtWidgets import QApplication, QLayout, QLayoutItem, QSizePolicy, QWidget
+
+LIVE_RESIZE_POLL_MS = 32
 
 
-def defer_while_live_resize(widget: QWidget, callback) -> bool:
-    """Hold a layout follow-up until an edge drag pauses.
-
-    Changing a size hint on every pixel makes Qt pull the window back while
-    Windows is still moving it. The corner and edge shake is that fight.
-    """
-    if not getattr(widget.window(), "_live_resizing", False):
+def is_live_resizing(widget: QWidget | None) -> bool:
+    """Return True while the widget's top-level window is in an interactive resize drag."""
+    if widget is None:
         return False
-    timer = getattr(widget, "_live_resize_timer", None)
+    from PyQt6 import sip
+
+    if sip.isdeleted(widget):
+        return False
+    win = widget.window()
+    if win is None or sip.isdeleted(win):
+        return False
+    return bool(getattr(win, "_live_resizing", False))
+
+
+def cancel_live_resize(widget: QWidget | None, callback: Callable[[], object] | None = None) -> None:
+    """Clear one or all pending live-resize callbacks queued on ``widget``."""
+    if widget is None:
+        return
+    from PyQt6 import sip
+
+    if sip.isdeleted(widget):
+        return
+    callbacks: list[Callable[[], object]] | None = getattr(widget, "_live_resize_callbacks", None)
+    if not callbacks:
+        return
+    if callback is None:
+        callbacks.clear()
+    elif callback in callbacks:
+        callbacks.remove(callback)
+
+
+def _widget_depth(widget: QWidget) -> int:
+    depth = 0
+    cur = widget.parentWidget()
+    while cur is not None:
+        depth += 1
+        cur = cur.parentWidget()
+    return depth
+
+
+def _is_within_subtree(widget: QWidget, root: QWidget) -> bool:
+    cur: QWidget | None = widget
+    while cur is not None:
+        if cur is root:
+            return True
+        cur = cur.parentWidget()
+    return False
+
+
+def flush_live_resize(root: QWidget | None) -> int:
+    """Flush deferred live-resize callbacks under ``root`` once live resize has ended."""
+    if root is None:
+        return 0
+    from PyQt6 import sip
+
+    if sip.isdeleted(root) or is_live_resizing(root):
+        return 0
+    win = root.window() or root
+    if sip.isdeleted(win):
+        return 0
+
+    pending_map: dict[int, weakref.ReferenceType[QWidget]] = dict(
+        getattr(win, "_live_resize_pending_widgets", None) or {}
+    )
+    if getattr(root, "_live_resize_callbacks", None):
+        pending_map.setdefault(id(root), weakref.ref(root))
+    if not pending_map:
+        timer = getattr(win, "_live_resize_timer", None)
+        if timer is not None and not sip.isdeleted(timer):
+            timer.stop()
+        return 0
+
+    keep_map: dict[int, weakref.ReferenceType[QWidget]] = {}
+    targets: list[QWidget] = []
+    for wid, ref in pending_map.items():
+        w = ref()
+        if w is None or sip.isdeleted(w):
+            continue
+        cbs = getattr(w, "_live_resize_callbacks", None)
+        if not cbs:
+            continue
+        if _is_within_subtree(w, root):
+            targets.append(w)
+        else:
+            keep_map[wid] = ref
+
+    win._live_resize_pending_widgets = keep_map
+    if not keep_map:
+        timer = getattr(win, "_live_resize_timer", None)
+        if timer is not None and not sip.isdeleted(timer):
+            timer.stop()
+    if not targets:
+        return 0
+
+    tiers: dict[int, list[QWidget]] = {}
+    for w in targets:
+        tiers.setdefault(_widget_depth(w), []).append(w)
+
+    app = QApplication.instance()
+    if app is not None:
+        QApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)
+    ran = 0
+    sorted_depths = sorted(tiers)
+    for idx, depth in enumerate(sorted_depths):
+        tier_ran = 0
+        for w in tiers[depth]:
+            if sip.isdeleted(w):
+                continue
+            callbacks = list(getattr(w, "_live_resize_callbacks", ()) or ())
+            w._live_resize_callbacks = []
+            for cb in callbacks:
+                if not sip.isdeleted(w):
+                    cb()
+                    ran += 1
+                    tier_ran += 1
+        if tier_ran and app is not None and idx + 1 < len(sorted_depths):
+            QApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)
+
+    if ran and app is not None:
+        QApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)
+    return ran
+
+
+def set_live_resizing(window: QWidget | None, active: bool) -> None:
+    """Set live-resize state on ``window`` and immediately flush deferred updates on end."""
+    if window is None:
+        return
+    from PyQt6 import sip
+
+    if sip.isdeleted(window):
+        return
+    win = window.window() or window
+    if sip.isdeleted(win):
+        return
+    win._live_resizing = bool(active)
+    if not active:
+        flush_live_resize(win)
+        timer = getattr(win, "_live_resize_timer", None)
+        if timer is not None and not sip.isdeleted(timer):
+            timer.stop()
+
+
+def _on_window_live_resize_timer(weak_win: weakref.ReferenceType[QWidget]) -> None:
+    from PyQt6 import sip
+
+    win = weak_win()
+    if win is None or sip.isdeleted(win):
+        return
+    pending_map: dict[int, weakref.ReferenceType[QWidget]] | None = getattr(
+        win, "_live_resize_pending_widgets", None
+    )
+    if not pending_map:
+        return
+    if bool(getattr(win, "_live_resizing", False)):
+        # Still inside an active drag (e.g. >32ms mouse pause): keep holding!
+        timer = getattr(win, "_live_resize_timer", None)
+        if timer is not None and not sip.isdeleted(timer):
+            timer.start(LIVE_RESIZE_POLL_MS)
+        return
+    flush_live_resize(win)
+
+
+def defer_while_live_resize(widget: QWidget, callback: Callable[[], object]) -> bool:
+    """Hold a structural layout follow-up until an interactive edge drag ends.
+
+    Changing a size hint or pane minimum width on every pixel makes Qt pull
+    the window back while Windows is still moving it, and firing a short timer
+    during a mid-drag mouse pause jumps the layout under the cursor.
+    """
+    if not is_live_resizing(widget):
+        cancel_live_resize(widget, callback)
+        return False
+    callbacks: list[Callable[[], object]] | None = getattr(widget, "_live_resize_callbacks", None)
+    if callbacks is None:
+        callbacks = [callback]
+        widget._live_resize_callbacks = callbacks
+    elif callback not in callbacks:
+        callbacks.append(callback)
+
+    win = widget.window() or widget
+    pending: dict[int, weakref.ReferenceType[QWidget]] | None = getattr(
+        win, "_live_resize_pending_widgets", None
+    )
+    if pending is None:
+        pending = {}
+        win._live_resize_pending_widgets = pending
+    wid = id(widget)
+    existing = pending.get(wid)
+    if existing is None or existing() is not widget:
+        pending[wid] = weakref.ref(widget)
+
+    timer = getattr(win, "_live_resize_timer", None)
     if timer is None:
-        timer = QTimer(widget)
+        timer = QTimer(win)
         timer.setSingleShot(True)
-        timer.timeout.connect(callback)
-        widget._live_resize_timer = timer
-    timer.start(32)
+        weak_win = weakref.ref(win)
+        timer.timeout.connect(lambda _w=weak_win: _on_window_live_resize_timer(_w))
+        win._live_resize_timer = timer
+    if not timer.isActive():
+        timer.start(LIVE_RESIZE_POLL_MS)
     return True
+
+
+defer_resize = defer_while_live_resize
 
 
 class FlowLayout(QLayout):
     def __init__(self, parent: QWidget | None = None, spacing: int = 6, *, margin: int = -1) -> None:
         super().__init__(parent)
         self._items: list[QLayoutItem] = []
+        self._last_height = 0
         if margin >= 0:
             self.setContentsMargins(margin, margin, margin, margin)
         self.setSpacing(spacing)
@@ -49,11 +245,32 @@ class FlowLayout(QLayout):
         return True
 
     def heightForWidth(self, width: int) -> int:
+        parent = self.parentWidget()
+        if self._last_height > 0 and is_live_resizing(parent) and parent is not None:
+            defer_while_live_resize(parent, self._flush_live_resize)
+            return self._last_height
         return self._arrange(QRect(0, 0, width, 0), apply=False)
 
     def setGeometry(self, rect: QRect) -> None:
         super().setGeometry(rect)
-        self._arrange(rect, apply=True)
+        parent = self.parentWidget()
+        if self._last_height > 0 and is_live_resizing(parent) and parent is not None:
+            defer_while_live_resize(parent, self._flush_live_resize)
+            return
+        self._last_height = self._arrange(rect, apply=True)
+
+    def _flush_live_resize(self) -> None:
+        from PyQt6 import sip
+
+        if sip.isdeleted(self):
+            return
+        rect = self.geometry()
+        if rect.width() > 0:
+            self._last_height = self._arrange(rect, apply=True)
+        self.invalidate()
+        parent = self.parentWidget()
+        if parent is not None and not sip.isdeleted(parent):
+            parent.updateGeometry()
 
     def sizeHint(self) -> QSize:
         return self.minimumSize()
@@ -166,6 +383,8 @@ class WrappingToolBar(QWidget):
         if sip.isdeleted(self):
             return
         self._pending = False
+        if defer_while_live_resize(self, self._flush):
+            return
         self.updateGeometry()
         if self.isVisible() or self.width() > 0:
             self._sync_height()
@@ -386,6 +605,8 @@ class PairedToolBar(QWidget):
         if sip.isdeleted(self):
             return
         self._pending = False
+        if defer_while_live_resize(self, self._flush):
+            return
         self.updateGeometry()
         if self.isVisible() or self.width() > 0:
             self._sync_height()

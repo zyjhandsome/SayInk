@@ -108,6 +108,35 @@ class MeetingImportController:
             return "已导入音视频。可先核对文字稿，或切换到「纪要」点击「生成纪要」。"
         return "已导入文字稿。确认内容后，可切换到「纪要」点击「生成纪要」。"
 
+    def _commit_transcript_payload(
+        self,
+        text: str,
+        title: str,
+        detect: bool,
+        started: int | None,
+        preparsed: Any,
+    ) -> Any:
+        h = self._host
+        try:
+            return h._ctrl.import_transcript(
+                text,
+                title=title,
+                detect_structure=detect,
+                started_at=started,
+                parsed=preparsed,
+            )
+        except TypeError:
+            return h._ctrl.import_transcript(
+                text,
+                title=title,
+                detect_structure=detect,
+                started_at=started,
+            )
+
+    def _transcript_commit_error(self) -> str:
+        notice = str(getattr(self._host._ctrl, "transcript_import_notice", "") or "").strip()
+        return notice or "无法写入数据库，请重试；框内文字已保留。"
+
     def ask_import(self) -> tuple[Any, ...] | None:
         from sayink.ui.transcript_import_dialog import TranscriptImportDialog
 
@@ -125,28 +154,67 @@ class MeetingImportController:
             dialog.parsed(),
         )
 
-    def import_transcript(self) -> None:
+    def _import_transcript_via_hook(self) -> None:
         h = self._host
-        if h._ctrl.is_active:
-            h._set_status("会议进行中，请结束后再导入文字稿")
-            return
         asked = h._ask_import()
         if not asked:
             return
         text, title, detect = asked[:3]
         started = asked[3] if len(asked) > 3 else None
         preparsed = asked[4] if len(asked) > 4 else None
-        try:
-            record = h._ctrl.import_transcript(
-                text, title=title, detect_structure=detect, started_at=started, parsed=preparsed
-            )
-        except TypeError:
-            record = h._ctrl.import_transcript(
-                text, title=title, detect_structure=detect, started_at=started
+        record = self._commit_transcript_payload(text, title, detect, started, preparsed)
+        if record is None:
+            h._unsaved_transcript_draft = (text, title, detect, started)
+            h._set_status(getattr(h._ctrl, "transcript_import_notice", "") or "没有可导入的文字", tone="error")
+            return
+        h._unsaved_transcript_draft = None
+        h.show_meeting(record.id)
+        h._set_status(self.imported_status_message(record.id, "文字稿"))
+
+    def import_transcript(self) -> None:
+        from sayink.ui.transcript_import_dialog import TranscriptImportDialog
+
+        h = self._host
+        if h._ctrl.is_active:
+            h._set_status("会议进行中，请结束后再导入文字稿")
+            return
+        if "_ask_import" in h.__dict__:
+            self._import_transcript_via_hook()
+            return
+        dialog = TranscriptImportDialog(
+            h,
+            commit_fn=self._commit_transcript_payload,
+            commit_error_fn=self._transcript_commit_error,
+        )
+        draft = getattr(h, "_unsaved_transcript_draft", None)
+        if isinstance(draft, tuple) and len(draft) >= 3 and str(draft[0]).strip():
+            dialog._edit.setPlainText(str(draft[0]))
+            if str(draft[1]).strip():
+                dialog._title.setText(str(draft[1]))
+            dialog._detect.setChecked(bool(draft[2]))
+        with _quiet_tooltips(h):
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if not accepted:
+            return
+        record = dialog.committed_record()
+        if record is None:
+            record = self._commit_transcript_payload(
+                dialog.transcript_text(),
+                dialog.meeting_title(),
+                dialog.detect_structure(),
+                dialog.meeting_started_ms(),
+                dialog.parsed(),
             )
         if record is None:
-            h._set_status(getattr(h._ctrl, "transcript_import_notice", "") or "没有可导入的文字")
+            h._unsaved_transcript_draft = (
+                dialog.transcript_text(),
+                dialog.meeting_title(),
+                dialog.detect_structure(),
+                dialog.meeting_started_ms(),
+            )
+            h._set_status(getattr(h._ctrl, "transcript_import_notice", "") or "没有可导入的文字", tone="error")
             return
+        h._unsaved_transcript_draft = None
         h.show_meeting(record.id)
         h._set_status(self.imported_status_message(record.id, "文字稿"))
 
@@ -222,6 +290,66 @@ class MeetingImportController:
             h._import_kicker.hide()
             h._import_filename.hide()
 
+    def _has_unsaved_media(self) -> bool:
+        return bool(getattr(self._host._ctrl, "_unsaved_media", None))
+
+    def _unsaved_media_title(self) -> str:
+        fn = getattr(self._host._ctrl, "unsaved_media_title", None)
+        if callable(fn):
+            return str(fn() or "").strip()
+        raw = getattr(self._host._ctrl, "_unsaved_media", None)
+        if isinstance(raw, tuple) and len(raw) >= 2:
+            return str(raw[1] or "").strip()
+        return str(getattr(raw, "title", "") or "").strip()
+
+    def _has_unsaved_finalize(self) -> bool:
+        fn = getattr(self._host._ctrl, "has_unsaved_finalize", None)
+        return bool(fn()) if callable(fn) else False
+
+    def _unsaved_finalize_title(self) -> str:
+        fn = getattr(self._host._ctrl, "unsaved_finalize_title", None)
+        return str(fn() or "").strip() if callable(fn) else ""
+
+    def _sync_unsaved_media_buttons(self, *, busy: bool, browsing: bool) -> None:
+        h = self._host
+        show_media = browsing and not busy and self._has_unsaved_media()
+        media_title = self._unsaved_media_title() if show_media else ""
+        short_media = (media_title[:16] + "…") if len(media_title) > 17 else media_title
+        h._media_retry_btn.setText(f"重试保存（{short_media}）" if short_media else "重试保存")
+        h._media_retry_btn.setToolTip(
+            f"「{media_title}」上次识别的文字还在，再写入一次数据库"
+            if media_title
+            else "上次识别的文字还在，再写入一次数据库"
+        )
+        h._media_retry_btn.setVisible(show_media)
+        if hasattr(h, "_media_discard_btn"):
+            h._media_discard_btn.setVisible(show_media)
+
+    def _sync_unsaved_finalize_buttons(self, *, busy: bool, browsing: bool) -> None:
+        h = self._host
+        active = bool(getattr(h._ctrl, "is_active", False))
+        show_fin = browsing and not busy and not active and self._has_unsaved_finalize()
+        fin_title = self._unsaved_finalize_title() if show_fin else ""
+        if hasattr(h, "_finalize_retry_btn"):
+            h._finalize_retry_btn.setText("重试保存结束状态")
+            h._finalize_retry_btn.setToolTip(
+                f"「{fin_title}」结束状态尚未保存，点击重试写入数据库"
+                if fin_title
+                else "刚才结束的会议尚未保存终态，点击重试写入数据库"
+            )
+            h._finalize_retry_btn.setVisible(show_fin)
+        if hasattr(h, "_finalize_discard_btn"):
+            h._finalize_discard_btn.setToolTip(
+                f"放弃「{fin_title}」未保存的结束状态更新"
+                if fin_title
+                else "放弃未保存的会议结束状态更新"
+            )
+            h._finalize_discard_btn.setVisible(show_fin)
+
+    def _sync_unsaved_recovery_buttons(self, *, busy: bool, browsing: bool) -> None:
+        self._sync_unsaved_media_buttons(busy=busy, browsing=browsing)
+        self._sync_unsaved_finalize_buttons(busy=busy, browsing=browsing)
+
     def _sync_retry_and_cancel_buttons(
         self,
         *,
@@ -238,9 +366,7 @@ class MeetingImportController:
         h._media_cancel_btn.setToolTip(stop_tip)
         if not busy:
             h._media_cancel_pending = False
-        h._media_retry_btn.setVisible(
-            browsing and not busy and bool(getattr(h._ctrl, "_unsaved_media", None))
-        )
+        self._sync_unsaved_recovery_buttons(busy=busy, browsing=browsing)
         failed_path = getattr(h, "_failed_media_path", "") or ""
         h._media_again_btn.setVisible(
             browsing and not busy and bool(failed_path) and Path(failed_path).is_file()
@@ -293,7 +419,7 @@ class MeetingImportController:
         from sayink.ui import meeting_page as mp
 
         h = self._host
-        if not getattr(h._ctrl, "importing_media", False):
+        if self._has_unsaved_media() or not getattr(h._ctrl, "importing_media", False):
             reason = h._ctrl.media_block_reason()
             if reason:
                 h._set_status(reason, tone="error")
@@ -335,7 +461,7 @@ class MeetingImportController:
     @staticmethod
     def _build_start_kwargs(path: Path, title: str, opts: dict[str, Any]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"title": title or path.stem}
-        for key in ("language", "model_id", "started_at"):
+        for key in ("language", "model_id", "started_at", "auto_generate"):
             if opts and key in opts and opts[key] not in ("", None):
                 kwargs[key] = opts[key]
         return kwargs
@@ -658,6 +784,112 @@ class MeetingImportController:
         if message:
             h._set_status(message, tone="error")
 
+    def discard_unsaved_media(self) -> None:
+        from sayink.ui import meeting_page as mp
+
+        h = self._host
+        if not self._has_unsaved_media():
+            self.sync_media_buttons()
+            return
+        title = self._unsaved_media_title()
+        box = mp.QMessageBox(h)
+        box.setWindowTitle("放弃未保存结果")
+        box.setIcon(mp.QMessageBox.Icon.Warning)
+        box.setText(
+            f"放弃「{title}」尚未保存的导入识别结果？"
+            if title
+            else "放弃尚未保存的导入识别结果？"
+        )
+        box.setInformativeText("放弃后本次已识别的文字将被清除，后续若仍需要须重新识别音视频文件。")
+        stay = box.addButton("保留并稍后重试", QMessageBox.ButtonRole.RejectRole)
+        discard = box.addButton("放弃未保存结果", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(stay)
+        box.setEscapeButton(stay)
+        _style_dialog_box(box, danger_btn=discard)
+        with _quiet_tooltips(h):
+            box.exec()
+        if box.clickedButton() is not discard:
+            return
+        discard_fn = getattr(h._ctrl, "discard_unsaved_media", None)
+        if callable(discard_fn):
+            ok = bool(discard_fn())
+        else:
+            h._ctrl._unsaved_media = None
+            ok = True
+        self.sync_media_buttons()
+        h.refresh()
+        if ok:
+            h._set_status("已放弃未保存的导入结果。")
+
+    def on_finalize_save_failed(self, meeting_id: str, message: str) -> None:
+        from sayink.ui import meeting_page as mp
+
+        h = self._host
+        if h._stack.currentIndex() == mp.PAGE_LIVE:
+            h._show_ended_meeting(meeting_id)
+        else:
+            h.refresh()
+        self.sync_media_buttons()
+        h._set_status(
+            message or "会议结束状态未能写入数据库，可点击「重试保存结束状态」。",
+            tone="error",
+        )
+
+    def retry_finalize_save(self) -> None:
+        h = self._host
+        if not self._has_unsaved_finalize():
+            self.sync_media_buttons()
+            return
+        retry_fn = getattr(h._ctrl, "retry_finalize_save", None)
+        if not callable(retry_fn):
+            return
+        res = retry_fn()
+        still_unsaved = self._has_unsaved_finalize()
+        self.sync_media_buttons()
+        if still_unsaved:
+            err = res.strip() if isinstance(res, str) and res.strip() else "会议结束状态仍未保存，请稍后重试。"
+            h._set_status(err, tone="error")
+            return
+        mid = res.strip() if isinstance(res, str) else ""
+        if mid and h._store.get_meeting(mid) is not None:
+            h.show_meeting(mid)
+        else:
+            h.refresh()
+        h._set_status("已保存会议结束状态。", tone="ok")
+
+    def discard_unsaved_finalize(self) -> None:
+        from sayink.ui import meeting_page as mp
+
+        h = self._host
+        if not self._has_unsaved_finalize():
+            self.sync_media_buttons()
+            return
+        title = self._unsaved_finalize_title()
+        box = mp.QMessageBox(h)
+        box.setWindowTitle("放弃未保存的结束状态")
+        box.setIcon(mp.QMessageBox.Icon.Warning)
+        box.setText(
+            f"放弃「{title}」尚未保存的会议结束状态？"
+            if title
+            else "放弃尚未保存的会议结束状态？"
+        )
+        box.setInformativeText("已落盘的会议文字稿仍会保留在列表中，但本次结束时间与说话人整理将不再重试写入。")
+        stay = box.addButton("保留并稍后重试", QMessageBox.ButtonRole.RejectRole)
+        discard = box.addButton("放弃", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(stay)
+        box.setEscapeButton(stay)
+        _style_dialog_box(box, danger_btn=discard)
+        with _quiet_tooltips(h):
+            box.exec()
+        if box.clickedButton() is not discard:
+            return
+        discard_fn = getattr(h._ctrl, "discard_unsaved_finalize", None)
+        ok = bool(discard_fn()) if callable(discard_fn) else False
+        self.sync_media_buttons()
+        h.refresh()
+        if ok:
+            h._set_status("已放弃未保存的会议结束状态。")
+
     def retry_failed_media(self) -> None:
         h = self._host
         path = h._failed_media_path
@@ -666,8 +898,16 @@ class MeetingImportController:
             self.sync_media_buttons()
             h._set_status("找不到刚才的文件，无法重新导入。", tone="error")
             return
+        if self._has_unsaved_media() or not getattr(h._ctrl, "importing_media", False):
+            reason = h._ctrl.media_block_reason()
+            if reason:
+                h._set_status(reason, tone="error")
+                return
         h._failed_media_path = ""
-        self.begin_media_paths([Path(path)])
+        err = self.begin_media_paths([Path(path)])
+        if err:
+            h._failed_media_path = path
+            self.sync_media_buttons()
 
     def on_media_failed(self, message: str) -> None:
         h = self._host
@@ -748,6 +988,12 @@ class MeetingImportController:
 
     def _accept_dropped_media(self, media: list[Path], ignored: int) -> None:
         h = self._host
+        if self._has_unsaved_media() or not getattr(h._ctrl, "importing_media", False):
+            reason = h._ctrl.media_block_reason()
+            if reason:
+                msg = f"{reason} 已忽略 {ignored} 个不是音视频的文件。" if ignored else reason
+                h._set_status(msg, tone="error")
+                return
         if h.isVisible():
             accepted, error = h._confirm_and_begin_media_paths(media)
             if not accepted:
@@ -785,7 +1031,11 @@ class MeetingImportController:
         if h._ctrl.is_active:
             h._set_status("会议进行中，请结束后再导入文字稿")
             return
-        dialog = TranscriptImportDialog(h)
+        dialog = TranscriptImportDialog(
+            h,
+            commit_fn=self._commit_transcript_payload,
+            commit_error_fn=self._transcript_commit_error,
+        )
         loaded = dialog._load_file_path(path)
         if loaded and ignored:
             dialog._extra_note = f"一次只能导入一个文件，已忽略其余 {ignored} 个。"
@@ -794,24 +1044,25 @@ class MeetingImportController:
             accepted = dialog.exec() == QDialog.DialogCode.Accepted
         if not accepted:
             return
-        try:
-            record = h._ctrl.import_transcript(
+        record = dialog.committed_record()
+        if record is None:
+            record = self._commit_transcript_payload(
                 dialog.transcript_text(),
-                title=dialog.meeting_title(),
-                detect_structure=dialog.detect_structure(),
-                started_at=dialog.meeting_started_ms(),
-                parsed=dialog.parsed(),
-            )
-        except TypeError:
-            record = h._ctrl.import_transcript(
-                dialog.transcript_text(),
-                title=dialog.meeting_title(),
-                detect_structure=dialog.detect_structure(),
-                started_at=dialog.meeting_started_ms(),
+                dialog.meeting_title(),
+                dialog.detect_structure(),
+                dialog.meeting_started_ms(),
+                dialog.parsed(),
             )
         if record is None:
+            h._unsaved_transcript_draft = (
+                dialog.transcript_text(),
+                dialog.meeting_title(),
+                dialog.detect_structure(),
+                dialog.meeting_started_ms(),
+            )
             h._set_status(getattr(h._ctrl, "transcript_import_notice", "") or "没有可导入的文字", tone="error")
             return
+        h._unsaved_transcript_draft = None
         h.show_meeting(record.id)
         h._set_status(self.imported_status_message(record.id, "文字稿"), tone="ok")
 

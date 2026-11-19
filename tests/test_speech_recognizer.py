@@ -1603,3 +1603,42 @@ class TestDynamicQuietAsrAudio:
         assert worker.quiet_speech is None
         worker.run()
         assert any(len(w) == rate and np.array_equal(w, soft) for w in seen)
+
+
+class TestAuxModelBoundaryGuards:
+    @pytest.mark.parametrize("aux_id", ["silero-vad", "speaker-campplus", "speaker-activity"])
+    def test_aux_models_excluded_from_asr_startup_configure_and_media_import(
+        self, aux_id, tmp_path, monkeypatch
+    ):
+        import sayink.speech_recognizer as sr
+        from sayink.app import App
+        from sayink.config import Config
+
+        monkeypatch.setattr(sr, "is_model_downloaded", lambda _mid: True)
+        assert sr.is_aux_model(aux_id) is True
+        assert sr.is_asr_model(aux_id) is False
+        assert sr.is_asr_model_downloaded(aux_id) is False
+        assert sr.resolve_startup_model_id(aux_id) == sr.DEFAULT_MODEL_ID
+
+        # Even when nothing is downloaded on disk, aux IDs never survive startup selection
+        monkeypatch.setattr(sr, "is_model_downloaded", lambda _mid: False)
+        assert sr.resolve_startup_model_id(aux_id) == sr.DEFAULT_MODEL_ID
+
+        # SpeechRecognizer.configure refuses aux models without starting a load worker
+        monkeypatch.setattr(sr, "is_model_downloaded", lambda _mid: True)
+        rec = sr.SpeechRecognizer()
+        load_calls: list[int] = []
+        monkeypatch.setattr(rec, "_load_model", lambda: load_calls.append(1))
+        rec.configure(aux_id, 4)
+        assert load_calls == []
+        assert rec.current_model_id != aux_id
+
+        # App._resolve_media_import_model_id rejects aux IDs in meeting.model_id and stt.model_id
+        cfg = Config(config_dir=tmp_path / f"cfg-{aux_id}")
+        cfg.set("meeting.model_id", aux_id)
+        cfg.set("stt.model_id", aux_id)
+        app = App.create_headless(cfg)
+        try:
+            assert app._resolve_media_import_model_id() == sr.DEFAULT_MODEL_ID
+        finally:
+            app.deleteLater()

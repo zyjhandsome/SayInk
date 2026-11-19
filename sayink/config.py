@@ -332,6 +332,7 @@ class Config:
         # Unreadable config whose backup also failed. Saving would replace it
         # with defaults and drop hotkeys, glossary and templates.
         self._persist_blocked = False
+        self._dirty = False
         self.corrupt_recovered = False
         self.last_save_failed = False
         self._config_file = self._config_dir / "config.json"
@@ -390,19 +391,18 @@ class Config:
         meeting_source_migrated = self._migrate_meeting_input_source()
         stt_migrated = self._migrate_stt_model(defer_save=True)
         test_stripped = self._strip_test_pollution()
-        if (
-            not self._persist_blocked
-            and (
-                test_stripped
-                or secret_migrated
-                or moved
-                or retired_cleaned
-                or output_migrated
-                or meeting_source_migrated
-                or stt_migrated
-                or self._type_repairs
-            )
-        ):
+        needs_migration_save = bool(
+            test_stripped
+            or secret_migrated
+            or moved
+            or retired_cleaned
+            or output_migrated
+            or meeting_source_migrated
+            or stt_migrated
+            or self._type_repairs
+        )
+        if needs_migration_save and not self._persist_blocked:
+            self._dirty = True
             self.save_immediate()
 
     def _load_secret(self, *, defer_save: bool = False) -> bool:
@@ -462,7 +462,12 @@ class Config:
 
     def _backup_unreadable_config(self) -> Path | None:
         """Keep the unreadable file so the next save cannot erase API keys etc."""
-        backup = self._config_dir / f"config.corrupt-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = self._config_dir / f"config.corrupt-{stamp}.json"
+        seq = 1
+        while backup.exists():
+            backup = self._config_dir / f"config.corrupt-{stamp}-{seq}.json"
+            seq += 1
         try:
             os.replace(self._config_file, backup)
             return backup
@@ -668,6 +673,7 @@ class Config:
             if self._is_startup_disabled_by_windows(winreg):
                 if self._config.get("auto_start", False):
                     self._config["auto_start"] = False
+                    self._dirty = True
                     self.save_immediate()
                     log.info("检测到系统启动项管理中已禁用 SayInk 开机自启，已同步关闭配置")
                 return
@@ -690,6 +696,7 @@ class Config:
 
             if registered and not self._config.get("auto_start", False):
                 self._config["auto_start"] = True
+                self._dirty = True
                 self.save_immediate()
                 log.info("同步注册表开机自启状态到配置文件")
         except Exception as e:
@@ -796,6 +803,7 @@ class Config:
         return result
 
     def _schedule_save(self, delay_ms: int = 500) -> None:
+        self._dirty = True
         timer = getattr(self, "_save_timer", None)
         if timer is None:
             return
@@ -821,6 +829,17 @@ class Config:
     def _do_save(self):
         """实际执行保存操作"""
         self.save()
+
+    @property
+    def is_dirty(self) -> bool:
+        timer = getattr(self, "_save_timer", None)
+        return bool(getattr(self, "_dirty", False) or (timer is not None and timer.isActive()))
+
+    def save_if_dirty(self) -> bool:
+        """立即保存未落盘的配置变更；若无变更则跳过写盘并返回 True。"""
+        if not self.is_dirty:
+            return True
+        return self.save_immediate()
 
     def save_immediate(self) -> bool:
         """立即保存配置，用于应用退出前。失败时返回 False。"""
@@ -857,6 +876,8 @@ class Config:
             )
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
             target_path = str(self._config_file)
             for attempt in range(4):
                 try:
@@ -875,6 +896,7 @@ class Config:
                 except OSError:
                     pass
             return False
+        self._dirty = False
         self.last_save_failed = False
         return True
 

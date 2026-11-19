@@ -15,6 +15,7 @@ import glob
 import json
 import logging
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -22,14 +23,17 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, Iterable
 
+import sayink.audio_recovery as _audio_recovery_mod
 from sayink.audio_recovery import (
     _invalidate_pending_bytes_cache,
     delete_session_recovery_files,
 )
 from sayink.history_store import MEETING_TRIGGER_MODE, HistoryStore, SegmentRecord, escape_like, row_to_segment
 from sayink.media_import import MEDIA_SOURCE
+from sayink.minutes_prompts import speaker_label
+from sayink.minutes_render import replace_names_in_markdown
 from sayink.transcript_import import (
     IMPORT_SOURCE,
     ImportedTranscript,
@@ -232,8 +236,21 @@ def _allowed_cleanup_roots(db_root: Path, temp_root: Path) -> list[Path]:
     return allowed_roots
 
 
-def _session_json_matches_meeting(meta_file: Path, meeting_id: str) -> bool:
-    if not meta_file.is_file() or meta_file.is_symlink():
+def _delete_recovery_sessions_batch(session_ids: Iterable[str], *, base_dir: Path) -> int:
+    ids = [str(s).strip() for s in session_ids if str(s or "").strip()]
+    if not ids:
+        return 0
+    batch_fn = getattr(_audio_recovery_mod, "delete_sessions_recovery_files", None)
+    if callable(batch_fn):
+        return int(batch_fn(ids, base_dir=base_dir) or 0)
+    removed = 0
+    for sid in dict.fromkeys(ids):
+        removed += int(delete_session_recovery_files(sid, base_dir=base_dir) or 0)
+    return removed
+
+
+def _session_json_matches_any_meeting(meta_file: Path, meeting_ids: set[str]) -> bool:
+    if not meeting_ids or not meta_file.is_file() or meta_file.is_symlink():
         return False
     try:
         meta = json.loads(meta_file.read_text(encoding="utf-8"))
@@ -242,18 +259,31 @@ def _session_json_matches_meeting(meta_file: Path, meeting_id: str) -> bool:
     if not isinstance(meta, dict):
         return False
     return any(
-        str(meta.get(k) or "").strip() == meeting_id
+        str(meta.get(k) or "").strip() in meeting_ids
         for k in ("session_id", "meeting_id", "history_id", "id")
     )
 
 
-def _cleanup_recovery_journals(recovery_root: Path, meeting_id: str, raw: str) -> set[str]:
+def _session_json_matches_meeting(meta_file: Path, meeting_id: str) -> bool:
+    return _session_json_matches_any_meeting(meta_file, {meeting_id} if meeting_id else set())
+
+
+def _cleanup_recovery_journals_batch(
+    recovery_root: Path,
+    meeting_ids: set[str],
+    raw_paths: Iterable[str],
+) -> set[str]:
     journal_names: set[str] = set()
+    clean_ids = {str(m).strip() for m in meeting_ids if str(m or "").strip()}
+    if not clean_ids and not raw_paths:
+        return journal_names
     try:
         if not recovery_root.is_dir() or recovery_root.is_symlink():
             return journal_names
         rec_resolved = recovery_root.resolve()
-        if raw:
+        for raw in raw_paths:
+            if not raw:
+                continue
             try:
                 cand_resolved = Path(raw).resolve()
                 if cand_resolved != rec_resolved and cand_resolved.is_relative_to(rec_resolved):
@@ -262,19 +292,28 @@ def _cleanup_recovery_journals(recovery_root: Path, meeting_id: str, raw: str) -
                         journal_names.add(rel_parts[0])
             except OSError:
                 pass
+        lower_ids = {m.lower() for m in clean_ids}
         for child in list(recovery_root.iterdir()):
             if not child.is_dir() or child.is_symlink() or len(child.name) != 32:
                 continue
-            if child.name.lower() == meeting_id.lower() or _session_json_matches_meeting(
-                child / "session.json", meeting_id
+            if (
+                child.name in journal_names
+                or child.name.lower() in lower_ids
+                or _session_json_matches_any_meeting(child / "session.json", clean_ids)
             ):
                 journal_names.add(child.name)
-        delete_session_recovery_files(meeting_id, base_dir=recovery_root)
-        for jname in list(journal_names):
-            delete_session_recovery_files(jname, base_dir=recovery_root)
+        _delete_recovery_sessions_batch(journal_names | clean_ids, base_dir=recovery_root)
     except OSError:
         pass
     return journal_names
+
+
+def _cleanup_recovery_journals(recovery_root: Path, meeting_id: str, raw: str) -> set[str]:
+    return _cleanup_recovery_journals_batch(
+        recovery_root,
+        {meeting_id} if meeting_id else set(),
+        (raw,) if raw else (),
+    )
 
 
 def _remove_owned_audio_candidate(
@@ -340,11 +379,14 @@ def _cleanup_playback_wavs(temp_root: Path, journal_names: set[str]) -> None:
         pass
 
 
-def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, audio_path: str) -> None:
-    """Best-effort removal of SayInk-owned cached audio for a deleted meeting.
+def _cleanup_owned_meetings_audio(db_path: Path, audio_rows: Iterable[tuple[str, str, str]]) -> None:
+    """Best-effort batch removal of SayInk-owned cached audio for deleted meetings.
 
     External user media/transcript files and symlinks are never touched.
     """
+    rows = list(audio_rows)
+    if not rows:
+        return
     try:
         db_resolved = db_path.resolve()
         db_root = db_resolved.parent
@@ -353,11 +395,18 @@ def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, au
 
     temp_root = Path(tempfile.gettempdir())
     allowed_roots = _allowed_cleanup_roots(db_root, temp_root)
-    # Media import records the user's original path even when it is inside
-    # the app directory or a folder named "cache".
-    raw = (audio_path or "").strip() if source not in (MEDIA_SOURCE, IMPORT_SOURCE) else ""
-    journal_names = _cleanup_recovery_journals(db_root / "audio-recovery", meeting_id, raw)
-    if raw:
+    meeting_ids: set[str] = set()
+    owned_raws: list[str] = []
+    for meeting_id, source, audio_path in rows:
+        if meeting_id:
+            meeting_ids.add(meeting_id)
+        # Media import records the user's original path even when it is inside
+        # the app directory or a folder named "cache".
+        raw = (audio_path or "").strip() if source not in (MEDIA_SOURCE, IMPORT_SOURCE) else ""
+        if raw:
+            owned_raws.append(raw)
+    journal_names = _cleanup_recovery_journals_batch(db_root / "audio-recovery", meeting_ids, owned_raws)
+    for raw in owned_raws:
         _remove_owned_audio_candidate(
             raw,
             db_resolved=db_resolved,
@@ -366,6 +415,11 @@ def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, au
             journal_names=journal_names,
         )
     _cleanup_playback_wavs(temp_root, journal_names)
+
+
+def _cleanup_owned_meeting_audio(db_path: Path, meeting_id: str, source: str, audio_path: str) -> None:
+    """Best-effort removal of SayInk-owned cached audio for a deleted meeting."""
+    _cleanup_owned_meetings_audio(db_path, ((meeting_id, source, audio_path),))
 
 
 def _note_metadata(conn: sqlite3.Connection, meeting_id: str) -> dict[str, Any]:
@@ -401,12 +455,95 @@ def _row_to_meeting(r: tuple) -> MeetingRecord:
     )
 
 
+_SPEAKER_ID_RE = re.compile(r"^(?:说话人\s*|speaker[\s_-]*)(\d+)$", re.IGNORECASE)
+
+
+def coerce_speaker_id(value: int | str | None) -> int:
+    if isinstance(value, bool) or value is None:
+        return -1
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw.isdigit():
+            return int(raw)
+        match = _SPEAKER_ID_RE.fullmatch(raw)
+        if match:
+            return int(match.group(1))
+    return -1
+
+
+def _replace_speaker_pairs_in_text(text: str, pairs: list[tuple[str, str]]) -> str:
+    active = [(old, new) for old, new in pairs if old and new and old != new]
+    if not text or not active:
+        return text
+    nonce = uuid.uuid4().hex
+    staged: list[tuple[str, str]] = []
+    out = text
+    for idx, (old, new) in enumerate(active):
+        sentinel = f"\x00__SAYINK_MERGE_{nonce}_{idx}__\x00"
+        out, count = replace_names_in_markdown(out, old, sentinel)
+        if count:
+            staged.append((sentinel, new))
+    for sentinel, new in staged:
+        out = out.replace(sentinel, new)
+    return out
+
+
+def _patch_merged_json_payload(
+    raw_json: str,
+    *,
+    source_sid: int,
+    target_sid: int,
+    old_source_label: str,
+    new_target_label: str,
+) -> str:
+    if not raw_json:
+        return raw_json
+    try:
+        payload = json.loads(raw_json)
+    except (ValueError, TypeError):
+        return raw_json
+    if not isinstance(payload, dict):
+        return raw_json
+    src_num_label = speaker_label(source_sid)
+    dst_num_label = speaker_label(target_sid)
+    snapshot = payload.get("_speaker_names")
+    if isinstance(snapshot, dict):
+        src_snap = str(snapshot.pop(str(source_sid), "") or "").strip()
+        pairs = [(src_num_label, dst_num_label), (old_source_label, dst_num_label)]
+        if src_snap:
+            pairs.append((src_snap, dst_num_label))
+        snapshot[str(target_sid)] = new_target_label
+    else:
+        pairs = [(src_num_label, new_target_label), (old_source_label, new_target_label)]
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, str):
+            return _replace_speaker_pairs_in_text(node, pairs)
+        if isinstance(node, list):
+            return [_walk(item) for item in node]
+        if isinstance(node, dict):
+            updated: dict[str, Any] = {}
+            for k, v in node.items():
+                if k == "_speaker_names":
+                    updated[k] = dict(v) if isinstance(v, dict) else v
+                elif k in ("speaker_id", "speaker") and isinstance(v, int) and not isinstance(v, bool) and v == source_sid:
+                    updated[k] = target_sid
+                else:
+                    updated[k] = _walk(v)
+            return updated
+        return node
+
+    return json.dumps(_walk(payload), ensure_ascii=False)
+
+
 class MeetingStore:
     """Thin API over the meeting tables; all writes go through ``history``."""
 
     def __init__(self, history: HistoryStore):
         self._history = history
-        self._pending_write_ticket: int | None = None
+        self._write_local = threading.local()
         self._created_clock_lock = threading.Lock()
         self._last_created_ms = 0
 
@@ -424,20 +561,63 @@ class MeetingStore:
 
     # -- lifecycle -------------------------------------------------------
 
+    def _pending_local_tickets(self) -> list[int]:
+        tickets = getattr(self._write_local, "tickets", None)
+        if tickets is None:
+            tickets = []
+            self._write_local.tickets = tickets
+        return tickets
+
+    def _record_ticket(self, ticket: int | None) -> int:
+        resolved = int(ticket or 0)
+        if resolved > 0:
+            self._pending_local_tickets().append(resolved)
+        return resolved
+
     def _write(self, fn, *, after_commit=None) -> int:
         ticket = self._history.enqueue_write(
             fn, failure_notice=MEETING_WRITE_FAILED_NOTICE, after_commit=after_commit,
         )
-        if ticket and self._pending_write_ticket is None:
-            self._pending_write_ticket = ticket
-        return ticket
+        return self._record_ticket(ticket)
+
+    def _verify_single_ticket(self, ticket: int, timeout: float | None) -> bool:
+        if self.disabled or int(ticket or 0) <= 0:
+            return False
+        flush_ticket_fn = getattr(self._history, "flush_ticket", None)
+        if callable(flush_ticket_fn):
+            return bool(flush_ticket_fn(int(ticket), timeout=timeout))
+        return bool(self._history.flush(timeout=timeout, since_ticket=int(ticket)))
+
+    def flush_ticket(self, ticket: int, timeout: float = 10.0) -> bool:
+        resolved = int(ticket or 0)
+        pending = self._pending_local_tickets()
+        if resolved in pending:
+            pending[:] = [t for t in pending if t != resolved]
+        return self._verify_single_ticket(resolved, timeout)
 
     def flush(self, timeout: float = 10.0, *, since_ticket: int | None = None) -> bool:
-        ticket = since_ticket if since_ticket is not None else self._pending_write_ticket
-        self._pending_write_ticket = None
-        if ticket is not None:
-            return self._history.flush(timeout=timeout, since_ticket=ticket)
-        return self._history.flush(timeout=timeout)
+        if self.disabled:
+            self._pending_local_tickets().clear()
+            return False
+        if since_ticket is not None:
+            return self.flush_ticket(int(since_ticket), timeout=timeout)
+        pending = self._pending_local_tickets()
+        if pending:
+            tickets = list(dict.fromkeys(pending))
+            pending.clear()
+            deadline = None if timeout is None else (time.monotonic() + max(0.0, float(timeout)))
+            max_ticket = max(tickets)
+            rem = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if not self._verify_single_ticket(max_ticket, rem):
+                return False
+            for t in tickets:
+                if t == max_ticket:
+                    continue
+                rem = None if deadline is None else max(0.0, deadline - time.monotonic())
+                if not self._verify_single_ticket(t, rem):
+                    return False
+            return True
+        return bool(self._history.flush(timeout=timeout))
 
     def create_meeting(
         self,
@@ -520,11 +700,18 @@ class MeetingStore:
         if not segments:
             return None
 
-        started_candidates = [int(s.captured_at) if int(s.captured_at) > 0 else int(s.created_at) for s in segments]
+        started_candidates = [
+            int(s.captured_at) if int(s.captured_at or 0) > 0 else int(s.created_at)
+            for s in segments
+        ]
+        ended_candidates = [
+            int(s.captured_at) + max(0, int(s.duration_ms or 0))
+            if int(s.captured_at or 0) > 0
+            else int(s.created_at)
+            for s in segments
+        ]
         started_at = min(started_candidates)
-        ended_at = max(int(s.created_at) for s in segments)
-        if ended_at < started_at:
-            ended_at = started_at
+        ended_at = max(started_at, max(ended_candidates))
 
         source = next((s.source for s in segments if s.source), "")
         model_id = next((s.model for s in segments if s.model), "")
@@ -824,18 +1011,27 @@ class MeetingStore:
         ended_at: int | None = None,
         *,
         status: str = STATUS_ENDED,
-    ) -> None:
+        audio_path: str | None = None,
+    ) -> int:
         stamp = now_ms() if ended_at is None else int(ended_at)
         if status not in (STATUS_ENDED, STATUS_INTERRUPTED):
             status = STATUS_ENDED
 
         def _end(conn: sqlite3.Connection) -> None:
-            conn.execute(
-                "UPDATE meetings SET ended_at = ?, status = ? WHERE id = ? AND status != ?",
-                (stamp, status, meeting_id, STATUS_DELETED),
-            )
+            if audio_path:
+                conn.execute(
+                    "UPDATE meetings SET ended_at = ?, status = ?, "
+                    "audio_path = CASE WHEN ? != '' THEN ? ELSE audio_path END "
+                    "WHERE id = ? AND status != ?",
+                    (stamp, status, str(audio_path), str(audio_path), meeting_id, STATUS_DELETED),
+                )
+            else:
+                conn.execute(
+                    "UPDATE meetings SET ended_at = ?, status = ? WHERE id = ? AND status != ?",
+                    (stamp, status, meeting_id, STATUS_DELETED),
+                )
 
-        self._write(_end)
+        return self._write(_end)
 
     def mark_interrupted_meetings(self) -> None:
         """Startup: any meeting still ``live`` did not end cleanly."""
@@ -878,7 +1074,8 @@ class MeetingStore:
         agenda: str | None = None,
         notes_user: str | None = None,
         audio_path: str | None = None,
-    ) -> None:
+        after_commit: Callable[[], None] | None = None,
+    ) -> int:
         fields: dict[str, str] = {}
         if title is not None:
             fields["title"] = title
@@ -891,20 +1088,20 @@ class MeetingStore:
         if audio_path is not None:
             fields["audio_path"] = audio_path
         if not fields:
-            return
+            return 0
         assignments = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [meeting_id]
 
         def _update(conn: sqlite3.Connection) -> None:
             conn.execute(f"UPDATE meetings SET {assignments} WHERE id = ?", values)
 
-        self._write(_update)
+        return self._write(_update, after_commit=after_commit)
 
-    def delete_meeting(self, meeting_id: str) -> None:
+    def delete_meeting(self, meeting_id: str) -> int:
         """Hard-delete the meeting: metadata, transcript rows, marks, speakers, notes, and owned cached audio."""
-        self.delete_meetings([meeting_id])
+        return self.delete_meetings([meeting_id])
 
-    def delete_meetings(self, meeting_ids: list[str]) -> None:
+    def delete_meetings(self, meeting_ids: list[str]) -> int:
         """Hard-delete every id in one writer transaction.
 
         A per-meeting delete would commit and pump the minutes queue between
@@ -912,7 +1109,7 @@ class MeetingStore:
         """
         ids = list(dict.fromkeys(meeting_id for meeting_id in meeting_ids if meeting_id))
         if not ids or self.disabled:
-            return
+            return 0
         db_path = self._history.db_path
         audio_rows: list[tuple[str, str, str]] = []
 
@@ -940,21 +1137,20 @@ class MeetingStore:
                 conn.execute(f"DELETE FROM meetings WHERE id IN ({placeholders})", params)
 
         def _cleanup_audio() -> None:
-            for meeting_id, source, audio_path in audio_rows:
-                _cleanup_owned_meeting_audio(db_path, meeting_id, source, audio_path)
+            _cleanup_owned_meetings_audio(db_path, audio_rows)
 
-        self._write(_delete_all, after_commit=_cleanup_audio)
+        return self._write(_delete_all, after_commit=_cleanup_audio)
 
     # -- marks / speakers --------------------------------------------------
 
-    def add_mark(self, meeting_id: str, offset_ms: int, note: str = "") -> None:
+    def add_mark(self, meeting_id: str, offset_ms: int, note: str = "") -> int:
         def _insert(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "INSERT INTO meeting_marks (meeting_id, offset_ms, note) VALUES (?, ?, ?)",
                 (meeting_id, int(offset_ms), note),
             )
 
-        self._write(_insert)
+        return self._write(_insert)
 
     def set_speaker(
         self,
@@ -963,8 +1159,21 @@ class MeetingStore:
         *,
         display_name: str | None = None,
         suggested_name: str | None = None,
-    ) -> None:
+    ) -> int:
+        sid = int(speaker_id)
+
         def _upsert(conn: sqlite3.Connection) -> None:
+            if display_name == "" and suggested_name is None:
+                has_seg = conn.execute(
+                    "SELECT 1 FROM history WHERE session_id = ? AND trigger_mode = ? AND speaker_id = ? LIMIT 1",
+                    (meeting_id, MEETING_TRIGGER_MODE, sid),
+                ).fetchone()
+                if has_seg is None:
+                    conn.execute(
+                        "DELETE FROM meeting_speakers WHERE meeting_id = ? AND speaker_id = ?",
+                        (meeting_id, sid),
+                    )
+                    return
             conn.execute(
                 """
                 INSERT INTO meeting_speakers (meeting_id, speaker_id, display_name, suggested_name, name_locked)
@@ -975,15 +1184,15 @@ class MeetingStore:
                   name_locked = COALESCE(?, name_locked)
                 """,
                 (
-                    meeting_id, int(speaker_id), display_name, suggested_name,
+                    meeting_id, sid, display_name, suggested_name,
                     1 if display_name is not None else None,
                     display_name, suggested_name, 1 if display_name is not None else None,
                 ),
             )
 
-        self._write(_upsert)
+        return self._write(_upsert)
 
-    def save_inferred_names(self, meeting_id: str, names: dict[int, str], *, markdown: str | None = None) -> None:
+    def save_inferred_names(self, meeting_id: str, names: dict[int, str], *, markdown: str | None = None) -> int:
         """Commit validated automatic labels and their rendered notes together.
 
         Manual names (including an explicitly restored number) are protected.
@@ -1011,27 +1220,251 @@ class MeetingStore:
                     "WHERE meeting_id = ?",
                     (markdown, markdown, meeting_id),
                 )
-        self._write(_save)
+        return self._write(_save)
 
-    def relabel_segments(self, meeting_id: str, mapping: dict[int, int]) -> None:
+    def relabel_segments(self, meeting_id: str, mapping: dict[int, int]) -> int:
         """Recluster automatic meeting assignments; preserve manual corrections.
 
         Same SQL as continuous dictation (one implementation in the history
         store), restricted to this meeting's rows and to unlocked segments."""
-        self._history.relabel_session_speakers(
+        ticket = self._history.relabel_session_speakers(
             meeting_id, mapping, trigger_mode=MEETING_TRIGGER_MODE, respect_locks=True,
             failure_notice=MEETING_WRITE_FAILED_NOTICE,
         )
+        return self._record_ticket(ticket)
 
-    def set_segment_speakers(self, meeting_id: str, assignments: dict[int, int]) -> None:
+    def set_segment_speakers(
+        self,
+        meeting_id: str,
+        assignments: dict[int, int],
+        *,
+        locked: bool = False,
+    ) -> int:
         """Apply an end-of-meeting re-assignment ``{seq: speaker_id}``.
 
-        Automatic numbers only: a segment the user locked keeps its speaker.
+        Automatic numbers only by default: a segment the user locked keeps its speaker.
         """
-        self._history.relabel_session_segments(
-            meeting_id, assignments, trigger_mode=MEETING_TRIGGER_MODE,
-            failure_notice=MEETING_WRITE_FAILED_NOTICE,
-        )
+        if not locked:
+            ticket = self._history.relabel_session_segments(
+                meeting_id, assignments, trigger_mode=MEETING_TRIGGER_MODE,
+                failure_notice=MEETING_WRITE_FAILED_NOTICE,
+            )
+            return self._record_ticket(ticket)
+        if not assignments or not meeting_id:
+            return 0
+        rows = [(int(speaker_id), meeting_id, int(seq), MEETING_TRIGGER_MODE) for seq, speaker_id in assignments.items()]
+
+        def _lock_many(conn: sqlite3.Connection) -> None:
+            conn.executemany(
+                "UPDATE history SET speaker_id = ?, speaker_locked = 1 "
+                "WHERE session_id = ? AND seq = ? AND trigger_mode = ?",
+                rows,
+            )
+
+        return self._write(_lock_many)
+
+    def merge_speakers(
+        self,
+        meeting_id: str,
+        source_speaker_id: int | str,
+        target_speaker_id: int | str,
+        *,
+        target_display_name: str | None = None,
+        inferred_names: dict[int, str] | None = None,
+        notes_markdown: str | None = None,
+        notes_json_payload: str | None = None,
+        notes_user_markdown: str | None = None,
+        notes_mode: str = "auto",
+    ) -> bool:
+        """Atomically merge ``source_speaker_id`` into ``target_speaker_id`` in one transaction."""
+        src = coerce_speaker_id(source_speaker_id)
+        dst = coerce_speaker_id(target_speaker_id)
+        if not meeting_id or src <= 0 or dst <= 0 or src == dst or self.disabled:
+            return False
+
+        applied: list[bool] = []
+
+        def _merge(conn: sqlite3.Connection) -> None:
+            m_row = conn.execute(
+                "SELECT status FROM meetings WHERE id = ?",
+                (meeting_id,),
+            ).fetchone()
+            if m_row is None or m_row[0] not in (STATUS_LIVE, STATUS_ENDED, STATUS_INTERRUPTED):
+                applied.append(False)
+                return
+
+            existing_rows = {
+                int(r[0]): (str(r[1] or ""), str(r[2] or ""), bool(r[3]))
+                for r in conn.execute(
+                    "SELECT speaker_id, display_name, suggested_name, name_locked "
+                    "FROM meeting_speakers WHERE meeting_id = ?",
+                    (meeting_id,),
+                ).fetchall()
+            }
+            src_seg = conn.execute(
+                "SELECT 1 FROM history WHERE session_id = ? AND trigger_mode = ? AND speaker_id = ? LIMIT 1",
+                (meeting_id, MEETING_TRIGGER_MODE, src),
+            ).fetchone()
+            if src_seg is None and src not in existing_rows:
+                applied.append(False)
+                return
+
+            src_info = existing_rows.get(src)
+            dst_info = existing_rows.get(dst)
+            old_src_label = (
+                src_info[0] or (src_info[1] if not src_info[2] else "") or speaker_label(src)
+                if src_info is not None
+                else speaker_label(src)
+            )
+            old_dst_label = (
+                dst_info[0] or (dst_info[1] if not dst_info[2] else "") or speaker_label(dst)
+                if dst_info is not None
+                else speaker_label(dst)
+            )
+
+            if target_display_name is not None:
+                final_dst_display = target_display_name.strip()
+                final_dst_locked = 1
+                final_dst_suggested = dst_info[1] if dst_info is not None else ""
+            elif dst_info is not None and (dst_info[0] or dst_info[2]):
+                final_dst_display = dst_info[0]
+                final_dst_locked = 1
+                final_dst_suggested = dst_info[1]
+            elif src_info is not None and src_info[0]:
+                final_dst_display = src_info[0]
+                final_dst_locked = 1
+                final_dst_suggested = dst_info[1] if dst_info is not None else ""
+            elif dst_info is not None and dst_info[1]:
+                final_dst_display = dst_info[1]
+                final_dst_locked = 1
+                final_dst_suggested = dst_info[1]
+            else:
+                final_dst_display = ""
+                final_dst_locked = 0
+                final_dst_suggested = (
+                    src_info[1] if src_info is not None and src_info[1] and not src_info[2] else ""
+                )
+
+            moved = conn.execute(
+                "UPDATE history SET speaker_id = ?, speaker_locked = 1 "
+                "WHERE session_id = ? AND trigger_mode = ? AND speaker_id = ?",
+                (dst, meeting_id, MEETING_TRIGGER_MODE, src),
+            )
+            conn.execute(
+                "DELETE FROM meeting_speakers WHERE meeting_id = ? AND speaker_id = ?",
+                (meeting_id, src),
+            )
+            if final_dst_display or final_dst_suggested or final_dst_locked or dst in existing_rows:
+                conn.execute(
+                    """
+                    INSERT INTO meeting_speakers (meeting_id, speaker_id, display_name, suggested_name, name_locked)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(meeting_id, speaker_id) DO UPDATE SET
+                      display_name = excluded.display_name,
+                      suggested_name = excluded.suggested_name,
+                      name_locked = excluded.name_locked
+                    """,
+                    (meeting_id, dst, final_dst_display, final_dst_suggested, final_dst_locked),
+                )
+
+            if inferred_names is not None:
+                conn.execute(
+                    "UPDATE meeting_speakers SET suggested_name = '' "
+                    "WHERE meeting_id = ? AND display_name = '' AND name_locked = 0",
+                    (meeting_id,),
+                )
+                for inf_sid, inf_name in inferred_names.items():
+                    clean_sid = int(inf_sid)
+                    clean_inf = (inf_name or "").strip()
+                    if clean_sid <= 0 or clean_sid == src or not clean_inf:
+                        continue
+                    conn.execute(
+                        "INSERT INTO meeting_speakers (meeting_id, speaker_id, suggested_name) VALUES (?, ?, ?) "
+                        "ON CONFLICT(meeting_id, speaker_id) DO UPDATE SET suggested_name = excluded.suggested_name "
+                        "WHERE meeting_speakers.display_name = '' AND meeting_speakers.name_locked = 0",
+                        (meeting_id, clean_sid, clean_inf),
+                    )
+
+            dst_cur = conn.execute(
+                "SELECT display_name, suggested_name, name_locked FROM meeting_speakers "
+                "WHERE meeting_id = ? AND speaker_id = ?",
+                (meeting_id, dst),
+            ).fetchone()
+            if dst_cur is not None:
+                new_dst_label = (
+                    str(dst_cur[0] or "")
+                    or (str(dst_cur[1] or "") if not bool(dst_cur[2]) else "")
+                    or speaker_label(dst)
+                )
+            else:
+                new_dst_label = speaker_label(dst)
+
+            notes_row = conn.execute(
+                "SELECT json_payload, markdown, previous_markdown, user_edited, user_markdown "
+                "FROM meeting_notes WHERE meeting_id = ?",
+                (meeting_id,),
+            ).fetchone()
+            if notes_row is not None:
+                cur_json = str(notes_row[0] or "")
+                cur_md = str(notes_row[1] or "")
+                cur_prev_md = str(notes_row[2] or "")
+                cur_user_edited = bool(notes_row[3])
+                cur_user_md = str(notes_row[4] or "")
+
+                if notes_mode == "rendered" and notes_markdown is not None:
+                    next_md = notes_markdown
+                    next_json = notes_json_payload if notes_json_payload is not None else cur_json
+                    next_user_md = notes_user_markdown if notes_user_markdown is not None else cur_user_md
+                elif notes_mode == "user_edited" and notes_markdown is not None:
+                    next_md = notes_markdown
+                    next_json = notes_json_payload if notes_json_payload is not None else cur_json
+                    next_user_md = notes_user_markdown if notes_user_markdown is not None else notes_markdown
+                else:
+                    pairs = [
+                        (old_src_label, new_dst_label),
+                        (speaker_label(src), new_dst_label),
+                        (old_dst_label, new_dst_label),
+                    ]
+                    next_md = _replace_speaker_pairs_in_text(cur_md, pairs) if cur_md else cur_md
+                    next_user_md = _replace_speaker_pairs_in_text(cur_user_md, pairs) if cur_user_md else cur_user_md
+                    if cur_user_edited and next_md:
+                        next_user_md = next_md
+                    next_json = _patch_merged_json_payload(
+                        cur_json,
+                        source_sid=src,
+                        target_sid=dst,
+                        old_source_label=old_src_label,
+                        new_target_label=new_dst_label,
+                    )
+
+                if moved.rowcount:
+                    conn.execute(
+                        "UPDATE meeting_notes SET json_payload = ?, markdown = ?, user_markdown = ?, "
+                        "transcript_changed = 1, "
+                        "previous_transcript_changed = CASE WHEN ? != '' THEN 1 ELSE previous_transcript_changed END, "
+                        "user_transcript_changed = CASE WHEN ? != '' THEN 1 ELSE user_transcript_changed END "
+                        "WHERE meeting_id = ?",
+                        (next_json, next_md, next_user_md, cur_prev_md, next_user_md, meeting_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE meeting_notes SET json_payload = ?, markdown = ?, user_markdown = ? "
+                        "WHERE meeting_id = ?",
+                        (next_json, next_md, next_user_md, meeting_id),
+                    )
+
+            applied.append(True)
+
+        ticket = self._write(_merge)
+        if not self.flush_ticket(ticket, timeout=5.0):
+            return False
+        if not applied or not applied[0]:
+            return False
+        if self.speaker_has_segments(meeting_id, src):
+            return False
+        if any(s.speaker_id == src for s in self.get_speakers(meeting_id)):
+            return False
+        return True
 
     def set_segment_speaker(self, meeting_id: str, seq: int, speaker_id: int) -> None:
         """Lock one already-transcribed segment to the user's chosen speaker."""
@@ -1104,9 +1537,24 @@ class MeetingStore:
             return str(row[0]) if row is not None and row[0] is not None else None
         return self._history.read(_query, default=None)
 
-    def save_generation_checkpoint(self, meeting_id: str, fingerprint: str, step_key: str, payload: str) -> None:
-        saved = []
-        def _save(conn):
+    def save_generation_checkpoint(
+        self,
+        meeting_id: str,
+        fingerprint: str,
+        step_key: str,
+        payload: str,
+        *,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> None:
+        if cancel_check is not None and cancel_check():
+            return
+        saved: list[bool] = []
+        skipped: list[bool] = []
+
+        def _save(conn: sqlite3.Connection) -> None:
+            if cancel_check is not None and cancel_check():
+                skipped.append(True)
+                return
             # A deleted meeting must never be resurrected by an old worker.
             row = conn.execute("SELECT status FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
             if row is None or row[0] == STATUS_DELETED:
@@ -1117,9 +1565,12 @@ class MeetingStore:
             conn.execute("INSERT OR REPLACE INTO meeting_generation_cache VALUES (?, ?, ?, ?)",
                          (meeting_id, fingerprint, step_key, payload))
             saved.append(True)
-        self._write(_save)
-        if not self.flush(timeout=2.0):
+
+        ticket = self._write(_save)
+        if not self.flush_ticket(ticket, timeout=2.0):
             raise RuntimeError("分段进度未能保存，请重试")
+        if skipped:
+            return
         if not saved or (saved[0] and self._checkpoint_payload(meeting_id, fingerprint, step_key) != payload):
             raise RuntimeError("分段进度保存失败，请重试")
 
@@ -1597,11 +2048,26 @@ class MeetingStore:
 
         return self._history.read(_q, default=None)
 
-    def has_speaker(self, meeting_id: str, speaker_id: int) -> bool:
+    def speaker_has_segments(self, meeting_id: str, speaker_id: int) -> bool:
         def _q(conn: sqlite3.Connection) -> bool:
             row = conn.execute(
                 "SELECT 1 FROM history WHERE session_id = ? AND trigger_mode = ? AND speaker_id = ? LIMIT 1",
                 (meeting_id, MEETING_TRIGGER_MODE, int(speaker_id)),
+            ).fetchone()
+            return row is not None
+
+        return bool(self._history.read(_q, default=False))
+
+    def has_speaker(self, meeting_id: str, speaker_id: int) -> bool:
+        sid = int(speaker_id)
+
+        def _q(conn: sqlite3.Connection) -> bool:
+            row = conn.execute(
+                "SELECT 1 FROM history WHERE session_id = ? AND trigger_mode = ? AND speaker_id = ? "
+                "UNION ALL "
+                "SELECT 1 FROM meeting_speakers WHERE meeting_id = ? AND speaker_id = ? "
+                "LIMIT 1",
+                (meeting_id, MEETING_TRIGGER_MODE, sid, meeting_id, sid),
             ).fetchone()
             return row is not None
 

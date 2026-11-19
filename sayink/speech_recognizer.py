@@ -602,6 +602,11 @@ def is_aux_model(model_id: str) -> bool:
     return bool(info and info.get("aux"))
 
 
+def is_asr_model(model_id: str) -> bool:
+    info = get_model_info(model_id)
+    return bool(info and not info.get("aux"))
+
+
 def model_supports(model_id: str, feature: str) -> bool:
     info = get_model_info(model_id)
     return bool(info and feature in info.get("supports", ()))
@@ -879,26 +884,31 @@ def is_model_downloaded(model_id: str) -> bool:
     return bundled or all(_is_usable_model_file(folder / name) for name in info["files"])
 
 
+def is_asr_model_downloaded(model_id: str) -> bool:
+    return bool(model_id and not is_aux_model(model_id) and is_model_downloaded(model_id))
+
+
 def get_downloaded_models() -> list[str]:
-    return [m["id"] for m in MODEL_REGISTRY if is_model_downloaded(m["id"])]
+    return [m["id"] for m in MODEL_REGISTRY if is_asr_model_downloaded(m["id"])]
 
 
 def resolve_startup_model_id(configured_id: str | None) -> str:
     """Choose which STT model to load at startup.
 
-    Uses the saved config when that model is on disk; otherwise prefers
-    DEFAULT_MODEL_ID, then any other downloaded model.
+    Uses the saved config when that ASR model is on disk; otherwise prefers
+    DEFAULT_MODEL_ID, then any other downloaded ASR model. Auxiliary or unknown
+    model IDs fall back to DEFAULT_MODEL_ID when nothing is downloaded.
     """
     configured = (configured_id or "").strip() or DEFAULT_MODEL_ID
 
-    if is_model_downloaded(configured):
+    if is_asr_model_downloaded(configured):
         return configured
 
-    if configured != DEFAULT_MODEL_ID and is_model_downloaded(DEFAULT_MODEL_ID):
-        log.info("配置的模型 %s 未下载，改用默认模型 %s", configured, DEFAULT_MODEL_ID)
+    if configured != DEFAULT_MODEL_ID and is_asr_model_downloaded(DEFAULT_MODEL_ID):
+        log.info("配置的模型 %s 不可用作语音识别或未下载，改用默认模型 %s", configured, DEFAULT_MODEL_ID)
         return DEFAULT_MODEL_ID
 
-    downloaded = get_downloaded_models()
+    downloaded = [mid for mid in get_downloaded_models() if not is_aux_model(mid)]
     if downloaded:
         fallback = downloaded[0]
         log.warning(
@@ -909,6 +919,8 @@ def resolve_startup_model_id(configured_id: str | None) -> str:
         )
         return fallback
 
+    if is_aux_model(configured) or get_model_info(configured) is None:
+        return DEFAULT_MODEL_ID
     return configured
 
 
@@ -1832,6 +1844,9 @@ class SpeechRecognizer(QObject):
         if not model_supports(model_id, SUPPORTS_LANGUAGE):
             language = ""
         language = language_argument(model_id, language) if language else ""
+        if not model_id or is_aux_model(model_id):
+            log.warning("拒绝将非语音识别模型配置为识别引擎: %s", model_id)
+            return
         wanted: LoadTarget = (model_id, num_threads, hotwords or "", language)
 
         loaded = self._effective_loaded_target()
@@ -1852,7 +1867,7 @@ class SpeechRecognizer(QObject):
 
         self._model_id, self._num_threads, self._hotwords, self._language = wanted
 
-        if is_model_downloaded(model_id):
+        if is_asr_model_downloaded(model_id):
             self._load_model()
         else:
             log.warning("语音模型 %s 未下载", model_id)

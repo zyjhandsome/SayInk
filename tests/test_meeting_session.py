@@ -1268,6 +1268,235 @@ class TestSpeakerSessionWiring:
         controller.finalize()
         assert [s.speaker_id for s in controller.store.get_segments(record.id)] == [1, 1, 0]
 
+    def test_finalize_db_failure_keeps_controller_idle_stashes_unsaved_finalize_and_retries_or_discards(
+        self, config, controller, history
+    ):
+        config.set("llm.api_url", "http://localhost:11434/v1")
+        config.set("llm.model_name", "qwen2.5")
+        config.set("meeting.auto_generate", True)
+        # Prevent actual worker dispatch while verifying auto_enqueue in queue table.
+        controller._importing_media = False
+
+        record = controller.begin(MeetingOptions(title="终态写库失败测试"), _caps())
+        long_text = "大家好，我是陈明，今天我们正式同步一下本季度的后端可靠性改造计划与排期。" * 6
+        history.enqueue(_row(record.id, 0, long_text, speaker_id=1, started_at=record.started_at))
+        assert history.flush(timeout=2.0)
+
+        # Reject UPDATE meetings SET status = 'ended' in SQLite.
+        history.enqueue_write(
+            lambda conn: conn.execute(
+                "CREATE TRIGGER reject_finalize BEFORE UPDATE ON meetings "
+                "WHEN NEW.status = 'ended' BEGIN SELECT RAISE(ABORT, 'disk full'); END;"
+            )
+        )
+        assert history.flush(timeout=2.0)
+
+        ended_signals: list[str] = []
+        failed_signals: list[tuple[str, str]] = []
+        errors: list[str] = []
+        queued_signals: list[str] = []
+        controller.meeting_ended.connect(ended_signals.append)
+        controller.finalize_save_failed.connect(lambda mid, msg: failed_signals.append((mid, msg)))
+        controller.error.connect(errors.append)
+        controller.generation_queued.connect(queued_signals.append)
+
+        controller.request_end()
+
+        # Controller MUST return to IDLE and clear current so capture/exit/new meetings never wedge!
+        assert controller.state is MeetingState.IDLE
+        assert controller.current is None
+        assert ended_signals == []
+        assert queued_signals == []
+        assert len(failed_signals) == 1 and failed_signals[0][0] == record.id
+        assert errors
+        assert controller.has_unsaved_finalize() is True
+        assert controller.unsaved_finalize_title() == "终态写库失败测试"
+        assert controller.store.get_meeting(record.id).status == "live"
+
+        # Retry while trigger still active fails honestly and keeps retry snapshot.
+        retry_err = controller.retry_finalize_save()
+        assert isinstance(retry_err, str) and retry_err
+        assert controller.has_unsaved_finalize() is True
+        assert ended_signals == []
+
+        # Drop trigger and retry -> succeeds, updates status=ended, names speaker, and queues minutes!
+        drop_t1 = history.enqueue_write(lambda conn: conn.execute("DROP TRIGGER reject_finalize;"))
+        assert history.flush_ticket(drop_t1, timeout=2.0)
+        controller._generator.generate = lambda _req: None
+        assert controller.retry_finalize_save() is None
+        assert controller.has_unsaved_finalize() is False
+        saved = controller.store.get_meeting(record.id)
+        assert saved is not None and saved.status == "ended"
+        assert ended_signals == [record.id]
+        assert controller.speaker_names(record.id) == {1: "陈明"}
+        assert queued_signals == [record.id]
+
+        # Also verify discard_unsaved_finalize on a second failed finalize.
+        rec2 = controller.begin(MeetingOptions(title="放弃终态重试"), _caps())
+        trig_t2 = history.enqueue_write(
+            lambda conn: conn.execute(
+                "CREATE TRIGGER reject_finalize_2 BEFORE UPDATE ON meetings "
+                "WHEN NEW.status = 'ended' BEGIN SELECT RAISE(ABORT, 'disk full'); END;"
+            )
+        )
+        assert history.flush_ticket(trig_t2, timeout=2.0)
+        controller.request_end()
+        assert controller.has_unsaved_finalize() is True
+        assert controller.discard_unsaved_finalize() is True
+        assert controller.has_unsaved_finalize() is False
+        assert controller.discard_unsaved_finalize() is False
+        drop_t2 = history.enqueue_write(lambda conn: conn.execute("DROP TRIGGER reject_finalize_2;"))
+        assert history.flush_ticket(drop_t2, timeout=2.0)
+        assert rec2.id != record.id
+
+    def test_duration_freezes_at_capture_stop_across_pause_and_long_drain_queue(
+        self, controller, history, monkeypatch
+    ):
+        clock = {"ms": 1_000_000.0}
+        monkeypatch.setattr("sayink.meeting_session.time.time", lambda: clock["ms"] / 1000.0)
+        monkeypatch.setattr("sayink.meeting_store.time.time", lambda: clock["ms"] / 1000.0)
+
+        pending = {"n": 1}
+        controller._pending_segments = lambda: pending["n"]
+
+        rec = controller.begin(MeetingOptions(title="排空不计入时长"), _caps())
+        assert rec.started_at == 1_000_000
+
+        # Speak 4s, pause 5s, speak 6s -> active capture elapsed = 10_000ms (wall = 1_015_000).
+        clock["ms"] = 1_004_000.0
+        controller.pause("临时接电话")
+        clock["ms"] = 1_009_000.0
+        controller.resume()
+        clock["ms"] = 1_015_000.0
+
+        controller.request_end()
+        assert controller.state is MeetingState.DRAINING
+        assert controller.elapsed_ms() == 10_000
+
+        # Advance wall clock by 60s while ASR drains!
+        clock["ms"] = 1_075_000.0
+        assert controller.elapsed_ms() == 10_000
+
+        # Segment with captured_at == 0 fallback arriving at 75s wall time is capped at capture stop (1_015_000).
+        history.enqueue(
+            SegmentRecord(
+                session_id=rec.id,
+                seq=0,
+                created_at=1_075_000,
+                raw_text="排空期才落库的尾句",
+                duration_ms=2_000,
+                trigger_mode="meeting",
+                speaker_id=1,
+                captured_at=0,
+            )
+        )
+        assert history.flush(timeout=2.0)
+
+        pending["n"] = 0
+        controller._poll_drain()
+
+        assert controller.state is MeetingState.IDLE
+        saved = controller.store.get_meeting(rec.id)
+        assert saved is not None
+        assert saved.duration_ms == 10_000
+        segs = controller.store.get_segments(rec.id)
+        assert segs[0].captured_at == 1_008_000  # (1_015_000 - 2_000) - 5_000 pause = 1_008_000 -> end 1_010_000!
+
+    def test_unsaved_media_blocks_entry_points_preserves_options_across_both_retry_branches_and_supports_discard(
+        self, config, controller, history, tmp_path
+    ):
+        from sayink.media_import import MEDIA_SOURCE, MediaTurn, RecognitionResult
+
+        config.set("llm.api_url", "http://localhost:11434/v1")
+        config.set("llm.model_name", "qwen2.5")
+        config.set("meeting.auto_generate", False)
+        controller._generator.generate = lambda _req: None
+
+        wav_a = tmp_path / "alpha.wav"
+        wav_b = tmp_path / "beta.wav"
+        wav_a.write_bytes(b"RIFF")
+        wav_b.write_bytes(b"RIFF")
+
+        custom_start = 1_650_000_000_000
+        custom_glossary = [{"term": "SayInk", "variants": ["say ink"]}]
+        long_turn = MediaTurn(1, 0, 3_000, "这是一段完整的导入录音识别文本，需要验证重试后依然保留自定义时间与模型并触发自动生成。" * 6)
+        res_a = RecognitionResult((long_turn,), cancelled=False, audio_ms=3_000, audio_path=str(wav_a))
+
+        # Block INSERT INTO meetings for media source to force MediaCommitError.
+        trig_m = history.enqueue_write(
+            lambda conn: conn.execute(
+                f"CREATE TRIGGER reject_media BEFORE INSERT ON meetings "
+                f"WHEN NEW.source = '{MEDIA_SOURCE}' BEGIN SELECT RAISE(ABORT, 'db locked'); END;"
+            )
+        )
+        assert history.flush_ticket(trig_m, timeout=2.0)
+
+        controller._importing_media = True
+        controller._media_title = "客户访谈A"
+        controller._media_source_path = str(wav_a)
+        controller._media_options = {
+            "started_at": custom_start,
+            "model_id": "sense-voice",
+            "language": "zh",
+            "auto_generate": True,
+            "explicit_auto_generate": True,
+            "glossary": custom_glossary,
+        }
+        controller._on_media_job_done(res_a)
+
+        assert controller.has_unsaved_media() is True
+        assert controller.unsaved_media_title() == "客户访谈A"
+        block = controller.media_block_reason()
+        assert "客户访谈A" in block
+        assert controller.begin_media_import() == block
+        assert controller.start_media_import(str(wav_b), title="客户访谈B") == block
+
+        # Branch 1 (re-commit after dropping trigger): preserves started_at, model_id, glossary, and auto_generate!
+        drop_m = history.enqueue_write(lambda conn: conn.execute("DROP TRIGGER reject_media;"))
+        assert history.flush_ticket(drop_m, timeout=2.0)
+
+        assert controller.retry_media_save() == ""
+        assert controller.has_unsaved_media() is False
+        saved_a = controller.store.list_meetings()[0]
+        assert saved_a.title == "客户访谈A"
+        assert saved_a.started_at == custom_start
+        assert saved_a.model_id == "sense-voice"
+        assert saved_a.glossary == custom_glossary
+        assert controller.store.queued_generation(saved_a.id) is not None
+
+        # Branch 2 (late-flush recovery): row already landed in DB after initial timeout -> still triggers auto_generate!
+        res_b = RecognitionResult((long_turn,), cancelled=False, audio_ms=3_000, audio_path=str(wav_b))
+        orig_flush = controller.store.flush
+        controller.store.flush = lambda timeout=10.0, **kw: False
+        controller._importing_media = True
+        controller._media_title = "客户访谈B"
+        controller._media_source_path = str(wav_b)
+        controller._media_options = {
+            "started_at": custom_start + 60_000,
+            "model_id": "paraformer",
+            "auto_generate": True,
+            "explicit_auto_generate": True,
+        }
+        controller._on_media_job_done(res_b)
+        assert controller.has_unsaved_media() is True
+        controller.store.flush = orig_flush
+        assert history.flush(timeout=2.0)
+
+        assert controller.retry_media_save() == ""
+        assert controller.has_unsaved_media() is False
+        by_title = {m.title: m for m in controller.store.list_meetings()}
+        assert by_title["客户访谈B"].started_at == custom_start + 60_000
+        assert by_title["客户访谈B"].model_id == "paraformer"
+        assert controller.store.queued_generation(by_title["客户访谈B"].id) is not None
+
+        # Discard escape hatch clears unsaved media and kicks waiting queue!
+        controller._remember_unsaved(res_b, "卡死任务", "stuck-id", str(wav_b), options={"auto_generate": False})
+        assert controller.media_block_reason() != ""
+        assert controller.discard_unsaved_media() is True
+        assert controller.has_unsaved_media() is False
+        assert controller.media_block_reason() == ""
+        assert controller.discard_unsaved_media() is False
+
 
 class TestMeetingPageAuxDownload:
     @pytest.fixture
