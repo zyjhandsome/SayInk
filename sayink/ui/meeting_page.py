@@ -1681,6 +1681,16 @@ class MeetingPage(QWidget):
         self.refresh()
         self._sync_media_buttons()
 
+    def show_start_refusal(self, reason: str) -> None:
+        """Show why starting a meeting was refused in the browse status banner."""
+        text = (reason or "").strip()
+        if not text:
+            return
+        self._set_status(
+            text if text.startswith("无法开始会议") else f"无法开始会议：{text}",
+            tone="error",
+        )
+
     def _preferred_tab_for_meeting(self, meeting_id: str) -> int | None:
         if not meeting_id:
             return None

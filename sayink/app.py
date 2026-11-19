@@ -125,6 +125,9 @@ HISTORY_DISABLED_MEETING_REFUSAL = "历史数据库不可用，会议文字稿�
 BAR_REFRESH_AFTER_STOP_MS = 1200
 MEETING_BAR_REFRESH_MS = 1500
 MEETING_IDLE_REMINDER_SEC = 15 * 60
+# Rolling character cap for floating-bar subtitles during long continuous
+# dictation or meetings (the 480 px bar displays only the trailing ~25 chars).
+STREAM_BAR_MAX_CHARS = 400
 # One event-loop turn after the bar painted 「录音中」 before opening the device.
 CONTINUOUS_START_DELAY_MS = 50
 QUIT_POLL_MS = 80
@@ -375,8 +378,10 @@ class App(QObject):
         self._current_transcription = ""
         self._live_committed = ""
         self._live_raw_committed = ""
+        self._stream_bar_committed = ""
         self._live_inflight = ""
         self._hold_paste_sent = False
+        self._last_meeting_refusal = ""
         self._hold_target = (0, "")
         self._hold_duration_ms = 0
         self._hold_failed_slices = 0
@@ -1775,6 +1780,8 @@ class App(QObject):
         self._floating.show_continuous_stopped(detail)
         self._publish_open_history_session()
         if not pending:
+            self._stream_bar_committed = ""
+            self._live_inflight = ""
             self._maybe_finish_dictation_speakers()
             self._apply_pending_recognition_settings()
             # Re-checks state: a session restarted within the delay keeps its bar.
@@ -2313,6 +2320,8 @@ class App(QObject):
             return
         if self._pending_segment_count() > 0 or self._is_transcribing:
             return
+        self._stream_bar_committed = ""
+        self._live_inflight = ""
         self._finish_dictation_speakers()
 
     def _segment_route_reliable_from_recorder(self) -> bool:
@@ -2575,11 +2584,17 @@ class App(QObject):
     def _clear_live_transcript(self) -> None:
         self._live_committed = ""
         self._live_raw_committed = ""
+        self._stream_bar_committed = ""
         self._live_inflight = ""
         self._floating.clear_live_transcript()
 
     def _show_live_transcript(self) -> None:
-        parts = [self._live_committed, self._live_inflight]
+        committed = (
+            self._safe_attr("_stream_bar_committed", "")
+            if self._is_continuous_mode()
+            else self._safe_attr("_live_committed", "")
+        )
+        parts = [committed, self._safe_attr("_live_inflight", "")]
         text = join_segment_texts(parts)
         if text:
             self._floating.show_live_transcript(text)
@@ -2597,13 +2612,20 @@ class App(QObject):
         piece = (text or "").strip()
         if not piece:
             return
-        if self._live_committed:
-            self._live_committed = join_segment_texts([self._live_committed, piece])
+        if self._is_continuous_mode():
+            prev = self._safe_attr("_stream_bar_committed", "")
+            joined = join_segment_texts([prev, piece]) if prev else piece
+            if len(joined) > STREAM_BAR_MAX_CHARS:
+                joined = joined[-STREAM_BAR_MAX_CHARS:].lstrip()
+            self._stream_bar_committed = joined
         else:
-            self._live_committed = piece
-        self._live_raw_committed = join_segment_texts([
-            self._live_raw_committed, piece if raw_text is None else raw_text,
-        ])
+            if self._live_committed:
+                self._live_committed = join_segment_texts([self._live_committed, piece])
+            else:
+                self._live_committed = piece
+            self._live_raw_committed = join_segment_texts([
+                self._live_raw_committed, piece if raw_text is None else raw_text,
+            ])
         self._live_inflight = ""
         self._show_live_transcript()
 
@@ -3088,6 +3110,10 @@ class App(QObject):
             main = self._main
             if main is not None:
                 main.meeting_panel.show_meeting("")
+                refusal = str(self._safe_attr("_last_meeting_refusal", "") or "").strip()
+                show_refusal = getattr(main.meeting_panel, "show_start_refusal", None)
+                if refusal and callable(show_refusal):
+                    show_refusal(refusal)
 
     def _offer_aux_download(self) -> str:
         """「download」/「start」/「cancel」. Asks only once per install, and only
@@ -3451,6 +3477,7 @@ class App(QObject):
     def start_meeting(self, options: MeetingOptions) -> bool:
         """Switch the audio pipeline to a meeting; False when refused."""
         refusal = self._meeting_refusal(options)
+        self._last_meeting_refusal = refusal
         if refusal:
             log.warning("无法开始会议：%s", refusal)
             self._floating.show_error(refusal)
@@ -3671,6 +3698,7 @@ class App(QObject):
         self._tray.set_activity_tooltip(None)
         dropped = self._unrecognized_meeting_notice
         self._unrecognized_meeting_notice = ""
+        self._clear_live_transcript()
         self._floating.end_meeting_state(dropped)
         # Hand the pipeline back to dictation (segmenter profile included).
         self._embedder = None

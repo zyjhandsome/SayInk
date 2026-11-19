@@ -731,5 +731,139 @@ def test_app_meeting_wires_journal_audio_path_lane_levels_silent_warning_and_pau
             h["recorder"].set_recovery_directory.assert_called_with(None)
         finally:
             app._main = None
+            page._refresh_timer.stop()
             page.close()
             page.deleteLater()
+
+
+def test_back_to_back_meeting_starts_immediately_after_previous_meeting_with_transcript() -> None:
+    """Ending a meeting that recorded speech must never leave stale hold-to-talk
+    state that blocks starting the next meeting in default hotkey mode."""
+    from sayink.ui.meeting_page import PAGE_LIVE, MeetingPage
+
+    with app_harness(
+        {"audio.trigger_mode": "hotkey", "meeting.aux_prompted": True},
+        real_history=True,
+    ) as h:
+        app = h["app"]
+        page = MeetingPage(app._config, app.meeting)
+        page.start_requested.connect(app._on_meeting_page_start)
+        app._main = type("_MainStub", (), {"meeting_panel": page, "isVisible": lambda self: True})()
+        try:
+            assert app._hold_paste_sent is False
+            mid1 = _start(app, h, input_source="mixed", title="第一场会议")
+            app._on_segment_ready(_audio())
+            app._on_final_result("第一场会议的讨论内容。")
+            assert app._live_committed == ""
+            assert app._live_raw_committed == ""
+            assert "第一场会议的讨论内容" in app._stream_bar_committed
+
+            _end_and_wait(app, h, mid1)
+            assert app._live_committed == ""
+            assert app._live_raw_committed == ""
+            assert app._stream_bar_committed == ""
+            assert app._live_inflight == ""
+            assert app._hold_paste_sent is False
+
+            # Immediately start Meeting 2 from the start card (exact user UI path).
+            page.show_start_card()
+            h["floating"].show_error.reset_mock()
+            with patch("sayink.meeting_session.aux_model_path", return_value=None):
+                page._start_from_card()
+
+            assert app.meeting.state is MeetingState.LIVE
+            assert app.meeting.current_id != mid1
+            assert page._stack.currentIndex() == PAGE_LIVE
+            h["floating"].show_error.assert_not_called()
+
+            mid2 = app.meeting.current_id
+            app._on_segment_ready(_audio())
+            app._on_final_result("第二场会议顺利开始。")
+            _end_and_wait(app, h, mid2)
+            assert app._history.flush(timeout=2.0)
+            segs1 = app.meeting.store.get_segments(mid1)
+            segs2 = app.meeting.store.get_segments(mid2)
+            assert [s.raw_text for s in segs1] == ["第一场会议的讨论内容。"]
+            assert [s.raw_text for s in segs2] == ["第二场会议顺利开始。"]
+        finally:
+            app._main = None
+            page._refresh_timer.stop()
+            page.close()
+            page.deleteLater()
+            QCoreApplication.processEvents()
+
+
+def test_long_meeting_stream_bar_subtitle_stays_bounded() -> None:
+    """Long meetings must cap floating-bar rolling text and never grow _live_committed."""
+    from sayink.app import STREAM_BAR_MAX_CHARS
+
+    with app_harness({"audio.trigger_mode": "hotkey"}) as h:
+        app = h["app"]
+        mid = _start(app, h, input_source="mixed", title="一小时长会")
+        for i in range(200):
+            app._on_segment_ready(_audio(0.2))
+            app._on_final_result(f"第{i + 1}段长会议实时字幕测试内容。")
+        assert app._live_committed == ""
+        assert app._live_raw_committed == ""
+        assert 0 < len(app._stream_bar_committed) <= STREAM_BAR_MAX_CHARS
+        assert app._stream_bar_committed.endswith("第200段长会议实时字幕测试内容。")
+        latest_shown = h["floating"].show_live_transcript.call_args.args[0]
+        assert len(latest_shown) <= STREAM_BAR_MAX_CHARS
+        assert latest_shown.endswith("第200段长会议实时字幕测试内容。")
+
+        _end_and_wait(app, h, mid)
+        assert app._stream_bar_committed == ""
+        assert app._live_committed == ""
+
+
+def test_continuous_dictation_then_switch_to_hotkey_does_not_block_meeting() -> None:
+    """Stopping continuous dictation and switching back to hotkey mode must not
+    trip the uncommitted hold-to-talk refusal guard."""
+    with app_harness({"audio.trigger_mode": "continuous", "llm.enabled": False}) as h:
+        app = h["app"]
+        app._on_continuous_hotkey_start()
+        h["recorder"].is_continuous = True
+        app._on_segment_ready(_audio())
+        app._on_final_result("持续转写的一句话")
+        paste_cb = h["paster"].paste_async.call_args.args[1]
+        paste_cb("sent")
+        app._stop_continuous_user_session()
+        h["recorder"].is_continuous = False
+        QCoreApplication.processEvents()
+
+        h["config"].set("audio.trigger_mode", "hotkey")
+        assert app._live_committed == ""
+        assert app._stream_bar_committed == ""
+        assert app._meeting_refusal(MeetingOptions()) == ""
+        mid = _start(app, h, title="切换后的会议")
+        assert app.meeting.state is MeetingState.LIVE
+        _end_and_wait(app, h, mid)
+
+
+def test_refused_meeting_start_from_card_shows_in_page_error_banner() -> None:
+    """When starting a meeting is genuinely refused from the start card, the browse
+    page displays the refusal reason instead of silently hiding the status banner."""
+    from sayink.ui.meeting_page import PAGE_BROWSE, MeetingPage
+
+    with app_harness({"audio.trigger_mode": "hotkey", "meeting.aux_prompted": True}) as h:
+        app = h["app"]
+        page = MeetingPage(app._config, app.meeting)
+        page.start_requested.connect(app._on_meeting_page_start)
+        app._main = type("_MainStub", (), {"meeting_panel": page, "isVisible": lambda self: True})()
+        try:
+            page.show_start_card()
+            h["recorder"].is_recording = True
+            h["recorder"].is_continuous = False
+            with patch("sayink.meeting_session.aux_model_path", return_value=None):
+                page._start_from_card()
+            assert not app.meeting.is_active
+            assert page._stack.currentIndex() == PAGE_BROWSE
+            assert not page._status_label.isHidden()
+            assert "无法开始会议" in page._status_label.text()
+            assert "单次转写" in page._status_label.text()
+        finally:
+            app._main = None
+            page._refresh_timer.stop()
+            page.close()
+            page.deleteLater()
+            QCoreApplication.processEvents()
