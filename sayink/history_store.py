@@ -194,6 +194,10 @@ ranked AS (
     h.polished_text,
     ROW_NUMBER() OVER (PARTITION BY h.session_id ORDER BY h.seq ASC, h.id ASC) AS rn_all,
     ROW_NUMBER() OVER (
+      PARTITION BY h.session_id, (h.target_app != '')
+      ORDER BY h.seq ASC, h.id ASC
+    ) AS rn_app,
+    ROW_NUMBER() OVER (
       PARTITION BY h.session_id, (h.polished_text != ?)
       ORDER BY h.seq ASC, h.id ASC
     ) AS rn_vis
@@ -205,7 +209,7 @@ SELECT
   p.session_created,
   p.segment_count,
   COALESCE(MAX(CASE WHEN r.rn_all = 1 THEN r.source END), '') AS source,
-  COALESCE(MAX(CASE WHEN r.rn_all = 1 THEN r.target_app END), '') AS target_app,
+  COALESCE(MAX(CASE WHEN r.target_app != '' AND r.rn_app = 1 THEN r.target_app END), '') AS target_app,
   COALESCE(
     MAX(CASE WHEN r.polished_text != ? AND r.rn_vis = 1 THEN r.eff_text END),
     ''
@@ -313,6 +317,13 @@ def _is_corruption_error(exc: BaseException) -> bool:
     return "not a database" in msg or "malformed" in msg
 
 
+def _enable_secure_delete(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("PRAGMA secure_delete=FAST;")
+    except sqlite3.OperationalError:
+        conn.execute("PRAGMA secure_delete=ON;")
+
+
 class HistoryStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -327,6 +338,7 @@ class HistoryStore:
         self._init_error: BaseException | None = None
         self._committed_callbacks: list[Callable[[], None]] = []
         self._failed_callbacks: list[Callable[[str], None]] = []
+        self._ticket_settled_callback: Callable[[int, bool, str], None] | None = None
         self._segment_calibrator: Callable[[SegmentRecord], SegmentRecord] | None = None
         self._state_lock = threading.Lock()
         self._fail_lock = self._state_lock
@@ -337,6 +349,7 @@ class HistoryStore:
         self._evicted_failed_watermark = 0
         self._unobserved_failed_tickets: OrderedDict[int, None] = OrderedDict()
         self._unobserved_overflow = False
+        self._session_write_failures: OrderedDict[str, int] = OrderedDict()
         self._write_failures = 0
         self._unflushed_failures = 0
         self._closed = False
@@ -390,6 +403,7 @@ class HistoryStore:
         try:
             conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
             conn.execute("PRAGMA journal_mode=WAL;")
+            _enable_secure_delete(conn)
             current_version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
             conn.executescript(_DDL)
             _ensure_speaker_columns(conn)
@@ -470,6 +484,24 @@ class HistoryStore:
         queued write could not be committed."""
         self._failed_callbacks.append(callback)
 
+    def set_ticket_settled_callback(
+        self, cb: Callable[[int, bool, str], None] | None
+    ) -> None:
+        """Register an async callback ``cb(ticket, ok, error_msg)`` invoked from the
+        writer thread whenever an ``enqueue`` insert operation settles."""
+        with self._state_lock:
+            self._ticket_settled_callback = cb
+
+    def _notify_ticket_settled(self, ticket: int, ok: bool, error_msg: str = "") -> None:
+        with self._state_lock:
+            cb = self._ticket_settled_callback
+        if cb is None or ticket <= 0:
+            return
+        try:
+            cb(int(ticket), bool(ok), str(error_msg or ""))
+        except Exception:
+            logger.exception("HistoryStore ticket settled callback failed")
+
     def _notify_committed(self) -> None:
         for callback in list(self._committed_callbacks):
             try:
@@ -491,6 +523,38 @@ class HistoryStore:
         wall-clock timestamps against active meeting pause intervals."""
         self._segment_calibrator = calibrator
 
+    def _increment_session_failure_locked(self, session_id: str) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        self._session_write_failures[sid] = self._session_write_failures.get(sid, 0) + 1
+        self._session_write_failures.move_to_end(sid)
+        while len(self._session_write_failures) > _MAX_TRACKED_FAILED_TICKETS:
+            self._session_write_failures.popitem(last=False)
+
+    def get_session_write_failures(self, session_id: str) -> int:
+        """Return un-cleared write failure count for ``session_id`` (unaffected by ``flush()``)."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0
+        with self._state_lock:
+            return int(self._session_write_failures.get(sid, 0))
+
+    def clear_session_write_failures(self, session_id: str) -> None:
+        """Clear tracked write failure count for ``session_id``."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        with self._state_lock:
+            self._session_write_failures.pop(sid, None)
+
+    def is_ticket_failed(self, ticket: int) -> bool:
+        """Return True if processed ``ticket`` failed (unaffected by unscoped ``flush()``)."""
+        if ticket <= 0:
+            return True
+        with self._state_lock:
+            return self._is_ticket_failed_locked(int(ticket))
+
     def _enqueue_op(self, op: str, payload: Any) -> int:
         with self._state_lock:
             if self.disabled or self._closed or self._thread is None:
@@ -500,8 +564,16 @@ class HistoryStore:
             self._queue.put((op, payload, ticket))
             return ticket
 
-    def enqueue(self, record: SegmentRecord) -> int:
+    def enqueue(
+        self,
+        record: SegmentRecord,
+        *,
+        deduplicate_session_seq: bool = False,
+    ) -> int:
         if self.disabled or self._closed:
+            if record.session_id:
+                with self._state_lock:
+                    self._increment_session_failure_locked(record.session_id)
             return 0
         calibrator = self._segment_calibrator
         if calibrator is not None and record.trigger_mode == MEETING_TRIGGER_MODE:
@@ -509,9 +581,19 @@ class HistoryStore:
                 record = calibrator(record)
             except Exception:
                 logger.exception("HistoryStore segment calibrator failed")
-        return self._enqueue_op("insert", record)
+        ticket = self._enqueue_op("insert", (record, bool(deduplicate_session_seq)))
+        if ticket == 0 and record.session_id:
+            with self._state_lock:
+                self._increment_session_failure_locked(record.session_id)
+        return ticket
 
     def enqueue_delete_sessions(self, session_ids: list[str]) -> int:
+        if session_ids and not self.disabled and not self._closed:
+            try:
+                if self.recovery_dir.is_dir():
+                    import sayink.audio_recovery  # noqa: F401
+            except Exception:
+                pass
         return self._enqueue_op("delete_sessions", list(session_ids))
 
     def enqueue_delete_all(self) -> int:
@@ -954,9 +1036,12 @@ class HistoryStore:
                            (SELECT source FROM history h2
                             WHERE h2.session_id = summaries.session_id
                             ORDER BY h2.seq ASC LIMIT 1) AS source,
-                           (SELECT target_app FROM history h2
-                            WHERE h2.session_id = summaries.session_id
-                            ORDER BY h2.seq ASC LIMIT 1) AS target_app,
+                           COALESCE(
+                             (SELECT target_app FROM history h2
+                              WHERE h2.session_id = summaries.session_id AND h2.target_app != ''
+                              ORDER BY h2.seq ASC, h2.id ASC LIMIT 1),
+                             ''
+                           ) AS target_app,
                            (SELECT matched_text FROM matching m
                             WHERE m.session_id = summaries.session_id
                             ORDER BY m.seq LIMIT 1)
@@ -1123,6 +1208,7 @@ class HistoryStore:
                 conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
                 conn.execute("PRAGMA journal_mode=WAL;")
                 conn.execute("PRAGMA synchronous=NORMAL;")
+                _enable_secure_delete(conn)
             except Exception as exc:
                 if conn is not None:
                     try:
@@ -1168,9 +1254,10 @@ class HistoryStore:
             if ticket > self._last_processed_ticket:
                 self._last_processed_ticket = ticket
 
-    def _record_write_failure(self, ticket: int = 0) -> None:
+    def _record_write_failure(self, ticket: int = 0, *, session_id: str = "") -> None:
         with self._state_lock:
             self._write_failures += 1
+            self._increment_session_failure_locked(session_id)
             if ticket <= 0:
                 ticket = self._next_op_ticket
                 self._next_op_ticket += 1
@@ -1195,13 +1282,19 @@ class HistoryStore:
     def _dispatch(self, conn: sqlite3.Connection, item: Any) -> None:
         op = ""
         ticket = 0
+        insert_session_id = ""
         try:
             if isinstance(item, tuple) and len(item) == 3:
                 op, payload, ticket = item
             else:
                 op, payload = item
             if op == "insert":
-                self._do_insert(conn, payload)
+                if isinstance(payload, tuple) and len(payload) == 2:
+                    rec, dedup = payload
+                else:
+                    rec, dedup = payload, False
+                insert_session_id = getattr(rec, "session_id", "") or ""
+                self._do_insert(conn, rec, deduplicate_session_seq=bool(dedup))
             elif op == "delete_sessions":
                 self._do_delete_sessions(conn, payload)
             elif op == "delete_all":
@@ -1269,6 +1362,8 @@ class HistoryStore:
                 self._mark_ticket_processed(ticket)
                 return
             self._mark_ticket_processed(ticket)
+            if op == "insert":
+                self._notify_ticket_settled(ticket, True, "")
             self._notify_committed()
         except Exception:
             logger.exception("HistoryStore writer op failed")
@@ -1276,38 +1371,62 @@ class HistoryStore:
                 conn.rollback()
             except Exception:
                 logger.exception("HistoryStore rollback after writer failure failed")
-            self._record_write_failure(ticket)
-            self._notify_failed(
-                WRITE_FAILED_NOTICE if op == "insert" else DELETE_FAILED_NOTICE
-            )
+            self._record_write_failure(ticket, session_id=insert_session_id)
+            err_notice = WRITE_FAILED_NOTICE if op == "insert" else DELETE_FAILED_NOTICE
+            if op == "insert":
+                self._notify_ticket_settled(ticket, False, err_notice)
+            self._notify_failed(err_notice)
 
-    def _do_insert(self, conn: sqlite3.Connection, record: SegmentRecord) -> None:
-        conn.execute(
-            """
-            INSERT INTO history (
-              session_id, seq, created_at, raw_text, polished_text,
-              source, duration_ms, target_app, trigger_mode, model,
-              speaker_id, speaker_route, captured_at, corrected_text, speaker_locked
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                record.session_id,
-                record.seq,
-                record.created_at,
-                record.raw_text,
-                record.polished_text,
-                record.source,
-                record.duration_ms,
-                record.target_app,
-                record.trigger_mode,
-                record.model,
-                int(record.speaker_id),
-                record.speaker_route or "",
-                int(record.captured_at or 0),
-                record.corrected_text,
-                int(record.speaker_locked),
-            ),
+    def _do_insert(
+        self,
+        conn: sqlite3.Connection,
+        record: SegmentRecord,
+        *,
+        deduplicate_session_seq: bool = False,
+    ) -> None:
+        values = (
+            record.session_id,
+            record.seq,
+            record.created_at,
+            record.raw_text,
+            record.polished_text,
+            record.source,
+            record.duration_ms,
+            record.target_app,
+            record.trigger_mode,
+            record.model,
+            int(record.speaker_id),
+            record.speaker_route or "",
+            int(record.captured_at or 0),
+            record.corrected_text,
+            int(record.speaker_locked),
         )
+        if deduplicate_session_seq and record.session_id and record.seq is not None:
+            conn.execute(
+                """
+                INSERT INTO history (
+                  session_id, seq, created_at, raw_text, polished_text,
+                  source, duration_ms, target_app, trigger_mode, model,
+                  speaker_id, speaker_route, captured_at, corrected_text, speaker_locked
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM history WHERE session_id = ? AND seq = ?
+                )
+                """,
+                (*values, record.session_id, int(record.seq)),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO history (
+                  session_id, seq, created_at, raw_text, polished_text,
+                  source, duration_ms, target_app, trigger_mode, model,
+                  speaker_id, speaker_route, captured_at, corrected_text, speaker_locked
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
         conn.commit()
 
     def _cleanup_session_recovery_audio(self, session_ids: list[str]) -> None:
@@ -1371,6 +1490,11 @@ class HistoryStore:
             (MEETING_TRIGGER_MODE,),
         )
         conn.commit()
+        try:
+            conn.execute("VACUUM;")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        except Exception:
+            logger.debug("HistoryStore post-delete_all VACUUM skipped", exc_info=True)
         self._cleanup_session_recovery_audio(deleted_ids)
 
     def _do_cleanup(

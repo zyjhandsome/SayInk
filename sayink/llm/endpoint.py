@@ -188,6 +188,18 @@ def api_url_error(url: str, *, proxy_bypass_suffixes: str = "") -> str | None:
     return INSECURE_URL_ERROR
 
 
+_QUERY_SECRET_RE = re.compile(
+    r"(?i)([?&](?:api[_-]?key|access[_-]?token|x[_-]?api[_-]?key|auth[_-]?token|secret|key|token|sig|signature)=)"
+    r"(?!\[REDACTED\])([^&#\s\"'<>)\],;]+)"
+)
+_URL_USERINFO_INLINE_RE = re.compile(
+    r"(?i)((?:https?|wss?)://)(?!\[REDACTED\]@)([^/\s\"'<>@]+@)"
+)
+_BEARER_SECRET_RE = re.compile(
+    r"(?i)(\bBearer\s+)(?!\[REDACTED\])([^\s\"'<>;&,)\]]+)"
+)
+
+
 def redact_url_userinfo(url: str) -> tuple[str, bool]:
     """Drop ``user:password@`` so credentials are never persisted in URLs."""
     raw = (url or "").strip()
@@ -196,6 +208,15 @@ def redact_url_userinfo(url: str) -> tuple[str, bool]:
         return raw, False
     cleaned = urlunparse((parsed.scheme, request_netloc(parsed), parsed.path, "", parsed.query, parsed.fragment))
     return cleaned, True
+
+
+def redact_url_query_secrets(text: str) -> str:
+    """Redact URL query-string API keys, inline userinfo, and Bearer tokens from log/error strings."""
+    if not text:
+        return text
+    redacted = _QUERY_SECRET_RE.sub(r"\1[REDACTED]", text)
+    redacted = _URL_USERINFO_INLINE_RE.sub(r"\1[REDACTED]@", redacted)
+    return _BEARER_SECRET_RE.sub(r"\1[REDACTED]", redacted)
 
 
 def public_cleartext_note(url: str) -> str:

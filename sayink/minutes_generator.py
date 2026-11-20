@@ -13,7 +13,7 @@ import math
 import re
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Sequence
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
@@ -46,7 +46,13 @@ from sayink.minutes_render import (
     apply_speaker_names, clear_timeline, extract_json, render_markdown, strip_clock_citations,
 )
 from sayink.text_polisher import (
-    LLMCancelled, LLMResponseError, LLMTruncatedError, api_url_error, strip_model_thinking, http_client_options,
+    LLMCancelled,
+    LLMResponseError,
+    LLMTruncatedError,
+    api_url_error,
+    http_client_options,
+    redact_url_query_secrets,
+    strip_model_thinking,
 )
 from sayink.llm_transport import (
     Cancellation, LLMBrokenStream, LLMContextError, LLMDeadlineError, completion, is_billing_error,
@@ -96,15 +102,23 @@ class MinutesRequest:
     speakers_distinguished: bool = True
     timestamps_available: bool = True
     label_unknown: bool = True
+    include_user_notes: bool = True
+
+
+def _effective_context(request: MinutesRequest) -> MeetingContext:
+    if request.include_user_notes or not request.context.notes_user:
+        return request.context
+    return replace(request.context, notes_user="")
 
 
 def request_fingerprint(request: MinutesRequest) -> str:
     """Invalidate checkpoints whenever any generation input or contract changes."""
+    eff_context = _effective_context(request)
     data = {
         "version": 4, "api_url": request.api_url.rstrip("/"),
         "credential": hashlib.sha256(request.api_key.encode()).hexdigest(),
         "model": request.model_name, "template": asdict(request.template),
-        "context": asdict(request.context), "lines": [asdict(line) for line in request.lines],
+        "context": asdict(eff_context), "lines": [asdict(line) for line in request.lines],
         "names": request.speaker_names,
         "language": "" if request.template.is_refinement else request.output_language,
         "chunk_chars": request.chunk_chars, "context_tokens": request.context_window_tokens,
@@ -123,6 +137,8 @@ def request_fingerprint(request: MinutesRequest) -> str:
             REFINE_SYSTEM_PROMPT,
         ],
     }
+    if not request.include_user_notes:
+        data["include_user_notes"] = False
     if (
         not request.speakers_distinguished
         or not request.timestamps_available
@@ -419,14 +435,15 @@ class MinutesWorker(QThread):
     # -- pipeline ----------------------------------------------------------
 
     def _chunk_context(self, index: int, total: int, *, spans: list[tuple[int, int]] | None = None) -> MeetingContext:
+        eff_ctx = _effective_context(self._req)
         if total <= 1:
-            return self._req.context
+            return eff_ctx
         span_list = spans if spans is not None else self._chunk_spans
         if index < len(span_list):
             start_ms, end_ms = span_list[index]
         else:
             start_ms, end_ms = 0, 10**12
-        return _slice_context_for_span(self._req.context, start_ms, end_ms, chunked=True)
+        return _slice_context_for_span(eff_ctx, start_ms, end_ms, chunked=True)
 
     def _chunk_prompt(self, chunks, index, *, spans: list[tuple[int, int]] | None = None):
         context = ""
@@ -439,11 +456,13 @@ class MinutesWorker(QThread):
             chunk_ctx,
             chunks[index],
             chunk_label=f"第 {index + 1}/{len(chunks)} 段" if len(chunks) > 1 else "",
+            include_user_notes=self._req.include_user_notes,
         )
 
     def _plan_chunks(self, system):
         size = max(64, int(self._req.chunk_chars))
         merge_system: str | None = None
+        eff_ctx = _effective_context(self._req)
         while True:
             try:
                 chunk_items = chunk_transcript_with_spans(
@@ -463,7 +482,10 @@ class MinutesWorker(QThread):
                         speakers_distinguished=self._req.speakers_distinguished,
                         timestamps_available=self._req.timestamps_available,
                     )
-                if not self._fits(merge_system, build_merge_prompt(self._req.context, [{"summary": ""}])):
+                if not self._fits(
+                    merge_system,
+                    build_merge_prompt(eff_ctx, [{"summary": ""}], include_user_notes=self._req.include_user_notes),
+                ):
                     raise LLMContextError("提示词、笔记或术语表过长，请缩短内容或调整模型上下文设置")
             if all(self._fits(system, self._chunk_prompt(chunks, i, spans=spans)) for i in range(len(chunks))):
                 self._chunk_spans = spans
@@ -484,7 +506,8 @@ class MinutesWorker(QThread):
         allow_markdown_fallback: bool = False,
         chunk_context: MeetingContext | None = None,
     ):
-        active_ctx = chunk_context if chunk_context is not None else self._req.context
+        eff_ctx = _effective_context(self._req)
+        active_ctx = chunk_context if chunk_context is not None else eff_ctx
         try:
             raw = await self._chat(client, httpx, system, prompt)
         except (LLMContextError, LLMTruncatedError):
@@ -498,15 +521,15 @@ class MinutesWorker(QThread):
             right_ctx = _slice_context_for_span(active_ctx, right_start, right_end, chunked=True)
             left = await self._summarize(
                 client, httpx, system, left_text,
-                build_user_prompt(left_ctx, left_text), depth + 1,
+                build_user_prompt(left_ctx, left_text, include_user_notes=self._req.include_user_notes), depth + 1,
                 allow_markdown_fallback=True, chunk_context=left_ctx,
             )
             right = await self._summarize(
                 client, httpx, system, right_text,
-                build_user_prompt(right_ctx, right_text), depth + 1,
+                build_user_prompt(right_ctx, right_text, include_user_notes=self._req.include_user_notes), depth + 1,
                 allow_markdown_fallback=True, chunk_context=right_ctx,
             )
-            merge_ctx = active_ctx if chunk_context is not None else self._req.context
+            merge_ctx = active_ctx if chunk_context is not None else eff_ctx
             payload = await self._merge(client, httpx, [left, right], merge_context=merge_ctx)
             self._remember(system, prompt, json.dumps(payload, ensure_ascii=False))
             return payload
@@ -541,7 +564,9 @@ class MinutesWorker(QThread):
                 speakers_distinguished=self._req.speakers_distinguished,
                 timestamps_available=self._req.timestamps_available,
             )
-            md_user = build_user_prompt(chunk_ctx, chunk_text)
+            md_user = build_user_prompt(
+                chunk_ctx, chunk_text, include_user_notes=self._req.include_user_notes
+            )
             md_raw = await self._chat(client, httpx, md_system, md_user)
             try:
                 md_text = validate_markdown(md_raw)
@@ -550,7 +575,8 @@ class MinutesWorker(QThread):
         return validate_minutes(_markdown_to_partial(md_text, self._req.template))
 
     async def _merge(self, client, httpx, partials, *, merge_context: MeetingContext | None = None):
-        ctx = merge_context if merge_context is not None else self._req.context
+        ctx = merge_context if merge_context is not None else _effective_context(self._req)
+        inc_notes = self._req.include_user_notes
         system = build_merge_system_prompt(
             self._req.template, output_language=self._req.output_language,
             speakers_distinguished=self._req.speakers_distinguished,
@@ -562,7 +588,9 @@ class MinutesWorker(QThread):
             level += 1
             groups, current = [], []
             for part in partials:
-                if current and not self._fits(system, build_merge_prompt(ctx, current + [part])):
+                if current and not self._fits(
+                    system, build_merge_prompt(ctx, current + [part], include_user_notes=inc_notes)
+                ):
                     groups.append(current)
                     current = []
                 current.append(part)
@@ -585,7 +613,7 @@ class MinutesWorker(QThread):
                     continue
                 self._stage = f"正在合并各段纪要… 第 {level} 轮 {index + 1}/{len(groups)} 组"
                 self.progress.emit(self._stage)
-                prompt = build_merge_prompt(ctx, group)
+                prompt = build_merge_prompt(ctx, group, include_user_notes=inc_notes)
                 try:
                     raw = await self._chat(client, httpx, system, prompt)
                     payload = validate_minutes(extract_json(raw))
@@ -611,6 +639,15 @@ class MinutesWorker(QThread):
                 ctx,
                 template=self._req.template,
                 timestamps_available=self._req.timestamps_available,
+            )
+        elif merge_context is None and inc_notes and ctx.notes_user.strip():
+            result = _preserve_unmerged_user_context(
+                result,
+                ctx,
+                template=self._req.template,
+                timestamps_available=self._req.timestamps_available,
+                include_marks=False,
+                mark_unverified=True,
             )
         return result
 
@@ -656,8 +693,9 @@ class MinutesWorker(QThread):
                     return
             except ImportError:
                 pass
-            log.error("纪要生成失败: %s", exc)
-            self.error.emit(f"{action}失败: {exc}")
+            safe_err = redact_url_query_secrets(str(exc))
+            log.error("纪要生成失败: %s", safe_err)
+            self.error.emit(f"{action}失败: {safe_err}")
 
     async def _run_pipeline(self, httpx, started):
         req = self._req
@@ -704,7 +742,11 @@ class MinutesWorker(QThread):
                             speakers_distinguished=req.speakers_distinguished,
                             timestamps_available=req.timestamps_available,
                         ),
-                        build_user_prompt(req.context, chunks[0]),
+                        build_user_prompt(
+                            _effective_context(req),
+                            chunks[0],
+                            include_user_notes=req.include_user_notes,
+                        ),
                     )
                     markdown_text = validate_markdown(markdown_text)
             else:
@@ -1032,34 +1074,43 @@ def _preserve_unmerged_user_context(
     *,
     template: MinutesTemplate | None = None,
     timestamps_available: bool = True,
+    include_marks: bool = True,
+    mark_unverified: bool = False,
 ) -> dict[str, Any]:
-    if context is None or (not context.notes_user.strip() and not context.marks):
+    if context is None or (not context.notes_user.strip() and (not include_marks or not context.marks)):
         return merged
     haystack = _collect_merged_fact_haystack(merged)
     raw_blob = json.dumps(merged, ensure_ascii=False)
     uncovered: list[dict[str, str]] = []
     seen_norms: set[str] = set()
 
-    for offset_ms, note in context.marks:
-        clean_note = str(note or "").strip()
-        ts_str = format_timestamp(offset_ms) if timestamps_available else ""
-        if clean_note:
-            norm = _FACT_NORM_RE.sub("", clean_note).casefold()
-            if norm and norm not in haystack and norm not in seen_norms:
-                seen_norms.add(norm)
-                uncovered.append({"text": f"标记：{clean_note}", "ts": ts_str})
-        elif ts_str and ts_str not in raw_blob and ts_str not in seen_norms:
-            seen_norms.add(ts_str)
-            uncovered.append({"text": "用户重点标记时刻", "ts": ts_str})
+    if include_marks:
+        for offset_ms, note in context.marks:
+            clean_note = str(note or "").strip()
+            ts_str = format_timestamp(offset_ms) if timestamps_available else ""
+            if clean_note:
+                norm = _FACT_NORM_RE.sub("", clean_note).casefold()
+                if norm and norm not in haystack and norm not in seen_norms:
+                    seen_norms.add(norm)
+                    uncovered.append({"text": f"标记：{clean_note}", "ts": ts_str})
+            elif ts_str and ts_str not in raw_blob and ts_str not in seen_norms:
+                seen_norms.add(ts_str)
+                uncovered.append({"text": "用户重点标记时刻", "ts": ts_str})
 
     for raw_line in context.notes_user.splitlines():
         clean_line = re.sub(r"^[-*+•]\s+", "", raw_line.strip()).strip()
         if not clean_line:
             continue
-        norm = _FACT_NORM_RE.sub("", clean_line).casefold()
+        base_line = re.sub(r"（待核对）\s*$", "", clean_line).strip() or clean_line
+        norm = _FACT_NORM_RE.sub("", base_line).casefold()
         if norm and norm not in haystack and norm not in seen_norms:
             seen_norms.add(norm)
-            uncovered.append({"text": clean_line, "ts": ""})
+            display_line = (
+                f"{clean_line}（待核对）"
+                if mark_unverified and "待核对" not in clean_line
+                else clean_line
+            )
+            uncovered.append({"text": display_line, "ts": ""})
 
     if not uncovered:
         return merged
@@ -1149,8 +1200,15 @@ class MinutesGenerator(QObject):
     def is_running(self) -> bool:
         return self._worker is not None and self._worker.isRunning()
 
-    def generate(self, request: MinutesRequest) -> None:
+    def generate(
+        self,
+        request: MinutesRequest,
+        *,
+        include_user_notes: bool | None = None,
+    ) -> None:
         self.cancel()
+        if include_user_notes is not None and request.include_user_notes != bool(include_user_notes):
+            request = replace(request, include_user_notes=bool(include_user_notes))
         worker = MinutesWorker(request)
         worker.progress.connect(self._on_progress)
         worker.preview.connect(self._on_preview)

@@ -9,8 +9,9 @@ from typing import Any
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
-from sayink.asr_correction import CORRECTION_PROMPT, correction_user_prompt
+from sayink.asr_correction import CORRECTION_PROMPT, correction_user_prompt, glossary_prompt_lines
 from sayink.contracts import AppStyleRule
+from sayink.llm.endpoint import redact_url_query_secrets
 from sayink.llm import (
     API_ADDRESS_HINT,
     CHAT_RETRY_DELAY_SEC,
@@ -75,22 +76,86 @@ from sayink.llm import (
 log = logging.getLogger("SayInk")
 
 _TRANSCRIPT_WRAPPER_RE = re.compile(
-    r"^\s*<transcript>\s*(.*?)\s*</transcript>\s*$", re.DOTALL | re.IGNORECASE
+    r"^\s*<(transcript|selection)>\s*(.*?)\s*</\1>\s*$", re.DOTALL | re.IGNORECASE
+)
+_STRAY_SELECTION_TAG_RE = re.compile(r"</?selection>", re.IGNORECASE)
+_REWRITE_REFUSAL_MARKERS: tuple[str, ...] = (
+    "抱歉，我无法",
+    "很抱歉，我无法",
+    "抱歉，我不能",
+    "很抱歉，我不能",
+    "对不起，我不能",
+    "对不起，我无法",
+    "我无法完成",
+    "我无法满足",
+    "我无法协助",
+    "我不能协助",
+    "作为ai",
+    "作为一个ai",
+    "作为人工智能",
+    "作为语言模型",
+    "作为大语言模型",
+    "as an ai",
+    "as a language model",
+    "as an artificial intelligence",
+    "i cannot fulfill",
+    "i can't fulfill",
+    "i am unable to fulfill",
+    "i cannot comply",
+    "i can't comply",
+    "i cannot assist with",
+    "i can't assist with",
+    "i'm sorry, i cannot",
+    "i am sorry, i cannot",
+    "sorry, i cannot fulfill",
+    "sorry, i can't fulfill",
 )
 
 
-def polish_user_prompt(text: str) -> str:
+def polish_user_prompt(text: str, glossary: Any = ()) -> str:
     """Wrap dictated speech in explicit XML tags so questions are edited, not answered."""
+    lines = glossary_prompt_lines(glossary)
+    if lines:
+        glossary_block = (
+            "术语表（若语音内容涉及以下专有名词或同音误写，请按标准写法输出）：\n"
+            + "\n".join(f"- {line}" for line in lines)
+            + "\n\n"
+        )
+        return f"{glossary_block}<transcript>\n{text}\n</transcript>"
     return f"<transcript>\n{text}\n</transcript>"
 
 
 def strip_transcript_tags(text: str) -> str:
-    """Unwrap an outer ``<transcript>...</transcript>`` envelope if echoed by the model."""
+    """Unwrap outer ``<transcript>...</transcript>`` or ``<selection>...</selection>`` envelopes."""
     cleaned = (text or "").strip()
-    match = _TRANSCRIPT_WRAPPER_RE.match(cleaned)
-    if match:
-        return match.group(1).strip()
-    return cleaned
+    while True:
+        match = _TRANSCRIPT_WRAPPER_RE.match(cleaned)
+        if not match:
+            return cleaned
+        cleaned = match.group(2).strip()
+
+
+def _normalize_refusal_probe(text: str) -> str:
+    collapsed = re.sub(r"\s+", " ", (text or "").strip().casefold())
+    normalized = re.sub(r"\s*[,，:：]\s*", "，", collapsed)
+    return normalized.replace("作为 ai", "作为ai").replace("作为一个 ai", "作为一个ai")
+
+
+def validate_rewrite_output(raw_output: str, original_selection: str) -> tuple[str, str | None]:
+    """Strip wrapper tags and reject empty or obvious LLM meta-refusal rewrite outputs."""
+    cleaned = strip_transcript_tags(raw_output)
+    orig = original_selection or ""
+    if "<selection" not in orig.casefold() and "</selection>" not in orig.casefold():
+        cleaned = _STRAY_SELECTION_TAG_RE.sub("", cleaned).strip()
+    if not cleaned:
+        return "", "改写结果为空，原选区未改动"
+    probe_out = _normalize_refusal_probe(cleaned)
+    probe_orig = _normalize_refusal_probe(orig)
+    for marker in _REWRITE_REFUSAL_MARKERS:
+        norm_marker = _normalize_refusal_probe(marker)
+        if norm_marker and norm_marker in probe_out and norm_marker not in probe_orig:
+            return cleaned, "模型拒绝了改写请求，原选区未改动"
+    return cleaned, None
 
 
 _LEGACY_POLISH_PROMPT = (
@@ -412,7 +477,7 @@ class PolishWorker(QThread):
     def user_message(self) -> str:
         if self.is_correction:
             return correction_user_prompt(self._text, self._glossary, self._context)
-        return polish_user_prompt(self._text)
+        return polish_user_prompt(self._text, self._glossary)
 
     def request_options(self) -> dict[str, Any]:
         extra = thinking_payload_extra(self._api_url, self._model_name, "disabled")
@@ -487,8 +552,9 @@ class PolishWorker(QThread):
             log.error("LLM %s超时", self._action_label)
             self.error.emit(f"{self._action_label}超时，请稍后重试")
         except Exception as exc:
-            log.error("LLM %s失败: %s", self._action_label, exc)
-            self.error.emit(f"{self._action_label}失败: {exc}")
+            safe_err = redact_url_query_secrets(str(exc))
+            log.error("LLM %s失败: %s", self._action_label, safe_err)
+            self.error.emit(f"{self._action_label}失败: {safe_err}")
 
 
 class TextPolisher(QObject):
@@ -501,6 +567,7 @@ class TextPolisher(QObject):
         super().__init__(parent)
         self._worker: PolishWorker | None = None
         self._rewrite_worker: PolishWorker | None = None
+        self._rewrite_selection: str = ""
         self._workers: list[PolishWorker] = []
 
     @property
@@ -567,6 +634,7 @@ class TextPolisher(QObject):
     ) -> None:
         """Run an instruction-driven rewrite of ``selected_text`` in the background."""
         self.cancel_rewrite()
+        self._rewrite_selection = selected_text
         prompt_payload = rewrite_user_prompt(selected_text, instruction)
         worker = PolishWorker(
             api_url,
@@ -636,7 +704,11 @@ class TextPolisher(QObject):
     def _on_rewrite_result(self, rewritten_text: str) -> None:
         if self._rewrite_worker is None or self.sender() is not self._rewrite_worker:
             return
-        self.rewrite_complete.emit(rewritten_text)
+        cleaned, refusal_err = validate_rewrite_output(rewritten_text, self._rewrite_selection)
+        if refusal_err:
+            self.rewrite_error.emit(refusal_err)
+            return
+        self.rewrite_complete.emit(cleaned)
 
     def _on_rewrite_error(self, error_msg: str) -> None:
         if self._rewrite_worker is None or self.sender() is not self._rewrite_worker:
@@ -727,10 +799,12 @@ __all__ = [
     "polish_user_prompt",
     "prompt_config_key",
     "public_cleartext_note",
+    "redact_url_query_secrets",
     "redact_url_userinfo",
     "stream_chat_completion",
     "strip_model_thinking",
     "strip_transcript_tags",
     "system_prompt_for",
     "thinking_payload_extra",
+    "validate_rewrite_output",
 ]

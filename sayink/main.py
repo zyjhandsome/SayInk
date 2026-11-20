@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import time
 import atexit
 import logging
@@ -511,6 +512,86 @@ LOG_FILE_MAX_BYTES = 1_000_000
 LOG_FILE_BACKUPS = 3
 _crash_file = None
 
+_LOG_QUERY_SECRET_RE = re.compile(
+    r"(?i)([?&](?:api[_-]?key|access[_-]?token|x[_-]?api[_-]?key|auth[_-]?token|secret|key|token|sig|signature)=)"
+    r"(?!\[REDACTED\])([^&#\s\"'<>)\],;]+)"
+)
+_LOG_KV_API_KEY_RE = re.compile(
+    r"(?i)(\b(?:api[_-]?key|x[_-]?api[_-]?key)\s*[:=]\s*['\"]?)(?!\[REDACTED\])([^\s\"'<>;&,)\]]+)"
+)
+_LOG_USERINFO_RE = re.compile(r"(?i)((?:https?|wss?)://)(?!\[REDACTED\]@)([^/\s\"'<>@]+@)")
+_LOG_BEARER_RE = re.compile(r"(?i)(\bBearer\s+)(?!\[REDACTED\])([^\s\"'<>;&,)\]]+)")
+
+
+def redact_log_secrets(text: str) -> str:
+    """Redact Bearer tokens, URL query secrets, and inline API keys from log strings."""
+    if not text:
+        return text
+    out = _LOG_QUERY_SECRET_RE.sub(r"\1[REDACTED]", text)
+    out = _LOG_KV_API_KEY_RE.sub(r"\1[REDACTED]", out)
+    out = _LOG_USERINFO_RE.sub(r"\1[REDACTED]@", out)
+    return _LOG_BEARER_RE.sub(r"\1[REDACTED]", out)
+
+
+class SecretRedactingFilter(logging.Filter):
+    """Scrub credentials from formatted log messages and exception tracebacks before output."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            rendered = record.getMessage()
+            redacted = redact_log_secrets(rendered)
+            if redacted != rendered:
+                record.msg = redacted
+                record.args = ()
+            if record.exc_info and record.exc_info[1] is not None and not record.exc_text:
+                exc_str = str(record.exc_info[1])
+                if redact_log_secrets(exc_str) != exc_str:
+                    record.exc_text = redact_log_secrets(
+                        logging.Formatter().formatException(record.exc_info)
+                    )
+                    record.exc_info = None
+            elif record.exc_text:
+                record.exc_text = redact_log_secrets(record.exc_text)
+        except Exception:
+            pass
+        return True
+
+
+def _http_wire_logging_enabled() -> bool:
+    val = os.environ.get("SAYINK_LOG_HTTP_WIRE", "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def sweep_playback_temp_dir(
+    temp_root: str | os.PathLike[str] | None = None,
+    *,
+    max_age_s: float = 0.0,
+) -> int:
+    """Remove leftover meeting playback ``.wav`` copies in ``%TEMP%\\sayink-playback``."""
+    import tempfile
+    from pathlib import Path
+
+    removed = 0
+    try:
+        base = Path(temp_root) if temp_root is not None else Path(tempfile.gettempdir())
+        playback_dir = base / "sayink-playback"
+        if not playback_dir.is_dir() or playback_dir.is_symlink():
+            return 0
+        cutoff = time.time() - float(max_age_s) if max_age_s > 0 else None
+        for wav_file in list(playback_dir.glob("*.wav")):
+            try:
+                if not wav_file.is_file() or wav_file.is_symlink():
+                    continue
+                if cutoff is not None and wav_file.stat().st_mtime >= cutoff:
+                    continue
+                wav_file.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return removed
+
 
 def log_dir() -> str:
     from sayink.user_data import user_data_dir
@@ -561,9 +642,20 @@ def setup_logging(directory: str | None = None) -> str | None:
         console = logging.StreamHandler(sys.stderr)
         console.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
         handlers.append(console)
+    secret_filter = SecretRedactingFilter()
+    for handler in handlers:
+        handler.addFilter(secret_filter)
     level = _configured_log_level()
     logging.basicConfig(level=level, handlers=handlers, force=True)
-    if level > logging.DEBUG:
+    root_logger = logging.getLogger()
+    root_logger.filters[:] = [
+        f for f in root_logger.filters if not isinstance(f, SecretRedactingFilter)
+    ]
+    root_logger.addFilter(secret_filter)
+    if _http_wire_logging_enabled():
+        logging.getLogger("httpx").setLevel(logging.NOTSET)
+        logging.getLogger("httpcore").setLevel(logging.NOTSET)
+    else:
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("httpcore").setLevel(logging.WARNING)
     return log_path
@@ -606,6 +698,9 @@ def main():
         sys.exit(0)
 
     atexit.register(cleanup_lock)
+    swept_wavs = sweep_playback_temp_dir()
+    if swept_wavs:
+        log.info("启动清理遗留回放临时音频 %d 个", swept_wavs)
     log.info("SayInk 启动中 (silent=%s)...", silent_launch)
 
     if sys.platform == "win32":
