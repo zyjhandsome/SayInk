@@ -80,7 +80,7 @@ def style_message_box(
         return
     from sayink.ui import design_tokens as tok
     from sayink.ui import settings_styles as ss
-    from sayink.ui.theme import apply_window_dark_titlebar
+    from sayink.ui.theme import sync_window_dark_titlebar
 
     localize_message_box_buttons(box)
     resolved_primary = _resolve_primary_button(box, primary)
@@ -99,7 +99,7 @@ def style_message_box(
         btn.setMinimumWidth(68)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setStyleSheet(primary_css if btn is resolved_primary else ss.BTN_GHOST_SM)
-    apply_window_dark_titlebar(box, axis == "dark")
+    sync_window_dark_titlebar(box, axis == "dark")
 
 
 def confirm_box(
@@ -111,6 +111,7 @@ def confirm_box(
     cancel: str = "取消",
     default_accept: bool = False,
     destructive: bool = False,
+    informative_text: str = "",
 ) -> tuple[QMessageBox, object]:
     """Build a question. The second value is the accept button.
 
@@ -120,6 +121,8 @@ def confirm_box(
     box = QMessageBox(parent)
     box.setWindowTitle(title)
     box.setText(text)
+    if informative_text:
+        box.setInformativeText(informative_text)
     box.setIcon(QMessageBox.Icon.Warning if destructive else QMessageBox.Icon.Question)
     role = QMessageBox.ButtonRole.DestructiveRole if destructive else QMessageBox.ButtonRole.AcceptRole
     accept_btn = box.addButton(accept, role)
@@ -182,13 +185,13 @@ def text_prompt_box(
         + f"\nQDialog {{ background: {tok.BG}; color: {tok.TEXT}; }}"
     )
     layout = QVBoxLayout(dialog)
-    message = QLabel(label)
+    message = QLabel(label, dialog)
     message.setWordWrap(True)
     layout.addWidget(message)
-    edit = QLineEdit(text)
+    edit = QLineEdit(text, dialog)
     edit.setAccessibleName(title)
     layout.addWidget(edit)
-    error_label = QLabel("")
+    error_label = QLabel("", dialog)
     error_label.setObjectName("promptErrorLabel")
     error_label.setWordWrap(True)
     error_label.setStyleSheet(
@@ -198,7 +201,7 @@ def text_prompt_box(
     error_label.hide()
     layout.addWidget(error_label)
     dialog._error_label = error_label  # type: ignore[attr-defined]
-    buttons = QDialogButtonBox()
+    buttons = QDialogButtonBox(dialog)
     save = buttons.addButton("保存", QDialogButtonBox.ButtonRole.AcceptRole)
     cancel = buttons.addButton("取消", QDialogButtonBox.ButtonRole.RejectRole)
     save.setStyleSheet(settings_styles.BTN_PRIMARY)
@@ -239,7 +242,7 @@ def text_prompt_box(
     layout.addWidget(buttons)
 
     def _reapply_prompt_theme() -> None:
-        from sayink.ui.theme import apply_window_dark_titlebar
+        from sayink.ui.theme import sync_window_dark_titlebar
 
         dialog.setStyleSheet(
             settings_styles.WINDOW_CSS
@@ -257,7 +260,7 @@ def text_prompt_box(
                 f" border: 2px solid {tok.RED_TEXT}; border-radius: {tok.RADIUS_MD}px;"
                 " padding: 5px 11px; }"
             )
-        apply_window_dark_titlebar(dialog, getattr(tok, "ACTIVE_THEME", "light") == "dark")
+        sync_window_dark_titlebar(dialog, getattr(tok, "ACTIVE_THEME", "light") == "dark")
 
     dialog.reapply_theme = _reapply_prompt_theme  # type: ignore[attr-defined]
     _reapply_prompt_theme()

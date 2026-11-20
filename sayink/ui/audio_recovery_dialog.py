@@ -25,7 +25,7 @@ from sayink.ui import settings_styles
 from sayink.ui.native_dialog import native_file_dialog
 from sayink.ui.prompts import confirm
 from sayink.ui.settings_components import ElidedComboBox, _qcolor
-from sayink.ui.theme import apply_window_dark_titlebar
+from sayink.ui.theme import sync_window_dark_titlebar
 
 
 class RecoveryWorker(QThread):
@@ -395,7 +395,7 @@ class AudioRecoveryDialog(QDialog):
         palette = self.output.palette()
         palette.setColor(QPalette.ColorRole.PlaceholderText, _qcolor(tok.TEXT_DIM))
         self.output.setPalette(palette)
-        apply_window_dark_titlebar(self, getattr(tok, "ACTIVE_THEME", "light") == "dark")
+        sync_window_dark_titlebar(self, getattr(tok, "ACTIVE_THEME", "light") == "dark")
 
     def _sync_save_enabled(self) -> None:
         has_text = bool(self.output.toPlainText().strip())

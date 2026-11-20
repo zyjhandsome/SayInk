@@ -521,7 +521,6 @@ def confirm_export_overwrite_if_adjusted(page, raw_path: str, final_path: str) -
             cancel="取消",
             destructive=True,
         )
-        mp._style_dialog_box(box, danger_btn=overwrite)
         with mp._quiet_tooltips(page):
             box.exec()
         return box.clickedButton() == overwrite

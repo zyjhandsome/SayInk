@@ -458,6 +458,7 @@ def warm_win32_accessibility() -> None:
             ]
 
         probe = QWidget(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        probe.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
         probe.setAccessibleName("SayInk")
         hwnd = int(probe.winId() or 0)
         if not hwnd:

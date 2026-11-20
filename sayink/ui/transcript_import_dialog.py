@@ -32,7 +32,7 @@ from sayink.ui.native_dialog import native_file_dialog
 from sayink.ui.prompts import style_message_box
 from sayink.ui import settings_styles as ss
 from sayink.ui.settings_components import ThemedCheckBox
-from sayink.ui.theme import apply_window_dark_titlebar
+from sayink.ui.theme import sync_window_dark_titlebar
 
 _MAX_CHARS = 2_000_000
 _MAX_FILE_BYTES = _MAX_CHARS * 4
@@ -362,7 +362,7 @@ class TranscriptImportDialog(QDialog):
         self._style_preview(error=bool(self._file_error) or text_len > _MAX_CHARS)
         if self._drag_over:
             self._paint_drag_border()
-        apply_window_dark_titlebar(self, getattr(tok, "ACTIVE_THEME", "light") == "dark")
+        sync_window_dark_titlebar(self, getattr(tok, "ACTIVE_THEME", "light") == "dark")
 
     def _style_preview(self, *, error: bool) -> None:
         color = tok.RED if error else tok.TEXT

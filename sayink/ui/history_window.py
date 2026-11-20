@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 import html
 import logging
@@ -98,6 +99,19 @@ def release_list_item_widgets(list_widget: QListWidget, host: QWidget) -> None:
         widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
         widget.hide()
     list_widget.clear()
+
+
+@contextmanager
+def freeze_widget_updates(widget: QWidget):
+    """Coalesce multi-step row/pane mutations into a single paint pass when visible."""
+    freeze = widget.isVisible() and widget.updatesEnabled()
+    if freeze:
+        widget.setUpdatesEnabled(False)
+    try:
+        yield
+    finally:
+        if freeze:
+            widget.setUpdatesEnabled(True)
 
 
 class _ElidedLabel(QLabel):
@@ -988,30 +1002,31 @@ class HistoryWindow(QWidget):
         self._copy_btn.setToolTip(("复制识别原文" if raw_view else "复制润色后的全文") + shortcut)
 
     def _set_selection_mode(self, enabled: bool) -> None:
-        self._selection_mode = enabled
-        self._selection_mode_btn.blockSignals(True)
-        self._selection_mode_btn.setChecked(enabled)
-        self._selection_mode_btn.blockSignals(False)
-        self._selection_mode_btn.setText("完成" if enabled else "选择")
-        # Keep native Ctrl / Shift range selection in both modes. In batch
-        # mode, an unmodified row click (or Space) also toggles its checkbox.
-        self._session_list.batch_mode = enabled
-        if not enabled:
-            selected = self._session_list.selectedItems()
-            current = self._session_list.currentItem()
-            keep = current if current in selected else next(iter(selected or self.session_items()), None)
-            self._session_list.blockSignals(True)
-            try:
-                self._session_list.clearSelection()
-                if keep is not None:
-                    self._session_list.setCurrentItem(keep)
-                    keep.setSelected(True)
-            finally:
-                self._session_list.blockSignals(False)
-        if not enabled and not self.session_count():
-            self.refresh()
-        else:
-            self._on_selection_changed()
+        with freeze_widget_updates(self):
+            self._selection_mode = enabled
+            self._selection_mode_btn.blockSignals(True)
+            self._selection_mode_btn.setChecked(enabled)
+            self._selection_mode_btn.blockSignals(False)
+            self._selection_mode_btn.setText("完成" if enabled else "选择")
+            # Keep native Ctrl / Shift range selection in both modes. In batch
+            # mode, an unmodified row click (or Space) also toggles its checkbox.
+            self._session_list.batch_mode = enabled
+            if not enabled:
+                selected = self._session_list.selectedItems()
+                current = self._session_list.currentItem()
+                keep = current if current in selected else next(iter(selected or self.session_items()), None)
+                self._session_list.blockSignals(True)
+                try:
+                    self._session_list.clearSelection()
+                    if keep is not None:
+                        self._session_list.setCurrentItem(keep)
+                        keep.setSelected(True)
+                finally:
+                    self._session_list.blockSignals(False)
+            if not enabled and not self.session_count():
+                self.refresh()
+            else:
+                self._on_selection_changed()
 
     def _toggle_session_selection(self, session_id: str, checked: bool) -> None:
         for item in self.session_items():
@@ -1561,7 +1576,37 @@ class HistoryWindow(QWidget):
     def session_count(self) -> int:
         return len(self.session_items())
 
+    @property
+    def is_selection_mode(self) -> bool:
+        return bool(self._selection_mode)
+
+    def set_selection_mode(self, enabled: bool) -> None:
+        self._set_selection_mode(enabled)
+
+    def toggle_select_all_loaded(self) -> None:
+        self._toggle_select_all_loaded()
+
+    def delete_selected_sessions(self) -> None:
+        self._delete_selected_sessions()
+
+    def set_detail_chips(self, texts: list[str]) -> None:
+        self._set_detail_chips(texts)
+
+    def search_sessions(self, query: str) -> None:
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText(query)
+        self._search_edit.blockSignals(False)
+        self._perform_search()
+
+    @property
+    def toast_widget(self) -> QFrame:
+        return self._toast
+
     def _load_sessions(self, sessions: list[SessionSummary]) -> None:
+        with freeze_widget_updates(self):
+            self._load_sessions_impl(sessions)
+
+    def _load_sessions_impl(self, sessions: list[SessionSummary]) -> None:
         selected = self._selected_session_ids()
         current = self._session_list.currentItem()
         current_id = current.data(Qt.ItemDataRole.UserRole) if current is not None else None
@@ -1745,7 +1790,7 @@ class HistoryWindow(QWidget):
         header = QWidget()
         lay = QHBoxLayout(header)
         lay.setContentsMargins(13, 0 if first else 8, 10, 2)
-        lab = QLabel(day)
+        lab = QLabel(day, header)
         lab.setObjectName("streamDay")
         lay.addWidget(lab, 0, Qt.AlignmentFlag.AlignBottom)
         lay.addStretch(1)
@@ -1758,21 +1803,21 @@ class HistoryWindow(QWidget):
         outer = QHBoxLayout(row)
         outer.setContentsMargins(10, 8, 10, 8)
         outer.setSpacing(8)
-        checkbox = _SessionCheckBox()
+        checkbox = _SessionCheckBox(row)
         checkbox.setFixedSize(24, 32)
         checkbox.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         checkbox.setObjectName("historySessionCheckbox")
         checkbox.setAccessibleName(f"选择会话：{_session_title(session.created_at)}，{session.preview}")
-        checkbox.setVisible(self._selection_mode)
         checkbox.clicked.connect(lambda checked, sid=session.session_id: self._toggle_session_selection(sid, checked))
         outer.addWidget(checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
+        checkbox.setVisible(self._selection_mode)
         lay = QVBoxLayout()
         lay.setSpacing(4)
         outer.addLayout(lay, 1)
 
         line = QHBoxLayout()
         line.setSpacing(10)
-        time_lab = QLabel(_safe_dt(session.created_at).strftime("%H:%M"))
+        time_lab = QLabel(_safe_dt(session.created_at).strftime("%H:%M"), row)
         time_lab.setObjectName("streamTime")
         time_lab.setFixedWidth(42)
         line.addWidget(time_lab)
@@ -1782,12 +1827,13 @@ class HistoryWindow(QWidget):
         elif session.source:
             meta_parts.append(_source_description(session.source))
         meta_parts.append(f"{session.segment_count} 段")
-        meta = _ElidedLabel(" · ".join(meta_parts), show_full_tooltip=False)
+        meta = _ElidedLabel(" · ".join(meta_parts), row, show_full_tooltip=False)
         meta.setObjectName("streamMeta")
         line.addWidget(meta, 1)
         lay.addLayout(line)
         preview = _PreviewLabel(
             _search_excerpt(session.preview or "(无内容)", self._search_query),
+            row,
             show_full_tooltip=False,
         )
         preview.setObjectName("streamPreview")
@@ -1807,32 +1853,35 @@ class HistoryWindow(QWidget):
     # ── detail ────────────────────────────────────────────────────
 
     def _set_detail_chips(self, texts: list[str]) -> None:
-        while self._detail_chips.count():
-            item = self._detail_chips.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        self._detail_chip_labels = []
-        chip_css = _chip_qss()
-        metrics = QFontMetrics(self.font())
-        for text in texts:
-            if not text:
-                continue
-            shown = metrics.elidedText(text, Qt.TextElideMode.ElideMiddle, 240)
-            lab = QLabel(shown)
-            lab.setTextFormat(Qt.TextFormat.PlainText)
-            lab.setToolTip(text if shown != text else "")
-            lab.setObjectName("streamChip")
-            lab.setStyleSheet(chip_css)
-            # Chips size to their content and wrap to a new row when the
-            # detail pane is narrow; they are never squeezed or clipped.
-            lab.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
-            self._detail_chip_labels.append(lab)
-            self._detail_chips.addWidget(lab)
-        has_metadata = bool(self._detail_chip_labels)
-        self._metadata_btn.setVisible(has_metadata)
-        self._detail_context.setVisible(has_metadata)
-        self._detail_chip_bar.setVisible(has_metadata and self._metadata_btn.isChecked())
+        with freeze_widget_updates(self._detail_chip_bar):
+            while self._detail_chips.count():
+                item = self._detail_chips.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+                    widget.hide()
+                    widget.deleteLater()
+            self._detail_chip_labels = []
+            chip_css = _chip_qss()
+            metrics = QFontMetrics(self.font())
+            for text in texts:
+                if not text:
+                    continue
+                shown = metrics.elidedText(text, Qt.TextElideMode.ElideMiddle, 240)
+                lab = QLabel(shown, self._detail_chip_bar)
+                lab.setTextFormat(Qt.TextFormat.PlainText)
+                lab.setToolTip(text if shown != text else "")
+                lab.setObjectName("streamChip")
+                lab.setStyleSheet(chip_css)
+                # Chips size to their content and wrap to a new row when the
+                # detail pane is narrow; they are never squeezed or clipped.
+                lab.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+                self._detail_chip_labels.append(lab)
+                self._detail_chips.addWidget(lab)
+            has_metadata = bool(self._detail_chip_labels)
+            self._metadata_btn.setVisible(has_metadata)
+            self._detail_context.setVisible(has_metadata)
+            self._detail_chip_bar.setVisible(has_metadata and self._metadata_btn.isChecked())
 
     def _on_view_toggled(self, polished_checked: bool) -> None:
         if self._editing_session:
@@ -2771,8 +2820,8 @@ class HistoryWindow(QWidget):
         self._feedback_label.setText(display_text)
         self._learn_glossary_btn.setVisible(bool(learn_glossary and not has_undo))
         self._undo_btn.setVisible(has_undo)
-        self._toast.show()
         self._toast.reposition()
+        self._toast.show()
         self._feedback_timer.start(duration_ms)
 
     def _end_transient_feedback(self) -> None:
@@ -2788,13 +2837,13 @@ class HistoryWindow(QWidget):
             merged = "（之前的合并已生效）" if self._merge_committed_by_delete else ""
             self._feedback_label.setText(f"已删除 {len(self._pending_delete)} 项{merged} · 8 秒内可撤销删除")
             self._undo_btn.setVisible(True)
-            self._toast.show()
             self._toast.reposition()
+            self._toast.show()
         elif self._pending_merge:
             self._feedback_label.setText(f"已合并 {len(self._pending_merge)} 项 · 8 秒内可撤销")
             self._undo_btn.setVisible(True)
-            self._toast.show()
             self._toast.reposition()
+            self._toast.show()
         else:
             self._toast.hide()
 

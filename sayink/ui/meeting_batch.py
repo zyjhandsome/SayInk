@@ -26,8 +26,8 @@ def confirm_batch_delete(parent, count: int, live_count: int) -> bool:
         accept="删除",
         cancel="取消",
         destructive=True,
+        informative_text=info,
     )
-    box.setInformativeText(info)
     box.exec()
     return box.clickedButton() == delete
 

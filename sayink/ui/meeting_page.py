@@ -66,7 +66,7 @@ from sayink.ui import design_tokens as tok
 from sayink.ui.clipboard import COPY_FAILED_TEXT, copy_text as copy_text
 from sayink.ui.flow_layout import PairedToolBar, WrappingToolBar, defer_while_live_resize
 from sayink.ui.history_window import (
-    _ElidedLabel, _SessionCheckBox, _SessionList, release_list_item_widgets,
+    _ElidedLabel, _SessionCheckBox, _SessionList, freeze_widget_updates, release_list_item_widgets,
 )
 from sayink.ui.meeting_batch import confirm_batch_delete as confirm_batch_delete, fit_action_button
 from sayink.ui.meeting_dialogs import (
@@ -1111,6 +1111,10 @@ class MeetingPage(QWidget):
             return self._store.search_meetings(query, limit=limit)
 
     def refresh(self) -> None:
+        with freeze_widget_updates(self):
+            self._refresh_impl()
+
+    def _refresh_impl(self) -> None:
         self._reload_templates()
         self._sync_sort_button()
         if self._store.disabled:
@@ -1279,20 +1283,20 @@ class MeetingPage(QWidget):
         outer = QHBoxLayout(row)
         outer.setContentsMargins(10, 8, 10, 8)
         outer.setSpacing(8)
-        box = _SessionCheckBox()
+        box = _SessionCheckBox(row)
         box.setFixedSize(24, 32)
         box.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         box.setObjectName("meetingBatchCheck")
         box.setAccessibleName(f"选择会议：{record.display_title}")
-        box.setVisible(self._batch_mode)
         box.clicked.connect(lambda checked, meeting_id=record.id: self._toggle_meeting_selection(meeting_id, checked))
         outer.addWidget(box, 0, Qt.AlignmentFlag.AlignVCenter)
+        box.setVisible(self._batch_mode)
         lay = QVBoxLayout()
         lay.setSpacing(2)
-        title = _ElidedLabel(record.display_title, show_full_tooltip=False)
+        title = _ElidedLabel(record.display_title, row, show_full_tooltip=False)
         title.setObjectName("meetingRowTitle")
         lay.addWidget(title)
-        meta = _ElidedLabel(_meeting_row_meta(record, minutes), show_full_tooltip=False)
+        meta = _ElidedLabel(_meeting_row_meta(record, minutes), row, show_full_tooltip=False)
         meta.setObjectName("meetingRowMeta")
         lay.addWidget(meta)
         outer.addLayout(lay, 1)
@@ -1475,31 +1479,32 @@ class MeetingPage(QWidget):
         if enabled == self._batch_mode and self._list.batch_mode == enabled:
             self._sync_batch_actions()
             return
-        self._batch_mode = enabled
-        self._list.batch_mode = enabled
-        # A status line belongs to the view that produced it: single-meeting
-        # notices make no sense over the batch tools, and vice versa.
-        self._set_status("")
-        self._selection_mode_btn.blockSignals(True)
-        self._selection_mode_btn.setChecked(enabled)
-        self._selection_mode_btn.blockSignals(False)
-        self._selection_mode_btn.setText("完成" if enabled else "选择")
-        self._selection_mode_btn.setAccessibleName("完成选择" if enabled else "选择会议")
-        fit_action_button(self._selection_mode_btn)
-        if not enabled:
-            self._list.blockSignals(True)
-            try:
-                self._list.clearSelection()
-                for index in range(self._list.count()):
-                    item = self._list.item(index)
-                    if item.data(Qt.ItemDataRole.UserRole) == self._detail_id:
-                        item.setSelected(True)
-                        self._list.setCurrentItem(item)
-                        self._list.scrollToItem(item)
-                        break
-            finally:
-                self._list.blockSignals(False)
-        self.refresh()
+        with freeze_widget_updates(self):
+            self._batch_mode = enabled
+            self._list.batch_mode = enabled
+            # A status line belongs to the view that produced it: single-meeting
+            # notices make no sense over the batch tools, and vice versa.
+            self._set_status("")
+            self._selection_mode_btn.blockSignals(True)
+            self._selection_mode_btn.setChecked(enabled)
+            self._selection_mode_btn.blockSignals(False)
+            self._selection_mode_btn.setText("完成" if enabled else "选择")
+            self._selection_mode_btn.setAccessibleName("完成选择" if enabled else "选择会议")
+            fit_action_button(self._selection_mode_btn)
+            if not enabled:
+                self._list.blockSignals(True)
+                try:
+                    self._list.clearSelection()
+                    for index in range(self._list.count()):
+                        item = self._list.item(index)
+                        if item.data(Qt.ItemDataRole.UserRole) == self._detail_id:
+                            item.setSelected(True)
+                            self._list.setCurrentItem(item)
+                            self._list.scrollToItem(item)
+                            break
+                finally:
+                    self._list.blockSignals(False)
+            self.refresh()
 
     def _sync_batch_checks(self, selected_ids: list[str] | None = None) -> None:
         selected = set(self._selected_meeting_ids() if selected_ids is None else selected_ids)
@@ -1597,19 +1602,34 @@ class MeetingPage(QWidget):
             return
         ended_audio_paths = [record.audio_path for record in ended_records if record.audio_path]
         temp_wav_targets = self._audio_player.collect_temp_wavs_for_audio_paths(ended_audio_paths)
-        if self._detail_id in ended:
-            self._audio_player.unload_source()
-            self._editing_notes = False
-            self._notes_edit.clear()
-            self._detail_id = ""
-            self._drafts.title_meeting_id = ""
-        if not self._ctrl.delete_meetings(ended):
-            self._set_status("会议删除失败，请重试。")
-        else:
+        with freeze_widget_updates(self):
+            if self._detail_id in ended:
+                self._audio_player.unload_source()
+                self._editing_notes = False
+                self._notes_edit.clear()
+                self._detail_id = ""
+                self._drafts.title_meeting_id = ""
+            deleted_ok = self._ctrl.delete_meetings(ended)
+            self._refresh_timer.stop()
+            self._pending_refresh_id = ""
+            if not deleted_ok:
+                self._set_status("会议删除失败，请重试。", tone="error")
+                self.refresh()
+                return
             self._audio_player.remove_temp_wavs(temp_wav_targets)
+            if self._batch_mode and not self._search_query and self._store.count_meetings() == 0:
+                self._batch_mode = False
+                self._list.batch_mode = False
+                self._selection_mode_btn.blockSignals(True)
+                self._selection_mode_btn.setChecked(False)
+                self._selection_mode_btn.blockSignals(False)
+                self._selection_mode_btn.setText("选择")
+                self._selection_mode_btn.setAccessibleName("选择会议")
+                fit_action_button(self._selection_mode_btn)
+                self._sync_batch_actions([])
             skipped = f"，{len(live)} 场进行中的未删除" if live else ""
-            self._set_status(f"已删除 {len(ended)} 场会议{skipped}")
-        self.refresh()
+            self.refresh()
+            self._set_status(f"已删除 {len(ended)} 场会议{skipped}", transient=True)
 
     def _confirm_export_overwrite_if_adjusted(self, raw_path: str, final_path: str) -> bool:
         from sayink.ui.meeting_workspace_chrome import confirm_export_overwrite_if_adjusted
@@ -1651,6 +1671,47 @@ class MeetingPage(QWidget):
     def _load_more(self) -> None:
         self._list_limit += 100
         self.refresh()
+
+    @property
+    def is_batch_mode(self) -> bool:
+        return bool(self._batch_mode)
+
+    @property
+    def has_pending_refresh(self) -> bool:
+        return self._refresh_timer.isActive()
+
+    def set_batch_mode(self, enabled: bool) -> None:
+        self._set_batch_mode(enabled)
+
+    def select_loaded_meetings(self) -> None:
+        self._select_loaded_meetings()
+
+    def set_selected_meeting_ids(self, meeting_ids: set[str] | list[str]) -> None:
+        wanted = set(meeting_ids)
+        self._list.blockSignals(True)
+        try:
+            for index in range(self._list.count()):
+                item = self._list.item(index)
+                item.setSelected(str(item.data(Qt.ItemDataRole.UserRole) or "") in wanted)
+        finally:
+            self._list.blockSignals(False)
+        self._on_selection_changed()
+
+    def delete_selected_meetings(self) -> None:
+        self._delete_selected_meetings()
+
+    def delete_current_meeting(self) -> None:
+        self._delete()
+
+    def toggle_list_sort(self) -> None:
+        self._toggle_list_sort()
+
+    def search_meetings(self, query: str) -> None:
+        self._search_timer.stop()
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText(query)
+        self._search_edit.blockSignals(False)
+        self._perform_search()
 
     def show_meeting(self, meeting_id: str) -> None:
         """Open a meeting in the browse view (after it ended, or from a notice)."""
@@ -2852,9 +2913,8 @@ class MeetingPage(QWidget):
                 accept="放弃修改",
                 cancel="继续编辑",
                 destructive=True,
+                informative_text="放弃后将恢复为编辑前的已保存内容。",
             )
-            box.setInformativeText("放弃后将恢复为编辑前的已保存内容。")
-            _style_dialog_box(box, danger_btn=discard)
             with _quiet_tooltips(self):
                 box.exec()
             if box.clickedButton() != discard:
@@ -3273,9 +3333,8 @@ class MeetingPage(QWidget):
             accept="删除",
             cancel="取消",
             destructive=True,
+            informative_text="文字稿、笔记、标记与纪要会一起删除，无法撤销。",
         )
-        box.setInformativeText("文字稿、笔记、标记与纪要会一起删除，无法撤销。")
-        _style_dialog_box(box, danger_btn=delete)
         with _quiet_tooltips(self):
             box.exec()
         if box.clickedButton() != delete:
@@ -3283,16 +3342,20 @@ class MeetingPage(QWidget):
         temp_wav_targets = self._audio_player.collect_temp_wavs_for_audio_paths(
             [record.audio_path] if record.audio_path else ()
         )
-        self._audio_player.unload_source()
-        if self._ctrl.delete_meeting(record.id) is False:
-            self._set_status("会议删除失败，请重试。")
+        with freeze_widget_updates(self):
+            self._audio_player.unload_source()
+            deleted_ok = self._ctrl.delete_meeting(record.id) is not False
+            self._refresh_timer.stop()
+            self._pending_refresh_id = ""
+            if not deleted_ok:
+                self._set_status("会议删除失败，请重试。", tone="error")
+                self.refresh()
+                return
+            self._audio_player.remove_temp_wavs(temp_wav_targets)
+            self._editing_notes = False
+            self._detail_id = ""
+            self._drafts.title_meeting_id = ""
             self.refresh()
-            return
-        self._audio_player.remove_temp_wavs(temp_wav_targets)
-        self._editing_notes = False
-        self._detail_id = ""
-        self._drafts.title_meeting_id = ""
-        self.refresh()
 
     def _on_transcript_link(self, url) -> None:
         if url.scheme() == "seek-ms" and url.path().isdigit():

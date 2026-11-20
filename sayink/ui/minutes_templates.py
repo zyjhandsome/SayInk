@@ -339,16 +339,23 @@ class MinutesTemplatesDialog(QDialog):
         return self._custom != saved
 
     def _reload(self, selected_id) -> None:
-        self._list.clear()
-        for template in list_templates(self._custom):
-            item = QListWidgetItem(template.name + (" · 内置" if template.builtin else " · 自定义"))
-            item.setData(Qt.ItemDataRole.UserRole, template.id)
-            item.setToolTip(describe_template(template))
-            self._list.addItem(item)
-            if template.id == selected_id:
-                self._list.setCurrentItem(item)
-        if not self._list.currentItem():
-            self._list.setCurrentRow(0)
+        freeze = self._list.isVisible() and self._list.updatesEnabled()
+        if freeze:
+            self._list.setUpdatesEnabled(False)
+        try:
+            self._list.clear()
+            for template in list_templates(self._custom):
+                item = QListWidgetItem(template.name + (" · 内置" if template.builtin else " · 自定义"))
+                item.setData(Qt.ItemDataRole.UserRole, template.id)
+                item.setToolTip(describe_template(template))
+                self._list.addItem(item)
+                if template.id == selected_id:
+                    self._list.setCurrentItem(item)
+            if not self._list.currentItem():
+                self._list.setCurrentRow(0)
+        finally:
+            if freeze:
+                self._list.setUpdatesEnabled(True)
 
     def _selected(self):
         item = self._list.currentItem()

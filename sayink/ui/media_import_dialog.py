@@ -30,7 +30,7 @@ from sayink.ui import design_tokens as tok
 from sayink.ui import settings_styles as ss
 from sayink.ui.native_dialog import native_file_dialog
 from sayink.ui.settings_components import ElidedComboBox
-from sayink.ui.theme import apply_window_dark_titlebar
+from sayink.ui.theme import sync_window_dark_titlebar
 
 _NATURAL_SPLIT_RE = re.compile(r"(\d+)")
 
@@ -304,21 +304,28 @@ class MediaImportDialog(QDialog):
     # -- list manipulation ----------------------------------------------------
 
     def _rebuild_list(self, *, select_row: int = 0) -> None:
+        freeze = self._list.isVisible() and self._list.updatesEnabled()
+        if freeze:
+            self._list.setUpdatesEnabled(False)
         self._list.blockSignals(True)
-        self._list.clear()
-        dup_count = 0
-        for idx, path in enumerate(self._paths, start=1):
-            is_dup = _normalize_media_path(path) in self._existing_norm_paths
-            if is_dup:
-                dup_count += 1
-            label = f"{idx}. {path.name}" + ("  · 已导入过" if is_dup else "")
-            item = QListWidgetItem(label)
-            item.setToolTip(str(path))
-            self._list.addItem(item)
-        if self._paths:
-            clamped = max(0, min(select_row, len(self._paths) - 1))
-            self._list.setCurrentRow(clamped)
-        self._list.blockSignals(False)
+        try:
+            self._list.clear()
+            dup_count = 0
+            for idx, path in enumerate(self._paths, start=1):
+                is_dup = _normalize_media_path(path) in self._existing_norm_paths
+                if is_dup:
+                    dup_count += 1
+                label = f"{idx}. {path.name}" + ("  · 已导入过" if is_dup else "")
+                item = QListWidgetItem(label)
+                item.setToolTip(str(path))
+                self._list.addItem(item)
+            if self._paths:
+                clamped = max(0, min(select_row, len(self._paths) - 1))
+                self._list.setCurrentRow(clamped)
+        finally:
+            self._list.blockSignals(False)
+            if freeze:
+                self._list.setUpdatesEnabled(True)
         if dup_count > 0:
             self._dup_hint.setText(
                 f"提示：列表中有 {dup_count} 个文件此前已导入过。若无需用新参数重新识别，可将其选中后点「移除」。"
@@ -479,4 +486,4 @@ class MediaImportDialog(QDialog):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._ok_btn.setStyleSheet(ss.BTN_ACCENT_SM)
         self._ok_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        apply_window_dark_titlebar(self, getattr(tok, "ACTIVE_THEME", "light") == "dark")
+        sync_window_dark_titlebar(self, getattr(tok, "ACTIVE_THEME", "light") == "dark")

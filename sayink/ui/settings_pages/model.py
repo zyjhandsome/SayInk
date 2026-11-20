@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -187,6 +187,16 @@ class ModelSettingsPage(SettingsPage):
         self.storage_summary_label.setText(f"已下载 {count} 个 · 约 {total_mb} MB · {path}")
         self.storage_summary_label.setToolTip(str(config.models_dir))
 
+    @staticmethod
+    def _clear_layout_widgets(layout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+                widget.hide()
+                widget.deleteLater()
+
     def refresh_active_hero(
         self,
         config: Config,
@@ -196,78 +206,83 @@ class ModelSettingsPage(SettingsPage):
     ) -> None:
         from sayink.speech_recognizer import DEFAULT_MODEL_ID, get_model_info, is_model_downloaded
 
-        while self.model_hero_layout.count():
-            item = self.model_hero_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self.model_hero_status = None
+        freeze = self.isVisible() and self.updatesEnabled()
+        if freeze:
+            self.setUpdatesEnabled(False)
+        try:
+            self._clear_layout_widgets(self.model_hero_layout)
+            self.model_hero_status = None
 
-        active_id = config.get("stt.model_id", DEFAULT_MODEL_ID)
-        info = get_model_info(active_id) if active_id else None
-        if not info or not is_model_downloaded(active_id):
-            empty_wrap = QWidget()
-            empty_lay = QVBoxLayout(empty_wrap)
-            empty_lay.setContentsMargins(0, 8, 0, 8)
-            empty_lay.addWidget(empty_state("尚未选择已下载的模型，请从下方下载并启用。"))
-            self.model_hero_layout.addWidget(empty_wrap)
-            return
+            active_id = config.get("stt.model_id", DEFAULT_MODEL_ID)
+            info = get_model_info(active_id) if active_id else None
+            if not info or not is_model_downloaded(active_id):
+                empty_wrap = QWidget(self)
+                empty_lay = QVBoxLayout(empty_wrap)
+                empty_lay.setContentsMargins(0, 8, 0, 8)
+                empty_lay.addWidget(empty_state("尚未选择已下载的模型，请从下方下载并启用。"))
+                self.model_hero_layout.addWidget(empty_wrap)
+                return
 
-        card = QWidget()
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(18, 16, 18, 16)
-        lay.setSpacing(8)
+            card = QWidget(self)
+            lay = QVBoxLayout(card)
+            lay.setContentsMargins(18, 16, 18, 16)
+            lay.setSpacing(8)
 
-        head = QHBoxLayout()
-        title = QLabel(info["name"])
-        title.setProperty("viRole", "engineHeroTitle")
-        title.setStyleSheet(
-            f"color: {tok.TEXT}; font-family: {tok.FONT_DISPLAY}; font-size: {tok.TYPE_HERO}px;"
-            f" font-weight: 700; background: transparent;"
-        )
-        head.addWidget(title)
-        badge = QLabel("当前")
-        badge.setProperty("viRole", "engineHeroBadge")
-        badge.setStyleSheet(
-            f"background: {tok.SURFACE_PEARL}; color: {tok.TEXT_SEC};"
-            f" border: 1px solid {tok.HAIRLINE};"
-            f" border-radius: {tok.RADIUS_PILL}px; padding: 3px 10px;"
-            f" font-size: {tok.TYPE_CAPTION}px; font-weight: 700;"
-        )
-        head.addWidget(badge)
-        self.model_hero_status = QLabel()
-        self.model_hero_status.setAccessibleName("当前模型载入状态")
-        self.model_hero_status.setToolTip("下载完成后仍需载入内存；载入完成前快捷键不会响应。")
-        head.addWidget(self.model_hero_status)
-        self.paint_hero_status(runtime_status, recognition_pending=recognition_pending)
-        head.addStretch()
-        size = QLabel(f"{info['size_mb']} MB")
-        size.setProperty("viRole", "engineHeroSize")
-        size.setStyleSheet(
-            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
-        )
-        head.addWidget(size)
-        lay.addLayout(head)
+            head = QHBoxLayout()
+            title = QLabel(info["name"], card)
+            title.setProperty("viRole", "engineHeroTitle")
+            title.setStyleSheet(
+                f"color: {tok.TEXT}; font-family: {tok.FONT_DISPLAY}; font-size: {tok.TYPE_HERO}px;"
+                f" font-weight: 700; background: transparent;"
+            )
+            head.addWidget(title)
+            badge = QLabel("当前", card)
+            badge.setProperty("viRole", "engineHeroBadge")
+            badge.setStyleSheet(
+                f"background: {tok.SURFACE_PEARL}; color: {tok.TEXT_SEC};"
+                f" border: 1px solid {tok.HAIRLINE};"
+                f" border-radius: {tok.RADIUS_PILL}px; padding: 3px 10px;"
+                f" font-size: {tok.TYPE_CAPTION}px; font-weight: 700;"
+            )
+            head.addWidget(badge)
+            self.model_hero_status = QLabel(card)
+            self.model_hero_status.setAccessibleName("当前模型载入状态")
+            self.model_hero_status.setToolTip("下载完成后仍需载入内存；载入完成前快捷键不会响应。")
+            head.addWidget(self.model_hero_status)
+            self.paint_hero_status(runtime_status, recognition_pending=recognition_pending)
+            head.addStretch()
+            size = QLabel(f"{info['size_mb']} MB", card)
+            size.setProperty("viRole", "engineHeroSize")
+            size.setStyleSheet(
+                f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
+            )
+            head.addWidget(size)
+            lay.addLayout(head)
 
-        desc = QLabel(info["description"])
-        desc.setProperty("viRole", "engineHeroDesc")
-        desc.setWordWrap(True)
-        desc.setStyleSheet(
-            f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; background: transparent;"
-        )
-        lay.addWidget(desc)
+            desc = QLabel(info["description"], card)
+            desc.setProperty("viRole", "engineHeroDesc")
+            desc.setWordWrap(True)
+            desc.setStyleSheet(
+                f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_BODY_SM}px; background: transparent;"
+            )
+            lay.addWidget(desc)
 
-        meta = QLabel(
-            f"{info['languages']} · "
-            f"{format_model_ratings(info['accuracy'], info['speed'])}"
-        )
-        meta.setProperty("viRole", "engineHeroMeta")
-        meta.setStyleSheet(
-            f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
-        )
-        meta.setToolTip(RATING_TOOLTIP)
-        lay.addWidget(meta)
+            meta = QLabel(
+                f"{info['languages']} · "
+                f"{format_model_ratings(info['accuracy'], info['speed'])}",
+                card,
+            )
+            meta.setProperty("viRole", "engineHeroMeta")
+            meta.setStyleSheet(
+                f"color: {tok.TEXT_DIM}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
+            )
+            meta.setToolTip(RATING_TOOLTIP)
+            lay.addWidget(meta)
 
-        self.model_hero_layout.addWidget(card)
+            self.model_hero_layout.addWidget(card)
+        finally:
+            if freeze:
+                self.setUpdatesEnabled(True)
 
     def cards_match_config(self, config: Config) -> bool:
         if not self.model_cards:
@@ -290,66 +305,70 @@ class ModelSettingsPage(SettingsPage):
     ) -> None:
         from sayink.speech_recognizer import DEFAULT_MODEL_ID, MODEL_REGISTRY, is_model_downloaded
 
-        self.refresh_active_hero(config, runtime_status, recognition_pending=recognition_pending)
-        self.refresh_storage_summary(config)
+        freeze = self.isVisible() and self.updatesEnabled()
+        if freeze:
+            self.setUpdatesEnabled(False)
+        try:
+            self.refresh_active_hero(config, runtime_status, recognition_pending=recognition_pending)
+            self.refresh_storage_summary(config)
 
-        while self.cards_layout.count():
-            item = self.cards_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self.model_cards.clear()
-        active_id = config.get("stt.model_id", DEFAULT_MODEL_ID)
+            self._clear_layout_widgets(self.cards_layout)
+            self.model_cards.clear()
+            active_id = config.get("stt.model_id", DEFAULT_MODEL_ID)
 
-        def _add_section(title: str, models: list, downloaded: bool) -> None:
-            section = QWidget()
-            section_lay = QVBoxLayout(section)
-            section_lay.setContentsMargins(0, 0, 0, 0)
-            section_lay.setSpacing(10)
+            def _add_section(title: str, models: list, downloaded: bool) -> None:
+                section = QWidget(self)
+                section_lay = QVBoxLayout(section)
+                section_lay.setContentsMargins(0, 0, 0, 0)
+                section_lay.setSpacing(10)
 
-            if title:
-                section_lay.addWidget(section_header(title))
+                if title:
+                    section_lay.addWidget(section_header(title))
 
-            if not models:
-                msg = "暂无其他已下载模型" if downloaded else "所有模型均已下载"
-                empty_group = settings_group()
-                empty_lay = QVBoxLayout(empty_group)
-                empty_lay.setContentsMargins(0, 0, 0, 0)
-                empty_lay.addWidget(empty_state(msg))
-                section_lay.addWidget(empty_group)
-            else:
-                list_host = QWidget()
-                list_lay = QVBoxLayout(list_host)
-                list_lay.setContentsMargins(0, 0, 0, 0)
-                list_lay.setSpacing(12)
-                for m_info in models:
-                    card = ModelCard(
-                        m_info, downloaded, downloaded and m_info["id"] == active_id,
-                    )
-                    card.action_clicked.connect(self.card_action_requested.emit)
-                    self.model_cards[m_info["id"]] = card
-                    list_lay.addWidget(card)
-                section_lay.addWidget(list_host)
+                if not models:
+                    msg = "暂无其他已下载模型" if downloaded else "所有模型均已下载"
+                    empty_group = settings_group()
+                    empty_lay = QVBoxLayout(empty_group)
+                    empty_lay.setContentsMargins(0, 0, 0, 0)
+                    empty_lay.addWidget(empty_state(msg))
+                    section_lay.addWidget(empty_group)
+                else:
+                    list_host = QWidget(section)
+                    list_lay = QVBoxLayout(list_host)
+                    list_lay.setContentsMargins(0, 0, 0, 0)
+                    list_lay.setSpacing(12)
+                    for m_info in models:
+                        card = ModelCard(
+                            m_info, downloaded, downloaded and m_info["id"] == active_id,
+                        )
+                        card.action_clicked.connect(self.card_action_requested.emit)
+                        self.model_cards[m_info["id"]] = card
+                        list_lay.addWidget(card)
+                    section_lay.addWidget(list_host)
 
-            self.cards_layout.addWidget(section)
+                self.cards_layout.addWidget(section)
 
-        downloaded_models = [
-            m for m in MODEL_REGISTRY
-            if is_model_downloaded(m["id"]) and m["id"] != active_id
-        ]
-        available_models = [m for m in MODEL_REGISTRY if not is_model_downloaded(m["id"])]
-        available_models.sort(key=lambda model: model["id"] != DEFAULT_MODEL_ID)
-        if downloaded_models:
-            _add_section("其他已下载", downloaded_models, True)
-        _add_section("可下载", available_models, False)
-        self._add_aux_model_section()
-        self.model_cards_for_id = active_id
-        self.model_cards_downloaded = bool(active_id and is_model_downloaded(active_id))
-        card_buttons = [
-            btn
-            for card in self.model_cards.values()
-            for btn in card.findChildren(QPushButton)
-        ]
-        chain_tab_order([self.change_dir_btn, self.download_source_combo, *card_buttons])
+            downloaded_models = [
+                m for m in MODEL_REGISTRY
+                if is_model_downloaded(m["id"]) and m["id"] != active_id
+            ]
+            available_models = [m for m in MODEL_REGISTRY if not is_model_downloaded(m["id"])]
+            available_models.sort(key=lambda model: model["id"] != DEFAULT_MODEL_ID)
+            if downloaded_models:
+                _add_section("其他已下载", downloaded_models, True)
+            _add_section("可下载", available_models, False)
+            self._add_aux_model_section()
+            self.model_cards_for_id = active_id
+            self.model_cards_downloaded = bool(active_id and is_model_downloaded(active_id))
+            card_buttons = [
+                btn
+                for card in self.model_cards.values()
+                for btn in card.findChildren(QPushButton)
+            ]
+            chain_tab_order([self.change_dir_btn, self.download_source_combo, *card_buttons])
+        finally:
+            if freeze:
+                self.setUpdatesEnabled(True)
 
     def _add_aux_model_section(self) -> None:
         """Shared helpers: cards show file availability, not runtime activation."""

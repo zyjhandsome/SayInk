@@ -66,6 +66,22 @@ def apply_window_dark_titlebar(widget: object, is_dark: bool) -> bool:
         return False
 
 
+def sync_window_dark_titlebar(widget: object, is_dark: bool) -> bool:
+    """Apply dark titlebar immediately only if a native HWND already exists; otherwise defer to show.
+
+    Calling ``winId()`` on an unshown ``QDialog`` / ``QMessageBox`` during construction
+    forces Qt to materialize a small pre-layout Win32 HWND that visibly resizes/jumps on ``exec()``.
+    """
+    qt_app = QApplication.instance()
+    if isinstance(qt_app, QApplication):
+        _ensure_dialog_theme_filter(qt_app)
+    if isinstance(widget, QWidget) and not (
+        widget.isVisible() or widget.testAttribute(Qt.WidgetAttribute.WA_WState_Created)
+    ):
+        return False
+    return apply_window_dark_titlebar(widget, is_dark)
+
+
 def prefers_reduced_motion() -> bool:
     """Return True when OS or SAYINK_REDUCED_MOTION disables UI animations."""
     global _REDUCED_MOTION_CACHE

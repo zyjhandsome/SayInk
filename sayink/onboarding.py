@@ -25,7 +25,7 @@ from sayink.config import DEFAULT_HOTKEY, format_hotkey
 from sayink.speech_recognizer import DEFAULT_MODEL_ID, get_model_info
 from sayink.ui.prompts import style_message_box
 from sayink.ui.settings_components import ThemedCheckBox
-from sayink.ui.theme import apply_window_dark_titlebar
+from sayink.ui.theme import sync_window_dark_titlebar
 
 log = logging.getLogger("SayInk")
 
@@ -915,11 +915,13 @@ class _SetupDialog(QDialog):
         self.usage_hint.setWordWrap(True)
         layout.addWidget(self.usage_hint)
 
-        self.history_checkbox = ThemedCheckBox("在本机保存转写历史（仅存本地，可随时在设置中关闭）")
+        self.history_checkbox = ThemedCheckBox(
+            "在本机保存转写历史（仅存本地，可随时在设置中关闭）", self
+        )
         self.history_checkbox.setObjectName("setupHistoryCheckbox")
         self.history_checkbox.setChecked(bool(controller._config.get("history.enabled", True)))
-        self.history_checkbox.setVisible(not bool(controller._config.get("history.onboarded", False)))
         layout.addWidget(self.history_checkbox)
+        self.history_checkbox.setVisible(not bool(controller._config.get("history.onboarded", False)))
 
         layout.addStretch(1)
         footer_row = QHBoxLayout()
@@ -985,7 +987,7 @@ class _SetupDialog(QDialog):
             font.setPixelSize(tok.TYPE_BODY_SM)
             self.history_checkbox.setFont(font)
             self.history_checkbox.update()
-            apply_window_dark_titlebar(self, getattr(tok, "ACTIVE_THEME", "light") == "dark")
+            sync_window_dark_titlebar(self, getattr(tok, "ACTIVE_THEME", "light") == "dark")
         finally:
             self._applying_theme = False
 

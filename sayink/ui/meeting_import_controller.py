@@ -237,28 +237,37 @@ class MeetingImportController:
             h._import_queue.setVisible(bool(signature))
             return
         h._queue_signature = signature
-        while h._import_queue_lay.count():
-            item = h._import_queue_lay.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        for index, (path, title) in enumerate(signature):
-            row = QWidget()
-            lay = QHBoxLayout(row)
-            lay.setContentsMargins(0, 0, 0, 0)
-            lay.setSpacing(8)
-            name = title or Path(path).name
-            label = QLabel(name)
-            label.setObjectName("meetingImportQueueItem")
-            remove = QPushButton("移除")
-            remove.setAccessibleName(f"移除排队文件 {name}")
-            remove.setStyleSheet(ss.BTN_GHOST_SM)
-            remove.setCursor(Qt.CursorShape.PointingHandCursor)
-            remove.clicked.connect(lambda _checked=False, item_index=index: h._remove_queued_media(item_index))
-            lay.addWidget(label, 1)
-            lay.addWidget(remove, 0)
-            h._import_queue_lay.addWidget(row)
-        h._import_queue.setVisible(bool(signature))
+        freeze = h._import_queue.isVisible() and h._import_queue.updatesEnabled()
+        if freeze:
+            h._import_queue.setUpdatesEnabled(False)
+        try:
+            while h._import_queue_lay.count():
+                item = h._import_queue_lay.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+                    widget.hide()
+                    widget.deleteLater()
+            for index, (path, title) in enumerate(signature):
+                row = QWidget(h._import_queue)
+                lay = QHBoxLayout(row)
+                lay.setContentsMargins(0, 0, 0, 0)
+                lay.setSpacing(8)
+                name = title or Path(path).name
+                label = QLabel(name, row)
+                label.setObjectName("meetingImportQueueItem")
+                remove = QPushButton("移除", row)
+                remove.setAccessibleName(f"移除排队文件 {name}")
+                remove.setStyleSheet(ss.BTN_GHOST_SM)
+                remove.setCursor(Qt.CursorShape.PointingHandCursor)
+                remove.clicked.connect(lambda _checked=False, item_index=index: h._remove_queued_media(item_index))
+                lay.addWidget(label, 1)
+                lay.addWidget(remove, 0)
+                h._import_queue_lay.addWidget(row)
+            h._import_queue.setVisible(bool(signature))
+        finally:
+            if freeze:
+                h._import_queue.setUpdatesEnabled(True)
 
     def remove_queued_media(self, index: int) -> None:
         h = self._host
