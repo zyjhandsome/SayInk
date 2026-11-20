@@ -1,7 +1,7 @@
 """Emitted audio must point to the exact original input, including silent gaps."""
 import numpy as np
 
-from sayink.vad_segmenter import SpeechSegmenter
+from sayink.vad_segmenter import FORCED_CUT_OVERLAP_SEC, SpeechSegmenter
 from tools.asr_bench import segment_meeting_timed
 
 RATE = 16000
@@ -23,14 +23,14 @@ def test_original_offsets_survive_pre_roll_trim_and_irregular_blocks():
         if out is not None:
             a, b = seg.last_bounds
             assert np.array_equal(out, audio[a:b])
-            emitted.append((a, b))
+            emitted.append((a, b, getattr(out, "overlap_samples", 0)))
     tail = seg.flush()
     if tail is not None:
         a, b = seg.last_bounds
         assert np.array_equal(tail, audio[a:b])
-        emitted.append((a, b))
+        emitted.append((a, b, getattr(tail, "overlap_samples", 0)))
     assert len(emitted) >= 3
-    assert all(a[1] <= b[0] for a, b in zip(emitted, emitted[1:], strict=False))
+    assert all(a[1] <= b[0] + b[2] for a, b in zip(emitted, emitted[1:], strict=False))
     assert any(a[1] < b[0] for a, b in zip(emitted, emitted[1:], strict=False))
 
 
@@ -53,7 +53,9 @@ def test_carried_speech_tail_has_contiguous_original_bounds():
     seg = SpeechSegmenter(adaptive=False, min_speech_sec=0.1, max_speech_sec=1)
     first = seg.feed(np.full(24000, 0.05, np.float32))
     assert len(first) == RATE and seg.last_bounds == (0, RATE)
-    assert len(seg.flush()) == 8000 and seg.last_bounds == (RATE, 24000)
+    overlap = int(RATE * FORCED_CUT_OVERLAP_SEC)
+    flushed = seg.flush()
+    assert len(flushed) == 8000 + overlap and seg.last_bounds == (RATE - overlap, 24000)
 
 
 def test_timed_benchmark_does_not_collapse_the_gap_between_utterances():
@@ -82,4 +84,5 @@ def test_recorder_timestamp_includes_pre_roll_and_keeps_the_carried_tail_clock(m
     assert stamp == 999900
     tail = recorder._segmenter.flush()
     recorder._emit_segment(tail)
-    assert recorder.consume_segment_captured_at() == stamp + len(first) * 1000 // RATE
+    overlap = getattr(tail, "overlap_samples", 0)
+    assert recorder.consume_segment_captured_at() == stamp + (len(first) - overlap) * 1000 // RATE

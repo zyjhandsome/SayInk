@@ -65,6 +65,8 @@ class TestSpeechSegmenterBasics:
         assert tail.size == (160 - 131) * block
 
     def test_flat_long_utterance_still_cuts_at_the_limit(self):
+        from sayink.vad_segmenter import FORCED_CUT_OVERLAP_SEC
+
         seg = SpeechSegmenter(speech_threshold=0.002, min_speech_sec=0.1, adaptive=False)
         block = int(16000 * 0.1)
         emitted = [seg.feed(np.full(block, 0.5, dtype=np.float32)) for _ in range(160)]
@@ -73,7 +75,11 @@ class TestSpeechSegmenterBasics:
         assert emitted[0].size == int(16000 * 15)
         tail = seg.flush()
         assert tail is not None
-        assert sum(part.size for part in emitted) + tail.size == 160 * block
+        overlap = int(16000 * FORCED_CUT_OVERLAP_SEC)
+        assert getattr(tail, "overlap_samples", 0) == overlap
+        assert sum(part.size - getattr(part, "overlap_samples", 0) for part in emitted) + (
+            tail.size - getattr(tail, "overlap_samples", 0)
+        ) == 160 * block
 
     def test_max_length_forces_cut(self):
         seg = SpeechSegmenter(

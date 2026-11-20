@@ -41,14 +41,16 @@ def test_two_lanes_preserve_overlapping_speech_and_emit_capture_time_order(meeti
             recorder._feed_split_tracks((mic[start:start + 1600] + system[start:start + 1600]) / 2)
         with patch.object(recorder, "_drain_mixed_mono", return_value=None):
             recorder._flush_continuous_segments()
-    assert [stamp for _, _, stamp in results] == sorted(stamp for _, _, stamp in results)
     for route, original in (("mic", mic), ("system", system)):
+        route_stamps = [stamp for _, source, stamp in results if source == route]
+        assert route_stamps == sorted(route_stamps)
         coverage = np.zeros(total, np.int8)
         for audio, source, stamp in results:
             if source == route:
                 begin = (stamp - 1000) * 16
                 np.testing.assert_array_equal(audio, original[begin:begin + len(audio)])
-                coverage[begin:begin + len(audio)] += 1
+                overlap = getattr(audio, "overlap_samples", 0)
+                coverage[begin + overlap:begin + len(audio)] += 1
         assert np.all(coverage[original != 0] == 1)
     assert not recorder._split_ready
 

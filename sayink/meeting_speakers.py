@@ -12,13 +12,17 @@ from dataclasses import dataclass
 import numpy as np
 
 from sayink.audio_utils import TARGET_SAMPLE_RATE
-from sayink.speaker_clustering import TurnObservation
+from sayink.speaker_clustering import (
+    CROSS_ROUTE_MIN_SIMILARITY,
+    TurnObservation,
+    _subsample_evenly,
+)
 from sayink.speaker_session import SpeakerSession
 
 MAX_PROFILE_SAMPLES = 12
 MAX_RECENT_OBSERVATIONS = 512
+MAX_RETAINED_TURNS = 2048
 MATCH_MARGIN = 0.08
-CROSS_ROUTE_MIN_SIMILARITY = 0.80
 
 
 def voice_sample_is_clear(audio: np.ndarray) -> bool:
@@ -95,13 +99,21 @@ class MeetingSpeakerSession(SpeakerSession):
     transcript sequence, including sparse sequences and repeated corrections.
     """
 
-    def __init__(self, *, margin: float = MATCH_MARGIN, cross_route_matching: bool = True, **kwargs):
+    def __init__(
+        self,
+        *,
+        margin: float = MATCH_MARGIN,
+        cross_route_matching: bool = True,
+        max_turns: int | None = MAX_RETAINED_TURNS,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         from sayink.speaker_turns import SpeakerTurnContext
 
         self.turn_context = SpeakerTurnContext()
         self._margin = max(0.0, float(margin))
         self._cross_route_matching = bool(cross_route_matching)
+        self._max_turns: int | None = None if max_turns is None else max(1, int(max_turns))
         self._profiles: dict[int, _Profile] = {}
         self._observations: OrderedDict[int, _Observation] = OrderedDict()
         self._turns: list[TurnObservation] = []
@@ -110,7 +122,13 @@ class MeetingSpeakerSession(SpeakerSession):
         self._dimension = 0
 
     @classmethod
-    def for_embedder(cls, embedder, *, keep_history: bool = True) -> "MeetingSpeakerSession":
+    def for_embedder(
+        cls,
+        embedder,
+        *,
+        keep_history: bool = True,
+        max_turns: int | None = MAX_RETAINED_TURNS,
+    ) -> "MeetingSpeakerSession":
         """The session the app runs for ``embedder``: its thresholds, the
         shared continuity gap and cross-route matching only for CAM++.
 
@@ -126,7 +144,12 @@ class MeetingSpeakerSession(SpeakerSession):
             cross_route_matching=embedder.name == "campplus",
             sticky_threshold=embedder.sticky_threshold,
             sticky_gap_ms=STICKY_GAP_MS,
+            max_turns=max_turns,
         )
+
+    @property
+    def max_turns(self) -> int | None:
+        return self._max_turns
 
     @property
     def speaker_count(self) -> int:
@@ -187,6 +210,55 @@ class MeetingSpeakerSession(SpeakerSession):
         while len(self._observations) > MAX_RECENT_OBSERVATIONS:
             self._observations.popitem(last=False)
 
+    def _evict_turns(self) -> None:
+        cap = self._max_turns
+        if cap is None or len(self._turns) <= cap:
+            return
+        keep_target = max(1, int(cap * 0.85)) if cap >= 32 else cap
+        # First drop unkeyed (key < 0) turns from oldest first since end-of-session
+        # reclustering only operates on keyed transcript rows (key >= 0).
+        if any(t.key < 0 for t in self._turns):
+            keyed_only = [t for t in self._turns if t.key >= 0]
+            if len(keyed_only) >= keep_target:
+                self._turns = keyed_only
+            else:
+                unkeyed = [t for t in self._turns if t.key < 0]
+                keep_unkeyed = unkeyed[-(keep_target - len(keyed_only)) :]
+                keep_unkeyed_keys = {t.key for t in keep_unkeyed}
+                self._turns = [t for t in self._turns if t.key >= 0 or t.key in keep_unkeyed_keys]
+            if len(self._turns) <= cap:
+                self._turn_index = {t.key: idx for idx, t in enumerate(self._turns)}
+                return
+
+        confirmed_keys: set[int] = set()
+        for prof in self._profiles.values():
+            confirmed_keys.update(prof.confirmed)
+        seen_speakers: set[int] = set()
+        protected_indices: set[int] = set()
+        for idx, turn in enumerate(self._turns):
+            if turn.speaker_id > 0 and turn.speaker_id not in seen_speakers:
+                seen_speakers.add(turn.speaker_id)
+                protected_indices.add(idx)
+            elif turn.key in confirmed_keys:
+                protected_indices.add(idx)
+
+        n = len(self._turns)
+        recent_count = min(max(1, keep_target // 2), n)
+        recent_start = n - recent_count
+        protected_indices.update(range(recent_start, n))
+
+        if len(protected_indices) >= keep_target:
+            chosen = sorted(_subsample_evenly(sorted(protected_indices), cap))
+        else:
+            older_pool = [i for i in range(recent_start) if i not in protected_indices]
+            extra_budget = keep_target - len(protected_indices)
+            chosen_set = set(protected_indices)
+            chosen_set.update(_subsample_evenly(older_pool, extra_budget))
+            chosen = sorted(chosen_set)[:cap]
+
+        self._turns = [self._turns[i] for i in chosen]
+        self._turn_index = {t.key: idx for idx, t in enumerate(self._turns)}
+
     def assign(self, embedding: np.ndarray, route: str = "", *, start_ms: int = 0,
                end_ms: int = 0, sample_key: int | None = None, learnable: bool = True) -> int:
         with self._lock:
@@ -207,7 +279,12 @@ class MeetingSpeakerSession(SpeakerSession):
             if self._keep_history:
                 duration = int(end_ms - start_ms) if end_ms and end_ms >= start_ms >= 0 else 0
                 obs_turn = TurnObservation(
-                    key, speaker_id, None if vector is None else vector.copy(), duration, bool(learnable)
+                    key,
+                    speaker_id,
+                    None if vector is None else vector.copy(),
+                    duration,
+                    bool(learnable),
+                    route,
                 )
                 existing_idx = self._turn_index.get(key)
                 if existing_idx is not None and 0 <= existing_idx < len(self._turns):
@@ -215,6 +292,7 @@ class MeetingSpeakerSession(SpeakerSession):
                 else:
                     self._turn_index[key] = len(self._turns)
                     self._turns.append(obs_turn)
+                    self._evict_turns()
             # Uncertain turns break the continuity chain.
             self._last_id = speaker_id
             self._last_end_ms = int(end_ms or start_ms or 0)
@@ -303,10 +381,14 @@ class MeetingSpeakerSession(SpeakerSession):
             turn_idx = self._turn_index.get(key)
             if turn_idx is not None and 0 <= turn_idx < len(self._turns):
                 t = self._turns[turn_idx]
-                self._turns[turn_idx] = TurnObservation(t.key, speaker_id, t.vector, t.duration_ms, t.learnable)
+                self._turns[turn_idx] = TurnObservation(
+                    t.key, speaker_id, t.vector, t.duration_ms, t.learnable, t.route
+                )
             elif self._turns:
                 self._turns = [
-                    TurnObservation(t.key, speaker_id, t.vector, t.duration_ms, t.learnable) if t.key == key else t
+                    TurnObservation(t.key, speaker_id, t.vector, t.duration_ms, t.learnable, t.route)
+                    if t.key == key
+                    else t
                     for t in self._turns
                 ]
             if next(reversed(self._observations)) == key:

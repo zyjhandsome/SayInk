@@ -26,6 +26,9 @@ MIN_CLUSTER_SECONDS = 8.0
 # CAM++ groups of one person score far above it and different people mostly
 # below; the mel fallback rarely scores this low, so it keeps folding.
 DISTINCT_VOICE_SIMILARITY = 0.30
+# Minimum cosine similarity required to merge or fold observations across
+# distinct hardware capture routes ("mic" vs "system").
+CROSS_ROUTE_MIN_SIMILARITY = 0.80
 # Safety bound matching MeetingController: above 600 keyed turns, cluster a
 # representative <=512-turn sample and project the rest onto its centroids.
 MAX_UNBOUNDED_TURNS = 600
@@ -39,14 +42,57 @@ class TurnObservation:
     vector: np.ndarray | None
     duration_ms: int = 0
     learnable: bool = True
+    route: str = ""
 
 
-def average_linkage_labels(vectors: np.ndarray, max_distance: float) -> np.ndarray:
+def _routes_conflict(routes_a: set[str], routes_b: set[str]) -> bool:
+    """True when two non-empty hardware route sets differ (e.g. ``mic`` vs ``system``)."""
+    return bool(routes_a and routes_b and routes_a != routes_b)
+
+
+def _cluster_route_map(usable: list[TurnObservation], labels: np.ndarray) -> dict[int, set[str]]:
+    route_map: dict[int, set[str]] = defaultdict(set)
+    for idx, turn in enumerate(usable):
+        lbl = int(labels[idx])
+        if lbl >= 0 and turn.route:
+            route_map[lbl].add(turn.route)
+    return route_map
+
+
+def _best_reference_match(
+    vector: np.ndarray,
+    source_routes: set[str],
+    references: dict[int, np.ndarray],
+    ref_routes: dict[int, set[str]],
+    base_floor: float,
+) -> tuple[float, int | None]:
+    best_sim = -2.0
+    best_label: int | None = None
+    for label, ref_vec in references.items():
+        sim = float(vector @ ref_vec)
+        req = (
+            max(base_floor, CROSS_ROUTE_MIN_SIMILARITY)
+            if _routes_conflict(source_routes, ref_routes.get(label, set()))
+            else base_floor
+        )
+        if sim >= req and (best_label is None or (sim, label) > (best_sim, best_label)):
+            best_sim = sim
+            best_label = label
+    return best_sim, best_label
+
+
+def average_linkage_labels(
+    vectors: np.ndarray,
+    max_distance: float,
+    *,
+    routes: list[str] | tuple[str, ...] | None = None,
+) -> np.ndarray:
     """Agglomerative clustering (average linkage) on cosine distance.
 
     ``vectors`` must be unit length. Clusters merge while their average
-    pairwise distance is at most ``max_distance``. Returns one label per row,
-    numbered by first appearance.
+    pairwise distance is at most ``max_distance`` (and at most
+    ``1 - CROSS_ROUTE_MIN_SIMILARITY`` across conflicting non-empty ``routes``).
+    Returns one label per row, numbered by first appearance.
     """
     n = int(len(vectors))
     if n == 0:
@@ -54,12 +100,68 @@ def average_linkage_labels(vectors: np.ndarray, max_distance: float) -> np.ndarr
     if n == 1:
         return np.zeros(1, dtype=np.int64)
     v64 = vectors.astype(np.float64)
-    matrix = 1.0 - v64 @ v64.T
-    np.fill_diagonal(matrix, np.inf)
+    raw_matrix = 1.0 - v64 @ v64.T
+    np.fill_diagonal(raw_matrix, np.inf)
+    has_routes = bool(routes is not None and len(routes) == n and any(routes))
+    if not has_routes:
+        matrix = raw_matrix
+        sizes = np.ones(n, dtype=np.float64)
+        members: dict[int, list[int]] = {i: [i] for i in range(n)}
+        row_min = matrix.min(axis=1)
+        row_arg = matrix.argmin(axis=1)
+        while len(members) > 1:
+            i = int(np.argmin(row_min))
+            if not np.isfinite(row_min[i]) or row_min[i] > max_distance:
+                break
+            j = int(row_arg[i])
+            if i > j:
+                i, j = j, i
+            merged = (sizes[i] * matrix[i] + sizes[j] * matrix[j]) / (sizes[i] + sizes[j])
+            matrix[i, :] = merged
+            matrix[:, i] = merged
+            matrix[i, i] = np.inf
+            matrix[j, :] = np.inf
+            matrix[:, j] = np.inf
+            sizes[i] += sizes[j]
+            members[i].extend(members.pop(j))
+            row_min[j] = np.inf
+            row_min[i] = matrix[i].min()
+            row_arg[i] = int(matrix[i].argmin())
+            stale = np.flatnonzero((row_arg == i) | (row_arg == j))
+            stale = stale[(stale != i) & np.isfinite(row_min[stale])]
+            if stale.size:
+                sub = matrix[stale]
+                args = np.argmin(sub, axis=1)
+                row_arg[stale] = args
+                row_min[stale] = sub[np.arange(stale.size), args]
+            closer = np.flatnonzero(matrix[:, i] < row_min)
+            row_min[closer] = matrix[closer, i]
+            row_arg[closer] = i
+        labels = np.zeros(n, dtype=np.int64)
+        for rank, (_root, rows) in enumerate(sorted(members.items(), key=lambda item: min(item[1]))):
+            labels[rows] = rank
+        return labels
+
+    assert routes is not None
+    cross_max_distance = min(max_distance, max(0.0, 1.0 - CROSS_ROUTE_MIN_SIMILARITY))
+    cluster_routes: dict[int, set[str]] = {
+        i: ({str(routes[i]).strip()} if str(routes[i]).strip() else set())
+        for i in range(n)
+    }
+    eff_matrix = raw_matrix.copy()
+    for a in range(n):
+        r_a = cluster_routes[a]
+        if not r_a:
+            continue
+        for b in range(a + 1, n):
+            r_b = cluster_routes[b]
+            if r_b and r_a != r_b and eff_matrix[a, b] > cross_max_distance:
+                eff_matrix[a, b] = np.inf
+                eff_matrix[b, a] = np.inf
     sizes = np.ones(n, dtype=np.float64)
-    members: dict[int, list[int]] = {i: [i] for i in range(n)}
-    row_min = matrix.min(axis=1)
-    row_arg = matrix.argmin(axis=1)
+    members = {i: [i] for i in range(n)}
+    row_min = eff_matrix.min(axis=1)
+    row_arg = eff_matrix.argmin(axis=1)
     while len(members) > 1:
         i = int(np.argmin(row_min))
         if not np.isfinite(row_min[i]) or row_min[i] > max_distance:
@@ -67,28 +169,42 @@ def average_linkage_labels(vectors: np.ndarray, max_distance: float) -> np.ndarr
         j = int(row_arg[i])
         if i > j:
             i, j = j, i
-        merged = (sizes[i] * matrix[i] + sizes[j] * matrix[j]) / (sizes[i] + sizes[j])
-        matrix[i, :] = merged
-        matrix[:, i] = merged
-        matrix[i, i] = np.inf
-        matrix[j, :] = np.inf
-        matrix[:, j] = np.inf
+        merged = (sizes[i] * raw_matrix[i] + sizes[j] * raw_matrix[j]) / (sizes[i] + sizes[j])
+        raw_matrix[i, :] = merged
+        raw_matrix[:, i] = merged
+        raw_matrix[i, i] = np.inf
+        raw_matrix[j, :] = np.inf
+        raw_matrix[:, j] = np.inf
         sizes[i] += sizes[j]
         members[i].extend(members.pop(j))
+        cluster_routes[i].update(cluster_routes.pop(j))
+
+        eff_row = np.full(n, np.inf, dtype=np.float64)
+        r_i = cluster_routes[i]
+        for k, r_k in cluster_routes.items():
+            if k == i:
+                continue
+            d = raw_matrix[i, k]
+            if _routes_conflict(r_i, r_k) and d > cross_max_distance:
+                d = np.inf
+            eff_row[k] = d
+        eff_matrix[i, :] = eff_row
+        eff_matrix[:, i] = eff_row
+        eff_matrix[j, :] = np.inf
+        eff_matrix[:, j] = np.inf
+
         row_min[j] = np.inf
-        row_min[i] = matrix[i].min()
-        row_arg[i] = int(matrix[i].argmin())
-        # Every other row's distance to i changed; its minimum can only move
-        # if i (or the vanished j) was its nearest, or i just became nearer.
+        row_min[i] = eff_matrix[i].min()
+        row_arg[i] = int(eff_matrix[i].argmin())
         stale = np.flatnonzero((row_arg == i) | (row_arg == j))
         stale = stale[(stale != i) & np.isfinite(row_min[stale])]
         if stale.size:
-            sub = matrix[stale]
+            sub = eff_matrix[stale]
             args = np.argmin(sub, axis=1)
             row_arg[stale] = args
             row_min[stale] = sub[np.arange(stale.size), args]
-        closer = np.flatnonzero(matrix[:, i] < row_min)
-        row_min[closer] = matrix[closer, i]
+        closer = np.flatnonzero(eff_matrix[:, i] < row_min)
+        row_min[closer] = eff_matrix[closer, i]
         row_arg[closer] = i
     labels = np.zeros(n, dtype=np.int64)
     for rank, (_root, rows) in enumerate(sorted(members.items(), key=lambda item: min(item[1]))):
@@ -114,6 +230,7 @@ def _normalize_usable_turns(turns: list[TurnObservation]) -> list[TurnObservatio
                 vec / norm,
                 max(0, int(turn.duration_ms)),
                 bool(turn.learnable),
+                str(getattr(turn, "route", "") or "").strip(),
             )
         )
     return usable
@@ -142,6 +259,7 @@ def _recurring_subsecond_labels(
     # second participant who repeatedly answers in <1s clips forms a tight,
     # distinct cluster over the session and must not stay speaker 0 forever.
     promoted: set[int] = set()
+    route_map = _cluster_route_map(usable, labels)
     base_refs = {l: _cluster_centroid(vectors, labels, l) for l in base_founded} if base_founded else {}
     for label in counts:
         if label in base_founded:
@@ -156,7 +274,13 @@ def _recurring_subsecond_labels(
         cohesion = float(np.mean(vectors[sub_rows] @ center))
         if cohesion < 0.80:
             continue
-        if base_refs and _nearest_reference(center, base_refs)[0] >= DISTINCT_VOICE_SIMILARITY:
+        if (
+            base_refs
+            and _best_reference_match(
+                center, route_map.get(label, set()), base_refs, route_map, DISTINCT_VOICE_SIMILARITY
+            )[1]
+            is not None
+        ):
             continue
         promoted.add(label)
     return promoted
@@ -204,6 +328,7 @@ def _fold_small_clusters(
     if not big:
         return
     references = {l: _cluster_centroid(vectors, labels, l) for l in big}
+    route_map = _cluster_route_map(usable, labels)
     small = sorted(set(counts) - set(big))
     merge_floor = (
         max(DISTINCT_VOICE_SIMILARITY, float(threshold) - 0.15)
@@ -215,25 +340,66 @@ def _fold_small_clusters(
     # In fallback_seed short meetings (where no cluster has reached min_turns
     # or min_seconds yet), any clear founded voice below merge_floor is kept
     # as an independent speaker rather than collapsed into the single seed.
-    kept = [
-        l for l in small
-        if l in founded
-        and (fallback_seed or counts[l] >= min_turns or seconds[l] >= min_seconds)
-        and _nearest_reference(_cluster_centroid(vectors, labels, l), references)[0] < merge_floor
-    ]
-    references.update({l: _cluster_centroid(vectors, labels, l) for l in kept})
+    kept: list[int] = []
+    for l in small:
+        if (
+            l in founded
+            and (fallback_seed or counts[l] >= min_turns or seconds[l] >= min_seconds)
+            and _best_reference_match(
+                _cluster_centroid(vectors, labels, l),
+                route_map.get(l, set()),
+                references,
+                route_map,
+                merge_floor,
+            )[1]
+            is None
+        ):
+            kept.append(l)
+            references[l] = _cluster_centroid(vectors, labels, l)
+
+    # Never collapse a founded speaker on an isolated hardware route (e.g. a
+    # headphone "mic" user who spoke <3 turns / <8s) into an incompatible
+    # "system" speaker unless cross-route similarity reaches 0.80.
+    kept_set = set(kept)
+    for l in sorted(
+        (c for c in small if c in founded and c not in kept_set and route_map.get(c)),
+        key=lambda c: (-seconds[c], -counts[c], c),
+    ):
+        r_l = route_map.get(l, set())
+        has_compat_ref = any(not _routes_conflict(r_l, route_map.get(ref, set())) for ref in references)
+        if has_compat_ref:
+            continue
+        center = _cluster_centroid(vectors, labels, l)
+        if _best_reference_match(center, r_l, references, route_map, merge_floor)[1] is None:
+            kept.append(l)
+            kept_set.add(l)
+            references[l] = center
+
     unlike: list[tuple[int, int]] = []
     for l in small:
-        if l in kept:
+        if l in kept_set:
             continue
-        similarity, target = _nearest_reference(_cluster_centroid(vectors, labels, l), references)
-        if similarity >= merge_floor:
+        r_l = route_map.get(l, set())
+        center = _cluster_centroid(vectors, labels, l)
+        _sim, target = _best_reference_match(center, r_l, references, route_map, merge_floor)
+        if target is not None:
             labels[labels == l] = target
+            route_map[target].update(r_l)
         elif l in founded and not fallback_seed:
-            unlike.append((l, target))
+            compat_refs = {
+                ref: ref_vec
+                for ref, ref_vec in references.items()
+                if not _routes_conflict(r_l, route_map.get(ref, set()))
+            }
+            if compat_refs:
+                unlike.append((l, _nearest_reference(center, compat_refs)[1]))
     # A short clear group unlike every voice (laughter, a cough) says little
-    # about who made it; between turns of one speaker it stays with them.
+    # about who made it; between turns of one speaker on a compatible route it stays with them.
     for l, target in unlike:
+        r_l = route_map.get(l, set())
+        compat_set = {
+            ref for ref in references if not _routes_conflict(r_l, route_map.get(ref, set()))
+        }
         rows = set(np.flatnonzero(labels == l).tolist())
         around = {
             int(labels[n])
@@ -241,10 +407,13 @@ def _fold_small_clusters(
             for n in (r - 1, r + 1)
             if 0 <= n < len(usable) and n not in rows
         }
-        labels[labels == l] = around.pop() if len(around) == 1 and around <= set(references) else target
+        chosen = around.pop() if len(around) == 1 and around <= compat_set else target
+        labels[labels == l] = chosen
+        route_map[chosen].update(r_l)
 
 
 def _enforce_speaker_cap(
+    usable: list[TurnObservation],
     vectors: np.ndarray,
     labels: np.ndarray,
     durations: np.ndarray,
@@ -252,6 +421,7 @@ def _enforce_speaker_cap(
     max_speakers: int,
 ) -> None:
     limit = max(1, int(max_speakers))
+    route_map = _cluster_route_map(usable, labels)
     while True:
         current = [int(l) for l in np.unique(labels) if l >= 0]
         if len(current) <= limit:
@@ -265,8 +435,19 @@ def _enforce_speaker_cap(
             key=lambda l: (float(durations[labels == l].sum()), int(np.sum(labels == l))),
         )
         others = {o: _cluster_centroid(vectors, labels, o) for o in current if o != smallest}
-        similarity, target = _nearest_reference(_cluster_centroid(vectors, labels, smallest), others)
-        labels[labels == smallest] = target if similarity >= DISTINCT_VOICE_SIMILARITY else -1
+        r_small = route_map.get(smallest, set())
+        _sim, target = _best_reference_match(
+            _cluster_centroid(vectors, labels, smallest),
+            r_small,
+            others,
+            route_map,
+            DISTINCT_VOICE_SIMILARITY,
+        )
+        if target is not None:
+            labels[labels == smallest] = target
+            route_map[target].update(r_small)
+        else:
+            labels[labels == smallest] = -1
 
 
 def _claim_protected_clusters(
@@ -371,7 +552,12 @@ def reassign_turns(
     if len(dims) != 1:
         return manual
     vectors = np.stack([t.vector for t in usable if t.vector is not None])
-    labels = average_linkage_labels(vectors, max(0.0, 1.0 - float(threshold)))
+    turn_routes = [t.route for t in usable]
+    labels = average_linkage_labels(
+        vectors,
+        max(0.0, 1.0 - float(threshold)),
+        routes=turn_routes,
+    )
     durations = np.array([t.duration_ms / 1000.0 for t in usable], dtype=np.float64)
 
     manual_rows = [t.key in locked or t.speaker_id in protected for t in usable]
@@ -400,7 +586,7 @@ def reassign_turns(
 
     # The cap is not evidence of identity. An excess group unlike every other
     # stays unknown; manual identities are never removed.
-    _enforce_speaker_cap(vectors, labels, durations, manual_rows, max_speakers)
+    _enforce_speaker_cap(usable, vectors, labels, durations, manual_rows, max_speakers)
     return _number_clusters(
         usable, labels, durations, protected=protected, locked=locked, manual=manual
     )
@@ -426,10 +612,16 @@ def final_assignments(
     subsecond_unknowns = sum(
         1 for t in turns if 0 < t.duration_ms < 1000 and t.speaker_id == 0 and t.vector is not None
     )
+    distinct_routes = {
+        str(getattr(t, "route", "") or "").strip()
+        for t in turns
+        if getattr(t, "route", "") and t.learnable and t.vector is not None
+    }
     multi_voice_candidates = (
         int(getattr(session, "speaker_count", 0)) >= 2
         or len(protected_ids or ()) >= 2
         or subsecond_unknowns >= MIN_CLUSTER_TURNS
+        or len(distinct_routes) >= 2
     )
     limit = MAX_SPEAKERS if multi_voice_candidates else 1
     return reassign_turns(turns, threshold=threshold, max_speakers=limit,
@@ -514,13 +706,17 @@ def _select_bounded_turn_indices(
 def _build_cluster_projection(
     sampled_turns: list[TurnObservation],
     core: dict[int, int],
-) -> tuple[dict[int, np.ndarray], dict[int, int]]:
+) -> tuple[dict[int, np.ndarray], dict[int, int], dict[int, set[str]]]:
     cluster_vecs: dict[int, list[np.ndarray]] = {}
+    cluster_routes: dict[int, set[str]] = defaultdict(set)
     speaker_vote: dict[int, dict[int, int]] = {}
     for turn in sampled_turns:
         sid = core.get(turn.key, turn.speaker_id)
         if sid > 0 and turn.learnable and turn.vector is not None and len(turn.vector) > 0:
             cluster_vecs.setdefault(sid, []).append(np.asarray(turn.vector, dtype=np.float32))
+            t_route = str(getattr(turn, "route", "") or "").strip()
+            if t_route:
+                cluster_routes[sid].add(t_route)
         if turn.speaker_id > 0 and sid > 0:
             votes = speaker_vote.setdefault(turn.speaker_id, {})
             votes[sid] = votes.get(sid, 0) + 1
@@ -535,7 +731,7 @@ def _build_cluster_projection(
         for old_sid, votes in speaker_vote.items()
         if votes
     }
-    return centroids, fallback_map
+    return centroids, fallback_map, cluster_routes
 
 
 def _project_turn_speaker(
@@ -544,9 +740,12 @@ def _project_turn_speaker(
     threshold: float,
     centroids: dict[int, np.ndarray],
     fallback_map: dict[int, int],
+    cluster_routes: dict[int, set[str]] | None = None,
 ) -> int:
     best_sid = 0
     best_sim = -1.0
+    t_route = str(getattr(turn, "route", "") or "").strip()
+    t_routes = {t_route} if t_route else set()
     if centroids and turn.vector is not None and len(turn.vector) > 0:
         vec = np.asarray(turn.vector, dtype=np.float32)
         vnorm = float(np.linalg.norm(vec))
@@ -555,13 +754,21 @@ def _project_turn_speaker(
             for sid, cvec in centroids.items():
                 if cvec.shape == uvec.shape:
                     sim = float(np.dot(uvec, cvec))
-                    if sim > best_sim:
+                    req = (
+                        max(threshold, CROSS_ROUTE_MIN_SIMILARITY)
+                        if cluster_routes is not None
+                        and _routes_conflict(t_routes, cluster_routes.get(sid, set()))
+                        else threshold
+                    )
+                    if sim >= req and sim > best_sim:
                         best_sim = sim
                         best_sid = sid
-    if best_sid > 0 and best_sim >= threshold:
+    if best_sid > 0:
         return best_sid
     if turn.speaker_id in fallback_map:
-        return fallback_map[turn.speaker_id]
+        candidate = fallback_map[turn.speaker_id]
+        if cluster_routes is None or not _routes_conflict(t_routes, cluster_routes.get(candidate, set())):
+            return candidate
     return turn.speaker_id
 
 
@@ -619,7 +826,7 @@ def bounded_final_assignments(
     )
     if cancel is not None and cancel():
         return {}
-    centroids, fallback_map = _build_cluster_projection(sampled_turns, core)
+    centroids, fallback_map, cluster_routes = _build_cluster_projection(sampled_turns, core)
     full: dict[int, int] = dict(core)
     for idx, turn in enumerate(keyed):
         if cancel is not None and (idx & 63) == 0 and cancel():
@@ -633,6 +840,10 @@ def bounded_final_assignments(
             full[turn.key] = turn.speaker_id
             continue
         full[turn.key] = _project_turn_speaker(
-            turn, threshold=threshold, centroids=centroids, fallback_map=fallback_map
+            turn,
+            threshold=threshold,
+            centroids=centroids,
+            fallback_map=fallback_map,
+            cluster_routes=cluster_routes,
         )
     return full

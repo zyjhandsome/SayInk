@@ -81,10 +81,11 @@ def test_continuous_speech_has_no_missing_or_duplicated_samples(mode, seconds):
     def check(out):
         nonlocal cursor
         if out is not None:
-            assert seg.last_bounds == (cursor, cursor + len(out))
-            assert len(out) > 0
+            overlap = getattr(out, "overlap_samples", 0)
+            assert seg.last_bounds == (cursor - overlap, cursor - overlap + len(out))
+            assert len(out) > overlap
             assert len(out) <= 15 * RATE
-            cursor += len(out)
+            cursor += len(out) - overlap
 
     for start in range(0, total, 1600):
         block = rng.uniform(0.04, 0.06, min(1600, total - start)).astype(np.float32)
@@ -107,8 +108,12 @@ def test_immediate_tail_is_kept_even_if_neural_gate_has_not_reopened():
     assert out.size == 15 * RATE
     tail = np.full(160, 0.1, np.float32)
     assert seg.feed(tail) is None
-    np.testing.assert_array_equal(seg.flush(), tail)
-    assert seg.last_bounds == (15 * RATE, 15 * RATE + 160)
+    flushed = seg.flush()
+    assert flushed is not None
+    overlap = getattr(flushed, "overlap_samples", 0)
+    assert overlap == int(RATE * 0.24)
+    np.testing.assert_array_equal(flushed[overlap:], tail)
+    assert seg.last_bounds == (15 * RATE - overlap, 15 * RATE + 160)
     assert seg.flush() is None
 
 
