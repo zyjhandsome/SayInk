@@ -3,7 +3,7 @@ import sys
 from PyQt6.QtWidgets import QSystemTrayIcon, QMenu
 from PyQt6.QtGui import (
     QIcon, QIconEngine, QPixmap, QPainter, QColor, QBrush, QPen,
-    QRadialGradient, QPainterPath, QActionGroup
+    QRadialGradient, QPainterPath, QAction, QActionGroup
 )
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QSize, QRect, QRectF, QPoint, QPointF
 
@@ -998,6 +998,8 @@ class TrayIcon(QSystemTrayIcon):
     menu_closed = pyqtSignal()
     meeting_start_requested = pyqtSignal()
     meeting_end_requested = pyqtSignal()
+    end_meeting_requested = meeting_end_requested
+    stop_continuous_requested = pyqtSignal()
     meetings_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -1020,8 +1022,10 @@ class TrayIcon(QSystemTrayIcon):
         from PyQt6.QtCore import QTimer
 
         self._model_menu = None
+        self._end_meeting_menu = None
         self._model_group = None
         self._menu = None
+        self._continuous_listening = False
         self._menu_is_open = False
         self._wake_after_menu = False
         self._wake_queued = False
@@ -1074,6 +1078,7 @@ class TrayIcon(QSystemTrayIcon):
     def reapply_theme(self) -> None:
         _paint_menu(self._menu)
         _paint_menu(self._model_menu)
+        _paint_menu(self._end_meeting_menu)
         kind = getattr(self, "_icon_kind", "normal")
         self._rebuild_icons()
         self._apply_icon_kind(kind)
@@ -1112,6 +1117,13 @@ class TrayIcon(QSystemTrayIcon):
         history_action.triggered.connect(self.history_requested.emit)
 
         menu.addSeparator()
+        self._stop_continuous_action = QAction("结束持续转写并保留内容", menu)
+        self._stop_continuous_action.triggered.connect(self.stop_continuous_requested.emit)
+        self._end_meeting_menu = QMenu("结束会议", menu)
+        _paint_menu(self._end_meeting_menu)
+        self._confirm_end_meeting_action = self._end_meeting_menu.addAction("确认结束本场会议")
+        self._confirm_end_meeting_action.triggered.connect(self._on_confirm_end_meeting)
+        self._continue_meeting_action = self._end_meeting_menu.addAction("继续记录")
         self._meeting_toggle_action = menu.addAction("开始会议")
         self._meeting_toggle_action.triggered.connect(self._on_meeting_toggle)
         meetings_action = menu.addAction("会议记录")
@@ -1138,15 +1150,39 @@ class TrayIcon(QSystemTrayIcon):
         self.setContextMenu(menu)
 
     def _on_meeting_toggle(self) -> None:
-        if self._meeting_in_progress:
-            self.meeting_end_requested.emit()
-        else:
+        if not self._meeting_in_progress:
             self.meeting_start_requested.emit()
 
+    def _on_confirm_end_meeting(self) -> None:
+        if self._meeting_in_progress:
+            self.end_meeting_requested.emit()
+
+    def _sync_dynamic_session_actions(self) -> None:
+        if self._menu is None:
+            return
+        actions = self._menu.actions()
+        present = self._stop_continuous_action in actions
+        want_stop = bool(self._continuous_listening and not self._meeting_in_progress)
+        if want_stop and not present:
+            self._menu.insertAction(self._meeting_toggle_action, self._stop_continuous_action)
+        elif not want_stop and present:
+            self._menu.removeAction(self._stop_continuous_action)
+
+    def set_continuous_listening(self, active: bool) -> None:
+        """Show or hide 「结束持续转写并保留内容」 in the tray menu."""
+        self._continuous_listening = bool(active)
+        self._sync_dynamic_session_actions()
+
     def set_meeting_in_progress(self, active: bool) -> None:
-        """Flip the tray entry between 「开始会议」 and 「结束会议」."""
+        """Flip the tray entry between 1-click 「开始会议」 and submenu 「结束会议」."""
         self._meeting_in_progress = bool(active)
-        self._meeting_toggle_action.setText("结束会议" if active else "开始会议")
+        if self._meeting_in_progress:
+            self._meeting_toggle_action.setText("结束会议")
+            self._meeting_toggle_action.setMenu(self._end_meeting_menu)
+        else:
+            self._meeting_toggle_action.setMenu(None)
+            self._meeting_toggle_action.setText("开始会议")
+        self._sync_dynamic_session_actions()
 
     def show_update_notice(self, body: str) -> None:
         """Tray balloon for a new version. Other notices clear this kind."""

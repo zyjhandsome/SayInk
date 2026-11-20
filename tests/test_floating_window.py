@@ -380,7 +380,7 @@ def test_hold_recording_shows_live_transcript(win):
 
     win.show_recognizing()
     win.show_success("已输入", "可按 Ctrl+V 粘贴")
-    assert "这句还在" in win._text_label.text()
+    assert "可按 Ctrl+V 粘贴" in win._text_label.text()
 
 
 def test_live_transcript_keeps_the_tail_while_listening(win):
@@ -393,8 +393,10 @@ def test_live_transcript_keeps_the_tail_while_listening(win):
     win.show_listening()
     win.show_recognizing()
     win.show_success("已发送", "发送到 notepad")
-    assert "结尾还在" in win._text_label.text()
+    assert "发送到 notepad" in win._text_label.text()
     assert "正在听" in win._status_label.text()
+    win.refresh_continuous_ui()
+    assert "结尾还在" in win._text_label.text()
 
 
 def test_partial_text_grows_excerpt_only(win):

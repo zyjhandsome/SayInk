@@ -123,13 +123,14 @@ def test_config_links_switch_the_page_and_sidebar_together(about_window):
     assert win._nav_buttons[4].isChecked()
 
 
-def test_sidebar_and_summary_refresh_without_reconfiguring_audio(about_window):
+def test_sidebar_and_summary_refresh_without_reconfiguring_audio(about_window, config):
     win = about_window
     settings = win.settings_panel
     audio_changes = []
     settings.settings_changed.connect(lambda: audio_changes.append(True))
-    settings._history_enabled_row.setChecked(False)
-    settings._output_mode_combo.setCurrentIndex(settings._output_mode_combo.findData("history"))
+    config.set("history.enabled", False)
+    config.set_output_mode("history", auto=False)
+    settings.reload_settings(refresh_devices=False, heavy=False)
     assert "未保存" in win._output_label.text()
     assert "未保存" in settings._about_summary_rows["输出去向"].value_label.text()
     settings._history_enabled_row.setChecked(True)
@@ -167,11 +168,12 @@ def test_file_locations_toggle_works_from_the_keyboard_and_survives_theme_change
     assert toggle.accessibleName() == "展开文件位置"
 
 
-def test_missing_history_warning_keeps_its_semantics_after_a_theme_switch(about_window, _qapp_session):
+def test_missing_history_warning_keeps_its_semantics_after_a_theme_switch(about_window, config, _qapp_session):
     win = about_window
     settings = win.settings_panel
-    settings._history_enabled_row.setChecked(False)
-    settings._output_mode_combo.setCurrentIndex(settings._output_mode_combo.findData("history"))
+    config.set("history.enabled", False)
+    config.set_output_mode("history", auto=False)
+    settings.reload_settings(refresh_devices=False, heavy=False)
     apply_theme(_qapp_session, mode="dark", surfaces=[win, settings])
     assert tok.RED in win._output_label.styleSheet()
     assert tok.RED in settings._about_summary_rows["输出去向"].value_label.styleSheet()

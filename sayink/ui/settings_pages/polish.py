@@ -99,6 +99,7 @@ class PolishSettingsPage(SettingsPage):
     llm_enable_toggled = pyqtSignal(bool)
     llm_mode_changed = pyqtSignal(int)
     llm_fields_edited = pyqtSignal()
+    llm_url_editing_finished = pyqtSignal()
     app_presets_edited = pyqtSignal()
     prompt_reset_requested = pyqtSignal()
     llm_test_requested = pyqtSignal()
@@ -166,6 +167,7 @@ class PolishSettingsPage(SettingsPage):
         self.add(self._build_minutes_section(config))
 
         self.llm_url_edit.editingFinished.connect(self.llm_fields_edited.emit)
+        self.llm_url_edit.editingFinished.connect(self.llm_url_editing_finished.emit)
         self.llm_key_edit.editingFinished.connect(self.llm_fields_edited.emit)
         self.llm_model_edit.editingFinished.connect(self.llm_fields_edited.emit)
         self.llm_prompt_timer = QTimer(self)
@@ -286,7 +288,7 @@ class PolishSettingsPage(SettingsPage):
         polish_card_lay.setSpacing(0)
         self.llm_enable_row = ToggleOptionRow(
             "启用文字润色",
-            "关闭时直接输出原文；开启后，转写文字会发送至上方配置的服务",
+            "关闭时直接输出原文；开启后，会将口述文本、自定义词汇及同窗口近期上下文发送至上方配置的服务（绑定「直出原文」的应用除外）",
         )
         self.llm_enable_row.toggled.connect(self._handle_enable_toggled)
         polish_card_lay.addWidget(self.llm_enable_row)
@@ -467,7 +469,7 @@ class PolishSettingsPage(SettingsPage):
         lay.addWidget(group_divider())
         self.minutes_auto_row = ToggleOptionRow(
             "会议结束后自动生成纪要",
-            "用默认模板在后台生成，连续多场按顺序排队；文字稿会发送到上方配置的服务",
+            "用默认模板在后台生成，连续多场按顺序排队；会将完整文字稿、会议标题、参会人、议程、标记、我的笔记、自定义词汇与说话人称呼发送到上方配置的服务（不发送音频）",
         )
         self.minutes_auto_row.toggled.connect(self.minutes_auto_toggled.emit)
         lay.addWidget(self.minutes_auto_row)
