@@ -51,6 +51,7 @@ _MEETING_SHORT = MEETING_STATE_LABELS["live_short"]
 # call_when_painted() gives up waiting for a paint after this long (the bar
 # may be off screen or unchanged, and then no paint arrives).
 PAINT_WAIT_MAX_MS = 100
+MEETING_END_CONFIRM_TIMEOUT_MS = 3000
 
 
 def _ui_font(family, pixels, weight=QFont.Weight.Normal):
@@ -438,7 +439,10 @@ class WaveformWidget(QWidget):
 class FloatingWindow(QWidget):
 
     continuous_stop_requested = pyqtSignal()
+    end_requested = continuous_stop_requested
     cancel_requested = pyqtSignal()
+    retry_save_requested = pyqtSignal()
+    copy_unsaved_requested = pyqtSignal()
     settings_requested = pyqtSignal()
     history_requested = pyqtSignal()
     # Meeting state: 「标记」 button and a click on the bar body.
@@ -458,9 +462,13 @@ class FloatingWindow(QWidget):
         self._meeting_elapsed = "00:00:00"
         self._meeting_paused_detail = ""
         self._meeting_source = ""
+        self._meeting_end_armed = False
         self._capture_active = False
         # Set by end_capture() once the hold key is up; cleared by show_recording().
         self._capture_released = False
+        self._speech_capturing = False
+        self._suppress_cancel_btn = False
+        self._unsaved_recovery_active = False
         self._model_loading_active = False
         self._live_text = ""
         self._full_status_text = "准备中..."
@@ -472,6 +480,12 @@ class FloatingWindow(QWidget):
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self._on_hide_timer_timeout)
+        self._continuous_toast_timer = QTimer(self)
+        self._continuous_toast_timer.setSingleShot(True)
+        self._continuous_toast_timer.timeout.connect(self._on_continuous_toast_timeout)
+        self._meeting_end_confirm_timer = QTimer(self)
+        self._meeting_end_confirm_timer.setSingleShot(True)
+        self._meeting_end_confirm_timer.timeout.connect(self._disarm_meeting_end_confirm)
         self._transient_restore_timer = QTimer(self)
         self._transient_restore_timer.setSingleShot(True)
         self._transient_restore_timer.timeout.connect(self._restore_after_transient_meeting_notice)
@@ -586,6 +600,37 @@ class FloatingWindow(QWidget):
             return
         self.hide()
 
+    def _on_continuous_toast_timeout(self) -> None:
+        if self._listening_active and not self._meeting_active and not self._unsaved_recovery_active:
+            self.refresh_continuous_ui()
+
+    def _reset_transient_overlays(
+        self,
+        *,
+        keep_unsaved: bool = False,
+        keep_armed_meeting: bool = False,
+    ) -> None:
+        self._suppress_cancel_btn = False
+        self._continuous_toast_timer.stop()
+        if not keep_unsaved:
+            self._unsaved_recovery_active = False
+        if not keep_armed_meeting:
+            self._meeting_end_confirm_timer.stop()
+            self._meeting_end_armed = False
+
+    def refresh_continuous_ui(self) -> None:
+        if self._listening_active and not self._meeting_active:
+            self.show_listening()
+
+    def set_speech_capturing(self, active: bool) -> None:
+        flag = bool(active)
+        if self._speech_capturing == flag:
+            return
+        self._speech_capturing = flag
+        if self._listening_active and not self._meeting_active:
+            self._sync_cancel_button()
+            self._update_status_elision()
+
     def call_when_painted(self, fn) -> None:
         """Run ``fn`` once the bar's current state is on screen.
 
@@ -662,7 +707,7 @@ class FloatingWindow(QWidget):
                 }}
             """)
 
-        self._set_btn_css(self._cancel_btn, f"""
+        chip_css = f"""
             QPushButton {{
                 background: {tok.CHIP_BG};
                 color: {tok.FLOAT_TEXT};
@@ -677,11 +722,56 @@ class FloatingWindow(QWidget):
                 color: {tok.FLOAT_TEXT};
                 border-color: {tok.FLOAT_TEXT_SEC};
             }}
-        """)
+        """
+        self._set_btn_css(self._cancel_btn, chip_css)
+        if hasattr(self, "_copy_unsaved_btn"):
+            self._set_btn_css(self._copy_unsaved_btn, chip_css)
+        if hasattr(self, "_meeting_end_cancel_btn"):
+            self._set_btn_css(self._meeting_end_cancel_btn, chip_css)
+
+        primary_sm_css = f"""
+            QPushButton {{
+                background: {tok.PRIMARY_CONTAINER};
+                color: {tok.PRIMARY_ON};
+                border: none;
+                font-size: {tok.TYPE_CAPTION}px;
+                font-weight: 700;
+                border-radius: 14px;
+                padding: 0px 10px;
+            }}
+            QPushButton:hover {{
+                background: {tok.PRIMARY_CONTAINER_HOVER};
+                color: {tok.PRIMARY_ON};
+            }}
+            QPushButton:pressed {{
+                background: {tok.PRIMARY_CONTAINER_PRESSED};
+            }}
+        """
+        if hasattr(self, "_retry_save_btn"):
+            self._set_btn_css(self._retry_save_btn, primary_sm_css)
+
+        rec_color = _qcolor(tok.STATE_RECORD)
+        rec_fg = "#0D0D0D" if rec_color.lightness() > 145 else "#FFFFFF"
+        rec_hover = rec_color.lighter(108).name() if rec_color.lightness() > 145 else rec_color.darker(112).name()
+        record_btn_css = f"""
+            QPushButton {{
+                background: {tok.STATE_RECORD};
+                color: {rec_fg};
+                border: none;
+                font-size: {tok.TYPE_CAPTION}px;
+                font-weight: 700;
+                border-radius: 15px;
+                padding: 0px 12px;
+            }}
+            QPushButton:hover {{
+                background: {rec_hover};
+                color: {rec_fg};
+            }}
+        """
+        if hasattr(self, "_meeting_end_confirm_btn"):
+            self._set_btn_css(self._meeting_end_confirm_btn, record_btn_css)
+
         if self._meeting_active:
-            rec_color = _qcolor(tok.STATE_RECORD)
-            end_fg = "#0D0D0D" if rec_color.lightness() > 145 else "#FFFFFF"
-            end_hover = rec_color.lighter(108).name() if rec_color.lightness() > 145 else rec_color.darker(112).name()
             self._set_btn_css(self._mark_btn, f"""
                 QPushButton {{
                     background: {tok.CHIP_BG};
@@ -698,21 +788,7 @@ class FloatingWindow(QWidget):
                     border-color: {tok.FLOAT_TEXT_SEC};
                 }}
             """)
-            self._set_btn_css(self._end_btn, f"""
-                QPushButton {{
-                    background: {tok.STATE_RECORD};
-                    color: {end_fg};
-                    border: none;
-                    font-size: {tok.TYPE_CAPTION}px;
-                    font-weight: 700;
-                    border-radius: 15px;
-                    padding: 0px 12px;
-                }}
-                QPushButton:hover {{
-                    background: {end_hover};
-                    color: {end_fg};
-                }}
-            """)
+            self._set_btn_css(self._end_btn, record_btn_css)
         else:
             end_css = f"""
                 QPushButton {{
@@ -815,6 +891,7 @@ class FloatingWindow(QWidget):
         actions_row = QHBoxLayout()
         actions_row.setContentsMargins(2, 0, 0, 0)
         actions_row.setSpacing(14)
+        self._actions_row = actions_row
 
         self._cancel_btn = QPushButton("取消")
         self._cancel_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -826,14 +903,56 @@ class FloatingWindow(QWidget):
         self._cancel_btn.clicked.connect(self._on_close_clicked)
         self._cancel_btn.hide()
 
+        self._copy_unsaved_btn = QPushButton("复制原文")
+        self._copy_unsaved_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._copy_unsaved_btn.setFixedHeight(28)
+        self._copy_unsaved_btn.setMinimumWidth(62)
+        self._copy_unsaved_btn.setAccessibleName("复制未保存的原文")
+        self._copy_unsaved_btn.setToolTip("复制未保存的原文到剪贴板")
+        self._copy_unsaved_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._copy_unsaved_btn.clicked.connect(self.copy_unsaved_requested.emit)
+        self._copy_unsaved_btn.hide()
+
+        self._retry_save_btn = QPushButton("重试保存")
+        self._retry_save_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._retry_save_btn.setFixedHeight(28)
+        self._retry_save_btn.setMinimumWidth(62)
+        self._retry_save_btn.setAccessibleName("重试保存到历史")
+        self._retry_save_btn.setToolTip("重新写入本机历史数据库")
+        self._retry_save_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._retry_save_btn.clicked.connect(self.retry_save_requested.emit)
+        self._retry_save_btn.hide()
+
         self._end_btn = QPushButton("结束")
         self._end_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._end_btn.setFixedHeight(30)
         self._end_btn.setMinimumWidth(50)
+        self._end_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._end_btn.setAccessibleName("结束持续转写并保留已录内容")
         self._end_btn.setToolTip("结束录音，已录内容继续识别 · Esc")
         self._end_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._end_btn.clicked.connect(self._on_end_clicked)
+
+        self._meeting_end_confirm_btn = QPushButton("确认")
+        self._meeting_end_confirm_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._meeting_end_confirm_btn.setFixedHeight(30)
+        self._meeting_end_confirm_btn.setMinimumWidth(46)
+        self._meeting_end_confirm_btn.setAccessibleName("确认结束会议")
+        self._meeting_end_confirm_btn.setToolTip("确认结束本场会议并整理文字稿")
+        self._meeting_end_confirm_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._meeting_end_confirm_btn.clicked.connect(self._on_meeting_end_confirmed)
+        self._meeting_end_confirm_btn.hide()
+
+        self._meeting_end_cancel_btn = QPushButton("取消")
+        self._meeting_end_cancel_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._meeting_end_cancel_btn.setFixedHeight(30)
+        self._meeting_end_cancel_btn.setMinimumWidth(46)
+        self._meeting_end_cancel_btn.setAccessibleName("取消结束会议")
+        self._meeting_end_cancel_btn.setToolTip("继续记录本场会议")
+        self._meeting_end_cancel_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._meeting_end_cancel_btn.clicked.connect(self._disarm_meeting_end_confirm)
+        self._meeting_end_cancel_btn.hide()
+
         self._mark_btn = QPushButton("标记")
         self._mark_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._mark_btn.setFixedHeight(30)
@@ -854,8 +973,12 @@ class FloatingWindow(QWidget):
         self._dismiss_btn.hide()
 
         actions_row.addWidget(self._cancel_btn)
+        actions_row.addWidget(self._copy_unsaved_btn)
+        actions_row.addWidget(self._retry_save_btn)
         actions_row.addWidget(self._mark_btn)
         actions_row.addWidget(self._end_btn)
+        actions_row.addWidget(self._meeting_end_confirm_btn)
+        actions_row.addWidget(self._meeting_end_cancel_btn)
         actions_row.addWidget(self._dismiss_btn)
         header_row.addLayout(actions_row)
         container_layout.addLayout(header_row)
@@ -884,16 +1007,29 @@ class FloatingWindow(QWidget):
         used = 10 + 8 + self._dot.width() + 8
         if not self._waveform.isHidden():
             used += self._waveform.width() + 8
-        visible_btns = [
-            btn for btn in (self._cancel_btn, self._mark_btn, self._end_btn, self._dismiss_btn)
-            if not btn.isHidden()
-        ]
+        all_btns = (
+            self._cancel_btn,
+            self._copy_unsaved_btn,
+            self._retry_save_btn,
+            self._mark_btn,
+            self._end_btn,
+            self._meeting_end_confirm_btn,
+            self._meeting_end_cancel_btn,
+            self._dismiss_btn,
+        )
+        visible_btns = [btn for btn in all_btns if not btn.isHidden()]
         if visible_btns:
+            gap = self._actions_row.spacing() if hasattr(self, "_actions_row") else 14
             used += 8 + 2 + sum(
-                btn.width() if btn is self._dismiss_btn else max(btn.minimumWidth(), QFontMetrics(btn.font()).horizontalAdvance(btn.text()) + 20)
+                btn.width()
+                if btn is self._dismiss_btn
+                else max(
+                    btn.minimumWidth(),
+                    QFontMetrics(btn.font()).horizontalAdvance(btn.text()) + 20,
+                )
                 for btn in visible_btns
             )
-            used += 14 * max(0, len(visible_btns) - 1)
+            used += gap * max(0, len(visible_btns) - 1)
         return max(88, BAR_WIDTH - used)
 
     def _update_status_elision(self) -> None:
@@ -917,17 +1053,23 @@ class FloatingWindow(QWidget):
         if (
             self._meeting_active
             or self._model_loading_active
-            or getattr(self, "_state_token", "") == "STATE_ERROR"
+            or self._suppress_cancel_btn
+            or self._unsaved_recovery_active
+            or (getattr(self, "_state_token", "") == "STATE_ERROR" and not self._listening_active)
         ):
             self._cancel_btn.hide()
             return
         if self._capture_active and not self._listening_active:
             self._cancel_btn.setText("取消")
-            self._cancel_btn.setAccessibleName("取消本次转写")
-            self._cancel_btn.setToolTip("取消本次转写 · Esc")
+            if self._capture_released:
+                self._cancel_btn.setAccessibleName("取消上一句识别")
+                self._cancel_btn.setToolTip("取消上一句识别 · Esc")
+            else:
+                self._cancel_btn.setAccessibleName("取消本次转写")
+                self._cancel_btn.setToolTip("取消本次转写 · Esc")
             self._cancel_btn.show()
             return
-        if self._listening_active and bool(self._live_text):
+        if self._listening_active and not self._meeting_active and self._speech_capturing:
             self._cancel_btn.setText("放弃本句")
             self._cancel_btn.setAccessibleName("放弃当前句")
             self._cancel_btn.setToolTip("放弃当前正在说的这一句，继续监听")
@@ -963,15 +1105,44 @@ class FloatingWindow(QWidget):
     def _on_close_clicked(self) -> None:
         if self._capture_active and not self._listening_active:
             self.cancel_requested.emit()
-        elif self._listening_active and not self._meeting_active and self._live_text:
+        elif self._listening_active and not self._meeting_active:
             self.cancel_requested.emit()
-        elif self._listening_active:
-            self.continuous_stop_requested.emit()
         else:
             self.dismiss_if_idle()
 
     def _on_end_clicked(self) -> None:
-        self.continuous_stop_requested.emit()
+        if self._meeting_active:
+            self._arm_meeting_end_confirm()
+            return
+        self.end_requested.emit()
+
+    def _arm_meeting_end_confirm(self) -> None:
+        if not self._meeting_active:
+            return
+        self._meeting_end_armed = True
+        self._set_state("确认结束？", "STATE_WARN", pulse=False)
+        self._meeting_end_confirm_timer.start(MEETING_END_CONFIRM_TIMEOUT_MS)
+        self._present()
+
+    def _disarm_meeting_end_confirm(self) -> None:
+        self._meeting_end_confirm_timer.stop()
+        if not self._meeting_end_armed:
+            return
+        self._meeting_end_armed = False
+        self._meeting_end_confirm_btn.hide()
+        self._meeting_end_cancel_btn.hide()
+        if self._meeting_active:
+            if self._meeting_paused_detail:
+                self.show_meeting_paused(self._meeting_paused_detail)
+            else:
+                self.show_meeting(self._meeting_elapsed)
+
+    def _on_meeting_end_confirmed(self) -> None:
+        self._meeting_end_confirm_timer.stop()
+        self._meeting_end_armed = False
+        self._meeting_end_confirm_btn.hide()
+        self._meeting_end_cancel_btn.hide()
+        self.end_requested.emit()
 
     def set_placement_preference(self, placement: str) -> None:
         self._placement_pref = normalize_listen_bar_placement(placement)
@@ -1114,10 +1285,18 @@ class FloatingWindow(QWidget):
 
     def _present(self) -> None:
         self._hide_timer.stop()
-        self._end_btn.setVisible(self._listening_active)
-        self._mark_btn.setVisible(self._meeting_active)
+        armed_meeting = self._meeting_active and self._meeting_end_armed
+        show_unsaved = self._unsaved_recovery_active and not armed_meeting
+        self._meeting_end_confirm_btn.setVisible(armed_meeting)
+        self._meeting_end_cancel_btn.setVisible(armed_meeting)
+        self._copy_unsaved_btn.setVisible(show_unsaved)
+        self._retry_save_btn.setVisible(show_unsaved)
+        self._end_btn.setVisible(self._listening_active and not armed_meeting)
+        self._mark_btn.setVisible(self._meeting_active and not armed_meeting)
         self._sync_cancel_button()
         self._dismiss_btn.setVisible(self._is_passive_overlay())
+        if hasattr(self, "_actions_row"):
+            self._actions_row.setSpacing(8 if (armed_meeting or show_unsaved) else 14)
         self._apply_action_button_styles()
         self._update_status_elision()
         self._dot.set_suspended(False)
@@ -1195,6 +1374,10 @@ class FloatingWindow(QWidget):
         settings_action = menu.addAction("打开设置")
         settings_action.triggered.connect(self.settings_requested.emit)
         menu.addSeparator()
+        if self._listening_active and not self._meeting_active:
+            stop_action = menu.addAction("结束持续转写并保留内容")
+            stop_action.triggered.connect(self.end_requested.emit)
+            menu.addSeparator()
         reset_action = menu.addAction("重置悬浮窗位置")
         reset_action.triggered.connect(self.reset_to_default_position)
         if self.isVisible() and self._is_passive_overlay():
@@ -1267,12 +1450,21 @@ class FloatingWindow(QWidget):
     def meeting_active(self) -> bool:
         return self._meeting_active
 
+    @property
+    def _meeting_mode(self) -> bool:
+        return self._meeting_active
+
+    @_meeting_mode.setter
+    def _meeting_mode(self, value: bool) -> None:
+        self._meeting_active = bool(value)
+
     def set_meeting_source(self, label: str) -> None:
         """Audio source of the meeting about to start; cleared when it ends."""
         self._meeting_source = label
 
     def show_meeting(self, elapsed: str | None = None, detail: str = "") -> None:
         """Red-dot meeting bar: 「会议中 · hh:mm:ss」 + 标记 + 结束."""
+        self._reset_transient_overlays()
         if elapsed is not None:
             self._meeting_elapsed = elapsed
         self._transient_restore_timer.stop()
@@ -1282,6 +1474,7 @@ class FloatingWindow(QWidget):
         self._listening_active = True
         self._capture_active = False
         self._capture_released = False
+        self._speech_capturing = False
         self._end_btn.setAccessibleName("结束会议")
         self._end_btn.setToolTip("结束会议并整理文字稿")
         self._set_state(f"{_MEETING_SHORT} · {self._meeting_elapsed}", "STATE_RECORD", pulse=True)
@@ -1317,9 +1510,13 @@ class FloatingWindow(QWidget):
     def show_meeting_paused(
         self, detail: str = "", *, title: str = MEETING_STATE_LABELS["paused"]
     ) -> None:
+        self._reset_transient_overlays()
         self._transient_restore_timer.stop()
         self._meeting_active = True
         self._listening_active = True
+        self._capture_active = False
+        self._capture_released = False
+        self._speech_capturing = False
         self._meeting_paused_detail = detail
         self._set_state(title, "STATE_WARN", pulse=False)
         self._waveform.stop()
@@ -1328,12 +1525,15 @@ class FloatingWindow(QWidget):
         self._present()
 
     def end_meeting_state(self, detail: str = "") -> None:
+        self._reset_transient_overlays()
         self._transient_restore_timer.stop()
         self._meeting_active = False
         self._meeting_paused_detail = ""
         self._meeting_source = ""
         self._listening_active = False
         self._capture_active = False
+        self._capture_released = False
+        self._speech_capturing = False
         self.set_esc_stops_continuous(self._esc_stops_continuous)
         self._mark_btn.hide()
         self._live_text = ""
@@ -1424,11 +1624,15 @@ class FloatingWindow(QWidget):
         ``""`` clears it, which a new session does before any speech starts.
         """
         if self._meeting_active:
+            if self._meeting_end_armed:
+                self._present()
+                return
             if self._meeting_paused_detail:
                 self.show_meeting_paused(self._meeting_paused_detail)
             else:
                 self.show_meeting()
             return
+        self._reset_transient_overlays()
         self._model_loading_active = False
         self._listening_active = True
         self._capture_active = False
@@ -1464,6 +1668,7 @@ class FloatingWindow(QWidget):
         cleaned = " ".join((text or "").split())
         if self._meeting_bar_stays(cleaned):
             return
+        self._reset_transient_overlays()
         if self._hold_capture():
             self._show_capture_transcript(cleaned)
             return
@@ -1486,9 +1691,13 @@ class FloatingWindow(QWidget):
         self._live_text = ""
 
     def show_continuous_idle(self, hotkey: str):
+        self._reset_transient_overlays()
         self._model_loading_active = False
         self._restore_compact_height()
         self._listening_active = False
+        self._capture_active = False
+        self._capture_released = False
+        self._speech_capturing = False
         self._set_state("待开始", "STATE_MUTED", pulse=False)
         self._apply_excerpt(f"按住 {hotkey} 开始持续监听")
         self._use_drag_cursor()
@@ -1499,8 +1708,12 @@ class FloatingWindow(QWidget):
     def show_continuous_stopped(self, detail: str = ""):
         if self._meeting_bar_stays(detail, title="已停止监听", transient=True):
             return
+        self._reset_transient_overlays()
         self._restore_compact_height()
         self._listening_active = False
+        self._capture_active = False
+        self._capture_released = False
+        self._speech_capturing = False
         self._set_state("已停止监听", "STATE_MUTED", pulse=False)
         self._apply_excerpt(detail)
         self._use_drag_cursor()
@@ -1517,6 +1730,7 @@ class FloatingWindow(QWidget):
         """
         if not self._capture_active or self._listening_active or self._capture_released:
             return
+        self._reset_transient_overlays()
         self._capture_released = True
         self._set_state("正在识别", "STATE_RECOGNIZE", pulse=False)
         self._waveform.stop()
@@ -1539,8 +1753,10 @@ class FloatingWindow(QWidget):
         return self._text_label.toolTip() or self._text_label.text()
 
     def show_recording(self, *, title: str = "录音中", hint: str = ""):
+        self._reset_transient_overlays()
         continuing = self._hold_capture() and self._status_label.text() == title and self.isVisible()
         self._listening_active = False
+        self._speech_capturing = False
         self._capture_active = True
         self._capture_released = False
         if self._live_text:
@@ -1562,10 +1778,12 @@ class FloatingWindow(QWidget):
             # The meeting bar stays up for the whole meeting.
             self.show_listening()
             return
+        self._reset_transient_overlays()
         self._model_loading_active = False
         self._listening_active = False
         self._capture_active = False
         self._capture_released = False
+        self._speech_capturing = False
         self._set_mode("compact")
         self._use_drag_cursor()
         self._waveform.stop()
@@ -1622,6 +1840,7 @@ class FloatingWindow(QWidget):
     def show_recognizing(self, partial_text: str = ""):
         if self._meeting_bar_stays(partial_text):
             return
+        self._reset_transient_overlays()
         if self._hold_capture():
             if partial_text:
                 self._show_capture_transcript(partial_text)
@@ -1657,6 +1876,7 @@ class FloatingWindow(QWidget):
         """``action`` is the configured LLM step (润色 / 纠错 / 改写); ``preset_label`` shows active app preset."""
         if self._meeting_bar_stays(text or self._live_text):
             return
+        self._reset_transient_overlays()
         busy = f"{action}中 · {preset_label}" if preset_label else f"{action}中"
         if self._hold_capture():
             if self._live_text:
@@ -1692,80 +1912,122 @@ class FloatingWindow(QWidget):
     def show_success(self, message: str = "已输入", subtitle: str = ""):
         if self._meeting_bar_stays(subtitle or self._live_text):
             return
+        self._reset_transient_overlays()
         self._model_loading_active = False
+        self._capture_active = False
+        self._capture_released = False
+        clean_sub = " ".join((subtitle or "").split())
         if self._listening_active:
             self._set_state(f"正在听 · {message}", "STATE_LISTEN", pulse=False)
-            self._waveform.set_compact(bool(self._live_text))
+            self._waveform.set_compact(bool(clean_sub or self._live_text))
             self._waveform.show()
             self._waveform.start()
-            if self._live_text:
+            if clean_sub:
+                self._apply_excerpt(clean_sub, keep_tail=False)
+            elif self._live_text:
                 self._apply_excerpt(self._live_text, keep_tail=True)
-                self._present()
-                return
-            self._restore_compact_height()
-        elif self._capture_active and self._live_text:
-            self._set_state(message, "STATE_SUCCESS")
-            self._waveform.stop()
-            self._waveform.hide()
-            self._apply_excerpt(self._live_text, keep_tail=True)
+            else:
+                self._restore_compact_height()
             self._present()
-            self._hide_timer.start(2200)
             return
+        self._waveform.stop()
+        self._waveform.hide()
+        self._set_state(message, "STATE_SUCCESS")
+        if clean_sub:
+            self._apply_excerpt(clean_sub, keep_tail=False)
+        elif self._live_text:
+            self._apply_excerpt(self._live_text, keep_tail=True)
         else:
             self._restore_compact_height()
-            self._waveform.stop()
-            self._waveform.hide()
-            self._set_state(message, "STATE_SUCCESS")
-        self._apply_excerpt(subtitle)
         self._present()
-        if not self._listening_active:
-            dur = 2200 if subtitle else 1500
-            self._hide_timer.start(dur)
+        dur = 2200 if (clean_sub or self._live_text) else 1500
+        self._hide_timer.start(dur)
 
     def show_info(self, message: str, subtitle: str = ""):
         if self._meeting_bar_stays(subtitle, title=message, transient=True):
             return
-        if (self._listening_active or self._capture_active) and self._live_text:
-            if self._listening_active:
-                self._set_state(f"正在听 · {message}", "STATE_LISTEN", pulse=False)
-            else:
-                self._set_state(message, "STATE_RECOGNIZE", pulse=False)
-            self._restore_live_line()
-            self._present()
-            if self._capture_active and not self._listening_active:
-                self._hide_timer.start(2200)
-            return
-        self._restore_compact_height()
+        self._reset_transient_overlays()
+        self._capture_active = False
+        self._capture_released = False
+        clean_sub = " ".join((subtitle or "").split())
         if self._listening_active:
             self._set_state(f"正在听 · {message}", "STATE_LISTEN", pulse=False)
+            self._waveform.set_compact(bool(clean_sub or self._live_text))
+            self._waveform.show()
+            self._waveform.start()
+            if clean_sub:
+                self._apply_excerpt(clean_sub, keep_tail=False)
+            elif self._live_text:
+                self._apply_excerpt(self._live_text, keep_tail=True)
+            else:
+                self._restore_compact_height()
+            self._present()
+            return
+        self._waveform.stop()
+        self._waveform.hide()
+        self._set_state(message, "STATE_RECOGNIZE", pulse=False)
+        if clean_sub:
+            self._apply_excerpt(clean_sub, keep_tail=False)
+        elif self._live_text:
+            self._apply_excerpt(self._live_text, keep_tail=True)
+        else:
+            self._restore_compact_height()
+        self._present()
+        dur = 2200 if (clean_sub or self._live_text) else 1800
+        self._hide_timer.start(dur)
+
+    def show_warning(
+        self,
+        message: str,
+        subtitle: str = "",
+        *,
+        auto_dismiss_ms: int = 5000,
+        keep_continuous: bool = False,
+    ):
+        if self._model_loading_active:
+            return
+        if self._meeting_bar_stays(
+            subtitle,
+            title=message,
+            transient=True,
+            duration_ms=max(0, int(auto_dismiss_ms or 0)),
+        ):
+            return
+        self._reset_transient_overlays()
+        self._capture_active = False
+        self._capture_released = False
+        if not keep_continuous:
+            self._listening_active = False
+            self._speech_capturing = False
+            self._live_text = ""
+        self._restore_compact_height()
+        clean_sub = " ".join((subtitle or "").split())
+        if keep_continuous and self._listening_active:
+            self._waveform.set_compact(bool(clean_sub or self._live_text))
             self._waveform.show()
             self._waveform.start()
         else:
             self._waveform.stop()
             self._waveform.hide()
-            self._set_state(message, "STATE_RECOGNIZE", pulse=False)
-        self._apply_excerpt(subtitle)
-        self._present()
-        if not self._listening_active:
-            dur = 2200 if subtitle else 1800
-            self._hide_timer.start(dur)
-
-    def show_warning(self, message: str, subtitle: str = ""):
-        if self._model_loading_active:
-            return
-        if self._meeting_bar_stays(subtitle, title=message, transient=True, duration_ms=5000):
-            return
-        self._restore_compact_height()
-        self._waveform.stop()
-        self._waveform.hide()
         self._set_state(message, "STATE_WARN", pulse=False)
-        self._apply_excerpt(subtitle, keep_tail=False)
+        if clean_sub:
+            self._apply_excerpt(clean_sub, keep_tail=False)
+        elif keep_continuous and self._listening_active and self._live_text:
+            self._apply_excerpt(self._live_text, keep_tail=True)
         self._present()
-        self._hide_timer.start(5000)
+        if auto_dismiss_ms and auto_dismiss_ms > 0:
+            if keep_continuous and self._listening_active:
+                self._continuous_toast_timer.start(auto_dismiss_ms)
+            else:
+                self._hide_timer.start(auto_dismiss_ms)
+        else:
+            self._hide_timer.stop()
 
     def show_cancelled(self):
+        self._reset_transient_overlays()
         self._capture_active = False
         self._capture_released = False
+        self._speech_capturing = False
         self._live_text = ""
         self._restore_compact_height()
         self._waveform.stop()
@@ -1824,6 +2086,7 @@ class FloatingWindow(QWidget):
     def show_error(
         self,
         message: str,
+        subtitle: str = "",
         *,
         auto_dismiss_ms: int = 5000,
         keep_continuous: bool = False,
@@ -1832,23 +2095,34 @@ class FloatingWindow(QWidget):
             return
         if self._meeting_bar_stays(message, transient=True, duration_ms=max(0, int(auto_dismiss_ms or 0))):
             return
+        self._reset_transient_overlays()
         self._capture_active = False
         self._capture_released = False
         if not keep_continuous:
             self._listening_active = False
+            self._speech_capturing = False
             self._live_text = ""
         self._set_mode("compact")
-        self._waveform.stop()
-        self._waveform.hide()
         first_line, _, body_after_newline = message.partition("\n")
         status, colon_remainder = _error_headline(first_line)
-        parts = [p for p in (colon_remainder, body_after_newline) if p]
+        clean_sub = " ".join((subtitle or "").split())
+        parts = [p for p in (colon_remainder, body_after_newline, clean_sub) if p]
         remainder = "\n".join(parts).strip()
-        self.setToolTip(message)
-        self._status_label.setToolTip(message)
+        if keep_continuous and self._listening_active:
+            self._waveform.set_compact(bool(remainder or self._live_text))
+            self._waveform.show()
+            self._waveform.start()
+        else:
+            self._waveform.stop()
+            self._waveform.hide()
+        full_tip = f"{message}\n{clean_sub}".strip() if clean_sub else message
+        self.setToolTip(full_tip)
+        self._status_label.setToolTip(full_tip)
         self._set_state(status, "STATE_ERROR")
         if remainder:
-            self._apply_error_excerpt(remainder, message)
+            self._apply_error_excerpt(remainder, full_tip)
+        elif keep_continuous and self._listening_active and self._live_text:
+            self._apply_excerpt(self._live_text, keep_tail=True)
         else:
             self._text_label.setText("")
             self._text_label.setToolTip("")
@@ -1856,14 +2130,93 @@ class FloatingWindow(QWidget):
             self._set_mode("compact")
         self._present()
         if auto_dismiss_ms and auto_dismiss_ms > 0:
-            self._hide_timer.start(auto_dismiss_ms)
+            if keep_continuous and self._listening_active:
+                self._continuous_toast_timer.start(auto_dismiss_ms)
+            else:
+                self._hide_timer.start(auto_dismiss_ms)
         else:
             self._hide_timer.stop()
+
+    def show_unsaved_history_error(
+        self,
+        title: str = "保存历史失败",
+        subtitle: str = "",
+        count: int = 1,
+        *,
+        keep_continuous: bool | None = None,
+        auto_dismiss_ms: int = 0,
+        copy_label: str = "",
+    ) -> None:
+        if self._model_loading_active:
+            return
+        n = max(1, int(count or 1))
+        headline = title
+        if n > 1 and "段" not in headline and "（" not in headline and "(" not in headline:
+            headline = f"{headline}（{n} 段未保存）"
+        detail = " ".join((subtitle or "").split()) or "可点击「复制原文」或「重试保存」"
+        if self._meeting_bar_stays(detail, title=headline, transient=True, duration_ms=max(0, int(auto_dismiss_ms or 0))):
+            return
+        preserve_continuous = (
+            bool(self._listening_active and not self._meeting_active)
+            if keep_continuous is None
+            else bool(keep_continuous)
+        )
+        self._reset_transient_overlays(keep_unsaved=True)
+        self._unsaved_recovery_active = True
+        self._capture_active = False
+        self._capture_released = False
+        if not preserve_continuous:
+            self._listening_active = False
+            self._speech_capturing = False
+            self._live_text = ""
+        btn_label = copy_label.strip() if copy_label else "复制原文"
+        self._copy_unsaved_btn.setText(btn_label)
+        self._copy_unsaved_btn.setToolTip(
+            f"复制未保存的 {n} 段原文到剪贴板" if n > 1 else "复制未保存的原文到剪贴板"
+        )
+        if preserve_continuous and self._listening_active:
+            self._waveform.set_compact(True)
+            self._waveform.show()
+            self._waveform.start()
+        else:
+            self._waveform.stop()
+            self._waveform.hide()
+        full_tip = f"{headline} · {detail}"
+        self.setToolTip(full_tip)
+        self._status_label.setToolTip(full_tip)
+        self._set_state(headline, "STATE_ERROR")
+        self._apply_error_excerpt(detail, full_tip)
+        self._present()
+        if auto_dismiss_ms and auto_dismiss_ms > 0:
+            if preserve_continuous and self._listening_active:
+                self._continuous_toast_timer.start(auto_dismiss_ms)
+            else:
+                self._hide_timer.start(auto_dismiss_ms)
+        else:
+            self._hide_timer.stop()
+
+    def clear_unsaved_history_error(self) -> None:
+        if not self._unsaved_recovery_active:
+            return
+        self._unsaved_recovery_active = False
+        self._copy_unsaved_btn.hide()
+        self._retry_save_btn.hide()
+        if self._listening_active and not self._meeting_active:
+            self.show_listening()
+        elif self.isVisible():
+            self.dismiss_if_idle()
 
     def update_volume(self, volume: float):
         self._waveform.set_volume(volume)
 
-    def show_busy_transcribing(self):
+    def show_busy_transcribing(self, *, allow_cancel: bool = False):
+        self._reset_transient_overlays()
+        if allow_cancel and not self._listening_active:
+            self._capture_active = True
+            self._capture_released = True
+            self._suppress_cancel_btn = False
+        else:
+            self._suppress_cancel_btn = True
         self._restore_compact_height()
         self._set_state("请稍候", "STATE_RECOGNIZE", pulse=False)
         self._apply_excerpt("正在识别上一轮语音，稍后重试")
@@ -1893,7 +2246,11 @@ class FloatingWindow(QWidget):
                 duration_ms=0,
             )
             return
+        self._reset_transient_overlays()
         self._listening_active = False
+        self._capture_active = False
+        self._capture_released = False
+        self._speech_capturing = False
         self._restore_compact_height()
         self._model_loading_active = True
         # The one thing the user must know lives in the title, where nothing
@@ -1920,6 +2277,9 @@ class FloatingWindow(QWidget):
         self._user_moved = False
         self._pinned_token = ""
         self._idle_timer.stop()
+        self._continuous_toast_timer.stop()
+        self._meeting_end_confirm_timer.stop()
+        self._meeting_end_armed = False
         self._transient_restore_timer.stop()
         self._meeting_click_timer.stop()
         self._dot.set_suspended(True)
@@ -1994,7 +2354,7 @@ class FloatingWindow(QWidget):
             self._commit_drag()
             event.accept()
             return
-        if tracking and self._meeting_active:
+        if tracking and self._meeting_active and not self._meeting_end_armed:
             self._open_meeting_from_click()
         event.accept()
 

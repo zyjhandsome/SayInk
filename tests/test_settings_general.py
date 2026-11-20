@@ -680,8 +680,9 @@ class TestOutputMode:
 
     def test_missing_history_has_local_recovery_and_clipboard_dependency(self, settings_window, config):
         combo = settings_window._output_mode_combo
-        combo.setCurrentIndex(combo.findData("history"))
-        settings_window._history_enabled_row.setChecked(False)
+        config.set_output_mode("history", auto=False)
+        config.set("history.enabled", False)
+        settings_window.reload_settings(refresh_devices=False, heavy=False)
         assert "不会保存" in settings_window._output_mode_hint.text()
         assert not settings_window._enable_history_wrap.isHidden()
         assert not settings_window._restore_clipboard_row.isEnabled()

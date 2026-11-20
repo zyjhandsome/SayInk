@@ -551,7 +551,7 @@ class GeneralSettingsPage(SettingsPage):
         lay.addWidget(self.esc_stop_divider)
         self.esc_stop_row = ToggleOptionRow(
             "允许 Esc 结束持续转写",
-            "结束后继续识别已录内容；关闭时只能点转写条「结束」",
+            "结束后继续识别已录内容；关闭后仍可再次长按录音快捷键、点转写条「结束」或通过托盘菜单结束",
         )
         self.esc_stop_row.toggled.connect(self.esc_stop_toggled.emit)
         lay.addWidget(self.esc_stop_row)
@@ -1432,23 +1432,31 @@ class GeneralSettingsPage(SettingsPage):
             "恢复为 Alt+X，不改变转写模式、Esc、音频来源和结果去向。"
         )
 
-    def refresh_hotkey_hint(self, config: Config) -> None:
+    def refresh_hotkey_hint(self, config: Config, *, deferred_notice: bool = False) -> None:
         raw_hotkey = str(config.get("hotkey", DEFAULT_HOTKEY) or "")
         if not raw_hotkey:
-            self.hotkey_hint.setText(
+            hint_text = (
                 "当前未绑定录音快捷键。点击上方输入框后按下组合键即可重新绑定，或点击下方「快捷键恢复默认」。"
             )
             self.show_hotkey_feedback("", error=False)
         else:
-            self.hotkey_hint.setText(dictation_hints(config).detail)
+            hint_text = dictation_hints(config).detail
             self.show_hotkey_feedback(hotkey_conflict_warning(raw_hotkey), error=False)
+        if deferred_notice:
+            hint_text = f"已保存，下次转写生效。{hint_text}"
+        self.hotkey_hint.setText(hint_text)
+        fg = tok.AMBER_TEXT if deferred_notice else tok.TEXT_SEC
+        self.hotkey_hint.setStyleSheet(
+            f"color: {fg}; font-size: {tok.TYPE_FOOTNOTE}px;"
+            f" background: transparent; padding: 0 16px 12px 16px;"
+        )
         self.hotkey_hint.setToolTip("启动阈值：单次转写按住约 0.18 秒；持续转写按住约 0.30 秒，避免误触。")
         self.sync_hotkey_reset_state(raw_hotkey)
         continuous = self.selected_trigger_mode() == TRIGGER_MODE_CONTINUOUS
         set_section_visible(self.esc_stop_row, continuous)
         set_section_visible(self.esc_stop_divider, continuous)
 
-    def refresh_output_controls(self, config: Config) -> None:
+    def refresh_output_controls(self, config: Config, *, deferred_notice: bool = False) -> None:
         hints = dictation_hints(config)
         automatic = config.output_follows_input_source()
         choice = "auto" if automatic else config.output_mode()
@@ -1480,8 +1488,12 @@ class GeneralSettingsPage(SettingsPage):
         if hints.output_warning:
             text = "历史已关闭：结果不会保存或输入其他应用。请开启转写历史，或改为输入当前光标。"
             color = tok.RED
-        elif not history_only and self.selected_input_source() != INPUT_SOURCE_MICROPHONE:
-            text += " 电脑声音的识别结果也会输入光标处，请确认目标窗口。"
+        else:
+            if not history_only and self.selected_input_source() != INPUT_SOURCE_MICROPHONE:
+                text += " 电脑声音的识别结果也会输入光标处，请确认目标窗口。"
+            if deferred_notice:
+                text = f"已保存，下次转写生效。{text}"
+                color = tok.AMBER_TEXT
         self.output_mode_hint.setText(text)
         self.output_mode_hint.setStyleSheet(
             f"color: {color}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"

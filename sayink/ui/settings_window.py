@@ -33,6 +33,8 @@ from sayink.audio_recorder import AudioRecorder
 from sayink.config import (
     Config,
     DEFAULT_HOTKEY,
+    OUTPUT_MODE_HISTORY,
+    OUTPUT_MODE_PASTE,
     TRIGGER_MODE_HOTKEY,
     format_hotkey,
     is_reserved_hotkey,
@@ -204,6 +206,100 @@ def _host_surface(selector: str) -> str:
     return f"{selector} {{ background: {tok.BG}; }}"
 
 
+def _effective_llm_port(scheme: str, explicit_port: int | None) -> int:
+    if explicit_port is not None:
+        return int(explicit_port)
+    return 443 if scheme == "https" else 80
+
+
+def _format_llm_remote_origin(scheme: str, host: str, port: int) -> str:
+    host_fmt = f"[{host}]" if ":" in host else host
+    default_port = 443 if scheme == "https" else 80
+    return f"{scheme}://{host_fmt}" if port == default_port else f"{scheme}://{host_fmt}:{port}"
+
+
+def _confirmed_llm_remote_origins(raw_items: object) -> set[tuple[str, str, int]]:
+    from sayink.llm.endpoint import url_parts
+
+    if not isinstance(raw_items, (list, tuple, set)):
+        return set()
+    confirmed: set[tuple[str, str, int]] = set()
+    for raw in raw_items:
+        item = str(raw or "").strip().lower()
+        if not item:
+            continue
+        candidate = item if "://" in item else f"https://{item}"
+        parsed, raw_host, err = url_parts(candidate)
+        if err or parsed is None:
+            continue
+        scheme = (parsed.scheme or "https").lower()
+        host = raw_host.strip("[]").lower()
+        if scheme in {"http", "https"} and host:
+            confirmed.add((scheme, host, _effective_llm_port(scheme, parsed.port)))
+    return confirmed
+
+
+def llm_remote_host_needing_confirmation(
+    config: Config,
+    api_url_override: str | None = None,
+) -> str:
+    """Return ``scheme://host[:port]`` when dictation LLM endpoint is remote and unconfirmed."""
+    from sayink.llm.endpoint import (
+        api_url_error,
+        is_local_endpoint,
+        redact_url_userinfo,
+        url_parts,
+    )
+
+    raw = (
+        api_url_override
+        if api_url_override is not None
+        else str(config.get("llm.api_url", "") or "")
+    ).strip()
+    if not raw:
+        return ""
+    cleaned, _removed = redact_url_userinfo(raw)
+    suffixes = str(config.get("llm.proxy_bypass_suffixes", "") or "")
+    if api_url_error(cleaned, proxy_bypass_suffixes=suffixes) is not None:
+        return ""
+    if is_local_endpoint(cleaned):
+        return ""
+    parsed, raw_host, err = url_parts(cleaned)
+    if err or parsed is None:
+        return ""
+    scheme = (parsed.scheme or "").lower()
+    host = raw_host.strip("[]").lower()
+    if not host or scheme not in {"http", "https"}:
+        return ""
+    port = _effective_llm_port(scheme, parsed.port)
+    confirmed = _confirmed_llm_remote_origins(config.get("llm.confirmed_remote_hosts", []))
+    return "" if (scheme, host, port) in confirmed else _format_llm_remote_origin(scheme, host, port)
+
+
+def confirm_llm_remote_host(config: Config, host: str) -> None:
+    """Persist ``host`` in ``llm.confirmed_remote_hosts`` in canonical ``scheme://host[:port]`` form."""
+    from sayink.llm.endpoint import url_parts
+
+    item = (host or "").strip().lower()
+    if not item:
+        return
+    candidate = item if "://" in item else f"https://{item}"
+    parsed, raw_host, err = url_parts(candidate)
+    if err or parsed is None:
+        return
+    scheme = (parsed.scheme or "https").lower()
+    hostname = raw_host.strip("[]").lower()
+    if scheme not in {"http", "https"} or not hostname:
+        return
+    port = _effective_llm_port(scheme, parsed.port)
+    canonical = _format_llm_remote_origin(scheme, hostname, port)
+    hosts = list(config.get("llm.confirmed_remote_hosts", []) or [])
+    existing = _confirmed_llm_remote_origins(hosts)
+    if (scheme, hostname, port) not in existing:
+        hosts.append(canonical)
+        config.set("llm.confirmed_remote_hosts", hosts)
+
+
 class _ModelDirMoveWorker(QThread):
     """Background worker moving model folders off the UI thread."""
 
@@ -266,6 +362,11 @@ class SettingsWindow(QWidget):
         self._config = config
         self._pending_segment_count = pending_segment_count
         self._recording_busy = None
+        self._capture_active_checker = None
+        self._preserves_pending_checker = None
+        self._preserving_change_in_flight = False
+        self._deferred_trigger_mode_hint = False
+        self._deferred_output_mode_hint = False
         self._history_store = None
         self._history_limits_dirty = False
         self._dl_workers: dict[str, object] = {}
@@ -410,6 +511,7 @@ class SettingsWindow(QWidget):
         pp.llm_enable_toggled.connect(self._on_llm_enable_toggled)
         pp.llm_mode_changed.connect(self._on_llm_mode_changed)
         pp.llm_fields_edited.connect(self._flush_llm_fields)
+        pp.llm_url_editing_finished.connect(self._on_llm_url_editing_finished)
         pp.app_presets_edited.connect(self._flush_app_presets)
         pp.prompt_reset_requested.connect(self._reset_prompt)
         pp.llm_test_requested.connect(self._test_llm)
@@ -820,12 +922,50 @@ class SettingsWindow(QWidget):
 
     # ── Polish / AI Service ────────────────────────────────
 
+    def _ensure_llm_remote_consent(self) -> bool:
+        raw_url = (
+            self.polish_page.llm_url_edit.text().strip()
+            or str(self._config.get("llm.api_url", "") or "").strip()
+        )
+        host = llm_remote_host_needing_confirmation(self._config, api_url_override=raw_url)
+        if not host:
+            return True
+        if not self._confirm(
+            "启用远程文字润色",
+            f"开启后，口述转写文本、自定义词汇，以及同窗口近期上下文会自动发送到 {host} "
+            "进行润色或纠错（不发送音频；绑定为「直出原文」的应用不会发送，也不会进入上下文）。\n"
+            "确认后本机记住该地址，之后不再询问。",
+            accept="确认并开启",
+        ):
+            self._loading = True
+            try:
+                self.polish_page.llm_enable_row.setChecked(False)
+                self.polish_page.set_prompt_section_visible(False)
+            finally:
+                self._loading = False
+            self._config.set("llm.enabled", False)
+            self._update_llm_configuration_status()
+            return False
+        confirm_llm_remote_host(self._config, host)
+        save_immediate = getattr(self._config, "save_immediate", None)
+        if callable(save_immediate):
+            save_immediate()
+        return True
+
     def _on_llm_enable_toggled(self, enabled: bool) -> None:
         self.polish_page.set_prompt_section_visible(enabled)
         if self._loading:
             return
+        if enabled and not self._ensure_llm_remote_consent():
+            return
         self._config.set("llm.enabled", enabled)
         self._flush_llm_fields()
+
+    def _on_llm_url_editing_finished(self) -> None:
+        if self._loading or not self.isVisible():
+            return
+        if self.polish_page.llm_enable_row.isChecked() and not self._llm_url_error:
+            self._ensure_llm_remote_consent()
 
     def _llm_missing_fields(self) -> list[str]:
         return self.polish_page.missing_fields()
@@ -1028,6 +1168,38 @@ class SettingsWindow(QWidget):
     def set_recording_busy_checker(self, checker) -> None:
         self._recording_busy = checker
 
+    def set_capture_active_checker(self, checker) -> None:
+        self._capture_active_checker = checker
+
+    def set_preserves_pending_checker(self, checker) -> None:
+        self._preserves_pending_checker = checker
+
+    def _is_capture_or_processing_active(self) -> bool:
+        if callable(self._capture_active_checker) and bool(self._capture_active_checker()):
+            return True
+        if callable(self._recording_busy) and bool(self._recording_busy()):
+            return True
+        if self._recognition_pending:
+            return True
+        if callable(self._pending_segment_count):
+            try:
+                if int(self._pending_segment_count() or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        return False
+
+    def _active_utterances_preserved(self, *, force_preserve: bool = False) -> bool:
+        if force_preserve or self._preserving_change_in_flight:
+            return True
+        if callable(self._preserves_pending_checker) and bool(self._preserves_pending_checker()):
+            return True
+        if callable(self._capture_active_checker) and bool(self._capture_active_checker()):
+            return True
+        if callable(self._recording_busy) and bool(self._recording_busy()):
+            return True
+        return False
+
     def _run_mic_probe(self) -> None:
         if self._mic_probe_active or self._mic_test_recorder.is_recording:
             return
@@ -1180,6 +1352,9 @@ class SettingsWindow(QWidget):
     def _load_settings_fields(self, *, refresh_devices: bool, heavy: bool) -> None:
         self._llm_url_error = ""
         self._history_limits_dirty = False
+        if not self._is_capture_or_processing_active():
+            self._deferred_trigger_mode_hint = False
+            self._deferred_output_mode_hint = False
         self.general_page.load_config(self._config)
         self._refresh_audio_device_summary()
         self._refresh_hotkey_hint()
@@ -1218,11 +1393,13 @@ class SettingsWindow(QWidget):
     def set_pending_segment_counter(self, counter) -> None:
         self._pending_segment_count = counter
 
-    def _confirm_discard_pending(self) -> bool:
+    def _confirm_discard_pending(self, *, preserves_active: bool = False) -> bool:
         if self._pending_segment_count is None:
             return True
         pending = int(self._pending_segment_count())
         if pending <= 0:
+            return True
+        if self._active_utterances_preserved(force_preserve=preserves_active):
             return True
         return self._confirm(
             "待识别语音",
@@ -1297,12 +1474,18 @@ class SettingsWindow(QWidget):
         self._refresh_about_runtime_rows()
 
     def _refresh_hotkey_hint(self) -> None:
-        self.general_page.refresh_hotkey_hint(self._config)
+        self.general_page.refresh_hotkey_hint(
+            self._config,
+            deferred_notice=self._deferred_trigger_mode_hint,
+        )
         self._refresh_output_controls()
         self._refresh_meeting_defaults()
 
     def _refresh_output_controls(self) -> None:
-        self.general_page.refresh_output_controls(self._config)
+        self.general_page.refresh_output_controls(
+            self._config,
+            deferred_notice=self._deferred_output_mode_hint,
+        )
 
     def _refresh_meeting_defaults(self) -> None:
         self.general_page.refresh_meeting_defaults(self._config)
@@ -1415,9 +1598,39 @@ class SettingsWindow(QWidget):
         if self._loading:
             return
         gp = self.general_page
+        choice = gp.output_mode_combo.currentData()
+        will_be_history_only = (choice == OUTPUT_MODE_HISTORY) or (
+            choice == "auto" and gp.selected_input_source() != INPUT_SOURCE_MICROPHONE
+        )
+        if will_be_history_only and not bool(self._config.get("history.enabled", True)):
+            if not self._confirm(
+                "转写历史已关闭",
+                "当前已关闭「保存转写历史」，设为「仅保存到历史」会导致识别结果无法保存。\n"
+                "是否同时开启转写历史？",
+                accept="开启历史并保存",
+                cancel="取消",
+            ):
+                prev_choice = (
+                    "auto"
+                    if self._config.output_follows_input_source()
+                    else self._config.output_mode()
+                )
+                self._loading = True
+                try:
+                    set_combo_by_data(gp.output_mode_combo, prev_choice)
+                finally:
+                    self._loading = False
+                return
+            self._config.set("history.enabled", True)
+            self._loading = True
+            try:
+                gp.history_enabled_row.setChecked(True)
+                gp.refresh_history_controls()
+            finally:
+                self._loading = False
 
         def change() -> None:
-            choice = gp.output_mode_combo.currentData()
+            self._deferred_output_mode_hint = self._is_capture_or_processing_active()
             if choice == "auto":
                 self._config.set("output.follow_input_source", True)
                 self._config.follow_input_source_for_output(gp.selected_input_source())
@@ -1432,12 +1645,29 @@ class SettingsWindow(QWidget):
 
     def _on_history_enabled_toggled(self, checked: bool) -> None:
         gp = self.general_page
+        if not self._loading and not checked and self._config.history_only_output():
+            if not self._confirm(
+                "结果去向为仅保存到历史",
+                "当前结果去向为「仅保存到历史」，关闭转写历史会导致识别结果既不保存也不输入其他应用。\n"
+                "是否同时将结果去向改为「输入当前光标」？",
+                accept="改为输入光标并关闭历史",
+                cancel="保留转写历史",
+            ):
+                self._loading = True
+                try:
+                    gp.history_enabled_row.setChecked(True)
+                    gp.refresh_history_controls()
+                finally:
+                    self._loading = False
+                return
+            self._config.set_output_mode(OUTPUT_MODE_PASTE, auto=False)
 
         def change() -> None:
             gp.refresh_history_controls()
             if self._loading:
                 return
             self._config.set("history.enabled", checked)
+            self._config.save_immediate()
             self._refresh_hotkey_hint()
             self._refresh_about_runtime_rows()
             self.usage_hint_changed.emit()
@@ -1610,7 +1840,8 @@ class SettingsWindow(QWidget):
             if host:
                 if not self._confirm(
                     "会后自动生成纪要",
-                    f"每场会议结束后，完整文字稿会自动发送到 {host} 生成纪要（不发送音频）。"
+                    f"每场会议结束后，完整文字稿、会议标题、参会人、议程、标记、我的笔记、"
+                    f"自定义词汇与说话人称呼会自动发送到 {host} 生成纪要（不发送音频）。\n"
                     "确认后本机记住该地址，之后不再询问。",
                     accept="确认并开启",
                 ):
@@ -1759,7 +1990,8 @@ class SettingsWindow(QWidget):
     def _on_input_source_radio_toggled(self, checked: bool) -> None:
         if not checked or self._loading:
             return
-        anchor = self.general_page.src_mic_rb.parentWidget()
+        gp = self.general_page
+        anchor = gp.src_mic_rb.parentWidget()
         if anchor is not None:
             without_scroll_jump(anchor, self._sync_source_device_widgets)
         else:
@@ -1767,6 +1999,27 @@ class SettingsWindow(QWidget):
         if not self._confirm_discard_pending():
             self._revert_input_source_radios()
             return
+        if (
+            not bool(self._config.get("history.enabled", True))
+            and self._config.output_follows_input_source()
+            and gp.selected_input_source() != INPUT_SOURCE_MICROPHONE
+        ):
+            if not self._confirm(
+                "转写历史已关闭",
+                "电脑声音与混合音源默认「仅保存到历史」，但当前已关闭转写历史。\n"
+                "是否同时开启转写历史？",
+                accept="开启历史并切换",
+                cancel="取消",
+            ):
+                self._revert_input_source_radios()
+                return
+            self._config.set("history.enabled", True)
+            self._loading = True
+            try:
+                gp.history_enabled_row.setChecked(True)
+                gp.refresh_history_controls()
+            finally:
+                self._loading = False
         if anchor is not None:
             without_scroll_jump(anchor, self._persist_runtime_settings)
         else:
@@ -1775,10 +2028,42 @@ class SettingsWindow(QWidget):
     def _on_trigger_mode_radio_toggled(self, checked: bool) -> None:
         if not checked or self._loading:
             return
-        if not self._confirm_discard_pending():
+        was_active = self._is_capture_or_processing_active()
+        self._preserving_change_in_flight = True
+        try:
+            confirmed = self._confirm_discard_pending()
+        finally:
+            self._preserving_change_in_flight = False
+        if not confirmed:
             self._revert_trigger_mode_radios()
             return
-        anchor = self.general_page.trigger_hotkey_rb.parentWidget()
+        gp = self.general_page
+        new_mode = gp.selected_trigger_mode()
+        dest_mode, dest_follows = Config._destination_for(self._config, new_mode)
+        dest_history_only = (
+            gp.selected_input_source() != INPUT_SOURCE_MICROPHONE
+            if dest_follows
+            else dest_mode == OUTPUT_MODE_HISTORY
+        )
+        if dest_history_only and not bool(self._config.get("history.enabled", True)):
+            if not self._confirm(
+                "转写历史已关闭",
+                "该转写模式的结果去向为「仅保存到历史」，但当前已关闭转写历史。\n"
+                "是否同时开启转写历史？",
+                accept="开启历史并切换",
+                cancel="取消",
+            ):
+                self._revert_trigger_mode_radios()
+                return
+            self._config.set("history.enabled", True)
+            self._loading = True
+            try:
+                gp.history_enabled_row.setChecked(True)
+                gp.refresh_history_controls()
+            finally:
+                self._loading = False
+        self._deferred_trigger_mode_hint = was_active
+        anchor = gp.trigger_hotkey_rb.parentWidget()
         if anchor is not None:
             without_scroll_jump(anchor, self._persist_runtime_settings)
         else:
