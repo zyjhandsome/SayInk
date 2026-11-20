@@ -407,6 +407,7 @@ class TestFloatingWindowErrorUXAndSettingsPolish:
         try:
             # Simulate active continuous listening with live utterance, then fatal device error
             win.show_listening("notepad.exe")
+            win.set_speech_capturing(True)
             win.show_live_transcript("正在说的一句话")
             assert win._cancel_btn.isVisible()
             assert win._end_btn.isVisible()

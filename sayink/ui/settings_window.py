@@ -2123,6 +2123,10 @@ class SettingsWindow(QWidget):
         edit.setText(text)
         del blocker
 
+    def flush_llm_fields(self) -> None:
+        """Public: commit the AI-service URL / key / model edits to config now."""
+        self._flush_llm_fields()
+
     def _flush_llm_fields(self) -> None:
         if self._loading:
             return

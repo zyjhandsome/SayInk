@@ -668,16 +668,21 @@ class ReloadCoordinator:
             self.sync_recognition_runtime_status()
             self._publish_deferred_notice()
             return
-        if getattr(self.recorder, "is_recording", False):
-            # Rebuilding the segmenter under an open hold resets the audio
-            # anchor mid-sentence. Keep this utterance, apply once it is done.
+        if getattr(self.recorder, "is_recording", False) and not getattr(
+            self.recorder, "is_continuous", False
+        ):
+            # Rebuilding the segmenter under an open single-shot hold resets the
+            # audio anchor mid-sentence. Keep this utterance, apply once it is done.
             log.info("单次录音进行中，音频与引擎设置将在本次录音结束后生效")
-            self.deferred_audio_settings = True
-            self.apply_immediate_preferences()
-            self.sync_recognition_runtime_status()
-            self._publish_deferred_notice()
+            self._defer_audio_settings()
             return
         self.commit_audio_settings(clear_queue=True)
+
+    def _defer_audio_settings(self) -> None:
+        self.deferred_audio_settings = True
+        self.apply_immediate_preferences()
+        self.sync_recognition_runtime_status()
+        self._publish_deferred_notice()
 
     def commit_audio_settings(self, *, clear_queue: bool) -> None:
         if clear_queue:
@@ -687,7 +692,8 @@ class ReloadCoordinator:
             self.clear_queued_audio()
             if getattr(self.recorder, "is_continuous", False):
                 self.stop_continuous_listening()
-            self.reset_continuous_stop_flags()
+            if not self.pipeline_busy():
+                self.reset_continuous_stop_flags()
         self.apply_immediate_preferences()
         # A trigger-mode click used to re-open the recognizer, rescan every
         # audio device and restyle the window. Only the pieces that changed

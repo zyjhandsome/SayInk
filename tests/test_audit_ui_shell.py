@@ -521,6 +521,7 @@ class TestFloatingIslandPolish:
 
             bar.show_listening("Visual Studio Code")
             assert "Visual Studio Code" in bar._status_label.text()
+            bar.set_speech_capturing(True)
             bar.show_live_transcript("正在说的话")
             assert not bar._cancel_btn.isHidden()
             assert bar._cancel_btn.text() == "放弃本句"

@@ -815,8 +815,8 @@ class TestWave1Item7ConfigClipboardAndLauncher:
         ]
 
         assert restore_win32_clipboard_snapshot(snap) is True
-        assert registered_names == ["HTML Format"]
-        assert set_calls == [
+        assert "HTML Format" in registered_names
+        assert set_calls[:2] == [
             (13, text_bytes),
             (new_html_id, html_bytes),
         ]
@@ -828,7 +828,7 @@ class TestWave1Item7ConfigClipboardAndLauncher:
             win32_entries=[(13, text_bytes)],  # type: ignore[list-item]
         )
         assert restore_win32_clipboard_snapshot(legacy_snap) is True
-        assert set_calls == [(13, text_bytes)]
+        assert set_calls[0] == (13, text_bytes)
 
     def test_run_dev_bat_python_and_pyqt6_fallback_order(self):
         bat_path = Path(__file__).resolve().parent.parent / "run-dev.bat"

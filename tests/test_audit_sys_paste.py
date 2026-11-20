@@ -680,15 +680,15 @@ class TestClipboardSnapshotAndPasteGuards:
             "build_paste_target_snapshot",
             lambda _info: PasteTargetSnapshot(
                 hwnd=777,
-                focus_hwnd=1001,
-                title_digest="cccc3333dddd4444",  # User switched chat contact in same WeChat window!
+                focus_hwnd=1002,
+                title_digest="cccc3333dddd4444",  # User switched sub-focus in same window!
             ),
         )
         paster.paste_async("切走聊天框不误发", results.append, target_hwnd=777, target_app="weixin.exe")
         while timers:
             timers.pop(0)[1]()
         assert results[-1].status == "clipboard"
-        assert results[-1].detail == "session_changed"
+        assert results[-1].detail == "subfocus_changed"
         assert clipboard["text"] == "切走聊天框不误发"
         assert paster._restore_expected is None
 
@@ -697,9 +697,10 @@ class TestClipboardSnapshotAndPasteGuards:
         same = PasteTargetSnapshot(hwnd=10, focus_hwnd=20, title_digest="abcd")
         diff_focus = PasteTargetSnapshot(hwnd=10, focus_hwnd=21, title_digest="abcd")
         diff_title = PasteTargetSnapshot(hwnd=10, focus_hwnd=20, title_digest="ef01")
-        assert detect_session_change(before, same) is False
-        assert detect_session_change(before, diff_focus) is True
-        assert detect_session_change(before, diff_title) is True
+        assert detect_session_change(before, same) == ""
+        assert detect_session_change(before, diff_focus) == "subfocus_changed"
+        assert detect_session_change(before, diff_focus, check_subfocus=False) == ""
+        assert detect_session_change(before, diff_title) == ""
 
         monkeypatch.setattr(tp_mod, "_get_window_class_name", lambda _h: "CASCADIA_HOSTING_WINDOW_CLASS")
         assert detect_terminal_paste_mode(1, "WindowsTerminal.exe") == "ctrl_shift_v"
@@ -708,7 +709,7 @@ class TestClipboardSnapshotAndPasteGuards:
         assert detect_terminal_paste_mode(2, "mintty.exe") == "shift_insert"
 
         monkeypatch.setattr(tp_mod, "_get_window_class_name", lambda _h: "ConsoleWindowClass")
-        assert detect_terminal_paste_mode(3, "cmd.exe") == "ctrl_v"
+        assert detect_terminal_paste_mode(3, "cmd.exe") == "shift_insert"
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Win32 keybd_event test")
     def test_win32_shortcut_does_not_release_physically_held_ctrl(self, monkeypatch):

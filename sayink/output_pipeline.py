@@ -59,6 +59,35 @@ HISTORY_FAILURE_WARN_COOLDOWN_S = 300.0
 SEGMENT_PUMP_DELAY_MS = 0
 RESULT_TOAST_MS = 1700
 RESULT_TOAST_WITH_HINT_MS = 2200
+# Bounded bookkeeping for history tickets awaiting async settlement.
+MAX_TRACKED_HISTORY_TICKETS = 1024
+CAPTURE_LOST_NOTICE = "麦克风已断开"
+
+# Paste details that already copied the text and need their own wording.
+SKIPPED_COPIED_TITLES: dict[str, str] = {
+    "readonly_target": "目标不可编辑，已复制到剪贴板",
+    "terminal_multiline": "多行内容已复制，请在终端确认后粘贴",
+}
+
+
+@dataclass(frozen=True)
+class UtteranceContext:
+    """Delivery rules frozen when an utterance (hold or continuous segment) is captured.
+
+    Destination, trigger mode, target window and LLM-context eligibility must
+    never be re-read from live config at delivery time.
+    """
+
+    session_id: str = ""
+    trigger_mode: str = ""
+    history_only: bool | None = None
+    target_hwnd: int = 0
+    target_app: str = ""
+    baseline_snapshot: object = None
+    strict_subfocus: bool = True
+    append_fallback: bool = False
+    preset_id: str = ""
+    allow_llm_context: bool = True
 
 
 @dataclass
@@ -76,6 +105,7 @@ class _PendingHistoryRecord:
     captured_at: int = 0
     target_hwnd: int = 0
     target_app: str = ""
+    utterance: UtteranceContext | None = None
 
 
 @dataclass
@@ -100,6 +130,7 @@ class _SegmentContext:
     recognized_text: str | None = None
     speaker_vector: np.ndarray | None = None
     speaker_learnable: bool | None = None
+    utterance: UtteranceContext | None = None
 
 
 @dataclass
@@ -154,6 +185,10 @@ def _default_context_window() -> float:
     return RECENT_OUTPUT_CONTEXT_S
 
 
+def _empty_str() -> str:
+    return ""
+
+
 _PIPELINE_CALLBACK_DEFAULTS: dict[str, Callable[..., Any]] = {
     "schedule_later": _noop,
     "pump_queue": _noop,
@@ -180,6 +215,11 @@ _PIPELINE_CALLBACK_DEFAULTS: dict[str, Callable[..., Any]] = {
     "recent_context_window_s": _default_context_window,
     "polish_reject_fn": polish_rejection_reason,
     "correction_reject_fn": correction_rejection_reason,
+    # Remote LLM consent: returns the unconfirmed ``scheme://host`` or "".
+    "llm_remote_host_pending": _empty_str,
+    "notify_llm_consent_required": _noop,
+    # A meeting segment whose history write failed (or was refused).
+    "record_unsaved_meeting_segment": _noop,
 }
 
 
@@ -231,6 +271,23 @@ class OutputPipeline:
         self.history_failure_notified: bool = False
         self.last_history_failure_warn_at: float | None = None
         self.polish_error_failed: bool = False
+        # LLM context is only what actually went to the LLM, per target window.
+        self._last_llm_context_text: str = ""
+        self._last_llm_context_hwnd: int = 0
+        self._last_llm_context_at: float = 0.0
+        self.utterance_llm_used: bool | None = None
+        # Async history settlement (enabled once the App bridges the writer callback).
+        self.ticket_settlement_enabled: bool = False
+        self.tracked_tickets: dict[int, tuple[SegmentRecord, str, dict | None]] = {}
+        self.unsaved_records: list[SegmentRecord] = []
+        self.retry_tickets: set[int] = set()
+        self.retry_saved_count: int = 0
+        # Conflict-cancel: every homeless segment of the stopped session, in seq order.
+        self.homeless_entries: list[tuple[int, int, str]] = []
+        # A continuous destination chosen in the conflict dialog after capture.
+        self.continuous_destination_override: bool | None = None
+        # Set when the microphone dropped while buffered speech is still draining.
+        self.capture_lost_notice: str = ""
 
     def _bind_callbacks(
         self,
@@ -325,8 +382,20 @@ class OutputPipeline:
             return int(held[0] or 0), str(held[1] or "")
         return 0, ""
 
-    def utterance_history_only(self, record: Any) -> bool:
+    def utterance_for_output(self) -> UtteranceContext | None:
+        """Frozen delivery rules of the utterance about to go out (None for legacy rows)."""
+        utterance = getattr(self.record_for_output(), "utterance", None)
+        return utterance if isinstance(utterance, UtteranceContext) else None
+
+    def utterance_history_only(
+        self, record: Any, utterance: UtteranceContext | None = None
+    ) -> bool:
         """History-only for this utterance, not for a setting that changed later."""
+        if utterance is not None and utterance.history_only is not None:
+            override = self.continuous_destination_override
+            if override is not None and utterance.trigger_mode == TRIGGER_MODE_CONTINUOUS:
+                return override
+            return bool(utterance.history_only)
         source = getattr(record, "source", None) if record is not None else None
         trigger = getattr(record, "trigger_mode", None) if record is not None else None
         if trigger == TRIGGER_MODE_MEETING:
@@ -378,14 +447,62 @@ class OutputPipeline:
             return
         self.keep_unsaved_continuous_text = False
 
-    def recent_output_context(self) -> str:
-        """The previous output, if it went out recently enough to be the same
-        conversation; an old sentence from another window would only mislead."""
-        if not self.last_output_text:
+    def recent_output_context(self, target_hwnd: int | None = None) -> str:
+        """The previous LLM-processed output for the same target window, if recent.
+
+        ``直出原文`` (``preset="raw"``) and non-LLM utterances are never recorded
+        here, and an old sentence from another window would only mislead (or
+        leak private text into an unrelated app's prompt).
+        """
+        if not self._last_llm_context_text:
             return ""
-        if self.now_monotonic() - self.last_output_at > self.recent_context_window_s():
+        stamped = (
+            min(self._last_llm_context_at, self.last_output_at)
+            if self.last_output_at
+            else self._last_llm_context_at
+        )
+        if self.now_monotonic() - stamped > self.recent_context_window_s():
             return ""
-        return self.last_output_text
+        if target_hwnd is not None and int(target_hwnd or 0) != self._last_llm_context_hwnd:
+            return ""
+        return self._last_llm_context_text
+
+    def _direct_output_llm_eligible(self, target_app: str) -> bool:
+        """Eligibility when ``output_text`` is invoked directly without ``deliver_recognized_text``."""
+        if self.config is None or not bool(self.config.get("llm.enabled", False)):
+            return False
+        rule = resolve_app_style_rule(target_app, self.config.get("llm.app_presets", []))
+        if rule is not None and rule.preset_id == "raw":
+            return False
+        if not polish_settings_complete(
+            self.config.get("llm.api_url", ""),
+            self.config.get("llm.api_key", ""),
+            self.config.get("llm.model_name", ""),
+        ):
+            return False
+        try:
+            return not str(self.llm_remote_host_pending() or "")
+        except Exception:
+            return False
+
+    def _remember_llm_context(
+        self,
+        text: str,
+        hwnd: int,
+        target_app: str,
+        utterance: UtteranceContext | None,
+    ) -> None:
+        used = self.utterance_llm_used
+        self.utterance_llm_used = None
+        if utterance is not None and not utterance.allow_llm_context:
+            return
+        if used is False:
+            return
+        if used is None and not self._direct_output_llm_eligible(target_app):
+            return
+        self._last_llm_context_text = text
+        self._last_llm_context_hwnd = int(hwnd or 0)
+        self._last_llm_context_at = float(self.now_monotonic())
 
     def mark_busy(self) -> None:
         self.busy = True
@@ -503,7 +620,7 @@ class OutputPipeline:
         common = dict(
             mode=mode,
             glossary=self.glossary,
-            context=self.recent_output_context(),
+            context=self.recent_output_context(self.paste_target_for_output()[0]),
             target_app="",
             proxy_mode=self.config.get("llm.proxy_mode", "system"),
             proxy_bypass_suffixes=str(self.config.get("llm.proxy_bypass_suffixes", "") or ""),
@@ -548,9 +665,14 @@ class OutputPipeline:
         prompt = self.config.get(prompt_config_key(mode), "")
         self.llm_mode = mode
         self.glossary = list(self.glossary_for_pending_segment() or [])
+        self.utterance_llm_used = False
+        ready = llm_enabled and polish_settings_complete(api_url, api_key, model_name)
 
-        if llm_enabled and polish_settings_complete(api_url, api_key, model_name):
+        if ready and not self._remote_llm_consented():
+            self._dispatch_output(text, degraded_from_polish=True)
+        elif ready:
             action = "纠错" if mode == LLM_MODE_CORRECT else "润色"
+            self.utterance_llm_used = True
             self.tray.set_activity_tooltip("correcting" if mode == LLM_MODE_CORRECT else "polishing")
             self._show_polishing_hud(text, action=action, preset_label=preset_label)
             self._invoke_polisher(
@@ -569,6 +691,19 @@ class OutputPipeline:
             self._dispatch_output(text)
         if self.busy:
             self.schedule_queue_pump()
+
+    def _remote_llm_consented(self) -> bool:
+        """Dictation text goes to a remote LLM only after the host was confirmed."""
+        try:
+            host = str(self.llm_remote_host_pending() or "")
+        except Exception:
+            log.warning("检查远程 AI 服务确认状态失败，本句不发送", exc_info=True)
+            return False
+        if not host:
+            return True
+        log.warning("文字润色的远程 AI 服务尚未确认，本句直接输出原文")
+        self.notify_llm_consent_required(host)
+        return False
 
     def on_polish_complete(self, polished_text: str) -> None:
         if self.stage is not OutputStage.POLISH:
@@ -623,6 +758,17 @@ class OutputPipeline:
             self.pending_record = None
         self.finish_empty_recognition()
 
+    def _copy_homeless(self, text: str, record: SegmentRecord | None = None) -> bool:
+        """Append ``text`` to the stopped session's homeless segments and copy them all in ``seq`` order."""
+        order_idx = len(self.homeless_entries)
+        seq = int(record.seq) if record is not None and record.seq is not None else (1_000_000 + order_idx)
+        self.homeless_entries.append((seq, order_idx, text))
+        ordered = [t for _, _, t in sorted(self.homeless_entries) if t.strip()]
+        joined = "\n".join(ordered)
+        self.last_output_text = joined
+        self.last_output_at = float(self.now_monotonic())
+        return self.copy_clipboard(joined)
+
     def _resolve_continuous_unsaved_conflict(
         self,
         text: str,
@@ -630,32 +776,28 @@ class OutputPipeline:
         degraded_from_polish: bool,
         record: SegmentRecord | None,
         preserve_tail: bool,
-    ) -> bool:
-        """Handle continuous history-only output when history is disabled. Returns True if handled."""
-        if preserve_tail:
-            copied = self.copy_clipboard(text)
-            self._dispatch_paste_result(
-                PasteResult(
-                    "clipboard" if copied else "failed",
-                    detail="history_conflict" if copied else "clipboard_failed",
-                ),
-                degraded_from_polish=degraded_from_polish,
-                record=record,
-            )
-            self.release_unsaved_hold()
-            return True
-        self.token += 1
-        self.stage = OutputStage.PASTE
-        choice = self.ask_history_output_conflict(listening=True)
-        if choice == "history":
-            self.config.set("history.enabled", True)
-            return False
-        if choice == "paste":
-            self._set_output_mode_paste()
-            return False
-        self.keep_unsaved_continuous_text = True
-        copied = self.copy_clipboard(text)
-        self.stop_continuous_user_session()
+    ) -> str:
+        """Continuous history-only output while history is off.
+
+        Returns ``"handled"`` (copied out, nothing more to do), or the
+        destination the user picked: ``"history"`` / ``"paste"``.
+        """
+        if not preserve_tail:
+            self.token += 1
+            self.stage = OutputStage.PASTE
+            choice = self.ask_history_output_conflict(listening=True)
+            if choice == "history":
+                self.config.set("history.enabled", True)
+                return "history"
+            if choice == "paste":
+                self._set_output_mode_paste()
+                self.continuous_destination_override = False
+                return "paste"
+            self.keep_unsaved_continuous_text = True
+            self.homeless_entries = []
+        copied = self._copy_homeless(text, record)
+        if not preserve_tail:
+            self.stop_continuous_user_session()
         self._dispatch_paste_result(
             PasteResult(
                 "clipboard" if copied else "failed",
@@ -665,7 +807,7 @@ class OutputPipeline:
             record=record,
         )
         self.release_unsaved_hold()
-        return True
+        return "handled"
 
     def _begin_async_paste(
         self,
@@ -675,6 +817,7 @@ class OutputPipeline:
         paste_app: str,
         degraded_from_polish: bool,
         record: SegmentRecord | None,
+        utterance: UtteranceContext | None = None,
     ) -> None:
         self.stage = OutputStage.PASTE
         self.stage_text = text
@@ -700,12 +843,39 @@ class OutputPipeline:
                 token=_tok,
             )
 
-        self.paster.paste_async(
+        self._paste_with_utterance(
             text,
             _on_paste_done,
-            target_hwnd=paste_hwnd,
-            target_app=paste_app,
+            paste_hwnd=paste_hwnd,
+            paste_app=paste_app,
+            utterance=utterance,
         )
+
+    def _paste_with_utterance(
+        self,
+        text: str,
+        callback: Callable[..., None],
+        *,
+        paste_hwnd: int,
+        paste_app: str,
+        utterance: UtteranceContext | None,
+    ) -> None:
+        """Paste with the utterance's own snapshot and focus policy (legacy pasters: plain call)."""
+        if utterance is None:
+            self.paster.paste_async(text, callback, target_hwnd=paste_hwnd, target_app=paste_app)
+            return
+        try:
+            self.paster.paste_async(
+                text,
+                callback,
+                target_hwnd=paste_hwnd,
+                target_app=paste_app,
+                baseline_snapshot=utterance.baseline_snapshot,
+                strict_subfocus=utterance.strict_subfocus,
+                append_fallback=utterance.append_fallback,
+            )
+        except TypeError:
+            self.paster.paste_async(text, callback, target_hwnd=paste_hwnd, target_app=paste_app)
 
     def output_text(self, text: str, *, degraded_from_polish: bool = False) -> None:
         if self.exit_started():
@@ -717,26 +887,29 @@ class OutputPipeline:
             return
 
         paste_hwnd, paste_app = self.paste_target_for_output()
+        utterance = self.utterance_for_output()
         record = self.freeze_pending_history_record(text, degraded_from_polish)
         is_meeting_row = record is not None and record.trigger_mode == TRIGGER_MODE_MEETING
         forced_meeting_history = self.meeting_active() and not is_meeting_row
-        history_only = self.utterance_history_only(record) or forced_meeting_history
+        history_only = self.utterance_history_only(record, utterance) or forced_meeting_history
         if not is_meeting_row:
             self.last_output_text = text
             self.last_output_at = self.now_monotonic()
+            self._remember_llm_context(text, paste_hwnd, paste_app, utterance)
         if self._needs_unsaved_continuous_prompt(is_meeting_row, history_only):
             preserve_tail = self.keep_unsaved_continuous_text and not getattr(
                 self.recorder, "is_continuous", False
             )
-            if self._resolve_continuous_unsaved_conflict(
+            outcome = self._resolve_continuous_unsaved_conflict(
                 text,
                 degraded_from_polish=degraded_from_polish,
                 record=record,
                 preserve_tail=preserve_tail,
-            ):
+            )
+            if outcome == "handled":
                 return
             forced_meeting_history = self.meeting_active() and not is_meeting_row
-            history_only = self.utterance_history_only(record) or forced_meeting_history
+            history_only = outcome == "history" or forced_meeting_history
         if is_meeting_row or history_only:
             self._record_only_without_paste(
                 text,
@@ -752,6 +925,7 @@ class OutputPipeline:
             paste_app=paste_app,
             degraded_from_polish=degraded_from_polish,
             record=record,
+            utterance=utterance,
         )
 
     def _needs_unsaved_continuous_prompt(self, is_meeting_row: bool, history_only: bool) -> bool:
@@ -771,12 +945,18 @@ class OutputPipeline:
         degraded_from_polish: bool,
         record: SegmentRecord | None,
     ) -> None:
-        saved = is_meeting_row or bool(self.config.get("history.enabled", True))
+        history_on = bool(self.config.get("history.enabled", True))
+        store_ok = getattr(self.history, "disabled", False) is not True
+        saved = is_meeting_row or (history_on and store_ok)
         if forced_meeting_history and not saved:
             self.copy_clipboard(text)
-        log.info("只记录不粘贴：%d 字%s", len(text), "" if saved else "（历史已关闭，未保存）")
+        if saved:
+            detail = ""
+        else:
+            detail = "history_unavailable" if history_on else "history_disabled"
+        log.info("只记录不粘贴：%d 字%s", len(text), "" if saved else "（未保存）")
         self._dispatch_paste_result(
-            PasteResult("recorded", detail="" if saved else "history_disabled"),
+            PasteResult("recorded", detail=detail),
             degraded_from_polish=degraded_from_polish,
             record=record,
         )
@@ -973,16 +1153,21 @@ class OutputPipeline:
         target_app: str,
         polish_failed: bool,
         dropped_suffix: str,
+        paste_hint: str = "可按 Ctrl+V 粘贴",
     ) -> None:
-        if error_detail == "clipboard_changed":
-            reason = "剪贴板已变化"
+        copied_title = SKIPPED_COPIED_TITLES.get(error_detail)
+        if copied_title:
+            title = copied_title
+        elif error_detail == "clipboard_changed":
+            title = "剪贴板已变化，已取消自动粘贴"
         elif error_detail == "clipboard_unavailable":
-            reason = "无法核对剪贴板"
+            title = "无法核对剪贴板，已取消自动粘贴"
         else:
-            reason = "已跳过剪贴板写入"
-        title = f"{reason}，已取消自动粘贴"
+            title = "已跳过剪贴板写入，已取消自动粘贴"
         log.info("%s%s", title, f"（目标：{target_app}）" if target_app else "")
-        if self._history_saves_record(record):
+        if copied_title:
+            hint = f"目标应用：{target_app}" if target_app else paste_hint
+        elif self._history_saves_record(record):
             hint = "本次转写可在历史中复制"
         else:
             hint = self._unsaved_last_output_hint()
@@ -1021,6 +1206,10 @@ class OutputPipeline:
                 "桌面会话已切换或锁屏，已复制到剪贴板",
                 f"桌面会话已切换，已复制，请按 {paste_key}",
             ),
+            "subfocus_changed": (
+                "开口后窗口内的输入位置已变化，未发送粘贴键",
+                f"输入位置已变化，已复制，请回原位置按 {paste_key}",
+            ),
         }
         if error_detail in contextual:
             log_msg, title = contextual[error_detail]
@@ -1038,8 +1227,9 @@ class OutputPipeline:
             return
         if error_detail == "focus_changed":
             log.info("开口后的目标窗口已变化，未发送粘贴键")
-            title = f"未输入到 {target_app}" if target_app else "未输入到原来的窗口"
-            hint = paste_hint + dropped_suffix
+            where = target_app or "原来的窗口"
+            title = f"未输入到 {where} · 已复制，可按 {paste_key} 粘贴"
+            hint = "文字已在剪贴板，切回目标位置粘贴即可" + dropped_suffix
             if polish_failed:
                 hint = f"{hint} · 润色未生效（密钥/网络异常），已保留原文"
             self.show_post_output_floating(
@@ -1063,6 +1253,53 @@ class OutputPipeline:
             refresh_ms=RESULT_TOAST_WITH_HINT_MS,
         )
 
+    def _reset_paster_fallback(self) -> None:
+        reset = getattr(self.paster, "reset_fallback_accumulator", None)
+        if callable(reset):
+            reset()
+
+    def _show_capture_lost_feedback(self, target_hint: str) -> None:
+        """Buffered speech reached the target after the microphone dropped mid-capture."""
+        notice = self.capture_lost_notice or CAPTURE_LOST_NOTICE
+        self.capture_lost_notice = ""
+        title = f"已发送前半段 · {notice}"
+        log.warning("麦克风中途断开，已发送断开前的内容")
+        if self.continuous_user_stopped() or self.continuous_session_active():
+            self.floating.show_info(title, target_hint)
+            self.schedule_later(RESULT_TOAST_WITH_HINT_MS, self.refresh_continuous_ui)
+            return
+        self.floating.show_warning(title, target_hint)
+
+    def _show_sent_feedback(
+        self,
+        *,
+        target_app: str,
+        polish_failed: bool,
+        degraded_from_polish: bool,
+        dropped: int,
+        dropped_suffix: str,
+    ) -> None:
+        if polish_failed:
+            success_msg = "润色未生效（密钥/网络异常），已发送原文"
+        else:
+            success_msg = "已发送（原文）" if degraded_from_polish else "已发送"
+        target_hint = f"发送到 {target_app}" if target_app else "请确认目标应用已接收"
+        if dropped:
+            target_hint = f"{target_hint}{dropped_suffix}"
+        log.info("已向目标窗口发送粘贴快捷键%s", f": {target_app}" if target_app else "")
+        self._reset_paster_fallback()
+        if self.capture_lost_notice:
+            self._show_capture_lost_feedback(target_hint)
+            return
+        needs_attention = bool(polish_failed or dropped)
+        self.show_post_output_floating(
+            success_msg,
+            target_hint,
+            stopped_text=f"剩余内容：{success_msg} · {target_hint}",
+            use_info=degraded_from_polish or needs_attention,
+            refresh_ms=RESULT_TOAST_WITH_HINT_MS if needs_attention else RESULT_TOAST_MS,
+        )
+
     def _route_paste_status_feedback(
         self,
         status: str,
@@ -1077,22 +1314,13 @@ class OutputPipeline:
     ) -> None:
         paste_key = "Ctrl+V"
         paste_hint = f"可按 {paste_key} 粘贴"
-        if polish_failed:
-            success_msg = "润色未生效（密钥/网络异常），已发送原文"
-        else:
-            success_msg = "已发送（原文）" if degraded_from_polish else "已发送"
-        target_hint = f"发送到 {target_app}" if target_app else "请确认目标应用已接收"
-        if dropped:
-            target_hint = f"{target_hint}{dropped_suffix}"
-
         if status in {"sent", "pasted"}:
-            log.info("已向目标窗口发送粘贴快捷键%s", f": {target_app}" if target_app else "")
-            self.show_post_output_floating(
-                success_msg,
-                target_hint,
-                stopped_text=f"剩余内容：{success_msg} · {target_hint}",
-                use_info=degraded_from_polish or polish_failed,
-                refresh_ms=RESULT_TOAST_WITH_HINT_MS if polish_failed else RESULT_TOAST_MS,
+            self._show_sent_feedback(
+                target_app=target_app,
+                polish_failed=polish_failed,
+                degraded_from_polish=degraded_from_polish,
+                dropped=dropped,
+                dropped_suffix=dropped_suffix,
             )
             return
         if status == "recorded":
@@ -1122,6 +1350,7 @@ class OutputPipeline:
                 target_app=target_app,
                 polish_failed=polish_failed,
                 dropped_suffix=dropped_suffix,
+                paste_hint=paste_hint,
             )
             return
         if status in {"clipboard", "copied"}:
@@ -1176,8 +1405,7 @@ class OutputPipeline:
         self.dropped_slices = 0
         dropped_suffix = f" · 有 {dropped} 段未识别" if dropped else ""
         self._update_post_paste_tray_tooltip()
-        self._route_paste_status_feedback(
-            status,
+        feedback = dict(
             record=record,
             target_app=target_app,
             error_detail=error_detail,
@@ -1186,41 +1414,218 @@ class OutputPipeline:
             dropped=dropped,
             dropped_suffix=dropped_suffix,
         )
-        self.enqueue_history_record(record, target_app=target_app)
+        if status == "recorded":
+            self._settle_recorded_result(record, target_app, error_detail, feedback)
+        else:
+            self._route_paste_status_feedback(status, **feedback)
+            self.enqueue_history_record(record, target_app=target_app)
         self.maybe_finish_dictation_speakers()
         self.schedule_later(SEGMENT_PUMP_DELAY_MS, self.pump_queue)
+
+    # ── History write settlement & unsaved recovery ───────────────
+
+    def _settle_recorded_result(
+        self,
+        record: SegmentRecord | None,
+        target_app: str,
+        error_detail: str,
+        feedback: dict,
+    ) -> None:
+        """「仅保存到历史」 says 已保存 only once SQLite confirms the row."""
+        is_meeting_row = record is not None and record.trigger_mode == TRIGGER_MODE_MEETING
+        if record is None or is_meeting_row or error_detail == "history_disabled":
+            self._route_paste_status_feedback("recorded", **feedback)
+            self.enqueue_history_record(record, target_app=target_app)
+            return
+        if self.meeting_active():
+            # Leftover dictation archived under a running meeting (notice shown at takeover).
+            self.enqueue_history_record(record, target_app=target_app)
+            return
+        if error_detail == "history_unavailable":
+            # The history DB failed to open: nothing was saved, keep the words for recovery.
+            self._mark_unsaved(self.history_row(record, target_app))
+            return
+        ticket = self.enqueue_history_record(
+            record, target_app=target_app, kind="recorded", feedback=feedback
+        )
+        if self._is_real_ticket(ticket) and ticket == 0:
+            self._mark_unsaved(self.history_row(record, target_app))
+            return
+        if self._is_real_ticket(ticket) and ticket in self.tracked_tickets:
+            return  # green feedback waits for on_history_ticket_settled(ok=True)
+        self._route_paste_status_feedback("recorded", **feedback)
+
+    @staticmethod
+    def _is_real_ticket(ticket: Any) -> bool:
+        return isinstance(ticket, int) and not isinstance(ticket, bool)
+
+    @staticmethod
+    def history_row(record: SegmentRecord, target_app: str = "") -> SegmentRecord:
+        return SegmentRecord(
+            session_id=record.session_id,
+            seq=record.seq,
+            created_at=record.created_at,
+            raw_text=record.raw_text,
+            polished_text=record.polished_text,
+            source=record.source,
+            duration_ms=record.duration_ms,
+            target_app=target_app or record.target_app or "",
+            trigger_mode=record.trigger_mode,
+            model=record.model,
+            speaker_id=int(record.speaker_id),
+            speaker_route=record.speaker_route or "",
+            captured_at=int(record.captured_at or 0),
+        )
 
     def enqueue_history_record(
         self,
         record: SegmentRecord | None,
         *,
         target_app: str = "",
-    ) -> None:
+        kind: str = "",
+        feedback: dict | None = None,
+        deduplicate: bool = False,
+    ) -> Any:
+        """Queue ``record`` for the history DB; returns the writer ticket (None if skipped)."""
         if record is None:
-            return
+            return None
         # Meeting transcripts are the meeting itself, not dictation history:
         # they are kept even when the user has switched history off.
         is_meeting_row = record.trigger_mode == TRIGGER_MODE_MEETING
         if not is_meeting_row and not self.config.get("history.enabled", True):
-            return
+            return None
         if not (record.raw_text.strip() or record.polished_text.strip()):
+            return None
+        row = self.history_row(record, target_app)
+        if deduplicate:
+            ticket = self.history.enqueue(row, deduplicate_session_seq=True)
+        else:
+            ticket = self.history.enqueue(row)
+        track_kind = "meeting" if is_meeting_row else kind
+        if track_kind:
+            self._track_ticket(ticket, row, track_kind, feedback)
+        return ticket
+
+    def _track_ticket(
+        self, ticket: Any, row: SegmentRecord, kind: str, feedback: dict | None
+    ) -> None:
+        if not self._is_real_ticket(ticket):
             return
-        self.history.enqueue(
-            SegmentRecord(
-                session_id=record.session_id,
-                seq=record.seq,
-                created_at=record.created_at,
-                raw_text=record.raw_text,
-                polished_text=record.polished_text,
-                source=record.source,
-                duration_ms=record.duration_ms,
-                target_app=target_app or "",
-                trigger_mode=record.trigger_mode,
-                model=record.model,
-                speaker_id=int(record.speaker_id),
-                speaker_route=record.speaker_route or "",
-                captured_at=int(record.captured_at or 0),
-            )
+        if ticket == 0:
+            if kind == "meeting":
+                self.record_unsaved_meeting_segment(row)
+            return
+        if not self.ticket_settlement_enabled:
+            return
+        self.tracked_tickets[int(ticket)] = (row, kind, feedback)
+        while len(self.tracked_tickets) > MAX_TRACKED_HISTORY_TICKETS:
+            self.tracked_tickets.pop(next(iter(self.tracked_tickets)))
+
+    def on_history_ticket_settled(self, ticket: int, ok: bool, error_msg: str = "") -> None:
+        """GUI-thread slot: a queued history insert committed (``ok``) or failed."""
+        entry = self.tracked_tickets.pop(int(ticket), None)
+        if entry is None:
+            return
+        row, kind, feedback = entry
+        if kind == "meeting":
+            if not ok:
+                log.warning("会议片段写入历史失败: %s", error_msg)
+                self.record_unsaved_meeting_segment(row)
+            return
+        if kind == "retry":
+            self._settle_retry(int(ticket), row, ok)
+            return
+        if ok:
+            if feedback is not None and not self.unsaved_records:
+                self._route_paste_status_feedback("recorded", **feedback)
+            return
+        log.warning("「仅保存到历史」写入失败: %s", error_msg)
+        self._mark_unsaved(row)
+
+    def _mark_unsaved(self, row: SegmentRecord) -> None:
+        key = (row.session_id, row.seq)
+        if all((r.session_id, r.seq) != key for r in self.unsaved_records):
+            self.unsaved_records.append(row)
+        self.show_unsaved_history_error()
+
+    def show_unsaved_history_error(self) -> None:
+        count = len(self.unsaved_records)
+        if not count:
+            return
+        title = f"保存历史失败（{count} 段未保存）"
+        subtitle = "可点「复制全部」或「重试保存」" if count > 1 else "可点「复制原文」或「重试保存」"
+        show = getattr(self.floating, "show_unsaved_history_error", None)
+        if not callable(show):
+            self.floating.show_error(f"{title}\n{subtitle}")
+            return
+        show(title, subtitle, count, copy_label="复制全部" if count > 1 else "复制原文")
+
+    def unsaved_text(self) -> str:
+        """All unsaved segments, sessions in first-seen order and ``seq`` order within each."""
+        order: dict[str, int] = {}
+        for row in self.unsaved_records:
+            order.setdefault(row.session_id, len(order))
+        rows = sorted(self.unsaved_records, key=lambda r: (order[r.session_id], r.seq))
+        parts = [r.polished_text.strip() or r.raw_text.strip() for r in rows]
+        return "\n".join([p for p in parts if p])
+
+    def copy_unsaved_records(self) -> bool:
+        text = self.unsaved_text()
+        if not text:
+            return False
+        self.last_output_text = text
+        self.last_output_at = float(self.now_monotonic())
+        if not self.copy_clipboard(text):
+            self.floating.show_error("复制失败：无法写入剪贴板")
+            return False
+        count = len(self.unsaved_records)
+        self.floating.show_info(f"已复制 {count} 段原文", "可按 Ctrl+V 粘贴；仍可点「重试保存」")
+        return True
+
+    def retry_unsaved_records(self) -> int:
+        """Idempotently re-queue every unsaved segment (``WHERE NOT EXISTS (session_id, seq)``)."""
+        rows = list(self.unsaved_records)
+        if not rows:
+            return 0
+        self.unsaved_records = []
+        self.retry_saved_count = 0
+        queued = 0
+        for row in rows:
+            ticket = self.enqueue_history_record(row, target_app=row.target_app, kind="retry", deduplicate=True)
+            if self._is_real_ticket(ticket) and ticket in self.tracked_tickets:
+                self.retry_tickets.add(int(ticket))
+                queued += 1
+            elif self._is_real_ticket(ticket) and ticket == 0:
+                self.unsaved_records.append(row)
+        if self.unsaved_records:
+            self.show_unsaved_history_error()
+        elif not queued:
+            self._finish_retry(len(rows))
+        return queued
+
+    def _settle_retry(self, ticket: int, row: SegmentRecord, ok: bool) -> None:
+        self.retry_tickets.discard(ticket)
+        if ok:
+            self.retry_saved_count += 1
+        else:
+            self.unsaved_records.append(row)
+        if self.retry_tickets:
+            return
+        if self.unsaved_records:
+            self.show_unsaved_history_error()
+            return
+        self._finish_retry(self.retry_saved_count)
+
+    def _finish_retry(self, saved: int) -> None:
+        clear = getattr(self.floating, "clear_unsaved_history_error", None)
+        if callable(clear):
+            clear()
+        self.show_post_output_floating(
+            "已保存到历史",
+            f"已补存 {saved} 段",
+            stopped_text="剩余内容：已保存到历史",
+            use_info=False,
+            refresh_ms=RESULT_TOAST_MS,
         )
 
     def on_history_write_failed(self, message: str) -> None:

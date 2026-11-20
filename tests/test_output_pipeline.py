@@ -492,7 +492,8 @@ class TestOutputPipelineWatchdogAndConflicts:
         )
         pipe.output_text("尾句")
         assert len(prompts) == 1
-        assert ctx["copied"] == ["第一句", "尾句"]
+        assert ctx["copied"] == ["第一句", "第一句\n尾句"]
+        assert pipe.last_output_text == "第一句\n尾句"
         assert pipe.keep_unsaved_continuous_text is False
 
     def test_meeting_rows_persist_even_when_history_disabled_and_warn_once_on_db_error(self) -> None:

@@ -121,6 +121,9 @@ DEFAULT_CONFIG = {
         "mode": "polish",
         "app_presets": [],     # explicit per-app style rules: [{"app": "WeChat.exe", "preset": "chat"}]
         "rewrite_confirmed_origins": [],  # confirmed remote origins for select-and-speak rewrite
+        # Remote origins (scheme://host[:port]) the user confirmed for dictation
+        # polish / correction; dictated text never goes to an unconfirmed host.
+        "confirmed_remote_hosts": [],
     },
     "history": {
         "enabled": True,

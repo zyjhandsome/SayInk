@@ -841,9 +841,9 @@ def test_continuous_dictation_then_switch_to_hotkey_does_not_block_meeting() -> 
 
 
 def test_refused_meeting_start_from_card_shows_in_page_error_banner() -> None:
-    """When starting a meeting is genuinely refused from the start card, the browse
-    page displays the refusal reason instead of silently hiding the status banner."""
-    from sayink.ui.meeting_page import PAGE_BROWSE, MeetingPage
+    """When starting a meeting is genuinely refused from the start card, PAGE_START
+    stays open with an inline error banner and preserves the user's form fields."""
+    from sayink.ui.meeting_page import PAGE_START, MeetingPage
 
     with app_harness({"audio.trigger_mode": "hotkey", "meeting.aux_prompted": True}) as h:
         app = h["app"]
@@ -852,15 +852,17 @@ def test_refused_meeting_start_from_card_shows_in_page_error_banner() -> None:
         app._main = type("_MainStub", (), {"meeting_panel": page, "isVisible": lambda self: True})()
         try:
             page.show_start_card()
+            page.set_start_card_fields(title="产品评审", participants="张三")
             h["recorder"].is_recording = True
             h["recorder"].is_continuous = False
             with patch("sayink.meeting_session.aux_model_path", return_value=None):
                 page._start_from_card()
             assert not app.meeting.is_active
-            assert page._stack.currentIndex() == PAGE_BROWSE
-            assert not page._status_label.isHidden()
-            assert "无法开始会议" in page._status_label.text()
-            assert "单次转写" in page._status_label.text()
+            assert page._stack.currentIndex() == PAGE_START
+            assert not page._start_error_banner.isHidden()
+            assert "尚未开始录音" in page._start_error_banner.text()
+            assert "单次转写" in page._start_error_banner.text()
+            assert page.start_card_values().title == "产品评审"
         finally:
             app._main = None
             page._refresh_timer.stop()

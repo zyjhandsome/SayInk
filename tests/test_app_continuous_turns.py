@@ -71,7 +71,8 @@ def test_words_that_finish_after_the_conflict_cancel_are_copied_too(monkeypatch)
             app._on_speaker_turn_result(batch()[:1])
         app._segment_queue.remove(marker)
         app._output_text("后面这句还在识别")
-        assert copied == ["甲说方案可行", "后面这句还在识别"]
+        assert copied == ["甲说方案可行", "甲说方案可行\n后面这句还在识别"]
+        assert app.output_pipeline.last_output_text == "甲说方案可行\n后面这句还在识别"
         h["paster"].paste_async.assert_not_called()
 
 

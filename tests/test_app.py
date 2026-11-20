@@ -652,7 +652,7 @@ class TestFinalResultFlow:
             h["paster"].paste_async.assert_called_once()
             assert h["paster"].paste_async.call_args[0][0] == "第一段第三段"
             app._handle_paste_result(PasteResult("sent", target_app="notepad.exe"))
-            hint = h["floating"].show_success.call_args[0][1]
+            hint = h["floating"].show_info.call_args[0][1]
             assert "有 1 段未识别" in hint
 
             # The next hold starts clean.

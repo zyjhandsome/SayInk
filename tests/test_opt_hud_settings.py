@@ -438,7 +438,7 @@ class TestSettingsUxConflictPreventionAndConsent:
 
         # Loopback endpoint never prompts
         pp.llm_url_edit.setText("http://127.0.0.1:11434/v1")
-        win._flush_llm_fields()
+        win.flush_llm_fields()
         monkeypatch.setattr(win, "_confirm", lambda *a, **kw: pytest.fail("loopback must not prompt"))
         pp.llm_enable_row.setChecked(True)
         assert cfg.get("llm.enabled") is True
@@ -448,7 +448,7 @@ class TestSettingsUxConflictPreventionAndConsent:
         pp.llm_url_edit.setText("https://api.deepseek.com/v1")
         pp.llm_key_edit.setText("sk-demo")
         pp.llm_model_edit.setText("deepseek-flash")
-        win._flush_llm_fields()
+        win.flush_llm_fields()
         assert llm_remote_host_needing_confirmation(cfg) == "https://api.deepseek.com"
 
         prompts = []

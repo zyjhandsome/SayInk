@@ -74,6 +74,25 @@ def _error_headline(first_line: str) -> tuple[str, str]:
     return first_line[:index].strip(), first_line[index + len(mark):].strip()
 
 
+def _prefer_clause_wrap(
+    joined: str,
+    cut: int,
+    line1: str,
+    rest: str,
+    metrics: QFontMetrics,
+    avail: int,
+) -> tuple[str, str]:
+    """Break 2-line error hints at a clause separator when line 2 fits cleanly."""
+    for delim in ("；", "。", " · ", "; "):
+        idx = joined.rfind(delim, 0, cut)
+        if idx > 0:
+            cand_line1 = joined[: idx + len(delim)].rstrip()
+            cand_rest = joined[idx + len(delim) :].lstrip()
+            if cand_rest and metrics.horizontalAdvance(cand_rest) <= avail:
+                return cand_line1, cand_rest
+    return line1, rest
+
+
 _STATE_GLYPH_MAP = {
     "STATE_RECORD": "record",
     "STATE_LISTEN": "listen",
@@ -2069,6 +2088,8 @@ class FloatingWindow(QWidget):
         tl.endLayout()
         line1 = joined[:cut].rstrip()
         rest = joined[cut:].lstrip()
+        if rest:
+            line1, rest = _prefer_clause_wrap(joined, cut, line1, rest, metrics, avail)
         if not rest:
             self._text_label.setText(line1)
             self._text_label.setToolTip(full_tooltip)
