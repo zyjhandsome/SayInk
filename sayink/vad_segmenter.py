@@ -68,6 +68,10 @@ CUT_SEARCH_SEC = 3.0
 # The quietest block only counts as a gap when its RMS is below this fraction
 # of the window's median; otherwise the cut stays at the limit.
 QUIET_CUT_RATIO = 0.6
+# When MAX_SPEECH_SEC forces a cut and no quiet breath gap was found, carry a
+# short trailing audio overlap into the next speech buffer so non-CTC models
+# (Fun-ASR-Nano, Qwen3-ASR, SenseVoice) do not slice words mid-syllable.
+FORCED_CUT_OVERLAP_SEC = 0.24
 
 VAD_ENERGY = "energy"
 VAD_SILERO = "silero"
@@ -120,12 +124,14 @@ class SegmentedAudio(np.ndarray):
 
     noise_floor: float | None
     quiet_level: float
+    overlap_samples: int
 
     def __array_finalize__(self, obj) -> None:
         if obj is None:
             return
         self.noise_floor = getattr(obj, "noise_floor", None)
         self.quiet_level = getattr(obj, "quiet_level", 0.0)
+        self.overlap_samples = int(getattr(obj, "overlap_samples", 0) or 0)
 
 
 def attach_segment_acoustics(
@@ -133,11 +139,14 @@ def attach_segment_acoustics(
     *,
     noise_floor: float | None = None,
     quiet_level: float = 0.0,
+    overlap_samples: int | None = None,
 ) -> np.ndarray:
+    prev_overlap = int(getattr(audio, "overlap_samples", 0) or 0)
     view = audio.view(SegmentedAudio) if type(audio) is np.ndarray else audio
     try:
         view.noise_floor = None if noise_floor is None else float(noise_floor)
         view.quiet_level = float(quiet_level)
+        view.overlap_samples = prev_overlap if overlap_samples is None else max(0, int(overlap_samples))
     except AttributeError:
         pass
     return view
@@ -275,6 +284,7 @@ def make_meeting_segmenter(
     model_path: str | Path | None = None,
     gate_factory: Callable[["SpeechSegmenter"], SpeechGate] | None = None,
     quiet_boost: bool | None = None,
+    forced_cut_overlap_sec: float = FORCED_CUT_OVERLAP_SEC,
 ) -> "SpeechSegmenter":
     """The meeting-profile segmenter exactly as the recorder runs it.
 
@@ -290,6 +300,7 @@ def make_meeting_segmenter(
         silence_hold_sec=MEETING_SILENCE_HOLD_SEC,
         max_speech_sec=MEETING_MAX_SPEECH_SEC,
         quiet_boost=quiet_boost,
+        forced_cut_overlap_sec=forced_cut_overlap_sec,
     )
     if gate_factory is not None:
         segmenter.set_gate(gate_factory(segmenter))
@@ -315,6 +326,7 @@ class SpeechSegmenter:
         short_speech_sec: float = SHORT_SPEECH_SEC,
         short_silence_hold_sec: float = SHORT_SILENCE_HOLD_SEC,
         trailing_silence_keep_sec: float = TRAILING_SILENCE_KEEP_SEC,
+        forced_cut_overlap_sec: float = FORCED_CUT_OVERLAP_SEC,
         gate: SpeechGate | None = None,
         quiet_boost: bool | None = None,
     ):
@@ -329,6 +341,7 @@ class SpeechSegmenter:
             self._silence_hold_samples, int(sample_rate * short_silence_hold_sec)
         )
         self._trailing_keep_samples = int(sample_rate * max(0.0, trailing_silence_keep_sec))
+        self._forced_overlap_samples = int(sample_rate * max(0.0, forced_cut_overlap_sec))
         self._min_samples = int(sample_rate * min_speech_sec)
         self._max_samples = int(sample_rate * max_speech_sec)
         self._adaptive = adaptive
@@ -354,6 +367,14 @@ class SpeechSegmenter:
     def speech_threshold(self) -> float:
         """Configured base gate (system loopback uses a lower one)."""
         return self._speech_threshold
+
+    @property
+    def forced_cut_overlap_sec(self) -> float:
+        return self._forced_overlap_samples / self._rate if self._rate > 0 else 0.0
+
+    @forced_cut_overlap_sec.setter
+    def forced_cut_overlap_sec(self, value: float) -> None:
+        self._forced_overlap_samples = int(self._rate * max(0.0, float(value)))
 
     @property
     def gate(self) -> SpeechGate:
@@ -541,8 +562,9 @@ class SpeechSegmenter:
         # Quiet blocks heard before the gate opened, newest last.
         self._pre_roll: list[tuple[np.ndarray, float, float, float]] = []
         self._pre_roll_total = 0
-        # How much of the buffer came from the pre-roll (not the utterance).
+        # How much of the buffer came from the pre-roll or forced-cut overlap (not new speech).
         self._lead_samples = 0
+        self._overlap_samples = 0
 
     @property
     def last_route(self) -> str:
@@ -602,7 +624,8 @@ class SpeechSegmenter:
             self._remember_block(block, mic_energy, system_energy, float(rms))
             self._loud_samples += int(block.size)
             if self._total_samples >= self._max_samples:
-                return self._take_segment(limit=self._quiet_cut_point())
+                cut, quiet_cut = self._find_cut_point()
+                return self._take_segment(limit=cut, quiet_cut=quiet_cut)
             return None
 
         if not self._in_speech:
@@ -615,10 +638,14 @@ class SpeechSegmenter:
         self._remember_block(block, mic_energy, system_energy, float(rms))
         self._silence_run += block.size
         if self._total_samples >= self._max_samples:
-            return self._take_segment(limit=self._quiet_cut_point())
+            cut, quiet_cut = self._find_cut_point()
+            return self._take_segment(limit=cut, quiet_cut=quiet_cut)
         hold = (
             self._short_hold_samples
-            if self._loud_samples < self._short_speech_samples
+            if (
+                self._loud_samples < self._short_speech_samples
+                and not (self._continuation and self._loud_samples == 0)
+            )
             else self._silence_hold_samples
         )
         if self._silence_run >= hold:
@@ -651,9 +678,8 @@ class SpeechSegmenter:
         self._pre_roll = []
         self._pre_roll_total = 0
 
-    def _quiet_cut_point(self) -> int:
-        """Sample offset to cut a too-long utterance: the end of the quietest
-        block within CUT_SEARCH_SEC before the limit, else the limit itself."""
+    def _find_cut_point(self) -> tuple[int, bool]:
+        """Return ``(cut_offset, found_quiet_gap)`` before ``MAX_SPEECH_SEC``."""
         limit = self._max_samples
         window_start = limit - self._cut_search_samples
         candidates: list[tuple[int, float]] = []
@@ -665,14 +691,19 @@ class SpeechSegmenter:
             if end >= window_start:
                 candidates.append((end, rms))
         if not candidates:
-            return limit
+            return limit, False
         best_end, best_rms = min(candidates, key=lambda c: c[1])
         typical = float(np.median([rms for _end, rms in candidates]))
         # A "breath" must be clearly quieter than the rest of the window;
         # on a flat signal every block ties and the limit itself is the cut.
         if best_rms > typical * QUIET_CUT_RATIO or best_end < self._min_samples:
-            return limit
-        return best_end
+            return limit, False
+        return best_end, True
+
+    def _quiet_cut_point(self) -> int:
+        """Sample offset to cut a too-long utterance: the end of the quietest
+        block within CUT_SEARCH_SEC before the limit, else the limit itself."""
+        return self._find_cut_point()[0]
 
     def _should_drop(self) -> bool:
         spoken = self._total_samples - self._lead_samples
@@ -698,14 +729,26 @@ class SpeechSegmenter:
         # A neural gate may need more than the final few milliseconds to open
         # again after a forced cut. Recover only the immediate audible tail,
         # never a later independent click or an arbitrary silent pre-roll.
+        min_cont_rms = self._speech_threshold * (0.05 if self.quiet_speech else 1)
         if (not self._in_speech and self._continuation and self._pre_roll
                 and self._continuation_wait <= self._pre_roll_samples
-                and any(rms >= self._speech_threshold * (0.05 if self.quiet_speech else 1)
-                        for _b, _m, _s, rms in self._pre_roll)):
+                and any(rms >= min_cont_rms for _b, _m, _s, rms in self._pre_roll)):
             self._take_pre_roll()
             self._lead_samples = 0
             self._loud_samples = self._total_samples
             self._in_speech = True
+        elif (
+            self._in_speech
+            and self._continuation
+            and self._loud_samples == 0
+            and self._total_samples > self._lead_samples
+            and self._silence_run <= self._pre_roll_samples
+            and self._buffer
+        ):
+            post_samples = np.concatenate(self._buffer)[self._lead_samples:]
+            if post_samples.size > 0 and rms_volume(post_samples) >= min_cont_rms:
+                self._loud_samples = int(post_samples.size)
+                self._silence_run = 0
         if not self._in_speech or self._should_drop():
             self._reset_buffer()
             return None
@@ -713,6 +756,7 @@ class SpeechSegmenter:
             self._reset_buffer()
             return None
         start = self._input_samples - self._total_samples
+        prev_overlap = self._overlap_samples
         out = np.concatenate(self._buffer).astype(np.float32, copy=False)
         trim = max(0, self._silence_run - self._trailing_keep_samples)
         if trim:
@@ -723,7 +767,12 @@ class SpeechSegmenter:
         self._reset_buffer()
         self._last_route = dominant_route(mic, system)
         self._last_bounds = (start, start + int(out.size))
-        return attach_segment_acoustics(out, noise_floor=noise_floor, quiet_level=quiet_level)
+        return attach_segment_acoustics(
+            out,
+            noise_floor=noise_floor,
+            quiet_level=quiet_level,
+            overlap_samples=min(prev_overlap, int(out.size)),
+        )
 
     def _remember_block(
         self, block: np.ndarray, mic_energy: float, system_energy: float, rms: float = 0.0
@@ -764,7 +813,11 @@ class SpeechSegmenter:
         return mic, system, tail
 
     def _take_segment(
-        self, limit: int | None = None, *, tail_is_speech: bool = True
+        self,
+        limit: int | None = None,
+        *,
+        tail_is_speech: bool = True,
+        quiet_cut: bool = True,
     ) -> np.ndarray | None:
         if self._should_drop():
             self._reset_buffer()
@@ -773,12 +826,22 @@ class SpeechSegmenter:
             self._reset_buffer()
             return None
         start = self._input_samples - self._total_samples
+        prev_overlap = self._overlap_samples
+        prev_silence_run = self._silence_run
         audio = np.concatenate(self._buffer).astype(np.float32, copy=False)
         take = audio.size if limit is None else min(int(limit), int(audio.size))
         mic, system, tail_energy = self._split_energy(take)
         noise_floor = self.ambient_noise_floor
         quiet_level = self.quiet_level
-        tail = audio[take:] if take < audio.size else None
+        overlap_carry = 0
+        if tail_is_speech and not quiet_cut and self._forced_overlap_samples > 0:
+            overlap_carry = min(self._forced_overlap_samples, take // 4)
+        keep_from = max(0, take - overlap_carry)
+        actual_overlap = take - keep_from
+        tail = audio[keep_from:] if keep_from < audio.size else None
+        carried_energy = tail_energy
+        if actual_overlap > 0:
+            _, _, carried_energy = self._split_energy(keep_from)
         self._reset_buffer(reset_gate=not tail_is_speech)
         self._continuation = tail_is_speech
         self._last_route = dominant_route(mic, system)
@@ -793,12 +856,22 @@ class SpeechSegmenter:
                 rms_volume(tail),
             )
         elif tail is not None and tail.size:
+            new_after_take = max(0, audio.size - take)
+            new_silence = min(prev_silence_run, new_after_take)
+            new_loud = max(0, new_after_take - new_silence)
             self._in_speech = True
             self._buffer = [tail]
             self._total_samples = int(tail.size)
-            # The carried tail came from the loud run that forced this cut.
-            self._loud_samples = int(tail.size)
-            self._energy = tail_energy
+            self._overlap_samples = actual_overlap
+            self._lead_samples = actual_overlap
+            # Only samples beyond ``take`` count as new loud speech; carried
+            # overlap provides ASR context without double-counting duration.
+            self._loud_samples = new_loud
+            self._silence_run = new_silence
+            self._energy = carried_energy
         return attach_segment_acoustics(
-            audio[:take], noise_floor=noise_floor, quiet_level=quiet_level
+            audio[:take],
+            noise_floor=noise_floor,
+            quiet_level=quiet_level,
+            overlap_samples=min(prev_overlap, take),
         )

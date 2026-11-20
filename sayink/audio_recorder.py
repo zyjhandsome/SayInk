@@ -1,3 +1,4 @@
+from collections import deque
 import logging
 from pathlib import Path
 import threading
@@ -47,6 +48,7 @@ from sayink.lane_echo import DuplicateLaneSuppressor
 from sayink.runtime_status import SegmentationStatus
 from sayink.audio_recovery import RecordingJournal
 from sayink.vad_segmenter import (
+    FORCED_CUT_OVERLAP_SEC,
     VAD_ENERGY,
     VAD_SILERO,
     SpeechSegmenter,
@@ -127,6 +129,7 @@ class AudioRecorder(QObject):
     recording_finished = pyqtSignal(np.ndarray)
     segment_ready = pyqtSignal(np.ndarray)
     utterance_opened = pyqtSignal(int, str)
+    speech_active_changed = pyqtSignal(bool)
     error = pyqtSignal(str)
     warning = pyqtSignal(str)
     no_speech_warning = pyqtSignal()
@@ -136,6 +139,10 @@ class AudioRecorder(QObject):
     SYSTEM_ROUTE_POLL_SEC = 2.0
     SYSTEM_ACTIVE_RMS = 4e-4
     LANE_STALL_SEC = 3.0
+    # Bound how long a completed utterance on one independent lane can wait for
+    # an ongoing monologue on the other lane before releasing out-of-band.
+    SPLIT_MAX_HOLD_SEC = 2.5
+    MAX_READY_TARGETS = 256
     # Mixing waits for a lane that delivered within this window; a quieter
     # one (loopback while nothing plays) is filled with silence instead.
     MIX_WAIT_SEC = 0.3
@@ -217,7 +224,12 @@ class AudioRecorder(QObject):
         self._stream_anchor_ms = 0
         self._segment_captured_at = 0
         self._open_target = (0, "")
+        self._open_target_snapshot: object | None = None
         self._segment_target = (0, "")
+        self._segment_target_snapshot: object | None = None
+        self._ready_targets: deque[tuple[int, str, object | None]] = deque()
+        self._speech_active = False
+        self._last_system_open_error: Optional[Exception] = None
         self._recovery_root = None
         self._recovery_keep_completed: bool = False
         self._recovery_session_id: str = ""
@@ -253,6 +265,18 @@ class AudioRecorder(QObject):
         """Independent real-time RMS levels ``(mic_level, system_level)``."""
         return float(self._mic_level), float(self._system_level)
 
+    @property
+    def is_speech_active(self) -> bool:
+        """True while the active VAD segmenter has an open speech utterance."""
+        return bool(self._speech_active)
+
+    def _set_speech_active(self, active: bool) -> None:
+        want = bool(active)
+        if want == self._speech_active:
+            return
+        self._speech_active = want
+        self.speech_active_changed.emit(want)
+
     def discard_current_utterance(self) -> None:
         """Drop buffered audio, VAD state, and boundary lookahead for the active utterance."""
         with self._lock:
@@ -268,9 +292,12 @@ class AudioRecorder(QObject):
             role: type(buffer)() for role, buffer in self._split_boundaries.items()
         }
         self._split_ready = []
-        self._split_targets = {role: (0, "") for role in self._split_segmenters}
+        self._split_targets = {role: (0, "", None) for role in self._split_segmenters}
         self._open_target = (0, "")
+        self._open_target_snapshot = None
         self._segment_target = (0, "")
+        self._segment_target_snapshot = None
+        self._ready_targets.clear()
         self._segment_route = ""
         self._segment_route_reliable = False
         self._segment_captured_at = 0
@@ -278,6 +305,7 @@ class AudioRecorder(QObject):
         self._block_started_at = 0
         self._stream_anchor_ms = 0
         self._last_loopback_pad_at = 0.0
+        self._set_speech_active(False)
 
     def set_paused(self, paused: bool) -> None:
         """Pause or resume mixed-mode silent-loopback elapsed time tracking."""
@@ -343,6 +371,12 @@ class AudioRecorder(QObject):
         else:
             segmenter.quiet_boost = False
 
+    def _apply_forced_overlap(self, segmenter: SpeechSegmenter) -> None:
+        if hasattr(segmenter, "forced_cut_overlap_sec"):
+            segmenter.forced_cut_overlap_sec = (
+                0.0 if self._boundary_requested else FORCED_CUT_OVERLAP_SEC
+            )
+
     def set_separate_lanes(self, enabled: bool) -> None:
         self._separate_lanes_requested = bool(enabled)
 
@@ -354,6 +388,7 @@ class AudioRecorder(QObject):
         if not self._separate_lanes_requested or {lane.endpoint.role for lane in self._lanes} != {"microphone", "system"}:
             return
         from sayink.asr_context import BoundaryContextBuffer
+        overlap_sec = 0.0 if self._boundary_requested else FORCED_CUT_OVERLAP_SEC
         for role, threshold in (("microphone", 0.002), ("system", 0.0006)):
             if self._meeting_profile:
                 segmenter = make_meeting_segmenter(
@@ -361,48 +396,92 @@ class AudioRecorder(QObject):
                     vad=self._vad_kind,
                     model_path=self._vad_model_path,
                     gate_factory=lambda seg, r=role: self._split_speech_gate(r, seg),
+                    forced_cut_overlap_sec=overlap_sec,
                 )
             else:
-                segmenter = SpeechSegmenter(speech_threshold=threshold)
+                segmenter = SpeechSegmenter(
+                    speech_threshold=threshold,
+                    forced_cut_overlap_sec=overlap_sec,
+                )
                 segmenter.set_gate(self._split_speech_gate(role, segmenter))
             self._split_segmenters[role] = segmenter
             if self._vad_kind == VAD_SILERO and segmenter.gate_name != VAD_SILERO:
                 self.warning.emit(f"{role} 的语音检测模型未能启用，使用能量断句；本路轻声增强未启用。")
             self._apply_quiet_mode(segmenter)
-            self._split_targets[role] = (0, "")
+            self._split_targets[role] = (0, "", None)
             if self._boundary_requested:
                 self._split_boundaries[role] = BoundaryContextBuffer()
 
-    def _emit_split_segment(self, role, segment):
+    def _split_stream_now_ms(self) -> float:
+        stream_samples = max(
+            (int(getattr(seg, "_input_samples", 0) or 0) for seg in self._split_segmenters.values()),
+            default=0,
+        )
+        return self._stream_anchor_ms + stream_samples * 1000.0 / TARGET_SAMPLE_RATE
+
+    def _emit_split_segment(self, role, segment, target_entry=None):
         seg = self._split_segmenters[role]
         self._segment_route = "mic" if role == "microphone" else "system"
         self._segment_captured_at = self._stream_anchor_ms + int(seg.last_bounds[0] * 1000 / TARGET_SAMPLE_RATE)
-        self._segment_target = self._split_targets[role]
+        raw_target = target_entry if target_entry is not None else self._split_targets.get(role, (0, "", None))
+        if isinstance(raw_target, tuple) and len(raw_target) >= 3:
+            self._segment_target = (int(raw_target[0] or 0), str(raw_target[1] or ""))
+            self._segment_target_snapshot = raw_target[2]
+        elif isinstance(raw_target, tuple) and len(raw_target) == 2:
+            self._segment_target = (int(raw_target[0] or 0), str(raw_target[1] or ""))
+            self._segment_target_snapshot = None
+        else:
+            self._segment_target = (0, "")
+            self._segment_target_snapshot = None
         acoustics = (getattr(segment, "noise_floor", None), float(getattr(segment, "quiet_level", 0.0)))
-        metadata = (self._segment_route, self._segment_captured_at, self._segment_target, acoustics)
+        metadata = (
+            self._segment_route,
+            self._segment_captured_at,
+            self._segment_target,
+            acoustics,
+            self._segment_target_snapshot,
+        )
         boundary = self._split_boundaries.get(role)
         if boundary is not None:
             boundary.capture(segment, seg.last_bounds, seg.last_forced, metadata)
             self._release_split_context(role)
         else:
-            self._split_ready.append((segment, metadata))
+            self._split_ready.append((segment, metadata, self._split_stream_now_ms()))
 
     def _release_split_context(self, role, *, ending=False):
         boundary = self._split_boundaries.get(role)
         if boundary is not None:
+            now_ms = self._split_stream_now_ms()
             for audio, metadata in boundary.release(ending=ending):
-                self._split_ready.append((audio, metadata))
+                self._split_ready.append((audio, metadata, now_ms))
 
     def _release_split_ready(self, *, ending=False):
         starts = [seg.pending_start for seg in self._split_segmenters.values()]
         starts.extend(boundary.pending_start for boundary in self._split_boundaries.values()
                       if boundary.pending_start is not None)
-        watermark = self._stream_anchor_ms + min(starts) * 1000 / TARGET_SAMPLE_RATE
+        now_stream_ms = self._split_stream_now_ms()
+        watermark = (
+            self._stream_anchor_ms + min(starts) * 1000 / TARGET_SAMPLE_RATE
+            if starts
+            else now_stream_ms
+        )
+        max_hold_ms = self.SPLIT_MAX_HOLD_SEC * 1000.0
         self._split_ready.sort(key=lambda item: item[1][1])
         released = 0
-        while self._split_ready and (ending or self._split_ready[0][1][1] <= watermark):
-            audio, metadata = self._split_ready.pop(0)
-            self._segment_route, self._segment_captured_at, self._segment_target, acoustics = metadata
+        while self._split_ready:
+            head = self._split_ready[0]
+            audio, metadata = head[0], head[1]
+            ready_at_ms = head[2] if len(head) > 2 else float(metadata[1])
+            captured_at = metadata[1]
+            if not (
+                ending
+                or captured_at <= watermark
+                or (now_stream_ms - ready_at_ms) >= max_hold_ms
+            ):
+                break
+            self._split_ready.pop(0)
+            self._segment_route, self._segment_captured_at, self._segment_target, acoustics = metadata[:4]
+            self._segment_target_snapshot = metadata[4] if len(metadata) > 4 else None
             audio = attach_segment_acoustics(audio, noise_floor=acoustics[0], quiet_level=acoustics[1])
             self._segment_route_reliable = True
             self._emit_segment_ready(audio)
@@ -424,17 +503,35 @@ class AudioRecorder(QObject):
             was_in_speech = seg.in_speech
             audio = seg.feed(track)
             if not was_in_speech and (seg.in_speech or audio is not None):
-                self._remember_open_target()
-                self._split_targets[role] = self._open_target
+                if self._continuous_mode:
+                    self._remember_open_target()
+                    self._split_targets[role] = (
+                        self._open_target[0],
+                        self._open_target[1],
+                        self._open_target_snapshot,
+                    )
             if audio is not None:
-                emitted.append((seg.last_bounds[0], role, audio))
+                emitted.append((seg.last_bounds[0], role, audio, self._split_targets.get(role, (0, "", None))))
+                if seg.in_speech and self._continuous_mode:
+                    self._remember_open_target()
+                    self._split_targets[role] = (
+                        self._open_target[0],
+                        self._open_target[1],
+                        self._open_target_snapshot,
+                    )
+        self._set_speech_active(
+            any(bool(getattr(s, "in_speech", False)) for s in self._split_segmenters.values())
+        )
         # Segments becoming ready on the same tick follow capture time.
-        for _start, role, audio in sorted(emitted, key=lambda item: (item[0], item[1])):
-            self._emit_split_segment(role, audio)
+        for _start, role, audio, target_entry in sorted(emitted, key=lambda item: (item[0], item[1])):
+            self._emit_split_segment(role, audio, target_entry)
         return self._release_split_ready()
 
     def set_boundary_context(self, enabled: bool) -> None:
         self._boundary_requested = bool(enabled)
+        self._apply_forced_overlap(self._segmenter)
+        for seg in self._split_segmenters.values():
+            self._apply_forced_overlap(seg)
 
     def set_recovery_directory(self, root, *, keep_completed: bool | None = None) -> None:
         """Apply to the next recording, never start persisting an active one."""
@@ -527,17 +624,24 @@ class AudioRecorder(QObject):
             )
             self.segmentation_changed.emit(self._segmentation_status)
         threshold = 0.0006 if self._input_source == INPUT_SOURCE_SYSTEM else 0.002
+        overlap_sec = 0.0 if self._boundary_requested else FORCED_CUT_OVERLAP_SEC
         if self._meeting_profile:
             segmenter = make_meeting_segmenter(
-                speech_threshold=threshold, gate_factory=self._speech_gate,
+                speech_threshold=threshold,
+                gate_factory=self._speech_gate,
+                forced_cut_overlap_sec=overlap_sec,
             )
         else:
-            segmenter = SpeechSegmenter(speech_threshold=threshold)
+            segmenter = SpeechSegmenter(
+                speech_threshold=threshold,
+                forced_cut_overlap_sec=overlap_sec,
+            )
             segmenter.set_gate(self._speech_gate(segmenter))
         gate = segmenter.gate
         self._apply_quiet_mode(segmenter)
         self._segmenter = segmenter
         self._stream_anchor_ms = 0
+        self._set_speech_active(False)
         if self._is_recording and not self._is_cancelled and self._lanes:
             self._prepare_split_segmenters()
         self._segmentation_status = SegmentationStatus(
@@ -823,7 +927,8 @@ class AudioRecorder(QObject):
                     except Exception:
                         log.debug("关闭半开的音频流失败", exc_info=True)
 
-        raise RuntimeError(f"无法打开音频设备：{ep.device.name}") from last_err
+        detail = f"（{last_err}）" if last_err is not None and str(last_err).strip() else ""
+        raise RuntimeError(f"无法打开音频设备：{ep.device.name}{detail}") from last_err
 
     def _system_device_candidates(self, primary: StreamEndpoint) -> list[StreamEndpoint]:
 
@@ -838,6 +943,7 @@ class AudioRecorder(QObject):
 
     def _open_system_lane_with_fallback(self, primary: StreamEndpoint) -> Optional[_CaptureLane]:
         last_err: Optional[Exception] = None
+        self._last_system_open_error = None
         for ep in self._system_device_candidates(primary):
             lane = _CaptureLane(ep)
             try:
@@ -854,6 +960,7 @@ class AudioRecorder(QObject):
             except Exception as e:
                 last_err = e
                 log.debug("系统设备打开失败 %s: %s", ep.device.name, e)
+        self._last_system_open_error = last_err
         if last_err is not None:
             log.warning("所有系统声音设备均无法打开（末次错误: %s）", last_err)
         return None
@@ -1433,7 +1540,11 @@ class AudioRecorder(QObject):
 
         # A hold can leave a window here, and hold-to-talk never consumes it.
         self._open_target = (0, "")
+        self._open_target_snapshot = None
         self._segment_target = (0, "")
+        self._segment_target_snapshot = None
+        self._ready_targets.clear()
+        self._set_speech_active(False)
         self._continuous_mode = continuous
         from sayink.asr_context import BoundaryContextBuffer
         self._boundary_buffer = BoundaryContextBuffer() if self._boundary_requested else None
@@ -1499,9 +1610,11 @@ class AudioRecorder(QObject):
                             log.warning(warn)
                             self.warning.emit(warn)
                             continue
+                        sys_err = self._last_system_open_error
+                        sys_detail = f"（{sys_err}）" if sys_err is not None and str(sys_err).strip() else ""
                         raise RuntimeError(
-                            f"无法打开音频设备：{endpoint.device.name}"
-                        )
+                            f"无法打开音频设备：{endpoint.device.name}{sys_detail}"
+                        ) from sys_err
                     opened.append(lane)
                 else:
                     lane = _CaptureLane(endpoint)
@@ -1574,7 +1687,8 @@ class AudioRecorder(QObject):
             for lane in opened:
                 self._close_lane(lane)
             self._lanes = []
-            self.error.emit(self._friendly_open_error(str(e)))
+            self._set_speech_active(False)
+            self.error.emit(self._friendly_open_error(str(e), e))
 
     def start_continuous(self):
         self.start(continuous=True)
@@ -1591,6 +1705,7 @@ class AudioRecorder(QObject):
                     self._emit_split_segment(role, audio)
                 self._release_split_context(role, ending=True)
             emitted += self._release_split_ready(ending=True)
+            self._set_speech_active(False)
             return emitted
         if block is not None and block.size > 0:
             segment = self._feed_segmenter(block)
@@ -1598,12 +1713,14 @@ class AudioRecorder(QObject):
                 log.debug("持续监听收尾片段: %d 采样点", segment.size)
                 emitted += self._emit_segment(segment)
         flushed = self._segmenter.flush()
+        self._set_speech_active(False)
         if flushed is not None and flushed.size > 0:
             log.debug("持续监听 flush 片段: %d 采样点", flushed.size)
             self._block_started_at = self._segment_started_at
             # flush() never passes through _feed_segmenter, so the window
             # captured when this utterance opened would otherwise be lost.
             self._segment_target = self._open_target
+            self._segment_target_snapshot = self._open_target_snapshot
             emitted += self._emit_segment(flushed)
         return emitted
 
@@ -1627,35 +1744,57 @@ class AudioRecorder(QObject):
         if not was_in_speech and (segment is not None or in_speech):
             # The gate opened inside this block; the utterance started about
             # one block (plus pre-roll) before the block arrived.
-            self._remember_open_target()
+            if self._continuous_mode:
+                self._remember_open_target()
             self._segment_started_at = now_ms - int(self.CHUNK_DURATION * 1000)
+        if not was_in_speech and in_speech:
+            self._set_speech_active(True)
         if segment is not None:
             self._block_started_at = self._segment_started_at
             self._segment_target = self._open_target
+            self._segment_target_snapshot = self._open_target_snapshot
             if in_speech:
                 # A carried tail already belongs to the next utterance.
-                self._remember_open_target()
-                self._segment_started_at = now_ms
+                if self._continuous_mode:
+                    self._remember_open_target()
+                carried_ms = int(getattr(segmenter, "_total_samples", 0) * 1000 / TARGET_SAMPLE_RATE)
+                self._segment_started_at = now_ms - carried_ms
+        self._set_speech_active(in_speech)
         return segment
 
     def _remember_open_target(self) -> None:
-        """Record the foreground window on the UI thread when speech opens."""
-        from sayink.text_paster import (
-            TextPaster,
-            get_foreground_process_name,
-            get_foreground_window_info,
-            target_rejects_synthetic_input,
-        )
+        """Record the foreground window & isolated snapshot on speech open without global mutation."""
+        from sayink import text_paster as _tp
 
-        info = get_foreground_window_info()
-        hwnd = int(info[0] or 0)
-        name = get_foreground_process_name() if hwnd else ""
+        info = _tp.get_foreground_window_info()
+        hwnd = int(info[0] or 0) if info else 0
+        name = ""
+        snapshot = None
+        if hwnd:
+            proc_fn = _tp.get_foreground_process_name
+            if getattr(proc_fn, "__module__", "") == "sayink.text_paster":
+                name = _tp._process_name_from_window_info(info)
+            else:
+                name = str(proc_fn() or "")
+            cap_fn = getattr(_tp, "capture_paste_target_snapshot", None)
+            win_info_is_real = getattr(_tp.get_foreground_window_info, "__module__", "") == "sayink.text_paster"
+            if callable(cap_fn) and (
+                win_info_is_real or not getattr(cap_fn, "__module__", "").startswith("sayink.")
+            ):
+                snapshot = cap_fn(hwnd)
+            else:
+                snapshot = _tp.build_paste_target_snapshot(info)
+            if snapshot is not None and not getattr(snapshot, "hwnd", 0):
+                snapshot = None
+        is_own = getattr(_tp.TextPaster, "is_own_window", None) or _tp.TextPaster._is_own_window
         if hwnd and (
-            TextPaster._is_own_window(info)
-            or target_rejects_synthetic_input(info)
+            is_own(info)
+            or _tp.target_rejects_synthetic_input(info)
         ):
             hwnd = 0
+            snapshot = None
         self._open_target = (hwnd, name)
+        self._open_target_snapshot = snapshot
         self.utterance_opened.emit(hwnd, name)
 
     def _emit_segment(self, segment: np.ndarray) -> int:
@@ -1670,7 +1809,13 @@ class AudioRecorder(QObject):
                 segment,
                 bounds,
                 self._segmenter.last_forced,
-                (self._segment_route, self._segment_captured_at, self._segment_target, acoustics),
+                (
+                    self._segment_route,
+                    self._segment_captured_at,
+                    self._segment_target,
+                    acoustics,
+                    self._segment_target_snapshot,
+                ),
             )
             return self._release_boundary_context()
         else:
@@ -1683,7 +1828,8 @@ class AudioRecorder(QObject):
             return 0
         released = 0
         for audio, metadata in self._boundary_buffer.release(ending=ending):
-            self._segment_route, self._segment_captured_at, self._segment_target, acoustics = metadata
+            self._segment_route, self._segment_captured_at, self._segment_target, acoustics = metadata[:4]
+            self._segment_target_snapshot = metadata[4] if len(metadata) > 4 else None
             audio = attach_segment_acoustics(audio, noise_floor=acoustics[0], quiet_level=acoustics[1])
             self._segment_route_reliable = False
             self._emit_segment_ready(audio)
@@ -1693,6 +1839,13 @@ class AudioRecorder(QObject):
     def _emit_segment_ready(self, audio: np.ndarray) -> None:
         if not self._continuous_mode and audio.size:
             self._hold_segments_emitted += 1
+        if audio.size:
+            target = self._segment_target
+            t_hwnd = int(target[0] or 0) if isinstance(target, tuple) and len(target) >= 2 else 0
+            t_app = str(target[1] or "") if isinstance(target, tuple) and len(target) >= 2 else ""
+            if len(self._ready_targets) >= self.MAX_READY_TARGETS:
+                self._ready_targets.popleft()
+            self._ready_targets.append((t_hwnd, t_app, self._segment_target_snapshot))
         self.segment_ready.emit(audio)
 
     def consume_segment_route(self) -> str:
@@ -1717,13 +1870,34 @@ class AudioRecorder(QObject):
         self._segment_captured_at = 0
         return int(stamp or 0)
 
+    def consume_segment_target_details(self) -> tuple[int, str, object | None]:
+        """Return ``(hwnd, app_name, snapshot)`` captured when this segment's speech opened."""
+        if self._ready_targets:
+            hwnd, app, snap = self._ready_targets.popleft()
+            if not self._ready_targets:
+                self._segment_target = (0, "")
+                self._segment_target_snapshot = None
+            return int(hwnd or 0), str(app or ""), snap
+        target = self._segment_target
+        snap = self._segment_target_snapshot
+        self._segment_target = (0, "")
+        self._segment_target_snapshot = None
+        if not isinstance(target, tuple) or len(target) < 2:
+            return 0, "", None
+        return int(target[0] or 0), str(target[1] or ""), snap
+
     def consume_segment_target(self) -> tuple[int, str]:
         """Foreground window captured when this segment's speech opened."""
-        target = self._segment_target
-        self._segment_target = (0, "")
-        if not isinstance(target, tuple) or len(target) != 2:
-            return 0, ""
-        return int(target[0] or 0), str(target[1] or "")
+        hwnd, app, _snap = self.consume_segment_target_details()
+        return hwnd, app
+
+    def pop_open_target_details(self) -> tuple[int, str, object | None]:
+        """Pop per-segment ``(hwnd, app_name, snapshot)`` captured at speech open."""
+        return self.consume_segment_target_details()
+
+    def pop_open_target(self) -> tuple[int, str]:
+        """Pop per-segment ``(hwnd, app_name)`` captured at speech open."""
+        return self.consume_segment_target()
 
     def stop_continuous(self, *, flush: bool = True):
         if not self._continuous_mode and not self._is_recording:
@@ -1748,6 +1922,7 @@ class AudioRecorder(QObject):
         self._lanes = []
         self._terminate_pawp()
         self._segmenter.reset()
+        self._set_speech_active(False)
 
     def _close_lanes_then_flush(self, flush: bool = True) -> int:
         """Stopping a stream hands over the block still in the driver; close
@@ -1779,37 +1954,66 @@ class AudioRecorder(QObject):
         cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ：:;；,，")
         return cleaned
 
-    def _friendly_open_error(self, msg: str) -> str:
-        lower = msg.lower()
-        if msg.startswith(("无法打开音频设备", "音频设备启动失败")):
-            if "audio device" in lower and "realtek" not in lower:
-                return (
-                    "无法打开「Audio Device」类虚拟扬声器。"
-                    "请点「恢复自动选择」，或将 Windows 默认扬声器改为 Realtek 物理声卡。"
-                )
-            return self._strip_raw_error_codes(msg) or "无法打开音频设备，请检查设备连接后重试"
-        if "未找到可用的" in msg:
-            return msg
-        if "permission" in lower or "access" in lower:
+    def _friendly_open_error(self, msg: str | BaseException, err: BaseException | None = None) -> str:
+        if isinstance(msg, BaseException):
+            err = msg
+            text = str(msg)
+        else:
+            text = str(msg or "")
+        parts: list[str] = [text] if text else []
+        has_permission_exc = False
+        cur = err
+        seen: set[int] = set()
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            if isinstance(cur, PermissionError):
+                has_permission_exc = True
+            cur_str = str(cur).strip()
+            if cur_str and cur_str not in parts:
+                parts.append(cur_str)
+            cur = cur.__cause__ or cur.__context__
+        combined = " | ".join(parts)
+        lower = combined.lower()
+
+        if "未找到可用的" in combined:
+            return text
+        if (
+            has_permission_exc
+            or "permission" in lower
+            or "access" in lower
+            or "0x80070005" in lower
+            or "拒绝访问" in combined
+            or "权限" in combined
+        ):
             return "无法访问音频设备，请检查系统隐私与麦克风权限"
         if (
             "no device" in lower
             or "invalid device" in lower
             or "painvaliddevice" in lower
             or "there is no device" in lower
+            or "device unavailable" in lower
+            or "0x88890004" in lower
         ):
             return "未检测到可用的音频设备，请在设置中点「恢复自动选择」后重试"
+        if text.startswith(("无法打开音频设备", "音频设备启动失败")):
+            if "audio device" in lower and "realtek" not in lower:
+                return (
+                    "无法打开「Audio Device」类虚拟扬声器。"
+                    "请点「恢复自动选择」，或将 Windows 默认扬声器改为 Realtek 物理声卡。"
+                )
+        if "网易" in combined or "netease" in lower or "虚拟" in combined:
+            return (
+                "无法打开该虚拟扬声器采集电脑播放声。"
+                "请在「手动选择音频设备」中将「电脑声音」改为系统默认物理扬声器，或启用「立体声混音」。"
+            )
         if "loopback" in lower or "wasapi" in lower:
             return (
                 "无法打开系统声音采集。可尝试在设置中更换「电脑声音设备」，"
                 "或在系统声音设置中启用「立体声混音」。"
             )
-        if "网易" in msg or "netease" in lower or "虚拟" in msg:
-            return (
-                "无法打开该虚拟扬声器采集电脑播放声。"
-                "请在「手动选择音频设备」中将「电脑声音」改为系统默认物理扬声器，或启用「立体声混音」。"
-            )
-        cleaned = self._strip_raw_error_codes(msg)
+        if text.startswith(("无法打开音频设备", "音频设备启动失败")):
+            return self._strip_raw_error_codes(text) or "无法打开音频设备，请检查设备连接后重试"
+        cleaned = self._strip_raw_error_codes(text)
         return f"音频设备启动失败：{cleaned}" if cleaned else "音频设备启动失败，请检查音频设备设置"
 
     def _close_lane(self, lane: _CaptureLane):
@@ -1918,11 +2122,13 @@ class AudioRecorder(QObject):
         self._lanes = []
         self._terminate_pawp()
         self._segmenter.reset()
+        self._set_speech_active(False)
         if not cancelled and emitted == 0 and not self._suppress_empty_finished:
             self.recording_finished.emit(np.array([], dtype=np.float32))
 
     def cancel(self):
         self._is_cancelled = True
+        self._set_speech_active(False)
         if self._continuous_mode:
             self.stop_continuous(flush=False)
             return
