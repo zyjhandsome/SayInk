@@ -296,7 +296,7 @@ def test_srt_export_writes_transcript_cues(meeting, monkeypatch, tmp_path):
         QFileDialog, "getSaveFileName",
         lambda *_args, path=out: (str(path), "SRT 字幕 (*.srt)"),
     )
-    page._export("notes")
+    page._export("srt")
     written = tmp_path / "talk.srt"
     text = written.read_text(encoding="utf-8")
     assert "-->" in text

@@ -693,6 +693,8 @@ class MainWindow(QWidget):
         page.aux_models_changed.connect(lambda: self._settings._rebuild_model_cards())
         page.configure_requested.connect(self._open_ai_connection)
         page.glossary_updated.connect(self._on_glossary_learned)
+        page.view_mode_changed.connect(self._refresh_usage_summary)
+        page.audio_settings_requested.connect(lambda: self.show_page("general"))
         return page
 
     def _on_glossary_learned(self) -> None:
@@ -756,6 +758,11 @@ class MainWindow(QWidget):
 
         hints = dictation_hints(self._config)
         meeting = self._meeting_controller
+        is_meeting_start = (
+            self._page == "meeting"
+            and callable(getattr(self._meeting, "is_on_start_card", None))
+            and bool(self._meeting.is_on_start_card())
+        )
         if meeting is not None and meeting.is_active:
             state = meeting.state
             label = {
@@ -772,6 +779,21 @@ class MainWindow(QWidget):
             self._output_label.setText("仅保存会议记录")
             self._output_label.setProperty("outputWarning", False)
             self._shortcut_label.setText("在会议页暂停或结束\n转写快捷键暂不可用")
+        elif is_meeting_start:
+            upd_fn = getattr(self._meeting, "_update_card_notes", None)
+            if callable(upd_fn):
+                upd_fn()
+            vals_fn = getattr(self._meeting, "start_card_values", None)
+            vals = vals_fn() if callable(vals_fn) else None
+            src_key = str(getattr(vals, "input_source", "") or "mixed")
+            save_on = bool(self._config.get("meeting.save_audio", True))
+            self._status_tone_override = ""
+            self._runtime_label.setText(self._model_runtime_text)
+            self._runtime_label.setToolTip("")
+            self._mode_label.setText(f"{input_source_label(src_key)} · 准备开始会议")
+            self._output_label.setText(f"保存会议录音：{'已开启' if save_on else '已关闭'}")
+            self._output_label.setProperty("outputWarning", False)
+            self._shortcut_label.setText("点「开始」录制会议 · 结果保存到会议记录")
         else:
             self._status_tone_override = ""
             self._runtime_label.setText(self._model_runtime_text)
@@ -782,6 +804,15 @@ class MainWindow(QWidget):
             self._output_label.setProperty("outputWarning", hints.output_warning)
         self._paint_status_dot()
         self._paint_output_hint()
+
+    def sidebar_summary_texts(self) -> dict[str, str]:
+        """Public snapshot of the left sidebar runtime/mode/output/shortcut hints."""
+        return {
+            "runtime": self._runtime_label.text(),
+            "mode": self._mode_label.text(),
+            "output": self._output_label.text(),
+            "shortcut": self._shortcut_label.text(),
+        }
 
     def _paint_output_hint(self) -> None:
         color = tok.RED if self._output_label.property("outputWarning") else tok.TEXT_DIM
@@ -1296,6 +1327,7 @@ class MainWindow(QWidget):
             self._stack.setCurrentIndex(_STACK_SETTINGS)
             self._settings.show_page(settings_index[key])
         self._check_nav(key)
+        self._refresh_usage_summary()
 
     def _current_page_can_leave(self) -> bool:
         if self._page == "meeting":

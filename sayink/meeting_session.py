@@ -32,8 +32,9 @@ from typing import Any, Callable
 
 from PyQt6.QtCore import QEvent, QObject, QThread, QTimer, pyqtSignal
 
+from sayink.atomic_io import atomic_write_text
 from sayink.config import Config
-from sayink.history_store import HistoryStore, SegmentRecord
+from sayink.history_store import MEETING_TRIGGER_MODE, HistoryStore, SegmentRecord
 from sayink.meeting_store import (
     QUEUE_PRIORITY_AUTO,
     QUEUE_PRIORITY_USER,
@@ -362,6 +363,92 @@ def runs_on_this_machine(url: str) -> bool:
 
 
 _MAX_CLUSTER_TURNS = 512
+_PENDING_SIDECAR_FILENAME = "meeting_pending_state.json"
+
+
+@dataclass(frozen=True)
+class AsrFailureSpan:
+    meeting_id: str
+    captured_at: int
+    duration_ms: int = 0
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "meeting_id": self.meeting_id,
+            "captured_at": int(self.captured_at),
+            "duration_ms": int(self.duration_ms),
+            "reason": str(self.reason or ""),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> AsrFailureSpan | None:
+        mid = str(raw.get("meeting_id") or "").strip()
+        if not mid:
+            return None
+        try:
+            cap = int(raw.get("captured_at") or 0)
+            dur = max(0, int(raw.get("duration_ms") or 0))
+        except (TypeError, ValueError):
+            return None
+        return cls(
+            meeting_id=mid,
+            captured_at=cap,
+            duration_ms=dur,
+            reason=str(raw.get("reason") or ""),
+        )
+
+
+def format_asr_gap_notice(offset_ms: int) -> str:
+    return f"[{format_timestamp(max(0, int(offset_ms)))} 语音片段识别失败]"
+
+
+def _segment_to_dict(seg: SegmentRecord) -> dict[str, Any]:
+    return {
+        "session_id": str(seg.session_id),
+        "seq": int(seg.seq),
+        "created_at": int(seg.created_at),
+        "raw_text": str(seg.raw_text or ""),
+        "polished_text": str(seg.polished_text or ""),
+        "source": str(seg.source or ""),
+        "duration_ms": int(seg.duration_ms or 0),
+        "target_app": str(seg.target_app or ""),
+        "trigger_mode": str(seg.trigger_mode or MEETING_TRIGGER_MODE),
+        "model": str(seg.model or ""),
+        "speaker_id": int(seg.speaker_id or 0),
+        "speaker_route": str(seg.speaker_route or ""),
+        "captured_at": int(seg.captured_at or 0),
+        "corrected_text": str(seg.corrected_text or ""),
+        "speaker_locked": bool(seg.speaker_locked),
+    }
+
+
+def _segment_from_dict(raw: dict[str, Any]) -> SegmentRecord | None:
+    sid = str(raw.get("session_id") or "").strip()
+    if not sid:
+        return None
+    try:
+        seq = int(raw["seq"])
+        created_at = int(raw.get("created_at") or 0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return SegmentRecord(
+        session_id=sid,
+        seq=seq,
+        created_at=created_at,
+        raw_text=str(raw.get("raw_text") or ""),
+        polished_text=str(raw.get("polished_text") or ""),
+        source=str(raw.get("source") or ""),
+        duration_ms=int(raw.get("duration_ms") or 0),
+        target_app=str(raw.get("target_app") or ""),
+        trigger_mode=str(raw.get("trigger_mode") or MEETING_TRIGGER_MODE),
+        model=str(raw.get("model") or ""),
+        speaker_id=int(raw.get("speaker_id") or 0),
+        speaker_route=str(raw.get("speaker_route") or ""),
+        captured_at=int(raw.get("captured_at") or 0),
+        corrected_text=str(raw.get("corrected_text") or ""),
+        speaker_locked=bool(raw.get("speaker_locked", False)),
+    )
 
 
 @dataclass
@@ -374,6 +461,47 @@ class UnsavedFinalize:
     recluster_mapping: dict[int, int] = field(default_factory=dict)
     auto_enqueue: bool = False
     audio_path: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "meeting_id": self.meeting_id,
+            "title": self.title,
+            "started_at": int(self.started_at),
+            "frozen_ended_at": int(self.frozen_ended_at),
+            "recluster_changes": {str(k): int(v) for k, v in self.recluster_changes.items()},
+            "recluster_mapping": {str(k): int(v) for k, v in self.recluster_mapping.items()},
+            "auto_enqueue": bool(self.auto_enqueue),
+            "audio_path": str(self.audio_path or ""),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> UnsavedFinalize | None:
+        mid = str(raw.get("meeting_id") or "").strip()
+        if not mid:
+            return None
+        try:
+            started = int(raw.get("started_at") or 0)
+            ended = int(raw.get("frozen_ended_at") or started)
+            changes = {
+                int(k): int(v)
+                for k, v in (raw.get("recluster_changes") or {}).items()
+            }
+            mapping = {
+                int(k): int(v)
+                for k, v in (raw.get("recluster_mapping") or {}).items()
+            }
+        except (TypeError, ValueError, AttributeError):
+            return None
+        return cls(
+            meeting_id=mid,
+            title=str(raw.get("title") or ""),
+            started_at=started,
+            frozen_ended_at=ended,
+            recluster_changes=changes,
+            recluster_mapping=mapping,
+            auto_enqueue=bool(raw.get("auto_enqueue", False)),
+            audio_path=str(raw.get("audio_path") or ""),
+        )
 
 
 @dataclass
@@ -537,7 +665,13 @@ class MeetingController(QObject):
         self._frozen_elapsed_ms: int | None = None
         self._capture_stopped_wall_ms = 0
         self._paused_detail = ""
-        self._unsaved_finalize: UnsavedFinalize | None = None
+        self._unsaved_finalizes: dict[str, UnsavedFinalize] = {}
+        self.last_retried_finalize_id = ""
+        self._unsaved_segments: dict[str, list[SegmentRecord]] = {}
+        self._asr_failures: dict[str, list[AsrFailureSpan]] = {}
+        self._unrecovered_db_failures: dict[str, int] = {}
+        self._exclude_user_notes_ids: set[str] = set()
+        self._last_drain_pending = -1
         self._clock = QTimer(self)
         self._clock.setInterval(1000)
         self._clock.timeout.connect(self._tick)
@@ -576,6 +710,19 @@ class MeetingController(QObject):
         self.media_queue_notice = ""
         self.transcript_import_notice = ""
         self.srt_skip_note = ""
+        self._load_pending_sidecar()
+
+    @property
+    def _unsaved_finalize(self) -> UnsavedFinalize | None:
+        return next(reversed(self._unsaved_finalizes.values()), None)
+
+    @_unsaved_finalize.setter
+    def _unsaved_finalize(self, value: UnsavedFinalize | None) -> None:
+        if value is None:
+            self._unsaved_finalizes.clear()
+        else:
+            self._unsaved_finalizes[value.meeting_id] = value
+        self._save_pending_sidecar()
 
     # -- accessors -----------------------------------------------------------
 
@@ -845,6 +992,12 @@ class MeetingController(QObject):
     def paused_detail(self) -> str:
         return self._paused_detail
 
+    def pending_segment_count(self) -> int:
+        try:
+            return max(0, int(self._pending_segments() or 0))
+        except Exception:
+            return 0
+
     def request_end(self) -> None:
         """Audio capture has stopped; wait for queued segments, then finalize."""
         if self._state not in (MeetingState.LIVE, MeetingState.PAUSED):
@@ -858,6 +1011,7 @@ class MeetingController(QObject):
                 self._frozen_elapsed_ms = max(0, now_wall - self._started_wall_ms - self._paused_ms)
             else:
                 self._frozen_elapsed_ms = 0
+        self._last_drain_pending = self.pending_segment_count()
         self._set_state(MeetingState.DRAINING)
         self._drain_timer.start()
         self._poll_drain()
@@ -866,8 +1020,13 @@ class MeetingController(QObject):
         if self._state is not MeetingState.DRAINING:
             self._drain_timer.stop()
             return
-        if self._pending_segments() > 0:
+        rem = self.pending_segment_count()
+        if rem > 0:
+            if rem != self._last_drain_pending:
+                self._last_drain_pending = rem
+                self.state_changed.emit(MeetingState.DRAINING)
             return
+        self._last_drain_pending = 0
         self._drain_timer.stop()
         self.finalize()
 
@@ -917,6 +1076,399 @@ class MeetingController(QObject):
             self._capture_stopped_wall_ms = 0
         self._paused_detail = ""
 
+    def _pending_sidecar_path(self) -> Path | None:
+        cfg_dir = getattr(self._config, "config_dir", None)
+        if cfg_dir is not None:
+            return Path(cfg_dir) / _PENDING_SIDECAR_FILENAME
+        db_path = getattr(self._history, "db_path", None)
+        if isinstance(db_path, (str, Path)):
+            return Path(db_path).parent / _PENDING_SIDECAR_FILENAME
+        return None
+
+    def _load_pending_sidecar(self) -> None:
+        sidecar = self._pending_sidecar_path()
+        if sidecar is None or not sidecar.is_file():
+            return
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        for raw_fin in payload.get("unsaved_finalizes") or ():
+            if isinstance(raw_fin, dict):
+                fin = UnsavedFinalize.from_dict(raw_fin)
+                if fin is not None:
+                    self._unsaved_finalizes[fin.meeting_id] = fin
+        raw_segs = payload.get("unsaved_segments") or {}
+        if isinstance(raw_segs, dict):
+            for mid, items in raw_segs.items():
+                if not mid or not isinstance(items, list):
+                    continue
+                parsed_segs = [
+                    seg for item in items
+                    if isinstance(item, dict) and (seg := _segment_from_dict(item)) is not None
+                ]
+                if parsed_segs:
+                    self._unsaved_segments[str(mid)] = parsed_segs
+        raw_asr = payload.get("asr_failures") or {}
+        if isinstance(raw_asr, dict):
+            for mid, items in raw_asr.items():
+                if not mid or not isinstance(items, list):
+                    continue
+                parsed_asr = [
+                    span for item in items
+                    if isinstance(item, dict) and (span := AsrFailureSpan.from_dict(item)) is not None
+                ]
+                if parsed_asr:
+                    self._asr_failures[str(mid)] = parsed_asr
+
+    def _save_pending_sidecar(self) -> None:
+        sidecar = self._pending_sidecar_path()
+        if sidecar is None:
+            return
+        has_any = bool(
+            self._unsaved_finalizes
+            or any(self._unsaved_segments.values())
+            or any(self._asr_failures.values())
+        )
+        if not has_any:
+            try:
+                sidecar.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        payload = {
+            "version": 1,
+            "unsaved_finalizes": [fin.to_dict() for fin in self._unsaved_finalizes.values()],
+            "unsaved_segments": {
+                mid: [_segment_to_dict(s) for s in segs]
+                for mid, segs in self._unsaved_segments.items()
+                if segs
+            },
+            "asr_failures": {
+                mid: [span.to_dict() for span in spans]
+                for mid, spans in self._asr_failures.items()
+                if spans
+            },
+        }
+        try:
+            sidecar.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(sidecar, json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            log.debug("保存会议待恢复状态侧车失败: %s", exc)
+
+    def _history_session_write_failures(self, meeting_id: str) -> int:
+        if not meeting_id:
+            return 0
+        getter = getattr(self._history, "get_session_write_failures", None)
+        if callable(getter):
+            try:
+                return max(0, int(getter(meeting_id) or 0))
+            except Exception:
+                return 0
+        return 0
+
+    def record_unsaved_segment(
+        self,
+        meeting_id_or_record: str | SegmentRecord,
+        seg_record: SegmentRecord | None = None,
+    ) -> None:
+        """Stash a failed meeting ``SegmentRecord`` in memory (+ sidecar) for retry."""
+        if isinstance(meeting_id_or_record, SegmentRecord) and seg_record is None:
+            seg = meeting_id_or_record
+            mid = str(seg.session_id or self.current_id or "").strip()
+        else:
+            mid = str(meeting_id_or_record or "").strip()
+            seg = seg_record
+        if not mid or seg is None:
+            return
+        if seg.session_id != mid or seg.trigger_mode != MEETING_TRIGGER_MODE:
+            seg = replace(seg, session_id=mid, trigger_mode=MEETING_TRIGGER_MODE)
+        if seg.captured_at <= 0 and self.current_id == mid:
+            seg = self._calibrate_segment(seg)
+        bucket = self._unsaved_segments.setdefault(mid, [])
+        replaced = False
+        for idx, existing in enumerate(bucket):
+            if int(existing.seq) == int(seg.seq):
+                bucket[idx] = seg
+                replaced = True
+                break
+        if not replaced:
+            bucket.append(seg)
+            bucket.sort(key=lambda item: int(item.seq))
+        self._save_pending_sidecar()
+        if not self._shutting_down:
+            try:
+                self.meeting_changed.emit(mid)
+            except RuntimeError:
+                pass
+
+    def unsaved_segments(self, meeting_id: str) -> list[SegmentRecord]:
+        return list(self._unsaved_segments.get(meeting_id, ()))
+
+    def has_unsaved_segments(self, meeting_id: str | None = None) -> bool:
+        if meeting_id is not None:
+            return bool(self._unsaved_segments.get(meeting_id))
+        return any(bool(v) for v in self._unsaved_segments.values())
+
+    def record_asr_failure(
+        self,
+        captured_at: int | str = 0,
+        duration_ms: int = 0,
+        reason: str = "",
+        *,
+        meeting_id: str | None = None,
+    ) -> bool:
+        """Record a meeting ASR decode failure span and surface an explicit gap notice."""
+        if isinstance(captured_at, str) and meeting_id is None:
+            target_id = captured_at.strip() or self.current_id
+            raw_captured = int(duration_ms or 0)
+            raw_duration = 0
+            clean_reason = str(reason or "").strip()
+        else:
+            target_id = (meeting_id or "").strip() or self.current_id
+            try:
+                raw_captured = int(captured_at or 0)
+            except (TypeError, ValueError):
+                raw_captured = 0
+            raw_duration = max(0, int(duration_ms or 0))
+            clean_reason = str(reason or "").strip()
+        if not target_id:
+            return False
+        cur = self.current
+        record = cur if (cur is not None and cur.id == target_id) else self._store.get_meeting(target_id)
+        started_at = (
+            self._started_wall_ms
+            if (self.current_id == target_id and self._started_wall_ms > 0)
+            else (int(record.started_at) if record is not None else 0)
+        )
+        if raw_captured > 0:
+            if self.current_id == target_id and self._paused_intervals_active():
+                stamp_ms = max(started_at, raw_captured - self._paused_deduction_at(raw_captured))
+            else:
+                stamp_ms = raw_captured
+        elif self.current_id == target_id and started_at > 0:
+            stamp_ms = started_at + self.elapsed_ms()
+        else:
+            stamp_ms = max(started_at, now_ms())
+        span = AsrFailureSpan(
+            meeting_id=target_id,
+            captured_at=stamp_ms,
+            duration_ms=raw_duration,
+            reason=clean_reason,
+        )
+        self._asr_failures.setdefault(target_id, []).append(span)
+        self._save_pending_sidecar()
+        offset_ms = max(0, stamp_ms - started_at) if started_at > 0 else max(0, stamp_ms)
+        gap_text = format_asr_gap_notice(offset_ms)
+        if not self._shutting_down:
+            try:
+                self.notice.emit("语音片段识别失败", gap_text)
+                self.meeting_changed.emit(target_id)
+            except RuntimeError:
+                pass
+        return True
+
+    def asr_failures(self, meeting_id: str) -> list[AsrFailureSpan]:
+        return list(self._asr_failures.get(meeting_id, ()))
+
+    def asr_gap_lines(self, meeting_id: str, started_at: int) -> list[TranscriptLine]:
+        spans = self._asr_failures.get(meeting_id, ())
+        if not spans:
+            return []
+        base = int(started_at or 0)
+        out: list[TranscriptLine] = []
+        for span in spans:
+            offset = (
+                max(0, int(span.captured_at) - base)
+                if (int(span.captured_at) > 0 and base > 0)
+                else max(0, int(span.captured_at))
+            )
+            out.append(
+                TranscriptLine(
+                    offset_ms=offset,
+                    speaker_id=0,
+                    text=format_asr_gap_notice(offset),
+                    route="asr_gap",
+                    duration_ms=max(0, int(span.duration_ms)),
+                    time_known=True,
+                )
+            )
+        return out
+
+    def _merge_lines_with_asr_gaps(
+        self,
+        meeting_id: str,
+        started_at: int,
+        lines: list[TranscriptLine],
+    ) -> list[TranscriptLine]:
+        gaps = self.asr_gap_lines(meeting_id, started_at)
+        if not gaps:
+            return lines
+        tagged: list[tuple[int, int, int, TranscriptLine]] = [
+            (int(line.offset_ms), 0, idx, line) for idx, line in enumerate(lines)
+        ]
+        for idx, gap in enumerate(gaps):
+            tagged.append((int(gap.offset_ms), 1, idx, gap))
+        tagged.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [item[3] for item in tagged]
+
+    def segment_integrity_counts(
+        self,
+        meeting_id: str,
+        *,
+        saved_segments: list[SegmentRecord] | None = None,
+    ) -> tuple[int, int, int]:
+        """Return ``(saved_count, asr_failed_count, db_failed_count)`` for ``meeting_id``."""
+        if not meeting_id:
+            return (0, 0, 0)
+        segs = saved_segments if saved_segments is not None else self._store.get_segments(meeting_id)
+        saved_seqs = {int(s.seq) for s in segs}
+        saved_count = len(segs)
+        asr_failed_count = len(self._asr_failures.get(meeting_id, ()))
+        pending_unsaved = [
+            s for s in self._unsaved_segments.get(meeting_id, ()) if int(s.seq) not in saved_seqs
+        ]
+        hist_fail = self._history_session_write_failures(meeting_id)
+        unrec_fail = int(self._unrecovered_db_failures.get(meeting_id, 0) or 0)
+        db_failed_count = max(len(pending_unsaved), hist_fail, unrec_fail)
+        return (saved_count, asr_failed_count, db_failed_count)
+
+    def segment_integrity_banner_text(
+        self,
+        meeting_id: str,
+        *,
+        has_saved_audio: bool | None = None,
+        saved_segments: list[SegmentRecord] | None = None,
+    ) -> str:
+        saved_count, asr_failed, db_failed = self.segment_integrity_counts(
+            meeting_id, saved_segments=saved_segments
+        )
+        if asr_failed <= 0 and db_failed <= 0:
+            return ""
+        base = f"已保存 {saved_count} 段、识别失败 {asr_failed} 段、保存失败 {db_failed} 段"
+        if has_saved_audio is None:
+            rec = self._store.get_meeting(meeting_id)
+            ap = str(getattr(rec, "audio_path", "") or "").strip() if rec is not None else ""
+            has_saved_audio = bool(
+                ap
+                and (Path(ap).is_file() or (Path(ap).is_dir() and (Path(ap) / "audio.f32").is_file()))
+            )
+        details: list[str] = []
+        if asr_failed > 0 and not has_saved_audio:
+            details.append("未保存会议录音，识别失败处无本地音频可补回")
+        if db_failed > 0 and self.has_unsaved_segments(meeting_id):
+            details.append("可点击「重试保存缺失片段」补写数据库")
+        return f"{base}（{'；'.join(details)}）" if details else base
+
+    def retry_unsaved_segments(self, meeting_id: str | None = None) -> tuple[bool, str]:
+        """Idempotently persist missing ``(session_id, seq)`` rows without duplicates."""
+        target_id = (meeting_id or "").strip() or next(iter(self._unsaved_segments.keys()), "")
+        if not target_id:
+            return (True, "")
+        pending = list(self._unsaved_segments.get(target_id, ()))
+        existing_seqs = {int(s.seq) for s in self._store.get_segments(target_id)}
+        missing = [seg for seg in pending if int(seg.seq) not in existing_seqs]
+        if not missing:
+            self._unsaved_segments.pop(target_id, None)
+            self._unrecovered_db_failures.pop(target_id, None)
+            clear_fn = getattr(self._history, "clear_session_write_failures", None)
+            if callable(clear_fn):
+                clear_fn(target_id)
+            self._save_pending_sidecar()
+            self.meeting_changed.emit(target_id)
+            return (True, "缺失片段已全部在数据库中")
+        if self._store.disabled or getattr(self._history, "disabled", False):
+            err = "历史数据库不可用，无法保存缺失片段"
+            self.error.emit(err)
+            return (False, err)
+
+        def _insert_missing(conn) -> None:
+            for seg in missing:
+                conn.execute(
+                    """
+                    INSERT INTO history (
+                      session_id, seq, created_at, raw_text, polished_text,
+                      source, duration_ms, target_app, trigger_mode, model,
+                      speaker_id, speaker_route, captured_at, corrected_text, speaker_locked
+                    )
+                    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    WHERE NOT EXISTS (
+                      SELECT 1 FROM history WHERE session_id = ? AND seq = ? AND trigger_mode = ?
+                    )
+                    """,
+                    (
+                        target_id,
+                        int(seg.seq),
+                        int(seg.created_at),
+                        str(seg.raw_text or ""),
+                        str(seg.polished_text or ""),
+                        str(seg.source or ""),
+                        int(seg.duration_ms or 0),
+                        str(seg.target_app or ""),
+                        MEETING_TRIGGER_MODE,
+                        str(seg.model or ""),
+                        int(seg.speaker_id or 0),
+                        str(seg.speaker_route or ""),
+                        int(seg.captured_at or 0),
+                        str(seg.corrected_text or ""),
+                        1 if seg.speaker_locked else 0,
+                        target_id,
+                        int(seg.seq),
+                        MEETING_TRIGGER_MODE,
+                    ),
+                )
+
+        ticket = self._history.enqueue_write(_insert_missing)
+        flushed = ticket > 0 and self._store.flush_ticket(ticket, timeout=5.0)
+        after_segments = self._store.get_segments(target_id) if flushed else []
+        after_seqs = {int(s.seq) for s in after_segments}
+        still_missing = [seg for seg in missing if int(seg.seq) not in after_seqs]
+        if not flushed or still_missing:
+            self._unsaved_segments[target_id] = still_missing if flushed else missing
+            self._save_pending_sidecar()
+            err = f"仍有 {len(self._unsaved_segments[target_id])} 段未能写入数据库，请检查磁盘空间后重试"
+            self.error.emit(err)
+            return (False, err)
+
+        self._unsaved_segments.pop(target_id, None)
+        self._unrecovered_db_failures.pop(target_id, None)
+        clear_fn = getattr(self._history, "clear_session_write_failures", None)
+        if callable(clear_fn):
+            clear_fn(target_id)
+        self._save_pending_sidecar()
+        record = self._store.get_meeting(target_id)
+        if record is not None and record.status in (STATUS_ENDED, STATUS_INTERRUPTED):
+            max_end = max(
+                [
+                    int(record.ended_at or record.started_at),
+                    *(
+                        int(s.captured_at) + max(0, int(s.duration_ms or 0))
+                        for s in after_segments
+                        if int(s.captured_at or 0) > 0
+                    ),
+                ]
+            )
+            if max_end > int(record.ended_at or 0):
+                end_t = self._store.end_meeting(
+                    target_id, ended_at=max_end, status=record.status, audio_path=record.audio_path
+                )
+                self._store.flush_ticket(end_t, timeout=2.0)
+                record = self._store.get_meeting(target_id) or record
+            self.auto_name_speakers(target_id, _emit=False, record=record, segments=after_segments)
+            notes = self._store.get_notes(target_id)
+            if (
+                record.status == STATUS_ENDED
+                and (notes is None or not notes.markdown.strip())
+                and self._store.queued_generation(target_id) is None
+                and not self._shutting_down
+            ):
+                self._enqueue_automatic(target_id, record=record, segments=after_segments)
+                self._pump_queue()
+        self.meeting_changed.emit(target_id)
+        return (True, f"已补存 {len(missing)} 段缺失文字稿")
+
     def finalize(self) -> None:
         """Mark the meeting ended, re-cluster speakers, drop the embeddings."""
         cur = self.current
@@ -929,9 +1481,25 @@ class MeetingController(QObject):
         now_wall = int(time.time() * 1000)
         self._close_open_pause(now_wall)
         active_end = max(started_at, started_at + self.elapsed_ms())
+        pre_fail = self._history_session_write_failures(meeting_id)
+        flush_ok = True
         if not self._store.disabled:
-            self._history.flush(timeout=2.0)
+            flush_ok = bool(self._history.flush(timeout=2.0))
+        post_fail = self._history_session_write_failures(meeting_id)
         segments = self._store.get_segments(meeting_id)
+        saved_seqs = {int(s.seq) for s in segments}
+        if meeting_id in self._unsaved_segments:
+            rem_segs = [
+                seg for seg in self._unsaved_segments[meeting_id] if int(seg.seq) not in saved_seqs
+            ]
+            if rem_segs:
+                self._unsaved_segments[meeting_id] = rem_segs
+            else:
+                self._unsaved_segments.pop(meeting_id, None)
+        unsaved_seg_count = len(self._unsaved_segments.get(meeting_id, ()))
+        observed_db_fail = max(pre_fail, post_fail, 0 if flush_ok else 1)
+        if observed_db_fail > unsaved_seg_count:
+            self._unrecovered_db_failures[meeting_id] = observed_db_fail
         calibrated_ends = [
             s.captured_at + max(0, int(s.duration_ms or 0))
             for s in segments
@@ -992,7 +1560,7 @@ class MeetingController(QObject):
         self._embedder = None
 
         if not persisted:
-            self._unsaved_finalize = UnsavedFinalize(
+            self._unsaved_finalizes[meeting_id] = UnsavedFinalize(
                 meeting_id=meeting_id,
                 title=(cur.title or "").strip() or cur.display_title,
                 started_at=started_at,
@@ -1002,6 +1570,7 @@ class MeetingController(QObject):
                 auto_enqueue=self.auto_generate_enabled(),
                 audio_path=str(cur.audio_path or ""),
             )
+            self._save_pending_sidecar()
             # Release audio/tray/live-page locks via ENDED -> IDLE without claiming DB success.
             self._set_state(MeetingState.ENDED)
             self._reset_live_runtime()
@@ -1013,12 +1582,16 @@ class MeetingController(QObject):
             return
 
         assert stored_record is not None
-        if self._unsaved_finalize is not None and self._unsaved_finalize.meeting_id == meeting_id:
-            self._unsaved_finalize = None
+        self._unsaved_finalizes.pop(meeting_id, None)
+        self._save_pending_sidecar()
         if recluster_changes or recluster_mapping or (has_custom_recluster and custom_reclustered is not False):
             segments = self._store.get_segments(meeting_id)
         self.auto_name_speakers(meeting_id, _emit=False, record=stored_record, segments=segments)
-        self._enqueue_automatic(meeting_id, record=stored_record, segments=segments)
+        if not self.has_unsaved_segments(meeting_id):
+            self._enqueue_automatic(meeting_id, record=stored_record, segments=segments)
+        integrity_msg = self.segment_integrity_banner_text(meeting_id, saved_segments=segments)
+        if integrity_msg:
+            self.notice.emit("会议记录存在缺失片段", integrity_msg)
         with self._current_lock:
             self._current = stored_record
         self._set_state(MeetingState.ENDED)
@@ -1029,59 +1602,77 @@ class MeetingController(QObject):
         self._set_state(MeetingState.IDLE)
         self._pump_queue()
 
-    def has_unsaved_finalize(self) -> bool:
-        return self._unsaved_finalize is not None
+    def has_unsaved_finalize(self, meeting_id: str | None = None) -> bool:
+        if meeting_id is not None:
+            return meeting_id in self._unsaved_finalizes
+        return bool(self._unsaved_finalizes)
 
-    def unsaved_finalize_title(self) -> str:
-        pending = self._unsaved_finalize
+    def unsaved_finalize_ids(self) -> tuple[str, ...]:
+        return tuple(self._unsaved_finalizes.keys())
+
+    def default_unsaved_finalize_id(self) -> str:
+        return next(reversed(self._unsaved_finalizes.keys()), "")
+
+    def unsaved_finalize_title(self, meeting_id: str | None = None) -> str:
+        if meeting_id:
+            pending = self._unsaved_finalizes.get(meeting_id)
+        else:
+            pending = next(reversed(self._unsaved_finalizes.values()), None)
         if pending is None:
             return ""
         return pending.title
 
-    def retry_finalize_save(self) -> str | None:
-        pending = self._unsaved_finalize
+    def retry_finalize_save(self, meeting_id: str | None = None) -> str | None:
+        target_id = (meeting_id or "").strip() or self.default_unsaved_finalize_id()
+        pending = self._unsaved_finalizes.get(target_id) if target_id else None
         if pending is None:
             return "没有可重试保存的会议结束状态"
-        meeting_id = pending.meeting_id
+        mid = pending.meeting_id
+        if self.has_unsaved_segments(mid):
+            seg_ok, seg_msg = self.retry_unsaved_segments(mid)
+            if not seg_ok:
+                return seg_msg
         end_ticket = self._store.end_meeting(
-            meeting_id,
+            mid,
             ended_at=pending.frozen_ended_at,
             status=STATUS_ENDED,
             audio_path=pending.audio_path,
         )
         recluster_ticket = 0
         if pending.recluster_changes:
-            recluster_ticket = self._store.set_segment_speakers(meeting_id, pending.recluster_changes)
+            recluster_ticket = self._store.set_segment_speakers(mid, pending.recluster_changes)
         elif pending.recluster_mapping:
-            recluster_ticket = self._store.relabel_segments(meeting_id, pending.recluster_mapping)
+            recluster_ticket = self._store.relabel_segments(mid, pending.recluster_mapping)
 
         end_ok = self._store.flush_ticket(end_ticket, timeout=5.0)
         recluster_ok = self._store.flush_ticket(recluster_ticket, timeout=5.0) if recluster_ticket else True
-        stored_record = self._store.get_meeting(meeting_id) if end_ok else None
+        stored_record = self._store.get_meeting(mid) if end_ok else None
         if not end_ok or not recluster_ok or stored_record is None or stored_record.status != STATUS_ENDED:
             err_msg = "会议结束状态保存失败，请检查磁盘空间后重试"
-            self.finalize_save_failed.emit(meeting_id, err_msg)
+            self.finalize_save_failed.emit(mid, err_msg)
             self.error.emit(err_msg)
             return err_msg
 
-        self._unsaved_finalize = None
-        segments = self._store.get_segments(meeting_id)
-        self.auto_name_speakers(meeting_id, _emit=False, record=stored_record, segments=segments)
-        if pending.auto_enqueue and not self._shutting_down:
-            self._enqueue_automatic(meeting_id, record=stored_record, segments=segments)
-        self.meeting_ended.emit(meeting_id)
-        self.meeting_changed.emit(meeting_id)
+        self._unsaved_finalizes.pop(mid, None)
+        self.last_retried_finalize_id = mid
+        self._save_pending_sidecar()
+        segments = self._store.get_segments(mid)
+        self.auto_name_speakers(mid, _emit=False, record=stored_record, segments=segments)
+        if pending.auto_enqueue and not self._shutting_down and not self.has_unsaved_segments(mid):
+            self._enqueue_automatic(mid, record=stored_record, segments=segments)
+        self.meeting_ended.emit(mid)
+        self.meeting_changed.emit(mid)
         if not self._shutting_down:
             self._pump_queue()
         return None
 
-    def discard_unsaved_finalize(self) -> bool:
-        pending = self._unsaved_finalize
+    def discard_unsaved_finalize(self, meeting_id: str | None = None) -> bool:
+        target_id = (meeting_id or "").strip() or self.default_unsaved_finalize_id()
+        pending = self._unsaved_finalizes.pop(target_id, None) if target_id else None
         if pending is None:
             return False
-        meeting_id = pending.meeting_id
-        self._unsaved_finalize = None
-        self.meeting_changed.emit(meeting_id)
+        self._save_pending_sidecar()
+        self.meeting_changed.emit(pending.meeting_id)
         return True
 
     def _apply_recluster(self, meeting_id: str) -> bool:
@@ -1138,7 +1729,40 @@ class MeetingController(QObject):
         self._set_state(MeetingState.IDLE)
 
     def mark_interrupted(self) -> None:
-        self._store.mark_interrupted_meetings()
+        protected = tuple(self._unsaved_finalizes.keys())
+        if not protected or not hasattr(self._history, "enqueue_write") or "mark_interrupted_meetings" in self._store.__dict__:
+            self._store.mark_interrupted_meetings()
+            return
+        placeholders = ",".join("?" for _ in protected)
+
+        def _fix_excluding_pending_finalizes(conn) -> None:
+            conn.execute(
+                f"""
+                UPDATE meetings
+                SET status = ?,
+                    ended_at = MAX(
+                        started_at,
+                        COALESCE(
+                            ended_at,
+                            (
+                                SELECT MAX(
+                                    CASE
+                                        WHEN captured_at > 0 THEN captured_at + CASE WHEN duration_ms > 0 THEN duration_ms ELSE 0 END
+                                        ELSE created_at
+                                    END
+                                )
+                                FROM history
+                                WHERE history.session_id = meetings.id AND history.trigger_mode = ?
+                            ),
+                            started_at
+                        )
+                    )
+                WHERE status = ? AND id NOT IN ({placeholders})
+                """,
+                (STATUS_INTERRUPTED, MEETING_TRIGGER_MODE, STATUS_LIVE, *protected),
+            )
+
+        self._history.enqueue_write(_fix_excluding_pending_finalizes)
 
     def _tick(self) -> None:
         self.clock_tick.emit(self.elapsed_text())
@@ -2078,11 +2702,23 @@ class MeetingController(QObject):
         if record is None:
             return ""
         names = self.speaker_names(meeting_id)
-        lines = transcript_lines(self._store.get_segments(meeting_id), record.started_at)
-        show_speakers, show_times, label_unknown = self._transcript_flags(record, lines)
-        return render_transcript(
-            lines, names, show_speakers=show_speakers, show_times=show_times, label_unknown=label_unknown,
-        )
+        raw_lines = transcript_lines(self._store.get_segments(meeting_id), record.started_at)
+        show_speakers, show_times, label_unknown = self._transcript_flags(record, raw_lines)
+        lines = self._merge_lines_with_asr_gaps(meeting_id, record.started_at, raw_lines)
+        rendered: list[str] = []
+        for line in lines:
+            if line.route == "asr_gap":
+                rendered.append(line.text)
+            else:
+                rendered.append(
+                    line.render(
+                        names,
+                        show_speakers=show_speakers,
+                        show_times=show_times,
+                        label_unknown=label_unknown,
+                    )
+                )
+        return "\n".join(rendered)
 
     def export_transcript_srt(self, meeting_id: str) -> str:
         record = self._store.get_meeting(meeting_id)
@@ -2279,8 +2915,20 @@ class MeetingController(QObject):
             self._generating_for = ""
             self.generation_preview_text = ""
         self._forced_auto_generate_ids.discard(meeting_id)
-        if self._unsaved_finalize is not None and self._unsaved_finalize.meeting_id == meeting_id:
-            self._unsaved_finalize = None
+        self._exclude_user_notes_ids.discard(meeting_id)
+        sidecar_changed = False
+        if meeting_id in self._unsaved_finalizes:
+            self._unsaved_finalizes.pop(meeting_id, None)
+            sidecar_changed = True
+        if meeting_id in self._unsaved_segments:
+            self._unsaved_segments.pop(meeting_id, None)
+            sidecar_changed = True
+        if meeting_id in self._asr_failures:
+            self._asr_failures.pop(meeting_id, None)
+            sidecar_changed = True
+        self._unrecovered_db_failures.pop(meeting_id, None)
+        if sidecar_changed:
+            self._save_pending_sidecar()
         self._store.delete_meeting(meeting_id)
         deleted = self._store.flush() and self._store.get_meeting(meeting_id) is None
         if deleted:
@@ -2297,10 +2945,22 @@ class MeetingController(QObject):
             self._cancel_active_generation_worker()
             self._generating_for = ""
             self.generation_preview_text = ""
+        sidecar_changed = False
         for mid in ids:
             self._forced_auto_generate_ids.discard(mid)
-        if self._unsaved_finalize is not None and self._unsaved_finalize.meeting_id in ids:
-            self._unsaved_finalize = None
+            self._exclude_user_notes_ids.discard(mid)
+            self._unrecovered_db_failures.pop(mid, None)
+            if mid in self._unsaved_finalizes:
+                self._unsaved_finalizes.pop(mid, None)
+                sidecar_changed = True
+            if mid in self._unsaved_segments:
+                self._unsaved_segments.pop(mid, None)
+                sidecar_changed = True
+            if mid in self._asr_failures:
+                self._asr_failures.pop(mid, None)
+                sidecar_changed = True
+        if sidecar_changed:
+            self._save_pending_sidecar()
         self._store.delete_meetings(ids)
         deleted = self._store.flush() and all(self._store.get_meeting(meeting_id) is None for meeting_id in ids)
         if deleted:
@@ -2314,7 +2974,13 @@ class MeetingController(QObject):
         parts = [part for part in parts if part]
         return ("\n\n".join(parts) + "\n") if parts else ""
 
-    def enqueue_minutes(self, meeting_ids: list[str], *, template_id: str | None = None) -> tuple[int, int]:
+    def enqueue_minutes(
+        self,
+        meeting_ids: list[str],
+        *,
+        template_id: str | None = None,
+        include_user_notes: bool | None = None,
+    ) -> tuple[int, int]:
         """Queue minutes for meetings that do not already have them.
 
         Returns ``(queued, skipped)``. Existing notes, a live meeting and an
@@ -2333,7 +2999,7 @@ class MeetingController(QObject):
             ):
                 skipped += 1
                 continue
-            if self.generate(meeting_id, template_id=template):
+            if self.generate(meeting_id, template_id=template, include_user_notes=include_user_notes):
                 queued += 1
             else:
                 skipped += 1
@@ -2346,7 +3012,6 @@ class MeetingController(QObject):
         if record is None:
             return ""
         notes = self._store.get_notes(meeting_id)
-        names = self.speaker_names(meeting_id)
         parts: list[str] = []
         if notes is not None and notes.markdown.strip():
             parts.append(notes.markdown.rstrip())
@@ -2357,13 +3022,10 @@ class MeetingController(QObject):
         if supplement:
             parts.append(supplement)
         if include_transcript:
-            lines = transcript_lines(self._store.get_segments(meeting_id), record.started_at)
-            if lines:
-                show_speakers, show_times, label_unknown = self._transcript_flags(record, lines)
+            tx_text = self.transcript_text(meeting_id).strip()
+            if tx_text:
                 parts.append("\n## 文字稿\n")
-                parts.append(render_transcript(
-                    lines, names, show_speakers=show_speakers, show_times=show_times, label_unknown=label_unknown,
-                ))
+                parts.append(tx_text)
         return "\n".join(parts).rstrip() + "\n"
 
     # -- minutes generation ----------------------------------------------------
@@ -2417,18 +3079,29 @@ class MeetingController(QObject):
                    if not job.failed and job.meeting_id != self._generating_for]
         return waiting.index(meeting_id) + 1 if meeting_id in waiting else 0
 
-    def generate(self, meeting_id: str, *, template_id: str | None = None, model_name: str | None = None) -> bool:
+    def generate(
+        self,
+        meeting_id: str,
+        *,
+        template_id: str | None = None,
+        model_name: str | None = None,
+        include_user_notes: bool | None = None,
+    ) -> bool:
         """User request: start now, or queue ahead of automatic jobs while
         another meeting generates. False (with ``generation_failed``) when
         the configuration or the transcript makes it impossible."""
         if self._generating_for == meeting_id:
             return False
+        if include_user_notes is False:
+            self._exclude_user_notes_ids.add(meeting_id)
+        elif include_user_notes is True:
+            self._exclude_user_notes_ids.discard(meeting_id)
         template_id = template_id or record_template_id(self._config, self._store.get_notes(meeting_id))
         if self._generating_for:
             # One worker, and its result is stored against the running id.
             problem = self._generation_problem(self._store.get_meeting(meeting_id), template_id, model_name)
         else:
-            problem = self._start(meeting_id, template_id, model_name)
+            problem = self._start(meeting_id, template_id, model_name, include_user_notes=include_user_notes)
         if problem is None:
             return False
         if problem:
@@ -2486,8 +3159,11 @@ class MeetingController(QObject):
                 wake = min(wake or job.not_before, job.not_before)
                 continue
             host = self.remote_host_needing_confirmation()
-            problem = (f"文字稿未发送：{host} 尚未确认。可在会议页点「生成纪要」确认后发送" if host
-                       else self._start(job.meeting_id, job.template_id))
+            problem = (
+                f"文字稿与会议资料未发送：{host} 尚未确认。可在会议页点「生成纪要」确认后发送"
+                if host
+                else self._start(job.meeting_id, job.template_id)
+            )
             if problem is None or not problem:
                 return
             self._record_failure(job.meeting_id, problem, transient=False)
@@ -2545,6 +3221,7 @@ class MeetingController(QObject):
         *,
         record: MeetingRecord | None = None,
         segments: list[SegmentRecord] | None = None,
+        include_user_notes: bool | None = None,
     ) -> str | None:
         """Dispatch one job to the worker; the reason when it cannot start."""
         record = record if record is not None else self._store.get_meeting(meeting_id)
@@ -2561,8 +3238,11 @@ class MeetingController(QObject):
         template = get_template(template_id, self._custom_templates())
         if segments is None:
             segments = self._store.get_segments(meeting_id)
-        lines: list[TranscriptLine] = transcript_lines(segments, record.started_at, prefer_polished=not template.is_refinement)
-        show_speakers, show_times, label_unknown = self._transcript_flags(record, lines)
+        spoken_lines: list[TranscriptLine] = transcript_lines(
+            segments, record.started_at, prefer_polished=not template.is_refinement
+        )
+        show_speakers, show_times, label_unknown = self._transcript_flags(record, spoken_lines)
+        lines = self._merge_lines_with_asr_gaps(meeting_id, record.started_at, spoken_lines)
         if not self.auto_name_speakers(meeting_id, record=record, segments=segments):
             return "说话人名称保存失败，请重试"
         names = self.speaker_names(meeting_id)
@@ -2571,12 +3251,17 @@ class MeetingController(QObject):
             started_at_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(record.started_at) / 1000.0))
         except (OSError, OverflowError, ValueError):
             started_at_text = "1970-01-01 00:00"
+        use_notes = (
+            (meeting_id not in self._exclude_user_notes_ids)
+            if include_user_notes is None
+            else bool(include_user_notes)
+        )
         context = MeetingContext(
             title=record.title,
             started_at_text=started_at_text,
             participants=record.participants,
             agenda=record.agenda,
-            notes_user=record.notes_user,
+            notes_user=record.notes_user if use_notes else "",
             marks=marks,
             glossary_terms=[str(g.get("term")) for g in record.glossary if isinstance(g, dict) and g.get("term")],
         )
@@ -2584,6 +3269,9 @@ class MeetingController(QObject):
             self._config.get("meeting.single_request_char_limit", DEFAULT_CHUNK_CHARS),
             DEFAULT_CHUNK_CHARS,
         ) or DEFAULT_CHUNK_CHARS
+        req_kwargs: dict[str, Any] = {}
+        if "include_user_notes" in MinutesRequest.__dataclass_fields__:
+            req_kwargs["include_user_notes"] = use_notes
         request = MinutesRequest(
             api_url=api_url,
             api_key=api_key,
@@ -2606,6 +3294,7 @@ class MeetingController(QObject):
             speakers_distinguished=show_speakers,
             timestamps_available=show_times,
             label_unknown=label_unknown,
+            **req_kwargs,
         )
         fingerprint = request_fingerprint(request)
         if self._generation_cancel_token is not None:
@@ -2637,6 +3326,7 @@ class MeetingController(QObject):
             self._generating_for = ""
             self.generation_preview_text = ""
             self._forced_auto_generate_ids.discard(meeting_id)
+            self._exclude_user_notes_ids.discard(meeting_id)
             self._cancel_active_generation_worker()
             self._store.dequeue_generation(meeting_id)
             self._store.flush()
@@ -2646,6 +3336,7 @@ class MeetingController(QObject):
     def remove_from_queue(self, meeting_id: str) -> None:
         """Cancel this meeting's job, running or waiting."""
         self._forced_auto_generate_ids.discard(meeting_id)
+        self._exclude_user_notes_ids.discard(meeting_id)
         if meeting_id and meeting_id == self._generating_for:
             self.cancel_generation()
             return
@@ -2689,6 +3380,7 @@ class MeetingController(QObject):
             self._record_failure(meeting_id, "纪要保存失败，已完成的分段会保留，请重试", transient=True)
             self._pump_queue()
             return
+        self._exclude_user_notes_ids.discard(meeting_id)
         self._store.clear_generation_checkpoints(meeting_id)
         self._store.dequeue_generation(meeting_id)
         self._store.flush()
