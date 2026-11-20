@@ -56,6 +56,7 @@ _ASCII_OEM_VK_FALLBACK = {
 _HOLD_WATCH_POLL_MS = 100
 _HEALTH_CHECK_INTERVAL_MS = 5000
 _SLEEP_WAKE_GAP_S = 20.0
+_CONTINUOUS_TOGGLE_DEBOUNCE_S = 0.35
 
 
 _WM_KEYDOWN = 0x0100
@@ -189,11 +190,13 @@ class HotKeyManager(QObject):
     recording_stop = pyqtSignal()
     recording_cancel = pyqtSignal()
     continuous_listen_start = pyqtSignal()
+    continuous_listen_stop = pyqtSignal()
     paste_last_triggered = pyqtSignal()
     rewrite_start = pyqtSignal()
     rewrite_stop = pyqtSignal()
     rewrite_cancel = pyqtSignal()
     esc_pressed = pyqtSignal()
+    esc_cancel_requested = pyqtSignal()
     hotkey_tap_too_short = pyqtSignal()
     listener_status = pyqtSignal(bool, str)
     # 从 pynput 线程投递到 Qt 主线程，再启动 QTimer
@@ -220,6 +223,11 @@ class HotKeyManager(QObject):
         self._is_recording = False
         self._recording_kind = "dictate"
         self._continuous_trigger_mode = False
+        self._continuous_listening_active = False
+        self._continuous_awaiting_start_keyup = False
+        self._awaiting_post_stop_keyup = False
+        self._continuous_toggle_ready_at = 0.0
+        self._cancellable_processing = False
         self._paused = False
         self._stopped = False
         self._listener = None
@@ -665,6 +673,11 @@ class HotKeyManager(QObject):
                 pass
             self._listener = None
         with self._lock:
+            self._is_recording = False
+            self._cancellable_processing = False
+            self._continuous_listening_active = False
+            self._continuous_awaiting_start_keyup = False
+            self._awaiting_post_stop_keyup = False
             self._pressed_keys.clear()
             self._suppressed_vks.clear()
             self._suppressed_vk_at.clear()
@@ -674,12 +687,24 @@ class HotKeyManager(QObject):
         self._cancel_hold_pending()
         if self._hold_watch_timer.isActive():
             self._hold_watch_timer.stop()
+        was_recording = False
+        stop_kind = "dictate"
         with self._lock:
             self._paused = True
+            if self._is_recording:
+                was_recording = True
+                stop_kind = self._recording_kind
+                self._is_recording = False
             self._pressed_keys.clear()
             self._suppressed_vks.clear()
             self._suppressed_vk_at.clear()
             self._suppressed_vk_async_visible.clear()
+        if was_recording:
+            log.info("快捷键监听暂停时正在录音，自动结束本次录音以防麦克风常驻")
+            if stop_kind == "rewrite":
+                self.rewrite_stop.emit()
+            else:
+                self.recording_stop.emit()
 
     def resume(self):
         self._cancel_hold_pending()
@@ -732,14 +757,45 @@ class HotKeyManager(QObject):
         self._cancel_hold_pending()
         with self._lock:
             self._continuous_trigger_mode = enabled
+            if not enabled:
+                self._continuous_listening_active = False
+                self._continuous_awaiting_start_keyup = False
+                self._awaiting_post_stop_keyup = False
             self._pressed_keys.clear()
             self._is_recording = False
+
+    def set_continuous_listening_active(self, active: bool) -> None:
+        """Track active continuous dictation so a fresh >=300ms hold toggle-stops."""
+        active_flag = bool(active)
+        with self._lock:
+            if active_flag:
+                keys_down = self._hotkey_still_held_locked("dictate") or bool(self._suppressed_vks)
+                if keys_down:
+                    self._continuous_awaiting_start_keyup = True
+            else:
+                self._continuous_awaiting_start_keyup = False
+                if self._hotkey_still_held_locked("dictate") or bool(self._suppressed_vks):
+                    self._awaiting_post_stop_keyup = True
+            self._continuous_listening_active = active_flag
+
+    @property
+    def continuous_listening_active(self) -> bool:
+        return self._continuous_listening_active
+
+    def set_cancellable_processing(self, active: bool) -> None:
+        """Enable/disable Esc cancellation during post-release single-shot recognition."""
+        with self._lock:
+            self._cancellable_processing = bool(active)
+
+    @property
+    def cancellable_processing(self) -> bool:
+        return self._cancellable_processing
 
     @property
     def hold_threshold_ms(self) -> int:
         if self._hold_kind == "rewrite":
             return MIN_HOLD_MS
-        if self._continuous_trigger_mode:
+        if self._continuous_trigger_mode or self._continuous_listening_active:
             return MIN_HOLD_CONTINUOUS_MS
         return MIN_HOLD_MS
 
@@ -757,7 +813,7 @@ class HotKeyManager(QObject):
         return bool(keys and keys.issubset(self._pressed_keys))
 
     def _on_hold_timeout(self):
-        start_continuous = start_recording = start_rewrite = False
+        start_continuous = stop_continuous = start_recording = start_rewrite = False
         reconcile = self._should_reconcile_async_state()
         with self._lock:
             if reconcile:
@@ -773,7 +829,16 @@ class HotKeyManager(QObject):
                     self._is_recording = True
                     self._recording_kind = "rewrite"
                     start_rewrite = True
+            elif self._continuous_listening_active:
+                now = time.monotonic()
+                if not self._continuous_awaiting_start_keyup and now >= self._continuous_toggle_ready_at:
+                    self._continuous_listening_active = False
+                    self._awaiting_post_stop_keyup = True
+                    stop_continuous = True
             elif self._continuous_trigger_mode:
+                now = time.monotonic()
+                self._continuous_awaiting_start_keyup = True
+                self._continuous_toggle_ready_at = now + _CONTINUOUS_TOGGLE_DEBOUNCE_S
                 start_continuous = True
             elif not self._is_recording:
                 self._is_recording = True
@@ -784,6 +849,9 @@ class HotKeyManager(QObject):
             if reconcile:
                 self._hold_watch_timer.start(_HOLD_WATCH_POLL_MS)
             self.rewrite_start.emit()
+        elif stop_continuous:
+            log.debug("持续监听中再次按住快捷键达标，请求结束持续监听")
+            self.continuous_listen_stop.emit()
         elif start_continuous:
             log.debug("快捷键按住达标，请求开启持续监听")
             self.continuous_listen_start.emit()
@@ -837,6 +905,7 @@ class HotKeyManager(QObject):
         sync_hold_timer = False
         fire_paste_last = False
         cancel_kind: str | None = None
+        emit_esc_cancel = False
         reconcile = self._should_reconcile_async_state()
 
         with self._lock:
@@ -866,6 +935,9 @@ class HotKeyManager(QObject):
                 if self._is_recording:
                     self._is_recording = False
                     cancel_kind = self._recording_kind
+                elif self._cancellable_processing:
+                    self._cancellable_processing = False
+                    emit_esc_cancel = True
                 break_esc = True
             else:
                 break_esc = False
@@ -884,15 +956,23 @@ class HotKeyManager(QObject):
                     self._hold_started_at = time.monotonic()
                     newly_armed = True
                 elif not was_dictate and self._hotkey_still_held_locked("dictate"):
-                    self._hold_pending = True
-                    self._hold_kind = "dictate"
                     self._hold_activated = False
-                    self._hold_started_at = time.monotonic()
-                    newly_armed = True
+                    now_mono = time.monotonic()
+                    debounced_toggle = self._continuous_listening_active and (
+                        self._continuous_awaiting_start_keyup
+                        or now_mono < self._continuous_toggle_ready_at
+                    )
+                    if not self._awaiting_post_stop_keyup and not debounced_toggle:
+                        self._hold_pending = True
+                        self._hold_kind = "dictate"
+                        self._hold_started_at = now_mono
+                        newly_armed = True
         if cancel_kind == "rewrite":
             self.rewrite_cancel.emit()
         elif cancel_kind == "dictate":
             self.recording_cancel.emit()
+        elif emit_esc_cancel:
+            self.esc_cancel_requested.emit()
         if stale_held_ms is not None:
             self._defer_hook_log(logging.INFO, "快捷键按住 %.0f ms，检测到修饰键已释放", stale_held_ms)
             if stale_kind == "rewrite":
@@ -923,6 +1003,13 @@ class HotKeyManager(QObject):
             active_pending_keys = self._active_hold_keys_locked(self._hold_kind)
             releases_hotkey = normalized in active_pending_keys or key in active_pending_keys
 
+            if not self._hotkey_still_held_locked("dictate"):
+                if self._continuous_awaiting_start_keyup:
+                    self._continuous_awaiting_start_keyup = False
+                    self._continuous_toggle_ready_at = time.monotonic() + _CONTINUOUS_TOGGLE_DEBOUNCE_S
+                if self._awaiting_post_stop_keyup:
+                    self._awaiting_post_stop_keyup = False
+
             if self._hold_pending and releases_hotkey:
                 pending_kind = self._hold_kind
                 self._hold_pending = False
@@ -930,7 +1017,11 @@ class HotKeyManager(QObject):
                 if not self._hold_activated:
                     tapped = True
                     held_ms = (time.monotonic() - self._hold_started_at) * 1000
-                    quiet = quiet or (pending_kind == "dictate" and self._taps_type_text())
+                    quiet = (
+                        quiet
+                        or self._continuous_listening_active
+                        or (pending_kind == "dictate" and self._taps_type_text())
+                    )
                     if held_ms >= MIN_SHORT_TAP_MS and not quiet and pending_kind == "dictate":
                         emit_short_tap = True
                     else:

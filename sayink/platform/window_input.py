@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import sys
+import threading
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
@@ -30,6 +31,7 @@ TERMINAL_SHIFT_INSERT_EXES: frozenset[str] = frozenset(
         "putty.exe",
     }
 )
+TERMINAL_APP_EXES: frozenset[str] = TERMINAL_CTRL_SHIFT_V_EXES | TERMINAL_SHIFT_INSERT_EXES
 CONSOLE_HOST_EXES: frozenset[str] = frozenset(
     {
         "cmd.exe",
@@ -40,9 +42,11 @@ CONSOLE_HOST_EXES: frozenset[str] = frozenset(
         "bash.exe",
     }
 )
-ALL_TERMINAL_EXES: frozenset[str] = (
-    TERMINAL_CTRL_SHIFT_V_EXES | TERMINAL_SHIFT_INSERT_EXES | CONSOLE_HOST_EXES
-)
+ALL_TERMINAL_EXES: frozenset[str] = TERMINAL_APP_EXES | CONSOLE_HOST_EXES
+DEFAULT_UIA_SELECTION_TIMEOUT_S: float = 0.5
+_MAX_ACTIVE_UIA_WORKERS: int = 4
+_uia_worker_lock = threading.Lock()
+_active_uia_workers: int = 0
 
 _VK_LSHIFT, _VK_RSHIFT = 0xA0, 0xA1
 _VK_LCONTROL, _VK_RCONTROL = 0xA2, 0xA3
@@ -57,10 +61,14 @@ _VK_MENU_MASK = 0xE8
 _STRAY_MODIFIER_VKS = (_VK_LSHIFT, _VK_RSHIFT, _VK_LMENU, _VK_RMENU, _VK_LWIN, _VK_RWIN)
 
 
+def normalize_process_exe(process_name: str) -> str:
+    """Normalize a process path or name to lowercase EXE basename."""
+    return (process_name or "").strip().replace("/", "\\").rsplit("\\", 1)[-1].casefold()
+
+
 def is_terminal_process(process_name: str) -> bool:
-    """True when ``process_name`` is a terminal/shell where simulated Ctrl+C sends SIGINT."""
-    exe = (process_name or "").strip().replace("/", "\\").rsplit("\\", 1)[-1].casefold()
-    return exe in ALL_TERMINAL_EXES
+    """True when ``process_name`` is a terminal/shell where simulated Ctrl+C/newline is unsafe."""
+    return normalize_process_exe(process_name) in ALL_TERMINAL_EXES
 
 
 @runtime_checkable
@@ -185,14 +193,20 @@ def send_paste_shortcut_win32(
         _tap(_VK_MENU_MASK, key_up)
 
 
-def read_selected_text_uia() -> str | None:
-    """Side-effect-free Windows UI Automation ``TextPattern.GetSelection`` query.
+def _extract_uia_text_ranges(ranges: Any) -> str | None:
+    parts: list[str] = []
+    for idx in range(int(ranges.Length)):
+        rng = ranges.GetElement(idx)
+        if rng is None:
+            continue
+        chunk = rng.GetText(32768)
+        if isinstance(chunk, str) and chunk:
+            parts.append(chunk)
+    selected = "".join(parts)
+    return selected if selected.strip() else None
 
-    Never touches the clipboard and never synthesizes keystrokes. Returns ``None``
-    when the focused control does not expose UIA ``TextPattern`` or has an empty selection.
-    """
-    if sys.platform != "win32":
-        return None
+
+def _query_selected_text_uia_sync() -> str | None:
     com_inited = False
     try:
         import pythoncom
@@ -211,15 +225,7 @@ def read_selected_text_uia() -> str | None:
         ranges = pattern.GetSelection()
         if ranges is None or ranges.Length <= 0:
             return None
-        parts: list[str] = []
-        for idx in range(int(ranges.Length)):
-            rng = ranges.GetElement(idx)
-            if rng is not None:
-                chunk = rng.GetText(32768)
-                if isinstance(chunk, str) and chunk:
-                    parts.append(chunk)
-        selected = "".join(parts)
-        return selected if selected.strip() else None
+        return _extract_uia_text_ranges(ranges)
     except Exception:
         log.debug("UI Automation 读取选区不可用或无选区", exc_info=True)
         return None
@@ -231,6 +237,54 @@ def read_selected_text_uia() -> str | None:
                 pythoncom.CoUninitialize()
             except Exception:
                 log.debug("释放 UIA COM 上下文失败", exc_info=True)
+
+
+def read_selected_text_uia(timeout_s: float = DEFAULT_UIA_SELECTION_TIMEOUT_S) -> str | None:
+    """Side-effect-free Windows UI Automation ``TextPattern.GetSelection`` query.
+
+    Executes cross-process COM calls on a daemon STA worker thread bounded by
+    ``timeout_s`` so a hung target application never freezes the Qt GUI thread.
+    Never touches the clipboard and never synthesizes keystrokes.
+    """
+    global _active_uia_workers
+    if sys.platform != "win32":
+        return None
+    effective_timeout = max(0.01, float(timeout_s))
+    with _uia_worker_lock:
+        if _active_uia_workers >= _MAX_ACTIVE_UIA_WORKERS:
+            log.warning("UI Automation 后台查询线程已达上限 (%d)，跳过选区读取", _MAX_ACTIVE_UIA_WORKERS)
+            return None
+        _active_uia_workers += 1
+
+    result_box: list[str | None] = [None]
+    done = threading.Event()
+
+    def _sta_worker() -> None:
+        global _active_uia_workers
+        try:
+            result_box[0] = _query_selected_text_uia_sync()
+        finally:
+            with _uia_worker_lock:
+                _active_uia_workers = max(0, _active_uia_workers - 1)
+            done.set()
+
+    worker = threading.Thread(
+        target=_sta_worker,
+        name="SayInk-UIA-Selection",
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except Exception:
+        with _uia_worker_lock:
+            _active_uia_workers = max(0, _active_uia_workers - 1)
+        log.debug("启动 UIA STA 线程失败", exc_info=True)
+        return None
+
+    if not done.wait(timeout=effective_timeout):
+        log.warning("UI Automation 读取选区超时 (%.2fs)，已放弃等待以保护主线程", effective_timeout)
+        return None
+    return result_box[0]
 
 
 class Win32WindowInputBackend:
