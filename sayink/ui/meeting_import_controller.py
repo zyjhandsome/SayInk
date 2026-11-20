@@ -302,13 +302,48 @@ class MeetingImportController:
             return str(raw[1] or "").strip()
         return str(getattr(raw, "title", "") or "").strip()
 
-    def _has_unsaved_finalize(self) -> bool:
+    def _has_unsaved_finalize(self, meeting_id: str | None = None) -> bool:
         fn = getattr(self._host._ctrl, "has_unsaved_finalize", None)
-        return bool(fn()) if callable(fn) else False
+        if not callable(fn):
+            return False
+        if meeting_id:
+            try:
+                return bool(fn(meeting_id))
+            except TypeError:
+                return bool(fn())
+        return bool(fn())
 
-    def _unsaved_finalize_title(self) -> str:
+    def _target_unsaved_finalize_id(self) -> str:
+        h = self._host
+        detail_id = str(getattr(h, "_detail_id", "") or "").strip()
+        ids_fn = getattr(h._ctrl, "unsaved_finalize_ids", None)
+        if callable(ids_fn):
+            ids = tuple(ids_fn() or ())
+            if detail_id and detail_id in ids:
+                return detail_id
+            return str(ids[-1]) if ids else ""
+        def_fn = getattr(h._ctrl, "default_unsaved_finalize_id", None)
+        return str(def_fn() or "").strip() if callable(def_fn) else ""
+
+    def _unsaved_finalize_title(self, meeting_id: str | None = None) -> str:
         fn = getattr(self._host._ctrl, "unsaved_finalize_title", None)
-        return str(fn() or "").strip() if callable(fn) else ""
+        if not callable(fn):
+            return ""
+        if meeting_id:
+            try:
+                return str(fn(meeting_id) or "").strip()
+            except TypeError:
+                return str(fn() or "").strip()
+        return str(fn() or "").strip()
+
+    @staticmethod
+    def _invoke_ctrl_finalize_op(fn: Any, target_id: str) -> Any:
+        if target_id:
+            try:
+                return fn(target_id)
+            except TypeError:
+                return fn()
+        return fn()
 
     def _sync_unsaved_media_buttons(self, *, busy: bool, browsing: bool) -> None:
         h = self._host
@@ -329,7 +364,8 @@ class MeetingImportController:
         h = self._host
         active = bool(getattr(h._ctrl, "is_active", False))
         show_fin = browsing and not busy and not active and self._has_unsaved_finalize()
-        fin_title = self._unsaved_finalize_title() if show_fin else ""
+        target_id = self._target_unsaved_finalize_id() if show_fin else ""
+        fin_title = self._unsaved_finalize_title(target_id or None) if show_fin else ""
         if hasattr(h, "_finalize_retry_btn"):
             h._finalize_retry_btn.setText("重试保存结束状态")
             h._finalize_retry_btn.setToolTip(
@@ -835,36 +871,49 @@ class MeetingImportController:
             tone="error",
         )
 
-    def retry_finalize_save(self) -> None:
+    def _resolve_retried_meeting_id(self, target_id: str) -> str:
+        if target_id:
+            return target_id
+        return str(getattr(self._host._ctrl, "last_retried_finalize_id", "") or "").strip()
+
+    def _finalize_retry_failed(self, res: Any, target_id: str) -> bool:
+        if isinstance(res, str) and bool(res.strip()):
+            return True
+        return self._has_unsaved_finalize(target_id) if target_id else self._has_unsaved_finalize()
+
+    def retry_finalize_save(self, meeting_id: str | None = None) -> str | None:
         h = self._host
-        if not self._has_unsaved_finalize():
+        if not self._has_unsaved_finalize(meeting_id):
             self.sync_media_buttons()
-            return
+            return "没有可重试保存的会议结束状态"
         retry_fn = getattr(h._ctrl, "retry_finalize_save", None)
         if not callable(retry_fn):
-            return
-        res = retry_fn()
-        still_unsaved = self._has_unsaved_finalize()
-        self.sync_media_buttons()
-        if still_unsaved:
+            return "没有可重试保存的会议结束状态"
+        target_id = (meeting_id or "").strip() or self._target_unsaved_finalize_id()
+        res = self._invoke_ctrl_finalize_op(retry_fn, target_id)
+        if self._finalize_retry_failed(res, target_id):
+            self.sync_media_buttons()
             err = res.strip() if isinstance(res, str) and res.strip() else "会议结束状态仍未保存，请稍后重试。"
             h._set_status(err, tone="error")
-            return
-        mid = res.strip() if isinstance(res, str) else ""
+            return err
+        mid = self._resolve_retried_meeting_id(target_id)
         if mid and h._store.get_meeting(mid) is not None:
             h.show_meeting(mid)
         else:
             h.refresh()
+        self.sync_media_buttons()
         h._set_status("已保存会议结束状态。", tone="ok")
+        return None
 
-    def discard_unsaved_finalize(self) -> None:
+    def discard_unsaved_finalize(self, meeting_id: str | None = None) -> bool:
         from sayink.ui import meeting_page as mp
 
         h = self._host
-        if not self._has_unsaved_finalize():
+        if not self._has_unsaved_finalize(meeting_id):
             self.sync_media_buttons()
-            return
-        title = self._unsaved_finalize_title()
+            return False
+        target_id = (meeting_id or "").strip() or self._target_unsaved_finalize_id()
+        title = self._unsaved_finalize_title(target_id or None)
         box = mp.QMessageBox(h)
         box.setWindowTitle("放弃未保存的结束状态")
         box.setIcon(mp.QMessageBox.Icon.Warning)
@@ -882,13 +931,14 @@ class MeetingImportController:
         with _quiet_tooltips(h):
             box.exec()
         if box.clickedButton() is not discard:
-            return
+            return False
         discard_fn = getattr(h._ctrl, "discard_unsaved_finalize", None)
-        ok = bool(discard_fn()) if callable(discard_fn) else False
+        ok = bool(self._invoke_ctrl_finalize_op(discard_fn, target_id)) if callable(discard_fn) else False
         self.sync_media_buttons()
         h.refresh()
         if ok:
             h._set_status("已放弃未保存的会议结束状态。")
+        return ok
 
     def retry_failed_media(self) -> None:
         h = self._host

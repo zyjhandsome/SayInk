@@ -75,6 +75,16 @@ class MeetingLiveController:
 
     def __init__(self, host: Any) -> None:
         self._host = host
+        self._card_combos_touched = False
+
+    def _on_card_combo_changed(self, _index: int = 0) -> None:
+        h = self._host
+        self._card_combos_touched = True
+        h._update_card_notes()
+        sig = getattr(h, "view_mode_changed", None)
+        mode_fn = getattr(h, "current_view_mode", None)
+        if sig is not None and callable(mode_fn):
+            sig.emit(str(mode_fn()))
 
     def build_start_card(self) -> QWidget:
         h = self._host
@@ -100,6 +110,14 @@ class MeetingLiveController:
         )
         h._card_hint.setWordWrap(True)
         lay.addWidget(h._card_hint)
+
+        h._start_error_banner = QLabel("")
+        h._start_error_banner.setObjectName("meetingStartErrorBanner")
+        h._start_error_banner.setAccessibleName("开始会议错误提示")
+        h._start_error_banner.setTextFormat(Qt.TextFormat.PlainText)
+        h._start_error_banner.setWordWrap(True)
+        h._start_error_banner.hide()
+        lay.addWidget(h._start_error_banner)
 
         row = QHBoxLayout()
         row.setSpacing(10)
@@ -155,6 +173,12 @@ class MeetingLiveController:
         h._opt_agenda.setFixedHeight(60)
         lay.addWidget(h._opt_agenda)
 
+        h._opt_save_audio_hint = QLabel("")
+        h._opt_save_audio_hint.setObjectName("meetingSaveAudioHint")
+        h._opt_save_audio_hint.setAccessibleName("会议录音保存状态")
+        h._opt_save_audio_hint.setWordWrap(True)
+        lay.addWidget(h._opt_save_audio_hint)
+
         h._card_notes = QLabel("")
         h._card_notes.setWordWrap(True)
         h._card_notes.hide()
@@ -180,8 +204,9 @@ class MeetingLiveController:
         h._card_start.clicked.connect(h._start_from_card)
         actions.addWidget(h._card_start)
         page_lay.addLayout(actions)
-        h._opt_source.currentIndexChanged.connect(h._update_card_notes)
-        h._opt_model.currentIndexChanged.connect(h._update_card_notes)
+        h._opt_source.currentIndexChanged.connect(self._on_card_combo_changed)
+        h._opt_model.currentIndexChanged.connect(self._on_card_combo_changed)
+        h._opt_language.currentIndexChanged.connect(self._on_card_combo_changed)
         return page
 
     def _build_live_header_and_tools(self, lay: QVBoxLayout) -> None:
@@ -395,7 +420,52 @@ class MeetingLiveController:
         lay.addLayout(actions)
         return page
 
-    def show_start_card(self) -> None:
+    def _populate_start_card_combos(self, *, preserve: bool) -> None:
+        from sayink.ui import meeting_page as mp
+
+        h = self._host
+        defaults = MeetingOptions.from_config(h._config)
+        target_src = str(h._opt_source.currentData() or defaults.input_source) if preserve else defaults.input_source
+        target_mod = str(h._opt_model.currentData() or "") if preserve else defaults.model_id
+        target_lang = str(h._opt_language.currentData() or defaults.language) if preserve else defaults.language
+
+        h._opt_source.blockSignals(True)
+        index = h._opt_source.findData(target_src)
+        h._opt_source.setCurrentIndex(max(0, index))
+        h._opt_source.blockSignals(False)
+
+        h._opt_model.blockSignals(True)
+        h._opt_model.clear()
+        h._opt_model.addItem(h._follow_model_label(), "")
+        for model in MODEL_REGISTRY:
+            if mp.is_model_downloaded(model["id"]):
+                h._opt_model.addItem(model["name"], model["id"])
+        index = h._opt_model.findData(target_mod)
+        h._opt_model.setCurrentIndex(max(0, index))
+        h._opt_model.blockSignals(False)
+        h._opt_model._sync_overflow_tooltip()
+
+        h._opt_language.blockSignals(True)
+        index = h._opt_language.findData(target_lang)
+        h._opt_language.setCurrentIndex(max(0, index))
+        h._opt_language.blockSignals(False)
+
+    def _clear_start_card_after_begin(self) -> None:
+        h = self._host
+        h._opt_title.clear()
+        h._opt_participants.clear()
+        h._opt_agenda.clear()
+        if hasattr(h, "_start_error_banner"):
+            h._start_error_banner.clear()
+            h._start_error_banner.hide()
+        self._card_combos_touched = False
+
+    def reset_start_card(self) -> None:
+        self._clear_start_card_after_begin()
+        self._populate_start_card_combos(preserve=False)
+        self._host._update_card_notes()
+
+    def show_start_card(self, *, reset: bool = False) -> None:
         from sayink.ui import meeting_page as mp
 
         h = self._host
@@ -405,29 +475,43 @@ class MeetingLiveController:
         if h._ctrl.is_active:
             self.enter_live()
             return
-        defaults = MeetingOptions.from_config(h._config)
-        h._opt_title.clear()
-        h._opt_participants.clear()
-        h._opt_agenda.clear()
-        index = h._opt_source.findData(defaults.input_source)
-        h._opt_source.setCurrentIndex(max(0, index))
-        h._opt_model.blockSignals(True)
-        h._opt_model.clear()
-        h._opt_model.addItem(h._follow_model_label(), "")
-        for model in MODEL_REGISTRY:
-            if mp.is_model_downloaded(model["id"]):
-                h._opt_model.addItem(model["name"], model["id"])
-        index = h._opt_model.findData(defaults.model_id)
-        h._opt_model.setCurrentIndex(max(0, index))
-        h._opt_model.blockSignals(False)
-        h._opt_model._sync_overflow_tooltip()
-        index = h._opt_language.findData(defaults.language)
-        h._opt_language.setCurrentIndex(max(0, index))
+        if reset:
+            self._clear_start_card_after_begin()
+        self._populate_start_card_combos(preserve=self._card_combos_touched)
         h._update_card_notes()
         h._start_btn.setVisible(False)
         h._stack.setCurrentIndex(mp.PAGE_START)
         h._sync_media_buttons()
         h._opt_title.setFocus()
+        h._start_scroll.verticalScrollBar().setValue(0)
+        sig = getattr(h, "view_mode_changed", None)
+        mode_fn = getattr(h, "current_view_mode", None)
+        if sig is not None and callable(mode_fn):
+            sig.emit(str(mode_fn()))
+
+    def show_start_error_inline(self, reason: str) -> None:
+        from sayink.ui import meeting_page as mp
+
+        h = self._host
+        text = (reason or "").strip()
+        if not text:
+            if hasattr(h, "_start_error_banner"):
+                h._start_error_banner.clear()
+                h._start_error_banner.hide()
+            return
+        for prefix in ("尚未开始录音：", "无法开始会议："):
+            if text.startswith(prefix):
+                text = text[len(prefix) :].strip()
+        msg = f"尚未开始录音：{text}"
+        self._card_combos_touched = True
+        if h._opt_model.count() == 0:
+            self._populate_start_card_combos(preserve=True)
+        h._start_error_banner.setText(msg)
+        h._start_error_banner.show()
+        h._update_card_notes()
+        h._start_btn.setVisible(False)
+        h._stack.setCurrentIndex(mp.PAGE_START)
+        h._sync_media_buttons()
         h._start_scroll.verticalScrollBar().setValue(0)
 
     def follow_model_label(self) -> str:
@@ -455,10 +539,23 @@ class MeetingLiveController:
             h._opt_loopback_hint.clear()
             h._opt_loopback_hint.hide()
 
+    def _sync_card_save_audio_hint(self) -> None:
+        h = self._host
+        if not hasattr(h, "_opt_save_audio_hint"):
+            return
+        save_on = bool(h._config.get("meeting.save_audio", True))
+        h._opt_save_audio_hint.setText(
+            "保存会议录音：已开启（支持会后回放与异常恢复，可在 设置 → 通用 更改）"
+            if save_on
+            else "保存会议录音：已关闭（仅保存文字稿，不留存本地录音，可在 设置 → 通用 开启）"
+        )
+        h._opt_save_audio_hint.show()
+
     def update_card_notes(self) -> None:
         h = self._host
         options = self.options_from_card()
         self._sync_card_loopback_hint(options.input_source)
+        self._sync_card_save_audio_hint()
         dictation = str(h._config.get("stt.model_id", DEFAULT_MODEL_ID) or DEFAULT_MODEL_ID)
         caps = resolve_capabilities(h._config, options, dictation_model_id=dictation)
         notes = list(caps.notes)
@@ -550,7 +647,11 @@ class MeetingLiveController:
         h._sync_media_buttons()
 
     def start_from_card(self) -> None:
-        self._host.start_requested.emit(self.options_from_card())
+        h = self._host
+        if hasattr(h, "_start_error_banner"):
+            h._start_error_banner.clear()
+            h._start_error_banner.hide()
+        h.start_requested.emit(self.options_from_card())
 
     def live_input_source(self) -> str:
         h = self._host
@@ -715,6 +816,7 @@ class MeetingLiveController:
         from sayink.ui import meeting_page as mp
 
         h = self._host
+        self._clear_start_card_after_begin()
         record = h._ctrl.current
         meeting_id = record.id if record is not None else ""
         if h._drafts.enter_live_session(meeting_id):
@@ -742,6 +844,16 @@ class MeetingLiveController:
         h._sync_responsive_layout()
         self.render_live()
 
+    def _draining_remaining_segments(self) -> int:
+        ctrl = self._host._ctrl
+        fn = getattr(ctrl, "pending_segment_count", None) or getattr(ctrl, "_pending_segments", None)
+        if not callable(fn):
+            return 0
+        try:
+            return max(0, int(fn() or 0))
+        except Exception:
+            return 0
+
     def sync_live_state(self) -> None:
         from sayink.ui import settings_styles as ss
 
@@ -760,7 +872,13 @@ class MeetingLiveController:
             h._mark_btn.setStyleSheet(ss.BTN_ACCENT_SM + h._disabled_btn_sm_override())
         elif state is MeetingState.DRAINING:
             h._live_silence_timer.stop()
-            h._live_status.setText("正在整理文字稿，请稍候…")
+            rem = self._draining_remaining_segments()
+            status_text = (
+                f"已停止采集，正在整理文字稿（剩余 {rem} 段），请稍候…"
+                if rem > 0
+                else "已停止采集，正在整理文字稿，请稍候…"
+            )
+            h._live_status.setText(status_text)
             h._live_status.show()
             h._resume_btn.hide()
             h._pause_btn.hide()
@@ -785,13 +903,29 @@ class MeetingLiveController:
         from sayink.ui import design_tokens as tok
 
         h = self._host
-        paused = h._ctrl.state is MeetingState.PAUSED
-        color = tok.TEXT_DIM if paused else tok.STATE_RECORD
+        state = h._ctrl.state
+        if state is MeetingState.PAUSED:
+            clock_color = tok.TEXT_DIM
+            dot_color = tok.TEXT_DIM
+            a11y_label = "采集已暂停"
+        elif state is MeetingState.DRAINING:
+            clock_color = tok.AMBER_TEXT
+            dot_color = tok.AMBER
+            rem = self._draining_remaining_segments()
+            a11y_label = (
+                f"已停止采集，正在整理文字稿（剩余 {rem} 段）"
+                if rem > 0
+                else "已停止采集，正在整理文字稿"
+            )
+        else:
+            clock_color = tok.STATE_RECORD
+            dot_color = tok.STATE_RECORD
+            a11y_label = "正在记录"
         h._live_clock.setStyleSheet(
-            f"font-size: {tok.TYPE_TITLE_LG}px; font-weight: 700; color: {color}; background: transparent;"
+            f"font-size: {tok.TYPE_TITLE_LG}px; font-weight: 700; color: {clock_color}; background: transparent;"
         )
-        h._live_rec_dot.setStyleSheet(f"background: {color}; border-radius: 4px;")
-        h._live_rec_dot.setAccessibleName("采集已暂停" if paused else "正在记录")
+        h._live_rec_dot.setStyleSheet(f"background: {dot_color}; border-radius: 4px;")
+        h._live_rec_dot.setAccessibleName(a11y_label)
 
     def on_state_changed(self, state: MeetingState) -> None:
         from sayink.ui import meeting_page as mp

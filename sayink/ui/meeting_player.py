@@ -167,6 +167,7 @@ def _probe_wav_duration_ms(path: Path) -> int:
     return 0
 
 
+PLAYBACK_TEMP_WAV_MAX_AGE_S: float = 2 * 3600
 _STALE_PLAYBACK_WAV_PRUNED = False
 _PRUNED_PLAYBACK_DIRS: set[str] = set()
 
@@ -174,7 +175,7 @@ _PRUNED_PLAYBACK_DIRS: set[str] = set()
 def _prune_stale_playback_wavs(
     out_dir: Path,
     *,
-    max_age_s: float = 48 * 3600,
+    max_age_s: float = PLAYBACK_TEMP_WAV_MAX_AGE_S,
     exclude: set[Path] | None = None,
     force: bool = False,
 ) -> None:
@@ -407,6 +408,37 @@ class _AudioPlayerBar(QFrame):
         for key in (self._norm_audio_key(source_path), self._norm_audio_key(raw_f32)):
             if key:
                 self._temp_wavs_by_source.setdefault(key, set()).add(wav_path)
+
+    def _release_active_temp_wav(self) -> None:
+        if not self._playable_path:
+            return
+        wav_path = Path(self._playable_path)
+        if wav_path not in self._session_temp_wavs:
+            return
+        if self._player is not None:
+            try:
+                self._player.setSource(QUrl())
+            except Exception:
+                pass
+        try:
+            wav_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._session_temp_wavs.discard(wav_path)
+        for key in list(self._temp_wavs_by_source):
+            rem = self._temp_wavs_by_source[key] - {wav_path}
+            if rem:
+                self._temp_wavs_by_source[key] = rem
+            else:
+                self._temp_wavs_by_source.pop(key, None)
+        self._playable_path = ""
+
+    def active_temp_wav_paths(self) -> list[Path]:
+        return [p for p in self._session_temp_wavs if p.exists()]
+
+    def closeEvent(self, event) -> None:
+        self.cleanup_temp_files()
+        super().closeEvent(event)
 
     def unload_source(self) -> None:
         self._pending_seek_ms = None
@@ -698,6 +730,7 @@ class _AudioPlayerBar(QFrame):
                 self._player.stop()
             except Exception:
                 pass
+        self._release_active_temp_wav()
         self._position_ms = 0
         self._sync_ui()
 

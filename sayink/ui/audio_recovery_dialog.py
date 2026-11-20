@@ -30,6 +30,7 @@ from sayink.ui.theme import apply_window_dark_titlebar
 
 class RecoveryWorker(QThread):
     text_ready = pyqtSignal(str)
+    segment_ready = pyqtSignal(int, int, str)
     progress = pyqtSignal(int, int)
     failed = pyqtSignal(str)
 
@@ -45,6 +46,7 @@ class RecoveryWorker(QThread):
         glossary=None,
         decode_lock=None,
         recognizer_getter=None,
+        min_offset_ms: int = 0,
     ):
         super().__init__()
         self.recording = recording
@@ -56,6 +58,7 @@ class RecoveryWorker(QThread):
         self.glossary = list(glossary) if glossary else []
         self.decode_lock = decode_lock
         self.recognizer_getter = recognizer_getter
+        self.min_offset_ms = max(0, int(min_offset_ms or 0))
         self.cancelled = False
         self._active_quiet = False
         self._last_pct = -1
@@ -67,6 +70,18 @@ class RecoveryWorker(QThread):
         if pct != self._last_pct:
             self._last_pct = pct
             self.progress.emit(min(done, total), total)
+
+    @staticmethod
+    def _slice_timing_ms(seg, audio, done_samples: int) -> tuple[int, int]:
+        bounds = getattr(seg, "last_bounds", None)
+        if bounds is not None and len(bounds) == 2:
+            start_s, end_s = max(0, int(bounds[0])), max(0, int(bounds[1]))
+            offset_ms = start_s * 1000 // TARGET_SAMPLE_RATE
+            dur_ms = max(1, (end_s - start_s) * 1000 // TARGET_SAMPLE_RATE)
+            return (offset_ms, dur_ms)
+        dur_ms = max(1, len(audio) * 1000 // TARGET_SAMPLE_RATE)
+        offset_ms = max(0, done_samples * 1000 // TARGET_SAMPLE_RATE - dur_ms)
+        return (offset_ms, dur_ms)
 
     def run(self):
         try:
@@ -96,16 +111,20 @@ class RecoveryWorker(QThread):
                 done += len(block)
                 audio = seg.feed(block)
                 if audio is not None:
-                    self._decode(audio)
+                    off_ms, dur_ms = self._slice_timing_ms(seg, audio, done)
+                    if off_ms >= self.min_offset_ms:
+                        self._decode(audio, offset_ms=off_ms, duration_ms=dur_ms)
                 self._report_progress(done, total)
             if not self.cancelled and (audio := seg.flush()) is not None:
-                self._decode(audio)
+                off_ms, dur_ms = self._slice_timing_ms(seg, audio, done)
+                if off_ms >= self.min_offset_ms:
+                    self._decode(audio, offset_ms=off_ms, duration_ms=dur_ms)
             if not self.cancelled:
                 self._report_progress(total, total)
         except Exception as exc:
             self.failed.emit(str(exc))
 
-    def _decode(self, audio):
+    def _decode(self, audio, *, offset_ms: int = 0, duration_ms: int = 0):
         if self.decode_lock is not None:
             with self.decode_lock:
                 active = (
@@ -144,10 +163,13 @@ class RecoveryWorker(QThread):
         else:
             final_text = raw_text
         if final_text:
+            self.segment_ready.emit(int(offset_ms), int(duration_ms), final_text)
             self.text_ready.emit(final_text)
 
 
 class AudioRecoveryDialog(QDialog):
+    meeting_backfilled = pyqtSignal(str, int)
+
     def __init__(
         self,
         root,
@@ -159,6 +181,8 @@ class AudioRecoveryDialog(QDialog):
         glossary=None,
         decode_lock=None,
         recognizer_getter=None,
+        meeting_store=None,
+        history_store=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -174,9 +198,15 @@ class AudioRecoveryDialog(QDialog):
         self.glossary = list(glossary) if glossary else []
         self.decode_lock = decode_lock
         self.recognizer_getter = recognizer_getter
+        self.meeting_store, self.history_store = self._resolve_stores(
+            parent, meeting_store, history_store
+        )
         self.worker = None
         self._worker_failed = False
         self._busy = False
+        self._decoded_key: tuple[str, str] | None = None
+        self._decoded_segments: list[tuple[int, int, str]] = []
+        self._pending_backfill_target: tuple[str, object, int] | None = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(tok.SPACE_MD, tok.SPACE_MD, tok.SPACE_MD, tok.SPACE_MD)
         layout.setSpacing(10)
@@ -227,12 +257,18 @@ class AudioRecoveryDialog(QDialog):
         track_row.addWidget(self.track, 1)
         layout.addLayout(track_row)
         self.items.currentRowChanged.connect(self._update_tracks)
+        self.track.currentIndexChanged.connect(lambda _idx: self._sync_backfill_btn())
 
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setSpacing(tok.SPACE_SM)
         self.transcribe_btn = QPushButton("重新识别")
         self.transcribe_btn.setProperty("viBtn", "primarySm")
+        self.backfill_btn = QPushButton("补回原会议")
+        self.backfill_btn.setAccessibleName("补回原会议")
+        self.backfill_btn.setProperty("viBtn", "ghostSm")
+        self.backfill_btn.setToolTip("将上次已保存片段之后新识别出的内容追加回原会议记录")
+        self.backfill_btn.hide()
         self.export_btn = QPushButton("导出 WAV")
         self.export_btn.setProperty("viBtn", "ghostSm")
         self.stop_btn = QPushButton("停止")
@@ -240,6 +276,7 @@ class AudioRecoveryDialog(QDialog):
         self.delete_btn = QPushButton("删除所选录音")
         self.delete_btn.setProperty("viBtn", "dangerSm")
         actions.addWidget(self.transcribe_btn)
+        actions.addWidget(self.backfill_btn)
         actions.addWidget(self.export_btn)
         actions.addWidget(self.stop_btn)
         actions.addStretch(1)
@@ -270,6 +307,7 @@ class AudioRecoveryDialog(QDialog):
 
         for button in (
             self.transcribe_btn,
+            self.backfill_btn,
             self.export_btn,
             self.stop_btn,
             self.delete_btn,
@@ -281,6 +319,7 @@ class AudioRecoveryDialog(QDialog):
         self.output.textChanged.connect(self._sync_save_enabled)
         self.export_btn.clicked.connect(self._export)
         self.transcribe_btn.clicked.connect(self._transcribe)
+        self.backfill_btn.clicked.connect(lambda: self.backfill_selected_meeting())
         self.stop_btn.clicked.connect(self.cancel_processing)
         self.delete_btn.clicked.connect(self._delete)
         self.save_btn.clicked.connect(self._save_text)
@@ -350,7 +389,7 @@ class AudioRecoveryDialog(QDialog):
             f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
         )
         self.transcribe_btn.setStyleSheet(primary_sm)
-        for button in (self.export_btn, self.stop_btn, self.save_btn, self.close_btn):
+        for button in (self.backfill_btn, self.export_btn, self.stop_btn, self.save_btn, self.close_btn):
             button.setStyleSheet(settings_styles.BTN_GHOST_SM)
         self.delete_btn.setStyleSheet(settings_styles.BTN_DANGER_SM)
         palette = self.output.palette()
@@ -381,6 +420,64 @@ class AudioRecoveryDialog(QDialog):
             if self.worker.isRunning():
                 self.status.setText("正在停止，请等待当前识别片段完成…")
 
+    @staticmethod
+    def _resolve_stores(parent, meeting_store, history_store):
+        m_store = meeting_store
+        h_store = history_store
+        if m_store is None and parent is not None:
+            candidates = [parent]
+            win_fn = getattr(parent, "window", None)
+            if callable(win_fn):
+                win = win_fn()
+                if win is not None and win is not parent:
+                    candidates.append(win)
+            for obj in candidates:
+                ctrl = getattr(obj, "_meeting_controller", None) or getattr(obj, "_ctrl", None)
+                if ctrl is not None:
+                    m_store = getattr(ctrl, "store", None) or getattr(ctrl, "_store", None)
+                    if h_store is None:
+                        h_store = getattr(ctrl, "_history", None)
+                    if m_store is not None:
+                        break
+                panel = getattr(obj, "meeting_panel", None)
+                if panel is not None:
+                    m_store = getattr(panel, "_store", None)
+                    if m_store is not None:
+                        break
+        if h_store is None and m_store is not None:
+            h_store = getattr(m_store, "_history", None)
+        return (m_store, h_store)
+
+    @staticmethod
+    def _item_key(item) -> tuple[str, str] | None:
+        if item is None:
+            return None
+        d = getattr(item, "directory", getattr(item, "path", ""))
+        return (str(d), str(getattr(item, "track", "audio") or "audio"))
+
+    def _matched_meeting_for(self, item):
+        if item is None or self.meeting_store is None or getattr(self.meeting_store, "disabled", False):
+            return None
+        meta = getattr(item, "metadata", None) or {}
+        mid = str(meta.get("meeting_id") or "").strip()
+        if not mid:
+            return None
+        return self.meeting_store.get_meeting(mid)
+
+    def _has_cached_segments_for_selected(self) -> bool:
+        key = self._item_key(self._selected())
+        return bool(key is not None and self._decoded_key == key and self._decoded_segments)
+
+    def _sync_backfill_btn(self) -> None:
+        matched = self._matched_meeting_for(self._selected())
+        self.backfill_btn.setVisible(matched is not None)
+        can_run = (
+            matched is not None
+            and not self._busy
+            and (self._has_cached_segments_for_selected() or self._current_recognizer() is not None)
+        )
+        self.backfill_btn.setEnabled(can_run)
+
     def _refresh(self):
         self.recordings = recordings(self.root)
         self.items.clear()
@@ -390,7 +487,9 @@ class AudioRecoveryDialog(QDialog):
             except (OSError, OverflowError, ValueError, TypeError):
                 stamp = "未知时间"
             state = "已结束" if item.metadata.get("complete") else "异常中断 / 缓存失败"
-            self.items.addItem(f"{stamp} · {item.seconds / 60:.1f} 分钟 · {state}")
+            matched = self._matched_meeting_for(item)
+            suffix = f" · 原会议：{matched.display_title}" if matched is not None else ""
+            self.items.addItem(f"{stamp} · {item.seconds / 60:.1f} 分钟 · {state}{suffix}")
         has_recordings = bool(self.recordings)
         self._empty_banner.setVisible(not has_recordings)
         self._empty_list_hint.setVisible(not has_recordings)
@@ -406,11 +505,14 @@ class AudioRecoveryDialog(QDialog):
         self._set_busy(False)
 
     def _update_tracks(self, row):
+        self.track.blockSignals(True)
         self.track.clear()
         if 0 <= row < len(self.recordings):
             titles = {"audio": "混合录音", "microphone": "麦克风原始音轨", "system": "电脑声音原始音轨"}
             for track in self.recordings[row].available_tracks:
                 self.track.addItem(titles.get(track, track), track)
+        self.track.blockSignals(False)
+        self._sync_backfill_btn()
 
     def _selected(self):
         row = self.items.currentRow()
@@ -428,6 +530,7 @@ class AudioRecoveryDialog(QDialog):
         self.items.setEnabled(not busy)
         self.track.setEnabled(not busy)
         self._sync_save_enabled()
+        self._sync_backfill_btn()
 
     def _on_progress(self, done: int, total: int) -> None:
         if self.worker is None or self.worker.cancelled or self._worker_failed:
@@ -441,12 +544,17 @@ class AudioRecoveryDialog(QDialog):
         self._worker_failed = True
         self.status.setText(f"处理失败：{message}")
 
+    def _on_segment_ready(self, offset_ms: int, duration_ms: int, text: str) -> None:
+        self._decoded_segments.append((int(offset_ms), int(duration_ms), str(text)))
+
     def _start(self, worker):
         self.worker = worker
         self._worker_failed = False
         self._set_busy(True)
         self.status.setText("正在本机处理…")
         worker.text_ready.connect(self.output.appendPlainText)
+        if hasattr(worker, "segment_ready"):
+            worker.segment_ready.connect(self._on_segment_ready)
         worker.progress.connect(self._on_progress)
         worker.failed.connect(self._on_failed)
         worker.finished.connect(self._finished)
@@ -454,24 +562,37 @@ class AudioRecoveryDialog(QDialog):
 
     def _finished(self):
         worker = self.worker
-        if not self._worker_failed and worker is not None:
-            self.status.setText("处理完成" if not worker.cancelled else "已停止，已有恢复文字保留")
+        pending_target = self._pending_backfill_target
+        self._pending_backfill_target = None
+        cancelled = bool(worker is not None and worker.cancelled)
+        failed = self._worker_failed
+        if not failed and worker is not None:
+            self.status.setText("处理完成" if not cancelled else "已停止，已有恢复文字保留")
         self._set_busy(False)
         self.worker = None
         if worker is not None:
             worker.deleteLater()
+        if pending_target is not None and not failed and not cancelled:
+            mid, item, base_ms = pending_target
+            meeting = self.meeting_store.get_meeting(mid) if self.meeting_store is not None else None
+            if meeting is not None:
+                self._commit_backfill_segments(item, meeting, base_ms, list(self._decoded_segments))
 
     def _export(self):
         if item := self._selected():
             with native_file_dialog(self):
                 target, _ = QFileDialog.getSaveFileName(self, "导出录音", "恢复录音.wav", "WAV (*.wav)")
             if target:
+                self._pending_backfill_target = None
                 self._start(RecoveryWorker(item, target=Path(target)))
 
     def _transcribe(self):
         rec = self._current_recognizer()
         if (item := self._selected()) and rec is not None:
             self.output.clear()
+            self._decoded_key = self._item_key(item)
+            self._decoded_segments = []
+            self._pending_backfill_target = None
             self._start(
                 RecoveryWorker(
                     item,
@@ -484,6 +605,160 @@ class AudioRecoveryDialog(QDialog):
                     recognizer_getter=self.recognizer_getter,
                 )
             )
+
+    def _backfill_cutoff(self, item, meeting) -> tuple[int, int | None, int | None, int]:
+        meta = getattr(item, "metadata", None) or {}
+        raw_ts = meta.get("started_at")
+        if isinstance(raw_ts, (int, float)) and raw_ts > 0:
+            rec_ms = int(raw_ts) if raw_ts > 100_000_000_000 else int(round(float(raw_ts) * 1000.0))
+            base_ms = rec_ms if abs(rec_ms - int(meeting.started_at)) > 5000 else int(meeting.started_at)
+        else:
+            base_ms = int(meeting.started_at)
+        existing = self.meeting_store.get_segments(meeting.id) if self.meeting_store is not None else []
+        if not existing:
+            return (base_ms, None, None, 0)
+        starts = [
+            int(s.captured_at) if int(s.captured_at or 0) > 0
+            else max(0, int(s.created_at) - max(0, int(s.duration_ms or 0)))
+            for s in existing
+        ]
+        ends = [
+            st + max(0, int(s.duration_ms or 0))
+            for st, s in zip(starts, existing, strict=True)
+        ]
+        last_start = max(starts)
+        last_end = max(ends)
+        cutoff_epoch = max(last_start + 1, last_end - 100)
+        min_off = max(0, cutoff_epoch - base_ms)
+        return (base_ms, last_start, last_end, min_off)
+
+    def _commit_backfill_segments(
+        self,
+        item,
+        meeting,
+        base_ms: int,
+        decoded_segments: list[tuple[int, int, str]],
+    ) -> int:
+        if self.meeting_store is None or self.history_store is None:
+            self.status.setText("当前未连接会议数据库，无法补回原会议。")
+            return 0
+        _b, last_start, last_end, _m = self._backfill_cutoff(item, meeting)
+        fresh: list[tuple[int, int, str]] = []
+        for off_ms, dur_ms, text in decoded_segments:
+            cleaned = str(text or "").strip()
+            if not cleaned:
+                continue
+            cap_at = base_ms + max(0, int(off_ms))
+            if last_start is not None and not (cap_at > last_start and cap_at >= (last_end or 0) - 100):
+                continue
+            fresh.append((max(0, int(off_ms)), max(1, int(dur_ms or 1)), cleaned))
+        if not fresh:
+            self.status.setText("没有新的未保存片段需要补回（原会议已包含最新内容）。")
+            return 0
+        existing = self.meeting_store.get_segments(meeting.id)
+        next_seq = max((int(s.seq) for s in existing), default=0) + 1
+        track = str(getattr(item, "track", "audio") or "audio")
+        route = "system" if track == "system" else ("microphone" if track == "microphone" else "")
+        meta = getattr(item, "metadata", None) or {}
+        model_name = str(meta.get("model_id") or getattr(meeting, "model_id", "") or "")
+        source = str(getattr(meeting, "source", "") or "mixed")
+        rec_dir = str(getattr(item, "directory", getattr(item, "path", "")) or "")
+        now_epoch_ms = int(time.time() * 1000)
+        tail_off, tail_dur, _ = fresh[-1]
+        new_end_ms = base_ms + tail_off + tail_dur
+
+        def _write(conn) -> None:
+            for idx, (off_ms, dur_ms, text) in enumerate(fresh):
+                cap_at = base_ms + off_ms
+                created_at = max(cap_at + dur_ms, now_epoch_ms)
+                seq = next_seq + idx
+                conn.execute(
+                    """
+                    INSERT INTO history (
+                      session_id, seq, created_at, raw_text, polished_text,
+                      source, duration_ms, target_app, trigger_mode, model,
+                      speaker_id, speaker_route, captured_at, corrected_text, speaker_locked
+                    )
+                    SELECT ?, ?, ?, ?, ?, ?, ?, '', 'meeting', ?, 0, ?, ?, '', 0
+                    WHERE NOT EXISTS (
+                      SELECT 1 FROM history WHERE session_id = ? AND seq = ? AND trigger_mode = 'meeting'
+                    )
+                    """,
+                    (
+                        meeting.id, seq, created_at, text, text,
+                        source, dur_ms, model_name, route, cap_at,
+                        meeting.id, seq,
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE meetings
+                SET ended_at = MAX(COALESCE(ended_at, 0), ?),
+                    audio_path = CASE WHEN COALESCE(audio_path, '') = '' THEN ? ELSE audio_path END
+                WHERE id = ?
+                """,
+                (new_end_ms, rec_dir, meeting.id),
+            )
+            conn.execute(
+                "UPDATE meeting_notes SET transcript_changed = 1 WHERE meeting_id = ? AND COALESCE(markdown, '') != ''",
+                (meeting.id,),
+            )
+
+        ticket = self.history_store.enqueue_write(_write)
+        flushed = ticket > 0 and self.meeting_store.flush_ticket(ticket, timeout=5.0)
+        if not flushed:
+            self.status.setText("补回原会议失败：数据库写入未完成，请稍后重试。")
+            return 0
+        count = len(fresh)
+        self.status.setText(f"已将 {count} 段新识别内容补回「{meeting.display_title}」。")
+        self.meeting_backfilled.emit(meeting.id, count)
+        return count
+
+    def append_recovered_segments(
+        self,
+        recovered_segments: list[tuple[int, int, str]],
+        *,
+        item=None,
+    ) -> int:
+        """Public helper to append ``(offset_ms, duration_ms, text)`` slices to the matched meeting."""
+        target_item = item or self._selected()
+        meeting = self._matched_meeting_for(target_item)
+        if target_item is None or meeting is None:
+            return 0
+        base_ms, _ls, _le, _mo = self._backfill_cutoff(target_item, meeting)
+        return self._commit_backfill_segments(target_item, meeting, base_ms, list(recovered_segments))
+
+    def backfill_selected_meeting(self) -> int:
+        """Backfill newly recovered tail segments after the last saved segment into the original meeting."""
+        item = self._selected()
+        meeting = self._matched_meeting_for(item)
+        if item is None or meeting is None:
+            return 0
+        base_ms, _ls, _le, min_off = self._backfill_cutoff(item, meeting)
+        if self._has_cached_segments_for_selected():
+            return self._commit_backfill_segments(item, meeting, base_ms, list(self._decoded_segments))
+        rec = self._current_recognizer()
+        if rec is None:
+            self.status.setText("模型尚未就绪，请等待识别模型加载后再补回原会议。")
+            return 0
+        self.output.clear()
+        self._decoded_key = self._item_key(item)
+        self._decoded_segments = []
+        self._pending_backfill_target = (meeting.id, item, base_ms)
+        self._start(
+            RecoveryWorker(
+                item,
+                recognizer=rec,
+                vad=self.vad,
+                vad_path=self.vad_path,
+                quiet=self.quiet,
+                glossary=self.glossary,
+                decode_lock=self.decode_lock,
+                recognizer_getter=self.recognizer_getter,
+                min_offset_ms=min_off,
+            )
+        )
+        return 0
 
     def _delete(self):
         if (item := self._selected()) and confirm(

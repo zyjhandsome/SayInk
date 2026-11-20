@@ -28,35 +28,12 @@ import time
 import weakref
 
 from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import (
-    QDesktopServices,
-    QKeySequence,
-    QShortcut,
-    QTextCursor,
-)
+from PyQt6.QtGui import QDesktopServices, QKeySequence, QShortcut, QTextCursor
 from PyQt6.QtWidgets import (
-    QAbstractItemView,
-    QButtonGroup,
-    QComboBox,
-    QDialog,
-    QFileDialog as QFileDialog,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QMenu,
-    QMessageBox as QMessageBox,
-    QPlainTextEdit,
-    QProgressBar,
-    QPushButton,
-    QScrollArea,
-    QSizePolicy,
-    QSplitter,
-    QStackedWidget,
-    QVBoxLayout,
-    QWidget,
+    QAbstractItemView, QButtonGroup, QComboBox, QDialog, QFileDialog as QFileDialog,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
+    QMessageBox as QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from sayink.atomic_io import atomic_write_text as atomic_write_text
@@ -183,6 +160,8 @@ class MeetingPage(QWidget):
     pause_requested = pyqtSignal()
     resume_requested = pyqtSignal()
     configure_requested = pyqtSignal()     # minutes need the AI service connection
+    audio_settings_requested = pyqtSignal()  # open audio device troubleshooting in Settings
+    view_mode_changed = pyqtSignal(str)    # "browse" | "start" | "live"
     aux_models_changed = pyqtSignal()      # a helper model was downloaded here
     glossary_updated = pyqtSignal()        # user accepted a learned glossary correction
     _title_write_settled = pyqtSignal(str, str, int)
@@ -424,6 +403,7 @@ class MeetingPage(QWidget):
         self._stack.addWidget(self._build_browse())
         self._stack.addWidget(self._build_start_card())
         self._stack.addWidget(self._build_live())
+        self._stack.currentChanged.connect(lambda _idx: self.view_mode_changed.emit(self.current_view_mode()))
         outer.addWidget(self._stack, 1)
         for button in self.findChildren(QPushButton):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -547,7 +527,12 @@ class MeetingPage(QWidget):
         self._export_btn.setToolTip("选择要导出的会议内容")
         self._export_menu = QMenu(self._export_btn)
         self._export_actions = {}
-        for scope, label in (("notes", "仅导出纪要"), ("transcript", "仅导出文字稿"), ("all", "导出完整会议记录")):
+        for scope, label in (
+            ("notes", "仅导出纪要"),
+            ("transcript", "仅导出文字稿"),
+            ("srt", "导出文字稿字幕 (.srt)"),
+            ("all", "导出完整会议记录"),
+        ):
             action = self._export_menu.addAction(label)
             action.triggered.connect(lambda _checked=False, kind=scope: self._export(kind))
             self._export_actions[scope] = action
@@ -669,6 +654,23 @@ class MeetingPage(QWidget):
         state_lay.addWidget(self._cancel_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         right_lay.addWidget(self._detail_meta)
         right_lay.addWidget(self._state_row)
+        self._integrity_banner = QFrame()
+        self._integrity_banner.setObjectName("meetingIntegrityBanner")
+        integrity_lay = QHBoxLayout(self._integrity_banner)
+        integrity_lay.setContentsMargins(10, 6, 8, 6)
+        integrity_lay.setSpacing(8)
+        self._integrity_label = QLabel("")
+        self._integrity_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._integrity_label.setWordWrap(True)
+        self._integrity_label.setAccessibleName("会议片段完整性提示")
+        integrity_lay.addWidget(self._integrity_label, 1)
+        self._segment_retry_btn = QPushButton("重试保存缺失片段")
+        self._segment_retry_btn.setAccessibleName("重试保存缺失片段")
+        self._segment_retry_btn.clicked.connect(lambda: self.retry_unsaved_segments())
+        self._segment_retry_btn.hide()
+        integrity_lay.addWidget(self._segment_retry_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._integrity_banner.hide()
+        right_lay.addWidget(self._integrity_banner)
         self._materials = QWidget()
         self._materials.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         materials_lay = QVBoxLayout(self._materials)
@@ -877,6 +879,22 @@ class MeetingPage(QWidget):
         detail_find_lay.addWidget(self._detail_find_close_btn, 0)
         self._detail_find_bar.hide()
         right_lay.addWidget(self._detail_find_bar)
+
+        self._empty_speech_bar = QWidget()
+        empty_bar_lay = QHBoxLayout(self._empty_speech_bar)
+        empty_bar_lay.setContentsMargins(0, 2, 0, 2)
+        empty_bar_lay.setSpacing(8)
+        self._empty_play_btn = QPushButton("回放本场录音")
+        self._empty_play_btn.setAccessibleName("回放本场录音")
+        self._empty_play_btn.clicked.connect(self._play_empty_meeting_audio)
+        empty_bar_lay.addWidget(self._empty_play_btn, 0)
+        self._empty_device_btn = QPushButton("检查音频设备")
+        self._empty_device_btn.setAccessibleName("检查音频设备")
+        self._empty_device_btn.clicked.connect(self.audio_settings_requested.emit)
+        empty_bar_lay.addWidget(self._empty_device_btn, 0)
+        empty_bar_lay.addStretch(1)
+        self._empty_speech_bar.hide()
+        right_lay.addWidget(self._empty_speech_bar)
 
         self._content_stack = QStackedWidget()
         self._content_stack.setMinimumHeight(140)
@@ -1216,10 +1234,8 @@ class MeetingPage(QWidget):
             self._show_import_detail()
         elif importing:
             self._paint_import_banner()
-        if self.is_compact_single_pane:
-            self._apply_compact_pane_visibility()
-        else:
-            self._detail_pane.setVisible(bool(records) or self._editing_notes or importing)
+        from sayink.ui import meeting_workspace_chrome as mwc
+        mwc.finish_page_refresh(self, has_records=bool(records), importing=importing)
 
     def _release_row_widgets(self) -> None:
         """Drop row widgets before ``clear()``.
@@ -1548,6 +1564,8 @@ class MeetingPage(QWidget):
             self._audio_player.hide()
             self._detail_find_bar.hide()
             self._content_hint.hide()
+            self._integrity_banner.hide()
+            self._empty_speech_bar.hide()
 
     def _select_loaded_meetings(self) -> None:
         if not self._batch_mode:
@@ -1604,30 +1622,26 @@ class MeetingPage(QWidget):
         export_selected_meetings(self)
 
     def _generate_selected_meetings(self) -> None:
+        from sayink.ui.meeting_workspace_chrome import confirm_remote_ai_consent
+
         ids = self._selected_meeting_ids()
         if not ids:
             return
         if not minutes_settings_complete(self._config):
             self.configure_requested.emit()
             return
+        template_id = str(self._config.get("meeting.template_id", "general") or "general")
+        include_notes: bool | None = None
         host = self._ctrl.remote_host_needing_confirmation()
         if host:
-            box = QMessageBox(self)
-            box.setWindowTitle("发送到远端模型")
-            box.setIcon(QMessageBox.Icon.Question)
-            box.setText(f"所选会议里还没有纪要的文字稿将发送到 {host}。")
-            box.setInformativeText("不会发送音频。确认后本机记住该地址，这次批量生成只问这一次。")
-            ok = box.addButton("发送并生成", QMessageBox.ButtonRole.AcceptRole)
-            box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
-            box.setDefaultButton(ok)
-            _style_dialog_box(box)
-            with _quiet_tooltips(self):
-                box.exec()
-            if box.clickedButton() != ok:
+            ok, include_notes = confirm_remote_ai_consent(
+                self, host, is_refinement=self._is_refinement(template_id), batch=True,
+            )
+            if not ok:
                 return
             self._ctrl.confirm_remote_host(host)
-        template_id = str(self._config.get("meeting.template_id", "general") or "general")
-        queued, skipped = self._ctrl.enqueue_minutes(ids, template_id=template_id)
+        kw = {"include_user_notes": include_notes} if include_notes is not None else {}
+        queued, skipped = self._ctrl.enqueue_minutes(ids, template_id=template_id, **kw)
         if queued:
             tail = f"，跳过 {skipped} 场" if skipped else ""
             self._set_status(f"已排队生成 {queued} 场纪要{tail}")
@@ -1682,20 +1696,27 @@ class MeetingPage(QWidget):
         self._sync_media_buttons()
 
     def show_start_refusal(self, reason: str) -> None:
-        """Show why starting a meeting was refused in the browse status banner."""
+        """Show why starting a meeting was refused (inline on PAGE_START, else browse banner)."""
         text = (reason or "").strip()
         if not text:
+            return
+        if self._stack.currentIndex() == PAGE_START:
+            self.show_start_error_inline(text)
             return
         self._set_status(
             text if text.startswith("无法开始会议") else f"无法开始会议：{text}",
             tone="error",
         )
 
+    def show_start_error_inline(self, reason: str) -> None:
+        """Keep the user on PAGE_START with an inline ``尚未开始录音：{reason}`` banner."""
+        self._live_ui.show_start_error_inline(reason)
+
     def _preferred_tab_for_meeting(self, meeting_id: str) -> int | None:
         if not meeting_id:
             return None
         record = self._store.get_meeting(meeting_id)
-        if record is None or record.source not in (IMPORT_SOURCE, MEDIA_SOURCE):
+        if record is None or record.status == STATUS_LIVE:
             return None
         notes = self._store.get_notes(meeting_id)
         if notes is not None and notes.markdown:
@@ -1705,7 +1726,11 @@ class MeetingPage(QWidget):
         job = self._ctrl.queued_generation(meeting_id)
         if job is not None and not job.failed:
             return 0
-        return 1
+        if record.source in (IMPORT_SOURCE, MEDIA_SOURCE):
+            return 1
+        asr_fn = getattr(self._ctrl, "asr_failures", None)
+        has_asr_gaps = bool(callable(asr_fn) and asr_fn(meeting_id))
+        return 1 if (self._store.get_segments(meeting_id) or has_asr_gaps) else 0
 
     def _apply_landing_tab_for_meeting(self, meeting_id: str, *, from_list: bool) -> None:
         if self._editing_notes:
@@ -1756,6 +1781,7 @@ class MeetingPage(QWidget):
         self._detail_id = meeting_id
         self._notes_view.restore_reading_position(0)
         self._transcript_view.restore_reading_position(0)
+        self._apply_landing_tab_for_meeting(meeting_id, from_list=False)
         self._stack.setCurrentIndex(PAGE_BROWSE)
         self._start_btn.setVisible(True)
         if self._batch_mode:
@@ -1797,12 +1823,19 @@ class MeetingPage(QWidget):
             config=self._config,
         )
 
+    def _play_empty_meeting_audio(self) -> None:
+        if self._audio_player.audio_path:
+            self._audio_player.show()
+            self._audio_player.play()
+
     def _clear_detail(self, *, clear_status: bool = True) -> None:
         if not self._flush_bound_title(sync=True) or not self._save_notes_draft() or not self._save_record_notes():
             return
         self._audio_player.unload_source()
         self._audio_player.hide()
         self._detail_find_bar.hide()
+        self._integrity_banner.hide()
+        self._empty_speech_bar.hide()
         self._materials.hide()
         self._record_notes.blockSignals(True)
         self._record_notes.clear()
@@ -2016,6 +2049,12 @@ class MeetingPage(QWidget):
             action.triggered.connect(lambda _=False, sid=speaker_id: self._prompt_rename_speaker(sid))
         self._speaker_btn.setVisible(bool(speaker_ids))
         self._speaker_btn.setEnabled(not generating)
+        from sayink.ui.meeting_workspace_chrome import sync_detail_integrity_and_empty_state
+
+        sync_detail_integrity_and_empty_state(
+            self, record, segments,
+            has_audio=has_audio, configured=configured, markdown=markdown, generating=generating,
+        )
         self._sync_copy_action(notes)
         self._sync_content_hint(notes)
 
@@ -2206,12 +2245,16 @@ class MeetingPage(QWidget):
         self._fit_template_cluster()
         self._export_actions["notes"].setEnabled(has_notes)
         self._export_actions["transcript"].setEnabled(has_transcript)
+        if "srt" in self._export_actions:
+            self._export_actions["srt"].setEnabled(has_transcript and self._transcript_has_times)
         self._export_actions["all"].setEnabled(bool(self._detail_id))
 
     def _transcript_html(
         self, lines, names: dict[int, str], *, links: bool = False, highlight: int = -1, live: bool = False,
         show_speakers: bool = True, show_times: bool = True, label_unknown: bool = True, playable: bool = False,
     ) -> str:
+        from sayink.ui.meeting_workspace_chrome import splice_asr_gaps_into_html
+
         meeting_id = self._ctrl.current_id if live else self._detail_id
         sequences = self._live_transcript_sequences if live else self._transcript_sequences
         locked = self._live_locked_sequences if live else self._speaker_locked_sequences
@@ -2220,7 +2263,7 @@ class MeetingPage(QWidget):
             s.speaker_id for s in self._store.get_speakers(meeting_id)
             if s.suggested_name and not s.display_name and not s.name_locked
         } if links and meeting_id else set()
-        return build_transcript_html(
+        base_html = build_transcript_html(
             lines,
             names,
             links=links,
@@ -2238,6 +2281,10 @@ class MeetingPage(QWidget):
             label_unknown=label_unknown,
             playable=playable,
         )
+        rec = self._ctrl.current if live else (self._store.get_meeting(meeting_id) if meeting_id else None)
+        gap_fn = getattr(self._ctrl, "asr_gap_lines", None)
+        gaps = gap_fn(meeting_id, rec.started_at if rec is not None else 0) if (callable(gap_fn) and meeting_id and rec is not None) else []
+        return splice_asr_gaps_into_html(base_html, lines, gaps)
 
     def _on_notes_link(self, url) -> None:
         if url.scheme() == "ts" and url.path().isdigit():
@@ -2576,25 +2623,20 @@ class MeetingPage(QWidget):
         notes_before = self._store.get_notes(self._detail_id)
         if notes_before is not None and notes_before.user_edited and notes_before.markdown:
             self._drafts.user_markdown_backups[self._detail_id] = notes_before.markdown
+        from sayink.ui.meeting_workspace_chrome import confirm_remote_ai_consent
+
+        include_notes: bool | None = None
         host = self._ctrl.remote_host_needing_confirmation()
         if host:
-            box = QMessageBox(self)
-            box.setWindowTitle("发送到远端模型")
-            box.setIcon(QMessageBox.Icon.Question)
-            purpose = "整理原文" if self._is_refinement() else "生成纪要"
-            box.setText(f"这场会议的完整文字稿将发送到 {host} {purpose}。")
-            box.setInformativeText("不会发送音频。确认后本机记住该地址，之后不再询问。")
-            ok = box.addButton("发送并生成", QMessageBox.ButtonRole.AcceptRole)
-            box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
-            box.setDefaultButton(ok)
-            _style_dialog_box(box)
-            with _quiet_tooltips(self):
-                box.exec()
-            if box.clickedButton() != ok:
+            ok, include_notes = confirm_remote_ai_consent(
+                self, host, is_refinement=self._is_refinement(), batch=False,
+            )
+            if not ok:
                 return
             self._ctrl.confirm_remote_host(host)
         template_id = str(self._template_combo.currentData() or "general")
-        self._ctrl.generate(self._detail_id, template_id=template_id)
+        kw = {"include_user_notes": include_notes} if include_notes is not None else {}
+        self._ctrl.generate(self._detail_id, template_id=template_id, **kw)
 
     def _confirm_regenerate(self) -> bool:
         notes = self._store.get_notes(self._detail_id)
@@ -2865,9 +2907,8 @@ class MeetingPage(QWidget):
             self._follow_live_resize()
 
     def _sync_live_marks_height(self, has_marks: bool | None = None) -> None:
-        from sayink.ui.meeting_workspace_chrome import _sync_live_marks_height as _sync_marks
-
-        _sync_marks(self, has_marks)
+        from sayink.ui import meeting_workspace_chrome as mwc
+        mwc._sync_live_marks_height(self, has_marks)
 
     @property
     def is_compact_single_pane(self) -> bool:
@@ -2875,39 +2916,32 @@ class MeetingPage(QWidget):
         return bool(getattr(self, "_compact_single_pane", False))
 
     def show_compact_list(self) -> None:
-        from sayink.ui.meeting_workspace_chrome import show_compact_list as _show_compact_list
-
-        _show_compact_list(self)
+        from sayink.ui import meeting_workspace_chrome as mwc
+        mwc.show_compact_list(self)
 
     def show_compact_detail(self) -> None:
-        from sayink.ui.meeting_workspace_chrome import show_compact_detail as _show_compact_detail
-
-        _show_compact_detail(self)
+        from sayink.ui import meeting_workspace_chrome as mwc
+        mwc.show_compact_detail(self)
 
     def _on_compact_meeting_clicked(self, item: QListWidgetItem) -> None:
-        from sayink.ui.meeting_workspace_chrome import _on_compact_meeting_clicked as _on_compact_click
-
-        _on_compact_click(self, item)
+        from sayink.ui import meeting_workspace_chrome as mwc
+        mwc._on_compact_meeting_clicked(self, item)
 
     def _apply_compact_pane_visibility(self) -> None:
-        from sayink.ui.meeting_workspace_chrome import _apply_compact_pane_visibility as _apply_panes
-
-        _apply_panes(self)
+        from sayink.ui import meeting_workspace_chrome as mwc
+        mwc._apply_compact_pane_visibility(self)
 
     def sync_viewport_width(self, host_width: int | None = None) -> None:
-        from sayink.ui.meeting_workspace_chrome import sync_viewport_width as _sync_viewport_width
-
-        _sync_viewport_width(self, host_width)
+        from sayink.ui import meeting_workspace_chrome as mwc
+        mwc.sync_viewport_width(self, host_width)
 
     def _sync_responsive_layout(self) -> None:
-        from sayink.ui.meeting_workspace_chrome import _sync_responsive_layout as _sync_layout
-
-        _sync_layout(self)
+        from sayink.ui import meeting_workspace_chrome as mwc
+        mwc._sync_responsive_layout(self)
 
     def _follow_live_resize(self) -> None:
-        from sayink.ui.meeting_workspace_chrome import follow_live_resize
-
-        follow_live_resize(self)
+        from sayink.ui import meeting_workspace_chrome as mwc
+        mwc.follow_live_resize(self)
 
     def keyPressEvent(self, event) -> None:
         if event.matches(QKeySequence.StandardKey.Find):
@@ -3207,22 +3241,14 @@ class MeetingPage(QWidget):
             rows.append(("参会人", record.participants.strip()))
         return rows
 
-    def export_meeting_to_path(
-        self,
-        meeting_id: str,
-        path: str | Path,
-        *,
-        scope: str = "all",
-    ) -> bool:
+    def export_meeting_to_path(self, meeting_id: str, path: str | Path, *, scope: str = "all") -> bool:
         """Public contract writing ``meeting_id`` to ``path`` (.md, .docx, .txt, or .srt)."""
-        from sayink.ui.meeting_workspace_chrome import export_meeting_to_path as _export_to_path
-
-        return _export_to_path(self, meeting_id, path, scope=scope)
+        from sayink.ui import meeting_workspace_chrome as mwc
+        return mwc.export_meeting_to_path(self, meeting_id, path, scope=scope)
 
     def _export(self, scope: str = "all") -> None:
-        from sayink.ui.meeting_workspace_chrome import export_single_meeting
-
-        export_single_meeting(self, scope=scope)
+        from sayink.ui import meeting_workspace_chrome as mwc
+        mwc.export_single_meeting(self, scope=scope)
 
     def _delete(self) -> None:
         record = self._store.get_meeting(self._detail_id) if self._detail_id else None
@@ -3513,8 +3539,40 @@ class MeetingPage(QWidget):
     def _build_live(self) -> QWidget:
         return self._live_ui.build_live()
 
-    def show_start_card(self) -> None:
-        self._live_ui.show_start_card()
+    def show_start_card(self, *, reset: bool = False) -> None:
+        self._live_ui.show_start_card(reset=reset)
+
+    def reset_start_card(self) -> None:
+        self._live_ui.reset_start_card()
+
+    def current_view_mode(self) -> str:
+        return {PAGE_START: "start", PAGE_LIVE: "live"}.get(self._stack.currentIndex(), "browse")
+
+    def is_on_start_card(self) -> bool:
+        return self._stack.currentIndex() == PAGE_START
+
+    def start_card_values(self):
+        return self._live_ui.options_from_card()
+
+    def set_start_card_fields(self, **kwargs) -> None:
+        from sayink.ui import meeting_workspace_chrome as mwc
+        mwc.set_start_card_fields_ui(self, **kwargs)
+
+    def retry_unsaved_segments(self, meeting_id: str | None = None) -> tuple[bool, str]:
+        from sayink.ui import meeting_workspace_chrome as mwc
+        return mwc.retry_unsaved_segments_ui(self, meeting_id)
+
+    def select_meetings_for_batch(self, meeting_ids: list[str] | tuple[str, ...]) -> None:
+        from sayink.ui import meeting_workspace_chrome as mwc
+        mwc.select_meetings_for_batch_ui(self, meeting_ids)
+
+    def ui_state_snapshot(self) -> dict[str, object]:
+        from sayink.ui import meeting_workspace_chrome as mwc
+        return mwc.page_ui_snapshot(self)
+
+    trigger_generate = _generate
+    trigger_batch_generate = _generate_selected_meetings
+    trigger_export = _export
 
     def cancel_downloads(self) -> None:
         self._aux_dl.cancel()
@@ -3667,11 +3725,14 @@ class MeetingPage(QWidget):
     def _on_finalize_save_failed(self, meeting_id: str, message: str) -> None:
         self._import_ui.on_finalize_save_failed(meeting_id, message)
 
-    def _retry_finalize_save(self) -> None:
-        self._import_ui.retry_finalize_save()
+    def _retry_finalize_save(self, meeting_id: str | None = None) -> str | None:
+        return self._import_ui.retry_finalize_save(meeting_id)
 
-    def _discard_unsaved_finalize(self) -> None:
-        self._import_ui.discard_unsaved_finalize()
+    def _discard_unsaved_finalize(self, meeting_id: str | None = None) -> bool:
+        return self._import_ui.discard_unsaved_finalize(meeting_id)
+
+    retry_finalize_save = _retry_finalize_save
+    discard_unsaved_finalize = _discard_unsaved_finalize
 
     def _retry_failed_media(self) -> None:
         self._import_ui.retry_failed_media()

@@ -40,6 +40,26 @@ def reapply_theme(page: object) -> None:
                   page._materials_agenda, page._opt_loopback_hint, page._live_mic_label,
                   page._live_sys_label, page._live_find_status, page._detail_find_status):
         label.setStyleSheet(dim)
+    for opt_lbl in (getattr(page, "_opt_save_audio_hint", None),):
+        if opt_lbl is not None:
+            opt_lbl.setStyleSheet(dim)
+    start_err = getattr(page, "_start_error_banner", None)
+    if start_err is not None:
+        start_err.setStyleSheet(
+            f"color: {tok.RED_TEXT}; font-size: {tok.TYPE_FOOTNOTE}px; background: {tok.RED_BG};"
+            f" border: 1px solid {tok.RED}; border-radius: {tok.RADIUS_MD}px; padding: 6px 10px;"
+        )
+    integrity_banner = getattr(page, "_integrity_banner", None)
+    if integrity_banner is not None:
+        integrity_banner.setStyleSheet(
+            f"QFrame#meetingIntegrityBanner {{ background: {tok.AMBER_SOFT};"
+            f" border: 1px solid {tok.CALLOUT_BORDER}; border-radius: {tok.RADIUS_MD}px; }}"
+        )
+    integrity_label = getattr(page, "_integrity_label", None)
+    if integrity_label is not None:
+        integrity_label.setStyleSheet(
+            f"color: {tok.AMBER_TEXT}; font-size: {tok.TYPE_FOOTNOTE}px; background: transparent;"
+        )
     field_label_css = (
         f"color: {tok.TEXT_SEC}; font-size: {tok.TYPE_FOOTNOTE}px; font-weight: 700; background: transparent;"
     )
@@ -180,6 +200,9 @@ def reapply_theme(page: object) -> None:
         btn.setStyleSheet(ss.BTN_GHOST_SM)
     for extra_ghost in (
         getattr(page, "_finalize_retry_btn", None),
+        getattr(page, "_segment_retry_btn", None),
+        getattr(page, "_empty_play_btn", None),
+        getattr(page, "_empty_device_btn", None),
     ):
         if extra_ghost is not None:
             extra_ghost.setStyleSheet(ss.BTN_GHOST_SM)
@@ -543,28 +566,42 @@ def export_selected_meetings(page) -> None:
     page._set_status(f"已导出 {len(ids)} 场会议")
 
 
+def _notes_text_for_export(page, record) -> str:
+    if record.id == page._detail_id:
+        return page._current_notes_text()
+    notes = page._store.get_notes(record.id)
+    return notes.markdown if notes is not None else ""
+
+
+def _markdown_for_record_export_scope(page, record, scope: str) -> str:
+    if record.id == page._detail_id and scope in ("notes", "transcript", "all"):
+        return page._markdown_for_export_scope(record, scope)
+    if scope == "transcript":
+        return page._ctrl.export_transcript_markdown(record.id)
+    if scope == "notes":
+        return _notes_text_for_export(page, record)
+    return page._ctrl.export_markdown(record.id)
+
+
 def export_meeting_to_path(page, meeting_id: str, path, *, scope: str = "all") -> bool:
     from pathlib import Path
     from sayink.ui import meeting_page as mp
 
+    if scope not in ("notes", "transcript", "all", "srt"):
+        return False
     record = page._store.get_meeting(meeting_id)
     if record is None:
         return False
     target = Path(path)
     kind = mp._export_kind(str(target), "")
+    effective_scope = "transcript" if scope == "srt" else scope
+    if kind == "srt" and effective_scope == "notes":
+        return False
     try:
         if kind == "docx":
             from sayink.docx_io import write_docx_document
 
-            if meeting_id == page._detail_id:
-                body_md = page._markdown_for_export_scope(record, scope)
-            elif scope == "transcript":
-                body_md = page._ctrl.export_transcript_markdown(record.id)
-            elif scope == "notes":
-                notes = page._store.get_notes(record.id)
-                body_md = notes.markdown if notes is not None else ""
-            else:
-                body_md = page._ctrl.export_markdown(record.id)
+            body_md = _markdown_for_record_export_scope(page, record, effective_scope)
             write_docx_document(
                 target,
                 title=record.display_title,
@@ -573,12 +610,31 @@ def export_meeting_to_path(page, meeting_id: str, path, *, scope: str = "all") -
             )
             return True
         if kind == "srt":
+            _has_speakers, has_times = page._ctrl.transcript_shape(record)
+            if not has_times:
+                return False
             mp.atomic_write_text(target, page._ctrl.export_transcript_srt(record.id), encoding="utf-8")
             return True
         if kind == "txt":
-            mp.atomic_write_text(target, page._ctrl.transcript_text(record.id), encoding="utf-8")
+            if effective_scope == "notes":
+                text = _notes_text_for_export(page, record)
+            elif effective_scope == "transcript":
+                text = page._ctrl.transcript_text(record.id)
+            else:
+                notes_txt = _notes_text_for_export(page, record).rstrip()
+                supplement = page._ctrl.supplements_markdown(record.id).strip()
+                chunks = [
+                    part
+                    for part in (notes_txt, supplement, page._ctrl.transcript_text(record.id).rstrip())
+                    if part
+                ]
+                text = "\n\n".join(chunks)
+                if text and not text.endswith("\n"):
+                    text += "\n"
+            mp.atomic_write_text(target, text, encoding="utf-8")
             return True
-        mp.atomic_write_text(target, page._ctrl.export_markdown(record.id), encoding="utf-8")
+        body_md = _markdown_for_record_export_scope(page, record, effective_scope)
+        mp.atomic_write_text(target, body_md, encoding="utf-8")
         return True
     except OSError:
         return False
@@ -592,23 +648,37 @@ def export_single_meeting(page, scope: str = "all") -> None:
     record = page._store.get_meeting(page._detail_id) if page._detail_id else None
     if record is None:
         return
-    label = {"notes": page._result_label(), "transcript": "文字稿", "all": "完整会议记录"}[scope]
-    default = mp.export_save_path(
-        f"{mp.safe_filename(record.display_title)}-{label}-{mp._safe_dt(record.started_at).strftime('%Y%m%d')}.md"
-    )
-    filters = "Markdown (*.md);;Word 文档 (*.docx);;纯文本 (*.txt)"
-    if page._transcript_has_times:
-        filters += ";;SRT 字幕 (*.srt)"
+    if scope == "srt":
+        if not page._transcript_has_times:
+            page._set_status("这场文字稿没有时间戳，无法导出字幕")
+            return
+        label = "文字稿字幕"
+        default = mp.export_save_path(
+            f"{mp.safe_filename(record.display_title)}-{label}-{mp._safe_dt(record.started_at).strftime('%Y%m%d')}.srt"
+        )
+        filters = "SRT 字幕 (*.srt)"
+    else:
+        label = {"notes": page._result_label(), "transcript": "文字稿", "all": "完整会议记录"}[scope]
+        default = mp.export_save_path(
+            f"{mp.safe_filename(record.display_title)}-{label}-{mp._safe_dt(record.started_at).strftime('%Y%m%d')}.md"
+        )
+        filters = "Markdown (*.md);;Word 文档 (*.docx);;纯文本 (*.txt)"
+        if scope != "notes" and page._transcript_has_times:
+            filters += ";;SRT 字幕 (*.srt)"
     with mp.native_file_dialog(page):
         raw_path, selected = mp.QFileDialog.getSaveFileName(
             page, "导出" + label, default, filters,
         )
     if not raw_path:
         return
-    kind = mp._export_kind(raw_path, selected)
+    kind = "srt" if scope == "srt" else mp._export_kind(raw_path, selected)
+    if kind == "srt" and scope == "notes":
+        page._set_status("仅导出纪要不支持 SRT 字幕格式；如需字幕请选择「导出文字稿字幕 (.srt)」。", tone="error")
+        return
     if kind == "srt" and not page._transcript_has_times:
         page._set_status("这场文字稿没有时间戳，无法导出字幕")
         return
+    eff_scope = "transcript" if scope == "srt" else scope
     path = mp._with_export_suffix(raw_path, kind)
     if not page._confirm_export_overwrite_if_adjusted(raw_path, path):
         return
@@ -621,16 +691,16 @@ def export_single_meeting(page, scope: str = "all") -> None:
                 path,
                 title=record.display_title,
                 metadata_rows=page._docx_metadata_rows(record),
-                markdown_body=page._markdown_for_export_scope(record, scope),
+                markdown_body=page._markdown_for_export_scope(record, eff_scope),
             )
         elif kind == "srt":
             text = page._ctrl.export_transcript_srt(record.id)
             srt_note = getattr(page._ctrl, "srt_skip_note", "") or ""
             mp.atomic_write_text(path, text, encoding="utf-8")
         elif kind == "txt":
-            if scope == "notes":
+            if eff_scope == "notes":
                 text = page._current_notes_text()
-            elif scope == "transcript":
+            elif eff_scope == "transcript":
                 text = page._ctrl.transcript_text(record.id)
             else:
                 notes = page._current_notes_text().rstrip()
@@ -641,7 +711,7 @@ def export_single_meeting(page, scope: str = "all") -> None:
                     text += "\n"
             mp.atomic_write_text(path, text, encoding="utf-8")
         else:
-            text = page._markdown_for_export_scope(record, scope)
+            text = page._markdown_for_export_scope(record, eff_scope)
             mp.atomic_write_text(path, text, encoding="utf-8")
     except PermissionError as exc:
         mp.alert_error(page, "导出失败", f"目标文件可能正被其他程序占用，无法写入：{exc}")
@@ -652,5 +722,258 @@ def export_single_meeting(page, scope: str = "all") -> None:
     if kind == "srt":
         page._set_status(f"已导出文字稿字幕（{srt_note}）" if srt_note else "已导出文字稿字幕")
     else:
-        page._set_status("已导出" + label + ("（包含当前草稿）" if page._editing_notes and scope != "transcript" else ""))
+        page._set_status("已导出" + label + ("（包含当前草稿）" if page._editing_notes and eff_scope != "transcript" else ""))
+
+
+def confirm_remote_ai_consent(
+    page,
+    host: str,
+    *,
+    is_refinement: bool,
+    batch: bool = False,
+) -> tuple[bool, bool | None]:
+    from PyQt6.QtWidgets import QCheckBox
+    from sayink.ui import meeting_page as mp
+
+    box = mp.QMessageBox(page)
+    box.setWindowTitle("发送到远端模型")
+    box.setIcon(mp.QMessageBox.Icon.Question)
+    if batch:
+        if is_refinement:
+            lead = f"所选会议里还没有整理结果的文字稿、说话人称呼与自定义词汇将发送到 {host}。"
+        else:
+            lead = (
+                f"所选会议里还没有纪要的完整文字稿、会议标题、参会人、议程、"
+                f"时间标记、我的笔记、自定义词汇与说话人称呼将发送到 {host}。"
+            )
+    elif is_refinement:
+        lead = f"这场会议的文字稿、说话人称呼与自定义词汇将发送到 {host} 整理原文。"
+    else:
+        lead = (
+            f"这场会议的完整文字稿、会议标题、参会人、议程、时间标记、"
+            f"我的笔记、自定义词汇与说话人称呼将发送到 {host} 生成纪要。"
+        )
+    box.setText(lead)
+    box.setInformativeText("不会发送音频。确认后本机记住该地址，后续生成不再重复询问。")
+    notes_cb: QCheckBox | None = None
+    if not is_refinement:
+        notes_cb = QCheckBox("发送时包含「我的笔记」", page)
+        notes_cb.setChecked(True)
+        set_cb = getattr(box, "setCheckBox", None)
+        if callable(set_cb):
+            set_cb(notes_cb)
+    ok = box.addButton("发送并生成", mp.QMessageBox.ButtonRole.AcceptRole)
+    box.addButton("取消", mp.QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(ok)
+    mp._style_dialog_box(box)
+    with mp._quiet_tooltips(page):
+        box.exec()
+    if box.clickedButton() != ok:
+        return (False, None)
+    include_notes = bool(notes_cb.isChecked()) if notes_cb is not None else None
+    return (True, include_notes)
+
+
+def splice_asr_gaps_into_html(base_html: str, lines, gap_lines) -> str:
+    import html as html_mod
+    from sayink.ui import design_tokens as tok
+
+    if not gap_lines:
+        return base_html
+    gap_css = (
+        f"margin:6px 0; color:{tok.AMBER_TEXT}; font-size:{tok.TYPE_FOOTNOTE}px;"
+        f" font-weight:700;"
+    )
+    if not lines or not base_html:
+        return "".join(
+            f"<p style='{gap_css}'>{html_mod.escape(gap.text)}</p>" for gap in gap_lines
+        )
+    out = base_html
+    by_before_index: dict[int, list[str]] = {}
+    trailing: list[str] = []
+    for gap in gap_lines:
+        g_off = int(gap.offset_ms)
+        placed = False
+        for idx, line in enumerate(lines):
+            if int(line.offset_ms) > g_off:
+                by_before_index.setdefault(idx, []).append(
+                    f"<p style='{gap_css}'>{html_mod.escape(gap.text)}</p>"
+                )
+                placed = True
+                break
+        if not placed:
+            trailing.append(f"<p style='{gap_css}'>{html_mod.escape(gap.text)}</p>")
+    for idx in sorted(by_before_index.keys(), reverse=True):
+        anchor = f"<a name='seg{idx}'></a>"
+        pos = out.find(anchor)
+        if pos >= 0:
+            p_start = out.rfind("<p", 0, pos)
+            insert_at = p_start if p_start >= 0 else pos
+            out = out[:insert_at] + "".join(by_before_index[idx]) + out[insert_at:]
+    if trailing:
+        out += "".join(trailing)
+    return out
+
+
+def sync_detail_integrity_and_empty_state(
+    page,
+    record,
+    segments,
+    *,
+    has_audio: bool,
+    configured: bool,
+    markdown: str,
+    generating: bool,
+) -> None:
+    from sayink.meeting_store import STATUS_LIVE
+    from sayink.media_import import MEDIA_SOURCE
+    from sayink.transcript_import import IMPORT_SOURCE
+
+    banner = getattr(page, "_integrity_banner", None)
+    label = getattr(page, "_integrity_label", None)
+    retry_btn = getattr(page, "_segment_retry_btn", None)
+    if banner is not None and label is not None:
+        banner_fn = getattr(page._ctrl, "segment_integrity_banner_text", None)
+        text = (
+            str(banner_fn(record.id, has_saved_audio=has_audio, saved_segments=segments) or "").strip()
+            if callable(banner_fn) and record.status != STATUS_LIVE
+            else ""
+        )
+        label.setText(text)
+        banner.setVisible(bool(text))
+        if retry_btn is not None:
+            has_unsaved_fn = getattr(page._ctrl, "has_unsaved_segments", None)
+            retry_btn.setVisible(bool(text and callable(has_unsaved_fn) and has_unsaved_fn(record.id)))
+
+    empty_bar = getattr(page, "_empty_speech_bar", None)
+    play_btn = getattr(page, "_empty_play_btn", None)
+    device_btn = getattr(page, "_empty_device_btn", None)
+    is_live_recorded = record.source not in (IMPORT_SOURCE, MEDIA_SOURCE)
+    asr_fn = getattr(page._ctrl, "asr_failures", None)
+    unsaved_fn = getattr(page._ctrl, "has_unsaved_segments", None)
+    has_failures = bool(
+        (callable(asr_fn) and asr_fn(record.id))
+        or (callable(unsaved_fn) and unsaved_fn(record.id))
+    )
+    zero_spoken = (
+        is_live_recorded
+        and record.status != STATUS_LIVE
+        and len(segments) == 0
+        and not has_failures
+    )
+    if empty_bar is not None:
+        empty_bar.setVisible(zero_spoken and not page._editing_notes)
+        if play_btn is not None:
+            play_btn.setVisible(zero_spoken and has_audio)
+        if device_btn is not None:
+            device_btn.setVisible(zero_spoken)
+    if zero_spoken:
+        empty_msg = "本场未录到发言，暂无文字稿。"
+        if has_audio:
+            empty_msg += "可点击「回放本场录音」核对原始声音，或点击「检查音频设备」排查麦克风与电脑声回环设置。"
+        else:
+            empty_msg += "请点击「检查音频设备」排查麦克风或电脑声输出设备，确认未静音后再试。"
+        if not configured:
+            empty_msg += "\n后续生成纪要前可点击「配置 AI 接口」填写接口地址、密钥和模型，无需开启文字润色。"
+        page._transcript_view.setPlaceholderText("本场未录到发言")
+        if not markdown and not generating and not page._editing_notes:
+            page._notes_view.setPlaceholderText(empty_msg)
+            page._notes_empty.setText(empty_msg)
+            page._notes_stack.setCurrentWidget(page._notes_empty)
+    else:
+        page._transcript_view.setPlaceholderText("文字稿为空")
+
+
+def retry_unsaved_segments_ui(page, meeting_id: str | None = None) -> tuple[bool, str]:
+    mid = str(meeting_id or page._detail_id or "").strip()
+    retry_fn = getattr(page._ctrl, "retry_unsaved_segments", None)
+    if not mid or not callable(retry_fn):
+        return (True, "")
+    ok, msg = retry_fn(mid)
+    page.refresh()
+    if not ok:
+        page._set_status(msg or "仍有缺失片段未能写入数据库，请稍后重试。", tone="error")
+    elif msg:
+        page._set_status(msg)
+    else:
+        page._set_status("已补存缺失的文字稿片段。")
+    return (ok, msg)
+
+
+def set_start_card_fields_ui(
+    page,
+    *,
+    title: str | None = None,
+    participants: str | None = None,
+    agenda: str | None = None,
+    input_source: str | None = None,
+    language: str | None = None,
+) -> None:
+    if title is not None:
+        page._opt_title.setText(title)
+    if participants is not None:
+        page._opt_participants.setText(participants)
+    if agenda is not None:
+        page._opt_agenda.setPlainText(agenda)
+    if input_source is not None:
+        idx = page._opt_source.findData(input_source)
+        if idx >= 0:
+            page._opt_source.setCurrentIndex(idx)
+    if language is not None:
+        idx = page._opt_language.findData(language)
+        if idx >= 0:
+            page._opt_language.setCurrentIndex(idx)
+
+
+def page_ui_snapshot(page) -> dict[str, object]:
+    export_menu = {
+        k: (act.text(), act.isEnabled())
+        for k, act in getattr(page, "_export_actions", {}).items()
+    }
+    return {
+        "view_mode": page.current_view_mode(),
+        "active_tab": "transcript" if page._content_stack.currentIndex() == 1 else "notes",
+        "status_text": page._status_label.text() if not page._status_label.isHidden() else "",
+        "start_error": page._start_error_banner.text() if not page._start_error_banner.isHidden() else "",
+        "save_audio_hint": page._opt_save_audio_hint.text(),
+        "integrity_banner": page._integrity_label.text() if not page._integrity_banner.isHidden() else "",
+        "segment_retry_visible": not page._segment_retry_btn.isHidden(),
+        "empty_bar_visible": not page._empty_speech_bar.isHidden(),
+        "empty_play_visible": not page._empty_play_btn.isHidden(),
+        "empty_device_visible": not page._empty_device_btn.isHidden(),
+        "notes_empty_text": page._notes_empty.text(),
+        "transcript_placeholder": page._transcript_view.placeholderText(),
+        "transcript_text": page._transcript_view.toPlainText(),
+        "live_transcript_text": page._live_transcript.toPlainText(),
+        "live_dot_a11y": page._live_rec_dot.accessibleName(),
+        "live_dot_style": page._live_rec_dot.styleSheet(),
+        "live_clock_style": page._live_clock.styleSheet(),
+        "live_status_text": page._live_status.text() if not page._live_status.isHidden() else "",
+        "export_menu": export_menu,
+        "finalize_retry_visible": not page._finalize_retry_btn.isHidden(),
+        "finalize_retry_text": page._finalize_retry_btn.text(),
+        "finalize_retry_tooltip": page._finalize_retry_btn.toolTip(),
+    }
+
+
+def finish_page_refresh(page, *, has_records: bool, importing: bool) -> None:
+    if page.is_compact_single_pane:
+        page._apply_compact_pane_visibility()
+    else:
+        page._detail_pane.setVisible(has_records or page._editing_notes or importing)
+    if page._stack.currentIndex() == PAGE_LIVE and page._ctrl.is_active:
+        page._render_live()
+
+
+def select_meetings_for_batch_ui(page, meeting_ids: list[str] | tuple[str, ...]) -> None:
+    from PyQt6.QtCore import Qt
+
+    target = set(meeting_ids)
+    page._set_batch_mode(True)
+    for idx in range(page._list.count()):
+        item = page._list.item(idx)
+        if item is not None and item.data(Qt.ItemDataRole.UserRole) in target:
+            item.setSelected(True)
+    page._sync_batch_actions()
+
 
