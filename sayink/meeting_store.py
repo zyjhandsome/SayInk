@@ -73,6 +73,28 @@ def _format_local_ms(fmt: str, ts_ms: int, fallback: str = "01-01 00:00") -> str
         return fallback
 
 
+_MD_HEADER_TIME_RE = re.compile(r"^-\s*时间[：:]")
+
+
+def _patch_markdown_started_at(markdown: str, started_at_ms: int) -> str:
+    if not markdown:
+        return markdown
+    stamp = _format_local_ms("%Y-%m-%d %H:%M", started_at_ms, fallback="1970-01-01 00:00")
+    lines = markdown.splitlines(keepends=True)
+    changed = False
+    for idx, raw_line in enumerate(lines):
+        stripped = raw_line.strip()
+        if stripped.startswith("## "):
+            break
+        if _MD_HEADER_TIME_RE.match(stripped):
+            ending = "\r\n" if raw_line.endswith("\r\n") else ("\n" if raw_line.endswith("\n") else "")
+            updated = f"- 时间：{stamp}{ending}"
+            if updated != raw_line:
+                lines[idx] = updated
+                changed = True
+    return "".join(lines) if changed else markdown
+
+
 @dataclass(frozen=True)
 class MeetingRecord:
     id: str
@@ -1002,6 +1024,23 @@ class MeetingStore:
                     """,
                     (delta, meeting_id),
                 )
+            note_row = conn.execute(
+                "SELECT markdown, previous_markdown, user_markdown FROM meeting_notes WHERE meeting_id = ?",
+                (meeting_id,),
+            ).fetchone()
+            if note_row is not None:
+                cur_md = note_row[0] or ""
+                prev_md = note_row[1] or ""
+                usr_md = note_row[2] or ""
+                new_md = _patch_markdown_started_at(cur_md, new)
+                new_prev_md = _patch_markdown_started_at(prev_md, new)
+                new_usr_md = _patch_markdown_started_at(usr_md, new)
+                if (new_md, new_prev_md, new_usr_md) != (cur_md, prev_md, usr_md):
+                    conn.execute(
+                        "UPDATE meeting_notes SET markdown = ?, previous_markdown = ?, user_markdown = ? "
+                        "WHERE meeting_id = ?",
+                        (new_md, new_prev_md, new_usr_md, meeting_id),
+                    )
 
         self._write(_shift)
 

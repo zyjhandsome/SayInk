@@ -525,7 +525,9 @@ def build_markdown_system_prompt(
 MERGE_SYSTEM_PROMPT = (
     "你是会议纪要撰写助手。下面是同一场会议按时间顺序分块生成的若干份中间纪要（JSON）。"
     "请把它们合并成一份完整纪要：去重、统一措辞、补写整体摘要与发言人摘要；"
-    "保留每条的时间戳；不要新增中间纪要里没有的事实。\n"
+    "保留每条的时间戳；不要新增中间纪要与 <user_notes> 用户笔记之外的事实。"
+    "若提供有 <user_notes> 用户笔记且其中某条目未被任何中间纪要覆盖，允许并必须保留该条目并在末尾标注「（待核对）」，"
+    "严禁为其编造发言人、结论或时间戳。\n"
     "输出严格符合下面的 JSON schema，只输出一个 JSON 对象。\n\n"
     + JSON_SCHEMA_TEXT
 )
@@ -582,7 +584,13 @@ def extract_user_note_outline(notes_user: str) -> list[str]:
     return items
 
 
-def build_user_prompt(context: MeetingContext, transcript_text: str, *, chunk_label: str = "") -> str:
+def build_user_prompt(
+    context: MeetingContext,
+    transcript_text: str,
+    *,
+    chunk_label: str = "",
+    include_user_notes: bool = True,
+) -> str:
     head = ["会议信息："]
     head.append(f"- 标题：{context.title or '（未填写）'}")
     if context.started_at_text:
@@ -594,9 +602,9 @@ def build_user_prompt(context: MeetingContext, transcript_text: str, *, chunk_la
     notes = []
     for offset_ms, note in context.marks:
         notes.append(f"- [{format_timestamp(offset_ms)}] 标记{('：' + note) if note else ''}")
-    if context.notes_user.strip():
+    if include_user_notes and context.notes_user.strip():
         notes.append(USER_NOTES_OUTLINE_DIRECTIVE)
-        notes.append(context.notes_user.strip())
+        notes.append(f"<user_notes>\n{context.notes_user.strip()}\n</user_notes>")
     body = "\n".join(head)
     body += "\n\n用户标记与笔记：\n" + ("\n".join(notes) if notes else "（无）")
     label = f"（{chunk_label}）" if chunk_label else ""
@@ -604,8 +612,19 @@ def build_user_prompt(context: MeetingContext, transcript_text: str, *, chunk_la
     return body
 
 
-def build_merge_prompt(context: MeetingContext, partials: Sequence[dict[str, Any]]) -> str:
-    head = build_user_prompt(context, "（以下为中间纪要，不能补写其中没有的事实）") + "\n\n"
+def build_merge_prompt(
+    context: MeetingContext,
+    partials: Sequence[dict[str, Any]],
+    *,
+    include_user_notes: bool = True,
+) -> str:
+    has_notes = include_user_notes and bool(context.notes_user.strip())
+    placeholder = (
+        "（以下为各段中间纪要；除保留 <user_notes> 中未覆盖条目并标注「（待核对）」外，不能补写其中没有的事实）"
+        if has_notes
+        else "（以下为中间纪要，不能补写其中没有的事实）"
+    )
+    head = build_user_prompt(context, placeholder, include_user_notes=include_user_notes) + "\n\n"
     parts = []
     for index, partial in enumerate(partials, start=1):
         parts.append(f"中间纪要 {index}/{len(partials)}：\n{json.dumps(partial, ensure_ascii=False)}")

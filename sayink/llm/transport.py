@@ -17,6 +17,7 @@ from sayink.llm.endpoint import (
     http_client_options,
     http_stream_timeout,
     normalize_model_name,
+    redact_url_query_secrets,
     request_headers,
     thinking_payload_extra,
 )
@@ -141,6 +142,25 @@ class Cancellation:
         return asyncio.run(bound())
 
 
+def _scrub_exception_secrets(exc: BaseException) -> None:
+    if not exc.args:
+        return
+    scrubbed = tuple(redact_url_query_secrets(arg) if isinstance(arg, str) else arg for arg in exc.args)
+    if scrubbed != exc.args:
+        try:
+            exc.args = scrubbed
+        except Exception:
+            pass
+
+
+def _raise_redacted_for_status(response: Any) -> None:
+    try:
+        response.raise_for_status()
+    except Exception as exc:
+        _scrub_exception_secrets(exc)
+        raise
+
+
 def _handle_sync_post_error(
     response: Any,
     *,
@@ -159,7 +179,7 @@ def _handle_sync_post_error(
     adapted = adapt_chat_flags(body_error_message(err_body), token_parameter, include_temperature)
     if adapted is not None and adapted != (token_parameter, include_temperature):
         return "adapt", adapted[0], adapted[1]
-    raise LLMResponseError(http_status_message(code, err_body))
+    raise LLMResponseError(redact_url_query_secrets(http_status_message(code, err_body)))
 
 
 def chat_completion(
@@ -205,11 +225,17 @@ def chat_completion(
         try:
             response = client.post(url, headers=headers, json=payload)
         except transient as exc:
+            _scrub_exception_secrets(exc)
             if cancelled():
                 raise LLMCancelled() from exc
             if attempt == 2:
                 raise
-            log.warning("LLM %s 连接异常，%.1f 秒后重试一次: %s", label, retry_delay_sec, exc)
+            log.warning(
+                "LLM %s 连接异常，%.1f 秒后重试一次: %s",
+                label,
+                retry_delay_sec,
+                redact_url_query_secrets(str(exc)),
+            )
             time.sleep(retry_delay_sec)
             continue
         if cancelled():
@@ -260,7 +286,7 @@ def _handle_sync_stream_error(
         return "retry", token_parameter, include_temperature
     if cancelled():
         raise LLMCancelled()
-    raise LLMResponseError(http_status_message(code, err_body))
+    raise LLMResponseError(redact_url_query_secrets(http_status_message(code, err_body)))
 
 
 def stream_chat_completion(
@@ -336,11 +362,16 @@ def stream_chat_completion(
                 except TimeoutError as exc:
                     raise httpx_mod.TimeoutException(str(exc)) from exc
         except transient as exc:
+            _scrub_exception_secrets(exc)
             if cancelled():
                 raise LLMCancelled() from exc
             if attempt == 2:
                 raise
-            msg = "流式连接提前结束" if isinstance(exc, LLMBrokenStream) else f"连接异常: {exc}"
+            msg = (
+                "流式连接提前结束"
+                if isinstance(exc, LLMBrokenStream)
+                else f"连接异常: {redact_url_query_secrets(str(exc))}"
+            )
             log.warning("LLM %s %s，%.1f 秒后重试一次", label, msg, retry_delay_sec)
             time.sleep(retry_delay_sec)
     if downgrade:
@@ -526,7 +557,7 @@ async def async_completion(
                             response.status_code == 429 and not billing
                         )
                         if not retryable or attempts >= 2:
-                            response.raise_for_status()
+                            _raise_redacted_for_status(response)
                         delay = retry_after_seconds(response, retry_delay_sec * attempts)
                         retry_cause = f"HTTP {response.status_code}"
                         retry_reason = (
@@ -552,6 +583,7 @@ async def async_completion(
                         )
                         return text
             except transient as exc:
+                _scrub_exception_secrets(exc)
                 retry_cause, retry_reason = _classify_async_exception(exc, httpx_mod)
                 if attempts >= 2:
                     log.warning(
@@ -668,17 +700,19 @@ def test_endpoint_connection(
                 if outcome == "ok":
                     return True, msg
                 if outcome == "fail":
-                    return False, msg
+                    return False, redact_url_query_secrets(msg)
         return False, "连接失败: 未收到响应"
     except (httpx.TimeoutException, TimeoutError):
         return False, "连接超时"
     except httpx.HTTPStatusError as exc:
         resp = getattr(exc, "response", None)
-        return False, http_status_message(
-            getattr(resp, "status_code", None),
-            response_error_body(resp),
+        return False, redact_url_query_secrets(
+            http_status_message(
+                getattr(resp, "status_code", None),
+                response_error_body(resp),
+            )
         )
     except LLMResponseError as exc:
-        return False, str(exc)
+        return False, redact_url_query_secrets(str(exc))
     except Exception as exc:  # httpx / ssl / socket errors outside HTTPStatusError
-        return False, f"连接失败: {exc}"
+        return False, f"连接失败: {redact_url_query_secrets(str(exc))}"

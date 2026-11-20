@@ -193,16 +193,35 @@ def _classify_variant_entry(
     return (variant, term), ""
 
 
+def _conflict_reason_category(msg: str) -> str:
+    if "单字误写" in msg:
+        return "单字误写已忽略"
+    if "同名" in msg:
+        return "误写与术语同名"
+    if "同时指向" in msg:
+        return "误写指向多个术语"
+    if "包含" in msg:
+        return "误写被其他术语包含"
+    return "规则冲突"
+
+
 def _log_new_glossary_conflicts(conflicts: list[str]) -> None:
     if not conflicts:
         return
+    import hashlib
+
+    fresh: list[str] = []
     with _GLOSSARY_CONFLICT_LOCK:
         for msg in conflicts:
-            if msg not in _LOGGED_GLOSSARY_CONFLICTS:
+            digest = hashlib.blake2b(msg.encode("utf-8"), digest_size=8).hexdigest()
+            if digest not in _LOGGED_GLOSSARY_CONFLICTS:
                 if len(_LOGGED_GLOSSARY_CONFLICTS) > 512:
                     _LOGGED_GLOSSARY_CONFLICTS.clear()
-                _LOGGED_GLOSSARY_CONFLICTS.add(msg)
-                log.warning("词库冲突提示: %s", msg)
+                _LOGGED_GLOSSARY_CONFLICTS.add(digest)
+                fresh.append(msg)
+    if fresh:
+        reasons = "、".join(dict.fromkeys(_conflict_reason_category(m) for m in fresh))
+        log.warning("词库冲突提示: 已忽略 %d 条冲突规则（%s）", len(fresh), reasons)
 
 
 def glossary_variant_map_with_conflicts(
