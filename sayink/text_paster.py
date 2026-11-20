@@ -11,12 +11,16 @@ import pyperclip
 from PyQt6.QtCore import QTimer
 
 from sayink.platform.window_input import (
+    CONSOLE_HOST_EXES as _CONSOLE_HOST_EXES,
+    TERMINAL_APP_EXES as _TERMINAL_APP_EXES,
     TERMINAL_CTRL_SHIFT_V_EXES as _TERMINAL_CTRL_SHIFT_V_EXES,
     TERMINAL_SHIFT_INSERT_EXES as _TERMINAL_SHIFT_INSERT_EXES,
     _VK_MENU_MASK as _VK_MENU_MASK,
     get_foreground_window_win32 as _get_foreground_window_win32,
     held_stray_modifiers as _held_stray_modifiers,
     is_ctrl_physically_held as _is_ctrl_physically_held,
+    is_terminal_process,
+    normalize_process_exe,
     send_paste_shortcut_win32,
 )
 
@@ -24,21 +28,42 @@ log = logging.getLogger("SayInk")
 
 PASTE_DELAY_MS = 150
 VERIFY_AFTER_PASTE_MS = 120
-# Some apps read the clipboard lazily after Ctrl+V; restoring sooner can paste
-# the user's old clipboard instead of the transcript.
-RESTORE_CLIPBOARD_DELAY_MS = 500
+# Heavy Electron/Office/IDE targets can consume Ctrl+V lazily (>500ms); restoring
+# at 800ms prevents pasting the user's old clipboard instead of the transcript.
+RESTORE_CLIPBOARD_DELAY_MS = 800
+RESTORE_CLIPBOARD_RETRY_DELAY_MS = 150
+MAX_RESTORE_CLIPBOARD_RETRIES = 2
 # Hard cap on multi-format Win32 clipboard backup to prevent OOM on huge bitmaps.
 MAX_CLIPBOARD_SNAPSHOT_BYTES = 32 * 1024 * 1024
 
 _REAL_PYPERCLIP_COPY = pyperclip.copy
 _REAL_PYPERCLIP_PASTE = pyperclip.paste
 
-# Standard Win32 HGLOBAL-backed clipboard formats safe to snapshot & restore.
+# Standard Win32 HGLOBAL-backed clipboard formats safe to snapshot & restore,
+# plus GDI/handle/synthesized formats that must never be GlobalLock'd or re-set.
+_CF_TEXT = 1
+_CF_BITMAP = 2
+_CF_METAFILEPICT = 3
+_CF_OEMTEXT = 7
 _CF_DIB = 8
+_CF_PALETTE = 9
 _CF_UNICODETEXT = 13
+_CF_ENHMETAFILE = 14
 _CF_HDROP = 15
+_CF_LOCALE = 16
 _CF_DIBV5 = 17
 _STANDARD_SNAPSHOT_FORMATS = (_CF_UNICODETEXT, _CF_DIBV5, _CF_DIB, _CF_HDROP)
+_UNSAFE_STANDARD_FORMATS = frozenset(
+    {
+        _CF_TEXT,
+        _CF_BITMAP,
+        _CF_METAFILEPICT,
+        _CF_OEMTEXT,
+        _CF_PALETTE,
+        _CF_ENHMETAFILE,
+        _CF_LOCALE,
+    }
+)
 _NAMED_SNAPSHOT_FORMATS = (
     "PNG",
     "image/png",
@@ -46,8 +71,44 @@ _NAMED_SNAPSHOT_FORMATS = (
     "Rich Text Format",
     "Preferred DropEffect",
 )
+CLIPBOARD_EXCLUSION_FORMAT_NAMES = (
+    "ExcludeClipboardContentFromMonitorProcessing",
+    "CanIncludeInClipboardHistory",
+    "CanUploadToCloudClipboard",
+)
+_SKIPPED_REGISTERED_FORMAT_NAMES = frozenset(
+    {name.lower() for name in CLIPBOARD_EXCLUSION_FORMAT_NAMES}
+    | {
+        "clipboard viewer ignore",
+        "dataobject",
+        "ole private data",
+    }
+)
 _GMEM_MOVEABLE = 0x0002
 _GCS_COMPSTR = 0x0008
+_GWL_STYLE = -16
+_ES_READONLY = 0x0800
+_DESKTOP_SWITCHDESKTOP = 0x0100
+_ERROR_ACCESS_DENIED = 5
+_READONLY_EDIT_CLASSES = frozenset(
+    {
+        "edit",
+        "richedit",
+        "richedit20a",
+        "richedit20w",
+        "richedit50w",
+        "msftedit_class",
+    }
+)
+_TERMINAL_WINDOW_CLASSES = frozenset(
+    {
+        "CASCADIA_HOSTING_WINDOW_CLASS",
+        "mintty",
+        "PuTTY",
+        "ConsoleWindowClass",
+        "PseudoConsoleWindow",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -58,6 +119,7 @@ class PasteTargetSnapshot:
     focus_hwnd: int = 0
     title_digest: str = ""
     captured_at: float = 0.0
+    desktop_locked: bool = False
 
 
 @dataclass
@@ -68,8 +130,11 @@ class ClipboardSnapshot:
     text_fallback: str | None = None
     use_win32: bool = False
     oversized: bool = False
+    open_failed: bool = False
 
     def __bool__(self) -> bool:
+        if self.open_failed or self.oversized:
+            return False
         if self.use_win32:
             return bool(self.win32_entries)
         return bool(self.text_fallback)
@@ -369,19 +434,71 @@ def _get_gui_focus_hwnd(hwnd: int) -> int:
         return 0
 
 
+def _is_desktop_locked() -> bool:
+    """True when the active Windows input desktop is locked (Win+L) or UAC secure desktop."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        user32.OpenInputDesktop.restype = wintypes.HANDLE
+        user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+        user32.CloseDesktop.restype = wintypes.BOOL
+
+        hdesk = user32.OpenInputDesktop(0, False, _DESKTOP_SWITCHDESKTOP)
+        if hdesk:
+            user32.CloseDesktop(hdesk)
+            return False
+        return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+    except Exception:
+        return False
+
+
 def build_paste_target_snapshot(info: tuple) -> PasteTargetSnapshot:
+    locked = _is_desktop_locked()
     if not info:
-        return PasteTargetSnapshot(hwnd=0)
+        return PasteTargetSnapshot(hwnd=0, desktop_locked=locked)
     hwnd = int(info[0] or 0)
     title = str(info[1] or "") if len(info) >= 2 else ""
     if not hwnd:
-        return PasteTargetSnapshot(hwnd=0)
+        return PasteTargetSnapshot(hwnd=0, desktop_locked=locked)
     return PasteTargetSnapshot(
         hwnd=hwnd,
         focus_hwnd=_get_gui_focus_hwnd(hwnd),
         title_digest=_hash_window_title(title),
         captured_at=time.monotonic(),
+        desktop_locked=locked,
     )
+
+
+def capture_paste_target_snapshot(hwnd: int | None = None) -> PasteTargetSnapshot | None:
+    """Capture an immutable ``PasteTargetSnapshot`` without mutating global state."""
+    if hwnd is not None:
+        target = int(hwnd or 0)
+        if target <= 0:
+            return None
+        info = get_foreground_window_info()
+        if info and int(info[0] or 0) == target:
+            if TextPaster.is_own_window(info):
+                return None
+            return build_paste_target_snapshot(info)
+        return PasteTargetSnapshot(
+            hwnd=target,
+            focus_hwnd=_get_gui_focus_hwnd(target),
+            title_digest="",
+            captured_at=time.monotonic(),
+            desktop_locked=_is_desktop_locked(),
+        )
+    info = get_foreground_window_info()
+    if not info:
+        return None
+    fg_hwnd = int(info[0] or 0)
+    if not fg_hwnd or TextPaster.is_own_window(info):
+        return None
+    return build_paste_target_snapshot(info)
 
 
 def remember_paste_target(info: tuple | PasteTargetSnapshot | None = None) -> PasteTargetSnapshot:
@@ -392,6 +509,7 @@ def remember_paste_target(info: tuple | PasteTargetSnapshot | None = None) -> Pa
             focus_hwnd=info.focus_hwnd,
             title_digest=info.title_digest,
             captured_at=info.captured_at or time.monotonic(),
+            desktop_locked=info.desktop_locked,
         )
     else:
         resolved = get_foreground_window_info() if info is None else info
@@ -429,17 +547,33 @@ def get_remembered_paste_target(hwnd: int) -> PasteTargetSnapshot | None:
 def detect_session_change(
     before: PasteTargetSnapshot | None,
     after: PasteTargetSnapshot | None,
-) -> bool:
-    """True when same top-level HWND switched child focus or chat/tab title."""
+    *,
+    check_subfocus: bool = True,
+) -> str:
+    """Classify focus/session transitions; returns ``''`` when safe to paste.
+
+    Never aborts solely because ``title_digest`` changed (editor dirty ``*``
+    markers, IM unread ``(1)`` badges, or shell OSC title updates) when ``hwnd``
+    and (if ``check_subfocus`` is True) ``focus_hwnd`` still match.
+    """
     if before is None or after is None:
-        return False
-    if not before.hwnd or before.hwnd != after.hwnd:
-        return False
-    if before.focus_hwnd and after.focus_hwnd and before.focus_hwnd != after.focus_hwnd:
-        return True
-    if before.title_digest and after.title_digest and before.title_digest != after.title_digest:
-        return True
-    return False
+        return ""
+    if before.desktop_locked != after.desktop_locked or after.desktop_locked:
+        return "session_changed"
+    if not before.hwnd:
+        return ""
+    if before.hwnd != after.hwnd:
+        if after.hwnd == 0 and _is_desktop_locked():
+            return "session_changed"
+        return "focus_changed"
+    if (
+        check_subfocus
+        and before.focus_hwnd
+        and after.focus_hwnd
+        and before.focus_hwnd != after.focus_hwnd
+    ):
+        return "subfocus_changed"
+    return ""
 
 
 _IME_POPUP_CLASSES = (
@@ -570,6 +704,17 @@ def _get_window_class_name(hwnd: int) -> str:
     if sys.platform != "win32" or not hwnd:
         return ""
     try:
+        import ctypes
+
+        windll_u32 = getattr(getattr(ctypes, "windll", None), "user32", None)
+        get_cls = getattr(windll_u32, "GetClassNameW", None) if windll_u32 is not None else None
+        if get_cls is not None and not isinstance(windll_u32, getattr(ctypes, "WinDLL", ())):
+            buf = ctypes.create_unicode_buffer(256)
+            nlen = int(get_cls(int(hwnd), buf, len(buf)) or 0)
+            return str(buf.value[:nlen] if nlen > 0 else buf.value or "")
+    except Exception:
+        pass
+    try:
         import win32gui
 
         cls_fn = getattr(win32gui, "GetClassName", None)
@@ -577,7 +722,56 @@ def _get_window_class_name(hwnd: int) -> str:
             return str(cls_fn(int(hwnd)) or "")
     except Exception:
         pass
-    return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32")
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetClassNameW.restype = ctypes.c_int
+        buf = ctypes.create_unicode_buffer(256)
+        nlen = int(user32.GetClassNameW(wintypes.HWND(int(hwnd)), buf, len(buf)) or 0)
+        return str(buf.value[:nlen]) if nlen > 0 else ""
+    except Exception:
+        return ""
+
+
+def _get_win32_window_style(hwnd: int) -> int:
+    if sys.platform != "win32" or not hwnd:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        windll_u32 = getattr(getattr(ctypes, "windll", None), "user32", None)
+        if windll_u32 is not None and not isinstance(windll_u32, getattr(ctypes, "WinDLL", ())):
+            get_long = getattr(windll_u32, "GetWindowLongW", None)
+            if callable(get_long):
+                return int(get_long(int(hwnd), _GWL_STYLE) or 0)
+        user32 = ctypes.WinDLL("user32")
+        user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetWindowLongW.restype = wintypes.LONG
+        return int(user32.GetWindowLongW(wintypes.HWND(int(hwnd)), _GWL_STYLE) or 0)
+    except Exception:
+        return 0
+
+
+def is_native_readonly_edit(hwnd: int, focus_hwnd: int = 0) -> bool:
+    """Zero-IPC Win32 ``ES_READONLY`` check strictly for classic ``Edit``/``RichEdit*`` controls.
+
+    Never invokes cross-process UI Automation and never blocks terminals,
+    browsers, Electron/WPF apps, or custom widgets.
+    """
+    check_hwnd = int(focus_hwnd or hwnd or 0)
+    if sys.platform != "win32" or not check_hwnd:
+        return False
+    cls_lower = _get_window_class_name(check_hwnd).strip().lower()
+    if not cls_lower:
+        return False
+    if cls_lower in _READONLY_EDIT_CLASSES or cls_lower.startswith("richedit"):
+        style = _get_win32_window_style(check_hwnd)
+        return bool(style & _ES_READONLY)
+    return False
 
 
 def _extract_hwnd(info: tuple | int | None) -> int:
@@ -592,12 +786,67 @@ def detect_terminal_paste_mode(info: tuple | int, target_app: str = "") -> str:
     """Identify terminal windows and return 'ctrl_shift_v', 'shift_insert', or 'ctrl_v'."""
     hwnd = _extract_hwnd(info)
     cls_name = _get_window_class_name(hwnd)
-    exe_lower = (target_app or "").strip().lower()
+    exe_lower = normalize_process_exe(target_app)
     if cls_name == "CASCADIA_HOSTING_WINDOW_CLASS" or exe_lower in _TERMINAL_CTRL_SHIFT_V_EXES:
         return "ctrl_shift_v"
-    if cls_name in ("mintty", "PuTTY") or exe_lower in _TERMINAL_SHIFT_INSERT_EXES:
+    if (
+        cls_name in ("mintty", "PuTTY", "ConsoleWindowClass", "PseudoConsoleWindow")
+        or exe_lower in _TERMINAL_SHIFT_INSERT_EXES
+        or exe_lower in _CONSOLE_HOST_EXES
+    ):
         return "shift_insert"
     return "ctrl_v"
+
+
+def is_terminal_paste_target(info: tuple | int | None, target_app: str = "") -> bool:
+    """True when ``target_app`` or window class is any terminal/console host."""
+    exe_lower = normalize_process_exe(target_app)
+    if exe_lower in _CONSOLE_HOST_EXES or exe_lower in _TERMINAL_APP_EXES or is_terminal_process(target_app):
+        return True
+    hwnd = _extract_hwnd(info)
+    if hwnd and _get_window_class_name(hwnd) in _TERMINAL_WINDOW_CLASSES:
+        return True
+    return False
+
+
+def _is_safe_snapshot_format(fmt_int: int, format_name: str) -> bool:
+    """True when ``fmt_int`` is a safe HGLOBAL format (not GDI/handle/synthesized/OLE internal)."""
+    if fmt_int in _UNSAFE_STANDARD_FORMATS:
+        return False
+    if 0x0080 <= fmt_int <= 0x008F:  # CF_OWNERDISPLAY / CF_DSP*
+        return False
+    if 0x0200 <= fmt_int <= 0x03FF:  # CF_PRIVATE* / CF_GDIOBJ*
+        return False
+    if fmt_int < 0xC000:
+        return fmt_int in _STANDARD_SNAPSHOT_FORMATS
+    if fmt_int > 0xFFFF or not format_name:
+        return False
+    return format_name.lower() not in _SKIPPED_REGISTERED_FORMAT_NAMES
+
+
+def _set_win32_clipboard_exclusion_formats(ctypes_mod, user32, kernel32) -> None:
+    """Mark clipboard write transient so Win+V history and Cloud Clipboard ignore it."""
+    register_fn = getattr(user32, "RegisterClipboardFormatW", None)
+    if not callable(register_fn):
+        return
+    zero_dword = b"\x00\x00\x00\x00"
+    for fmt_name in CLIPBOARD_EXCLUSION_FORMAT_NAMES:
+        fmt_id = int(register_fn(fmt_name) or 0)
+        if fmt_id <= 0:
+            continue
+        hmem = kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(zero_dword))
+        if not hmem:
+            continue
+        ptr = kernel32.GlobalLock(hmem)
+        if not ptr:
+            kernel32.GlobalFree(hmem)
+            continue
+        try:
+            ctypes_mod.memmove(ptr, zero_dword, len(zero_dword))
+        finally:
+            kernel32.GlobalUnlock(hmem)
+        if not user32.SetClipboardData(fmt_id, hmem):
+            kernel32.GlobalFree(hmem)
 
 
 def _win32_clipboard_apis():
@@ -652,7 +901,7 @@ def get_win32_clipboard_sequence_number() -> int | None:
 
 
 def capture_win32_clipboard_snapshot(max_bytes: int = MAX_CLIPBOARD_SNAPSHOT_BYTES) -> ClipboardSnapshot:
-    """Capture supported multi-format Win32 HGLOBAL clipboard payloads up to ``max_bytes``."""
+    """Capture safe multi-format & custom HGLOBAL Win32 clipboard payloads up to ``max_bytes``."""
     snap = ClipboardSnapshot(use_win32=True)
     if sys.platform != "win32":
         return snap
@@ -664,10 +913,9 @@ def capture_win32_clipboard_snapshot(max_bytes: int = MAX_CLIPBOARD_SNAPSHOT_BYT
             break
         time.sleep(0.01 * (attempt + 1))
     if not opened:
+        snap.open_failed = True
         return snap
 
-    allowed_names = {name.lower() for name in _NAMED_SNAPSHOT_FORMATS}
-    allowed_standard = set(_STANDARD_SNAPSHOT_FORMATS)
     total_bytes = 0
     try:
         fmt = user32.EnumClipboardFormats(0)
@@ -680,15 +928,12 @@ def capture_win32_clipboard_snapshot(max_bytes: int = MAX_CLIPBOARD_SNAPSHOT_BYT
             seen_formats.add(fmt_int)
 
             format_name = ""
-            keep = fmt_int in allowed_standard
             if fmt_int >= 0xC000:
                 name_buf = ctypes.create_unicode_buffer(256)
                 nlen = user32.GetClipboardFormatNameW(fmt_int, name_buf, len(name_buf))
                 if nlen > 0:
                     format_name = name_buf.value
-                    if format_name.lower() in allowed_names:
-                        keep = True
-            if not keep:
+            if not _is_safe_snapshot_format(fmt_int, format_name):
                 continue
 
             handle = user32.GetClipboardData(fmt_int)
@@ -699,7 +944,7 @@ def capture_win32_clipboard_snapshot(max_bytes: int = MAX_CLIPBOARD_SNAPSHOT_BYT
                 continue
             if total_bytes + size > max_bytes:
                 snap.oversized = True
-                log.info("原剪贴板内容超过 %d MB 安全上限，跳过超限格式备份", max_bytes // (1024 * 1024))
+                log.info("原剪贴板内容超过 %d MB 安全上限，跳过覆写恢复以防破坏原剪贴板", max_bytes // (1024 * 1024))
                 continue
             ptr = kernel32.GlobalLock(handle)
             if not ptr:
@@ -718,9 +963,21 @@ def capture_win32_clipboard_snapshot(max_bytes: int = MAX_CLIPBOARD_SNAPSHOT_BYT
     return snap
 
 
-def restore_win32_clipboard_snapshot(snapshot: ClipboardSnapshot) -> bool:
+snapshot_win32_clipboard = capture_win32_clipboard_snapshot
+
+
+def restore_win32_clipboard_snapshot(
+    snapshot: ClipboardSnapshot,
+    *,
+    exclude_from_history: bool = True,
+) -> bool:
     """Restore a multi-format Win32 ``ClipboardSnapshot`` atomically."""
-    if sys.platform != "win32" or not snapshot.win32_entries:
+    if (
+        sys.platform != "win32"
+        or snapshot.open_failed
+        or snapshot.oversized
+        or not snapshot.win32_entries
+    ):
         return False
     ctypes, user32, kernel32 = _win32_clipboard_apis()
     opened = False
@@ -766,19 +1023,61 @@ def restore_win32_clipboard_snapshot(snapshot: ClipboardSnapshot) -> bool:
                 restored_any = True
             else:
                 kernel32.GlobalFree(hmem)
+        if restored_any and exclude_from_history:
+            _set_win32_clipboard_exclusion_formats(ctypes, user32, kernel32)
     finally:
         user32.CloseClipboard()
     return restored_any
 
 
-def get_foreground_process_name() -> str:
+def set_win32_clipboard_text(text: str, *, exclude_from_history: bool = False) -> bool:
+    """Write ``CF_UNICODETEXT`` via Win32 clipboard APIs with optional Win+V/cloud exclusion."""
+    if sys.platform != "win32":
+        raise OSError("Win32 clipboard API unavailable off Windows")
+    ctypes, user32, kernel32 = _win32_clipboard_apis()
+    opened = False
+    for attempt in range(3):
+        if user32.OpenClipboard(None):
+            opened = True
+            break
+        if attempt < 2:
+            time.sleep(0.015 * (attempt + 1))
+    if not opened:
+        raise RuntimeError("OpenClipboard temporarily locked")
+
+    payload = text.encode("utf-16-le") + b"\x00\x00"
+    try:
+        if not user32.EmptyClipboard():
+            raise RuntimeError("EmptyClipboard failed")
+        hmem = kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(payload))
+        if not hmem:
+            raise MemoryError("GlobalAlloc failed for clipboard text")
+        ptr = kernel32.GlobalLock(hmem)
+        if not ptr:
+            kernel32.GlobalFree(hmem)
+            raise MemoryError("GlobalLock failed for clipboard text")
+        try:
+            ctypes.memmove(ptr, payload, len(payload))
+        finally:
+            kernel32.GlobalUnlock(hmem)
+        if not user32.SetClipboardData(_CF_UNICODETEXT, hmem):
+            kernel32.GlobalFree(hmem)
+            raise RuntimeError("SetClipboardData(CF_UNICODETEXT) failed")
+        if exclude_from_history:
+            _set_win32_clipboard_exclusion_formats(ctypes, user32, kernel32)
+    finally:
+        user32.CloseClipboard()
+    return True
+
+
+def get_foreground_process_name(*, remember_target: bool = True) -> str:
     """Return foreground process basename only (D4 privacy: no window title).
 
-    Also records a privacy-safe target snapshot (focus HWND + title hash) so
-    later ``paste_async`` can detect chat/tab switches within the same HWND.
+    Records legacy global snapshot only when ``remember_target=True``.
     """
     info = get_foreground_window_info()
-    remember_paste_target(info)
+    if remember_target:
+        remember_paste_target(info)
     return _process_name_from_window_info(info)
 
 
@@ -809,17 +1108,33 @@ def _verify_paste_target(hwnd_before: int) -> bool:
 class TextPaster:
     OWN_TITLES: ClassVar[set[str]] = {"SayInk 设置", "SayInk"}
 
-    def __init__(self, restore_clipboard: bool = False):
+    def __init__(self, restore_clipboard: bool = False, *, keep_on_unverified: bool = False):
         self.restore_clipboard = restore_clipboard
+        self.keep_on_unverified = keep_on_unverified
         self._paste_seq = 0
         # The user's own clipboard while a delayed restore has not run yet;
         # the next paste must not mistake the previous transcript for it.
         self._saved_snapshot: ClipboardSnapshot | None = None
         self._restore_expected: tuple[int | None, str] | None = None
+        self._last_fallback_seq_num: int | None = None
+        self._last_fallback_text: str = ""
+
+    @property
+    def _restore_snapshot(self) -> ClipboardSnapshot | None:
+        return self._saved_snapshot
+
+    @_restore_snapshot.setter
+    def _restore_snapshot(self, value: ClipboardSnapshot | None) -> None:
+        self._saved_snapshot = value
 
     def _clear_clipboard_restore(self) -> None:
         self._saved_snapshot = None
         self._restore_expected = None
+
+    def reset_fallback_accumulator(self) -> None:
+        """Clear consecutive continuous-mode clipboard fallback accumulation state."""
+        self._last_fallback_seq_num = None
+        self._last_fallback_text = ""
 
     def cancel(self) -> None:
         """Forget a paste whose shortcut has not been sent yet and clear pending restore."""
@@ -834,6 +1149,37 @@ class TextPaster:
             and pyperclip.paste is _REAL_PYPERCLIP_PASTE
         )
 
+    def _write_clipboard_text(self, text: str, *, exclude_from_history: bool) -> None:
+        if sys.platform == "win32" and pyperclip.copy is _REAL_PYPERCLIP_COPY:
+            set_win32_clipboard_text(text, exclude_from_history=exclude_from_history)
+            return
+        self._copy_clipboard_with_retry(text)
+
+    def _can_append_to_fallback_clipboard(self, append_fallback: bool) -> bool:
+        if not append_fallback or not self._last_fallback_text:
+            return False
+        current_seq = self._current_clipboard_seq()
+        if self._last_fallback_seq_num is not None and current_seq is not None:
+            return current_seq == self._last_fallback_seq_num
+        if self._last_fallback_seq_num is not None or current_seq is not None:
+            return False
+        try:
+            return pyperclip.paste() == self._last_fallback_text
+        except Exception:
+            return False
+
+    def _prepare_fallback_text(self, text: str, *, append_fallback: bool) -> str:
+        if self._can_append_to_fallback_clipboard(append_fallback):
+            return f"{self._last_fallback_text}\n{text}"
+        return text
+
+    def _record_fallback_clipboard(self, written_text: str, *, enabled: bool) -> None:
+        if not enabled:
+            self.reset_fallback_accumulator()
+            return
+        self._last_fallback_text = written_text
+        self._last_fallback_seq_num = self._current_clipboard_seq()
+
     def _capture_clipboard_snapshot(self) -> ClipboardSnapshot:
         if self._use_native_win32_clipboard():
             try:
@@ -847,13 +1193,14 @@ class TextPaster:
             old_text = None
         return ClipboardSnapshot(text_fallback=old_text, use_win32=False)
 
-    def _restore_clipboard_snapshot(self, snapshot: ClipboardSnapshot, expected_text: str) -> None:
+    def _restore_clipboard_snapshot(self, snapshot: ClipboardSnapshot, expected_text: str) -> bool:
         if snapshot.use_win32:
-            restore_win32_clipboard_snapshot(snapshot)
-            return
+            return bool(restore_win32_clipboard_snapshot(snapshot))
         if snapshot.text_fallback:
             if pyperclip.paste() == expected_text:
                 pyperclip.copy(snapshot.text_fallback)
+            return True
+        return False
 
     def _current_clipboard_seq(self) -> int | None:
         # The Win32 sequence is available even after pyperclip lazily replaces
@@ -906,6 +1253,9 @@ class TextPaster:
         info: tuple,
         target_hwnd: int | None,
         target_app: str | None,
+        *,
+        baseline_snapshot: PasteTargetSnapshot | None = None,
+        strict_subfocus: bool = True,
     ) -> tuple[int, str, bool, PasteTargetSnapshot | None, str, bool]:
         current_snapshot = build_paste_target_snapshot(info)
         if target_hwnd is None:
@@ -913,25 +1263,41 @@ class TextPaster:
             has_target = hwnd != 0 and not self._is_own_window(info)
             resolved_app = _process_name_from_window_info(info) if has_target else ""
             if not has_target:
+                if current_snapshot.desktop_locked:
+                    return hwnd, resolved_app, False, None, "session_changed", False
                 return hwnd, resolved_app, False, None, "", False
+            effective_baseline = baseline_snapshot or current_snapshot
+            change = detect_session_change(
+                effective_baseline, current_snapshot, check_subfocus=strict_subfocus
+            )
+            if change:
+                return hwnd, resolved_app, False, effective_baseline, change, False
             if _is_ime_composing(hwnd, current_snapshot.focus_hwnd):
-                return hwnd, resolved_app, False, current_snapshot, "ime_active", False
-            return hwnd, resolved_app, True, current_snapshot, "", False
+                return hwnd, resolved_app, False, effective_baseline, "ime_active", False
+            if is_native_readonly_edit(hwnd, current_snapshot.focus_hwnd):
+                return hwnd, resolved_app, False, effective_baseline, "readonly_target", False
+            return hwnd, resolved_app, True, effective_baseline, "", False
 
         hwnd = int(target_hwnd)
         resolved_app = target_app or ""
-        baseline = get_remembered_paste_target(hwnd) or current_snapshot
-        if hwnd == 0 or info[0] != hwnd:
-            skip = "focus_changed" if hwnd and info[0] != hwnd else ""
-            return hwnd, resolved_app, False, baseline, skip, False
+        baseline = baseline_snapshot or get_remembered_paste_target(hwnd) or PasteTargetSnapshot(hwnd=hwnd)
+        if hwnd == 0:
+            return hwnd, resolved_app, False, baseline, "", False
+        if current_snapshot.desktop_locked or (info[0] == 0 and _is_desktop_locked()):
+            return hwnd, resolved_app, False, baseline, "session_changed", False
+        if info[0] != hwnd:
+            return hwnd, resolved_app, False, baseline, "focus_changed", False
         if self._is_own_window(info):
             return hwnd, resolved_app, False, baseline, "", False
         if target_rejects_synthetic_input(info):
             return hwnd, resolved_app, False, baseline, "elevated", True
-        if detect_session_change(baseline, current_snapshot):
-            return hwnd, resolved_app, False, baseline, "session_changed", True
+        change = detect_session_change(baseline, current_snapshot, check_subfocus=strict_subfocus)
+        if change:
+            return hwnd, resolved_app, False, baseline, change, True
         if _is_ime_composing(hwnd, current_snapshot.focus_hwnd):
             return hwnd, resolved_app, False, baseline, "ime_active", True
+        if is_native_readonly_edit(hwnd, current_snapshot.focus_hwnd):
+            return hwnd, resolved_app, False, baseline, "readonly_target", True
         return hwnd, resolved_app, True, baseline, "", True
 
     def _prepare_clipboard_backup(self) -> ClipboardSnapshot | None:
@@ -941,6 +1307,9 @@ class TextPaster:
             old_snapshot = self._saved_snapshot
         else:
             old_snapshot = self._capture_clipboard_snapshot()
+        if old_snapshot is not None and not bool(old_snapshot):
+            self._saved_snapshot = None
+            return None
         self._saved_snapshot = old_snapshot
         return old_snapshot
 
@@ -948,15 +1317,24 @@ class TextPaster:
     def _recheck_target_before_send(
         hwnd: int,
         baseline_snapshot: PasteTargetSnapshot | None,
+        *,
+        strict_subfocus: bool = True,
     ) -> tuple[tuple, str]:
         info_now = get_foreground_window_info()
+        now_snapshot = build_paste_target_snapshot(info_now)
+        if now_snapshot.desktop_locked or (hwnd != 0 and info_now[0] == 0 and _is_desktop_locked()):
+            return info_now, "session_changed"
         if hwnd == 0 or info_now[0] != hwnd:
             return info_now, "focus_changed"
-        now_snapshot = build_paste_target_snapshot(info_now)
-        if detect_session_change(baseline_snapshot, now_snapshot):
-            return info_now, "session_changed"
+        change = detect_session_change(
+            baseline_snapshot, now_snapshot, check_subfocus=strict_subfocus
+        )
+        if change:
+            return info_now, change
         if _is_ime_composing(hwnd, now_snapshot.focus_hwnd):
             return info_now, "ime_active"
+        if is_native_readonly_edit(hwnd, now_snapshot.focus_hwnd):
+            return info_now, "readonly_target"
         return info_now, ""
 
     def _run_delayed_restore(
@@ -965,19 +1343,47 @@ class TextPaster:
         old_snapshot: ClipboardSnapshot | None,
         expected_clip_seq: int | None,
         text: str,
+        retry_count: int = 0,
     ) -> None:
         if seq != self._paste_seq:
             return
-        self._clear_clipboard_restore()
-        if old_snapshot is None:
+        if old_snapshot is None or not bool(old_snapshot):
+            self._clear_clipboard_restore()
             return
-        try:
-            if self._clipboard_paste_blocker(expected_clip_seq, text):
-                log.debug("剪贴板内容已变化或无法核对，跳过恢复旧剪贴板")
+        blocker = self._clipboard_paste_blocker(expected_clip_seq, text)
+        if blocker == "clipboard_changed":
+            log.debug("剪贴板内容已变化，跳过恢复旧剪贴板")
+            self._clear_clipboard_restore()
+            return
+        if blocker == "clipboard_unavailable":
+            if retry_count < MAX_RESTORE_CLIPBOARD_RETRIES:
+                QTimer.singleShot(
+                    RESTORE_CLIPBOARD_RETRY_DELAY_MS,
+                    lambda: self._run_delayed_restore(
+                        seq, old_snapshot, expected_clip_seq, text, retry_count + 1
+                    ),
+                )
                 return
-            self._restore_clipboard_snapshot(old_snapshot, text)
+            self._clear_clipboard_restore()
+            return
+
+        restored_ok = False
+        try:
+            restored_ok = self._restore_clipboard_snapshot(old_snapshot, text)
         except Exception:
-            log.debug("恢复原剪贴板失败", exc_info=True)
+            log.debug("恢复原剪贴板尝试失败 (retry=%d)", retry_count, exc_info=True)
+            restored_ok = False
+
+        if not restored_ok and retry_count < MAX_RESTORE_CLIPBOARD_RETRIES:
+            log.debug("原剪贴板恢复遇到占用，%d ms 后重试 (%d/%d)", RESTORE_CLIPBOARD_RETRY_DELAY_MS, retry_count + 1, MAX_RESTORE_CLIPBOARD_RETRIES)
+            QTimer.singleShot(
+                RESTORE_CLIPBOARD_RETRY_DELAY_MS,
+                lambda: self._run_delayed_restore(
+                    seq, old_snapshot, expected_clip_seq, text, retry_count + 1
+                ),
+            )
+            return
+        self._clear_clipboard_restore()
 
     def _run_delayed_verify(
         self,
@@ -987,6 +1393,7 @@ class TextPaster:
         old_snapshot: ClipboardSnapshot | None,
         expected_clip_seq: int | None,
         text: str,
+        keep_on_unverified: bool,
         finish: Callable[[PasteResult], None],
     ) -> None:
         if seq != self._paste_seq:
@@ -1000,12 +1407,33 @@ class TextPaster:
             finish(PasteResult("sent", target_app=target_app))
             return
         log.info("粘贴键已发出，但随后焦点切换，无法确认是否已插入")
-        detail = (
-            "clipboard_changed_after_send"
-            if self._clipboard_paste_blocker(expected_clip_seq, text)
-            else "focus_changed_after_send"
-        )
+        clip_changed = bool(self._clipboard_paste_blocker(expected_clip_seq, text))
+        detail = "clipboard_changed_after_send" if clip_changed else "focus_changed_after_send"
+        if (
+            self.restore_clipboard
+            and old_snapshot
+            and not keep_on_unverified
+            and not clip_changed
+        ):
+            QTimer.singleShot(
+                RESTORE_CLIPBOARD_DELAY_MS,
+                lambda: self._run_delayed_restore(seq, old_snapshot, expected_clip_seq, text),
+            )
         finish(PasteResult("unverified", target_app=target_app, detail=detail))
+
+    def _publish_delayed_fallback(
+        self,
+        text: str,
+        *,
+        prior_fallback: str,
+        append_fallback: bool,
+    ) -> None:
+        fallback_text = f"{prior_fallback}\n{text}" if (append_fallback and prior_fallback) else text
+        try:
+            self._write_clipboard_text(fallback_text, exclude_from_history=False)
+            self._record_fallback_clipboard(fallback_text, enabled=append_fallback)
+        except Exception:
+            log.debug("回退写入剪贴板（保留 Win+V）失败", exc_info=True)
 
     def _run_delayed_paste(
         self,
@@ -1013,6 +1441,10 @@ class TextPaster:
         hwnd: int,
         target_app: str,
         baseline_snapshot: PasteTargetSnapshot | None,
+        strict_subfocus: bool,
+        append_fallback: bool,
+        prior_fallback: str,
+        keep_on_unverified: bool,
         old_snapshot: ClipboardSnapshot | None,
         expected_clip_seq: int | None,
         text: str,
@@ -1021,29 +1453,55 @@ class TextPaster:
         global _ACTIVE_PASTE_MODE
         if seq != self._paste_seq:
             return
-        info_now, skip_now = self._recheck_target_before_send(hwnd, baseline_snapshot)
-        paste_mode = detect_terminal_paste_mode(info_now, target_app or "") if not skip_now else None
+        info_now, skip_now = self._recheck_target_before_send(
+            hwnd, baseline_snapshot, strict_subfocus=strict_subfocus
+        )
         clipboard_blocker = self._clipboard_paste_blocker(expected_clip_seq, text)
         if clipboard_blocker:
+            self.reset_fallback_accumulator()
             finish(PasteResult("skipped", target_app=target_app, detail=clipboard_blocker))
             return
+        if not skip_now and is_terminal_paste_target(info_now, target_app or ""):
+            stripped = text.rstrip("\r\n")
+            if "\r" in stripped or "\n" in stripped:
+                self._publish_delayed_fallback(
+                    stripped, prior_fallback=prior_fallback, append_fallback=append_fallback
+                )
+                finish(PasteResult("skipped", target_app=target_app, detail="terminal_multiline"))
+                return
         if skip_now:
-            finish(PasteResult("clipboard", target_app=target_app, detail=skip_now))
+            self._publish_delayed_fallback(
+                text, prior_fallback=prior_fallback, append_fallback=append_fallback
+            )
+            status = "skipped" if skip_now in ("readonly_target", "terminal_multiline") else "clipboard"
+            finish(PasteResult(status, target_app=target_app, detail=skip_now))
             return
+        paste_mode = detect_terminal_paste_mode(info_now, target_app or "")
         prev_mode = _ACTIVE_PASTE_MODE
         _ACTIVE_PASTE_MODE = paste_mode
         try:
             _paste_shortcut()
         except Exception as exc:
             log.warning("模拟粘贴失败: %s", exc)
+            self._publish_delayed_fallback(
+                text, prior_fallback=prior_fallback, append_fallback=append_fallback
+            )
             finish(PasteResult("clipboard", target_app=target_app))
             return
         finally:
             _ACTIVE_PASTE_MODE = prev_mode
+        self.reset_fallback_accumulator()
         QTimer.singleShot(
             VERIFY_AFTER_PASTE_MS,
             lambda: self._run_delayed_verify(
-                seq, hwnd, target_app, old_snapshot, expected_clip_seq, text, finish
+                seq,
+                hwnd,
+                target_app,
+                old_snapshot,
+                expected_clip_seq,
+                text,
+                keep_on_unverified,
+                finish,
             ),
         )
 
@@ -1054,34 +1512,92 @@ class TextPaster:
         *,
         target_hwnd: int | None = None,
         target_app: str | None = None,
+        baseline_snapshot: PasteTargetSnapshot | None = None,
+        strict_subfocus: bool = True,
+        append_fallback: bool = False,
+        keep_on_unverified: bool | None = None,
     ) -> None:
         """Copy text, synthesize paste after a short delay, and verify target focus."""
         if not text:
             callback(PasteResult("error", detail="空文本"))
             return
 
+        effective_keep_unverified = (
+            self.keep_on_unverified if keep_on_unverified is None else bool(keep_on_unverified)
+        )
         info = get_foreground_window_info()
         (
             hwnd,
             resolved_app,
             has_target,
-            baseline_snapshot,
+            resolved_baseline,
             skip_detail,
             checked_uipi,
-        ) = self._resolve_initial_paste_target(info, target_hwnd, target_app)
+        ) = self._resolve_initial_paste_target(
+            info,
+            target_hwnd,
+            target_app,
+            baseline_snapshot=baseline_snapshot,
+            strict_subfocus=strict_subfocus,
+        )
+
+        if has_target and not checked_uipi and target_rejects_synthetic_input(info):
+            log.info("目标窗口以更高权限运行，系统会拦截模拟粘贴；已复制到剪贴板")
+            has_target = False
+            skip_detail = "elevated"
+
+        if is_terminal_paste_target(hwnd or info, resolved_app):
+            text = text.rstrip("\r\n")
+            if not text:
+                callback(PasteResult("error", target_app=resolved_app, detail="空文本"))
+                return
+            if has_target and ("\r" in text or "\n" in text):
+                has_target = False
+                skip_detail = "terminal_multiline"
 
         self._paste_seq += 1
         seq = self._paste_seq
+
+        if not has_target:
+            self._clear_clipboard_restore()
+            fallback_text = self._prepare_fallback_text(text, append_fallback=append_fallback)
+            try:
+                self._write_clipboard_text(fallback_text, exclude_from_history=False)
+                self._record_fallback_clipboard(fallback_text, enabled=append_fallback)
+            except Exception as exc:
+                log.error("写入剪贴板失败: %s", exc)
+                callback(PasteResult("error", target_app=resolved_app, detail=str(exc)))
+                return
+            status = "skipped" if skip_detail in ("readonly_target", "terminal_multiline") else "clipboard"
+            callback(PasteResult(status, target_app=resolved_app or "", detail=skip_detail))
+            return
+
+        prior_fallback = (
+            self._last_fallback_text
+            if self._can_append_to_fallback_clipboard(append_fallback)
+            else ""
+        )
         old_snapshot = self._prepare_clipboard_backup()
 
         def finish(result: PasteResult) -> None:
-            restoring = bool(result.status == "sent" and self.restore_clipboard and old_snapshot)
+            restoring = bool(
+                self.restore_clipboard
+                and old_snapshot
+                and (
+                    result.status == "sent"
+                    or (
+                        result.status == "unverified"
+                        and not effective_keep_unverified
+                        and result.detail != "clipboard_changed_after_send"
+                    )
+                )
+            )
             if not restoring and seq == self._paste_seq:
                 self._clear_clipboard_restore()
             callback(result)
 
         try:
-            self._copy_clipboard_with_retry(text)
+            self._write_clipboard_text(text, exclude_from_history=True)
         except Exception as exc:
             log.error("写入剪贴板失败: %s", exc)
             finish(PasteResult("error", target_app=resolved_app, detail=str(exc)))
@@ -1090,25 +1606,129 @@ class TextPaster:
         expected_clip_seq = self._current_clipboard_seq()
         self._restore_expected = (expected_clip_seq, text) if old_snapshot else None
 
-        if not has_target:
-            finish(PasteResult("clipboard", target_app=resolved_app or "", detail=skip_detail))
-            return
-
-        if not checked_uipi and target_rejects_synthetic_input(info):
-            log.info("目标窗口以更高权限运行，系统会拦截模拟粘贴；已复制到剪贴板")
-            finish(PasteResult("clipboard", target_app=resolved_app, detail="elevated"))
-            return
-
         QTimer.singleShot(
             PASTE_DELAY_MS,
             lambda: self._run_delayed_paste(
                 seq,
                 hwnd,
                 resolved_app,
-                baseline_snapshot,
+                resolved_baseline,
+                strict_subfocus,
+                append_fallback,
+                prior_fallback,
+                effective_keep_unverified,
                 old_snapshot,
                 expected_clip_seq,
                 text,
                 finish,
             ),
         )
+
+    def paste(
+        self,
+        text: str,
+        *,
+        target_hwnd: int | None = None,
+        target_app: str | None = None,
+        baseline_snapshot: PasteTargetSnapshot | None = None,
+        strict_subfocus: bool = True,
+        append_fallback: bool = False,
+        keep_on_unverified: bool | None = None,
+    ) -> PasteResult:
+        """Synchronous paste entrypoint sharing target, terminal, readonly, and fallback policies."""
+        if not text:
+            return PasteResult("error", detail="空文本")
+
+        effective_keep_unverified = (
+            self.keep_on_unverified if keep_on_unverified is None else bool(keep_on_unverified)
+        )
+        info = get_foreground_window_info()
+        (
+            hwnd,
+            resolved_app,
+            has_target,
+            resolved_baseline,
+            skip_detail,
+            checked_uipi,
+        ) = self._resolve_initial_paste_target(
+            info,
+            target_hwnd,
+            target_app,
+            baseline_snapshot=baseline_snapshot,
+            strict_subfocus=strict_subfocus,
+        )
+        if has_target and not checked_uipi and target_rejects_synthetic_input(info):
+            has_target = False
+            skip_detail = "elevated"
+
+        if is_terminal_paste_target(hwnd or info, resolved_app):
+            text = text.rstrip("\r\n")
+            if not text:
+                return PasteResult("error", target_app=resolved_app, detail="空文本")
+            if has_target and ("\r" in text or "\n" in text):
+                has_target = False
+                skip_detail = "terminal_multiline"
+
+        self._paste_seq += 1
+        seq = self._paste_seq
+
+        if not has_target:
+            self._clear_clipboard_restore()
+            fallback_text = self._prepare_fallback_text(text, append_fallback=append_fallback)
+            try:
+                self._write_clipboard_text(fallback_text, exclude_from_history=False)
+                self._record_fallback_clipboard(fallback_text, enabled=append_fallback)
+            except Exception as exc:
+                return PasteResult("error", target_app=resolved_app, detail=str(exc))
+            status = "skipped" if skip_detail in ("readonly_target", "terminal_multiline") else "clipboard"
+            return PasteResult(status, target_app=resolved_app or "", detail=skip_detail)
+
+        prior_fallback = (
+            self._last_fallback_text
+            if self._can_append_to_fallback_clipboard(append_fallback)
+            else ""
+        )
+        old_snapshot = self._prepare_clipboard_backup()
+        try:
+            self._write_clipboard_text(text, exclude_from_history=True)
+        except Exception as exc:
+            self._clear_clipboard_restore()
+            return PasteResult("error", target_app=resolved_app, detail=str(exc))
+
+        expected_clip_seq = self._current_clipboard_seq()
+        self._restore_expected = (expected_clip_seq, text) if old_snapshot else None
+
+        global _ACTIVE_PASTE_MODE
+        paste_mode = detect_terminal_paste_mode(info, resolved_app or "")
+        prev_mode = _ACTIVE_PASTE_MODE
+        _ACTIVE_PASTE_MODE = paste_mode
+        try:
+            _paste_shortcut()
+        except Exception:
+            self._clear_clipboard_restore()
+            self._publish_delayed_fallback(
+                text, prior_fallback=prior_fallback, append_fallback=append_fallback
+            )
+            return PasteResult("clipboard", target_app=resolved_app)
+        finally:
+            _ACTIVE_PASTE_MODE = prev_mode
+
+        self.reset_fallback_accumulator()
+        if _verify_paste_target(hwnd):
+            if self.restore_clipboard and old_snapshot:
+                QTimer.singleShot(
+                    RESTORE_CLIPBOARD_DELAY_MS,
+                    lambda: self._run_delayed_restore(seq, old_snapshot, expected_clip_seq, text),
+                )
+            return PasteResult("sent", target_app=resolved_app)
+
+        clip_changed = bool(self._clipboard_paste_blocker(expected_clip_seq, text))
+        detail = "clipboard_changed_after_send" if clip_changed else "focus_changed_after_send"
+        if self.restore_clipboard and old_snapshot and not effective_keep_unverified and not clip_changed:
+            QTimer.singleShot(
+                RESTORE_CLIPBOARD_DELAY_MS,
+                lambda: self._run_delayed_restore(seq, old_snapshot, expected_clip_seq, text),
+            )
+        else:
+            self._clear_clipboard_restore()
+        return PasteResult("unverified", target_app=resolved_app, detail=detail)
