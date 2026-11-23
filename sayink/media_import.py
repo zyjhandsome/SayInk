@@ -11,6 +11,7 @@ from contextlib import closing
 from dataclasses import dataclass, replace
 import inspect
 from pathlib import Path
+import time
 from typing import Callable, Iterator
 
 import numpy as np
@@ -21,14 +22,15 @@ from sayink.audio_file_decoder import (
     probe_media_duration_ms,
 )
 from sayink.audio_utils import TARGET_SAMPLE_RATE
+from sayink.import_eta import ImportProgressSample
 
 MEDIA_SOURCE = "import_media"
 _SAMPLES_PER_MS = TARGET_SAMPLE_RATE // 1000
-# Reading the file is the short part of an import. The bar reserves the first
-# 30 points for decode and the rest for recognition, so a finished read is 30,
-# not 100. Callers must not leave the UI on that 30 with a "已读取" label.
-_READ_PROGRESS_BUDGET = 30
-_RECOGNITION_PROGRESS_BUDGET = 70
+# Decoding overlaps recognition, so the bar keeps only a sliver for the read
+# and leaves the last few points for speaker cleanup. 100 is completion.
+_READ_PROGRESS_BUDGET = 2
+_RECOGNITION_PROGRESS_BUDGET = 93
+_PROGRESS_BEFORE_FINALIZE = _READ_PROGRESS_BUDGET + _RECOGNITION_PROGRESS_BUDGET
 # Maximum ready VAD chunks held ahead of ASR at any time (~8 * <=15s < 8 MB RAM).
 _STREAM_CHUNK_WINDOW = 8
 
@@ -630,14 +632,17 @@ class _StreamingChunkSource:
 
 
 def _recognition_percent(index: int, fraction: float, count: int) -> int:
-    """Map chunk progress onto the 30–99 band. 100 is completion.
+    """Map chunk progress onto the recognition band. 100 is completion.
 
     ``index`` is 1-based and ``fraction`` is how far the current chunk has
     been decoded. Leading silence is not treated as work already done.
     """
     total = max(1, int(count))
     done = (max(1, int(index)) - 1) + max(0.0, min(1.0, float(fraction)))
-    return min(99, _READ_PROGRESS_BUDGET + int(_RECOGNITION_PROGRESS_BUDGET * done / total))
+    return min(
+        _PROGRESS_BEFORE_FINALIZE,
+        _READ_PROGRESS_BUDGET + int(_RECOGNITION_PROGRESS_BUDGET * done / total),
+    )
 
 
 def _streaming_percent(
@@ -654,10 +659,13 @@ def _streaming_percent(
         span = max(1, probed_samples - first_chunk_start)
         pos = int(chunk.start) + frac * max(0, int(chunk.stop) - int(chunk.start))
         ratio = max(0.0, min(0.99, (pos - first_chunk_start) / span))
-        return min(99, _READ_PROGRESS_BUDGET + int(_RECOGNITION_PROGRESS_BUDGET * ratio))
+        return min(_PROGRESS_BEFORE_FINALIZE, _READ_PROGRESS_BUDGET + int(_RECOGNITION_PROGRESS_BUDGET * ratio))
     done = (max(1, int(index)) - 1) + frac
     horizon = max(float(produced_count + 2), done + float(_STREAM_CHUNK_WINDOW))
-    return min(99, _READ_PROGRESS_BUDGET + int(_RECOGNITION_PROGRESS_BUDGET * (done / horizon)))
+    return min(
+        _PROGRESS_BEFORE_FINALIZE,
+        _READ_PROGRESS_BUDGET + int(_RECOGNITION_PROGRESS_BUDGET * (done / horizon)),
+    )
 
 
 def _decode_accepts_on_progress(fn) -> bool:
@@ -679,6 +687,97 @@ def _probe_import_samples(source: Path) -> int:
     return int(duration_ms * _SAMPLES_PER_MS) if duration_ms > 0 else 0
 
 
+def _cursor_ms(chunk: AudioChunk | None, fraction: float) -> int:
+    if chunk is None:
+        return 0
+    frac = max(0.0, min(1.0, float(fraction)))
+    span = max(0, int(chunk.stop) - int(chunk.start))
+    return int(int(chunk.start) + frac * span) // _SAMPLES_PER_MS
+
+
+def _publish_import_timeline(
+    timeline_cb: Callable[[ImportProgressSample], None] | None,
+    phase: str,
+    position_ms: int,
+    total_ms: int,
+    known: bool,
+    *,
+    read_percent: int = 0,
+) -> None:
+    if timeline_cb is None:
+        return
+    timeline_cb(
+        ImportProgressSample(
+            phase=phase,
+            wall_s=time.monotonic(),
+            audio_position_ms=max(0, int(position_ms)),
+            audio_total_ms=max(0, int(total_ms)),
+            duration_known=bool(known) and int(total_ms) > 0,
+            read_percent=max(0, min(100, int(read_percent))),
+        )
+    )
+
+
+def _emit_recognition_progress(
+    fraction: float,
+    index: int,
+    chunk: AudioChunk | None,
+    *,
+    first_chunk: AudioChunk | None,
+    source_stream,
+    first_chunk_start: int,
+    probed_samples: int,
+    state: dict,
+    progress,
+    progress_cb,
+    timeline_cb,
+) -> None:
+    if first_chunk is None:
+        return
+    if source_stream.eof:
+        total = max(1, source_stream.total_produced)
+        pct = _recognition_percent(index, fraction, total)
+        msg = f"正在识别 {index}/{total} 段"
+    else:
+        pct = _streaming_percent(
+            index,
+            fraction,
+            chunk,
+            first_chunk_start=first_chunk_start,
+            probed_samples=max(probed_samples, source_stream.timeline_samples),
+            produced_count=source_stream.total_produced,
+        )
+        msg = f"正在识别第 {index} 段"
+    total_ms, known = _timeline_duration(
+        eof=source_stream.eof,
+        probed_samples=probed_samples,
+        timeline_samples=source_stream.timeline_samples,
+    )
+    _publish_import_timeline(timeline_cb, "recognizing", _cursor_ms(chunk, fraction), total_ms, known)
+    if progress is None and progress_cb is None:
+        return
+    if pct < state["pct"]:
+        pct = state["pct"]
+    else:
+        state["pct"] = pct
+    if progress_cb is not None:
+        progress_cb(pct, msg)
+    elif progress is not None:
+        progress(msg if source_stream.eof else f"{msg}（{pct}%）")
+
+
+def _timeline_duration(*, eof: bool, probed_samples: int, timeline_samples: int) -> tuple[int, bool]:
+    """Return ``(total_ms, known)``. A growing decode buffer is not a duration."""
+    probed = max(0, int(probed_samples))
+    produced = max(0, int(timeline_samples))
+    if probed > 0:
+        samples = max(probed, produced) if eof else probed
+        return samples // _SAMPLES_PER_MS, samples > 0
+    if eof and produced > 0:
+        return produced // _SAMPLES_PER_MS, True
+    return 0, False
+
+
 def recognize_file(
     path,
     *,
@@ -691,6 +790,7 @@ def recognize_file(
     glossary=(),
     progress_cb: Callable[[int, str], None] | None = None,
     preview_cb: Callable[[str], None] | None = None,
+    timeline_cb: Callable[[ImportProgressSample], None] | None = None,
     speaker_model_enabled: bool = True,
     speaker_activity_enabled: bool = False,
     activity_path: str | Path | None | object = _UNSET,
@@ -709,28 +809,34 @@ def recognize_file(
         resolved_audio_path = str(source)
 
     state = {"pct": -1, "recognizing": False}
+    probed_samples = _probe_import_samples(source)
 
     def _emit_decode_progress(pct: int, msg: str) -> None:
-        if progress_cb is None or state["recognizing"]:
+        if state["recognizing"]:
             return
         scaled = min(_READ_PROGRESS_BUDGET, max(0, int(pct) * _READ_PROGRESS_BUDGET // 100))
-        if scaled < state["pct"]:
-            scaled = state["pct"]
-        else:
-            state["pct"] = scaled
-        progress_cb(scaled, msg)
+        if progress_cb is not None:
+            if scaled < state["pct"]:
+                scaled = state["pct"]
+            else:
+                state["pct"] = scaled
+            progress_cb(scaled, msg)
+        total_ms, known = _timeline_duration(eof=False, probed_samples=probed_samples, timeline_samples=0)
+        _publish_import_timeline(timeline_cb, "reading", 0, total_ms, known, read_percent=int(pct))
 
     if progress_cb is not None:
         state["pct"] = 0
         progress_cb(0, "正在解码音频...")
-    probed_samples = _probe_import_samples(source)
+    if timeline_cb is not None:
+        total_ms, known = _timeline_duration(eof=False, probed_samples=probed_samples, timeline_samples=0)
+        _publish_import_timeline(timeline_cb, "reading", 0, total_ms, known, read_percent=0)
 
     source_stream = _StreamingChunkSource(
         source,
         vad=vad,
         vad_path=vad_path,
         cancel=cancel,
-        decode_progress_cb=_emit_decode_progress if progress_cb is not None else None,
+        decode_progress_cb=_emit_decode_progress if (progress_cb is not None or timeline_cb is not None) else None,
     )
     with closing(source_stream):
         if source_stream.cancelled_during_open:
@@ -747,34 +853,23 @@ def recognize_file(
         state["recognizing"] = True
 
         def emit_recognition(fraction: float, index: int, chunk: AudioChunk | None = None) -> None:
-            if first_chunk is None or (progress is None and progress_cb is None):
-                return
-            if source_stream.eof:
-                total = max(1, source_stream.total_produced)
-                pct = _recognition_percent(index, fraction, total)
-                msg = f"正在识别 {index}/{total} 段"
-            else:
-                pct = _streaming_percent(
-                    index,
-                    fraction,
-                    chunk,
-                    first_chunk_start=first_chunk_start,
-                    probed_samples=max(probed_samples, source_stream.timeline_samples),
-                    produced_count=source_stream.total_produced,
-                )
-                msg = f"正在识别第 {index} 段"
-            if pct < state["pct"]:
-                pct = state["pct"]
-            else:
-                state["pct"] = pct
-            if progress_cb is not None:
-                progress_cb(pct, msg)
-            elif progress is not None:
-                progress(msg if source_stream.eof else f"{msg}（{pct}%）")
+            _emit_recognition_progress(
+                fraction,
+                index,
+                chunk,
+                first_chunk=first_chunk,
+                source_stream=source_stream,
+                first_chunk_start=first_chunk_start,
+                probed_samples=probed_samples,
+                state=state,
+                progress=progress,
+                progress_cb=progress_cb,
+                timeline_cb=timeline_cb,
+            )
 
         if first_chunk is not None:
-            # Publish this before the speaker model loads. Otherwise the last line
-            # the UI has is "已读取（30%）" for the whole first segment.
+            # Publish this before the speaker model loads, so the banner leaves
+            # the short decode phase as soon as the first segment is ready.
             emit_recognition(0.0, 1, first_chunk)
         effective_speaker_path = speaker_path if speaker_model_enabled else None
         available = bool(effective_speaker_path and Path(effective_speaker_path).is_file())
@@ -811,6 +906,18 @@ def recognize_file(
             emit_recognition(1.0, index, chunk)
             return turns
 
+        def _finalize_speakers(sess, threshold):
+            if cancel is None or not cancel():
+                total_ms, known = _timeline_duration(
+                    eof=True,
+                    probed_samples=max(probed_samples, source_stream.timeline_samples),
+                    timeline_samples=source_stream.timeline_samples,
+                )
+                _publish_import_timeline(timeline_cb, "finalizing", total_ms, total_ms, known)
+            from sayink.speaker_clustering import bounded_final_assignments
+
+            return bounded_final_assignments(sess, threshold, cancel=cancel)
+
         result = recognize_with_session(
             source_stream,
             decode_chunk,
@@ -818,6 +925,7 @@ def recognize_file(
             threshold=float(embedder.cluster_threshold),
             cancel=cancel,
             preview=preview_cb,
+            finalize=_finalize_speakers,
         )
         final_audio_ms = source_stream.audio_ms
 

@@ -578,6 +578,7 @@ class _MediaImportJob(QThread):
 
     progressed = pyqtSignal(str)
     previewed = pyqtSignal(str)
+    timeline = pyqtSignal(object)
     succeeded = pyqtSignal(object)
     failed = pyqtSignal(str)
 
@@ -607,6 +608,8 @@ class _MediaImportJob(QThread):
                 has_var_kw = False
             if "preview" in params or has_var_kw:
                 kwargs["preview"] = self.previewed.emit
+            if "timeline" in params or has_var_kw:
+                kwargs["timeline"] = self.timeline.emit
             if self._options and ("options" in params or has_var_kw):
                 kwargs["options"] = dict(self._options)
             result = self._runner(self._path, self._cancel.is_set, self.progressed.emit, **kwargs)
@@ -634,6 +637,7 @@ class MeetingController(QObject):
     media_import_started = pyqtSignal(str, str) # path, title
     media_import_progress = pyqtSignal(str)
     media_import_preview = pyqtSignal(str)
+    media_import_timeline = pyqtSignal(object)
     media_import_finished = pyqtSignal(str)     # meeting id, or "" when nothing was saved
     media_import_failed = pyqtSignal(str)
 
@@ -2413,6 +2417,7 @@ class MeetingController(QObject):
         job = _MediaImportJob(path, self._media_runner, self._media_cancel, None, options=opts)
         job.progressed.connect(self.media_import_progress)
         job.previewed.connect(self.media_import_preview)
+        job.timeline.connect(self.media_import_timeline)
         job.succeeded.connect(self._on_media_job_done)
         job.failed.connect(self._on_media_job_failed)
         job.finished.connect(self._retire_media_job)
@@ -3424,7 +3429,7 @@ class MeetingController(QObject):
         if job.isRunning() and force:
             # Keep the QThread alive after this controller is destroyed. Terminating
             # it here deadlocks a Python worker that still needs this thread.
-            for signal in (job.progressed, job.previewed, job.succeeded, job.failed, job.finished):
+            for signal in (job.progressed, job.previewed, job.timeline, job.succeeded, job.failed, job.finished):
                 try:
                     signal.disconnect()
                 except TypeError:

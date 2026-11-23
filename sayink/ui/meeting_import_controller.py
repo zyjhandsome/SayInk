@@ -10,7 +10,7 @@ import re
 import time
 from typing import Any
 
-from PyQt6.QtCore import QEvent, Qt
+from PyQt6.QtCore import QEvent, QTimer, Qt
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
     QDialog,
@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from sayink.import_eta import ImportEtaEstimator, ImportProgressSample
 from sayink.media_import import file_dialog_filter
 from sayink.meeting_store import STATUS_INTERRUPTED
 from sayink.ui.media_import_dialog import MediaImportDialog, natural_media_sort_key
@@ -30,17 +31,6 @@ from sayink.ui.native_dialog import native_file_dialog
 
 _ORIG_GET_OPEN_FILE_NAME = QFileDialog.getOpenFileName
 _DROPPABLE_TRANSCRIPT_SUFFIXES = frozenset({".txt", ".md", ".docx", ".srt", ".vtt", ".json"})
-
-
-def _format_import_remain(seconds: float) -> str:
-    remaining = max(0, int(round(seconds)))
-    if remaining < 60:
-        return f"大约还需 {remaining} 秒"
-    minutes, secs = divmod(remaining, 60)
-    if minutes < 60:
-        return f"大约还需 {minutes} 分 {secs} 秒" if secs else f"大约还需 {minutes} 分钟"
-    hours, minutes = divmod(minutes, 60)
-    return f"大约还需 {hours} 小时 {minutes} 分钟"
 
 
 def _media_stop_button_state(recognizing: bool, pending: bool) -> tuple[str, str]:
@@ -79,13 +69,18 @@ def _format_progress_display(
     remain: str,
     *,
     cancel_pending: bool,
+    position: str = "",
+    head: str | None = None,
 ) -> str:
     if cancel_pending:
         return "正在停止，当前这段完成后保留已有文字"
-    head = "正在识别" if "正在识别" in raw_text else "正在读取"
+    if not head:
+        head = "正在识别" if "正在识别" in raw_text else "正在读取"
     parts = [head]
     if pct is not None:
         parts.append(f"{pct}%")
+    if position:
+        parts.append(position)
     if remain:
         parts.append(remain)
     return " · ".join(parts)
@@ -96,6 +91,26 @@ class MeetingImportController:
 
     def __init__(self, host: Any) -> None:
         self._host = host
+        self._eta = ImportEtaEstimator()
+        self._eta_view = None
+        self._has_timeline = False
+        self._clock = time.monotonic
+        self._eta_timer = QTimer(host)
+        self._eta_timer.setInterval(1000)
+        self._eta_timer.timeout.connect(self._on_eta_tick)
+
+    def _reset_eta(self) -> None:
+        self._eta.reset()
+        self._eta_view = None
+        self._has_timeline = False
+        self._eta_timer.stop()
+
+    def _on_eta_tick(self) -> None:
+        if not self._has_timeline or not getattr(self._host._ctrl, "importing_media", False):
+            self._eta_timer.stop()
+            return
+        self._eta_view = self._eta.tick(self._clock())
+        self.apply_progress_widgets()
 
     def imported_status_message(self, meeting_id: str, kind_label: str) -> str:
         h = self._host
@@ -546,6 +561,7 @@ class MeetingImportController:
         h._media_cancel_pending = False
         h._pending_media_import_path = str(path)
         h._media_import_started = time.monotonic()
+        self._reset_eta()
         h._import_owns_detail = True
         h._media_import_title = (title or path.stem).strip()
         h._media_progress_text = "正在读取音频…"
@@ -560,6 +576,7 @@ class MeetingImportController:
         h._media_cancel_pending = False
         h._pending_media_import_path = str(path or "")
         h._media_import_started = time.monotonic()
+        self._reset_eta()
         if resolved_title:
             h._media_import_title = resolved_title
         h._media_progress_text = "正在读取音频…"
@@ -573,19 +590,30 @@ class MeetingImportController:
     def apply_progress_widgets(self) -> None:
         h = self._host
         raw_text = getattr(h, "_media_progress_text", "") or "正在读取音频…"
-        pct, determinate = _parse_progress_percent(raw_text)
+        eta = self._eta_view if self._has_timeline else None
+        position = ""
+        head = None
+        if eta is not None:
+            pct = eta.percent
+            determinate = pct is not None
+            remain = eta.remain_text
+            position = eta.position_text
+            head = eta.phase_text
+        else:
+            pct, determinate = _parse_progress_percent(raw_text)
+            remain = ""
         if determinate and pct is not None:
             h._import_progress_bar.setRange(0, 100)
             h._import_progress_bar.setValue(pct)
         else:
             h._import_progress_bar.setRange(0, 0)
-        remain = ""
-        if pct is not None and 5 <= pct <= 95 and h._media_import_started:
-            elapsed = time.monotonic() - h._media_import_started
-            if elapsed >= 3:
-                remain = _format_import_remain(elapsed * (100 - pct) / max(pct, 1))
         display_text = _format_progress_display(
-            raw_text, pct, remain, cancel_pending=bool(h._media_cancel_pending)
+            raw_text,
+            pct,
+            remain,
+            cancel_pending=bool(h._media_cancel_pending),
+            position=position,
+            head=head,
         )
         h._import_progress.setVisible(True)
         h._import_progress.setText(display_text)
@@ -631,6 +659,7 @@ class MeetingImportController:
             h._start_block,
         ):
             widget.hide()
+        self._reset_eta()
 
     def _cancel_queued_media_flow(self, queued_count: int) -> None:
         h = self._host
@@ -723,6 +752,20 @@ class MeetingImportController:
             return "cancel_all"
         return ""
 
+    def on_media_timeline(self, sample: ImportProgressSample) -> None:
+        h = self._host
+        if not getattr(h._ctrl, "importing_media", False):
+            return
+        self._has_timeline = True
+        self._eta_view = self._eta.observe(sample)
+        if not self._eta_timer.isActive():
+            self._eta_timer.start()
+        if h._import_owns_detail or not getattr(h, "_detail_id", ""):
+            self.show_import_detail()
+        else:
+            h._detail_pane.setVisible(True)
+            self.paint_import_banner()
+
     def on_media_progress(self, text: str) -> None:
         h = self._host
         if not text:
@@ -731,6 +774,7 @@ class MeetingImportController:
         if title and title != getattr(h, "_media_import_title", ""):
             h._media_import_started = time.monotonic()
             self.clear_import_live()
+            self._reset_eta()
         if title:
             h._media_import_title = title
         h._media_progress_text = text
@@ -1129,5 +1173,4 @@ class MeetingImportController:
 __all__ = [
     "MeetingImportController",
     "_ORIG_GET_OPEN_FILE_NAME",
-    "_format_import_remain",
 ]

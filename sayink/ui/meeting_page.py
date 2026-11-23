@@ -251,6 +251,9 @@ class MeetingPage(QWidget):
         if hasattr(started, "connect"):
             started.connect(self._on_media_started)
         self._ctrl.media_import_progress.connect(self._on_media_progress)
+        timeline = getattr(self._ctrl, "media_import_timeline", None)
+        if hasattr(timeline, "connect"):
+            timeline.connect(self._on_media_timeline)
         preview = getattr(self._ctrl, "media_import_preview", None)
         if hasattr(preview, "connect"):
             preview.connect(self._on_media_preview)
@@ -3772,6 +3775,9 @@ class MeetingPage(QWidget):
 
     def _on_media_progress(self, text: str) -> None:
         self._import_ui.on_media_progress(text)
+
+    def _on_media_timeline(self, sample) -> None:
+        self._import_ui.on_media_timeline(sample)
 
     def _on_media_preview(self, text: str) -> None:
         self._import_ui.on_media_preview(text)

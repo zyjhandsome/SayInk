@@ -3836,7 +3836,7 @@ class App(QObject):
             return stt_model
         return DEFAULT_MODEL_ID
 
-    def _run_media_import(self, path, cancel, progress, preview=None, options=None):
+    def _run_media_import(self, path, cancel, progress, preview=None, options=None, timeline=None):
         from contextlib import contextmanager
         from sayink import speech_recognizer as _sr
         from sayink.media_import import recognize_file
@@ -3859,6 +3859,10 @@ class App(QObject):
         speaker_activity_enabled = bool(getattr(settings, "speaker_activity_enabled", False))
         speaker_path = self._aux_model_path(AUX_MODEL_SPEAKER) if speaker_model_enabled else None
         activity_path = self._aux_model_path(AUX_MODEL_SPEAKER_ACTIVITY) if speaker_activity_enabled else None
+
+        def _forward_timeline(sample) -> None:
+            if timeline is not None:
+                timeline(sample)
 
         def _forward_progress(pct: int, msg: str) -> None:
             if progress is None or not msg:
@@ -3992,6 +3996,7 @@ class App(QObject):
                 glossary=glossary,
                 progress_cb=_forward_progress if progress is not None else None,
                 preview_cb=preview,
+                timeline_cb=_forward_timeline if timeline is not None else None,
                 speaker_model_enabled=speaker_model_enabled,
                 speaker_activity_enabled=speaker_activity_enabled,
                 activity_path=activity_path,

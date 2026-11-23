@@ -186,12 +186,12 @@ def test_store_writes_media_times_and_keeps_them_after_history_cleanup(tmp_path)
 def test_recognition_percent_ignores_leading_silence():
     from sayink.media_import import _recognition_percent
 
-    assert _recognition_percent(1, 0.0, 4) == 30
-    assert _recognition_percent(1, 0.0, 4) < 50
+    assert _recognition_percent(1, 0.0, 4) == 2
+    assert _recognition_percent(1, 0.0, 4) < 30
     assert _recognition_percent(1, 1.0, 4) < _recognition_percent(2, 0.0, 4) or (
         _recognition_percent(1, 1.0, 4) == _recognition_percent(2, 0.0, 4)
     )
-    assert _recognition_percent(4, 1.0, 4) == 99
+    assert _recognition_percent(4, 1.0, 4) == 95
 
 
 def _controller(config, tmp_path):
@@ -342,7 +342,7 @@ def test_finished_read_does_not_stay_on_thirty_percent_while_recognizing(tmp_pat
             recog = [(pct, msg) for pct, msg in seen if "正在识别" in msg]
             assert recog, seen
             assert not any(msg.startswith("已读取") for _, msg in seen), seen
-            assert recog[0][0] >= 30
+            assert 2 <= recog[0][0] < 30
             if on_progress is not None:
                 before = len(seen)
                 on_progress(max(1, len(audio) // 2), len(audio))
@@ -640,7 +640,105 @@ def test_recognize_file_streams_non_wav_with_delayed_origin_and_pts_gap(tmp_path
     assert result.turns[1].offset_ms == 613_500
     assert result.turns[1].duration_ms == 1_500
     assert result.audio_ms == 615_000
-    assert pcts[0] == 0 and 30 in pcts and pcts[-1] == 100
+    assert pcts[0] == 0 and 1 in pcts and 2 in pcts and pcts[-1] == 100
+
+
+def test_import_timeline_reports_audio_position_for_the_whole_file(tmp_path, monkeypatch):
+    """进度按文件里的位置走，识别刚开始时不能因为读取额度直接跳到 30%。"""
+    from sayink.import_eta import ImportEtaEstimator, ImportProgressSample
+
+    source = tmp_path / "talk.mp4"
+    source.write_bytes(b"mp4")
+    chunks = [
+        AudioChunk(0, 16_000, np.ones(16_000, dtype=np.float32)),
+        AudioChunk(16_000, 32_000, np.ones(16_000, dtype=np.float32)),
+    ]
+    monkeypatch.setattr(
+        "sayink.media_import.iter_media_pcm_timed",
+        lambda path, *, cancel=None, progress_cb=None: iter([(np.ones(32_000, dtype=np.float32), 0, 0)]),
+    )
+    monkeypatch.setattr(
+        "sayink.media_import.segment_timed_blocks",
+        lambda *args, **kwargs: (chunks, 32_000),
+    )
+    monkeypatch.setattr("sayink.media_import._probe_import_samples", lambda _path: 160_000)
+    events: list[ImportProgressSample] = []
+
+    class Recognizer:
+        def decode_meeting_blocking(self, audio, *, turn_analyzer, cancelled, on_progress=None):
+            if on_progress is not None:
+                on_progress(len(audio) // 2, len(audio))
+            return [_turn("一段", 0, len(audio))], ""
+
+    recognize_file(
+        source,
+        recognizer=Recognizer(),
+        speaker_path=None,
+        vad="energy",
+        vad_path=None,
+        cancel=lambda: False,
+        timeline_cb=events.append,
+    )
+    recognizing = [event for event in events if event.phase == "recognizing"]
+    assert recognizing
+    assert recognizing[0].duration_known is True
+    assert recognizing[0].audio_total_ms == 10_000
+    assert recognizing[0].audio_position_ms == 0
+    assert any(event.phase == "finalizing" for event in events)
+    opening = ImportEtaEstimator().observe(recognizing[0])
+    assert opening.percent is not None and opening.percent < 30
+
+
+def test_import_banner_keeps_the_audio_eta_when_a_percent_string_arrives(config, tmp_path):
+    from sayink.import_eta import ImportProgressSample
+
+    controller, history = _controller(config, tmp_path)
+    page = MeetingPage(config, controller)
+    try:
+        controller._importing_media = True
+        now = time.monotonic()
+        page._on_media_timeline(ImportProgressSample("recognizing", now, 0, 100_000, True))
+        page._on_media_timeline(ImportProgressSample("recognizing", now + 10, 10_000, 100_000, True))
+        assert "约 2 分钟" in page._import_progress.text()
+        assert page._import_progress_bar.value() < 30
+        page._on_media_progress("正在识别第 1 段（65%）")
+        assert "约 2 分钟" in page._import_progress.text()
+        assert "65%" not in page._import_progress.text()
+        assert page._import_progress_bar.value() < 30
+        page._import_ui._clock = lambda: now + 60
+        page._import_ui._on_eta_tick()
+        assert "约 2 分钟" not in page._import_progress.text()
+        assert "不到 1 分钟" in page._import_progress.text()
+        page._on_media_timeline(
+            ImportProgressSample("recognizing", now + 60, 12_500, 0, False)
+        )
+        assert "已识别 0:12 音频" in page._import_progress.text()
+        assert "约" not in page._import_progress.text()
+        assert page._import_progress_bar.maximum() == 0
+    finally:
+        controller._importing_media = False
+        page.deleteLater()
+        controller.shutdown()
+        history.close(timeout=2)
+
+
+def test_media_job_forwards_a_timeline_callback_when_the_runner_accepts_one():
+    from sayink.meeting_session import _MediaImportJob
+
+    seen = {}
+
+    def runner(path, cancel, progress, timeline=None):
+        seen["path"] = path
+        seen["timeline"] = timeline
+        return "ok"
+
+    job = _MediaImportJob("clip.mp3", runner, threading.Event())
+    forwarded = []
+    job.timeline.connect(forwarded.append)
+    job.run()
+    assert seen["path"] == "clip.mp3"
+    seen["timeline"]("ping")
+    assert forwarded == ["ping"]
 
 
 def test_media_import_dialog_natural_sort_reorder_and_duplicate_hint(config, tmp_path, qapp):
